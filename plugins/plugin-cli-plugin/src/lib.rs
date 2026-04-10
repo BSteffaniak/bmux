@@ -10,7 +10,8 @@ use bmux_plugin_sdk::{EXIT_OK, HostScope, NativeCommandContext, PluginCommandErr
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
+use tracing::{debug, info};
 
 #[derive(Default)]
 pub struct PluginCliPlugin;
@@ -84,10 +85,57 @@ fn run_core_proxy_command(
     command.arg("--core-builtins-only");
     command.args(command_path);
     command.args(&context.arguments);
-    let status = command.status().map_err(|error| {
-        PluginCommandError::from(format!("failed running core command: {error}"))
-    })?;
-    Ok(status.code().unwrap_or(EXIT_OK))
+
+    // When running inside the TUI attach loop the terminal is in raw mode.
+    // Any child stdout/stderr would corrupt the display, so capture both and
+    // route them through tracing (which writes to the log file only in attach
+    // context).  In normal CLI mode, inherit stdio so the user sees output.
+    if stdin_is_raw_mode() {
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        let output = command.output().map_err(|error| {
+            PluginCommandError::from(format!("failed running core command: {error}"))
+        })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stdout.lines().filter(|l| !l.is_empty()) {
+            info!(target: "bmux::plugin_cli::proxy", "{line}");
+        }
+        for line in stderr.lines().filter(|l| !l.is_empty()) {
+            debug!(target: "bmux::plugin_cli::proxy", "{line}");
+        }
+
+        Ok(output.status.code().unwrap_or(EXIT_OK))
+    } else {
+        let status = command.status().map_err(|error| {
+            PluginCommandError::from(format!("failed running core command: {error}"))
+        })?;
+        Ok(status.code().unwrap_or(EXIT_OK))
+    }
+}
+
+/// Returns `true` when the process's stdin is a terminal in raw mode (i.e.
+/// `ICANON` is disabled).  This reliably detects the TUI attach context
+/// because the attach loop enters raw mode before dispatching keybinding
+/// plugin commands, whereas normal CLI invocations leave the terminal in
+/// cooked mode.
+#[cfg(unix)]
+fn stdin_is_raw_mode() -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &raw mut termios) == 0 {
+            return termios.c_lflag & libc::ICANON == 0;
+        }
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn stdin_is_raw_mode() -> bool {
+    false
 }
 
 fn run_list_command(context: &NativeCommandContext) -> Result<i32, String> {

@@ -243,7 +243,7 @@ pub async fn run() -> Result<u8> {
             log_level,
             verbose,
         } => {
-            let file_only = command_enters_raw_mode(cli.command.as_ref());
+            let file_only = command_enters_raw_mode(cli.command.as_ref()) || cli.core_builtins_only;
             init_logging(verbose, Some(log_level), file_only);
             validate_record_bootstrap_flags(&cli)?;
             let connection_context = ConnectionContext::new(cli.target.as_deref());

@@ -1269,6 +1269,14 @@ pub(super) async fn run_recording_cut(
         .await
         .map_err(map_cli_client_error)?;
     let name_display = recording.name.as_deref().unwrap_or("-");
+    tracing::info!(
+        id = %recording.id,
+        name = %name_display,
+        events = recording.event_count,
+        bytes = recording.payload_bytes,
+        path = %recording.path,
+        "recording cut created",
+    );
     println!(
         "recording cut created: {} name={} events={} bytes={} path={}",
         recording.id, name_display, recording.event_count, recording.payload_bytes, recording.path

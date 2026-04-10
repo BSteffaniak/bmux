@@ -1229,8 +1229,10 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "libc",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
