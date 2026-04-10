@@ -36,9 +36,13 @@ fn host_status_prints_runtime_state_from_file() {
     let runtime_dir = root.path().join("runtime");
     let config_dir = root.path().join("config");
     let data_dir = root.path().join("data");
+    let state_dir = root.path().join("state");
+    let log_dir = root.path().join("logs");
     std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     std::fs::create_dir_all(&data_dir).expect("create data dir");
+    std::fs::create_dir_all(&state_dir).expect("create state dir");
+    std::fs::create_dir_all(&log_dir).expect("create log dir");
 
     let current_pid = std::process::id();
     let host_state = serde_json::json!({
@@ -59,6 +63,8 @@ fn host_status_prints_runtime_state_from_file() {
         .env("BMUX_RUNTIME_DIR", &runtime_dir)
         .env("BMUX_CONFIG_DIR", &config_dir)
         .env("BMUX_DATA_DIR", &data_dir)
+        .env("BMUX_STATE_DIR", &state_dir)
+        .env("BMUX_LOG_DIR", &log_dir)
         .output()
         .expect("run bmux host --status");
 
@@ -84,15 +90,21 @@ fn host_status_without_state_returns_not_running_message() {
     let runtime_dir = root.path().join("runtime");
     let config_dir = root.path().join("config");
     let data_dir = root.path().join("data");
+    let state_dir = root.path().join("state");
+    let log_dir = root.path().join("logs");
     std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     std::fs::create_dir_all(&data_dir).expect("create data dir");
+    std::fs::create_dir_all(&state_dir).expect("create state dir");
+    std::fs::create_dir_all(&log_dir).expect("create log dir");
 
     let output = Command::new(bmux_binary())
         .args(["host", "--status"])
         .env("BMUX_RUNTIME_DIR", &runtime_dir)
         .env("BMUX_CONFIG_DIR", &config_dir)
         .env("BMUX_DATA_DIR", &data_dir)
+        .env("BMUX_STATE_DIR", &state_dir)
+        .env("BMUX_LOG_DIR", &log_dir)
         .output()
         .expect("run bmux host --status");
 

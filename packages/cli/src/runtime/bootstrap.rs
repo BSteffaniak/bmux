@@ -4,6 +4,7 @@ use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions, SessionSummary};
 use bmux_server::BmuxServer;
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use tracing::{Level, warn};
 use uuid::Uuid;
@@ -507,12 +508,7 @@ pub(super) fn init_logging(verbose: bool, cli_level: Option<LogLevel>, file_only
     let _ = EFFECTIVE_LOG_LEVEL.set(tracing_level);
 
     {
-        let paths =
-            moosicbox_log_runtime::resolve_paths(&moosicbox_log_runtime::LogRuntimePathsConfig {
-                app_name: "bmux",
-                state_dir_env: "BMUX_STATE_DIR",
-                log_dir_env: "BMUX_LOG_DIR",
-            });
+        let paths = resolve_logging_paths();
         let runtime_level = match level {
             LogLevel::Error => "error",
             LogLevel::Warn => "warn",
@@ -543,6 +539,24 @@ pub(super) fn init_logging(verbose: bool, cli_level: Option<LogLevel>, file_only
         }
     }
 }
+
+fn resolve_logging_paths() -> moosicbox_log_runtime::LogRuntimePaths {
+    let mut paths =
+        moosicbox_log_runtime::resolve_paths(&moosicbox_log_runtime::LogRuntimePathsConfig {
+            app_name: "bmux",
+            state_dir_env: "BMUX_STATE_DIR",
+            log_dir_env: "BMUX_LOG_DIR",
+        });
+
+    if std::env::var_os("BMUX_LOG_DIR").is_none()
+        && let Some(state_dir) = std::env::var_os("BMUX_STATE_DIR")
+    {
+        paths.log_dir = PathBuf::from(state_dir).join("logs");
+    }
+
+    paths
+}
+
 #[cfg(test)]
 mod tests {
     fn empty_cli() -> bmux_cli_schema::Cli {

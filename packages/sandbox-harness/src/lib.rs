@@ -66,7 +66,7 @@ impl SandboxHarness {
     /// Returns an error if startup fails or the server is not ready in time.
     pub async fn start_with_options(options: SandboxHarnessOptions) -> Result<Self> {
         let (paths, root_dir) = create_temp_paths();
-        ensure_sandbox_dirs(&paths)?;
+        ensure_sandbox_dirs(&paths, &root_dir)?;
         write_pid_marker(&root_dir)?;
 
         let server = BmuxServer::from_config_paths(&paths);
@@ -113,6 +113,10 @@ impl SandboxHarness {
         &self.root_dir
     }
 
+    fn log_dir(&self) -> PathBuf {
+        self.root_dir.join("logs")
+    }
+
     /// Return BMUX environment overrides for this sandbox.
     #[must_use]
     pub fn env_overrides(&self) -> BTreeMap<&'static str, String> {
@@ -133,6 +137,7 @@ impl SandboxHarness {
             "BMUX_STATE_DIR",
             self.paths.state_dir.to_string_lossy().to_string(),
         );
+        values.insert("BMUX_LOG_DIR", self.log_dir().to_string_lossy().to_string());
         values
     }
 
@@ -142,6 +147,7 @@ impl SandboxHarness {
         command.env("BMUX_RUNTIME_DIR", &self.paths.runtime_dir);
         command.env("BMUX_DATA_DIR", &self.paths.data_dir);
         command.env("BMUX_STATE_DIR", &self.paths.state_dir);
+        command.env("BMUX_LOG_DIR", self.log_dir());
     }
 
     /// Gracefully shut down the sandbox and clean up the temp root directory.
@@ -271,7 +277,7 @@ fn create_temp_paths() -> (ConfigPaths, PathBuf) {
     (paths, root)
 }
 
-fn ensure_sandbox_dirs(paths: &ConfigPaths) -> Result<()> {
+fn ensure_sandbox_dirs(paths: &ConfigPaths, root_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(&paths.config_dir)
         .with_context(|| format!("failed creating {}", paths.config_dir.display()))?;
     std::fs::create_dir_all(&paths.runtime_dir)
@@ -280,6 +286,8 @@ fn ensure_sandbox_dirs(paths: &ConfigPaths) -> Result<()> {
         .with_context(|| format!("failed creating {}", paths.data_dir.display()))?;
     std::fs::create_dir_all(&paths.state_dir)
         .with_context(|| format!("failed creating {}", paths.state_dir.display()))?;
+    std::fs::create_dir_all(root_dir.join("logs"))
+        .with_context(|| format!("failed creating {}", root_dir.join("logs").display()))?;
     Ok(())
 }
 
@@ -372,7 +380,7 @@ fn is_pid_alive(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::SandboxHarness;
+    use super::{SandboxHarness, create_temp_paths, ensure_sandbox_dirs};
 
     #[tokio::test]
     async fn sandbox_harness_starts_and_connects() {
@@ -388,5 +396,13 @@ mod tests {
             .shutdown(false)
             .await
             .expect("sandbox shutdown should succeed");
+    }
+
+    #[test]
+    fn ensure_sandbox_dirs_creates_sandbox_log_dir() {
+        let (paths, root) = create_temp_paths();
+        ensure_sandbox_dirs(&paths, &root).expect("sandbox dirs should be created");
+        assert!(root.join("logs").exists(), "sandbox logs dir should exist");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

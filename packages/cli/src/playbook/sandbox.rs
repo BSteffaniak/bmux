@@ -223,6 +223,7 @@ fn apply_sandbox_env(
     cmd.env("BMUX_RUNTIME_DIR", &paths.runtime_dir);
     cmd.env("BMUX_DATA_DIR", &paths.data_dir);
     cmd.env("BMUX_STATE_DIR", &paths.state_dir);
+    cmd.env("BMUX_LOG_DIR", root_dir.join("logs"));
 
     // Deterministic defaults — override the parent value (Inherit) or provide
     // the only value (Clean) for variables that affect terminal/locale behavior.
@@ -713,4 +714,47 @@ pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> (usize, Vec<CleanupEntry>) {
     }
 
     (scanned, entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+
+    fn command_env_value(command: &ProcessCommand, key: &str) -> Option<std::ffi::OsString> {
+        command.get_envs().find_map(|(name, value)| {
+            if name == OsStr::new(key) {
+                value.map(std::ffi::OsStr::to_os_string)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn apply_sandbox_env_sets_log_dir_inside_sandbox_root() {
+        let root =
+            std::env::temp_dir().join(format!("bmux-playbook-env-test-{}", std::process::id()));
+        let paths = ConfigPaths::new(
+            root.join("c"),
+            root.join("r"),
+            root.join("d"),
+            root.join("s"),
+        );
+        let mut command = ProcessCommand::new("sh");
+
+        apply_sandbox_env(
+            &mut command,
+            &paths,
+            &root,
+            &BTreeMap::new(),
+            super::super::types::SandboxEnvMode::Inherit,
+        );
+
+        assert_eq!(
+            command_env_value(&command, "BMUX_LOG_DIR"),
+            Some(root.join("logs").into_os_string())
+        );
+    }
 }

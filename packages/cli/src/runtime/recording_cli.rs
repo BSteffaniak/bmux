@@ -1342,6 +1342,15 @@ pub(super) async fn start_verify_server(
     }
 }
 
+fn apply_verify_server_env(command: &mut ProcessCommand, paths: &ConfigPaths, root_dir: &Path) {
+    command
+        .env("BMUX_CONFIG_DIR", &paths.config_dir)
+        .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
+        .env("BMUX_DATA_DIR", &paths.data_dir)
+        .env("BMUX_STATE_DIR", &paths.state_dir)
+        .env("BMUX_LOG_DIR", root_dir.join("logs"));
+}
+
 pub(super) async fn start_verify_server_foreground(
     target_binary: &Path,
     paths: &ConfigPaths,
@@ -1364,13 +1373,10 @@ pub(super) async fn start_verify_server_foreground(
         .open(&stderr_log)
         .with_context(|| format!("failed opening verify stderr log {}", stderr_log.display()))?;
 
-    let child = ProcessCommand::new(target_binary)
-        .arg("server")
-        .arg("start")
-        .env("BMUX_CONFIG_DIR", &paths.config_dir)
-        .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
-        .env("BMUX_DATA_DIR", &paths.data_dir)
-        .env("BMUX_STATE_DIR", &paths.state_dir)
+    let mut command = ProcessCommand::new(target_binary);
+    command.arg("server").arg("start");
+    apply_verify_server_env(&mut command, paths, root_dir);
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -1417,14 +1423,10 @@ pub(super) async fn start_verify_server_daemon(
         .with_context(|| format!("failed creating verify logs dir {}", logs_dir.display()))?;
     let stdout_log = logs_dir.join("verify-server-daemon.stdout.log");
     let stderr_log = logs_dir.join("verify-server-daemon.stderr.log");
-    let output = ProcessCommand::new(target_binary)
-        .arg("server")
-        .arg("start")
-        .arg("--daemon")
-        .env("BMUX_CONFIG_DIR", &paths.config_dir)
-        .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
-        .env("BMUX_DATA_DIR", &paths.data_dir)
-        .env("BMUX_STATE_DIR", &paths.state_dir)
+    let mut command = ProcessCommand::new(target_binary);
+    command.arg("server").arg("start").arg("--daemon");
+    apply_verify_server_env(&mut command, paths, root_dir);
+    let output = command
         .output()
         .context("failed starting verify target daemon fallback")?;
     std::fs::write(&stdout_log, &output.stdout)
@@ -1626,8 +1628,34 @@ pub(super) fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingE
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     #[allow(clippy::wildcard_imports)]
     use super::*;
+
+    fn command_env_value(command: &ProcessCommand, key: &str) -> Option<std::ffi::OsString> {
+        command.get_envs().find_map(|(name, value)| {
+            if name == OsStr::new(key) {
+                value.map(std::ffi::OsStr::to_os_string)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn verify_server_env_sets_log_dir_inside_verify_root() {
+        let (paths, root) = verify_temp_paths();
+        let mut command = ProcessCommand::new("sh");
+        apply_verify_server_env(&mut command, &paths, &root);
+
+        assert_eq!(
+            command_env_value(&command, "BMUX_LOG_DIR"),
+            Some(root.join("logs").into_os_string())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn make_event(
         kind: RecordingEventKind,

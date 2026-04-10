@@ -39,7 +39,7 @@ pub static ENV_OVERRIDE_DOCS: &[EnvOverrideDoc] = &[
     EnvOverrideDoc {
         variable: "BMUX_STATE_DIR",
         scope: "state",
-        description: "Overrides the persistent state directory (recordings, traces, and runtime layout state).",
+        description: "Overrides the persistent state directory (recordings, traces, and runtime layout state); when BMUX_LOG_DIR is unset, logs default to $BMUX_STATE_DIR/logs.",
     },
     EnvOverrideDoc {
         variable: "BMUX_LOG_DIR",
@@ -323,6 +323,10 @@ fn default_log_dir() -> PathBuf {
         return PathBuf::from(path);
     }
 
+    if let Some(path) = std::env::var_os("BMUX_STATE_DIR") {
+        return PathBuf::from(path).join("logs");
+    }
+
     #[cfg(target_os = "macos")]
     {
         dirs::home_dir().map_or_else(
@@ -474,7 +478,42 @@ impl Default for ConfigPaths {
 #[cfg(test)]
 mod tests {
     use super::{ConfigPaths, resolve_first_existing, stable_fnv1a64};
+    use std::ffi::OsString;
     use std::path::PathBuf;
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_ref() {
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
 
     /// Build a `ConfigPaths` with a custom candidate chain for testing.
     fn paths_with_candidates(candidates: Vec<PathBuf>) -> ConfigPaths {
@@ -819,6 +858,39 @@ mod tests {
             left.rolling_recordings_dir(),
             right.rolling_recordings_dir()
         );
+    }
+
+    #[test]
+    fn logs_dir_defaults_to_state_dir_override_when_log_override_is_unset() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
+        let _state_guard = EnvVarGuard::set("BMUX_STATE_DIR", "/tmp/bmux-state-override");
+        let _log_guard = EnvVarGuard::unset("BMUX_LOG_DIR");
+
+        let paths = ConfigPaths::new(
+            PathBuf::from("/tmp/bmux-config"),
+            PathBuf::from("/tmp/bmux-runtime"),
+            PathBuf::from("/tmp/bmux-data"),
+            PathBuf::from("/tmp/bmux-state"),
+        );
+        assert_eq!(
+            paths.logs_dir(),
+            PathBuf::from("/tmp/bmux-state-override/logs")
+        );
+    }
+
+    #[test]
+    fn logs_dir_prefers_explicit_log_dir_override_over_state_dir_override() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
+        let _state_guard = EnvVarGuard::set("BMUX_STATE_DIR", "/tmp/bmux-state-override");
+        let _log_guard = EnvVarGuard::set("BMUX_LOG_DIR", "/tmp/bmux-log-override");
+
+        let paths = ConfigPaths::new(
+            PathBuf::from("/tmp/bmux-config"),
+            PathBuf::from("/tmp/bmux-runtime"),
+            PathBuf::from("/tmp/bmux-data"),
+            PathBuf::from("/tmp/bmux-state"),
+        );
+        assert_eq!(paths.logs_dir(), PathBuf::from("/tmp/bmux-log-override"));
     }
 
     #[cfg(target_os = "macos")]

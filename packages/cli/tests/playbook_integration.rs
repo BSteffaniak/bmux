@@ -8,6 +8,7 @@
 //! - **Direct API tests**: Import `bmux_cli::playbook::*` and call parsers/validators
 //!   directly (lower-level checks).
 
+use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
@@ -20,6 +21,60 @@ fn bmux_binary() -> PathBuf {
 /// Path to the fixtures directory.
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/playbooks")
+}
+
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "bmux-playbook-integration-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+struct BmuxCommandSandbox {
+    root: TempDirGuard,
+}
+
+impl BmuxCommandSandbox {
+    fn new(label: &str) -> Self {
+        let root = TempDirGuard::new(label);
+        for dir in ["config", "runtime", "data", "state", "logs"] {
+            std::fs::create_dir_all(root.path().join(dir)).expect("create sandbox dir");
+        }
+        Self { root }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(bmux_binary());
+        self.apply(&mut command);
+        command
+    }
+
+    fn apply(&self, command: &mut Command) {
+        command
+            .env("BMUX_CONFIG_DIR", self.root.path().join("config"))
+            .env("BMUX_RUNTIME_DIR", self.root.path().join("runtime"))
+            .env("BMUX_DATA_DIR", self.root.path().join("data"))
+            .env("BMUX_STATE_DIR", self.root.path().join("state"))
+            .env("BMUX_LOG_DIR", self.root.path().join("logs"));
+    }
 }
 
 /// Construct a platform-appropriate IPC endpoint from a socket path string.
@@ -92,7 +147,9 @@ fn run_playbook_fixture(name: &str) -> (serde_json::Value, bool) {
     let fixture = fixtures_dir().join(name);
     assert!(fixture.exists(), "fixture not found: {}", fixture.display());
 
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("run-playbook-fixture");
+    let output = sandbox
+        .command()
         .args(["playbook", "run", "--json", fixture.to_str().unwrap()])
         .env("BMUX_PLAYBOOK_ENV_MODE", "inherit")
         .output()
@@ -113,13 +170,16 @@ fn run_playbook_fixture(name: &str) -> (serde_json::Value, bool) {
 }
 
 #[test]
+#[serial]
 fn playbook_run_interactive_step_controls() {
     use std::io::Write;
 
     let fixture = fixtures_dir().join("echo_hello.dsl");
     assert!(fixture.exists(), "fixture not found: {}", fixture.display());
 
-    let mut child = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("interactive-step-controls");
+    let mut child = sandbox
+        .command()
         .args([
             "playbook",
             "run",
@@ -318,7 +378,9 @@ fn playbook_env_mode_clean() {
 
     // For this test, do NOT set BMUX_PLAYBOOK_ENV_MODE — the playbook itself
     // has @env-mode clean, so the sandbox should use clean mode.
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("env-mode-clean");
+    let output = sandbox
+        .command()
         .args(["playbook", "run", "--json", fixture.to_str().unwrap()])
         .output()
         .expect("failed to run bmux playbook");
@@ -517,7 +579,9 @@ fn playbook_assert_matches() {
 fn playbook_dry_run() {
     let fixture = fixtures_dir().join("echo_hello.dsl");
 
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("dry-run");
+    let output = sandbox
+        .command()
         .args(["playbook", "dry-run", "--json", fixture.to_str().unwrap()])
         .output()
         .expect("failed to run bmux playbook dry-run");
@@ -868,7 +932,9 @@ fn playbook_level_timeout_skips_remaining() {
 fn playbook_from_recording_cli() {
     // Step 1: Run a playbook with --record to produce a recording.
     let fixture = fixtures_dir().join("echo_hello.dsl");
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("from-recording");
+    let output = sandbox
+        .command()
         .args([
             "playbook",
             "run",
@@ -898,7 +964,8 @@ fn playbook_from_recording_cli() {
     };
 
     // Step 2: Run from-recording to generate DSL from the recording.
-    let from_output = Command::new(bmux_binary())
+    let from_output = sandbox
+        .command()
         .args(["playbook", "from-recording", &recording_id])
         .output()
         .expect("failed to run bmux playbook from-recording");
@@ -1017,12 +1084,15 @@ impl Drop for ProcessGuard {
 }
 
 #[tokio::test]
+#[serial]
 async fn interactive_mode_basic() {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 
     // Step 1: Spawn the interactive session.
-    let mut child = std::process::Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("interactive-mode-basic");
+    let mut child = sandbox
+        .command()
         .args([
             "playbook",
             "interactive",
@@ -1276,11 +1346,14 @@ async fn interactive_mode_basic() {
 }
 
 #[tokio::test]
+#[serial]
 async fn interactive_mode_json_screen_delta_formats() {
     use std::process::Stdio;
     use tokio::io::BufReader as TokioBufReader;
 
-    let mut child = std::process::Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("interactive-mode-screen-delta");
+    let mut child = sandbox
+        .command()
         .args([
             "playbook",
             "interactive",
@@ -1407,11 +1480,14 @@ async fn interactive_mode_json_screen_delta_formats() {
 }
 
 #[tokio::test]
+#[serial]
 async fn interactive_mode_watchpoint_event_burst_cursor_delta_hit() {
     use std::process::Stdio;
     use tokio::io::BufReader as TokioBufReader;
 
-    let mut child = std::process::Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("interactive-mode-watchpoint-cursor");
+    let mut child = sandbox
+        .command()
         .args([
             "playbook",
             "interactive",
@@ -1530,11 +1606,14 @@ async fn interactive_mode_watchpoint_event_burst_cursor_delta_hit() {
 }
 
 #[tokio::test]
+#[serial]
 async fn interactive_mode_watchpoint_event_burst_screen_delta_hit_and_blocks_recursive() {
     use std::process::Stdio;
     use tokio::io::BufReader as TokioBufReader;
 
-    let mut child = std::process::Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("interactive-mode-watchpoint-screen");
+    let mut child = sandbox
+        .command()
         .args([
             "playbook",
             "interactive",
@@ -1735,7 +1814,9 @@ fn playbook_shell_exit_mid_playbook() {
 fn playbook_validate_valid_json() {
     let fixture = fixtures_dir().join("echo_hello.dsl");
 
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("validate-valid-json");
+    let output = sandbox
+        .command()
         .args(["playbook", "validate", "--json", fixture.to_str().unwrap()])
         .output()
         .expect("failed to run bmux playbook validate");
@@ -1754,7 +1835,9 @@ fn playbook_validate_valid_json() {
 fn playbook_validate_invalid_json() {
     let fixture = fixtures_dir().join("invalid_no_session.dsl");
 
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("validate-invalid-json");
+    let output = sandbox
+        .command()
         .args(["playbook", "validate", "--json", fixture.to_str().unwrap()])
         .output()
         .expect("failed to run bmux playbook validate");
@@ -1785,7 +1868,9 @@ fn playbook_validate_invalid_json() {
 /// Helper: run a playbook fixture and return the raw JSON string.
 fn run_playbook_fixture_raw(name: &str) -> String {
     let fixture = fixtures_dir().join(name);
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("run-playbook-fixture-raw");
+    let output = sandbox
+        .command()
         .args(["playbook", "run", "--json", fixture.to_str().unwrap()])
         .env("BMUX_PLAYBOOK_ENV_MODE", "inherit")
         .output()
@@ -1808,7 +1893,9 @@ fn playbook_diff_detects_changes() {
     std::fs::write(&right_path, &right_json).unwrap();
 
     // Run diff.
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("diff-detects-changes");
+    let output = sandbox
+        .command()
         .args([
             "playbook",
             "diff",
@@ -1856,7 +1943,9 @@ fn playbook_diff_identical() {
     let path = dir.join("result.json");
     std::fs::write(&path, &result_json).unwrap();
 
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("diff-identical");
+    let output = sandbox
+        .command()
         .args([
             "playbook",
             "diff",
@@ -1898,7 +1987,9 @@ fn playbook_diff_identical() {
 #[test]
 fn playbook_var_cli_override() {
     let fixture = fixtures_dir().join("var_override.dsl");
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("var-cli-override");
+    let output = sandbox
+        .command()
         .args([
             "playbook",
             "run",
@@ -1960,7 +2051,9 @@ fn playbook_continue_on_error() {
 
 #[test]
 fn playbook_cleanup_dry_run() {
-    let output = Command::new(bmux_binary())
+    let sandbox = BmuxCommandSandbox::new("cleanup-dry-run");
+    let output = sandbox
+        .command()
         .args(["playbook", "cleanup", "--json", "--dry-run"])
         .output()
         .expect("failed to run bmux playbook cleanup");
