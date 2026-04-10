@@ -20,7 +20,7 @@ Default launch behavior:
 
 - Running `bmux` with no subcommand now uses the server path only.
 - If the server is not running, bmux starts it in daemon mode.
-- If no session exists, bmux creates `session-1` (or the next available `session-N`) and attaches.
+- If no session exists, bmux creates `tab-1` (or the next available `tab-N`) and attaches.
 
 ## Server Commands
 

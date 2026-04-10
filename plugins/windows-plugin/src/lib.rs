@@ -66,13 +66,10 @@ fn handle_command(
     match context.command.as_str() {
         "new-window" => {
             let name = option_value(&context.arguments, "name");
-            let response = context
-                .context_create(&ContextCreateRequest {
-                    name,
-                    attributes: BTreeMap::new(),
-                })
-                .map_err(|error| error.to_string())?;
-            println!("created window context: {}", response.context.id);
+            let ack = create_window(context, name)?;
+            if let Some(context_id) = ack.id {
+                println!("created window context: {context_id}");
+            }
             Ok(())
         }
         "list-windows" => {
@@ -238,7 +235,7 @@ fn list_windows(
             id: context.id.to_string(),
             name: context
                 .name
-                .unwrap_or_else(|| format!("context-{}", index.saturating_add(1))),
+                .unwrap_or_else(|| format!("tab-{}", index.saturating_add(1))),
             active: current_context == Some(context.id),
         })
         .collect())
@@ -248,10 +245,16 @@ fn create_window(
     caller: &impl HostRuntimeApi,
     name: Option<String>,
 ) -> Result<WindowCommandAck, String> {
+    let resolved_name = name.or_else(|| {
+        caller
+            .context_list()
+            .ok()
+            .map(|response| next_default_tab_name_for_contexts(&response.contexts))
+    });
     let previous_context = resolve_effective_current_context(caller).ok().flatten();
     let response = caller
         .context_create(&ContextCreateRequest {
-            name,
+            name: resolved_name,
             attributes: BTreeMap::new(),
         })
         .map_err(|error| error.to_string())?;
@@ -266,6 +269,20 @@ fn create_window(
         ok: true,
         id: Some(context_id.to_string()),
     })
+}
+
+fn next_default_tab_name_for_contexts(contexts: &[bmux_plugin_sdk::ContextSummary]) -> String {
+    let mut next = 1_u32;
+    loop {
+        let candidate = format!("tab-{next}");
+        if contexts
+            .iter()
+            .all(|context| context.name.as_deref() != Some(candidate.as_str()))
+        {
+            return candidate;
+        }
+        next = next.saturating_add(1);
+    }
 }
 
 fn kill_window(
@@ -1255,6 +1272,28 @@ mod tests {
     }
 
     #[test]
+    fn list_windows_uses_tab_prefix_for_unnamed_contexts() {
+        let sessions = vec![
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: None,
+                attributes: BTreeMap::new(),
+            },
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: None,
+                attributes: BTreeMap::new(),
+            },
+        ];
+        let host = MockHost::with_sessions(sessions);
+
+        let windows = list_windows(&host, None).expect("list should succeed");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].name, "tab-1");
+        assert_eq!(windows[1].name, "tab-2");
+    }
+
+    #[test]
     fn resolve_session_id_finds_name_and_id() {
         let sessions = sample_sessions();
         let alpha_id = sessions[0].id;
@@ -1287,6 +1326,33 @@ mod tests {
             .expect("create log lock should succeed")
             .clone();
         assert_eq!(creates.as_slice(), &[Some("dev".to_string())]);
+    }
+
+    #[test]
+    fn create_window_assigns_next_tab_name_when_name_is_missing() {
+        let sessions = vec![
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: Some("tab-1".to_string()),
+                attributes: BTreeMap::new(),
+            },
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: Some("tab-3".to_string()),
+                attributes: BTreeMap::new(),
+            },
+        ];
+        let host = MockHost::with_sessions(sessions);
+
+        let ack = create_window(&host, None).expect("create should succeed");
+        assert!(ack.ok);
+        assert!(ack.id.is_some());
+        let creates: Vec<_> = host
+            .creates
+            .lock()
+            .expect("create log lock should succeed")
+            .clone();
+        assert_eq!(creates.as_slice(), &[Some("tab-2".to_string())]);
     }
 
     #[test]

@@ -1384,8 +1384,13 @@ pub async fn handle_attach_runtime_action(
 ) -> std::result::Result<(), ClientError> {
     match action {
         RuntimeAction::NewWindow | RuntimeAction::NewSession => {
+            let default_name = client
+                .list_contexts()
+                .await
+                .ok()
+                .map(|contexts| next_default_tab_name_for_contexts(&contexts));
             let context = client
-                .create_context(None, std::collections::BTreeMap::new())
+                .create_context(default_name, std::collections::BTreeMap::new())
                 .await?;
             let attach_info = open_attach_for_context(client, context.id).await?;
             view_state.attached_id = attach_info.session_id;
@@ -3240,8 +3245,9 @@ pub fn build_attach_tabs_from_catalog(
 
     tab_contexts
         .into_iter()
-        .map(|context| AttachTab {
-            label: context_summary_label(&context),
+        .enumerate()
+        .map(|(index, context)| AttachTab {
+            label: context_summary_label(&context, Some(index.saturating_add(1))),
             active: current_context_id == Some(context.id),
             context_id: Some(context.id),
         })
@@ -3276,32 +3282,49 @@ pub fn resolve_attach_context_label_from_catalog(
     session_id: Uuid,
 ) -> String {
     if let Some(context_id) = context_id
-        && let Some(context) = contexts.iter().find(|context| context.id == context_id)
+        && let Some((index, context)) = contexts
+            .iter()
+            .enumerate()
+            .find(|(_, context)| context.id == context_id)
     {
-        return context_summary_label(context);
+        return context_summary_label(context, Some(index.saturating_add(1)));
     }
 
-    if let Some(context) = contexts.iter().find(|context| {
+    if let Some((index, context)) = contexts.iter().enumerate().find(|(_, context)| {
         context
             .attributes
             .get("bmux.session_id")
             .is_some_and(|value| value == &session_id.to_string())
     }) {
-        return context_summary_label(context);
+        return context_summary_label(context, Some(index.saturating_add(1)));
     }
 
     "terminal".to_string()
 }
 
-pub fn context_summary_label(context: &ContextSummary) -> String {
+pub fn context_summary_label(context: &ContextSummary, fallback_index: Option<usize>) -> String {
     context
         .name
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .map_or_else(
-            || format!("context-{}", short_uuid(context.id)),
+            || fallback_index.map_or_else(|| "tab".to_string(), |index| format!("tab-{index}")),
             ToString::to_string,
         )
+}
+
+pub fn next_default_tab_name_for_contexts(contexts: &[ContextSummary]) -> String {
+    let mut next = 1_u32;
+    loop {
+        let candidate = format!("tab-{next}");
+        if contexts
+            .iter()
+            .all(|context| context.name.as_deref() != Some(candidate.as_str()))
+        {
+            return candidate;
+        }
+        next = next.saturating_add(1);
+    }
 }
 
 pub fn resolve_attach_session_label_and_count_from_catalog(

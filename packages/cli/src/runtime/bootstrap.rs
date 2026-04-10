@@ -171,7 +171,7 @@ pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Re
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
 
     if sessions.is_empty() {
-        let name = next_default_session_name(&sessions);
+        let name = next_default_tab_name(&sessions);
         let id = client
             .new_session(Some(name.clone()))
             .await
@@ -183,7 +183,7 @@ pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Re
     let writable_sessions = sessions.clone();
 
     if writable_sessions.is_empty() {
-        let name = next_default_session_name(&sessions);
+        let name = next_default_tab_name(&sessions);
         let id = client
             .new_session(Some(name.clone()))
             .await
@@ -205,10 +205,10 @@ pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Re
     Ok(session.id)
 }
 
-pub(super) fn next_default_session_name(sessions: &[SessionSummary]) -> String {
+pub(super) fn next_default_tab_name(sessions: &[SessionSummary]) -> String {
     let mut next = 1_u32;
     loop {
-        let candidate = format!("session-{next}");
+        let candidate = format!("tab-{next}");
         if sessions
             .iter()
             .all(|session| session.name.as_deref() != Some(candidate.as_str()))
