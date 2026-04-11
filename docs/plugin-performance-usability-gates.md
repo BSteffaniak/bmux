@@ -34,6 +34,15 @@ For changes under `plugins/**`:
 ### 4) End-to-end command latency SLO
 
 - `./scripts/perf-plugin-command-latency.sh --iterations 20 --warmup 5 --max-p95-ms 250 --max-p99-ms 350`
+- `./scripts/perf-plugin-runtime-matrix.sh --iterations 20 --warmup 5`
+
+### 5) Plugin runtime command matrix SLO
+
+`scripts/perf-plugin-runtime-matrix.sh` enforces per-scenario p95/p99 SLOs:
+
+- `plugin list --json`: p95 <= 250ms, p99 <= 350ms
+- `plugin doctor --json`: p95 <= 350ms, p99 <= 500ms
+- `plugin rebuild --list --json`: p95 <= 550ms, p99 <= 750ms
 
 ## Usability Acceptance Matrix
 
