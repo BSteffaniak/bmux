@@ -4,6 +4,7 @@
 
 use bmux_config::BmuxConfig;
 use bmux_plugin::HostRuntimeApi;
+use bmux_plugin::prompt;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, NativeCommandContext, PaneCloseRequest, PaneLaunchCommand,
@@ -86,7 +87,11 @@ impl RustPlugin for ClusterPlugin {
             },
             "cluster-command/v1", "pane_retry" => |req: ClusterCommandPaneRetryRequest, ctx| {
                 let pane = parse_pane_retry_ref(req.pane.unwrap_or_else(|| "active".to_string()));
-                let result = execute_cluster_pane_retry(ctx, &ClusterPaneRetryArgs { pane })
+                let result = execute_cluster_pane_retry(ctx, &ClusterPaneRetryArgs {
+                    pane,
+                    on_failure: RetryFailurePolicy::Abort,
+                    retries: 0,
+                })
                     .map_err(|error| ServiceResponse::error("pane_retry_failed", error))?;
                 Ok(result)
             },
@@ -189,9 +194,18 @@ enum PaneRetryRef {
     Name(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryFailurePolicy {
+    Abort,
+    Continue,
+    Prompt,
+}
+
 #[derive(Debug, Clone)]
 struct ClusterPaneRetryArgs {
     pane: PaneRetryRef,
+    on_failure: RetryFailurePolicy,
+    retries: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -660,8 +674,7 @@ fn execute_cluster_pane_retry(
         &pane_id_text,
         resolve_cluster_binding_for_pane(caller, pane)?,
     )?;
-    run_health_probe(caller, &binding.target, HealthProbe::Test)
-        .map_err(|error| mark_retry_probe_failed(caller, &pane_id_text, &binding, &error))?;
+    run_retry_probe_with_policy(caller, &pane_id_text, &binding, args)?;
 
     let launch = caller
         .pane_launch(&PaneLaunchRequest {
@@ -782,6 +795,108 @@ fn mark_retry_probe_failed(
         },
     );
     format!("target '{}' is not ready: {error}", binding.target)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPromptDecision {
+    Retry,
+    Continue,
+    Abort,
+}
+
+fn run_retry_probe_with_policy(
+    caller: &impl HostRuntimeApi,
+    pane_id: &str,
+    binding: &ClusterPaneBinding,
+    args: &ClusterPaneRetryArgs,
+) -> Result<(), String> {
+    let mut remaining_retries = args.retries;
+    loop {
+        match run_health_probe(caller, &binding.target, HealthProbe::Test) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let message = mark_retry_probe_failed(caller, pane_id, binding, &error);
+                if remaining_retries > 0 {
+                    remaining_retries -= 1;
+                    let _ = append_cluster_connection_event(
+                        caller,
+                        ClusterConnectionEvent {
+                            ts_unix_ms: now_unix_ms(),
+                            pane_id: Some(pane_id.to_string()),
+                            cluster: binding.cluster.clone(),
+                            target: Some(binding.target.clone()),
+                            source: Some("retry".to_string()),
+                            state: ClusterConnectionState::Retrying,
+                            message: format!(
+                                "retrying health probe (remaining retries: {remaining_retries})"
+                            ),
+                        },
+                    );
+                    continue;
+                }
+
+                match args.on_failure {
+                    RetryFailurePolicy::Abort => return Err(message),
+                    RetryFailurePolicy::Continue => {
+                        let _ = append_cluster_connection_event(
+                            caller,
+                            ClusterConnectionEvent {
+                                ts_unix_ms: now_unix_ms(),
+                                pane_id: Some(pane_id.to_string()),
+                                cluster: binding.cluster.clone(),
+                                target: Some(binding.target.clone()),
+                                source: Some("retry".to_string()),
+                                state: ClusterConnectionState::Degraded,
+                                message: "continuing launch despite failed health probe"
+                                    .to_string(),
+                            },
+                        );
+                        return Ok(());
+                    }
+                    RetryFailurePolicy::Prompt => {
+                        match prompt_retry_decision(&binding.target, &error)
+                            .unwrap_or(RetryPromptDecision::Abort)
+                        {
+                            RetryPromptDecision::Retry => {}
+                            RetryPromptDecision::Continue => return Ok(()),
+                            RetryPromptDecision::Abort => return Err(message),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn prompt_retry_decision(target: &str, error: &str) -> Option<RetryPromptDecision> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let request = prompt::PromptRequest::single_select(
+        format!("Retry host '{target}'?"),
+        vec![
+            prompt::PromptOption::new("retry", "Retry health probe"),
+            prompt::PromptOption::new("continue", "Continue launch anyway"),
+            prompt::PromptOption::new("abort", "Abort"),
+        ],
+    )
+    .message(format!("{error}\nChoose retry behavior."))
+    .submit_label("Apply")
+    .cancel_label("Abort");
+
+    let response =
+        tokio::task::block_in_place(|| handle.block_on(prompt::request(request))).ok()?;
+    match response {
+        prompt::PromptResponse::Submitted(prompt::PromptValue::Single(choice)) => {
+            match choice.as_str() {
+                "retry" => Some(RetryPromptDecision::Retry),
+                "continue" => Some(RetryPromptDecision::Continue),
+                _ => Some(RetryPromptDecision::Abort),
+            }
+        }
+        prompt::PromptResponse::Submitted(_) => Some(RetryPromptDecision::Abort),
+        prompt::PromptResponse::Cancelled | prompt::PromptResponse::RejectedBusy => {
+            Some(RetryPromptDecision::Abort)
+        }
+    }
 }
 
 fn execute_cluster_pane_move(
@@ -1251,6 +1366,8 @@ fn parse_cluster_pane_new_args(arguments: &[String]) -> Result<ClusterPaneNewArg
 
 fn parse_cluster_pane_retry_args(arguments: &[String]) -> Result<ClusterPaneRetryArgs, String> {
     let mut pane = None;
+    let mut on_failure = RetryFailurePolicy::Abort;
+    let mut retries = 0_u32;
     let mut positional = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
@@ -1272,6 +1389,32 @@ fn parse_cluster_pane_retry_args(arguments: &[String]) -> Result<ClusterPaneRetr
             index += 1;
             continue;
         }
+        if argument == "--on-failure" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--on-failure requires a value".to_string())?;
+            on_failure = parse_retry_failure_policy(value)?;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--on-failure=") {
+            on_failure = parse_retry_failure_policy(value)?;
+            index += 1;
+            continue;
+        }
+        if argument == "--retries" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--retries requires a value".to_string())?;
+            retries = parse_retry_count(value)?;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--retries=") {
+            retries = parse_retry_count(value)?;
+            index += 1;
+            continue;
+        }
         if argument.starts_with('-') {
             index += 1;
             continue;
@@ -1284,7 +1427,30 @@ fn parse_cluster_pane_retry_args(arguments: &[String]) -> Result<ClusterPaneRetr
         .or_else(|| positional.into_iter().find(|value| !value.is_empty()))
         .unwrap_or_else(|| "active".to_string());
     let pane = parse_pane_retry_ref(raw);
-    Ok(ClusterPaneRetryArgs { pane })
+    Ok(ClusterPaneRetryArgs {
+        pane,
+        on_failure,
+        retries,
+    })
+}
+
+fn parse_retry_failure_policy(value: &str) -> Result<RetryFailurePolicy, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "abort" => Ok(RetryFailurePolicy::Abort),
+        "continue" => Ok(RetryFailurePolicy::Continue),
+        "prompt" => Ok(RetryFailurePolicy::Prompt),
+        _ => Err(format!(
+            "invalid --on-failure value '{value}' (expected: abort|continue|prompt)"
+        )),
+    }
+}
+
+fn parse_retry_count(value: &str) -> Result<u32, String> {
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("invalid --retries value '{value}' (expected non-negative integer)"))
 }
 
 fn parse_cluster_pane_move_args(arguments: &[String]) -> Result<ClusterPaneMoveArgs, String> {
@@ -1688,6 +1854,8 @@ mod tests {
     fn parse_cluster_pane_retry_args_defaults_to_active() {
         let parsed = parse_cluster_pane_retry_args(&[]).expect("retry args should parse");
         assert!(matches!(parsed.pane, PaneRetryRef::Active));
+        assert_eq!(parsed.on_failure, RetryFailurePolicy::Abort);
+        assert_eq!(parsed.retries, 0);
     }
 
     #[test]
@@ -1695,6 +1863,21 @@ mod tests {
         let parsed = parse_cluster_pane_retry_args(&["--pane".to_string(), "3".to_string()])
             .expect("retry args should parse");
         assert!(matches!(parsed.pane, PaneRetryRef::Index(3)));
+    }
+
+    #[test]
+    fn parse_cluster_pane_retry_args_supports_policy_and_retry_count() {
+        let parsed = parse_cluster_pane_retry_args(&[
+            "--pane".to_string(),
+            "active".to_string(),
+            "--on-failure".to_string(),
+            "prompt".to_string(),
+            "--retries".to_string(),
+            "2".to_string(),
+        ])
+        .expect("retry args should parse");
+        assert_eq!(parsed.on_failure, RetryFailurePolicy::Prompt);
+        assert_eq!(parsed.retries, 2);
     }
 
     #[test]
