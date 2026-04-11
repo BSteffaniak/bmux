@@ -15,6 +15,7 @@ ALLOW_NONZERO="0"
 
 BMUX_BIN="${BMUX_BIN:-}"
 BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
+ARTIFACT_JSON="${ARTIFACT_JSON:-}"
 TARGET_ARGS=(plugin list --json)
 
 usage() {
@@ -34,6 +35,7 @@ Options:
   --max-runtime-retries N   Fail if runtime retry warnings exceed N
   --max-runtime-respawns N  Fail if runtime respawn warnings exceed N
   --max-runtime-timeouts N  Fail if runtime timeout warnings exceed N
+  --artifact-json PATH      Write machine-readable JSON artifact report
   --allow-nonzero     Allow non-zero command exit status during sampling
   -h, --help          Show this help message
 
@@ -92,6 +94,10 @@ parse_args() {
 			;;
 		--max-runtime-timeouts)
 			MAX_RUNTIME_TIMEOUTS="$2"
+			shift 2
+			;;
+		--artifact-json)
+			ARTIFACT_JSON="$2"
 			shift 2
 			;;
 		--)
@@ -237,5 +243,33 @@ if [[ -n "$MAX_RUNTIME_TIMEOUTS" ]]; then
 	fault_cmd+=(--max-runtime-timeouts "$MAX_RUNTIME_TIMEOUTS")
 fi
 "${fault_cmd[@]}"
+
+if [[ -n "$ARTIFACT_JSON" ]]; then
+	artifact_cmd=(
+		"$BMUX_PERF_TOOLS_BIN"
+		report-json
+		--input "$SAMPLE_JSON_FILE"
+		--output "$ARTIFACT_JSON"
+	)
+	if [[ -n "$MAX_P99_MS" ]]; then
+		artifact_cmd+=(--max-p99-ms "$MAX_P99_MS")
+	fi
+	if [[ -n "$MAX_P95_MS" ]]; then
+		artifact_cmd+=(--max-p95-ms "$MAX_P95_MS")
+	fi
+	if [[ -n "$MAX_AVG_MS" ]]; then
+		artifact_cmd+=(--max-avg-ms "$MAX_AVG_MS")
+	fi
+	if [[ -n "$MAX_RUNTIME_RETRIES" ]]; then
+		artifact_cmd+=(--max-runtime-retries "$MAX_RUNTIME_RETRIES")
+	fi
+	if [[ -n "$MAX_RUNTIME_RESPAWNS" ]]; then
+		artifact_cmd+=(--max-runtime-respawns "$MAX_RUNTIME_RESPAWNS")
+	fi
+	if [[ -n "$MAX_RUNTIME_TIMEOUTS" ]]; then
+		artifact_cmd+=(--max-runtime-timeouts "$MAX_RUNTIME_TIMEOUTS")
+	fi
+	"${artifact_cmd[@]}"
+fi
 
 echo "perf check passed"

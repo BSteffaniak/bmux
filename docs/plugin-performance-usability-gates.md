@@ -39,6 +39,11 @@ For changes under `plugins/**`:
 Perf scripts are Python-free and use the workspace helper binary (`bmux-perf-tools`).
 The scripts auto-build the helper on first use.
 
+For CI artifact archiving, use:
+
+- `./scripts/perf-plugin-command-latency.sh ... --artifact-json <path>.json`
+- `./scripts/perf-plugin-runtime-matrix.sh ... --artifact-dir <dir>`
+
 ### 5) Plugin runtime command matrix SLO
 
 `scripts/perf-plugin-runtime-matrix.sh` enforces per-scenario p95/p99 SLOs:

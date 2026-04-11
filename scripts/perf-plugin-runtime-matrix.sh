@@ -9,6 +9,7 @@ BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
 ITERATIONS="${ITERATIONS:-30}"
 WARMUP="${WARMUP:-5}"
 COLD_MODE="0"
+ARTIFACT_DIR="${ARTIFACT_DIR:-}"
 
 usage() {
 	cat <<'USAGE'
@@ -21,6 +22,7 @@ Options:
   --iterations N      Measured iterations per scenario (default: 30)
   --warmup N          Warmup iterations per scenario (default: 5)
   --cold              Run without warmup (sets warmup to 0)
+  --artifact-dir DIR  Write per-scenario JSON artifact reports
   -h, --help          Show this help message
 USAGE
 }
@@ -53,6 +55,10 @@ parse_args() {
 			COLD_MODE="1"
 			shift
 			;;
+		--artifact-dir)
+			ARTIFACT_DIR="$2"
+			shift 2
+			;;
 		-h | --help)
 			usage
 			exit 0
@@ -78,6 +84,13 @@ run_case() {
 		max_p99_ms=$((max_p99_ms * 20))
 	fi
 
+	local artifact_json=""
+	if [[ -n "$ARTIFACT_DIR" ]]; then
+		local slug
+		slug="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')"
+		artifact_json="$ARTIFACT_DIR/${slug}.json"
+	fi
+
 	echo
 	echo "=== ${title} ==="
 	local cmd=(
@@ -92,6 +105,9 @@ run_case() {
 	)
 	if [[ -n "$BMUX_BIN" ]]; then
 		cmd+=(--bmux-bin "$BMUX_BIN")
+	fi
+	if [[ -n "$artifact_json" ]]; then
+		cmd+=(--artifact-json "$artifact_json")
 	fi
 	cmd+=(-- "${args[@]}")
 	"${cmd[@]}"
@@ -109,6 +125,13 @@ run_case_allow_nonzero() {
 		max_p99_ms=$((max_p99_ms * 20))
 	fi
 
+	local artifact_json=""
+	if [[ -n "$ARTIFACT_DIR" ]]; then
+		local slug
+		slug="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')"
+		artifact_json="$ARTIFACT_DIR/${slug}.json"
+	fi
+
 	echo
 	echo "=== ${title} ==="
 	local cmd=(
@@ -124,6 +147,9 @@ run_case_allow_nonzero() {
 	)
 	if [[ -n "$BMUX_BIN" ]]; then
 		cmd+=(--bmux-bin "$BMUX_BIN")
+	fi
+	if [[ -n "$artifact_json" ]]; then
+		cmd+=(--artifact-json "$artifact_json")
 	fi
 	cmd+=(-- "${args[@]}")
 	"${cmd[@]}"
@@ -161,6 +187,10 @@ fi
 if [[ -z "$BMUX_BIN" ]]; then
 	cargo build -q -p bmux_cli
 	BMUX_BIN="$ROOT_DIR/target/debug/bmux"
+fi
+
+if [[ -n "$ARTIFACT_DIR" ]]; then
+	mkdir -p "$ARTIFACT_DIR"
 fi
 
 if [[ ! -x "$BMUX_BIN" ]]; then
