@@ -2559,12 +2559,13 @@ extends = ["tmux_compat", "zellij_compat"]
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
         assert_eq!(config.keybindings.initial_mode, "normal");
+        assert_eq!(config.keybindings.prefix, "ctrl+b");
         assert_eq!(
             config
                 .keybindings
                 .modes
                 .get("insert")
-                .and_then(|mode| mode.bindings.get("ctrl+a")),
+                .and_then(|mode| mode.bindings.get("ctrl+b")),
             Some(&"enter_mode normal".to_string())
         );
         assert_eq!(
@@ -2597,6 +2598,10 @@ active_profile = "zellij_compat"
         assert_eq!(
             config.keybindings.global.get("alt+n"),
             Some(&"split_focused_horizontal".to_string())
+        );
+        assert_eq!(
+            config.keybindings.global.get("alt+v"),
+            Some(&"split_focused_vertical".to_string())
         );
     }
 

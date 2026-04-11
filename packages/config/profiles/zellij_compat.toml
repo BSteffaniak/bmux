@@ -1,2 +1,9 @@
 [keybindings.global]
+"alt+h" = "focus_left_pane"
+"alt+j" = "focus_down_pane"
+"alt+k" = "focus_up_pane"
+"alt+l" = "focus_right_pane"
 "alt+n" = "split_focused_horizontal"
+"alt+v" = "split_focused_vertical"
+"alt+x" = "close_focused_pane"
+"alt+z" = "zoom_pane"

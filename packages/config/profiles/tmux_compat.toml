@@ -1,8 +1,23 @@
 [keybindings]
 initial_mode = "insert"
+prefix       = "ctrl+b"
 
 [keybindings.modes.insert.bindings]
-"ctrl+a" = "enter_mode normal"
+"ctrl+b" = "enter_mode normal"
 
 [keybindings.modes.normal.bindings]
-escape = "enter_mode insert"
+"%"         = "split_focused_vertical"
+"?"         = "show_help"
+"\""        = "split_focused_horizontal"
+arrow_down  = "focus_down_pane"
+arrow_left  = "focus_left_pane"
+arrow_right = "focus_right_pane"
+arrow_up    = "focus_up_pane"
+c           = "plugin:bmux.windows:new-window"
+d           = "detach"
+escape      = "enter_mode insert"
+n           = "plugin:bmux.windows:next-window"
+o           = "focus_next_pane"
+p           = "plugin:bmux.windows:prev-window"
+x           = "close_focused_pane"
+z           = "zoom_pane"
