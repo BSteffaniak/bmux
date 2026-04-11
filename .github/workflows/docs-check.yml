@@ -1,0 +1,57 @@
+name: Docs Check
+
+on:
+  pull_request:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/docs-check.yml"
+      - "docs/**"
+      - "README.md"
+      - "TESTING.md"
+      - "packages/docs-site/**"
+      - "packages/cli-schema/**"
+      - "packages/config/**"
+      - "packages/config-doc/**"
+      - "packages/config-doc-derive/**"
+      - "packages/cli/src/playbook/**"
+      - "examples/native-plugin/README.md"
+      - "packages/plugin-sdk/README.md"
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/docs-check.yml"
+      - "docs/**"
+      - "README.md"
+      - "TESTING.md"
+      - "packages/docs-site/**"
+      - "packages/cli-schema/**"
+      - "packages/config/**"
+      - "packages/config-doc/**"
+      - "packages/config-doc-derive/**"
+      - "packages/cli/src/playbook/**"
+      - "examples/native-plugin/README.md"
+      - "packages/plugin-sdk/README.md"
+  workflow_dispatch:
+
+jobs:
+  docs-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install markdownlint-cli
+        run: npm install --global markdownlint-cli
+
+      - name: Lint Markdown
+        run: markdownlint "**/*.md"
+
+      - name: Validate docs snippets
+        run: cargo test -p bmux_docs_site_ui markdown_opt_in_snippets_are_valid
+
+      - name: Validate docs source sections
+        run: cargo test -p bmux_docs_site_ui markdown_section_headings_used_by_docs_routes_exist
+
+      - name: Build static docs site
+        run: cargo run --release -p bmux_docs_site -- gen --output dist

@@ -51,6 +51,24 @@ pub static ROUTER: LazyLock<Router> = LazyLock::new(|| {
         .with_static_route(&["/docs/config"], |_| async {
             bmux_docs_site_ui::pages::docs::config()
         })
+        .with_static_route(&["/docs/concepts"], |_| async {
+            bmux_docs_site_ui::pages::docs::concepts()
+        })
+        .with_static_route(&["/docs/command-cookbook"], |_| async {
+            bmux_docs_site_ui::pages::docs::command_cookbook()
+        })
+        .with_static_route(&["/docs/setup-guide"], |_| async {
+            bmux_docs_site_ui::pages::docs::setup_guide()
+        })
+        .with_static_route(&["/docs/troubleshooting"], |_| async {
+            bmux_docs_site_ui::pages::docs::troubleshooting()
+        })
+        .with_static_route(&["/docs/operations"], |_| async {
+            bmux_docs_site_ui::pages::docs::operations()
+        })
+        .with_static_route(&["/docs/docs-snippet-tags"], |_| async {
+            bmux_docs_site_ui::pages::docs::docs_snippet_tags()
+        })
         // Docs — Plugins
         .with_static_route(&["/docs/plugins"], |_| async {
             bmux_docs_site_ui::pages::docs::plugins()

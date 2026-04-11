@@ -46,6 +46,10 @@ fail-on-warnings = [
     "bmux_config/fail-on-warnings",
 ]
 
+[dev-dependencies]
+bmux_cli = { workspace = true }
+toml     = { workspace = true, features = ["parse"] }
+
 [package.metadata.cargo-machete]
 ignored = [
     "bmux_config_doc",              # Used via ConfigDocSchema trait derives in bmux_config types

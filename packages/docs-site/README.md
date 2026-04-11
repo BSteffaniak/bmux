@@ -14,10 +14,16 @@ reference pages.
 - `/` / `/home` -- landing page
 - `/docs/installation` -- build-from-source instructions
 - `/docs/quickstart` -- getting started guide
+- `/docs/concepts` -- core bmux concepts and architecture mental model
 - `/docs/cli` -- auto-generated CLI reference
+- `/docs/command-cookbook` -- task-oriented command recipes
 - `/docs/config` -- auto-generated configuration reference
+- `/docs/setup-guide` -- practical setup flows for local/remote/hosted
 - `/docs/playbooks` -- headless scripted execution
 - `/docs/images` -- terminal image protocol support
+- `/docs/troubleshooting` -- debugging and failure triage playbook
+- `/docs/operations` -- maintenance and operations workflows
+- `/docs/docs-snippet-tags` -- author guide for verified snippets
 - `/docs/plugins` -- plugin system overview
 - `/docs/plugin-sdk` -- plugin authoring guide
 - `/docs/plugin-example` -- walkthrough of the example plugin

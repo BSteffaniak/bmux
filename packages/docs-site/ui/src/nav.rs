@@ -35,8 +35,16 @@ pub static SECTIONS: &[NavSection] = &[
         title: "Reference",
         items: &[
             NavItem {
+                label: "Concepts",
+                href: "/docs/concepts",
+            },
+            NavItem {
                 label: "CLI",
                 href: "/docs/cli",
+            },
+            NavItem {
+                label: "Command Cookbook",
+                href: "/docs/command-cookbook",
             },
             NavItem {
                 label: "Playbooks",
@@ -71,9 +79,27 @@ pub static SECTIONS: &[NavSection] = &[
     },
     NavSection {
         title: "Development",
-        items: &[NavItem {
-            label: "Testing",
-            href: "/docs/testing",
-        }],
+        items: &[
+            NavItem {
+                label: "Setup Guide",
+                href: "/docs/setup-guide",
+            },
+            NavItem {
+                label: "Testing",
+                href: "/docs/testing",
+            },
+            NavItem {
+                label: "Troubleshooting",
+                href: "/docs/troubleshooting",
+            },
+            NavItem {
+                label: "Operations",
+                href: "/docs/operations",
+            },
+            NavItem {
+                label: "Snippet Tags",
+                href: "/docs/docs-snippet-tags",
+            },
+        ],
     },
 ];

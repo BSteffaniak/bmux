@@ -77,6 +77,60 @@ pub fn config() -> Containers {
     )
 }
 
+#[must_use]
+pub fn concepts() -> Containers {
+    layout::docs_layout(
+        "/docs/concepts",
+        None,
+        &md(include_str!("../../../../../docs/concepts.md")),
+    )
+}
+
+#[must_use]
+pub fn command_cookbook() -> Containers {
+    layout::docs_layout(
+        "/docs/command-cookbook",
+        None,
+        &md(include_str!("../../../../../docs/command-cookbook.md")),
+    )
+}
+
+#[must_use]
+pub fn setup_guide() -> Containers {
+    layout::docs_layout(
+        "/docs/setup-guide",
+        None,
+        &md(include_str!("../../../../../docs/setup-guide.md")),
+    )
+}
+
+#[must_use]
+pub fn troubleshooting() -> Containers {
+    layout::docs_layout(
+        "/docs/troubleshooting",
+        None,
+        &md(include_str!("../../../../../docs/troubleshooting.md")),
+    )
+}
+
+#[must_use]
+pub fn operations() -> Containers {
+    layout::docs_layout(
+        "/docs/operations",
+        None,
+        &md(include_str!("../../../../../docs/operations.md")),
+    )
+}
+
+#[must_use]
+pub fn docs_snippet_tags() -> Containers {
+    layout::docs_layout(
+        "/docs/docs-snippet-tags",
+        None,
+        &md(include_str!("../../../../../docs/docs-snippet-tags.md")),
+    )
+}
+
 // ── Plugins ─────────────────────────────────────────────────────────────────
 
 #[must_use]
@@ -852,7 +906,13 @@ fn infer_value_type_from_name(val_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{generate_cli_reference, generate_config_reference};
+    use bmux_cli::playbook;
+    use bmux_cli_schema::Cli;
     use bmux_config::{BmuxConfig, ConfigDocSchema};
+    use clap::Parser;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn config_reference_includes_connections_nested_dotted_keys() {
@@ -931,5 +991,398 @@ mod tests {
             .find(|line| line.contains("--record-event-kind"))
             .expect("missing --record-event-kind line");
         assert!(record_event_kind_line.contains("repeatable"));
+    }
+
+    #[test]
+    fn markdown_section_headings_used_by_docs_routes_exist() {
+        let readme = include_str!("../../../../../README.md");
+        assert!(
+            readme.contains("## Installation"),
+            "README heading '## Installation' missing"
+        );
+        assert!(
+            readme.contains("## Current CLI Workflow"),
+            "README heading '## Current CLI Workflow' missing"
+        );
+    }
+
+    #[test]
+    fn markdown_opt_in_snippets_are_valid() {
+        let mut failures = Vec::new();
+        let key_patterns = collect_config_key_patterns();
+
+        for file in markdown_sources() {
+            let content = fs::read_to_string(&file)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()));
+
+            for block in parse_fenced_blocks(&content) {
+                match block.language.as_str() {
+                    "bmux-cli" => {
+                        if let Err(error) = validate_cli_block(&block.content) {
+                            failures.push(format!(
+                                "{}:{} [{}] {error}",
+                                file.display(),
+                                block.start_line,
+                                block.language
+                            ));
+                        }
+                    }
+                    "bmux-playbook" => {
+                        if let Err(error) = validate_playbook_block(&block.content) {
+                            failures.push(format!(
+                                "{}:{} [{}] {error}",
+                                file.display(),
+                                block.start_line,
+                                block.language
+                            ));
+                        }
+                    }
+                    "bmux-config" => {
+                        if let Err(error) = validate_config_block(&block.content, &key_patterns) {
+                            failures.push(format!(
+                                "{}:{} [{}] {error}",
+                                file.display(),
+                                block.start_line,
+                                block.language
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            return;
+        }
+
+        let report = failures.join("\n");
+        panic!("docs snippet validation failures:\n{report}");
+    }
+
+    #[derive(Debug)]
+    struct FencedBlock {
+        language: String,
+        content: String,
+        start_line: usize,
+    }
+
+    fn parse_fenced_blocks(markdown: &str) -> Vec<FencedBlock> {
+        let mut blocks = Vec::new();
+        let mut in_block = false;
+        let mut block_language = String::new();
+        let mut block_start = 0;
+        let mut lines = Vec::new();
+
+        for (line_index, raw_line) in markdown.lines().enumerate() {
+            let line_number = line_index + 1;
+            let trimmed = raw_line.trim_start();
+
+            if !in_block {
+                if let Some(rest) = trimmed.strip_prefix("```") {
+                    in_block = true;
+                    block_language = rest
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    block_start = line_number;
+                    lines.clear();
+                }
+                continue;
+            }
+
+            if trimmed.starts_with("```") {
+                blocks.push(FencedBlock {
+                    language: block_language.clone(),
+                    content: lines.join("\n"),
+                    start_line: block_start,
+                });
+                in_block = false;
+                block_language.clear();
+                lines.clear();
+                continue;
+            }
+
+            lines.push(raw_line.to_string());
+        }
+
+        blocks
+    }
+
+    fn validate_cli_block(content: &str) -> Result<(), String> {
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let command = line
+                .strip_prefix("$ ")
+                .or_else(|| line.strip_prefix("# "))
+                .unwrap_or(line);
+
+            if !command.starts_with("bmux") {
+                return Err(format!("expected command to start with 'bmux': {command}"));
+            }
+
+            let args = shell_split(command)?;
+            Cli::try_parse_from(args).map_err(|err| err.to_string())?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_playbook_block(content: &str) -> Result<(), String> {
+        if content.contains("[[step]]") || content.contains("[playbook]") {
+            let (playbook, _includes) =
+                playbook::parse_toml::parse_toml(content).map_err(|err| err.to_string())?;
+            let errors = playbook::validate(&playbook, false);
+            if errors.is_empty() {
+                return Ok(());
+            }
+            return Err(errors.join("; "));
+        }
+
+        let (playbook, _includes) = playbook::parse_dsl::parse_dsl(content)
+            .map_err(|err| format!("playbook parse error: {err}"))?;
+        let errors = playbook::validate(&playbook, false);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    fn validate_config_block(content: &str, key_patterns: &BTreeSet<String>) -> Result<(), String> {
+        let value: toml::Value = toml::from_str(content)
+            .map_err(|err| format!("failed to parse TOML snippet: {err}"))?;
+
+        let _parsed: BmuxConfig = toml::from_str(content)
+            .map_err(|err| format!("failed to deserialize BmuxConfig snippet: {err}"))?;
+
+        let mut snippet_keys = Vec::new();
+        collect_toml_leaf_keys(&value, "", &mut snippet_keys);
+
+        for key in snippet_keys {
+            if !key_matches_patterns(&key, key_patterns) {
+                return Err(format!("unknown config key: {key}"));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn collect_toml_leaf_keys(value: &toml::Value, prefix: &str, out: &mut Vec<String>) {
+        match value {
+            toml::Value::Table(table) => {
+                for (key, child) in table {
+                    let next = if prefix.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    collect_toml_leaf_keys(child, &next, out);
+                }
+            }
+            toml::Value::Array(values) => {
+                if values.iter().all(toml::Value::is_table) {
+                    for (index, child) in values.iter().enumerate() {
+                        let next = if prefix.is_empty() {
+                            index.to_string()
+                        } else {
+                            format!("{prefix}.{index}")
+                        };
+                        collect_toml_leaf_keys(child, &next, out);
+                    }
+                } else {
+                    out.push(prefix.to_string());
+                }
+            }
+            _ => out.push(prefix.to_string()),
+        }
+    }
+
+    fn key_matches_patterns(key: &str, key_patterns: &BTreeSet<String>) -> bool {
+        key_patterns
+            .iter()
+            .any(|pattern| dotted_key_matches(key, pattern))
+    }
+
+    fn dotted_key_matches(key: &str, pattern: &str) -> bool {
+        let key_segments: Vec<&str> = key.split('.').collect();
+        let pattern_segments: Vec<&str> = pattern.split('.').collect();
+        if key_segments.len() != pattern_segments.len() {
+            return false;
+        }
+
+        for (segment, pattern_segment) in key_segments.iter().zip(pattern_segments.iter()) {
+            if pattern_segment.starts_with('<') && pattern_segment.ends_with('>') {
+                continue;
+            }
+            if segment != pattern_segment {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn collect_config_key_patterns() -> BTreeSet<String> {
+        let mut patterns = BTreeSet::new();
+        for field in BmuxConfig::field_docs() {
+            if let Some(bmux_config_doc::NestedFieldDoc::Inline { fields, .. }) = field.nested {
+                collect_field_patterns(fields, field.toml_key, &mut patterns);
+            }
+        }
+        patterns
+    }
+
+    fn collect_field_patterns(
+        fields: Vec<bmux_config::FieldDoc>,
+        prefix: &str,
+        out: &mut BTreeSet<String>,
+    ) {
+        for field in fields {
+            let full_key = if prefix.is_empty() {
+                field.toml_key.to_string()
+            } else {
+                format!("{prefix}.{}", field.toml_key)
+            };
+
+            match field.nested {
+                Some(bmux_config_doc::NestedFieldDoc::Inline { fields, .. }) => {
+                    collect_field_patterns(fields, &full_key, out);
+                }
+                Some(bmux_config_doc::NestedFieldDoc::Map {
+                    key_placeholder,
+                    value_fields,
+                    ..
+                }) => {
+                    let map_prefix = format!("{full_key}.{key_placeholder}");
+                    collect_field_patterns(value_fields, &map_prefix, out);
+                }
+                Some(bmux_config_doc::NestedFieldDoc::List {
+                    index_placeholder,
+                    item_fields,
+                    ..
+                }) => {
+                    let list_prefix = format!("{full_key}.{index_placeholder}");
+                    collect_field_patterns(item_fields, &list_prefix, out);
+                }
+                None => {
+                    out.insert(full_key);
+                }
+            }
+        }
+    }
+
+    fn markdown_sources() -> Vec<PathBuf> {
+        let root = workspace_root();
+        let mut files = vec![
+            root.join("README.md"),
+            root.join("TESTING.md"),
+            root.join("packages/plugin-sdk/README.md"),
+            root.join("examples/native-plugin/README.md"),
+        ];
+
+        collect_markdown_files(&root.join("docs"), &mut files);
+
+        files.sort();
+        files
+    }
+
+    fn collect_markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        if !dir.exists() {
+            return;
+        }
+
+        let entries = fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("failed to read dir {}: {err}", dir.display()));
+        for entry in entries {
+            let entry = entry
+                .unwrap_or_else(|err| panic!("failed to read entry in {}: {err}", dir.display()));
+            let path = entry.path();
+
+            if path.is_dir() {
+                collect_markdown_files(&path, out);
+                continue;
+            }
+
+            if path.extension().is_some_and(|ext| ext == "md") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn workspace_root() -> PathBuf {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir
+            .ancestors()
+            .nth(3)
+            .expect("workspace root should be three levels up from ui crate")
+            .to_path_buf()
+    }
+
+    fn shell_split(command: &str) -> Result<Vec<String>, String> {
+        let mut args = Vec::new();
+        let mut current = String::new();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        for ch in command.chars() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+
+            if in_single {
+                if ch == '\'' {
+                    in_single = false;
+                } else {
+                    current.push(ch);
+                }
+                continue;
+            }
+
+            if in_double {
+                if ch == '"' {
+                    in_double = false;
+                } else {
+                    current.push(ch);
+                }
+                continue;
+            }
+
+            match ch {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                c if c.is_ascii_whitespace() => {
+                    if !current.is_empty() {
+                        args.push(current.clone());
+                        current.clear();
+                    }
+                }
+                _ => current.push(ch),
+            }
+        }
+
+        if escaped {
+            return Err("dangling escape in command".to_string());
+        }
+        if in_single || in_double {
+            return Err("unterminated quote in command".to_string());
+        }
+        if !current.is_empty() {
+            args.push(current);
+        }
+
+        Ok(args)
     }
 }
