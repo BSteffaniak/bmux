@@ -256,3 +256,52 @@ fn sandbox_bundle_writes_manifest_logs_and_repro() {
         "repro command should include sandbox run"
     );
 }
+
+#[test]
+#[serial]
+fn sandbox_inspect_explicit_id_resolves_target_manifest() {
+    let sandbox = CommandSandbox::new("inspect-explicit-id");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--keep",
+            "--name",
+            "explicit-id",
+            "--",
+            "--version",
+        ])
+        .output()
+        .expect("run sandbox for explicit id inspect");
+    assert!(
+        run_output.status.success(),
+        "sandbox run should succeed: {}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let run_json = parse_json_stdout(&run_output);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let inspect_output = sandbox
+        .command()
+        .args(["sandbox", "inspect", sandbox_id.as_str(), "--json"])
+        .output()
+        .expect("inspect explicit sandbox id");
+    assert!(
+        inspect_output.status.success(),
+        "inspect explicit id should succeed: {}",
+        String::from_utf8_lossy(&inspect_output.stderr)
+    );
+
+    let inspect_json = parse_json_stdout(&inspect_output);
+    let manifest_id = inspect_json["manifest"]["id"]
+        .as_str()
+        .expect("inspect output should include manifest id");
+    assert_eq!(manifest_id, sandbox_id);
+}
