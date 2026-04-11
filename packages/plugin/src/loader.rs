@@ -98,6 +98,20 @@ struct PersistentProcessWorker {
     stderr_capture: Arc<Mutex<Vec<u8>>>,
 }
 
+impl PersistentProcessWorker {
+    fn stderr_snapshot(&self) -> Vec<u8> {
+        self.stderr_capture
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_default()
+    }
+
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl ProcessPluginRuntime {
     fn invoke(
         &self,
@@ -234,60 +248,103 @@ impl ProcessPluginRuntime {
             .map_err(|_| PluginError::ServiceProtocol {
                 details: "persistent worker mutex poisoned".to_string(),
             })?;
-        if guard.is_none() {
-            *guard = Some(self.spawn_persistent_worker(plugin_id)?);
+        for attempt in 0..=1 {
+            if guard.is_none() {
+                *guard = Some(self.spawn_persistent_worker(plugin_id)?);
+            }
+
+            let worker = guard.as_mut().ok_or_else(|| PluginError::ServiceProtocol {
+                details: "persistent process worker unavailable".to_string(),
+            })?;
+
+            if worker
+                .child
+                .try_wait()
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: format!("failed polling persistent process worker: {error}"),
+                })?
+                .is_some()
+            {
+                if attempt == 0 {
+                    Self::reset_persistent_worker(&mut guard, false);
+                    continue;
+                }
+
+                return Err(PluginError::ServiceProtocol {
+                    details: format!(
+                        "persistent process worker exited before handling request{}",
+                        summarize_stderr_suffix(&worker.stderr_snapshot())
+                    ),
+                });
+            }
+
+            if let Err(error) = worker
+                .stdin
+                .write_all(&frame)
+                .and_then(|()| worker.stdin.flush())
+            {
+                if attempt == 0 {
+                    Self::reset_persistent_worker(&mut guard, true);
+                    continue;
+                }
+
+                return Err(PluginError::ServiceProtocol {
+                    details: format!(
+                        "failed writing persistent process request frame: {error}{}",
+                        summarize_stderr_suffix(&worker.stderr_snapshot())
+                    ),
+                });
+            }
+
+            let response_bytes = match read_framed_payload_with_timeout(&mut worker.stdout, timeout)
+            {
+                Ok(frame_bytes) => frame_bytes,
+                Err(error) => {
+                    if attempt == 0 {
+                        Self::reset_persistent_worker(&mut guard, true);
+                        continue;
+                    }
+                    return Err(PluginError::ServiceProtocol {
+                        details: format!(
+                            "failed reading persistent process response frame: {error}{}",
+                            summarize_stderr_suffix(&worker.stderr_snapshot())
+                        ),
+                    });
+                }
+            };
+
+            let response =
+                decode_process_invocation_response(&response_bytes).map_err(|error| {
+                    PluginError::ServiceProtocol {
+                        details: format!(
+                            "failed decoding persistent process response frame: {error}{}",
+                            summarize_stderr_suffix(&worker.stderr_snapshot())
+                        ),
+                    }
+                })?;
+
+            let status = worker
+                .child
+                .try_wait()
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: format!("failed polling persistent process worker: {error}"),
+                })?
+                .unwrap_or_else(success_exit_status);
+            drop(guard);
+            return Ok((Some(response), status));
         }
 
-        let worker = guard.as_mut().ok_or_else(|| PluginError::ServiceProtocol {
+        Err(PluginError::ServiceProtocol {
             details: "persistent process worker unavailable".to_string(),
-        })?;
+        })
+    }
 
-        worker
-            .stdin
-            .write_all(&frame)
-            .and_then(|()| worker.stdin.flush())
-            .map_err(|error| PluginError::ServiceProtocol {
-                details: format!("failed writing persistent process request frame: {error}"),
-            })?;
-
-        let response_bytes = read_framed_payload_with_timeout(&mut worker.stdout, timeout)
-            .map_err(|error| PluginError::ServiceProtocol {
-                details: format!(
-                    "failed reading persistent process response frame: {error}{}",
-                    summarize_stderr_suffix(
-                        &worker
-                            .stderr_capture
-                            .lock()
-                            .map(|buffer| buffer.clone())
-                            .unwrap_or_default()
-                    )
-                ),
-            })?;
-
-        let response = decode_process_invocation_response(&response_bytes).map_err(|error| {
-            PluginError::ServiceProtocol {
-                details: format!(
-                    "failed decoding persistent process response frame: {error}{}",
-                    summarize_stderr_suffix(
-                        &worker
-                            .stderr_capture
-                            .lock()
-                            .map(|buffer| buffer.clone())
-                            .unwrap_or_default()
-                    )
-                ),
-            }
-        })?;
-
-        let status = worker
-            .child
-            .try_wait()
-            .map_err(|error| PluginError::ServiceProtocol {
-                details: format!("failed polling persistent process worker: {error}"),
-            })?
-            .unwrap_or_else(success_exit_status);
-        drop(guard);
-        Ok((Some(response), status))
+    fn reset_persistent_worker(guard: &mut Option<PersistentProcessWorker>, terminate: bool) {
+        if let Some(mut stale_worker) = guard.take()
+            && terminate
+        {
+            stale_worker.terminate();
+        }
     }
 
     fn spawn_persistent_worker(&self, plugin_id: &str) -> Result<PersistentProcessWorker> {
@@ -2749,6 +2806,218 @@ minimum = "1.0"
             .run_command("hello", &args)
             .expect("process runtime command should run");
         assert_eq!(status, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_runtime_persistent_worker_reuses_single_process() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "bmux-persistent-worker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("temp test root should be created");
+        let script_path = temp_root.join("worker.py");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import struct
+import sys
+
+MAGIC = b"BMUXPRC1"
+counter = 0
+
+def read_exact(n):
+    data = sys.stdin.buffer.read(n)
+    if len(data) != n:
+        return None
+    return data
+
+while True:
+    header = read_exact(12)
+    if header is None:
+        break
+    if header[:8] != MAGIC:
+        break
+    payload_len = struct.unpack(">I", header[8:12])[0]
+    payload = read_exact(payload_len)
+    if payload is None:
+        break
+
+    counter += 1
+    zigzag_status = (counter << 1) & 0xFF
+    response_payload = bytes([0x00, 0x01, zigzag_status, 0x00])
+    response_frame = MAGIC + struct.pack(">I", len(response_payload)) + response_payload
+    sys.stdout.buffer.write(response_frame)
+    sys.stdout.buffer.flush()
+"#,
+        )
+        .expect("worker script should be written");
+
+        let manifest = PluginManifest::from_toml_str(&format!(
+            r#"
+id = "process.worker.plugin"
+name = "Process Worker Plugin"
+version = "0.1.0"
+runtime = "process"
+entry = "python3"
+entry_args = ["{}"]
+process_persistent_worker = true
+
+[[commands]]
+name = "hello"
+summary = "hello"
+execution = "provider_exec"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+            script_path.display()
+        ))
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
+            .expect("manifest should register");
+        let registered = registry
+            .get("process.worker.plugin")
+            .expect("plugin should register")
+            .clone();
+
+        let loaded = super::load_registered_plugin(
+            &registered,
+            &HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            &BTreeMap::new(),
+        )
+        .expect("process runtime worker plugin should load");
+
+        let args: Vec<String> = Vec::new();
+        let first = loaded
+            .run_command("hello", &args)
+            .expect("first worker command should run");
+        let second = loaded
+            .run_command("hello", &args)
+            .expect("second worker command should run");
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_runtime_persistent_worker_respawns_after_worker_exit() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "bmux-persistent-worker-respawn-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("temp test root should be created");
+        let script_path = temp_root.join("worker_once.py");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import struct
+import sys
+
+MAGIC = b"BMUXPRC1"
+
+def read_exact(n):
+    data = sys.stdin.buffer.read(n)
+    if len(data) != n:
+        return None
+    return data
+
+header = read_exact(12)
+if header is None or header[:8] != MAGIC:
+    sys.exit(1)
+payload_len = struct.unpack(">I", header[8:12])[0]
+payload = read_exact(payload_len)
+if payload is None:
+    sys.exit(1)
+
+response_payload = bytes([0x00, 0x01, 0x02, 0x00])
+response_frame = MAGIC + struct.pack(">I", len(response_payload)) + response_payload
+sys.stdout.buffer.write(response_frame)
+sys.stdout.buffer.flush()
+"#,
+        )
+        .expect("worker script should be written");
+
+        let manifest = PluginManifest::from_toml_str(&format!(
+            r#"
+id = "process.worker.respawn.plugin"
+name = "Process Worker Respawn Plugin"
+version = "0.1.0"
+runtime = "process"
+entry = "python3"
+entry_args = ["{}"]
+process_persistent_worker = true
+
+[[commands]]
+name = "hello"
+summary = "hello"
+execution = "provider_exec"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+            script_path.display()
+        ))
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
+            .expect("manifest should register");
+        let registered = registry
+            .get("process.worker.respawn.plugin")
+            .expect("plugin should register")
+            .clone();
+
+        let loaded = super::load_registered_plugin(
+            &registered,
+            &HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            &BTreeMap::new(),
+        )
+        .expect("process runtime worker plugin should load");
+
+        let args: Vec<String> = Vec::new();
+        let first = loaded
+            .run_command("hello", &args)
+            .expect("first worker command should run");
+        let second = loaded
+            .run_command("hello", &args)
+            .expect("second worker command should run after respawn");
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
