@@ -120,20 +120,10 @@ fn run_sample(args: Vec<String>) -> Result<(), String> {
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        retries += count_occurrences(
-            &stderr,
-            "persistent process worker write failed; recycling worker",
-        );
-        retries += count_occurrences(
-            &stderr,
-            "persistent process worker read failed; recycling worker",
-        );
-        respawns += count_occurrences(&stderr, "persistent process worker exited; respawning");
-        timeouts += count_occurrences(
-            &stderr,
-            "persistent process worker read timed out; recycling worker",
-        );
-        timeouts += count_occurrences(&stderr, "process runtime one-shot invocation timed out");
+        let faults = count_runtime_faults(&stderr);
+        retries += faults.retries;
+        respawns += faults.respawns;
+        timeouts += faults.timeouts;
         samples_ms.push(elapsed_ms);
     }
 
@@ -422,6 +412,43 @@ fn count_occurrences(haystack: &str, needle: &str) -> u64 {
     haystack.matches(needle).count() as u64
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RuntimeFaultCounts {
+    retries: u64,
+    respawns: u64,
+    timeouts: u64,
+}
+
+fn count_runtime_faults(stderr: &str) -> RuntimeFaultCounts {
+    let token_retries = count_occurrences(stderr, "[bmux-runtime-fault:persistent-retry]");
+    let token_respawns = count_occurrences(stderr, "[bmux-runtime-fault:persistent-respawn]");
+    let token_timeouts = count_occurrences(stderr, "[bmux-runtime-fault:persistent-timeout]")
+        + count_occurrences(stderr, "[bmux-runtime-fault:one-shot-timeout]");
+
+    if token_retries + token_respawns + token_timeouts > 0 {
+        return RuntimeFaultCounts {
+            retries: token_retries,
+            respawns: token_respawns,
+            timeouts: token_timeouts,
+        };
+    }
+
+    RuntimeFaultCounts {
+        retries: count_occurrences(
+            stderr,
+            "persistent process worker write failed; recycling worker",
+        ) + count_occurrences(
+            stderr,
+            "persistent process worker read failed; recycling worker",
+        ),
+        respawns: count_occurrences(stderr, "persistent process worker exited; respawning"),
+        timeouts: count_occurrences(
+            stderr,
+            "persistent process worker read timed out; recycling worker",
+        ) + count_occurrences(stderr, "process runtime one-shot invocation timed out"),
+    }
+}
+
 fn parse_u64(value: &str, flag: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
@@ -438,4 +465,64 @@ fn percentile_nearest_rank(values: &[f64], percentile: f64) -> f64 {
     let rank = ((percentile / 100.0) * values.len() as f64).ceil() as usize;
     let index = rank.saturating_sub(1).min(values.len() - 1);
     values[index]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RuntimeFaultCounts, count_occurrences, count_runtime_faults, parse_u64,
+        percentile_nearest_rank,
+    };
+
+    #[test]
+    fn count_occurrences_counts_multiple_matches() {
+        let haystack = "retry retry respawn retry";
+        assert_eq!(count_occurrences(haystack, "retry"), 3);
+        assert_eq!(count_occurrences(haystack, "respawn"), 1);
+    }
+
+    #[test]
+    fn count_occurrences_empty_needle_is_zero() {
+        assert_eq!(count_occurrences("abc", ""), 0);
+    }
+
+    #[test]
+    fn percentile_nearest_rank_matches_expected_points() {
+        let values = [10.0, 20.0, 30.0, 40.0, 50.0];
+        assert_eq!(percentile_nearest_rank(&values, 50.0), 30.0);
+        assert_eq!(percentile_nearest_rank(&values, 95.0), 50.0);
+        assert_eq!(percentile_nearest_rank(&values, 99.0), 50.0);
+    }
+
+    #[test]
+    fn parse_u64_rejects_non_numeric_values() {
+        let error = parse_u64("abc", "--iterations").expect_err("parse should fail");
+        assert!(error.contains("--iterations must be a non-negative integer"));
+    }
+
+    #[test]
+    fn count_runtime_faults_prefers_structured_tokens() {
+        let stderr = "[bmux-runtime-fault:persistent-retry]\n[bmux-runtime-fault:persistent-respawn]\n[bmux-runtime-fault:one-shot-timeout]\n";
+        assert_eq!(
+            count_runtime_faults(stderr),
+            RuntimeFaultCounts {
+                retries: 1,
+                respawns: 1,
+                timeouts: 1
+            }
+        );
+    }
+
+    #[test]
+    fn count_runtime_faults_supports_legacy_messages() {
+        let stderr = "persistent process worker write failed; recycling worker\nprocess runtime one-shot invocation timed out\n";
+        assert_eq!(
+            count_runtime_faults(stderr),
+            RuntimeFaultCounts {
+                retries: 1,
+                respawns: 0,
+                timeouts: 1
+            }
+        );
+    }
 }
