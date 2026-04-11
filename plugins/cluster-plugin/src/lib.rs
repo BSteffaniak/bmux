@@ -1616,13 +1616,16 @@ fn parse_cluster_events_limit(value: &str) -> Result<usize, String> {
 
 fn parse_cluster_events_since(value: &str) -> Result<u64, String> {
     let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("now") || trimmed == "0" {
+        return Ok(now_unix_ms());
+    }
     if let Ok(absolute_unix_ms) = trimmed.parse::<u64>() {
         return Ok(absolute_unix_ms);
     }
 
     let duration_ms = parse_relative_duration_ms(trimmed).map_err(|reason| {
         format!(
-            "invalid --since value '{value}' ({reason}; expected unix ms integer or relative duration like 500ms, 30s, 15m, 2h, 1d, 1h30m)"
+            "invalid --since value '{value}' ({reason}; expected 'now', '0', unix ms integer, or relative duration like 500ms, 30s, 15m, 2h, 1d, 1h30m)"
         )
     })?;
     Ok(now_unix_ms().saturating_sub(duration_ms))
@@ -2365,6 +2368,17 @@ mod tests {
         let parsed =
             parse_cluster_events_since("1712345678000").expect("absolute unix ms should parse");
         assert_eq!(parsed, 1_712_345_678_000);
+    }
+
+    #[test]
+    fn parse_cluster_events_since_accepts_now_aliases() {
+        let before = now_unix_ms();
+        let now_alias = parse_cluster_events_since("now").expect("now alias should parse");
+        let zero_alias = parse_cluster_events_since("0").expect("zero alias should parse");
+        let after = now_unix_ms();
+
+        assert!(now_alias >= before && now_alias <= after);
+        assert!(zero_alias >= before && zero_alias <= after);
     }
 
     #[test]
