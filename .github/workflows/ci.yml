@@ -227,8 +227,12 @@ jobs:
           fi
 
           changed_files=$(git diff --name-only "$base_ref" "${{ github.sha }}")
+          echo "Changed files since base:"
+          echo "$changed_files"
 
-          if echo "$changed_files" | grep -Eq '^(packages/plugin/|packages/plugin-sdk/|plugins/|packages/cli/src/runtime/plugin|scripts/perf-plugin-|docs/plugin-performance-usability-gates\.md)'; then
+          plugin_runtime_pattern='^(packages/plugin/|packages/plugin-sdk/|plugins/|packages/cli/src/runtime/plugin[^/]*\.rs$|scripts/perf-plugin-command-latency\.sh$|scripts/perf-plugin-runtime-matrix\.sh$|\.github/workflows/ci\.yml$)'
+
+          if echo "$changed_files" | grep -Eq "$plugin_runtime_pattern"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "plugin/runtime changes detected"
           else
