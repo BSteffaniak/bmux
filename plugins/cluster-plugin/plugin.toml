@@ -151,6 +151,13 @@ value_name = "PANE"
 
 [[commands.arguments]]
 kind       = "string"
+name       = "pane_ref"
+position   = 0
+required   = false
+value_name = "PANE"
+
+[[commands.arguments]]
+kind       = "string"
 long       = "host"
 name       = "host"
 value_name = "HOST"
