@@ -51,6 +51,7 @@ pub type Result<T> = std::result::Result<T, ConfigError>;
 struct CompositionConfig {
     active_profile: Option<String>,
     layer_order: Vec<String>,
+    auto_select: Vec<CompositionAutoSelectRule>,
     profiles: BTreeMap<String, CompositionProfile>,
 }
 
@@ -59,6 +60,26 @@ struct CompositionConfig {
 struct CompositionProfile {
     extends: Vec<String>,
     patch: toml::Table,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct CompositionAutoSelectRule {
+    profile: String,
+    cwd_prefix: Option<String>,
+    host: Option<String>,
+    os: Option<String>,
+    term_prefix: Option<String>,
+    runtime: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompositionResolution {
+    pub selected_profile: Option<String>,
+    pub selected_profile_source: Option<String>,
+    pub matched_auto_select_index: Option<usize>,
+    pub layer_order: Vec<String>,
+    pub available_profiles: Vec<String>,
 }
 
 fn built_in_composition_profiles() -> BTreeMap<String, CompositionProfile> {
@@ -106,6 +127,48 @@ escape = "enter_mode insert"
 
 fn canonical_profile_id(profile_id: &str) -> String {
     profile_id.trim().to_ascii_lowercase()
+}
+
+fn evaluate_auto_select_rule(rule: &CompositionAutoSelectRule) -> bool {
+    if let Some(cwd_prefix) = &rule.cwd_prefix {
+        let Some(cwd) = std::env::current_dir().ok() else {
+            return false;
+        };
+        let cwd_value = cwd.to_string_lossy().to_string();
+        if !cwd_value.starts_with(cwd_prefix) {
+            return false;
+        }
+    }
+    if let Some(host) = &rule.host {
+        let candidate = std::env::var("HOSTNAME")
+            .ok()
+            .or_else(|| std::env::var("HOST").ok())
+            .unwrap_or_default();
+        if !candidate.eq_ignore_ascii_case(host) {
+            return false;
+        }
+    }
+    if let Some(os) = &rule.os
+        && !std::env::consts::OS.eq_ignore_ascii_case(os)
+    {
+        return false;
+    }
+    if let Some(term_prefix) = &rule.term_prefix {
+        let term = std::env::var("TERM").unwrap_or_default();
+        if !term
+            .to_ascii_lowercase()
+            .starts_with(&term_prefix.to_ascii_lowercase())
+        {
+            return false;
+        }
+    }
+    if let Some(runtime_name) = &rule.runtime {
+        let runtime = std::env::var("BMUX_RUNTIME").unwrap_or_default();
+        if !runtime.eq_ignore_ascii_case(runtime_name) {
+            return false;
+        }
+    }
+    true
 }
 
 fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
@@ -196,9 +259,12 @@ fn resolve_profile_patch(
     resolve_inner(requested_profile_id, profiles, &mut stack, &mut cache)
 }
 
+#[allow(clippy::too_many_lines)]
+// Composition resolution intentionally keeps validation and merge flow in one place
+// so precedence behavior is easy to audit end-to-end.
 fn resolve_composed_config_value(
     raw: &toml::Value,
-) -> std::result::Result<toml::Value, ConfigError> {
+) -> std::result::Result<(toml::Value, CompositionResolution), ConfigError> {
     let mut raw_table = raw
         .as_table()
         .cloned()
@@ -220,7 +286,27 @@ fn resolve_composed_config_value(
         profiles.insert(canonical_id, profile);
     }
 
-    let default_layers = if composition.active_profile.is_some() {
+    let auto_selected_profile = composition
+        .auto_select
+        .iter()
+        .position(evaluate_auto_select_rule)
+        .map(|index| {
+            (
+                index,
+                canonical_profile_id(&composition.auto_select[index].profile),
+            )
+        });
+    let active_profile = composition
+        .active_profile
+        .as_deref()
+        .map(canonical_profile_id)
+        .or_else(|| {
+            auto_selected_profile
+                .as_ref()
+                .map(|(_, profile)| profile.clone())
+        });
+
+    let default_layers = if active_profile.is_some() {
         vec![
             "defaults".to_string(),
             "profile:active".to_string(),
@@ -245,14 +331,14 @@ fn resolve_composed_config_value(
             .unwrap_or_else(toml::Table::new),
     );
 
-    for layer in layer_order {
+    for layer in &layer_order {
         match layer.as_str() {
             "defaults" => {}
             "config" => {
                 merge_toml_value(&mut resolved, toml::Value::Table(raw_table.clone()));
             }
             "profile:active" => {
-                let Some(active_profile) = composition.active_profile.as_deref() else {
+                let Some(active_profile) = active_profile.as_deref() else {
                     return Err(ConfigError::InvalidValue {
                         field: "composition.layer_order".to_string(),
                         value: "layer 'profile:active' requires composition.active_profile"
@@ -276,7 +362,23 @@ fn resolve_composed_config_value(
         }
     }
 
-    Ok(resolved)
+    let mut available_profiles = profiles.keys().cloned().collect::<Vec<_>>();
+    available_profiles.sort();
+    let resolution = CompositionResolution {
+        selected_profile: active_profile,
+        selected_profile_source: if composition.active_profile.is_some() {
+            Some("composition.active_profile".to_string())
+        } else if auto_selected_profile.is_some() {
+            Some("composition.auto_select".to_string())
+        } else {
+            None
+        },
+        matched_auto_select_index: auto_selected_profile.map(|(index, _)| index),
+        layer_order,
+        available_profiles,
+    };
+
+    Ok((resolved, resolution))
 }
 
 /// Root configuration structure for bmux, deserialized from `bmux.toml`
@@ -1777,6 +1879,26 @@ impl BmuxConfig {
         Self::load_from_path(&paths.config_file())
     }
 
+    /// Load configuration and include composition resolution metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_with_resolution() -> Result<(Self, CompositionResolution)> {
+        let paths = ConfigPaths::default();
+        Self::load_from_path_with_resolution(&paths.config_file(), None)
+    }
+
+    /// Load configuration while forcing a specific active composition profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_with_forced_profile(profile_id: &str) -> Result<(Self, CompositionResolution)> {
+        let paths = ConfigPaths::default();
+        Self::load_from_path_with_resolution(&paths.config_file(), Some(profile_id))
+    }
+
     /// Load the configured global theme.
     ///
     /// Returns the built-in default theme when `appearance.theme` is empty or
@@ -1821,19 +1943,58 @@ impl BmuxConfig {
     ///
     /// Returns an error if the configuration file cannot be read or parsed.
     pub fn load_from_path(path: &std::path::Path) -> Result<Self> {
+        let (config, _resolution) = Self::load_from_path_with_resolution(path, None)?;
+        Ok(config)
+    }
+
+    /// Load configuration from a specific path and return composition metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_from_path_with_resolution(
+        path: &std::path::Path,
+        forced_profile: Option<&str>,
+    ) -> Result<(Self, CompositionResolution)> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok((
+                Self::default(),
+                CompositionResolution {
+                    selected_profile: None,
+                    selected_profile_source: None,
+                    matched_auto_select_index: None,
+                    layer_order: vec!["defaults".to_string(), "config".to_string()],
+                    available_profiles: built_in_composition_profiles().keys().cloned().collect(),
+                },
+            ));
         }
 
         let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadError {
             error: e.to_string(),
         })?;
 
-        let raw_value: toml::Value =
+        let mut raw_value: toml::Value =
             toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
                 error: e.to_string(),
             })?;
-        let resolved_value = resolve_composed_config_value(&raw_value)?;
+        if let Some(profile_id) = forced_profile
+            && let Some(root) = raw_value.as_table_mut()
+        {
+            let composition_value = root
+                .entry("composition".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            let composition_table =
+                composition_value
+                    .as_table_mut()
+                    .ok_or_else(|| ConfigError::ParseError {
+                        error: "[composition] must be a table".to_string(),
+                    })?;
+            composition_table.insert(
+                "active_profile".to_string(),
+                toml::Value::String(profile_id.to_string()),
+            );
+        }
+        let (resolved_value, resolution) = resolve_composed_config_value(&raw_value)?;
         let mut config: Self = resolved_value
             .try_into()
             .map_err(|e| ConfigError::ParseError {
@@ -1853,7 +2014,7 @@ impl BmuxConfig {
         }
 
         config.validate()?;
-        Ok(config)
+        Ok((config, resolution))
     }
 
     /// Save configuration to default location
@@ -2154,9 +2315,20 @@ impl BmuxConfig {
 
     /// Merge another configuration into this one
     pub fn merge(&mut self, other: Self) {
-        // This is a simple merge that overwrites values
-        // In a real implementation, you might want more sophisticated merging
-        *self = other;
+        let Ok(mut base) = toml::Value::try_from(&*self) else {
+            *self = other;
+            return;
+        };
+        let Ok(overlay) = toml::Value::try_from(&other) else {
+            *self = other;
+            return;
+        };
+        merge_toml_value(&mut base, overlay);
+        if let Ok(merged) = base.try_into() {
+            *self = merged;
+        } else {
+            *self = other;
+        }
     }
 }
 
@@ -2419,6 +2591,72 @@ enabled = ["three"]
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
         assert_eq!(config.plugins.enabled, vec!["three".to_string()]);
+    }
+
+    #[test]
+    fn composition_auto_select_uses_first_matching_rule() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+layer_order = ["defaults", "profile:active", "config"]
+
+[[composition.auto_select]]
+profile = "first"
+os = "macos"
+
+[[composition.auto_select]]
+profile = "second"
+os = "macos"
+
+[composition.profiles.first.patch.general]
+server_timeout = 111
+
+[composition.profiles.second.patch.general]
+server_timeout = 222
+"#,
+        )
+        .expect("write temp config");
+
+        let (config, resolution) =
+            BmuxConfig::load_from_path_with_resolution(&path, None).expect("failed loading config");
+        assert_eq!(config.general.server_timeout, 111);
+        assert_eq!(resolution.selected_profile, Some("first".to_string()));
+        assert_eq!(resolution.matched_auto_select_index, Some(0));
+    }
+
+    #[test]
+    fn composition_forced_profile_overrides_auto_select() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+layer_order = ["defaults", "profile:active", "config"]
+
+[[composition.auto_select]]
+profile = "first"
+os = "macos"
+
+[composition.profiles.first.patch.general]
+server_timeout = 111
+
+[composition.profiles.second.patch.general]
+server_timeout = 222
+"#,
+        )
+        .expect("write temp config");
+
+        let (config, resolution) =
+            BmuxConfig::load_from_path_with_resolution(&path, Some("second"))
+                .expect("failed loading config");
+        assert_eq!(config.general.server_timeout, 222);
+        assert_eq!(resolution.selected_profile, Some("second".to_string()));
+        assert_eq!(
+            resolution.selected_profile_source,
+            Some("composition.active_profile".to_string())
+        );
     }
 
     #[test]

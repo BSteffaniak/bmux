@@ -2398,7 +2398,8 @@ async fn apply_attach_runtime_actions(
             | crate::input::RuntimeAction::WindowGoto8
             | crate::input::RuntimeAction::WindowGoto9
             | crate::input::RuntimeAction::WindowClose
-            | crate::input::RuntimeAction::EnterMode(_) => {}
+            | crate::input::RuntimeAction::EnterMode(_)
+            | crate::input::RuntimeAction::SwitchProfile(_) => {}
         }
         runtime
             .processor

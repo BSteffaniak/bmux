@@ -75,7 +75,11 @@ use cli_parse::{
     ParsedRuntimeCli, parse_runtime_cli, resolve_log_level, tracing_level,
     validate_record_bootstrap_flags,
 };
-use config_cli::{run_config_get, run_config_path, run_config_set, run_config_show};
+use config_cli::{
+    run_config_get, run_config_path, run_config_profiles_diff, run_config_profiles_evaluate,
+    run_config_profiles_lint, run_config_profiles_list, run_config_profiles_resolve,
+    run_config_profiles_set_active, run_config_profiles_show, run_config_set, run_config_show,
+};
 use dispatch::run_command;
 use doctor_cli::run_doctor;
 use logs_cli::{run_logs_level, run_logs_path, run_logs_tail};

@@ -61,6 +61,7 @@ pub enum RuntimeAction {
     WindowGoto9,
     WindowClose,
     EnterMode(String),
+    SwitchProfile(String),
     PluginCommand {
         plugin_id: String,
         command_name: String,
@@ -127,6 +128,7 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::WindowGoto9 => "window_goto_9",
         RuntimeAction::WindowClose => "window_close",
         RuntimeAction::EnterMode(_) => "enter_mode",
+        RuntimeAction::SwitchProfile(_) => "switch_profile",
         RuntimeAction::PluginCommand { .. } => "plugin_command",
         RuntimeAction::ForwardToPane(_) => "forward_to_pane",
     }
@@ -136,6 +138,7 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
 pub fn action_to_config_name(action: &RuntimeAction) -> String {
     match action {
         RuntimeAction::EnterMode(mode_id) => format!("enter_mode {mode_id}"),
+        RuntimeAction::SwitchProfile(profile_id) => format!("switch_profile {profile_id}"),
         RuntimeAction::PluginCommand {
             plugin_id,
             command_name,
@@ -164,6 +167,9 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
     let trimmed = value.trim();
     if let Some(mode_action) = parse_enter_mode_action(trimmed) {
         return mode_action;
+    }
+    if let Some(profile_action) = parse_switch_profile_action(trimmed) {
+        return profile_action;
     }
     // Try plugin action first on the original string so that arguments
     // preserve their original case (e.g. file paths, user-entered values).
@@ -244,6 +250,22 @@ fn parse_enter_mode_action(value: &str) -> Option<Result<RuntimeAction>> {
         )));
     }
     Some(Ok(RuntimeAction::EnterMode(mode_id.to_ascii_lowercase())))
+}
+
+fn parse_switch_profile_action(value: &str) -> Option<Result<RuntimeAction>> {
+    let (command, target_profile) = value.split_once(' ')?;
+    if !command.eq_ignore_ascii_case("switch_profile") {
+        return None;
+    }
+    let profile_id = target_profile.trim();
+    if profile_id.is_empty() {
+        return Some(Err(anyhow::anyhow!(
+            "invalid switch_profile action '{value}' (profile id is required)"
+        )));
+    }
+    Some(Ok(RuntimeAction::SwitchProfile(
+        profile_id.to_ascii_lowercase(),
+    )))
 }
 
 fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
@@ -434,6 +456,22 @@ mod tests {
         assert_eq!(
             action_to_config_name(&RuntimeAction::EnterMode("normal".to_string())),
             "enter_mode normal"
+        );
+    }
+
+    #[test]
+    fn parse_action_accepts_switch_profile_action() {
+        assert_eq!(
+            parse_action("switch_profile Vim").expect("switch_profile should parse"),
+            RuntimeAction::SwitchProfile("vim".to_string())
+        );
+    }
+
+    #[test]
+    fn action_to_config_name_serializes_switch_profile_action() {
+        assert_eq!(
+            action_to_config_name(&RuntimeAction::SwitchProfile("zellij_compat".to_string())),
+            "switch_profile zellij_compat"
         );
     }
 }

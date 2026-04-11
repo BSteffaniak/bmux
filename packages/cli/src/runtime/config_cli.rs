@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
 
+fn config_file_path() -> std::path::PathBuf {
+    ConfigPaths::default().config_file()
+}
+
 pub(super) fn run_config_path(as_json: bool) -> Result<u8> {
     let paths = ConfigPaths::default();
     let path = paths.config_file();
@@ -120,6 +124,187 @@ pub(super) fn run_config_set(key: &str, raw_value: &str) -> Result<u8> {
 
     println!("{key} = {raw_value}");
     Ok(0)
+}
+
+pub(super) fn run_config_profiles_list(as_json: bool) -> Result<u8> {
+    let (_config, resolution) =
+        BmuxConfig::load_with_resolution().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "profiles": resolution.available_profiles,
+            }))
+            .context("failed to encode profiles json")?
+        );
+    } else {
+        for profile in resolution.available_profiles {
+            println!("{profile}");
+        }
+    }
+    Ok(0)
+}
+
+pub(super) fn run_config_profiles_show(profile: &str, as_json: bool) -> Result<u8> {
+    let path = config_file_path();
+    let (config, resolution) = BmuxConfig::load_from_path_with_resolution(&path, Some(profile))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let value = toml::Value::try_from(&config).context("failed to serialize config")?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "profile": profile,
+                "resolution": resolution,
+                "resolved_config": value,
+            }))
+            .context("failed to encode profile json")?
+        );
+    } else {
+        println!("profile: {profile}");
+        if let Some(source) = resolution.selected_profile_source {
+            println!("source: {source}");
+        }
+        let rendered = toml::to_string_pretty(&value).context("failed to render profile config")?;
+        print!("{rendered}");
+    }
+    Ok(0)
+}
+
+pub(super) fn run_config_profiles_resolve(profile: Option<&str>, as_json: bool) -> Result<u8> {
+    let path = config_file_path();
+    let (_config, resolution) = BmuxConfig::load_from_path_with_resolution(&path, profile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resolution)
+                .context("failed to encode resolution json")?
+        );
+    } else {
+        println!(
+            "selected_profile: {}",
+            resolution.selected_profile.as_deref().unwrap_or("<none>")
+        );
+        println!(
+            "source: {}",
+            resolution
+                .selected_profile_source
+                .as_deref()
+                .unwrap_or("<none>")
+        );
+        if let Some(index) = resolution.matched_auto_select_index {
+            println!("matched_auto_select_index: {index}");
+        }
+        println!("layer_order: {}", resolution.layer_order.join(" -> "));
+    }
+    Ok(0)
+}
+
+pub(super) fn run_config_profiles_diff(from: &str, to: &str, as_json: bool) -> Result<u8> {
+    let path = config_file_path();
+    let (from_config, _) = BmuxConfig::load_from_path_with_resolution(&path, Some(from))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (to_config, _) = BmuxConfig::load_from_path_with_resolution(&path, Some(to))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let from_value =
+        toml::Value::try_from(&from_config).context("failed to serialize from config")?;
+    let to_value = toml::Value::try_from(&to_config).context("failed to serialize to config")?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "from": from,
+                "to": to,
+                "from_config": from_value,
+                "to_config": to_value,
+            }))
+            .context("failed to encode diff json")?
+        );
+    } else {
+        println!("from profile: {from}");
+        println!("to profile: {to}");
+        if from_value == to_value {
+            println!("no differences");
+        } else {
+            println!("resolved configurations differ");
+        }
+    }
+    Ok(0)
+}
+
+pub(super) fn run_config_profiles_lint(as_json: bool) -> Result<u8> {
+    let path = config_file_path();
+    let (_config, resolution) = BmuxConfig::load_from_path_with_resolution(&path, None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "available_profiles": resolution.available_profiles,
+            }))
+            .context("failed to encode lint json")?
+        );
+    } else {
+        println!(
+            "ok: {} profiles validated",
+            resolution.available_profiles.len()
+        );
+    }
+    Ok(0)
+}
+
+pub(super) fn run_config_profiles_evaluate(as_json: bool) -> Result<u8> {
+    let path = config_file_path();
+    let (_config, resolution) = BmuxConfig::load_from_path_with_resolution(&path, None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resolution).context("failed to encode evaluate json")?
+        );
+    } else {
+        println!(
+            "selected profile: {}",
+            resolution.selected_profile.as_deref().unwrap_or("<none>")
+        );
+        if let Some(index) = resolution.matched_auto_select_index {
+            println!("matched auto_select rule: {index}");
+        }
+    }
+    Ok(0)
+}
+
+pub(super) fn run_config_profiles_set_active(profile: &str) -> Result<()> {
+    let paths = ConfigPaths::default();
+    let path = paths.config_file();
+    let source = if path.exists() {
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml_edit::DocumentMut = source
+        .parse()
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    set_dotted_key(
+        &mut doc,
+        "composition.active_profile",
+        toml_edit::value(profile)
+            .into_value()
+            .expect("string value"),
+    )
+    .context("failed setting composition.active_profile")?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    }
+    std::fs::write(&path, doc.to_string())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 fn resolve_dotted_key<'a>(table: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {

@@ -1538,6 +1538,59 @@ pub enum ConfigCommand {
         /// Value to set (booleans, integers, and strings are auto-detected)
         value: String,
     },
+    /// Manage composition profiles
+    Profiles {
+        #[command(subcommand)]
+        command: ConfigProfilesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigProfilesCommand {
+    /// List known profile ids
+    List {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one profile patch and inheritance metadata
+    Show {
+        /// Profile id
+        profile: String,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show resolved active profile and effective layers
+    Resolve {
+        /// Optional forced profile id
+        profile: Option<String>,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diff two resolved profile configurations
+    Diff {
+        /// From profile id
+        from: String,
+        /// To profile id
+        to: String,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate profile graph and layer rules
+    Lint {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evaluate auto-select rules in current environment
+    Evaluate {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]

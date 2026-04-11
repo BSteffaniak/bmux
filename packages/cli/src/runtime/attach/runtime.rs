@@ -1956,6 +1956,13 @@ pub async fn handle_attach_ui_action(
         RuntimeAction::ConfirmScrollback => {
             confirm_attach_scrollback(view_state);
         }
+        RuntimeAction::SwitchProfile(_) => {
+            view_state.set_transient_status(
+                "switch_profile is handled by attach input loop",
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+        }
         RuntimeAction::SessionPrev => {
             view_state.exit_scrollback();
             switch_attach_session_relative(client, view_state, -1).await?;
@@ -2734,6 +2741,84 @@ pub fn sync_attach_active_mode_from_processor(
         .map_or_else(|| mode_id.to_ascii_uppercase(), ToString::to_string);
     view_state.active_mode_id = mode_id;
     view_state.active_mode_label = mode_label;
+}
+
+pub fn apply_attach_profile_switch(
+    profile_id: &str,
+    attach_input_processor: &mut InputProcessor,
+    view_state: &mut AttachViewState,
+) -> Result<()> {
+    let config_path = ConfigPaths::default().config_file();
+    let previous_config_source = if config_path.exists() {
+        Some(
+            std::fs::read_to_string(&config_path)
+                .with_context(|| format!("failed reading {}", config_path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    let previous_keymap = attach_input_processor.keymap().clone();
+    let previous_mouse_config = view_state.mouse.config.clone();
+    let previous_status_position = view_state.status_position;
+
+    if let Err(error) = super::super::run_config_profiles_set_active(profile_id) {
+        return Err(error.context("failed updating composition.active_profile"));
+    }
+
+    let result = (|| -> Result<()> {
+        let (resolved_config, resolution) =
+            bmux_config::BmuxConfig::load_with_forced_profile(profile_id)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let keymap = attach_keymap_from_config(&resolved_config);
+        attach_input_processor.replace_keymap(keymap);
+        attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+        view_state.status_position = if resolved_config.status_bar.enabled {
+            resolved_config.appearance.status_position
+        } else {
+            StatusPosition::Off
+        };
+        view_state.mouse.config = resolved_config.attach_mouse_config();
+        sync_attach_active_mode_from_processor(
+            view_state,
+            attach_input_processor.keymap(),
+            attach_input_processor.active_mode_id(),
+        );
+        view_state.set_transient_status(
+            format!(
+                "active profile: {}",
+                resolution
+                    .selected_profile
+                    .unwrap_or_else(|| profile_id.to_ascii_lowercase())
+            ),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        match previous_config_source {
+            Some(source) => {
+                let _ = std::fs::write(&config_path, source);
+            }
+            None => {
+                let _ = std::fs::remove_file(&config_path);
+            }
+        }
+        attach_input_processor.replace_keymap(previous_keymap);
+        attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+        view_state.mouse.config = previous_mouse_config;
+        view_state.status_position = previous_status_position;
+        sync_attach_active_mode_from_processor(
+            view_state,
+            attach_input_processor.keymap(),
+            attach_input_processor.active_mode_id(),
+        );
+        return Err(error.context("rolled back profile switch"));
+    }
+
+    Ok(())
 }
 
 pub const fn status_insets_for_position(status_position: StatusPosition) -> (u16, u16) {
@@ -4640,6 +4725,27 @@ pub async fn handle_attach_terminal_event(
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }
             AttachEventAction::Ui(action) => {
+                if let RuntimeAction::SwitchProfile(profile_id) = &action {
+                    match apply_attach_profile_switch(
+                        profile_id,
+                        attach_input_processor,
+                        view_state,
+                    ) {
+                        Ok(()) => {
+                            view_state.dirty.layout_needs_refresh = true;
+                            view_state.dirty.full_pane_redraw = true;
+                            view_state.dirty.status_needs_redraw = true;
+                        }
+                        Err(error) => {
+                            view_state.set_transient_status(
+                                format!("profile switch failed: {error}"),
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                        }
+                    }
+                    continue;
+                }
                 if matches!(action, RuntimeAction::ShowHelp) {
                     view_state.help_overlay_open = !view_state.help_overlay_open;
                     if view_state.help_overlay_open {
@@ -5784,6 +5890,7 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
         | RuntimeAction::ToggleSplitDirection
         | RuntimeAction::RestartFocusedPane
         | RuntimeAction::EnterMode(_)
+        | RuntimeAction::SwitchProfile(_)
         | RuntimeAction::EnterScrollMode
         | RuntimeAction::ExitScrollMode
         | RuntimeAction::ScrollUpLine

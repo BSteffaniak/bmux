@@ -795,6 +795,13 @@ impl InputProcessor {
         &self.keymap
     }
 
+    pub fn replace_keymap(&mut self, keymap: Keymap) {
+        let active_mode = keymap.initial_mode.clone();
+        self.keymap = keymap;
+        self.active_mode = active_mode;
+        self.pending = None;
+    }
+
     pub(crate) const fn set_scroll_mode(&mut self, enabled: bool) {
         self.scroll_mode = enabled;
     }
