@@ -338,6 +338,7 @@ struct ClusterEventsArgs {
     cluster: Option<String>,
     target: Option<String>,
     state: Option<ClusterConnectionState>,
+    since_unix_ms: Option<u64>,
     limit: Option<usize>,
 }
 
@@ -454,6 +455,11 @@ fn filter_cluster_events(
             }
             if let Some(state) = args.state.as_ref()
                 && &event.state != state
+            {
+                return false;
+            }
+            if let Some(since_unix_ms) = args.since_unix_ms
+                && event.ts_unix_ms < since_unix_ms
             {
                 return false;
             }
@@ -1479,6 +1485,7 @@ fn parse_cluster_events_args(arguments: &[String]) -> Result<ClusterEventsArgs, 
     let mut cluster = None;
     let mut target = None;
     let mut state = None;
+    let mut since_unix_ms = None;
     let mut limit = None;
     let mut index = 0;
     while index < arguments.len() {
@@ -1548,6 +1555,19 @@ fn parse_cluster_events_args(arguments: &[String]) -> Result<ClusterEventsArgs, 
             index += 1;
             continue;
         }
+        if argument == "--since" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--since requires a value".to_string())?;
+            since_unix_ms = Some(parse_cluster_events_since(value)?);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--since=") {
+            since_unix_ms = Some(parse_cluster_events_since(value)?);
+            index += 1;
+            continue;
+        }
         index += 1;
     }
     Ok(ClusterEventsArgs {
@@ -1555,6 +1575,7 @@ fn parse_cluster_events_args(arguments: &[String]) -> Result<ClusterEventsArgs, 
         cluster,
         target,
         state,
+        since_unix_ms,
         limit,
     })
 }
@@ -1591,6 +1612,13 @@ fn parse_cluster_events_limit(value: &str) -> Result<usize, String> {
         return Err("--limit must be greater than zero".to_string());
     }
     Ok(parsed)
+}
+
+fn parse_cluster_events_since(value: &str) -> Result<u64, String> {
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --since value '{value}' (expected unix ms integer)"))
 }
 
 fn normalized_non_empty(value: &str) -> Option<String> {
@@ -2211,6 +2239,7 @@ mod tests {
         assert_eq!(parsed.cluster, None);
         assert_eq!(parsed.target, None);
         assert_eq!(parsed.state, None);
+        assert_eq!(parsed.since_unix_ms, None);
         assert_eq!(parsed.limit, None);
     }
 
@@ -2225,6 +2254,8 @@ mod tests {
             "db-a".to_string(),
             "--state".to_string(),
             "retrying".to_string(),
+            "--since".to_string(),
+            "1712345678000".to_string(),
             "--limit".to_string(),
             "25".to_string(),
         ])
@@ -2233,6 +2264,7 @@ mod tests {
         assert_eq!(parsed.cluster.as_deref(), Some("prod"));
         assert_eq!(parsed.target.as_deref(), Some("db-a"));
         assert_eq!(parsed.state, Some(ClusterConnectionState::Retrying));
+        assert_eq!(parsed.since_unix_ms, Some(1_712_345_678_000));
         assert_eq!(parsed.limit, Some(25));
     }
 
@@ -2241,6 +2273,13 @@ mod tests {
         let error = parse_cluster_events_args(&["--limit".to_string(), "0".to_string()])
             .expect_err("limit zero should be rejected");
         assert!(error.contains("greater than zero"));
+    }
+
+    #[test]
+    fn parse_cluster_events_args_rejects_invalid_since() {
+        let error = parse_cluster_events_args(&["--since".to_string(), "abc".to_string()])
+            .expect_err("invalid since should be rejected");
+        assert!(error.contains("unix ms integer"));
     }
 
     #[test]
