@@ -23,10 +23,29 @@ jobs:
           TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: tofu init
 
+      - name: OpenTofu fmt check
+        run: tofu fmt -check -recursive
+
+      - name: OpenTofu validate
+        env:
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TF_VAR_worker_cname_target: ${{ secrets.CLOUDFLARE_WORKER_CNAME_TARGET }}
+        run: tofu validate
+
+      - name: OpenTofu plan
+        env:
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TF_VAR_worker_cname_target: ${{ secrets.CLOUDFLARE_WORKER_CNAME_TARGET }}
+        run: tofu plan -out=tfplan
+
       - name: OpenTofu apply
         env:
           TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           TF_VAR_worker_cname_target: ${{ secrets.CLOUDFLARE_WORKER_CNAME_TARGET }}
-        run: tofu apply -auto-approve
+        run: tofu apply -auto-approve tfplan

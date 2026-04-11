@@ -17,5 +17,10 @@ find "$ROOT/$CHANNEL/artifacts" -type f -name "*.rpm" -exec cp -f {} "$RPM_ROOT"
 createrepo_c --update "$RPM_ROOT"
 
 if [ -n "${GPG_KEY_ID:-}" ]; then
-	gpg --batch --yes --detach-sign --armor "$RPM_ROOT/repodata/repomd.xml"
+	if [ -n "${GPG_PASSPHRASE:-}" ]; then
+		GPG_ARGS=(--pinentry-mode loopback --passphrase "$GPG_PASSPHRASE")
+	else
+		GPG_ARGS=()
+	fi
+	gpg --batch --yes --default-key "$GPG_KEY_ID" "${GPG_ARGS[@]}" --detach-sign --armor -o "$RPM_ROOT/repodata/repomd.xml.asc" "$RPM_ROOT/repodata/repomd.xml"
 fi

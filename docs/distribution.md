@@ -10,6 +10,7 @@ bmux distribution is channel-based and hosted on Cloudflare at:
 - `GET /install` (defaults to stable)
 - `GET /install?channel=nightly`
 - `GET /channels.json`
+- `GET /stable/*` and `GET /nightly/*` package/repository content proxied from R2
 
 ## APT
 
@@ -47,3 +48,13 @@ gpgcheck=1
 - Platform packages: `@bmux/<platform>`
 
 See `npm/` and `.github/workflows/release-npm.yml`.
+
+## Channel manifests
+
+Each release publishes:
+
+- `stable/latest.json`
+- `nightly/latest.json`
+
+These are consumed by the Worker to resolve install defaults and by
+`/channels.json` for clients.

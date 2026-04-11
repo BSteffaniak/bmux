@@ -6,15 +6,9 @@ locals {
   packages_fqdn = "${var.packages_hostname}.${var.domain_name}"
 }
 
-resource "cloudflare_r2_bucket" "stable" {
+resource "cloudflare_r2_bucket" "packages" {
   account_id = var.cloudflare_account_id
-  name       = var.stable_bucket_name
-  location   = "WNAM"
-}
-
-resource "cloudflare_r2_bucket" "nightly" {
-  account_id = var.cloudflare_account_id
-  name       = var.nightly_bucket_name
+  name       = var.packages_bucket_name
   location   = "WNAM"
 }
 

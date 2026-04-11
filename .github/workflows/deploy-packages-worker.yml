@@ -25,6 +25,15 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install Wrangler
+        run: npm install --no-save wrangler@4.13.2
+
+      - name: Verify Cloudflare identity
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler whoami
+
       - name: Deploy worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

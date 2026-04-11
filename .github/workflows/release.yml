@@ -12,7 +12,7 @@ on:
         options: [stable, nightly]
         default: stable
       version:
-        description: "Version override"
+        description: "Base version override"
         type: string
         required: false
 
@@ -45,18 +45,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve archive version
-        id: version
+      - name: Resolve release metadata
+        id: meta
         shell: bash
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="dev-${GITHUB_SHA::7}"
+          CHANNEL="${{ inputs.channel || 'stable' }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CHANNEL="stable"
           fi
-          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+          BASE="0.0.1"
+          if [ -n "${{ inputs.version }}" ]; then
+            BASE="${{ inputs.version }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            BASE="${GITHUB_REF_NAME#v}"
+          fi
+
+          if [ "$CHANNEL" = "nightly" ]; then
+            VERSION="${BASE}-nightly.$(date -u +%Y%m%d)+${GITHUB_SHA::7}"
+          else
+            VERSION="$BASE"
+          fi
+
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -80,7 +92,7 @@ jobs:
       - name: Prepare archive
         shell: bash
         run: |
-          VERSION="${{ steps.version.outputs.value }}"
+          VERSION="${{ steps.meta.outputs.version }}"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
           tar -czf "bmux-${VERSION}-${{ matrix.target }}.tar.gz" -C dist "${{ matrix.bin }}"
@@ -108,6 +120,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          CHANNEL="${{ inputs.channel || 'stable' }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CHANNEL="stable"
+          fi
+
+          BASE="0.0.1"
+          if [ -n "${{ inputs.version }}" ]; then
+            BASE="${{ inputs.version }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            BASE="${GITHUB_REF_NAME#v}"
+          fi
+
+          if [ "$CHANNEL" = "nightly" ]; then
+            VERSION="${BASE}-nightly.$(date -u +%Y%m%d)+${GITHUB_SHA::7}"
+          else
+            VERSION="$BASE"
+          fi
+
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -127,26 +164,6 @@ jobs:
         run: |
           curl -fsSL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_Linux_x86_64.tar.gz | tar -xz
           sudo mv nfpm /usr/local/bin/nfpm
-
-      - name: Resolve release metadata
-        id: meta
-        shell: bash
-        run: |
-          CHANNEL="${{ inputs.channel || 'stable' }}"
-          if [ "${{ github.event_name }}" = "push" ]; then
-            CHANNEL="stable"
-          fi
-          BASE="${GITHUB_REF_NAME#v}"
-          if [ -n "${{ inputs.version }}" ]; then
-            BASE="${{ inputs.version }}"
-          fi
-          if [ "$CHANNEL" = "nightly" ]; then
-            VERSION="${BASE}-nightly.$(date -u +%Y%m%d)+${GITHUB_SHA::7}"
-          else
-            VERSION="$BASE"
-          fi
-          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build bmux binary
         run: cargo build --release --target ${{ matrix.target }} -p bmux_cli
@@ -188,6 +205,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          CHANNEL="${{ inputs.channel || 'stable' }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CHANNEL="stable"
+          fi
+
+          BASE="0.0.1"
+          if [ -n "${{ inputs.version }}" ]; then
+            BASE="${{ inputs.version }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            BASE="${GITHUB_REF_NAME#v}"
+          fi
+
+          if [ "$CHANNEL" = "nightly" ]; then
+            VERSION="${BASE}-nightly.$(date -u +%Y%m%d)+${GITHUB_SHA::7}"
+            TAG="nightly-${BASE}-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+            PRERELEASE=true
+          else
+            VERSION="$BASE"
+            TAG="v$VERSION"
+            PRERELEASE=false
+          fi
+
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
       - name: Download artifact archives
         uses: actions/download-artifact@v4
         with:
@@ -202,37 +250,26 @@ jobs:
           find artifacts -name '*.rpm' -type f -exec cp {} release-files/ \;
           (cd release-files && shasum -a 256 * > SHA256SUMS)
 
-      - name: Resolve release metadata
-        id: meta
-        shell: bash
-        run: |
-          CHANNEL="${{ inputs.channel || 'stable' }}"
-          if [ "${{ github.event_name }}" = "push" ]; then
-            CHANNEL="stable"
-          fi
-          BASE="${GITHUB_REF_NAME#v}"
-          if [ -n "${{ inputs.version }}" ]; then
-            BASE="${{ inputs.version }}"
-          fi
-          if [ "$CHANNEL" = "nightly" ]; then
-            VERSION="${BASE}-nightly.$(date -u +%Y%m%d)+${GITHUB_SHA::7}"
-            TAG="nightly-${BASE}-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
-            PRERELEASE=true
-          else
-            VERSION="$BASE"
-            TAG="v$VERSION"
-            PRERELEASE=false
-          fi
-          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-
-      - name: Build apt repository metadata
+      - name: Install repo tools
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y dpkg-dev apt-utils gnupg createrepo-c
+
+      - name: Import repository signing key
+        if: ${{ secrets.GPG_PRIVATE_KEY != '' && secrets.GPG_KEY_ID != '' }}
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Build apt repository metadata
+        shell: bash
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
           mkdir -p out/${{ steps.meta.outputs.channel }}/artifacts
           cp release-files/*.deb out/${{ steps.meta.outputs.channel }}/artifacts/ || true
           cp release-files/*.rpm out/${{ steps.meta.outputs.channel }}/artifacts/ || true
@@ -241,9 +278,40 @@ jobs:
 
       - name: Build rpm repository metadata
         shell: bash
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           chmod +x packaging/repo/build-rpm-repo.sh
           ./packaging/repo/build-rpm-repo.sh "${{ steps.meta.outputs.channel }}" out
+
+      - name: Write latest channel manifest
+        shell: bash
+        run: |
+          CHANNEL="${{ steps.meta.outputs.channel }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p "out/$CHANNEL"
+          cat > "out/$CHANNEL/latest.json" <<EOF
+          {
+            "channel": "$CHANNEL",
+            "version": "$VERSION",
+            "updated_at": "$NOW",
+            "artifacts_base": "https://packages.bmux.dev/$CHANNEL/artifacts/$VERSION",
+            "apt_base": "https://packages.bmux.dev/$CHANNEL/apt",
+            "rpm_base": "https://packages.bmux.dev/$CHANNEL/rpm"
+          }
+          EOF
+
+      - name: Export public signing key
+        if: ${{ secrets.GPG_KEY_ID != '' }}
+        shell: bash
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        run: |
+          mkdir -p out/keys
+          gpg --batch --yes --armor --export "$GPG_KEY_ID" > out/keys/bmux-packages.asc
+          gpg --batch --yes --fingerprint "$GPG_KEY_ID" > out/keys/bmux-packages-fingerprint.txt
 
       - name: Upload release to GitHub
         uses: softprops/action-gh-release@v2
@@ -263,6 +331,10 @@ jobs:
           R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
         shell: bash
         run: |
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$R2_ENDPOINT"
+          test -n "$R2_BUCKET"
           python -m pip install --user awscli
           export PATH="$HOME/.local/bin:$PATH"
           CHANNEL="${{ steps.meta.outputs.channel }}"
@@ -270,3 +342,7 @@ jobs:
           aws --endpoint-url "$R2_ENDPOINT" s3 cp release-files "s3://$R2_BUCKET/$CHANNEL/artifacts/$VERSION" --recursive
           aws --endpoint-url "$R2_ENDPOINT" s3 cp out/$CHANNEL/apt "s3://$R2_BUCKET/$CHANNEL/apt" --recursive
           aws --endpoint-url "$R2_ENDPOINT" s3 cp out/$CHANNEL/rpm "s3://$R2_BUCKET/$CHANNEL/rpm" --recursive
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp out/$CHANNEL/latest.json "s3://$R2_BUCKET/$CHANNEL/latest.json"
+          if [ -d out/keys ]; then
+            aws --endpoint-url "$R2_ENDPOINT" s3 cp out/keys "s3://$R2_BUCKET/keys" --recursive
+          fi

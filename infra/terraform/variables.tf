@@ -26,16 +26,10 @@ variable "domain_name" {
   default     = "bmux.dev"
 }
 
-variable "stable_bucket_name" {
-  description = "R2 bucket for stable channel"
+variable "packages_bucket_name" {
+  description = "R2 bucket used for all channels"
   type        = string
-  default     = "bmux-packages-stable"
-}
-
-variable "nightly_bucket_name" {
-  description = "R2 bucket for nightly channel"
-  type        = string
-  default     = "bmux-packages-nightly"
+  default     = "bmux-packages"
 }
 
 variable "worker_cname_target" {

@@ -2,6 +2,11 @@ name = "bmux-packages"
 main = "src/index.js"
 compatibility_date = "2026-04-11"
 
+[[r2_buckets]]
+binding = "PACKAGES_BUCKET"
+bucket_name = "bmux-packages"
+preview_bucket_name = "bmux-packages"
+
 [vars]
 PACKAGES_HOST = "packages.bmux.dev"
 STABLE_VERSION = "0.0.1-alpha.0"

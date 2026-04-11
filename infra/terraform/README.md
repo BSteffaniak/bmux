@@ -5,8 +5,7 @@ distribution at `packages.bmux.dev`.
 
 ## Managed resources
 
-- R2 bucket for stable channel artifacts and repositories
-- R2 bucket for nightly channel artifacts and repositories
+- R2 bucket for all distribution channels
 - DNS record for `packages.bmux.dev`
 
 ## Inputs
@@ -16,6 +15,8 @@ distribution at `packages.bmux.dev`.
 - `cloudflare_zone_id`
 - `packages_hostname` (default: `packages`)
 - `domain_name` (default: `bmux.dev`)
+- `packages_bucket_name` (default: `bmux-packages`)
+- `worker_cname_target` (for example, `bmux-packages.<subdomain>.workers.dev`)
 
 ## Example
 
@@ -32,4 +33,9 @@ tofu apply
 ## Notes
 
 - Wrangler deploys the Worker itself. OpenTofu handles base infrastructure.
+- Channel data is stored as prefixes in a single bucket: `stable/*` and `nightly/*`.
 - Use the same account and zone values in CI release workflows.
+- `worker_cname_target` should be your deployed Worker hostname, for example
+  `bmux-packages.<subdomain>.workers.dev`.
+- This setup is separate from the docs Pages project and should not collide with
+  docs deployment.
