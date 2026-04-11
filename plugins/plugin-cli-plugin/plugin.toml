@@ -207,6 +207,18 @@ value_name          = "SELECTOR"
 
 [[commands]]
 expose_in_cli = true
+name          = "doctor"
+path          = ["plugin", "doctor"]
+summary       = "Validate plugin configuration and readiness"
+
+[[commands.arguments]]
+kind  = "boolean"
+long  = "json"
+name  = "json"
+short = "j"
+
+[[commands]]
+expose_in_cli = true
 name          = "logs-path"
 path          = ["logs", "path"]
 summary       = "Core logs path command proxy"

@@ -11,6 +11,7 @@ use bmux_plugin_sdk::{
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -37,6 +38,7 @@ struct RuntimeCommandState {
 
 thread_local! {
     static RUNTIME_COMMAND_STATE_CACHE: RefCell<Option<RuntimeCommandState>> = const { RefCell::new(None) };
+    static LOADED_PLUGIN_CACHE: RefCell<BTreeMap<String, Rc<bmux_plugin::LoadedPlugin>>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 pub(super) fn plugin_host_metadata() -> HostMetadata {
@@ -1124,12 +1126,7 @@ pub(super) fn run_plugin_command_internal(
         anyhow::bail!(format_plugin_not_enabled_message(plugin_id));
     }
 
-    let loaded = load_plugin(
-        plugin,
-        &plugin_host_metadata(),
-        &state.available_capability_providers,
-    )
-    .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
+    let loaded = load_cached_plugin(plugin, &state)?;
     let plugin_search_roots = state.plugin_search_roots.clone();
     let available_capabilities = state
         .available_capability_providers
@@ -1176,6 +1173,28 @@ pub(super) fn run_plugin_command_internal(
         }
     }
     Ok(PluginCommandExecution { status, outcome })
+}
+
+fn load_cached_plugin(
+    plugin: &bmux_plugin::RegisteredPlugin,
+    state: &RuntimeCommandState,
+) -> Result<Rc<bmux_plugin::LoadedPlugin>> {
+    let plugin_id = plugin.declaration.id.as_str().to_string();
+    LOADED_PLUGIN_CACHE.with(|slot| {
+        if let Some(existing) = slot.borrow().get(&plugin_id) {
+            return Ok(Rc::clone(existing));
+        }
+
+        let loaded = load_plugin(
+            plugin,
+            &plugin_host_metadata(),
+            &state.available_capability_providers,
+        )
+        .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
+        let loaded = Rc::new(loaded);
+        slot.borrow_mut().insert(plugin_id, Rc::clone(&loaded));
+        Ok(loaded)
+    })
 }
 
 pub(super) fn format_plugin_command_run_error(

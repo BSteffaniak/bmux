@@ -21,6 +21,7 @@ impl RustPlugin for PluginCliPlugin {
             "list" => run_list_command(&context).map_err(PluginCommandError::from),
             "run" => run_run_command(&context).map_err(PluginCommandError::from),
             "rebuild" => run_rebuild_command(&context).map_err(PluginCommandError::from),
+            "doctor" => run_doctor_command(&context).map_err(PluginCommandError::from),
             _ => {
                 if let Some(command_path) = core_proxy_command_path(context.command.as_str()) {
                     run_core_proxy_command(&context, command_path)
@@ -35,144 +36,7 @@ impl RustPlugin for PluginCliPlugin {
     }
 }
 
-struct CoreProxyCommand {
-    command_name: &'static str,
-    command_path: &'static [&'static str],
-}
-
-const CORE_PROXY_COMMANDS: &[CoreProxyCommand] = &[
-    CoreProxyCommand {
-        command_name: "logs-path",
-        command_path: &["logs", "path"],
-    },
-    CoreProxyCommand {
-        command_name: "logs-level",
-        command_path: &["logs", "level"],
-    },
-    CoreProxyCommand {
-        command_name: "logs-tail",
-        command_path: &["logs", "tail"],
-    },
-    CoreProxyCommand {
-        command_name: "logs-watch",
-        command_path: &["logs", "watch"],
-    },
-    CoreProxyCommand {
-        command_name: "logs-profiles-list",
-        command_path: &["logs", "profiles", "list"],
-    },
-    CoreProxyCommand {
-        command_name: "logs-profiles-show",
-        command_path: &["logs", "profiles", "show"],
-    },
-    CoreProxyCommand {
-        command_name: "logs-profiles-delete",
-        command_path: &["logs", "profiles", "delete"],
-    },
-    CoreProxyCommand {
-        command_name: "logs-profiles-rename",
-        command_path: &["logs", "profiles", "rename"],
-    },
-    CoreProxyCommand {
-        command_name: "keymap-doctor",
-        command_path: &["keymap", "doctor"],
-    },
-    CoreProxyCommand {
-        command_name: "terminal-doctor",
-        command_path: &["terminal", "doctor"],
-    },
-    CoreProxyCommand {
-        command_name: "terminal-install-terminfo",
-        command_path: &["terminal", "install-terminfo"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-start",
-        command_path: &["recording", "start"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-stop",
-        command_path: &["recording", "stop"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-status",
-        command_path: &["recording", "status"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-path",
-        command_path: &["recording", "path"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-list",
-        command_path: &["recording", "list"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-delete",
-        command_path: &["recording", "delete"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-delete-all",
-        command_path: &["recording", "delete-all"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-cut",
-        command_path: &["recording", "cut"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-inspect",
-        command_path: &["recording", "inspect"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-replay",
-        command_path: &["recording", "replay"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-verify-smoke",
-        command_path: &["recording", "verify-smoke"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-export",
-        command_path: &["recording", "export"],
-    },
-    CoreProxyCommand {
-        command_name: "recording-prune",
-        command_path: &["recording", "prune"],
-    },
-    CoreProxyCommand {
-        command_name: "playbook-run",
-        command_path: &["playbook", "run"],
-    },
-    CoreProxyCommand {
-        command_name: "playbook-validate",
-        command_path: &["playbook", "validate"],
-    },
-    CoreProxyCommand {
-        command_name: "playbook-interactive",
-        command_path: &["playbook", "interactive"],
-    },
-    CoreProxyCommand {
-        command_name: "playbook-from-recording",
-        command_path: &["playbook", "from-recording"],
-    },
-    CoreProxyCommand {
-        command_name: "playbook-dry-run",
-        command_path: &["playbook", "dry-run"],
-    },
-    CoreProxyCommand {
-        command_name: "playbook-diff",
-        command_path: &["playbook", "diff"],
-    },
-    CoreProxyCommand {
-        command_name: "playbook-cleanup",
-        command_path: &["playbook", "cleanup"],
-    },
-];
-
-fn core_proxy_command_path(command_name: &str) -> Option<&'static [&'static str]> {
-    CORE_PROXY_COMMANDS
-        .iter()
-        .find(|entry| entry.command_name == command_name)
-        .map(|entry| entry.command_path)
-}
+include!(concat!(env!("OUT_DIR"), "/core_proxy_commands.rs"));
 
 fn run_core_proxy_command(
     context: &NativeCommandContext,
@@ -252,6 +116,88 @@ fn run_list_command(context: &NativeCommandContext) -> Result<i32, String> {
     Ok(EXIT_OK)
 }
 
+fn run_doctor_command(context: &NativeCommandContext) -> Result<i32, String> {
+    let as_json = has_flag(&context.arguments, "json");
+    let enabled_ids = context
+        .enabled_plugins
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let enabled_plugins = context
+        .registered_plugins
+        .iter()
+        .filter(|plugin| enabled_ids.contains(&plugin.id))
+        .collect::<Vec<_>>();
+
+    let mut issues = Vec::new();
+    for plugin_id in &context.enabled_plugins {
+        if !context
+            .registered_plugins
+            .iter()
+            .any(|registered| registered.id == *plugin_id)
+        {
+            issues.push(format!(
+                "enabled plugin '{plugin_id}' was not found in the registry"
+            ));
+        }
+    }
+
+    let available_capabilities = context
+        .available_capabilities
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for plugin in &enabled_plugins {
+        for required in &plugin.required_capabilities {
+            if !available_capabilities.contains(required) {
+                issues.push(format!(
+                    "plugin '{}' requires unavailable capability '{}'",
+                    plugin.id, required
+                ));
+            }
+        }
+    }
+
+    let mut command_owners: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for plugin in &enabled_plugins {
+        for command in &plugin.commands {
+            if let Some(owner) = command_owners.get(command) {
+                issues.push(format!(
+                    "enabled plugins '{}' and '{}' both expose command '{}'",
+                    owner, plugin.id, command
+                ));
+            } else {
+                command_owners.insert(command.clone(), plugin.id.clone());
+            }
+        }
+    }
+
+    let report = PluginDoctorReport {
+        healthy: issues.is_empty(),
+        enabled_plugins: context.enabled_plugins.clone(),
+        issues,
+    };
+
+    if as_json {
+        let output = serde_json::to_string_pretty(&report)
+            .map_err(|error| format!("failed encoding plugin doctor json: {error}"))?;
+        println!("{output}");
+    } else if report.healthy {
+        println!(
+            "plugin doctor: ok ({} enabled plugins)",
+            report.enabled_plugins.len()
+        );
+    } else {
+        println!("plugin doctor: found {} issue(s)", report.issues.len());
+        for issue in &report.issues {
+            println!("- {issue}");
+        }
+    }
+
+    Ok(if report.healthy { EXIT_OK } else { 1 })
+}
+
 fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
     if context.arguments.len() < 2 {
         return Err("usage: bmux plugin run <plugin> <command> [args ...]".to_string());
@@ -296,13 +242,10 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
 
     if options.selectors.is_empty() {
         if options.all_workspace_plugins {
-            for crate_name in &workspace_plugin_crates {
-                add_target(crate_name);
-            }
-        } else {
-            for bundled in &bundled_plugins {
-                add_target(&bundled.crate_name);
-            }
+            println!("--all-workspace-plugins is now the default behavior");
+        }
+        for crate_name in &workspace_plugin_crates {
+            add_target(crate_name);
         }
     } else {
         for selector in &options.selectors {
@@ -313,8 +256,7 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
 
     if targets.is_empty() {
         return Err(
-            "no plugin crates selected to build; use --all-workspace-plugins or provide selectors"
-                .to_string(),
+            "no plugin crates selected to build; provide one or more selectors".to_string(),
         );
     }
 
@@ -598,81 +540,25 @@ fn format_plugin_command_run_error(
 
 #[cfg(test)]
 mod tests {
-    use super::CORE_PROXY_COMMANDS;
-    use std::collections::BTreeSet;
+    use super::core_proxy_command_path;
 
     #[test]
-    fn proxy_command_table_stays_in_sync_with_manifest_commands() {
-        let manifest = include_str!("../plugin.toml");
-        let proxy_names = CORE_PROXY_COMMANDS
-            .iter()
-            .map(|entry| entry.command_name.to_string())
-            .collect::<BTreeSet<_>>();
-        let manifest_proxy_names = manifest_proxy_command_names(manifest);
+    fn generated_proxy_command_mapping_resolves_known_entries() {
         assert_eq!(
-            proxy_names, manifest_proxy_names,
-            "core proxy command table must match non-plugin command declarations in plugin.toml"
+            core_proxy_command_path("logs-path"),
+            Some(&["logs", "path"] as &[&str])
+        );
+        assert_eq!(
+            core_proxy_command_path("playbook-run"),
+            Some(&["playbook", "run"] as &[&str])
         );
     }
 
-    fn manifest_proxy_command_names(manifest: &str) -> BTreeSet<String> {
-        let mut names = BTreeSet::new();
-        let mut current_name: Option<String> = None;
-        let mut in_command = false;
-
-        for line in manifest.lines() {
-            let trimmed = line.trim();
-            if trimmed == "[[commands]]" {
-                in_command = true;
-                current_name = None;
-                continue;
-            }
-            if trimmed.starts_with("[[commands.") {
-                in_command = false;
-                continue;
-            }
-            if !in_command {
-                continue;
-            }
-
-            if let Some(value) = parse_quoted_value(trimmed, "name") {
-                current_name = Some(value.to_string());
-                continue;
-            }
-
-            if let Some(path_text) = parse_array_text(trimmed, "path")
-                && let Some(name) = current_name.take()
-                && !path_text.contains("\"plugin\"")
-            {
-                names.insert(name);
-            }
-        }
-
-        names
-    }
-
-    fn parse_quoted_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-        let (left, right) = line.split_once('=')?;
-        if left.trim() != key {
-            return None;
-        }
-        let value = right.trim();
-        if !value.starts_with('"') || !value.ends_with('"') || value.len() < 2 {
-            return None;
-        }
-        Some(&value[1..value.len() - 1])
-    }
-
-    fn parse_array_text<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-        let (left, right) = line.split_once('=')?;
-        if left.trim() != key {
-            return None;
-        }
-        let value = right.trim();
-        if !value.starts_with('[') || !value.ends_with(']') {
-            return None;
-        }
-        Some(value)
+    #[test]
+    fn generated_proxy_command_mapping_ignores_non_proxy_commands() {
+        assert!(core_proxy_command_path("list").is_none());
+        assert!(core_proxy_command_path("doctor").is_none());
+        assert!(core_proxy_command_path("does-not-exist").is_none());
     }
 }
 
@@ -700,6 +586,13 @@ struct PluginListEntry {
     required_capabilities: Vec<String>,
     provided_capabilities: Vec<String>,
     commands: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginDoctorReport {
+    healthy: bool,
+    enabled_plugins: Vec<String>,
+    issues: Vec<String>,
 }
 
 bmux_plugin_sdk::export_plugin!(PluginCliPlugin, include_str!("../plugin.toml"));
