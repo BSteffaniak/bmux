@@ -1210,6 +1210,46 @@ pub struct LoadedPlugin {
 }
 
 impl LoadedPlugin {
+    fn ensure_process_protocol_version(operation: &str, protocol_version: u16) -> Result<()> {
+        if protocol_version == PROCESS_RUNTIME_PROTOCOL_V1 {
+            return Ok(());
+        }
+        Err(PluginError::ServiceProtocol {
+            details: format!(
+                "unsupported process runtime {operation} response protocol version: {protocol_version}"
+            ),
+        })
+    }
+
+    fn unexpected_process_response(
+        operation: &str,
+        response: &ProcessInvocationResponse,
+    ) -> PluginError {
+        PluginError::ServiceProtocol {
+            details: format!(
+                "unexpected process runtime response for {operation} invocation: {response:?}"
+            ),
+        }
+    }
+
+    fn process_error_to_result(
+        operation: &str,
+        protocol_version: u16,
+        details: String,
+    ) -> Result<()> {
+        Self::ensure_process_protocol_version(operation, protocol_version)?;
+        Err(PluginError::ServiceProtocol { details })
+    }
+
+    fn invoke_process(
+        &self,
+        runtime: &ProcessPluginRuntime,
+        argv: &[String],
+        request: &ProcessInvocationRequest,
+    ) -> Result<(Option<ProcessInvocationResponse>, std::process::ExitStatus)> {
+        runtime.invoke(self.declaration.id.as_str(), argv, request)
+    }
+
     #[must_use]
     pub fn commands(&self) -> &[bmux_plugin_sdk::PluginCommand] {
         &self.declaration.commands
@@ -1425,21 +1465,14 @@ impl LoadedPlugin {
                     event: event.clone(),
                 };
                 let empty_argv: Vec<String> = Vec::new();
-                let (response, _) =
-                    runtime.invoke(self.declaration.id.as_str(), &empty_argv, &request)?;
+                let (response, _) = self.invoke_process(runtime, &empty_argv, &request)?;
                 match response {
                     None => return Ok(None),
                     Some(ProcessInvocationResponse::Event {
                         protocol_version,
                         status,
                     }) => {
-                        if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
-                            return Err(PluginError::ServiceProtocol {
-                                details: format!(
-                                    "unsupported process runtime event response protocol version: {protocol_version}"
-                                ),
-                            });
-                        }
+                        Self::ensure_process_protocol_version("event", protocol_version)?;
                         return Ok(status);
                     }
                     Some(ProcessInvocationResponse::Error {
@@ -1447,24 +1480,14 @@ impl LoadedPlugin {
                         details,
                         status,
                     }) => {
-                        if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
-                            return Err(PluginError::ServiceProtocol {
-                                details: format!(
-                                    "unsupported process runtime error response protocol version: {protocol_version}"
-                                ),
-                            });
-                        }
+                        Self::ensure_process_protocol_version("error", protocol_version)?;
                         if let Some(status) = status {
                             return Ok(Some(status));
                         }
                         return Err(PluginError::ServiceProtocol { details });
                     }
                     Some(other) => {
-                        return Err(PluginError::ServiceProtocol {
-                            details: format!(
-                                "unexpected process runtime response for event invocation: {other:?}"
-                            ),
-                        });
+                        return Err(Self::unexpected_process_response("event", &other));
                     }
                 }
             }
@@ -1501,19 +1524,13 @@ impl LoadedPlugin {
             context: context.clone(),
         };
         let empty_argv: Vec<String> = Vec::new();
-        let (response, _) = runtime.invoke(self.declaration.id.as_str(), &empty_argv, &request)?;
+        let (response, _) = self.invoke_process(runtime, &empty_argv, &request)?;
         match response {
             Some(ProcessInvocationResponse::Service {
                 protocol_version,
                 response,
             }) => {
-                if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
-                    return Err(PluginError::ServiceProtocol {
-                        details: format!(
-                            "unsupported process runtime service response protocol version: {protocol_version}"
-                        ),
-                    });
-                }
+                Self::ensure_process_protocol_version("service", protocol_version)?;
                 Ok(response)
             }
             Some(ProcessInvocationResponse::Error {
@@ -1521,24 +1538,14 @@ impl LoadedPlugin {
                 details,
                 status: _,
             }) => {
-                if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
-                    return Err(PluginError::ServiceProtocol {
-                        details: format!(
-                            "unsupported process runtime error response protocol version: {protocol_version}"
-                        ),
-                    });
-                }
-                Err(PluginError::ServiceProtocol { details })
+                Self::process_error_to_result("service", protocol_version, details)?;
+                unreachable!("process_error_to_result always returns Err")
             }
             None => Err(PluginError::UnsupportedPluginRuntime {
                 plugin_id: self.declaration.id.as_str().to_string(),
                 runtime: "process-services".to_string(),
             }),
-            Some(other) => Err(PluginError::ServiceProtocol {
-                details: format!(
-                    "unexpected process runtime response for service invocation: {other:?}"
-                ),
-            }),
+            Some(other) => Err(Self::unexpected_process_response("service", &other)),
         }
     }
 
@@ -1659,20 +1666,13 @@ impl LoadedPlugin {
                     context: context.clone(),
                 };
                 let empty_argv: Vec<String> = Vec::new();
-                let (response, status) =
-                    runtime.invoke(self.declaration.id.as_str(), &empty_argv, &request)?;
+                let (response, status) = self.invoke_process(runtime, &empty_argv, &request)?;
                 match response {
                     Some(ProcessInvocationResponse::Lifecycle {
                         protocol_version,
                         status,
                     }) => {
-                        if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
-                            return Err(PluginError::ServiceProtocol {
-                                details: format!(
-                                    "unsupported process runtime lifecycle response protocol version: {protocol_version}"
-                                ),
-                            });
-                        }
+                        Self::ensure_process_protocol_version("lifecycle", protocol_version)?;
                         status
                     }
                     Some(ProcessInvocationResponse::Error {
@@ -1680,13 +1680,7 @@ impl LoadedPlugin {
                         details,
                         status,
                     }) => {
-                        if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
-                            return Err(PluginError::ServiceProtocol {
-                                details: format!(
-                                    "unsupported process runtime error response protocol version: {protocol_version}"
-                                ),
-                            });
-                        }
+                        Self::ensure_process_protocol_version("error", protocol_version)?;
                         if let Some(status) = status {
                             status
                         } else {
@@ -1695,11 +1689,7 @@ impl LoadedPlugin {
                     }
                     None => status.code().unwrap_or(0),
                     Some(other) => {
-                        return Err(PluginError::ServiceProtocol {
-                            details: format!(
-                                "unexpected process runtime response for lifecycle invocation: {other:?}"
-                            ),
-                        });
+                        return Err(Self::unexpected_process_response("lifecycle", &other));
                     }
                 }
             }
@@ -1730,7 +1720,7 @@ impl LoadedPlugin {
         let argv = std::iter::once(command_name.to_string())
             .chain(arguments.iter().cloned())
             .collect::<Vec<_>>();
-        let (response, status) = runtime.invoke(self.declaration.id.as_str(), &argv, &request)?;
+        let (response, status) = self.invoke_process(runtime, &argv, &request)?;
 
         if let Some(response) = response {
             return match response {
@@ -1739,13 +1729,7 @@ impl LoadedPlugin {
                     status,
                     outcome,
                 } => {
-                    if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
-                        return Err(PluginError::ServiceProtocol {
-                            details: format!(
-                                "unsupported process runtime command response protocol version: {protocol_version}"
-                            ),
-                        });
-                    }
+                    Self::ensure_process_protocol_version("command", protocol_version)?;
                     Ok((
                         status,
                         outcome.unwrap_or(bmux_plugin_sdk::PluginCommandOutcome {
@@ -1758,20 +1742,10 @@ impl LoadedPlugin {
                     details,
                     status: _,
                 } => {
-                    if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
-                        return Err(PluginError::ServiceProtocol {
-                            details: format!(
-                                "unsupported process runtime error response protocol version: {protocol_version}"
-                            ),
-                        });
-                    }
-                    Err(PluginError::ServiceProtocol { details })
+                    Self::process_error_to_result("command", protocol_version, details)?;
+                    unreachable!("process_error_to_result always returns Err")
                 }
-                other => Err(PluginError::ServiceProtocol {
-                    details: format!(
-                        "unexpected process runtime response for command invocation: {other:?}"
-                    ),
-                }),
+                other => Err(Self::unexpected_process_response("command", &other)),
             };
         }
 
