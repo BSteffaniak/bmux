@@ -1141,6 +1141,17 @@ pub enum SandboxCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Bundle sandbox diagnostics and logs into a single directory
+    Bundle {
+        /// Sandbox id (bmux-sbx-...) or full path
+        target: String,
+        /// Optional output directory path (default: ./sandbox-bundles)
+        #[arg(long)]
+        output: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove orphaned sandbox temp directories from sandbox runs
     Cleanup {
         /// Only list orphaned dirs without deleting
@@ -4001,6 +4012,31 @@ mod tests {
                 id: Some(id),
                 json: true,
             } if id == "bmux-sbx-123"
+        ));
+    }
+
+    #[test]
+    fn parses_sandbox_bundle() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "sandbox",
+            "bundle",
+            "bmux-sbx-123",
+            "--output",
+            "./artifacts",
+            "--json",
+        ])
+        .expect("valid bundle args");
+        let Some(Command::Sandbox { command }) = cli.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Bundle {
+                target,
+                output: Some(output),
+                json: true,
+            } if target == "bmux-sbx-123" && output == "./artifacts"
         ));
     }
 

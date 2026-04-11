@@ -123,8 +123,8 @@ use remote_cli::{
     run_share, run_target_proxy_from_current_argv, run_unshare, should_proxy_to_target,
 };
 use sandbox_cli::{
-    RunSandboxOptions, run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect,
-    run_sandbox_list, run_sandbox_run,
+    RunSandboxOptions, run_sandbox_bundle, run_sandbox_cleanup, run_sandbox_doctor,
+    run_sandbox_inspect, run_sandbox_list, run_sandbox_run,
 };
 use server_commands::{
     run_server_bridge, run_server_gateway, run_server_recording_clear, run_server_recording_path,

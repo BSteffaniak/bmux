@@ -571,6 +571,55 @@ pub(super) fn run_sandbox_doctor(id: Option<&str>, json: bool) -> Result<u8> {
     Ok(u8::from(!ok))
 }
 
+pub(super) fn run_sandbox_bundle(target: &str, output: Option<&str>, json: bool) -> Result<u8> {
+    let root = resolve_sandbox_target(target)?;
+    let manifest = read_manifest(&root)?;
+
+    let output_root = output.map_or_else(
+        || {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("sandbox-bundles")
+        },
+        PathBuf::from,
+    );
+    std::fs::create_dir_all(&output_root)
+        .with_context(|| format!("failed creating {}", output_root.display()))?;
+
+    let bundle_dir = output_root.join(format!("{}-{}", manifest.id, unix_millis_now()));
+    std::fs::create_dir_all(&bundle_dir)
+        .with_context(|| format!("failed creating {}", bundle_dir.display()))?;
+
+    copy_if_exists(&root.join(MANIFEST_FILE), &bundle_dir.join(MANIFEST_FILE))?;
+    copy_if_exists(
+        &root.join(PID_MARKER_FILE),
+        &bundle_dir.join(PID_MARKER_FILE),
+    )?;
+    copy_if_exists(&root.join(LOCK_FILE), &bundle_dir.join(LOCK_FILE))?;
+
+    let logs_src = root.join("logs");
+    if logs_src.exists() {
+        copy_directory_recursive(&logs_src, &bundle_dir.join("logs"))?;
+    }
+
+    let repro_path = bundle_dir.join("repro.txt");
+    std::fs::write(&repro_path, format_repro_command_from_manifest(&manifest))
+        .with_context(|| format!("failed writing {}", repro_path.display()))?;
+
+    if json {
+        let payload = serde_json::json!({
+            "bundle_dir": bundle_dir.to_string_lossy().to_string(),
+            "sandbox_root": root.to_string_lossy().to_string(),
+            "sandbox_id": manifest.id,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("sandbox bundle created: {}", bundle_dir.display());
+    }
+
+    Ok(0)
+}
+
 fn append_target_doctor_checks(checks: &mut Vec<DoctorCheck>, target: &str) {
     match resolve_sandbox_target(target) {
         Ok(root) => {
@@ -598,6 +647,35 @@ fn append_target_doctor_checks(checks: &mut Vec<DoctorCheck>, target: &str) {
             detail: error.to_string(),
         }),
     }
+}
+
+fn copy_if_exists(source: &Path, destination: &Path) -> Result<()> {
+    if source.exists() {
+        std::fs::copy(source, destination)
+            .with_context(|| format!("failed copying {}", source.display()))?;
+    }
+    Ok(())
+}
+
+fn copy_directory_recursive(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::create_dir_all(destination)
+        .with_context(|| format!("failed creating {}", destination.display()))?;
+
+    for entry in
+        std::fs::read_dir(source).with_context(|| format!("failed reading {}", source.display()))?
+    {
+        let entry = entry.with_context(|| "failed reading directory entry".to_string())?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_directory_recursive(&source_path, &destination_path)?;
+        } else {
+            std::fs::copy(&source_path, &destination_path)
+                .with_context(|| format!("failed copying {}", source_path.display()))?;
+        }
+    }
+
+    Ok(())
 }
 
 pub(super) fn run_sandbox_cleanup(

@@ -117,6 +117,7 @@ pub enum BuiltInHandlerId {
     SandboxList,
     SandboxInspect,
     SandboxDoctor,
+    SandboxBundle,
     SandboxCleanup,
 }
 
@@ -722,6 +723,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::SandboxDoctor,
             &["sandbox", "doctor"],
             "Run health checks for sandbox workflows",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxBundle,
+            &["sandbox", "bundle"],
+            "Bundle sandbox diagnostics and logs",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SandboxCleanup,
