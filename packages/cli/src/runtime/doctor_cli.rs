@@ -93,6 +93,8 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
         ),
     ];
 
+    let has_failures = lines.iter().any(|(_, ok, _, _)| !*ok);
+
     if as_json {
         let checks: serde_json::Map<String, serde_json::Value> = lines
             .iter()
@@ -109,16 +111,21 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
                 .context("failed to encode hosted doctor json")?
         );
     } else {
+        if has_failures {
+            println!("Status: not ready");
+            println!("Fix: bmux setup");
+        } else {
+            println!("Status: ready");
+        }
         for (name, ok, hint, detail) in &lines {
             if *ok {
-                println!("{name}: PASS ({detail})");
+                println!("{name}: ok ({detail})");
             } else {
-                println!("{name}: FAIL ({detail}) | Fix: bmux setup | Advanced: {hint}");
+                println!("{name}: fail ({detail}) | Advanced: {hint}");
             }
         }
     }
 
-    let has_failures = lines.iter().any(|(_, ok, _, _)| !*ok);
     Ok(u8::from(has_failures))
 }
 

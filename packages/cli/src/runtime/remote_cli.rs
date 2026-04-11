@@ -667,7 +667,6 @@ pub(super) async fn run_setup(check: bool, mode: Option<HostedModeArg>) -> Resul
 }
 
 fn run_setup_check(mode: HostedMode) -> Result<u8> {
-    println!("bmux setup --check");
     let paths = ConfigPaths::default();
     let auth_state = load_auth_state_optional(&paths)?;
     let host_state = load_host_runtime_state(&paths)?;
@@ -699,7 +698,7 @@ fn run_setup_check(mode: HostedMode) -> Result<u8> {
         ) {
             println!("{line}");
         }
-        println!("Setup check: ready");
+        println!("Status: ready");
         return Ok(0);
     }
 
@@ -783,7 +782,7 @@ fn format_setup_check_not_ready_lines(
     };
 
     let mut lines = vec![
-        "Setup check: not ready".to_string(),
+        "Status: not ready".to_string(),
         format!("Reason: {reason_text}"),
         "Fix: bmux setup".to_string(),
     ];
@@ -4856,7 +4855,7 @@ mod tests {
             SetupHostCheck::Offline,
             SetupShareCheck::RequiredMissing,
         );
-        assert_eq!(lines[0], "Setup check: not ready");
+        assert_eq!(lines[0], "Status: not ready");
         assert_eq!(lines[1], "Reason: not signed in; host is offline");
         assert_eq!(lines[2], "Fix: bmux setup");
         assert_eq!(lines[3], "Advanced: bmux auth login");
