@@ -222,20 +222,6 @@ value_name = "PANE"
 
 [[commands.arguments]]
 kind       = "string"
-long       = "on-failure"
-name       = "on_failure"
-required   = false
-value_name = "POLICY"
-
-[[commands.arguments]]
-kind       = "string"
-long       = "retries"
-name       = "retries"
-required   = false
-value_name = "COUNT"
-
-[[commands.arguments]]
-kind       = "string"
 long       = "host"
 name       = "host"
 short      = "h"
@@ -267,3 +253,17 @@ name       = "pane_ref"
 position   = 0
 required   = false
 value_name = "PANE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "on-failure"
+name       = "on_failure"
+required   = false
+value_name = "POLICY"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "retries"
+name       = "retries"
+required   = false
+value_name = "COUNT"

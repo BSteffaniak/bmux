@@ -25,12 +25,13 @@ Current scope:
 - `cluster pane retry` supports probe retry policy controls (`--retries`, `--on-failure=abort|continue|prompt`)
 - Cluster service interfaces are implemented for query/command/event-list integrations
 
-## Commands (Scaffolded)
+## Commands
 
 - `cluster up`
 - `cluster status`
 - `cluster doctor`
 - `cluster hosts`
+- `cluster events`
 - `cluster pane new`
 - `cluster pane move`
 - `cluster pane retry`
