@@ -813,6 +813,28 @@ mod tests {
     }
 
     #[test]
+    fn command_lookup_includes_new_config_profiles_explain_handler() {
+        let command = built_in_command_by_handler(BuiltInHandlerId::ConfigProfilesExplain);
+        assert_eq!(
+            command.canonical_path,
+            vec![
+                "config".to_string(),
+                "profiles".to_string(),
+                "explain".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn command_lookup_includes_new_keymap_explain_handler() {
+        let command = built_in_command_by_handler(BuiltInHandlerId::KeymapExplain);
+        assert_eq!(
+            command.canonical_path,
+            vec!["keymap".to_string(), "explain".to_string()]
+        );
+    }
+
+    #[test]
     fn migrated_plugin_owned_commands_are_not_in_core_execution_table() {
         let paths = built_in_execution_commands()
             .into_iter()

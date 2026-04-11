@@ -1736,15 +1736,15 @@ pub enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessCommand, AuthCommand, Cli, Command, GatewayHostMode, HostedModeArg, KeymapCommand,
-        LogsCommand, LogsProfilesCommand, PerfCommand, PerfProfileArg, PlaybookCommand,
-        RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
-        RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
-        RecordingEventKindArg, RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg,
-        RecordingListStatusArg, RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode,
-        RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, SandboxCommand,
-        SandboxEnvModeArg, SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand,
-        TerminalCommand, TraceFamily,
+        AccessCommand, AuthCommand, Cli, Command, ConfigCommand, ConfigProfilesCommand,
+        GatewayHostMode, HostedModeArg, KeymapCommand, LogsCommand, LogsProfilesCommand,
+        PerfCommand, PerfProfileArg, PlaybookCommand, RecordingCommand, RecordingCursorBlinkMode,
+        RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile,
+        RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
+        RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
+        RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+        RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg, SandboxStatusArg,
+        ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -1755,6 +1755,74 @@ mod tests {
             panic!("expected keymap subcommand");
         };
         assert!(matches!(command, KeymapCommand::Doctor { json: false }));
+    }
+
+    #[test]
+    fn parses_keymap_explain_subcommand() {
+        let cli = Cli::try_parse_from([
+            "bmux", "keymap", "explain", "ctrl+b n", "--mode", "normal", "--json",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Keymap { command }) = cli.command else {
+            panic!("expected keymap subcommand");
+        };
+        assert!(matches!(
+            command,
+            KeymapCommand::Explain { key, mode, json }
+                if key == "ctrl+b n" && mode.as_deref() == Some("normal") && json
+        ));
+    }
+
+    #[test]
+    fn parses_config_profiles_explain_subcommand() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "config",
+            "profiles",
+            "explain",
+            "zellij_compat",
+            "--json",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Config {
+            command: ConfigCommand::Profiles { command },
+        }) = cli.command
+        else {
+            panic!("expected config profiles command");
+        };
+        assert!(matches!(
+            command,
+            ConfigProfilesCommand::Explain { profile, json }
+                if profile.as_deref() == Some("zellij_compat") && json
+        ));
+    }
+
+    #[test]
+    fn parses_config_profiles_switch_dry_run_subcommand() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "config",
+            "profiles",
+            "switch",
+            "tmux_compat",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Config {
+            command: ConfigCommand::Profiles { command },
+        }) = cli.command
+        else {
+            panic!("expected config profiles command");
+        };
+        assert!(matches!(
+            command,
+            ConfigProfilesCommand::Switch {
+                profile,
+                dry_run,
+                json,
+            } if profile == "tmux_compat" && dry_run && json
+        ));
     }
 
     #[test]

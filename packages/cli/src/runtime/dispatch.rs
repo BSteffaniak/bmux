@@ -1528,3 +1528,57 @@ const fn recording_event_kind_arg_to_ipc(kind: RecordingEventKindArg) -> Recordi
         RecordingEventKindArg::Custom => RecordingEventKind::Custom,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[allow(clippy::wildcard_imports)]
+    use super::*;
+
+    #[test]
+    fn built_in_handler_maps_config_profiles_explain() {
+        let command = Command::Config {
+            command: ConfigCommand::Profiles {
+                command: ConfigProfilesCommand::Explain {
+                    profile: Some("vim".to_string()),
+                    json: false,
+                },
+            },
+        };
+        assert_eq!(
+            built_in_handler_for_command(&command),
+            BuiltInHandlerId::ConfigProfilesExplain
+        );
+    }
+
+    #[test]
+    fn built_in_handler_maps_config_profiles_switch_with_dry_run() {
+        let command = Command::Config {
+            command: ConfigCommand::Profiles {
+                command: ConfigProfilesCommand::Switch {
+                    profile: "tmux_compat".to_string(),
+                    dry_run: true,
+                    json: true,
+                },
+            },
+        };
+        assert_eq!(
+            built_in_handler_for_command(&command),
+            BuiltInHandlerId::ConfigProfilesSwitch
+        );
+    }
+
+    #[test]
+    fn built_in_handler_maps_keymap_explain() {
+        let command = Command::Keymap {
+            command: KeymapCommand::Explain {
+                key: "ctrl+b n".to_string(),
+                mode: Some("normal".to_string()),
+                json: true,
+            },
+        };
+        assert_eq!(
+            built_in_handler_for_command(&command),
+            BuiltInHandlerId::KeymapExplain
+        );
+    }
+}
