@@ -1,4 +1,4 @@
-use crate::{PluginDeclaration, PluginManifest};
+use crate::{PluginDeclaration, PluginEntrypoint, PluginManifest};
 use bmux_plugin_sdk::{HostMetadata, HostScope, PluginError, RegisteredService, Result};
 use semver::Version;
 use std::collections::BTreeMap;
@@ -356,17 +356,29 @@ impl PluginRegistry {
     ) -> Result<()> {
         Self::validate_plugin_compat(registered_plugin, host, available_capabilities)?;
 
-        if let Some(entry_path) = registered_plugin.manifest.resolve_entry_path(
-            registered_plugin
-                .manifest_path
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-        ) && !entry_path.exists()
-        {
-            return Err(PluginError::MissingEntryFile {
-                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                path: entry_path,
-            });
+        match &registered_plugin.declaration.entrypoint {
+            PluginEntrypoint::Native { .. } => {
+                if let Some(entry_path) = registered_plugin.manifest.resolve_entry_path(
+                    registered_plugin
+                        .manifest_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new(".")),
+                ) && !entry_path.exists()
+                {
+                    return Err(PluginError::MissingEntryFile {
+                        plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                        path: entry_path,
+                    });
+                }
+            }
+            PluginEntrypoint::Process { command, .. } => {
+                if !process_command_is_available(registered_plugin, command) {
+                    return Err(PluginError::MissingEntryFile {
+                        plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                        path: PathBuf::from(command),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -488,6 +500,27 @@ impl PluginRegistry {
 
         Ok(())
     }
+}
+
+fn process_command_is_available(registered_plugin: &RegisteredPlugin, command: &str) -> bool {
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return registered_plugin
+            .manifest
+            .resolve_entry_path(
+                registered_plugin
+                    .manifest_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(".")),
+            )
+            .is_some_and(|resolved| resolved.exists());
+    }
+
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths)
+            .map(|path| path.join(command))
+            .any(|candidate| candidate.exists())
+    })
 }
 
 #[cfg(test)]

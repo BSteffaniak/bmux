@@ -161,6 +161,13 @@ pub enum PluginError {
         details: String,
     },
 
+    #[error("failed to spawn process plugin '{plugin_id}' command '{command}': {details}")]
+    ProcessPluginSpawn {
+        plugin_id: String,
+        command: String,
+        details: String,
+    },
+
     #[error("failed to resolve entry symbol '{symbol}' for plugin '{plugin_id}': {details}")]
     NativeEntrySymbol {
         plugin_id: String,

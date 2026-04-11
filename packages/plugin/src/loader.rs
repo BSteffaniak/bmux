@@ -42,6 +42,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tracing::{debug, error, info, trace, warn};
 
 type PluginEntryFn = unsafe extern "C" fn() -> *const c_char;
@@ -64,6 +65,15 @@ enum PluginBackend {
     Dynamic(Library),
     /// Statically linked into the binary (bundled plugins behind feature flags).
     Static(StaticPluginVtable),
+    /// External process plugin runtime.
+    Process(ProcessPluginRuntime),
+}
+
+#[derive(Debug, Clone)]
+struct ProcessPluginRuntime {
+    command: String,
+    args: Vec<String>,
+    current_dir: Option<PathBuf>,
 }
 
 thread_local! {
@@ -1123,7 +1133,14 @@ impl LoadedPlugin {
                         return Ok((status, outcome));
                     }
                 }
+                PluginBackend::Process(_) => {
+                    return self.run_process_command(command_name, arguments, Some(context));
+                }
             }
+        }
+
+        if matches!(self.backend, PluginBackend::Process(_)) {
+            return self.run_process_command(command_name, arguments, None);
         }
 
         // Fallback: use the legacy run_command symbol (dynamic only)
@@ -1235,6 +1252,7 @@ impl LoadedPlugin {
                     )?;
                 unsafe { event_symbol(payload.as_ptr(), payload.len()) }
             }
+            PluginBackend::Process(_) => return Ok(None),
         };
 
         Ok(Some(status))
@@ -1267,6 +1285,12 @@ impl LoadedPlugin {
                     )?;
                 Some(sym)
             }
+            PluginBackend::Process(_) => {
+                return Err(PluginError::UnsupportedPluginRuntime {
+                    plugin_id: self.declaration.id.as_str().to_string(),
+                    runtime: "process-services".to_string(),
+                });
+            }
         };
 
         let call_service = |payload: &[u8], output: &mut [u8], output_len: &mut usize| -> i32 {
@@ -1292,6 +1316,7 @@ impl LoadedPlugin {
                         )
                     }
                 }
+                PluginBackend::Process(_) => NATIVE_SERVICE_STATUS_OK,
             }
         };
 
@@ -1359,9 +1384,59 @@ impl LoadedPlugin {
                 })?;
                 unsafe { lifecycle_symbol(payload.as_ptr(), payload.len()) }
             }
+            PluginBackend::Process(_) => 0,
         };
 
         Ok(status)
+    }
+
+    fn run_process_command(
+        &self,
+        command_name: &str,
+        arguments: &[String],
+        context: Option<&NativeCommandContext>,
+    ) -> Result<(i32, bmux_plugin_sdk::PluginCommandOutcome)> {
+        let PluginBackend::Process(runtime) = &self.backend else {
+            return Err(PluginError::ServiceProtocol {
+                details: "run_process_command called for non-process backend".to_string(),
+            });
+        };
+
+        let mut command = Command::new(&runtime.command);
+        if let Some(current_dir) = &runtime.current_dir {
+            command.current_dir(current_dir);
+        }
+        command.args(&runtime.args);
+        command.arg(command_name);
+        command.args(arguments);
+        command.env("BMUX_PLUGIN_ID", self.declaration.id.as_str());
+        command.env("BMUX_PLUGIN_COMMAND", command_name);
+
+        if let Ok(arguments_json) = serde_json::to_string(arguments) {
+            command.env("BMUX_PLUGIN_ARGUMENTS_JSON", arguments_json);
+        }
+        if let Some(context) = context {
+            let context_json =
+                serde_json::to_string(context).map_err(|error| PluginError::ServiceProtocol {
+                    details: format!("failed encoding process plugin context json: {error}"),
+                })?;
+            command.env("BMUX_PLUGIN_CONTEXT_JSON", context_json);
+        }
+
+        let status = command
+            .status()
+            .map_err(|error| PluginError::ProcessPluginSpawn {
+                plugin_id: self.declaration.id.as_str().to_string(),
+                command: runtime.command.clone(),
+                details: error.to_string(),
+            })?;
+
+        Ok((
+            status.code().unwrap_or(1),
+            bmux_plugin_sdk::PluginCommandOutcome {
+                effects: Vec::new(),
+            },
+        ))
     }
 }
 
@@ -1384,18 +1459,28 @@ impl NativePluginLoader {
         host: &HostMetadata,
         available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
     ) -> Result<LoadedPlugin> {
-        if let PluginEntrypoint::Process { .. } = &registered_plugin.declaration.entrypoint {
-            return Err(PluginError::UnsupportedPluginRuntime {
-                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                runtime: "process".to_string(),
-            });
-        }
-
         PluginRegistry::validate_registered_plugin(
             registered_plugin,
             host,
             available_capabilities,
         )?;
+
+        if let PluginEntrypoint::Process { command, args } =
+            &registered_plugin.declaration.entrypoint
+        {
+            return Ok(LoadedPlugin {
+                registered: registered_plugin.clone(),
+                declaration: registered_plugin.declaration.clone(),
+                backend: PluginBackend::Process(ProcessPluginRuntime {
+                    command: command.clone(),
+                    args: args.clone(),
+                    current_dir: registered_plugin
+                        .manifest_path
+                        .parent()
+                        .map(Path::to_path_buf),
+                }),
+            });
+        }
 
         let entry_path = registered_plugin
             .manifest
