@@ -1226,7 +1226,6 @@ pub(super) fn run_hosts(verbose: bool) -> Result<u8> {
     if auth_ready && host_running {
         println!("Status: ready");
     } else {
-        println!("Status: not ready");
         let reason = match (auth_ready, host_running, host_state.as_ref()) {
             (false, false, Some(state)) => {
                 format!("not signed in; host state is stale (pid {})", state.pid)
@@ -1237,15 +1236,14 @@ pub(super) fn run_hosts(verbose: bool) -> Result<u8> {
             (true, false, None) => "host is offline".to_string(),
             (true, true, _) => "not ready".to_string(),
         };
-        println!("Reason: {reason}");
+        println!("Status: not ready ({reason})");
         println!("Fix: bmux setup");
     }
 
     if !config.connections.share_links.is_empty() {
         println!("share links:");
         for (name, target) in &config.connections.share_links {
-            println!("- bmux://{name}");
-            println!("  next: bmux join bmux://{name}");
+            println!("- bmux://{name} (join: bmux join bmux://{name})");
             if verbose {
                 println!("  target: {target}");
             }
@@ -1260,8 +1258,7 @@ pub(super) fn run_hosts(verbose: bool) -> Result<u8> {
                 ConnectionTransport::Tls => "tls",
                 ConnectionTransport::Iroh => "iroh",
             };
-            println!("- {name}");
-            println!("  next: bmux connect {name}");
+            println!("- {name} (connect: bmux connect {name})");
             if verbose {
                 println!("  transport: {transport}");
             }
@@ -1272,7 +1269,7 @@ pub(super) fn run_hosts(verbose: bool) -> Result<u8> {
         for target in &config.connections.recent_targets {
             println!("- {target}");
             if verbose {
-                println!("  next: bmux join {target}");
+                println!("  join: bmux join {target}");
             }
         }
     }

@@ -113,9 +113,7 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
             if *ok {
                 println!("{name}: PASS ({detail})");
             } else {
-                println!("{name}: FAIL ({detail})");
-                println!("  Fix: bmux setup");
-                println!("  Advanced: {hint}");
+                println!("{name}: FAIL ({detail}) | Fix: bmux setup | Advanced: {hint}");
             }
         }
     }
