@@ -107,8 +107,11 @@ bmux --runtime dev host
 # Ephemeral sandbox run (fully isolated config/runtime/data/state/logs)
 bmux sandbox run -- server status
 bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode inherit -- --version
+bmux sandbox dev -- server status
 bmux sandbox list --limit 10
-bmux sandbox inspect bmux-sbx-123 --tail 120
+bmux sandbox inspect --latest
+bmux sandbox inspect --latest-failed --tail 120
+bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 bmux sandbox doctor --json
 bmux sandbox cleanup --dry-run --json
 # Optional control-plane mode for account/share links
@@ -162,6 +165,11 @@ Logging defaults:
 Environment overrides:
 
 - `BMUX_LOG_LEVEL`: effective runtime log level
+
+Runtime selection vs sandbox isolation:
+
+- Use `--runtime <name>` to run multiple local bmux runtime instances side-by-side while still using your normal config/data/state roots.
+- Use `bmux sandbox ...` when you want a throwaway isolated environment (config/runtime/data/state/logs/home/tmp) for safe local build testing and failure triage.
 - `BMUX_LOG_DIR`: explicit log directory
 - `BMUX_STATE_DIR`: explicit state directory
 - `BMUX_TARGET`: default command target (same behavior as `--target`)

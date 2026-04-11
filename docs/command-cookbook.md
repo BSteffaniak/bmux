@@ -40,6 +40,9 @@ bmux logs tail --since 15m --lines 200 --no-follow
 # Run a bmux command in a clean isolated sandbox
 bmux sandbox run -- server status
 
+# Dev shortcut (keep artifacts on failures, prefers ./target/debug/bmux when present)
+bmux sandbox dev -- server status
+
 # Test a specific local bmux build in isolation
 bmux sandbox run --bmux-bin ./target/debug/bmux -- attach
 
@@ -61,11 +64,30 @@ bmux sandbox run --print-env -- server status
 # Discover recent sandboxes and inspect one
 bmux sandbox list --limit 10
 bmux sandbox inspect bmux-sbx-123 --tail 120
+bmux sandbox inspect --latest
+bmux sandbox inspect --latest-failed --tail 120
 
 # Health checks for sandbox runtime
 bmux sandbox doctor --json
 
+# Bundle diagnostics and logs for sharing
+bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
+bmux sandbox bundle bmux-sbx-123 --json
+
 # Clean up orphaned sandbox directories
 bmux sandbox cleanup --dry-run --json
 bmux sandbox cleanup --failed-only --older-than 600
+```
+
+## Sandbox Daily Loop
+
+```bmux-cli
+# 1) Validate your local build in isolation
+bmux sandbox dev --bmux-bin ./target/debug/bmux -- server status
+
+# 2) Re-check the most recent failed run
+bmux sandbox inspect --latest-failed --tail 200
+
+# 3) Package logs + repro metadata for teammates
+bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 ```

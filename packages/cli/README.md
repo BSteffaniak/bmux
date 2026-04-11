@@ -81,9 +81,12 @@ bmux --runtime dev host
 
 # sandboxed runs (isolated config/runtime/data/state/logs)
 bmux sandbox run -- server status
+bmux sandbox dev -- server status
 bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode inherit -- attach
 bmux sandbox list --limit 10
-bmux sandbox inspect bmux-sbx-123 --tail 120
+bmux sandbox inspect --latest
+bmux sandbox inspect --latest-failed --tail 120
+bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 bmux sandbox doctor --json
 bmux sandbox cleanup --dry-run --json
 # opt-in control-plane mode (hard-fails if control-plane operations fail)
