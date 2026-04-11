@@ -910,7 +910,7 @@ mod tests {
     use bmux_cli_schema::Cli;
     use bmux_config::{BmuxConfig, ConfigDocSchema};
     use clap::Parser;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1060,6 +1060,70 @@ mod tests {
         panic!("docs snippet validation failures:\n{report}");
     }
 
+    #[test]
+    fn markdown_snippet_coverage_report() {
+        let mut file_rows = Vec::new();
+        let mut total_fenced = 0usize;
+        let mut total_opt_in = 0usize;
+        let mut tag_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+        for file in markdown_sources() {
+            let content = fs::read_to_string(&file)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()));
+            let blocks = parse_fenced_blocks(&content);
+            let fenced = blocks.len();
+            let opt_in = blocks
+                .iter()
+                .filter(|block| is_opt_in_tag(&block.language))
+                .count();
+
+            for block in &blocks {
+                if is_opt_in_tag(&block.language) {
+                    *tag_counts.entry(block.language.clone()).or_default() += 1;
+                }
+            }
+
+            total_fenced += fenced;
+            total_opt_in += opt_in;
+
+            if fenced > 0 || opt_in > 0 {
+                file_rows.push((file, fenced, opt_in));
+            }
+        }
+
+        let percent = if total_fenced == 0 {
+            0.0
+        } else {
+            (total_opt_in as f64 / total_fenced as f64) * 100.0
+        };
+
+        let mut report = String::new();
+        report.push_str("docs snippet coverage report\n");
+        report.push_str(&format!(
+            "opt-in validated: {total_opt_in}/{total_fenced} ({percent:.1}%)\n"
+        ));
+        report.push_str("by tag:\n");
+        for (tag, count) in &tag_counts {
+            report.push_str(&format!("  - {tag}: {count}\n"));
+        }
+        report.push_str("by file:\n");
+        for (file, fenced, opt_in) in &file_rows {
+            report.push_str(&format!(
+                "  - {}: {opt_in}/{fenced}\n",
+                file.strip_prefix(workspace_root())
+                    .unwrap_or(file)
+                    .display()
+            ));
+        }
+
+        eprintln!("{report}");
+
+        assert!(
+            total_opt_in > 0,
+            "expected at least one opt-in snippet block; add a fenced block with one of: bmux-cli, bmux-playbook, bmux-config"
+        );
+    }
+
     #[derive(Debug)]
     struct FencedBlock {
         language: String,
@@ -1108,6 +1172,10 @@ mod tests {
         }
 
         blocks
+    }
+
+    fn is_opt_in_tag(language: &str) -> bool {
+        matches!(language, "bmux-cli" | "bmux-playbook" | "bmux-config")
     }
 
     fn validate_cli_block(content: &str) -> Result<(), String> {

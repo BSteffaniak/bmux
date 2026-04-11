@@ -33,3 +33,6 @@ scrollback_limit = 10000
 - Use regular markdown fences (`bash`, `sh`, `toml`) for examples you do not
   want validated.
 - Tag only high-value snippets first, then expand coverage over time.
+
+CI also prints a coverage report showing how many fenced code blocks are
+opt-in validated across docs files.

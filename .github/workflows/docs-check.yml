@@ -50,6 +50,9 @@ jobs:
       - name: Validate docs snippets
         run: cargo test -p bmux_docs_site_ui markdown_opt_in_snippets_are_valid
 
+      - name: Report docs snippet coverage
+        run: cargo test -p bmux_docs_site_ui markdown_snippet_coverage_report -- --nocapture
+
       - name: Validate docs source sections
         run: cargo test -p bmux_docs_site_ui markdown_section_headings_used_by_docs_routes_exist
 
