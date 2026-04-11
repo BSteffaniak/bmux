@@ -2359,6 +2359,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_cluster_up_args_supports_abort_policy() {
+        let parsed = parse_cluster_up_args(&["prod".to_string(), "--on-failure=abort".to_string()])
+            .expect("arguments should parse");
+        assert_eq!(parsed.on_failure, RetryFailurePolicy::Abort);
+    }
+
+    #[test]
     fn parse_cluster_up_args_requires_cluster() {
         let error = parse_cluster_up_args(&["--host".to_string(), "db-a".to_string()])
             .expect_err("cluster argument should be required");
@@ -2425,6 +2432,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_cluster_pane_retry_args_supports_continue_policy() {
+        let parsed = parse_cluster_pane_retry_args(&[
+            "--on-failure=continue".to_string(),
+            "--retries=1".to_string(),
+        ])
+        .expect("retry args should parse");
+        assert_eq!(parsed.on_failure, RetryFailurePolicy::Continue);
+        assert_eq!(parsed.retries, 1);
+    }
+
+    #[test]
     fn parse_cluster_events_args_defaults_to_text() {
         let parsed = parse_cluster_events_args(&[]).expect("events args should parse");
         assert_eq!(parsed.format, ClusterEventsFormat::Text);
@@ -2472,6 +2490,97 @@ mod tests {
         let error = parse_cluster_events_args(&["--since".to_string(), "abc".to_string()])
             .expect_err("invalid since should be rejected");
         assert!(error.contains("relative duration"));
+    }
+
+    #[test]
+    fn filter_cluster_events_applies_combined_filters_and_tail_limit() {
+        let events = vec![
+            ClusterConnectionEvent {
+                ts_unix_ms: 10,
+                pane_id: Some("p1".to_string()),
+                cluster: Some("prod".to_string()),
+                target: Some("db-a".to_string()),
+                source: Some("up".to_string()),
+                state: ClusterConnectionState::Connecting,
+                message: "launching".to_string(),
+            },
+            ClusterConnectionEvent {
+                ts_unix_ms: 20,
+                pane_id: Some("p2".to_string()),
+                cluster: Some("prod".to_string()),
+                target: Some("db-a".to_string()),
+                source: Some("retry".to_string()),
+                state: ClusterConnectionState::Retrying,
+                message: "retrying".to_string(),
+            },
+            ClusterConnectionEvent {
+                ts_unix_ms: 30,
+                pane_id: Some("p3".to_string()),
+                cluster: Some("prod".to_string()),
+                target: Some("db-a".to_string()),
+                source: Some("retry".to_string()),
+                state: ClusterConnectionState::Retrying,
+                message: "retrying-again".to_string(),
+            },
+            ClusterConnectionEvent {
+                ts_unix_ms: 40,
+                pane_id: Some("p4".to_string()),
+                cluster: Some("prod".to_string()),
+                target: Some("db-b".to_string()),
+                source: Some("up".to_string()),
+                state: ClusterConnectionState::Failed,
+                message: "failed".to_string(),
+            },
+        ];
+        let args = ClusterEventsArgs {
+            format: ClusterEventsFormat::Text,
+            cluster: Some("prod".to_string()),
+            target: Some("db-a".to_string()),
+            state: Some(ClusterConnectionState::Retrying),
+            since_unix_ms: Some(15),
+            limit: Some(1),
+        };
+
+        let filtered = filter_cluster_events(events, &args);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pane_id.as_deref(), Some("p3"));
+        assert_eq!(filtered[0].message, "retrying-again");
+    }
+
+    #[test]
+    fn filter_cluster_events_applies_since_cutoff() {
+        let events = vec![
+            ClusterConnectionEvent {
+                ts_unix_ms: 100,
+                pane_id: None,
+                cluster: Some("prod".to_string()),
+                target: Some("db-a".to_string()),
+                source: Some("up".to_string()),
+                state: ClusterConnectionState::Connecting,
+                message: "old".to_string(),
+            },
+            ClusterConnectionEvent {
+                ts_unix_ms: 200,
+                pane_id: None,
+                cluster: Some("prod".to_string()),
+                target: Some("db-a".to_string()),
+                source: Some("up".to_string()),
+                state: ClusterConnectionState::Ready,
+                message: "new".to_string(),
+            },
+        ];
+        let args = ClusterEventsArgs {
+            format: ClusterEventsFormat::Text,
+            cluster: None,
+            target: None,
+            state: None,
+            since_unix_ms: Some(150),
+            limit: None,
+        };
+
+        let filtered = filter_cluster_events(events, &args);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].message, "new");
     }
 
     #[test]
