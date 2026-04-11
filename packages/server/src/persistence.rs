@@ -567,6 +567,7 @@ mod tests {
         PaneLayoutNodeSnapshotV2, PaneSnapshotV2, SessionSnapshotV3, SnapshotError,
         SnapshotManager, SnapshotV4,
     };
+    use bmux_ipc::PaneLaunchCommand;
     use std::collections::BTreeMap;
     use uuid::Uuid;
 
@@ -629,6 +630,51 @@ mod tests {
         assert_eq!(decoded, snapshot);
         assert_eq!(decoded.sessions[0].id, session_id);
         assert_eq!(decoded.sessions[0].panes[0].id, window_id);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_persists_launch_command() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+
+        let snapshot = SnapshotV4 {
+            sessions: vec![SessionSnapshotV3 {
+                id: session_id,
+                name: Some("dev".to_string()),
+                panes: vec![PaneSnapshotV2 {
+                    id: pane_id,
+                    name: Some("remote-a".to_string()),
+                    shell: "/bin/sh".to_string(),
+                    launch_command: Some(PaneLaunchCommand {
+                        program: "ssh".to_string(),
+                        args: vec!["host-a".to_string()],
+                        cwd: Some("/tmp".to_string()),
+                        env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
+                    }),
+                    process_group_id: None,
+                    active_command: None,
+                    active_command_source: None,
+                    last_known_cwd: None,
+                }],
+                focused_pane_id: Some(pane_id),
+                layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id }),
+                floating_surfaces: vec![],
+            }],
+            follows: vec![],
+            selected_sessions: vec![],
+            contexts: vec![],
+            context_session_bindings: vec![],
+            selected_contexts: vec![],
+            mru_contexts: vec![],
+        };
+
+        let encoded = SnapshotManager::encode_snapshot(&snapshot).expect("snapshot should encode");
+        let decoded = SnapshotManager::decode_snapshot(&encoded).expect("snapshot should decode");
+
+        assert_eq!(
+            decoded.sessions[0].panes[0].launch_command,
+            snapshot.sessions[0].panes[0].launch_command
+        );
     }
 
     #[test]

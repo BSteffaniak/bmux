@@ -2378,6 +2378,12 @@ mod tests {
                     session_id: uuid::Uuid::new_v4(),
                 })
             }
+            bmux_ipc::Request::LaunchPane { .. } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneLaunched {
+                    id: uuid::Uuid::new_v4(),
+                    session_id: uuid::Uuid::new_v4(),
+                })
+            }
             bmux_ipc::Request::FocusPane { .. } => {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneFocused {
                     id: uuid::Uuid::new_v4(),
@@ -2967,6 +2973,73 @@ minimum = "1.0"
                 .is_some_and(|r| matches!(r, bmux_ipc::Request::SplitPane { .. }))
         });
         assert!(last_is_split);
+    }
+
+    #[test]
+    fn command_context_calls_core_pane_launch_via_kernel_bridge() {
+        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
+
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "launch-pane".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.panes.write".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.panes.write")
+                    .expect("capability should parse"),
+                kind: bmux_plugin_sdk::ServiceKind::Command,
+                interface_id: "pane-command/v1".to_string(),
+                provider: bmux_plugin_sdk::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.panes.write".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            registered_plugins: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: bmux_plugin_sdk::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+                state_dir: "/state".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let _response: bmux_plugin_sdk::PaneLaunchResponse = context
+            .call_service(
+                "bmux.panes.write",
+                bmux_plugin_sdk::ServiceKind::Command,
+                "pane-command/v1",
+                "launch",
+                &bmux_plugin_sdk::PaneLaunchRequest {
+                    session: None,
+                    target: None,
+                    direction: bmux_plugin_sdk::PaneSplitDirection::Vertical,
+                    name: Some("remote-a".to_string()),
+                    command: bmux_plugin_sdk::PaneLaunchCommand {
+                        program: "ssh".to_string(),
+                        args: vec!["host-a".to_string()],
+                        cwd: Some("/tmp".to_string()),
+                        env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
+                    },
+                },
+            )
+            .expect("core pane launch should succeed");
+
+        let last_is_launch = KERNEL_REQUESTS.with(|log| {
+            log.borrow()
+                .last()
+                .is_some_and(|r| matches!(r, bmux_ipc::Request::LaunchPane { .. }))
+        });
+        assert!(last_is_launch);
     }
 
     #[test]

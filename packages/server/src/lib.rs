@@ -11803,6 +11803,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_pane_succeeds_without_policy_provider() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::NewSession { name: None },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            response => panic!("expected session created response, got {response:?}"),
+        };
+
+        let launched = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::LaunchPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Vertical,
+                name: Some("remote-a".to_string()),
+                command: PaneLaunchCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-lc".to_string(), "printf launched".to_string()],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            },
+        )
+        .await;
+
+        match launched {
+            Response::Ok(ResponsePayload::PaneLaunched {
+                session_id: launched_session_id,
+                ..
+            }) => {
+                assert_eq!(launched_session_id, session_id);
+            }
+            response => panic!("expected successful launch response, got {response:?}"),
+        }
+
+        let listed = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::ListPanes {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await;
+        let panes = match listed {
+            Response::Ok(ResponsePayload::PaneList { panes }) => panes,
+            response => panic!("expected pane list response, got {response:?}"),
+        };
+        assert_eq!(panes.len(), 2);
+        assert!(
+            panes
+                .iter()
+                .any(|pane| pane.name.as_deref() == Some("remote-a"))
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_pane_rejects_empty_program() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::NewSession { name: None },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            response => panic!("expected session created response, got {response:?}"),
+        };
+
+        let launched = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::LaunchPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Vertical,
+                name: None,
+                command: PaneLaunchCommand {
+                    program: "   ".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            },
+        )
+        .await;
+
+        match launched {
+            Response::Err(ErrorResponse { code, message }) => {
+                assert_eq!(code, ErrorCode::Internal);
+                assert!(message.contains("program cannot be empty"));
+            }
+            response @ Response::Ok(_) => {
+                panic!("expected launch failure response, got {response:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     async fn exited_pane_keeps_layout_and_restart_reuses_same_pane_id() {
         let server = BmuxServer::new(test_endpoint());
