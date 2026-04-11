@@ -15,8 +15,16 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bmux_config     = { workspace = true }
+bmux_plugin     = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
+serde           = { workspace = true, features = ["derive", "std"] }
+toml            = { workspace = true }
 
 [features]
-fail-on-warnings = ["bmux_plugin_sdk/fail-on-warnings"]
-static-bundled   = []
+fail-on-warnings = [
+    "bmux_config/fail-on-warnings",
+    "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]
+static-bundled = []
