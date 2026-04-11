@@ -51,6 +51,7 @@ impl PluginId {
 #[serde(rename_all = "snake_case")]
 pub enum PluginEntrypoint {
     Native { symbol: String },
+    Process { command: String, args: Vec<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

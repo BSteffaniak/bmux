@@ -158,21 +158,6 @@ fn run_doctor_command(context: &NativeCommandContext) -> Result<i32, String> {
         }
     }
 
-    let mut command_owners: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    for plugin in &enabled_plugins {
-        for command in &plugin.commands {
-            if let Some(owner) = command_owners.get(command) {
-                issues.push(format!(
-                    "enabled plugins '{}' and '{}' both expose command '{}'",
-                    owner, plugin.id, command
-                ));
-            } else {
-                command_owners.insert(command.clone(), plugin.id.clone());
-            }
-        }
-    }
-
     let report = PluginDoctorReport {
         healthy: issues.is_empty(),
         enabled_plugins: context.enabled_plugins.clone(),

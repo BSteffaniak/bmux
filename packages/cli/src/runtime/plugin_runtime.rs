@@ -83,12 +83,11 @@ pub(super) fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPat
 /// binary only includes the plugin code the user opted into (all four by
 /// default via the `bundled-plugins` feature).
 ///
-/// To add a new bundled plugin, append one four-line entry here -- no need to
+/// To add a new bundled plugin, append one three-line entry here -- no need to
 /// touch two separate functions.
 macro_rules! declare_bundled_plugins {
     ($(
         feature = $feature:literal,
-        id = $id:literal,
         manifest = $manifest:expr,
         plugin_type = $ty:ty;
     )*) => {
@@ -97,7 +96,9 @@ macro_rules! declare_bundled_plugins {
             $(
                 #[cfg(feature = $feature)]
                 if let Err(e) = registry.register_bundled_manifest($manifest) {
-                    tracing::warn!(concat!("failed to register bundled ", $id, " plugin: {}"), e);
+                    let plugin_id = bundled_manifest_plugin_id($manifest)
+                        .unwrap_or_else(|| "<unknown-plugin-id>".to_string());
+                    tracing::warn!("failed to register bundled plugin '{plugin_id}': {e}");
                 }
             )*
         }
@@ -106,7 +107,10 @@ macro_rules! declare_bundled_plugins {
         fn static_bundled_vtable(plugin_id: &str) -> Option<bmux_plugin_sdk::StaticPluginVtable> {
             $(
                 #[cfg(feature = $feature)]
-                if plugin_id == $id {
+                if bundled_manifest_plugin_id($manifest)
+                    .as_deref()
+                    .is_some_and(|manifest_plugin_id| manifest_plugin_id == plugin_id)
+                {
                     return Some(bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest));
                 }
             )*
@@ -117,29 +121,30 @@ macro_rules! declare_bundled_plugins {
 
 declare_bundled_plugins! {
     feature = "bundled-plugin-clipboard",
-    id = "bmux.clipboard",
     manifest = include_str!("../../../../plugins/clipboard-plugin/plugin.toml"),
     plugin_type = bmux_clipboard_plugin::ClipboardPlugin;
 
     feature = "bundled-plugin-permissions",
-    id = "bmux.permissions",
     manifest = include_str!("../../../../plugins/permissions-plugin/plugin.toml"),
     plugin_type = bmux_permissions_plugin::PermissionsPlugin;
 
     feature = "bundled-plugin-cli",
-    id = "bmux.plugin_cli",
     manifest = include_str!("../../../../plugins/plugin-cli-plugin/plugin.toml"),
     plugin_type = bmux_plugin_cli_plugin::PluginCliPlugin;
 
     feature = "bundled-plugin-prompted-actions",
-    id = "bmux.prompted_actions",
     manifest = include_str!("../../../../plugins/prompted-actions-plugin/plugin.toml"),
     plugin_type = bmux_prompted_actions_plugin::PromptedActionsPlugin;
 
     feature = "bundled-plugin-windows",
-    id = "bmux.windows",
     manifest = include_str!("../../../../plugins/windows-plugin/plugin.toml"),
     plugin_type = bmux_windows_plugin::WindowsPlugin;
+}
+
+fn bundled_manifest_plugin_id(manifest: &str) -> Option<String> {
+    bmux_plugin::PluginManifest::from_toml_str(manifest)
+        .ok()
+        .map(|parsed| parsed.id)
 }
 
 /// Load a registered plugin, using the static vtable path for bundled plugins

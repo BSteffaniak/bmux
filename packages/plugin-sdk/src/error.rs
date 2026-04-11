@@ -104,6 +104,9 @@ pub enum PluginError {
     #[error("plugin '{plugin_id}' is registered as bundled-static but has no compiled vtable")]
     MissingStaticVtable { plugin_id: String },
 
+    #[error("plugin '{plugin_id}' uses unsupported runtime '{runtime}'")]
+    UnsupportedPluginRuntime { plugin_id: String, runtime: String },
+
     #[error("plugin '{plugin_id}' has invalid version range for {field}: {details}")]
     InvalidVersionRange {
         plugin_id: String,

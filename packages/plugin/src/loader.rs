@@ -1384,6 +1384,13 @@ impl NativePluginLoader {
         host: &HostMetadata,
         available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
     ) -> Result<LoadedPlugin> {
+        if let PluginEntrypoint::Process { .. } = &registered_plugin.declaration.entrypoint {
+            return Err(PluginError::UnsupportedPluginRuntime {
+                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                runtime: "process".to_string(),
+            });
+        }
+
         PluginRegistry::validate_registered_plugin(
             registered_plugin,
             host,
@@ -1501,6 +1508,12 @@ fn load_native_declaration(
 ) -> Result<PluginDeclaration> {
     let symbol_name = match &registered_plugin.declaration.entrypoint {
         PluginEntrypoint::Native { symbol } => symbol.as_bytes(),
+        PluginEntrypoint::Process { .. } => {
+            return Err(PluginError::UnsupportedPluginRuntime {
+                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                runtime: "process".to_string(),
+            });
+        }
     };
 
     let descriptor_symbol: Symbol<'_, PluginEntryFn> = unsafe { library.get(symbol_name) }
@@ -1508,6 +1521,7 @@ fn load_native_declaration(
             plugin_id: registered_plugin.declaration.id.as_str().to_string(),
             symbol: match &registered_plugin.declaration.entrypoint {
                 PluginEntrypoint::Native { symbol } => symbol.clone(),
+                PluginEntrypoint::Process { .. } => "process-entrypoint".to_string(),
             },
             details: error.to_string(),
         })?;
@@ -1515,6 +1529,7 @@ fn load_native_declaration(
     let descriptor_ptr = unsafe { descriptor_symbol() };
     let symbol = match &registered_plugin.declaration.entrypoint {
         PluginEntrypoint::Native { symbol } => symbol.clone(),
+        PluginEntrypoint::Process { .. } => "process-entrypoint".to_string(),
     };
     if descriptor_ptr.is_null() {
         return Err(PluginError::NullPluginEntry {

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 pub enum PluginRuntime {
     #[default]
     Native,
+    Process,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,8 +155,23 @@ impl PluginManifest {
                     details,
                 }
             })?,
-            entrypoint: PluginEntrypoint::Native {
-                symbol: self.entry_symbol.clone(),
+            entrypoint: match self.runtime {
+                PluginRuntime::Native => PluginEntrypoint::Native {
+                    symbol: self.entry_symbol.clone(),
+                },
+                PluginRuntime::Process => {
+                    let command = self
+                        .entry
+                        .as_ref()
+                        .map(|entry| entry.to_string_lossy().to_string())
+                        .ok_or_else(|| PluginError::MissingEntryPath {
+                            plugin_id: self.id.clone(),
+                        })?;
+                    PluginEntrypoint::Process {
+                        command,
+                        args: Vec::new(),
+                    }
+                }
             },
             description: self.description.clone(),
             homepage: self.homepage.clone(),
@@ -211,9 +227,9 @@ fn default_dependency_version_req() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::PluginManifest;
-    use crate::PluginExecutionClass;
-    use bmux_plugin_sdk::HostScope;
+    use super::{PluginManifest, PluginRuntime};
+    use crate::{PluginEntrypoint, PluginExecutionClass};
+    use bmux_plugin_sdk::{HostScope, PluginError};
 
     #[test]
     fn parses_native_plugin_manifest() {
@@ -411,5 +427,45 @@ owns_paths = [["terminal", "doctor"], ["terminal", "install-terminfo"]]
                 .iter()
                 .any(|path| path.0 == vec!["terminal".to_string(), "doctor".to_string()])
         );
+    }
+
+    #[test]
+    fn parses_process_runtime_manifest() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.process"
+name = "Process Runtime"
+version = "0.1.0"
+runtime = "process"
+entry = "python3"
+"#,
+        )
+        .expect("manifest should parse");
+        assert_eq!(manifest.runtime, PluginRuntime::Process);
+
+        let declaration = manifest
+            .to_declaration()
+            .expect("declaration should support process runtime");
+        assert!(matches!(
+            declaration.entrypoint,
+            PluginEntrypoint::Process { ref command, .. } if command == "python3"
+        ));
+    }
+
+    #[test]
+    fn process_runtime_requires_entry_command() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.process.missing"
+name = "Missing Process Entry"
+version = "0.1.0"
+runtime = "process"
+"#,
+        )
+        .expect("manifest should parse");
+        let error = manifest
+            .to_declaration()
+            .expect_err("process runtime requires entry command");
+        assert!(matches!(error, PluginError::MissingEntryPath { .. }));
     }
 }
