@@ -3321,29 +3321,25 @@ mod tests {
     };
     use bmux_ipc::transport::ErasedIpcStream;
     use std::fs;
-    use std::path::PathBuf;
     use std::time::Duration;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
     use uuid::Uuid;
 
-    fn temp_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic for test")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bmux-client-test-{nanos}"));
-        fs::create_dir_all(&dir).expect("temp dir should be created");
-        dir
+    fn temp_dir() -> TempDir {
+        tempfile::Builder::new()
+            .prefix("bmux-client-test-")
+            .tempdir()
+            .expect("temp dir should be created")
     }
 
     #[test]
     fn load_or_create_principal_id_creates_and_persists_value() {
         let root = temp_dir();
         let paths = ConfigPaths::new(
-            root.join("config"),
-            root.join("runtime"),
-            root.join("data"),
-            root.join("state"),
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
         );
         let first = load_or_create_principal_id(&paths).expect("principal id should be created");
         let second = load_or_create_principal_id(&paths).expect("principal id should be reused");
@@ -3354,10 +3350,10 @@ mod tests {
     fn load_or_create_principal_id_rejects_invalid_file_contents() {
         let root = temp_dir();
         let paths = ConfigPaths::new(
-            root.join("config"),
-            root.join("runtime"),
-            root.join("data"),
-            root.join("state"),
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
         );
         let path = paths.principal_id_file();
         if let Some(parent) = path.parent() {

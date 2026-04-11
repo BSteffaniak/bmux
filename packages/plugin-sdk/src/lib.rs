@@ -54,10 +54,15 @@ pub use command::{
 };
 pub use context::{
     CORE_CLI_BRIDGE_MAGIC_V1, CORE_CLI_BRIDGE_PROTOCOL_V1, CORE_CLI_COMMAND_CAPABILITY,
-    CORE_CLI_COMMAND_INTERFACE_V1, CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, CoreCliCommandRequest,
-    CoreCliCommandResponse, HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse,
-    NativeCommandContext, NativeLifecycleContext, NativeServiceContext, RegisteredPluginInfo,
-    decode_host_kernel_bridge_cli_command_payload, encode_host_kernel_bridge_cli_command_payload,
+    CORE_CLI_COMMAND_INTERFACE_V1, CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1,
+    CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1, CoreCliCommandRequest, CoreCliCommandResponse,
+    HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, NativeCommandContext,
+    NativeLifecycleContext, NativeServiceContext, PLUGIN_CLI_BRIDGE_MAGIC_V1,
+    PluginCliCommandRequest, PluginCliCommandResponse, RegisteredPluginInfo,
+    decode_host_kernel_bridge_cli_command_payload,
+    decode_host_kernel_bridge_plugin_command_payload,
+    encode_host_kernel_bridge_cli_command_payload,
+    encode_host_kernel_bridge_plugin_command_payload,
 };
 pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};

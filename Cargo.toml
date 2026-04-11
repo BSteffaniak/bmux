@@ -184,6 +184,7 @@ serde_json = { version = "1.0.143", default-features = false, features = [
 ] }
 similar = { version = "2.7.0" }
 syn = { version = "2.0.117", default-features = false }
+tempfile = { version = "3.27.0", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
 time = { version = "0.3.47", default-features = false }
 tokio = { version = "1.45.1", default-features = false }

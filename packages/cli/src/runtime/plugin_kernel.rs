@@ -6,7 +6,8 @@ use bmux_ipc::InvokeServiceKind;
 use bmux_plugin::PluginRegistry;
 use bmux_plugin_sdk::{
     CORE_CLI_COMMAND_CAPABILITY, CORE_CLI_COMMAND_INTERFACE_V1, HostConnectionInfo, HostScope,
-    PluginCommandEffect, RegisteredService, ServiceKind, ServiceRequest,
+    PluginCliCommandRequest, PluginCliCommandResponse, PluginCommandEffect, RegisteredService,
+    ServiceKind, ServiceRequest,
 };
 use bmux_server::{BmuxServer, ServiceInvokeContext};
 use clap::Parser;
@@ -28,7 +29,8 @@ pub(super) type KernelClientFactory =
 use super::{
     ConnectionContext, dispatch::dispatch_built_in_command, effective_enabled_plugins, load_plugin,
     plugin_host_metadata, resolve_plugin_search_paths, run_keymap_doctor, run_logs_level,
-    run_logs_path, run_recording_path, run_terminal_install_terminfo,
+    run_logs_path, run_plugin_keybinding_command, run_recording_path,
+    run_terminal_install_terminfo,
 };
 
 thread_local! {
@@ -257,6 +259,33 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
         return 0;
     }
 
+    if let Ok(Some(command_request)) =
+        bmux_plugin_sdk::decode_host_kernel_bridge_plugin_command_payload(&request.payload)
+    {
+        let response = match run_plugin_bridge_command(&command_request) {
+            Ok(exit_code) => PluginCliCommandResponse::new(exit_code),
+            Err(error) => PluginCliCommandResponse::failed(1, error.to_string()),
+        };
+        let Ok(payload) = bmux_plugin_sdk::encode_service_message(&response) else {
+            return 5;
+        };
+        let response = bmux_plugin_sdk::HostKernelBridgeResponse { payload };
+        let Ok(encoded) = bmux_plugin_sdk::encode_service_message(&response) else {
+            return 5;
+        };
+
+        unsafe {
+            *output_len = encoded.len();
+        }
+        if output_ptr.is_null() || encoded.len() > output_capacity {
+            return 4;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+        }
+        return 0;
+    }
+
     let payload = if let Some(context) = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone()) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             tokio::task::block_in_place(|| {
@@ -336,6 +365,17 @@ fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -
             })
             .map(i32::from)
     }
+}
+
+fn run_plugin_bridge_command(request: &PluginCliCommandRequest) -> Result<i32> {
+    let status = run_plugin_keybinding_command(
+        request.plugin_id.as_str(),
+        request.command_name.as_str(),
+        &request.arguments,
+        None,
+    )?
+    .status;
+    Ok(status)
 }
 
 fn run_core_built_in_command_fast_path(

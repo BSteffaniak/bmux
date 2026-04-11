@@ -2,16 +2,13 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::{
-    CapabilityProvider, HostRuntimeApi, PluginManifest, PluginRegistry,
-    discover_plugin_manifests_in_roots, load_registered_plugin,
-};
+use bmux_plugin::HostRuntimeApi;
 use bmux_plugin_sdk::{
-    CoreCliCommandRequest, CoreCliCommandResponse, EXIT_OK, HostScope, NativeCommandContext,
-    PluginCommandError, RustPlugin,
+    CoreCliCommandRequest, CoreCliCommandResponse, EXIT_OK, NativeCommandContext,
+    PluginCliCommandRequest, PluginCliCommandResponse, PluginCommandError, RustPlugin,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
@@ -260,99 +257,22 @@ fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
         return Err("usage: bmux plugin run <plugin> <command> [args ...]".to_string());
     }
 
-    let plugin_id = &context.arguments[0];
-    let command_name = &context.arguments[1];
+    let plugin_id = context.arguments[0].clone();
+    let command_name = context.arguments[1].clone();
     let args = context.arguments[2..].to_vec();
 
-    if plugin_id == &context.plugin_id {
+    if plugin_id == context.plugin_id {
         return Err(
             "running 'bmux.plugin_cli' via 'bmux plugin run' is not supported (self-invocation deadlock guard)"
                 .to_string(),
         );
     }
 
-    // Check if the target plugin is known via the registry info from the host.
-    let available_ids = context
-        .registered_plugins
-        .iter()
-        .map(|p| p.id.as_str())
-        .collect::<Vec<_>>();
-    let target_info = context
-        .registered_plugins
-        .iter()
-        .find(|p| p.id == *plugin_id)
-        .ok_or_else(|| format_plugin_not_found_message(plugin_id, &available_ids))?;
-
-    if !context
-        .enabled_plugins
-        .iter()
-        .any(|enabled| enabled == plugin_id)
-    {
-        return Err(format_plugin_not_enabled_message(plugin_id));
-    }
-
-    if target_info.bundled_static {
-        return Err(format!(
-            "plugin '{plugin_id}' is statically bundled into the binary and cannot be loaded dynamically via 'plugin run'.\n\
-             Run its commands directly, e.g.: bmux {command_name}",
-        ));
-    }
-
-    // Dynamic plugins: fall back to filesystem scan + dlopen loading.
-    let registry = scan_plugins_with_bundled_entry_fallback(context)?;
-    let plugin = registry
-        .get(plugin_id)
-        .ok_or_else(|| format_plugin_not_found_message(plugin_id, &available_ids))?;
-
-    let available_capabilities = context
-        .available_capabilities
-        .iter()
-        .filter_map(|scope| HostScope::new(scope).ok())
-        .map(|capability| {
-            let provider = CapabilityProvider {
-                capability: capability.clone(),
-                provider: bmux_plugin_sdk::ProviderId::Host,
-            };
-            (capability, provider)
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    let loaded = load_registered_plugin(plugin, &context.host, &available_capabilities)
-        .map_err(|error| format!("failed loading enabled plugin '{plugin_id}': {error}"))?;
-
-    let command_context = NativeCommandContext {
-        plugin_id: plugin.declaration.id.as_str().to_string(),
-        command: command_name.clone(),
-        arguments: args.clone(),
-        required_capabilities: plugin
-            .declaration
-            .required_capabilities
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        provided_capabilities: plugin
-            .declaration
-            .provided_capabilities
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        services: context.services.clone(),
-        available_capabilities: context.available_capabilities.clone(),
-        enabled_plugins: context.enabled_plugins.clone(),
-        plugin_search_roots: context.plugin_search_roots.clone(),
-        registered_plugins: context.registered_plugins.clone(),
-        host: context.host.clone(),
-        connection: context.connection.clone(),
-        settings: context.plugin_settings_map.get(plugin_id).cloned(),
-        plugin_settings_map: context.plugin_settings_map.clone(),
-        host_kernel_bridge: context.host_kernel_bridge,
-    };
-
-    let (status, _outcome) = loaded
-        .run_command_with_context_and_outcome(command_name, &args, Some(&command_context))
-        .map_err(|error| format_plugin_command_run_error(plugin_id, command_name, &error))?;
-
-    Ok(status)
+    let request = PluginCliCommandRequest::new(plugin_id.clone(), command_name.clone(), args);
+    let response: PluginCliCommandResponse = context
+        .plugin_command_run(&request)
+        .map_err(|error| format_plugin_command_run_error(&plugin_id, &command_name, &error))?;
+    Ok(response.exit_code)
 }
 
 fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
@@ -632,47 +552,6 @@ fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, String>
     Ok(options)
 }
 
-fn scan_plugins_with_bundled_entry_fallback(
-    context: &NativeCommandContext,
-) -> Result<PluginRegistry, String> {
-    let roots = plugin_roots(context);
-    let reports = discover_plugin_manifests_in_roots(&roots).map_err(|error| error.to_string())?;
-    let executable_dir = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let mut registry = PluginRegistry::new();
-
-    for report in reports {
-        for manifest_path in report.manifest_paths {
-            let mut manifest = PluginManifest::from_path(&manifest_path)
-                .map_err(|error| format!("failed parsing {}: {error}", manifest_path.display()))?;
-
-            if let Some(entry_path) = manifest
-                .resolve_entry_path(manifest_path.parent().unwrap_or_else(|| Path::new(".")))
-                && !entry_path.exists()
-                && let (Some(entry), Some(executable_dir)) =
-                    (manifest.entry.as_ref(), executable_dir.as_ref())
-            {
-                let candidate = executable_dir.join(entry);
-                if candidate.exists() {
-                    manifest.entry = Some(candidate);
-                }
-            }
-
-            registry
-                .register_manifest_from_root(&report.search_root, &manifest_path, manifest)
-                .map_err(|error| {
-                    format!(
-                        "failed registering plugin manifest {}: {error}",
-                        manifest_path.display()
-                    )
-                })?;
-        }
-    }
-
-    Ok(registry)
-}
-
 fn plugin_roots(context: &NativeCommandContext) -> Vec<PathBuf> {
     context
         .plugin_search_roots
@@ -702,27 +581,6 @@ fn has_flag(arguments: &[String], long_name: &str) -> bool {
     arguments.iter().any(|argument| argument == &long_flag)
 }
 
-fn format_plugin_not_found_message<S: AsRef<str>>(plugin_id: &str, available: &[S]) -> String {
-    if available.is_empty() {
-        format!("plugin '{plugin_id}' was not found")
-    } else {
-        let available = available
-            .iter()
-            .map(std::convert::AsRef::as_ref)
-            .collect::<Vec<_>>();
-        format!(
-            "plugin '{plugin_id}' was not found (available: {})",
-            available.join(", ")
-        )
-    }
-}
-
-fn format_plugin_not_enabled_message(plugin_id: &str) -> String {
-    format!(
-        "plugin '{plugin_id}' is not enabled; remove it from plugins.disabled or add it under plugins.enabled to run commands"
-    )
-}
-
 fn format_plugin_command_run_error(
     plugin_id: &str,
     command_name: &str,
@@ -735,6 +593,86 @@ fn format_plugin_command_run_error(
         )
     } else {
         base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CORE_PROXY_COMMANDS;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn proxy_command_table_stays_in_sync_with_manifest_commands() {
+        let manifest = include_str!("../plugin.toml");
+        let proxy_names = CORE_PROXY_COMMANDS
+            .iter()
+            .map(|entry| entry.command_name.to_string())
+            .collect::<BTreeSet<_>>();
+        let manifest_proxy_names = manifest_proxy_command_names(manifest);
+        assert_eq!(
+            proxy_names, manifest_proxy_names,
+            "core proxy command table must match non-plugin command declarations in plugin.toml"
+        );
+    }
+
+    fn manifest_proxy_command_names(manifest: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        let mut current_name: Option<String> = None;
+        let mut in_command = false;
+
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed == "[[commands]]" {
+                in_command = true;
+                current_name = None;
+                continue;
+            }
+            if trimmed.starts_with("[[commands.") {
+                in_command = false;
+                continue;
+            }
+            if !in_command {
+                continue;
+            }
+
+            if let Some(value) = parse_quoted_value(trimmed, "name") {
+                current_name = Some(value.to_string());
+                continue;
+            }
+
+            if let Some(path_text) = parse_array_text(trimmed, "path")
+                && let Some(name) = current_name.take()
+                && !path_text.contains("\"plugin\"")
+            {
+                names.insert(name);
+            }
+        }
+
+        names
+    }
+
+    fn parse_quoted_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        let (left, right) = line.split_once('=')?;
+        if left.trim() != key {
+            return None;
+        }
+        let value = right.trim();
+        if !value.starts_with('"') || !value.ends_with('"') || value.len() < 2 {
+            return None;
+        }
+        Some(&value[1..value.len() - 1])
+    }
+
+    fn parse_array_text<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        let (left, right) = line.split_once('=')?;
+        if left.trim() != key {
+            return None;
+        }
+        let value = right.trim();
+        if !value.starts_with('[') || !value.ends_with(']') {
+            return None;
+        }
+        Some(value)
     }
 }
 

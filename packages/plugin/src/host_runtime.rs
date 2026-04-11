@@ -6,15 +6,16 @@
 
 use bmux_plugin_sdk::{
     CORE_CLI_COMMAND_CAPABILITY, CORE_CLI_COMMAND_INTERFACE_V1,
-    CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, ContextCloseRequest, ContextCloseResponse,
-    ContextCreateRequest, ContextCreateResponse, ContextCurrentResponse, ContextListResponse,
-    ContextSelectRequest, ContextSelectResponse, CoreCliCommandRequest, CoreCliCommandResponse,
-    CurrentClientResponse, LogWriteRequest, PaneCloseRequest, PaneCloseResponse, PaneFocusRequest,
-    PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
-    PaneSplitRequest, PaneSplitResponse, RecordingWriteEventRequest, RecordingWriteEventResponse,
-    Result, ServiceKind, SessionCreateRequest, SessionCreateResponse, SessionKillRequest,
-    SessionKillResponse, SessionListResponse, SessionSelectRequest, SessionSelectResponse,
-    StorageGetRequest, StorageGetResponse, StorageSetRequest,
+    CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
+    ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
+    ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
+    CoreCliCommandRequest, CoreCliCommandResponse, CurrentClientResponse, LogWriteRequest,
+    PaneCloseRequest, PaneCloseResponse, PaneFocusRequest, PaneFocusResponse, PaneListRequest,
+    PaneListResponse, PaneResizeRequest, PaneResizeResponse, PaneSplitRequest, PaneSplitResponse,
+    PluginCliCommandRequest, PluginCliCommandResponse, RecordingWriteEventRequest,
+    RecordingWriteEventResponse, Result, ServiceKind, SessionCreateRequest, SessionCreateResponse,
+    SessionKillRequest, SessionKillResponse, SessionListResponse, SessionSelectRequest,
+    SessionSelectResponse, StorageGetRequest, StorageGetResponse, StorageSetRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -80,6 +81,24 @@ pub trait HostRuntimeApi: ServiceCaller {
             ServiceKind::Command,
             CORE_CLI_COMMAND_INTERFACE_V1,
             CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1,
+            request,
+        )
+    }
+
+    /// Run a plugin command in-process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
+    fn plugin_command_run(
+        &self,
+        request: &PluginCliCommandRequest,
+    ) -> Result<PluginCliCommandResponse> {
+        self.call_service(
+            CORE_CLI_COMMAND_CAPABILITY,
+            ServiceKind::Command,
+            CORE_CLI_COMMAND_INTERFACE_V1,
+            CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
             request,
         )
     }

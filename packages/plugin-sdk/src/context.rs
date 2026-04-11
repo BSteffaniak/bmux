@@ -295,8 +295,12 @@ pub const CORE_CLI_COMMAND_CAPABILITY: &str = "bmux.commands";
 pub const CORE_CLI_COMMAND_INTERFACE_V1: &str = "cli-command/v1";
 /// Service operation for executing a core CLI command path.
 pub const CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1: &str = "run_path";
+/// Service operation for executing a plugin command.
+pub const CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1: &str = "run_plugin";
 /// Marker prefix for host-kernel bridge CLI command payloads.
 pub const CORE_CLI_BRIDGE_MAGIC_V1: &[u8] = b"BMUXCMD1";
+/// Marker prefix for host-kernel bridge plugin command payloads.
+pub const PLUGIN_CLI_BRIDGE_MAGIC_V1: &[u8] = b"BMUXPLG1";
 /// Protocol version for `CoreCliCommandRequest`/`CoreCliCommandResponse`.
 pub const CORE_CLI_BRIDGE_PROTOCOL_V1: u16 = 1;
 
@@ -322,6 +326,53 @@ impl CoreCliCommandRequest {
 pub struct CoreCliCommandResponse {
     pub protocol_version: u16,
     pub exit_code: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCliCommandRequest {
+    pub protocol_version: u16,
+    pub plugin_id: String,
+    pub command_name: String,
+    pub arguments: Vec<String>,
+}
+
+impl PluginCliCommandRequest {
+    #[must_use]
+    pub const fn new(plugin_id: String, command_name: String, arguments: Vec<String>) -> Self {
+        Self {
+            protocol_version: CORE_CLI_BRIDGE_PROTOCOL_V1,
+            plugin_id,
+            command_name,
+            arguments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCliCommandResponse {
+    pub protocol_version: u16,
+    pub exit_code: i32,
+    pub error: Option<String>,
+}
+
+impl PluginCliCommandResponse {
+    #[must_use]
+    pub const fn new(exit_code: i32) -> Self {
+        Self {
+            protocol_version: CORE_CLI_BRIDGE_PROTOCOL_V1,
+            exit_code,
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn failed(exit_code: i32, error: String) -> Self {
+        Self {
+            protocol_version: CORE_CLI_BRIDGE_PROTOCOL_V1,
+            exit_code,
+            error: Some(error),
+        }
+    }
 }
 
 impl CoreCliCommandResponse {
@@ -375,12 +426,55 @@ pub fn decode_host_kernel_bridge_cli_command_payload(
     Ok(Some(request))
 }
 
+/// Encode a host-kernel bridge payload representing an in-process plugin
+/// command invocation request.
+///
+/// # Errors
+///
+/// Returns an error when serialization fails.
+pub fn encode_host_kernel_bridge_plugin_command_payload(
+    request: &PluginCliCommandRequest,
+) -> Result<Vec<u8>> {
+    let mut payload = PLUGIN_CLI_BRIDGE_MAGIC_V1.to_vec();
+    payload.extend(encode_service_message(request)?);
+    Ok(payload)
+}
+
+/// Decode a host-kernel bridge payload for in-process plugin command
+/// invocation.
+///
+/// Returns `Ok(None)` when the payload is not a plugin-command bridge payload.
+///
+/// # Errors
+///
+/// Returns an error when the payload has the plugin prefix but cannot be decoded.
+pub fn decode_host_kernel_bridge_plugin_command_payload(
+    payload: &[u8],
+) -> Result<Option<PluginCliCommandRequest>> {
+    if !payload.starts_with(PLUGIN_CLI_BRIDGE_MAGIC_V1) {
+        return Ok(None);
+    }
+    let encoded = &payload[PLUGIN_CLI_BRIDGE_MAGIC_V1.len()..];
+    let request: PluginCliCommandRequest = decode_service_message(encoded)?;
+    if request.protocol_version != CORE_CLI_BRIDGE_PROTOCOL_V1 {
+        return Err(PluginError::ServiceProtocol {
+            details: format!(
+                "unsupported plugin CLI bridge request protocol version: {}",
+                request.protocol_version
+            ),
+        });
+    }
+    Ok(Some(request))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CORE_CLI_BRIDGE_PROTOCOL_V1, CoreCliCommandRequest,
+        CORE_CLI_BRIDGE_PROTOCOL_V1, CoreCliCommandRequest, PluginCliCommandRequest,
         decode_host_kernel_bridge_cli_command_payload,
+        decode_host_kernel_bridge_plugin_command_payload,
         encode_host_kernel_bridge_cli_command_payload,
+        encode_host_kernel_bridge_plugin_command_payload,
     };
 
     #[test]
@@ -416,6 +510,48 @@ mod tests {
             error
                 .to_string()
                 .contains("unsupported core CLI bridge request protocol version")
+        );
+    }
+
+    #[test]
+    fn plugin_cli_bridge_payload_round_trip_preserves_request() {
+        let request = PluginCliCommandRequest::new(
+            "bmux.windows".to_string(),
+            "new-window".to_string(),
+            vec!["--name".to_string(), "work".to_string()],
+        );
+        let encoded = encode_host_kernel_bridge_plugin_command_payload(&request)
+            .expect("request should encode");
+        let decoded = decode_host_kernel_bridge_plugin_command_payload(&encoded)
+            .expect("payload should decode")
+            .expect("payload should be recognized");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn plugin_cli_bridge_payload_ignores_unknown_prefix() {
+        let decoded =
+            decode_host_kernel_bridge_plugin_command_payload(b"not-a-plugin-bridge-payload")
+                .expect("decode should succeed");
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn plugin_cli_bridge_payload_rejects_unsupported_protocol_version() {
+        let mut request = PluginCliCommandRequest::new(
+            "bmux.windows".to_string(),
+            "new-window".to_string(),
+            Vec::new(),
+        );
+        request.protocol_version = CORE_CLI_BRIDGE_PROTOCOL_V1 + 1;
+        let encoded = encode_host_kernel_bridge_plugin_command_payload(&request)
+            .expect("request should encode");
+        let error = decode_host_kernel_bridge_plugin_command_payload(&encoded)
+            .expect_err("decode should fail for unsupported protocol version");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported plugin CLI bridge request protocol version")
         );
     }
 }
