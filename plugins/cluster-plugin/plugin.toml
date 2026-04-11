@@ -19,6 +19,7 @@ provided_capabilities = [
 provided_features = ["bmux.server_clusters"]
 required_capabilities = [
     "bmux.commands",
+    "bmux.panes.write",
     "bmux.sessions.read",
     "bmux.sessions.write",
     "bmux.storage",
@@ -53,6 +54,24 @@ name       = "cluster"
 position   = 0
 required   = true
 value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "host"
+multiple   = true
+name       = "host"
+required   = false
+short      = "h"
+value_name = "HOST"
+
+[[commands.arguments]]
+kind             = "string"
+multiple         = true
+name             = "targets"
+position         = 1
+required         = false
+trailing_var_arg = true
+value_name       = "TARGET"
 
 [[commands]]
 aliases       = [["cluster", "status"]]

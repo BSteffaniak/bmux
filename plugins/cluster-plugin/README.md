@@ -12,9 +12,10 @@ Current scope:
 - Inventory sourced from `[plugins.settings."bmux.cluster"].clusters`
 - Target resolution validated against `[connections.targets]`
 - Readiness probes delegated to core remote commands (`remote test` / `remote doctor`)
+- `cluster up` creates/reuses `cluster-<name>` session and launches host-bound panes
+- Partial-start semantics: unhealthy hosts are reported as degraded while healthy hosts still launch
 
-Mutation and orchestration commands (`cluster up` and pane operations) remain
-stubbed and are implemented in follow-up slices.
+Cluster pane mutation helpers (`cluster pane ...`) remain stubbed for follow-up slices.
 
 ## Commands (Scaffolded)
 
