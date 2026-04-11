@@ -25,8 +25,16 @@ pub struct RegisteredPluginCommand {
 #[derive(Debug, Default, Clone)]
 pub struct PluginCommandRegistry {
     commands: Vec<RegisteredPluginCommand>,
+    resolved_by_path: BTreeMap<Vec<String>, ResolvedPathEntry>,
     owned_exact_paths: BTreeMap<Vec<String>, String>,
     owned_namespaces: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedPathEntry {
+    plugin_id: String,
+    command_name: String,
+    schema: PluginCommand,
 }
 
 impl PluginCommandRegistry {
@@ -113,6 +121,18 @@ impl PluginCommandRegistry {
                     aliases,
                     schema: command.clone(),
                 });
+                let registered = registry
+                    .commands
+                    .last()
+                    .expect("just-pushed plugin command should exist");
+                register_resolved_path_entry(
+                    &mut registry.resolved_by_path,
+                    &registered.canonical_path,
+                    registered,
+                );
+                for alias in &registered.aliases {
+                    register_resolved_path_entry(&mut registry.resolved_by_path, alias, registered);
+                }
             }
         }
 
@@ -134,37 +154,30 @@ impl PluginCommandRegistry {
     }
 
     pub fn resolve(&self, raw: &[String]) -> Option<ResolvedPluginCommand> {
-        self.commands
-            .iter()
-            .flat_map(|command| {
-                std::iter::once((&command.canonical_path, command))
-                    .chain(command.aliases.iter().map(move |alias| (alias, command)))
-            })
-            .filter(|(path, _)| raw.starts_with(path))
-            .max_by_key(|(path, _)| path.len())
-            .map(|(path, command)| ResolvedPluginCommand {
-                plugin_id: command.plugin_id.clone(),
-                command_name: command.command_name.clone(),
-                arguments: raw[path.len()..].to_vec(),
-                schema: command.schema.clone(),
-            })
+        for prefix_len in (1..=raw.len()).rev() {
+            let candidate = raw[..prefix_len].to_vec();
+            let Some(entry) = self.resolved_by_path.get(&candidate) else {
+                continue;
+            };
+            return Some(ResolvedPluginCommand {
+                plugin_id: entry.plugin_id.clone(),
+                command_name: entry.command_name.clone(),
+                arguments: raw[prefix_len..].to_vec(),
+                schema: entry.schema.clone(),
+            });
+        }
+        None
     }
 
     pub fn resolve_exact_path(&self, path: &[String]) -> Option<ResolvedPluginCommand> {
-        self.commands.iter().find_map(|command| {
-            let matches_path =
-                command.canonical_path == path || command.aliases.iter().any(|alias| alias == path);
-            if matches_path {
-                Some(ResolvedPluginCommand {
-                    plugin_id: command.plugin_id.clone(),
-                    command_name: command.command_name.clone(),
-                    arguments: Vec::new(),
-                    schema: command.schema.clone(),
-                })
-            } else {
-                None
-            }
-        })
+        self.resolved_by_path
+            .get(path)
+            .map(|entry| ResolvedPluginCommand {
+                plugin_id: entry.plugin_id.clone(),
+                command_name: entry.command_name.clone(),
+                arguments: Vec::new(),
+                schema: entry.schema.clone(),
+            })
     }
 
     pub fn validate_arguments(
@@ -278,6 +291,25 @@ impl PluginCommandRegistry {
         }
         Ok(root)
     }
+}
+
+fn register_resolved_path_entry(
+    index: &mut BTreeMap<Vec<String>, ResolvedPathEntry>,
+    path: &[String],
+    command: &RegisteredPluginCommand,
+) {
+    let previous = index.insert(
+        path.to_vec(),
+        ResolvedPathEntry {
+            plugin_id: command.plugin_id.clone(),
+            command_name: command.command_name.clone(),
+            schema: command.schema.clone(),
+        },
+    );
+    debug_assert!(
+        previous.is_none(),
+        "path collisions should be rejected before indexing"
+    );
 }
 
 pub fn selected_subcommand_path(matches: &ArgMatches) -> (Vec<String>, &ArgMatches) {

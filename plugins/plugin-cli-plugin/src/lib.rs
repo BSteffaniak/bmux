@@ -24,56 +24,157 @@ impl RustPlugin for PluginCliPlugin {
             "list" => run_list_command(&context).map_err(PluginCommandError::from),
             "run" => run_run_command(&context).map_err(PluginCommandError::from),
             "rebuild" => run_rebuild_command(&context).map_err(PluginCommandError::from),
-            "logs-path" => run_core_proxy_command(&context, &["logs", "path"]),
-            "logs-level" => run_core_proxy_command(&context, &["logs", "level"]),
-            "logs-tail" => run_core_proxy_command(&context, &["logs", "tail"]),
-            "logs-watch" => run_core_proxy_command(&context, &["logs", "watch"]),
-            "logs-profiles-list" => run_core_proxy_command(&context, &["logs", "profiles", "list"]),
-            "logs-profiles-show" => run_core_proxy_command(&context, &["logs", "profiles", "show"]),
-            "logs-profiles-delete" => {
-                run_core_proxy_command(&context, &["logs", "profiles", "delete"])
+            _ => {
+                if let Some(command_path) = core_proxy_command_path(context.command.as_str()) {
+                    run_core_proxy_command(&context, command_path)
+                } else {
+                    Err(PluginCommandError::from(format!(
+                        "unsupported command '{}'",
+                        context.command
+                    )))
+                }
             }
-            "logs-profiles-rename" => {
-                run_core_proxy_command(&context, &["logs", "profiles", "rename"])
-            }
-            "keymap-doctor" => run_core_proxy_command(&context, &["keymap", "doctor"]),
-            "terminal-doctor" => run_core_proxy_command(&context, &["terminal", "doctor"]),
-            "terminal-install-terminfo" => {
-                run_core_proxy_command(&context, &["terminal", "install-terminfo"])
-            }
-            "recording-start" => run_core_proxy_command(&context, &["recording", "start"]),
-            "recording-stop" => run_core_proxy_command(&context, &["recording", "stop"]),
-            "recording-status" => run_core_proxy_command(&context, &["recording", "status"]),
-            "recording-path" => run_core_proxy_command(&context, &["recording", "path"]),
-            "recording-list" => run_core_proxy_command(&context, &["recording", "list"]),
-            "recording-delete" => run_core_proxy_command(&context, &["recording", "delete"]),
-            "recording-delete-all" => {
-                run_core_proxy_command(&context, &["recording", "delete-all"])
-            }
-            "recording-cut" => run_core_proxy_command(&context, &["recording", "cut"]),
-            "recording-inspect" => run_core_proxy_command(&context, &["recording", "inspect"]),
-            "recording-replay" => run_core_proxy_command(&context, &["recording", "replay"]),
-            "recording-verify-smoke" => {
-                run_core_proxy_command(&context, &["recording", "verify-smoke"])
-            }
-            "recording-export" => run_core_proxy_command(&context, &["recording", "export"]),
-            "recording-prune" => run_core_proxy_command(&context, &["recording", "prune"]),
-            "playbook-run" => run_core_proxy_command(&context, &["playbook", "run"]),
-            "playbook-validate" => run_core_proxy_command(&context, &["playbook", "validate"]),
-            "playbook-interactive" => {
-                run_core_proxy_command(&context, &["playbook", "interactive"])
-            }
-            "playbook-from-recording" => {
-                run_core_proxy_command(&context, &["playbook", "from-recording"])
-            }
-            "playbook-dry-run" => run_core_proxy_command(&context, &["playbook", "dry-run"]),
-            "playbook-diff" => run_core_proxy_command(&context, &["playbook", "diff"]),
-            "playbook-cleanup" => run_core_proxy_command(&context, &["playbook", "cleanup"]),
-            other => Err(PluginCommandError::from(format!(
-                "unsupported command '{other}'"
-            ))),
         }
     }
+}
+
+struct CoreProxyCommand {
+    command_name: &'static str,
+    command_path: &'static [&'static str],
+}
+
+const CORE_PROXY_COMMANDS: &[CoreProxyCommand] = &[
+    CoreProxyCommand {
+        command_name: "logs-path",
+        command_path: &["logs", "path"],
+    },
+    CoreProxyCommand {
+        command_name: "logs-level",
+        command_path: &["logs", "level"],
+    },
+    CoreProxyCommand {
+        command_name: "logs-tail",
+        command_path: &["logs", "tail"],
+    },
+    CoreProxyCommand {
+        command_name: "logs-watch",
+        command_path: &["logs", "watch"],
+    },
+    CoreProxyCommand {
+        command_name: "logs-profiles-list",
+        command_path: &["logs", "profiles", "list"],
+    },
+    CoreProxyCommand {
+        command_name: "logs-profiles-show",
+        command_path: &["logs", "profiles", "show"],
+    },
+    CoreProxyCommand {
+        command_name: "logs-profiles-delete",
+        command_path: &["logs", "profiles", "delete"],
+    },
+    CoreProxyCommand {
+        command_name: "logs-profiles-rename",
+        command_path: &["logs", "profiles", "rename"],
+    },
+    CoreProxyCommand {
+        command_name: "keymap-doctor",
+        command_path: &["keymap", "doctor"],
+    },
+    CoreProxyCommand {
+        command_name: "terminal-doctor",
+        command_path: &["terminal", "doctor"],
+    },
+    CoreProxyCommand {
+        command_name: "terminal-install-terminfo",
+        command_path: &["terminal", "install-terminfo"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-start",
+        command_path: &["recording", "start"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-stop",
+        command_path: &["recording", "stop"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-status",
+        command_path: &["recording", "status"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-path",
+        command_path: &["recording", "path"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-list",
+        command_path: &["recording", "list"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-delete",
+        command_path: &["recording", "delete"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-delete-all",
+        command_path: &["recording", "delete-all"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-cut",
+        command_path: &["recording", "cut"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-inspect",
+        command_path: &["recording", "inspect"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-replay",
+        command_path: &["recording", "replay"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-verify-smoke",
+        command_path: &["recording", "verify-smoke"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-export",
+        command_path: &["recording", "export"],
+    },
+    CoreProxyCommand {
+        command_name: "recording-prune",
+        command_path: &["recording", "prune"],
+    },
+    CoreProxyCommand {
+        command_name: "playbook-run",
+        command_path: &["playbook", "run"],
+    },
+    CoreProxyCommand {
+        command_name: "playbook-validate",
+        command_path: &["playbook", "validate"],
+    },
+    CoreProxyCommand {
+        command_name: "playbook-interactive",
+        command_path: &["playbook", "interactive"],
+    },
+    CoreProxyCommand {
+        command_name: "playbook-from-recording",
+        command_path: &["playbook", "from-recording"],
+    },
+    CoreProxyCommand {
+        command_name: "playbook-dry-run",
+        command_path: &["playbook", "dry-run"],
+    },
+    CoreProxyCommand {
+        command_name: "playbook-diff",
+        command_path: &["playbook", "diff"],
+    },
+    CoreProxyCommand {
+        command_name: "playbook-cleanup",
+        command_path: &["playbook", "cleanup"],
+    },
+];
+
+fn core_proxy_command_path(command_name: &str) -> Option<&'static [&'static str]> {
+    CORE_PROXY_COMMANDS
+        .iter()
+        .find(|entry| entry.command_name == command_name)
+        .map(|entry| entry.command_path)
 }
 
 fn run_core_proxy_command(
