@@ -90,6 +90,14 @@ pub enum RecordingRenderMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingPaletteSource {
+    Auto,
+    Recording,
+    Terminal,
+    Xterm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum RecordingCursorMode {
     Auto,
     On,
@@ -632,6 +640,7 @@ pub enum RemoteCompleteCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // Clap subcommands intentionally store parsed payloads inline.
 pub enum RecordingCommand {
     /// Start explicit full-fidelity recording
     Start {
@@ -838,6 +847,18 @@ pub enum RecordingCommand {
         /// Additional font file path (repeatable)
         #[arg(long)]
         font_path: Vec<String>,
+        /// Palette source for indexed/default color resolution
+        #[arg(long, value_enum)]
+        palette_source: Option<RecordingPaletteSource>,
+        /// Foreground default override for palette resolution (`auto` or color)
+        #[arg(long)]
+        palette_foreground: Option<String>,
+        /// Background default override for palette resolution (`auto` or color)
+        #[arg(long)]
+        palette_background: Option<String>,
+        /// Indexed color override `INDEX=COLOR` (repeatable)
+        #[arg(long)]
+        palette_color: Vec<String>,
         /// Cursor rendering mode for export
         #[arg(long, value_enum)]
         cursor: Option<RecordingCursorMode>,
@@ -1482,9 +1503,9 @@ mod tests {
         RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
         RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
         RecordingEventKindArg, RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg,
-        RecordingListStatusArg, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-        RemoteCommand, RemoteCompleteCommand, ServerCommand, ServerRecordingCommand,
-        SessionCommand, TerminalCommand, TraceFamily,
+        RecordingListStatusArg, RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode,
+        RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand,
+        ServerRecordingCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -3750,6 +3771,16 @@ mod tests {
             "/tmp/font.ttf",
             "--font-path",
             "/tmp/font2.ttf",
+            "--palette-source",
+            "recording",
+            "--palette-foreground",
+            "#e0e0e0",
+            "--palette-background",
+            "#111111",
+            "--palette-color",
+            "5=#bb78d9",
+            "--palette-color",
+            "9=#ff6655",
             "--cursor",
             "on",
             "--cursor-shape",
@@ -3795,6 +3826,10 @@ mod tests {
                 font_size: Some(size),
                 line_height: Some(line_height),
                 font_path,
+                palette_source: Some(RecordingPaletteSource::Recording),
+                palette_foreground: Some(_),
+                palette_background: Some(_),
+                palette_color,
                 cursor: Some(RecordingCursorMode::On),
                 cursor_shape: Some(RecordingCursorShape::Bar),
                 cursor_blink: Some(RecordingCursorBlinkMode::Off),
@@ -3812,6 +3847,7 @@ mod tests {
             } if (size - 15.0).abs() < f32::EPSILON
                 && (line_height - 1.1).abs() < f32::EPSILON
                 && font_path.len() == 2
+                && palette_color.len() == 2
         ));
     }
 

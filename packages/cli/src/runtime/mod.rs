@@ -11,7 +11,7 @@ use bmux_cli_schema::{
     RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
     RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
     RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
-    RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+    RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
 };
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};

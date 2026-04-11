@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use bmux_cli_schema::{
     RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
     RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
-    RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+    RecordingExportFormat, RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode,
+    RecordingReplayMode,
 };
 use bmux_client::BmuxClient;
 use bmux_config::{
     BmuxConfig, ConfigPaths, RecordingExportCursorBlinkMode, RecordingExportCursorMode,
     RecordingExportCursorPaintMode, RecordingExportCursorProfile, RecordingExportCursorShape,
-    RecordingExportCursorTextMode,
+    RecordingExportCursorTextMode, RecordingExportPaletteSource,
 };
 use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingPayload, SessionSelector};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -155,6 +156,7 @@ pub(super) async fn run_recording_verify_smoke(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
@@ -176,6 +178,10 @@ pub(super) async fn run_recording_export(
     font_size: Option<f32>,
     line_height: Option<f32>,
     font_path: &[String],
+    palette_source: Option<RecordingPaletteSource>,
+    palette_foreground: Option<&str>,
+    palette_background: Option<&str>,
+    palette_color: &[String],
     cursor: Option<RecordingCursorMode>,
     cursor_shape: Option<RecordingCursorShape>,
     cursor_blink: Option<RecordingCursorBlinkMode>,
@@ -252,6 +258,23 @@ pub(super) async fn run_recording_export(
         cursor_bar_width_pct.unwrap_or_else(|| export_defaults.cursor_bar_width_pct.clamp(1, 100));
     let resolved_cursor_underline_height_pct = cursor_underline_height_pct
         .unwrap_or_else(|| export_defaults.cursor_underline_height_pct.clamp(1, 100));
+    let resolved_palette_source = palette_source.unwrap_or(match export_defaults.palette_source {
+        RecordingExportPaletteSource::Auto => RecordingPaletteSource::Auto,
+        RecordingExportPaletteSource::Recording => RecordingPaletteSource::Recording,
+        RecordingExportPaletteSource::Terminal => RecordingPaletteSource::Terminal,
+        RecordingExportPaletteSource::Xterm => RecordingPaletteSource::Xterm,
+    });
+    let resolved_palette_foreground = palette_foreground
+        .map(str::to_string)
+        .or_else(|| export_defaults.palette_foreground.clone());
+    let resolved_palette_background = palette_background
+        .map(str::to_string)
+        .or_else(|| export_defaults.palette_background.clone());
+    let resolved_palette_color = if palette_color.is_empty() {
+        export_defaults.palette_colors.clone()
+    } else {
+        palette_color.to_vec()
+    };
 
     recording::run_recording_export(
         recording_id,
@@ -270,6 +293,10 @@ pub(super) async fn run_recording_export(
         font_size,
         line_height,
         font_path,
+        resolved_palette_source,
+        resolved_palette_foreground.as_deref(),
+        resolved_palette_background.as_deref(),
+        &resolved_palette_color,
         resolved_cursor,
         resolved_cursor_shape,
         resolved_cursor_blink,
@@ -304,6 +331,10 @@ pub(super) async fn run_recording_auto_export_gif(recording_id: &str, output: &s
         None,
         None,
         None,
+        None,
+        None,
+        None,
+        &[],
         None,
         None,
         None,

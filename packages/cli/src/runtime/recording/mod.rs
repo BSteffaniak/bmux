@@ -7,9 +7,10 @@ use super::{
     RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
     RecordingCursorTextMode, RecordingEventEnvelope, RecordingEventKind, RecordingEventKindArg,
     RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
-    RecordingProfileArg, RecordingRenderMode, RecordingReplayMode, RecordingStatus,
-    RecordingSummary, Repeat, Result, Uuid, Write, active_runtime_name, cleanup_stale_pid_file,
-    connect_if_running_with_context, io, map_cli_client_error, parse_uuid_value, terminal,
+    RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+    RecordingStatus, RecordingSummary, Repeat, Result, Uuid, Write, active_runtime_name,
+    cleanup_stale_pid_file, connect_if_running_with_context, io, map_cli_client_error,
+    parse_uuid_value, terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_cli_output::{Table, TableAlign, TableColumn, write_table};
@@ -1912,6 +1913,10 @@ pub(super) async fn run_recording_export(
     font_size: Option<f32>,
     line_height: Option<f32>,
     font_path: &[String],
+    palette_source: RecordingPaletteSource,
+    palette_foreground: Option<&str>,
+    palette_background: Option<&str>,
+    palette_color: &[String],
     cursor: RecordingCursorMode,
     cursor_shape: RecordingCursorShape,
     cursor_blink: RecordingCursorBlinkMode,
@@ -1973,8 +1978,9 @@ pub(super) async fn run_recording_export(
         )
     }
 
-    let terminal_profile =
-        recording_terminal_profile(&events).or_else(terminal_profile::detect_render_profile);
+    let recording_profile = recording_terminal_profile(&events);
+    let host_profile = terminal_profile::detect_render_profile();
+    let terminal_profile = recording_profile.as_ref().or(host_profile.as_ref());
 
     match format {
         RecordingExportFormat::Gif => export_recording_gif(
@@ -1984,7 +1990,9 @@ pub(super) async fn run_recording_export(
             fps,
             max_duration,
             max_frames,
-            terminal_profile.as_ref(),
+            terminal_profile,
+            recording_profile.as_ref(),
+            host_profile.as_ref(),
             renderer,
             cell_size,
             cell_width,
@@ -1993,6 +2001,10 @@ pub(super) async fn run_recording_export(
             font_size,
             line_height,
             font_path,
+            palette_source,
+            palette_foreground,
+            palette_background,
+            palette_color,
             cursor,
             cursor_shape,
             cursor_blink,
@@ -2436,14 +2448,10 @@ fn parse_cursor_color(value: &str) -> Result<Option<(u8, u8, u8)>> {
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
         return Ok(None);
     }
-    let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
-    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        anyhow::bail!("invalid cursor color '{value}'; expected auto or #RRGGBB")
-    }
-    let r = u8::from_str_radix(&hex[0..2], 16).context("invalid cursor color red channel")?;
-    let g = u8::from_str_radix(&hex[2..4], 16).context("invalid cursor color green channel")?;
-    let b = u8::from_str_radix(&hex[4..6], 16).context("invalid cursor color blue channel")?;
-    Ok(Some((r, g, b)))
+    let Some(rgb) = parse_rgb_color(trimmed) else {
+        anyhow::bail!("invalid cursor color '{value}'; expected auto or a color value")
+    };
+    Ok(Some(rgb))
 }
 
 fn update_cursor_replay_state(state: &mut CursorReplayState, data: &[u8]) {
@@ -2870,6 +2878,8 @@ fn export_recording_gif(
     max_duration: Option<u64>,
     max_frames: Option<u32>,
     terminal_profile: Option<&terminal_profile::DetectedTerminalProfile>,
+    recording_profile: Option<&terminal_profile::DetectedTerminalProfile>,
+    host_profile: Option<&terminal_profile::DetectedTerminalProfile>,
     renderer: RecordingRenderMode,
     cell_size: Option<(u16, u16)>,
     cell_width: Option<u16>,
@@ -2878,6 +2888,10 @@ fn export_recording_gif(
     font_size: Option<f32>,
     line_height: Option<f32>,
     font_path: &[String],
+    palette_source: RecordingPaletteSource,
+    palette_foreground: Option<&str>,
+    palette_background: Option<&str>,
+    palette_color: &[String],
     cursor_mode: RecordingCursorMode,
     cursor_shape: RecordingCursorShape,
     cursor_blink: RecordingCursorBlinkMode,
@@ -3049,7 +3063,14 @@ fn export_recording_gif(
         font_path,
     )?;
     let renderer_init_started_at = profiler.stage_started();
-    let palette = xterm_256_palette();
+    let palette = resolve_export_palette(
+        palette_source,
+        recording_profile,
+        host_profile,
+        palette_foreground,
+        palette_background,
+        palette_color,
+    )?;
     let mut glyph_renderer = match render_options.mode {
         RecordingRenderMode::Font => GlyphRenderer::new(cell_w, cell_h, &render_options),
         RecordingRenderMode::Bitmap => None,
@@ -3835,7 +3856,7 @@ fn render_screen_rgba(
     max_cols: u16,
     cell_w: u16,
     cell_h: u16,
-    palette: &[(u8, u8, u8)],
+    palette: &ExportPalette,
     mut glyph_renderer: Option<&mut GlyphRenderer>,
     bitmap_cache: &mut BitmapGlyphCache,
 ) -> Vec<u8> {
@@ -3850,13 +3871,7 @@ fn render_screen_rgba(
             let Some(cell) = screen.cell(row, col) else {
                 continue;
             };
-            let mut fg = vt100_color_to_palette_index(cell.fgcolor(), true);
-            let mut bg = vt100_color_to_palette_index(cell.bgcolor(), false);
-            if cell.inverse() {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            let (fg_r, fg_g, fg_b) = palette[usize::from(fg)];
-            let (bg_r, bg_g, bg_b) = palette[usize::from(bg)];
+            let ((fg_r, fg_g, fg_b), (bg_r, bg_g, bg_b)) = resolved_cell_colors(cell, palette);
             let x0 = usize::from(col).saturating_mul(cw);
             let y0 = usize::from(row).saturating_mul(cell_height_px);
             for py in 0..cell_height_px {
@@ -4016,7 +4031,7 @@ impl ResvgFrameRenderer {
         screen: &vt100::Screen,
         rows: u16,
         cols: u16,
-        palette: &[(u8, u8, u8)],
+        palette: &ExportPalette,
     ) -> Result<Vec<u8>> {
         self.svg.clear();
         write!(
@@ -4146,14 +4161,14 @@ struct TextRun {
 
 fn resolved_cell_colors(
     cell: &vt100::Cell,
-    palette: &[(u8, u8, u8)],
+    palette: &ExportPalette,
 ) -> ((u8, u8, u8), (u8, u8, u8)) {
-    let mut fg = vt100_color_to_palette_index(cell.fgcolor(), true);
-    let mut bg = vt100_color_to_palette_index(cell.bgcolor(), false);
+    let mut fg = resolve_vt100_color(cell.fgcolor(), true, palette);
+    let mut bg = resolve_vt100_color(cell.bgcolor(), false, palette);
     if cell.inverse() {
         std::mem::swap(&mut fg, &mut bg);
     }
-    (palette[usize::from(fg)], palette[usize::from(bg)])
+    (fg, bg)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -4876,40 +4891,270 @@ const fn font_preset_for_options(_options: &RenderOptions) -> FontPreset {
     FontPreset::GhosttyNerd
 }
 
-fn vt100_color_to_palette_index(color: vt100::Color, foreground: bool) -> u8 {
+#[derive(Debug, Clone)]
+struct ExportPalette {
+    colors: [(u8, u8, u8); 256],
+    default_fg: (u8, u8, u8),
+    default_bg: (u8, u8, u8),
+}
+
+type PaletteRgb = (u8, u8, u8);
+type PaletteOverride = (u8, PaletteRgb);
+
+impl ExportPalette {
+    fn xterm() -> Self {
+        let colors = xterm_256_palette();
+        Self {
+            colors,
+            default_fg: colors[15],
+            default_bg: colors[0],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResolvedPaletteSource {
+    Recording,
+    Terminal,
+    Xterm,
+}
+
+fn resolve_export_palette(
+    source: RecordingPaletteSource,
+    recording_profile: Option<&terminal_profile::DetectedTerminalProfile>,
+    host_profile: Option<&terminal_profile::DetectedTerminalProfile>,
+    palette_foreground: Option<&str>,
+    palette_background: Option<&str>,
+    palette_color: &[String],
+) -> Result<ExportPalette> {
+    let mut palette = ExportPalette::xterm();
+    let resolved_source = match source {
+        RecordingPaletteSource::Auto => {
+            if recording_profile.is_some_and(profile_has_palette_data) {
+                ResolvedPaletteSource::Recording
+            } else if host_profile.is_some_and(profile_has_palette_data) {
+                ResolvedPaletteSource::Terminal
+            } else {
+                ResolvedPaletteSource::Xterm
+            }
+        }
+        RecordingPaletteSource::Recording => {
+            if recording_profile.is_some_and(profile_has_palette_data) {
+                ResolvedPaletteSource::Recording
+            } else {
+                ResolvedPaletteSource::Xterm
+            }
+        }
+        RecordingPaletteSource::Terminal => {
+            if host_profile.is_some_and(profile_has_palette_data) {
+                ResolvedPaletteSource::Terminal
+            } else {
+                ResolvedPaletteSource::Xterm
+            }
+        }
+        RecordingPaletteSource::Xterm => ResolvedPaletteSource::Xterm,
+    };
+
+    match resolved_source {
+        ResolvedPaletteSource::Recording => {
+            if let Some(profile) = recording_profile {
+                apply_profile_palette(&mut palette, profile);
+            }
+        }
+        ResolvedPaletteSource::Terminal => {
+            if let Some(profile) = host_profile {
+                apply_profile_palette(&mut palette, profile);
+            }
+        }
+        ResolvedPaletteSource::Xterm => {}
+    }
+
+    if let Some(fg) = parse_palette_default_override(palette_foreground, "palette foreground")? {
+        palette.default_fg = fg;
+    }
+    if let Some(bg) = parse_palette_default_override(palette_background, "palette background")? {
+        palette.default_bg = bg;
+    }
+    let overrides = parse_palette_color_overrides(palette_color)?;
+    for (index, rgb) in overrides {
+        palette.colors[usize::from(index)] = rgb;
+    }
+
+    Ok(palette)
+}
+
+const fn profile_has_palette_data(profile: &terminal_profile::DetectedTerminalProfile) -> bool {
+    profile.palette_defaults.foreground.is_some()
+        || profile.palette_defaults.background.is_some()
+        || !profile.palette_defaults.colors.is_empty()
+}
+
+fn apply_profile_palette(
+    palette: &mut ExportPalette,
+    profile: &terminal_profile::DetectedTerminalProfile,
+) {
+    if let Some(raw) = profile.palette_defaults.foreground.as_deref() {
+        if let Some(rgb) = parse_rgb_color(raw) {
+            palette.default_fg = rgb;
+        } else {
+            tracing::warn!(
+                "recording export: ignoring invalid terminal profile foreground color '{raw}'"
+            );
+        }
+    }
+    if let Some(raw) = profile.palette_defaults.background.as_deref() {
+        if let Some(rgb) = parse_rgb_color(raw) {
+            palette.default_bg = rgb;
+        } else {
+            tracing::warn!(
+                "recording export: ignoring invalid terminal profile background color '{raw}'"
+            );
+        }
+    }
+    for entry in &profile.palette_defaults.colors {
+        if let Some(rgb) = parse_rgb_color(&entry.color) {
+            palette.colors[usize::from(entry.index)] = rgb;
+        } else {
+            tracing::warn!(
+                "recording export: ignoring invalid terminal profile palette entry {}='{}'",
+                entry.index,
+                entry.color
+            );
+        }
+    }
+}
+
+fn parse_palette_default_override(
+    value: Option<&str>,
+    field_name: &str,
+) -> Result<Option<(u8, u8, u8)>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let Some(rgb) = parse_rgb_color(trimmed) else {
+        anyhow::bail!("invalid {field_name} '{raw}'; expected auto or a color value")
+    };
+    Ok(Some(rgb))
+}
+
+fn parse_palette_color_overrides(values: &[String]) -> Result<Vec<PaletteOverride>> {
+    values
+        .iter()
+        .map(|value| parse_palette_color_override(value))
+        .collect()
+}
+
+fn parse_palette_color_override(value: &str) -> Result<PaletteOverride> {
+    let (index_raw, color_raw) = value.split_once('=').ok_or_else(|| {
+        anyhow::anyhow!("invalid palette override '{value}'; expected INDEX=COLOR")
+    })?;
+    let index = parse_palette_index(index_raw.trim())
+        .ok_or_else(|| anyhow::anyhow!("invalid palette index '{index_raw}'; expected 0..255"))?;
+    let color = color_raw.trim();
+    let rgb = parse_rgb_color(color).ok_or_else(|| {
+        anyhow::anyhow!("invalid palette color '{color_raw}'; expected a color value")
+    })?;
+    Ok((index, rgb))
+}
+
+fn parse_palette_index(value: &str) -> Option<u8> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for (prefix, radix) in [
+        ("0x", 16),
+        ("0X", 16),
+        ("0b", 2),
+        ("0B", 2),
+        ("0o", 8),
+        ("0O", 8),
+    ] {
+        if let Some(digits) = trimmed.strip_prefix(prefix) {
+            if digits.is_empty() {
+                return None;
+            }
+            let parsed = u16::from_str_radix(digits, radix).ok()?;
+            return u8::try_from(parsed).ok();
+        }
+    }
+    let parsed = trimmed.parse::<u16>().ok()?;
+    u8::try_from(parsed).ok()
+}
+
+fn resolve_vt100_color(
+    color: vt100::Color,
+    foreground: bool,
+    palette: &ExportPalette,
+) -> (u8, u8, u8) {
     match color {
         vt100::Color::Default => {
             if foreground {
-                15
+                palette.default_fg
             } else {
-                0
+                palette.default_bg
             }
         }
-        vt100::Color::Idx(idx) => idx,
-        vt100::Color::Rgb(r, g, b) => nearest_xterm_index(r, g, b),
+        vt100::Color::Idx(idx) => palette.colors[usize::from(idx)],
+        vt100::Color::Rgb(r, g, b) => (r, g, b),
     }
 }
 
-#[allow(clippy::cast_possible_truncation)] // Index bounded to 0..=255
-fn nearest_xterm_index(r: u8, g: u8, b: u8) -> u8 {
-    let palette = xterm_256_palette();
-    let mut best_index = 0_u8;
-    let mut best_distance = u32::MAX;
-    for (index, (pr, pg, pb)) in palette.iter().enumerate() {
-        let dr = i32::from(*pr) - i32::from(r);
-        let dg = i32::from(*pg) - i32::from(g);
-        let db = i32::from(*pb) - i32::from(b);
-        let distance = (dr * dr + dg * dg + db * db).cast_unsigned();
-        if distance < best_distance {
-            best_distance = distance;
-            best_index = index as u8;
-        }
-    }
-    best_index
+fn parse_rgb_color(value: &str) -> Option<(u8, u8, u8)> {
+    parse_hex_rgb(value).or_else(|| parse_osc_rgb(value))
 }
 
-fn xterm_256_palette() -> Vec<(u8, u8, u8)> {
-    let mut colors = vec![
+fn parse_hex_rgb(value: &str) -> Option<(u8, u8, u8)> {
+    let trimmed = value.trim();
+    let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+fn parse_osc_rgb(value: &str) -> Option<(u8, u8, u8)> {
+    let trimmed = value.trim();
+    let body = trimmed
+        .strip_prefix("rgb:")
+        .or_else(|| trimmed.strip_prefix("RGB:"))?;
+    let mut channels = body.split('/');
+    let r = channels.next().and_then(hex_component_to_u8)?;
+    let g = channels.next().and_then(hex_component_to_u8)?;
+    let b = channels.next().and_then(hex_component_to_u8)?;
+    if channels.next().is_some() {
+        return None;
+    }
+    Some((r, g, b))
+}
+
+fn hex_component_to_u8(value: &str) -> Option<u8> {
+    if !(1..=4).contains(&value.len()) || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let parsed = u16::from_str_radix(value, 16).ok()?;
+    let bits = u32::try_from(value.len()).ok()?.saturating_mul(4);
+    let max = (1_u32 << bits).saturating_sub(1);
+    if max == 0 {
+        return None;
+    }
+    let scaled = (u32::from(parsed)
+        .saturating_mul(255)
+        .saturating_add(max / 2))
+        / max;
+    u8::try_from(scaled).ok()
+}
+
+fn xterm_256_palette() -> [(u8, u8, u8); 256] {
+    let mut colors = [(0_u8, 0_u8, 0_u8); 256];
+    let base = [
         (0x00, 0x00, 0x00),
         (0x80, 0x00, 0x00),
         (0x00, 0x80, 0x00),
@@ -4927,19 +5172,23 @@ fn xterm_256_palette() -> Vec<(u8, u8, u8)> {
         (0x00, 0xff, 0xff),
         (0xff, 0xff, 0xff),
     ];
+    colors[..16].copy_from_slice(&base);
 
     let steps = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+    let mut index = 16_usize;
     for r in steps {
         for g in steps {
             for b in steps {
-                colors.push((r, g, b));
+                colors[index] = (r, g, b);
+                index = index.saturating_add(1);
             }
         }
     }
 
     for i in 0..24_u8 {
         let value = 8 + i * 10;
-        colors.push((value, value, value));
+        colors[index] = (value, value, value);
+        index = index.saturating_add(1);
     }
     colors
 }
@@ -5766,6 +6015,7 @@ mod tests {
             font_size_px: Some(15),
             background_opacity_permille: Some(900),
             cursor_defaults: terminal_profile::CursorDefaults::default(),
+            palette_defaults: terminal_profile::PaletteDefaults::default(),
             source: "test".to_string(),
         };
         let options = build_render_options(
@@ -5792,6 +6042,7 @@ mod tests {
             font_size_px: Some(14),
             background_opacity_permille: None,
             cursor_defaults: terminal_profile::CursorDefaults::default(),
+            palette_defaults: terminal_profile::PaletteDefaults::default(),
             source: "ghostty-config:/tmp/config".to_string(),
         };
         let events = vec![DisplayTrackEnvelope {
@@ -6030,6 +6281,87 @@ mod tests {
             format_duration_compact(std::time::Duration::from_secs(3_665)),
             "1:01:05"
         );
+    }
+
+    #[test]
+    fn parse_palette_color_override_supports_prefixed_index_radix() {
+        assert_eq!(
+            parse_palette_color_override("0x0a=#010203").expect("hex index should parse"),
+            (10, (1, 2, 3))
+        );
+        assert_eq!(
+            parse_palette_color_override("0b1010=#010203").expect("binary index should parse"),
+            (10, (1, 2, 3))
+        );
+        assert_eq!(
+            parse_palette_color_override("0o12=#010203").expect("octal index should parse"),
+            (10, (1, 2, 3))
+        );
+    }
+
+    #[test]
+    fn parse_rgb_color_accepts_osc_rgb_format() {
+        assert_eq!(parse_rgb_color("rgb:ff/00/7f"), Some((255, 0, 127)));
+        assert_eq!(parse_rgb_color("RGB:ffff/0000/7fff"), Some((255, 0, 127)));
+    }
+
+    #[test]
+    fn resolve_vt100_color_preserves_truecolor_rgb() {
+        let palette = ExportPalette::xterm();
+        assert_eq!(
+            resolve_vt100_color(vt100::Color::Rgb(1, 2, 3), true, &palette),
+            (1, 2, 3)
+        );
+    }
+
+    #[test]
+    fn resolve_export_palette_auto_prefers_recording_profile_palette() {
+        let recording_profile = terminal_profile::DetectedTerminalProfile {
+            terminal_id: "ghostty".to_string(),
+            font_families: Vec::new(),
+            font_size_px: None,
+            background_opacity_permille: None,
+            cursor_defaults: terminal_profile::CursorDefaults::default(),
+            palette_defaults: terminal_profile::PaletteDefaults {
+                foreground: Some("#f0f0f0".to_string()),
+                background: Some("#101010".to_string()),
+                colors: vec![terminal_profile::PaletteColorEntry {
+                    index: 5,
+                    color: "#bb78d9".to_string(),
+                }],
+            },
+            source: "recording".to_string(),
+        };
+        let host_profile = terminal_profile::DetectedTerminalProfile {
+            terminal_id: "ghostty".to_string(),
+            font_families: Vec::new(),
+            font_size_px: None,
+            background_opacity_permille: None,
+            cursor_defaults: terminal_profile::CursorDefaults::default(),
+            palette_defaults: terminal_profile::PaletteDefaults {
+                foreground: Some("#ffffff".to_string()),
+                background: Some("#000000".to_string()),
+                colors: vec![terminal_profile::PaletteColorEntry {
+                    index: 5,
+                    color: "#00ff00".to_string(),
+                }],
+            },
+            source: "host".to_string(),
+        };
+
+        let resolved = resolve_export_palette(
+            RecordingPaletteSource::Auto,
+            Some(&recording_profile),
+            Some(&host_profile),
+            None,
+            None,
+            &[],
+        )
+        .expect("palette should resolve");
+
+        assert_eq!(resolved.default_fg, (0xf0, 0xf0, 0xf0));
+        assert_eq!(resolved.default_bg, (0x10, 0x10, 0x10));
+        assert_eq!(resolved.colors[5], (0xbb, 0x78, 0xd9));
     }
 
     #[test]

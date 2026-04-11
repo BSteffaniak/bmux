@@ -27,5 +27,5 @@ pub mod playbook;
 /// # Errors
 /// Returns an error when CLI parsing, command execution, or runtime startup fails.
 pub async fn run_cli() -> anyhow::Result<u8> {
-    runtime::run().await
+    Box::pin(runtime::run()).await
 }

@@ -9,6 +9,8 @@ pub(super) struct DetectedTerminalProfile {
     pub(super) background_opacity_permille: Option<u16>,
     #[serde(default)]
     pub(super) cursor_defaults: CursorDefaults,
+    #[serde(default)]
+    pub(super) palette_defaults: PaletteDefaults,
     pub(super) source: String,
 }
 
@@ -25,6 +27,20 @@ pub(super) struct CursorDefaults {
     pub(super) text_mode: Option<CursorDefaultTextMode>,
     pub(super) bar_width_pct: Option<u8>,
     pub(super) underline_height_pct: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub(super) struct PaletteDefaults {
+    pub(super) foreground: Option<String>,
+    pub(super) background: Option<String>,
+    #[serde(default)]
+    pub(super) colors: Vec<PaletteColorEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct PaletteColorEntry {
+    pub(super) index: u8,
+    pub(super) color: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -115,6 +131,7 @@ struct GhosttyConfigProfile {
     font_size_px: Option<u16>,
     background_opacity_permille: Option<u16>,
     cursor_defaults: CursorDefaults,
+    palette_defaults: PaletteDefaults,
 }
 
 impl GhosttyProvider {
@@ -149,6 +166,7 @@ impl GhosttyProvider {
             && parsed.font_size_px.is_none()
             && parsed.background_opacity_permille.is_none()
             && parsed.cursor_defaults == CursorDefaults::default()
+            && parsed.palette_defaults == PaletteDefaults::default()
         {
             return None;
         }
@@ -172,6 +190,7 @@ impl GhosttyProvider {
                 underline_height_pct: Some(8),
                 ..parsed.cursor_defaults
             },
+            palette_defaults: parsed.palette_defaults,
             source: format!("ghostty-config:{}", path.display()),
         })
     }
@@ -193,6 +212,7 @@ impl GhosttyProvider {
                 underline_height_pct: Some(8),
                 ..CursorDefaults::default()
             },
+            palette_defaults: PaletteDefaults::default(),
             source: "ghostty-default".to_string(),
         }
     }
@@ -266,6 +286,29 @@ fn parse_ghostty_config_profile(content: &str) -> GhosttyConfigProfile {
                 }
                 if let Some(opacity) = parse_ghostty_background_opacity_permille(&parsed) {
                     profile.background_opacity_permille = Some(opacity);
+                }
+            }
+            "foreground" => {
+                if parsed.is_empty() {
+                    profile.palette_defaults.foreground = None;
+                    continue;
+                }
+                profile.palette_defaults.foreground = Some(parsed);
+            }
+            "background" => {
+                if parsed.is_empty() {
+                    profile.palette_defaults.background = None;
+                    continue;
+                }
+                profile.palette_defaults.background = Some(parsed);
+            }
+            "palette" => {
+                if parsed.is_empty() {
+                    profile.palette_defaults.colors.clear();
+                    continue;
+                }
+                if let Some(entry) = parse_ghostty_palette_entry(&parsed) {
+                    profile.palette_defaults.colors.push(entry);
                 }
             }
             "cursor-style" => {
@@ -365,12 +408,51 @@ fn parse_ghostty_background_opacity_permille(value: &str) -> Option<u16> {
     Some(permille as u16)
 }
 
+fn parse_ghostty_palette_entry(value: &str) -> Option<PaletteColorEntry> {
+    let (index_raw, color_raw) = value.split_once('=')?;
+    let index = parse_ghostty_palette_index(index_raw.trim())?;
+    let color = color_raw.trim();
+    if color.is_empty() {
+        return None;
+    }
+    Some(PaletteColorEntry {
+        index,
+        color: color.to_string(),
+    })
+}
+
+fn parse_ghostty_palette_index(value: &str) -> Option<u8> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for (prefix, radix) in [
+        ("0x", 16),
+        ("0X", 16),
+        ("0b", 2),
+        ("0B", 2),
+        ("0o", 8),
+        ("0O", 8),
+    ] {
+        if let Some(digits) = trimmed.strip_prefix(prefix) {
+            if digits.is_empty() {
+                return None;
+            }
+            let parsed = u16::from_str_radix(digits, radix).ok()?;
+            return u8::try_from(parsed).ok();
+        }
+    }
+    let parsed = trimmed.parse::<u16>().ok()?;
+    u8::try_from(parsed).ok()
+}
+
 fn strip_inline_comment(line: &str) -> String {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
     let mut out = String::new();
-    for ch in line.chars() {
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
         if escaped {
             out.push(ch);
             escaped = false;
@@ -392,7 +474,12 @@ fn strip_inline_comment(line: &str) -> String {
             continue;
         }
         if ch == '#' && !in_single && !in_double {
-            break;
+            let at_line_start = out.trim().is_empty();
+            let prev_is_whitespace = out.chars().last().is_none_or(char::is_whitespace);
+            let next_is_whitespace_or_eol = chars.peek().is_none_or(|next| next.is_whitespace());
+            if at_line_start || (prev_is_whitespace && next_is_whitespace_or_eol) {
+                break;
+            }
         }
         out.push(ch);
     }
@@ -432,6 +519,10 @@ cursor-paint-mode = fill
 cursor-text-mode = swap_fg_bg
 cursor-bar-width-pct = 13
 cursor-underline-height-pct = 9
+foreground = '#f5f5f5'
+background = '#111111'
+palette = 5=#bb78d9
+palette = 0x09=#ff6655
 "#,
         );
         assert_eq!(parsed.font_families, vec!["Iosevka".to_string()]);
@@ -450,6 +541,27 @@ cursor-underline-height-pct = 9
         );
         assert_eq!(parsed.cursor_defaults.bar_width_pct, Some(13));
         assert_eq!(parsed.cursor_defaults.underline_height_pct, Some(9));
+        assert_eq!(
+            parsed.palette_defaults.foreground,
+            Some("#f5f5f5".to_string())
+        );
+        assert_eq!(
+            parsed.palette_defaults.background,
+            Some("#111111".to_string())
+        );
+        assert_eq!(
+            parsed.palette_defaults.colors,
+            vec![
+                PaletteColorEntry {
+                    index: 5,
+                    color: "#bb78d9".to_string()
+                },
+                PaletteColorEntry {
+                    index: 9,
+                    color: "#ff6655".to_string()
+                }
+            ]
+        );
     }
 
     #[test]
@@ -467,6 +579,15 @@ font-family = "Jet#Brains Mono" # inline comment
         assert_eq!(parse_ghostty_background_opacity_permille("-1"), Some(0));
         assert_eq!(parse_ghostty_background_opacity_permille("0.5"), Some(500));
         assert_eq!(parse_ghostty_background_opacity_permille("1.5"), Some(1000));
+    }
+
+    #[test]
+    fn parse_ghostty_palette_index_supports_prefixed_radix() {
+        assert_eq!(parse_ghostty_palette_index("15"), Some(15));
+        assert_eq!(parse_ghostty_palette_index("0x0f"), Some(15));
+        assert_eq!(parse_ghostty_palette_index("0o17"), Some(15));
+        assert_eq!(parse_ghostty_palette_index("0b1111"), Some(15));
+        assert_eq!(parse_ghostty_palette_index("300"), None);
     }
 
     #[test]

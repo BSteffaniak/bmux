@@ -398,6 +398,20 @@ pub struct RecordingExportConfig {
     pub cursor_bar_width_pct: u8,
     /// Cursor underline height default as a percent of cell height.
     pub cursor_underline_height_pct: u8,
+    /// Palette source default for `recording export`.
+    pub palette_source: RecordingExportPaletteSource,
+    /// Default foreground override for `recording export` palette resolution.
+    ///
+    /// Accepts `auto`/empty to keep source-derived defaults, or a color value.
+    pub palette_foreground: Option<String>,
+    /// Default background override for `recording export` palette resolution.
+    ///
+    /// Accepts `auto`/empty to keep source-derived defaults, or a color value.
+    pub palette_background: Option<String>,
+    /// Default indexed color overrides for `recording export`.
+    ///
+    /// Entries must be `INDEX=COLOR` (for example `5=#bb78d9`).
+    pub palette_colors: Vec<String>,
 }
 
 impl Default for RecordingExportConfig {
@@ -417,6 +431,10 @@ impl Default for RecordingExportConfig {
             cursor_text_mode: RecordingExportCursorTextMode::Auto,
             cursor_bar_width_pct: 16,
             cursor_underline_height_pct: 12,
+            palette_source: RecordingExportPaletteSource::Auto,
+            palette_foreground: None,
+            palette_background: None,
+            palette_colors: Vec::new(),
         }
     }
 }
@@ -476,6 +494,15 @@ pub enum RecordingExportCursorTextMode {
     Auto,
     SwapFgBg,
     ForceContrast,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ConfigDocEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingExportPaletteSource {
+    Auto,
+    Recording,
+    Terminal,
+    Xterm,
 }
 
 /// Core session defaults: shell, scrollback depth, and server connection settings
@@ -2555,6 +2582,13 @@ timeout_profile = "missing"
         );
         assert_eq!(config.recording.export.cursor_bar_width_pct, 16);
         assert_eq!(config.recording.export.cursor_underline_height_pct, 12);
+        assert_eq!(
+            config.recording.export.palette_source,
+            crate::RecordingExportPaletteSource::Auto
+        );
+        assert_eq!(config.recording.export.palette_foreground, None);
+        assert_eq!(config.recording.export.palette_background, None);
+        assert!(config.recording.export.palette_colors.is_empty());
     }
 
     #[test]
@@ -2563,7 +2597,7 @@ timeout_profile = "missing"
         let dir = path.parent().expect("temp dir").to_path_buf();
         std::fs::write(
             &path,
-            "[recording.export]\ncursor = 'on'\ncursor_shape = 'underline'\ncursor_blink = 'off'\ncursor_blink_period_ms = 650\ncursor_color = '#44aaee'\ncursor_profile = 'ghostty'\ncursor_solid_after_activity_ms = 900\ncursor_solid_after_input_ms = 910\ncursor_solid_after_output_ms = 920\ncursor_solid_after_cursor_ms = 930\ncursor_paint_mode = 'fill'\ncursor_text_mode = 'swap_fg_bg'\ncursor_bar_width_pct = 14\ncursor_underline_height_pct = 11\n",
+            "[recording.export]\ncursor = 'on'\ncursor_shape = 'underline'\ncursor_blink = 'off'\ncursor_blink_period_ms = 650\ncursor_color = '#44aaee'\ncursor_profile = 'ghostty'\ncursor_solid_after_activity_ms = 900\ncursor_solid_after_input_ms = 910\ncursor_solid_after_output_ms = 920\ncursor_solid_after_cursor_ms = 930\ncursor_paint_mode = 'fill'\ncursor_text_mode = 'swap_fg_bg'\ncursor_bar_width_pct = 14\ncursor_underline_height_pct = 11\npalette_source = 'recording'\npalette_foreground = '#d0d0d0'\npalette_background = '#101010'\npalette_colors = ['5=#bb78d9', '9=#ff6655']\n",
         )
         .expect("failed writing config fixture");
 
@@ -2612,6 +2646,22 @@ timeout_profile = "missing"
         );
         assert_eq!(config.recording.export.cursor_bar_width_pct, 14);
         assert_eq!(config.recording.export.cursor_underline_height_pct, 11);
+        assert_eq!(
+            config.recording.export.palette_source,
+            crate::RecordingExportPaletteSource::Recording
+        );
+        assert_eq!(
+            config.recording.export.palette_foreground,
+            Some("#d0d0d0".to_string())
+        );
+        assert_eq!(
+            config.recording.export.palette_background,
+            Some("#101010".to_string())
+        );
+        assert_eq!(
+            config.recording.export.palette_colors,
+            vec!["5=#bb78d9".to_string(), "9=#ff6655".to_string()]
+        );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }

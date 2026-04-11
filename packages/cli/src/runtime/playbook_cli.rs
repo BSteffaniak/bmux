@@ -94,6 +94,10 @@ pub(super) async fn run_playbook_run(
                 None,                        // font_size
                 None,                        // line_height
                 &[],                         // font_path
+                None,                        // palette_source
+                None,                        // palette_foreground
+                None,                        // palette_background
+                &[],                         // palette_color
                 None,                        // cursor
                 None,                        // cursor_shape
                 None,                        // cursor_blink
