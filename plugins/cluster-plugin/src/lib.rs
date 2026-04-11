@@ -225,6 +225,12 @@ struct ClusterUpExecution {
     statuses: Vec<ClusterLaunchStatus>,
 }
 
+#[derive(Debug, Clone)]
+struct ClusterLaunchOutcome {
+    pane_id: String,
+    degraded_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClusterPaneBinding {
     target: String,
@@ -617,6 +623,14 @@ fn execute_cluster_pane_new(
             message: "pane launched for reconnecting host session".to_string(),
         },
     )?;
+    let mut binding = binding;
+    let _ = verify_launched_binding(
+        caller,
+        &response.id.to_string(),
+        &mut binding,
+        RetryFailurePolicy::Continue,
+        0,
+    )?;
 
     Ok(ClusterCommandPaneMutationResponse {
         target: host.to_string(),
@@ -677,9 +691,23 @@ fn launch_ready_cluster_panes(
         let target = status.target.clone();
         let mut retries_remaining = retries;
         loop {
-            match launch_cluster_host(caller, session_selector, cluster, &target) {
-                Ok(pane_id) => {
-                    status.pane_id = Some(pane_id);
+            match launch_cluster_host(
+                caller,
+                session_selector,
+                cluster,
+                &target,
+                on_failure,
+                retries,
+            ) {
+                Ok(outcome) => {
+                    status.pane_id = Some(outcome.pane_id);
+                    if let Some(reason) = outcome.degraded_reason {
+                        status.state = ClusterHostState::Degraded;
+                        status.reason = Some(reason);
+                    } else {
+                        status.state = ClusterHostState::Ready;
+                        status.reason = None;
+                    }
                     break;
                 }
                 Err(failure) => {
@@ -708,7 +736,9 @@ fn launch_cluster_host(
     session_selector: &SessionSelector,
     cluster: &str,
     target: &str,
-) -> Result<String, String> {
+    on_failure: RetryFailurePolicy,
+    retries: u32,
+) -> Result<ClusterLaunchOutcome, String> {
     let response = caller
         .pane_launch(&PaneLaunchRequest {
             session: Some(session_selector.clone()),
@@ -747,7 +777,7 @@ fn launch_cluster_host(
         })?;
 
     let pane_id = response.id.to_string();
-    let binding = ClusterPaneBinding {
+    let mut binding = ClusterPaneBinding {
         target: target.to_string(),
         cluster: Some(cluster.to_string()),
         source: "up".to_string(),
@@ -785,7 +815,12 @@ fn launch_cluster_host(
             message: "pane launched for cluster host".to_string(),
         },
     );
-    Ok(pane_id)
+    let degraded_reason =
+        verify_launched_binding(caller, &pane_id, &mut binding, on_failure, retries)?;
+    Ok(ClusterLaunchOutcome {
+        pane_id,
+        degraded_reason,
+    })
 }
 
 fn execute_cluster_pane_retry(
@@ -844,12 +879,20 @@ fn execute_cluster_pane_retry(
         ClusterConnectionEvent {
             ts_unix_ms: now_unix_ms(),
             pane_id: Some(launch.id.to_string()),
-            cluster: new_binding.cluster,
+            cluster: new_binding.cluster.clone(),
             target: Some(binding.target.clone()),
             source: Some("retry".to_string()),
             state: ClusterConnectionState::Connecting,
             message: "retry launched replacement pane".to_string(),
         },
+    )?;
+    let mut new_binding = new_binding;
+    let _ = verify_launched_binding(
+        caller,
+        &launch.id.to_string(),
+        &mut new_binding,
+        args.on_failure,
+        args.retries,
     )?;
 
     caller
@@ -997,6 +1040,85 @@ fn run_retry_probe_with_policy(
     }
 }
 
+fn verify_launched_binding(
+    caller: &impl HostRuntimeApi,
+    pane_id: &str,
+    binding: &mut ClusterPaneBinding,
+    on_failure: RetryFailurePolicy,
+    retries: u32,
+) -> Result<Option<String>, String> {
+    let mut retries_remaining = retries;
+    loop {
+        match run_health_probe(caller, &binding.target, HealthProbe::Test) {
+            Ok(()) => {
+                binding.state = ClusterConnectionState::Ready;
+                binding.last_error = None;
+                binding.updated_at_unix_ms = now_unix_ms();
+                set_cluster_pane_binding(caller, pane_id, Some(binding))?;
+                append_cluster_connection_event(
+                    caller,
+                    ClusterConnectionEvent {
+                        ts_unix_ms: now_unix_ms(),
+                        pane_id: Some(pane_id.to_string()),
+                        cluster: binding.cluster.clone(),
+                        target: Some(binding.target.clone()),
+                        source: Some(binding.source.clone()),
+                        state: ClusterConnectionState::Ready,
+                        message: "post-launch health probe passed".to_string(),
+                    },
+                )?;
+                return Ok(None);
+            }
+            Err(error) => {
+                binding.state = ClusterConnectionState::Degraded;
+                binding.last_error = Some(error.clone());
+                binding.updated_at_unix_ms = now_unix_ms();
+                set_cluster_pane_binding(caller, pane_id, Some(binding))?;
+                let reason = format!("post-launch health probe failed: {error}");
+                append_cluster_connection_event(
+                    caller,
+                    ClusterConnectionEvent {
+                        ts_unix_ms: now_unix_ms(),
+                        pane_id: Some(pane_id.to_string()),
+                        cluster: binding.cluster.clone(),
+                        target: Some(binding.target.clone()),
+                        source: Some(binding.source.clone()),
+                        state: ClusterConnectionState::Degraded,
+                        message: reason.clone(),
+                    },
+                )?;
+                if retries_remaining > 0 {
+                    retries_remaining -= 1;
+                    append_cluster_connection_event(
+                        caller,
+                        ClusterConnectionEvent {
+                            ts_unix_ms: now_unix_ms(),
+                            pane_id: Some(pane_id.to_string()),
+                            cluster: binding.cluster.clone(),
+                            target: Some(binding.target.clone()),
+                            source: Some(binding.source.clone()),
+                            state: ClusterConnectionState::Retrying,
+                            message: format!(
+                                "retrying post-launch health probe (remaining retries: {retries_remaining})"
+                            ),
+                        },
+                    )?;
+                    continue;
+                }
+
+                return match decide_failure_policy_action(on_failure, &binding.target, &reason) {
+                    RetryPromptDecision::Retry => {
+                        retries_remaining = 0;
+                        continue;
+                    }
+                    RetryPromptDecision::Continue => Ok(Some(reason)),
+                    RetryPromptDecision::Abort => Err(reason),
+                };
+            }
+        }
+    }
+}
+
 fn decide_failure_policy_action(
     policy: RetryFailurePolicy,
     target: &str,
@@ -1094,12 +1216,20 @@ fn execute_cluster_pane_move(
         ClusterConnectionEvent {
             ts_unix_ms: now_unix_ms(),
             pane_id: Some(launch.id.to_string()),
-            cluster: new_binding.cluster,
+            cluster: new_binding.cluster.clone(),
             target: Some(args.host.clone()),
             source: Some("move".to_string()),
             state: ClusterConnectionState::Connecting,
             message: "move launched replacement pane".to_string(),
         },
+    )?;
+    let mut new_binding = new_binding;
+    let _ = verify_launched_binding(
+        caller,
+        &launch.id.to_string(),
+        &mut new_binding,
+        RetryFailurePolicy::Continue,
+        0,
     )?;
 
     caller
@@ -2386,6 +2516,18 @@ mod tests {
         let error = parse_cluster_events_since("1h30")
             .expect_err("malformed compound duration should be rejected");
         assert!(error.contains("missing a unit"));
+    }
+
+    #[test]
+    fn decide_failure_policy_action_non_prompt_modes_are_deterministic() {
+        assert_eq!(
+            decide_failure_policy_action(RetryFailurePolicy::Abort, "db-a", "boom"),
+            RetryPromptDecision::Abort
+        );
+        assert_eq!(
+            decide_failure_policy_action(RetryFailurePolicy::Continue, "db-a", "boom"),
+            RetryPromptDecision::Continue
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ Current scope:
 - `cluster pane retry` relaunches a host-bound pane by inferring target from pane naming convention
 - Cluster pane target metadata is persisted in plugin storage for robust move/retry behavior
 - Connection lifecycle state (`connecting/retrying/degraded/failed`) is tracked in pane metadata
+- Panes transition to `ready` only after post-launch health verification succeeds
 - `cluster pane retry` supports probe retry policy controls (`--retries`, `--on-failure=abort|continue|prompt`)
 - Cluster service interfaces are implemented for query/command/event-list integrations
 
