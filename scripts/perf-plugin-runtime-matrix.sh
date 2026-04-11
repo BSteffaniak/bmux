@@ -85,6 +85,9 @@ run_case() {
 		--warmup "$WARMUP"
 		--max-p95-ms "$max_p95_ms"
 		--max-p99-ms "$max_p99_ms"
+		--max-runtime-retries 0
+		--max-runtime-respawns 0
+		--max-runtime-timeouts 0
 	)
 	if [[ -n "$BMUX_BIN" ]]; then
 		cmd+=(--bmux-bin "$BMUX_BIN")
@@ -114,6 +117,9 @@ run_case_allow_nonzero() {
 		--warmup "$WARMUP"
 		--max-p95-ms "$max_p95_ms"
 		--max-p99-ms "$max_p99_ms"
+		--max-runtime-retries 0
+		--max-runtime-respawns 0
+		--max-runtime-timeouts 0
 	)
 	if [[ -n "$BMUX_BIN" ]]; then
 		cmd+=(--bmux-bin "$BMUX_BIN")

@@ -8,6 +8,9 @@ WARMUP="${WARMUP:-10}"
 MAX_P99_MS="${MAX_P99_MS:-}"
 MAX_P95_MS="${MAX_P95_MS:-}"
 MAX_AVG_MS="${MAX_AVG_MS:-}"
+MAX_RUNTIME_RETRIES="${MAX_RUNTIME_RETRIES:-}"
+MAX_RUNTIME_RESPAWNS="${MAX_RUNTIME_RESPAWNS:-}"
+MAX_RUNTIME_TIMEOUTS="${MAX_RUNTIME_TIMEOUTS:-}"
 ALLOW_NONZERO="0"
 
 BMUX_BIN="${BMUX_BIN:-}"
@@ -27,6 +30,9 @@ Options:
   --max-p99-ms N      Fail if measured p99 is above N milliseconds
   --max-p95-ms N      Fail if measured p95 is above N milliseconds
   --max-avg-ms N      Fail if measured average is above N milliseconds
+  --max-runtime-retries N   Fail if runtime retry warnings exceed N
+  --max-runtime-respawns N  Fail if runtime respawn warnings exceed N
+  --max-runtime-timeouts N  Fail if runtime timeout warnings exceed N
   --allow-nonzero     Allow non-zero command exit status during sampling
   -h, --help          Show this help message
 
@@ -75,6 +81,18 @@ parse_args() {
 			ALLOW_NONZERO="1"
 			shift
 			;;
+		--max-runtime-retries)
+			MAX_RUNTIME_RETRIES="$2"
+			shift 2
+			;;
+		--max-runtime-respawns)
+			MAX_RUNTIME_RESPAWNS="$2"
+			shift 2
+			;;
+		--max-runtime-timeouts)
+			MAX_RUNTIME_TIMEOUTS="$2"
+			shift 2
+			;;
 		--)
 			positional_mode=1
 			TARGET_ARGS=()
@@ -115,6 +133,15 @@ if [[ -n "$MAX_P95_MS" ]]; then
 fi
 if [[ -n "$MAX_AVG_MS" ]]; then
 	require_number "$MAX_AVG_MS" "--max-avg-ms"
+fi
+if [[ -n "$MAX_RUNTIME_RETRIES" ]]; then
+	require_number "$MAX_RUNTIME_RETRIES" "--max-runtime-retries"
+fi
+if [[ -n "$MAX_RUNTIME_RESPAWNS" ]]; then
+	require_number "$MAX_RUNTIME_RESPAWNS" "--max-runtime-respawns"
+fi
+if [[ -n "$MAX_RUNTIME_TIMEOUTS" ]]; then
+	require_number "$MAX_RUNTIME_TIMEOUTS" "--max-runtime-timeouts"
 fi
 
 if [[ "${#TARGET_ARGS[@]}" -eq 0 ]]; then
@@ -161,7 +188,8 @@ for ((i = 0; i < WARMUP; i += 1)); do
 done
 
 SAMPLES_FILE="$SANDBOX/samples_ms.txt"
-BMUX_PERF_ALLOW_NONZERO="$ALLOW_NONZERO" python3 - "$ITERATIONS" "$SAMPLES_FILE" -- "$BMUX_BIN" -- "${TARGET_ARGS[@]}" <<'PY'
+RUNTIME_METRICS_FILE="$SANDBOX/runtime_metrics.txt"
+BMUX_PERF_ALLOW_NONZERO="$ALLOW_NONZERO" python3 - "$ITERATIONS" "$SAMPLES_FILE" "$RUNTIME_METRICS_FILE" -- "$BMUX_BIN" -- "${TARGET_ARGS[@]}" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -169,8 +197,9 @@ import time
 
 iterations = int(sys.argv[1])
 samples_path = pathlib.Path(sys.argv[2])
+metrics_path = pathlib.Path(sys.argv[3])
 
-argv = sys.argv[3:]
+argv = sys.argv[4:]
 first_sep = argv.index("--")
 second_sep = argv.index("--", first_sep + 1)
 cmd = argv[first_sep + 1:second_sep]
@@ -178,16 +207,35 @@ target = argv[second_sep + 1:]
 allow_nonzero = bool(int(__import__("os").environ.get("BMUX_PERF_ALLOW_NONZERO", "0")))
 
 samples = []
+runtime_retries = 0
+runtime_respawns = 0
+runtime_timeouts = 0
 for _ in range(iterations):
     start_ns = time.perf_counter_ns()
-    completed = subprocess.run([*cmd, *target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    completed = subprocess.run([*cmd, *target], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     end_ns = time.perf_counter_ns()
     if completed.returncode != 0 and not allow_nonzero:
         print(f"command exited with non-zero status: {completed.returncode}", file=sys.stderr)
         sys.exit(completed.returncode)
+    stderr_text = completed.stderr or ""
+    runtime_retries += stderr_text.count("persistent process worker write failed; recycling worker")
+    runtime_retries += stderr_text.count("persistent process worker read failed; recycling worker")
+    runtime_respawns += stderr_text.count("persistent process worker exited; respawning")
+    runtime_timeouts += stderr_text.count("persistent process worker read timed out; recycling worker")
+    runtime_timeouts += stderr_text.count("process runtime one-shot invocation timed out")
     samples.append((end_ns - start_ns) / 1_000_000)
 
 samples_path.write_text("\n".join(f"{value:.3f}" for value in samples), encoding="utf-8")
+metrics_path.write_text(
+    "\n".join(
+        [
+            f"retries={runtime_retries}",
+            f"respawns={runtime_respawns}",
+            f"timeouts={runtime_timeouts}",
+        ]
+    ),
+    encoding="utf-8",
+)
 PY
 
 python3 - "$SAMPLES_FILE" "$MAX_P99_MS" "$MAX_P95_MS" "$MAX_AVG_MS" <<'PY'
@@ -229,6 +277,43 @@ if max_avg is not None and avg > max_avg:
 
 if violations:
     print("SLO check failed: " + "; ".join(violations), file=sys.stderr)
+    sys.exit(1)
+PY
+
+python3 - "$RUNTIME_METRICS_FILE" "$MAX_RUNTIME_RETRIES" "$MAX_RUNTIME_RESPAWNS" "$MAX_RUNTIME_TIMEOUTS" <<'PY'
+import pathlib
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+metrics = {}
+for line in lines:
+    if not line or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    metrics[key] = int(value)
+
+max_retries = int(sys.argv[2]) if sys.argv[2] else None
+max_respawns = int(sys.argv[3]) if sys.argv[3] else None
+max_timeouts = int(sys.argv[4]) if sys.argv[4] else None
+
+retries = metrics.get("retries", 0)
+respawns = metrics.get("respawns", 0)
+timeouts = metrics.get("timeouts", 0)
+
+print(
+    f"runtime_faults retries={retries} respawns={respawns} timeouts={timeouts}"
+)
+
+violations = []
+if max_retries is not None and retries > max_retries:
+    violations.append(f"retries {retries} > {max_retries}")
+if max_respawns is not None and respawns > max_respawns:
+    violations.append(f"respawns {respawns} > {max_respawns}")
+if max_timeouts is not None and timeouts > max_timeouts:
+    violations.append(f"timeouts {timeouts} > {max_timeouts}")
+
+if violations:
+    print("runtime fault check failed: " + "; ".join(violations), file=sys.stderr)
     sys.exit(1)
 PY
 

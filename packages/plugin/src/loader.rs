@@ -384,14 +384,22 @@ impl ProcessPluginRuntime {
                             self.metrics
                                 .persistent_timeouts
                                 .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                plugin_id,
+                                command = self.command,
+                                error = %error,
+                                metrics = ?self.metrics.snapshot(),
+                                "persistent process worker read timed out; recycling worker"
+                            );
+                        } else {
+                            warn!(
+                                plugin_id,
+                                command = self.command,
+                                error = %error,
+                                metrics = ?self.metrics.snapshot(),
+                                "persistent process worker read failed; recycling worker"
+                            );
                         }
-                        warn!(
-                            plugin_id,
-                            command = self.command,
-                            error = %error,
-                            metrics = ?self.metrics.snapshot(),
-                            "persistent process worker read failed; recycling worker"
-                        );
                         Self::reset_persistent_worker(&mut guard, true);
                         recovered_once = true;
                         continue;
