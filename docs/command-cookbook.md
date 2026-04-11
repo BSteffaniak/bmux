@@ -33,3 +33,22 @@ bmux logs path --json
 bmux logs level --json
 bmux logs tail --since 15m --lines 200 --no-follow
 ```
+
+## Ephemeral Sandbox Workflow
+
+```bmux-cli
+# Run a bmux command in a clean isolated sandbox
+bmux sandbox run -- server status
+
+# Test a specific local bmux build in isolation
+bmux sandbox run --bmux-bin ./target/debug/bmux -- attach
+
+# Keep artifacts/logs for debugging a failing sandbox run
+bmux sandbox run --keep --bmux-bin ./target/debug/bmux -- server start
+
+# Override to inherit parent environment instead of clean mode
+bmux sandbox run --env-mode inherit -- server status
+
+# Clean up orphaned sandbox directories
+bmux sandbox cleanup --dry-run --json
+```
