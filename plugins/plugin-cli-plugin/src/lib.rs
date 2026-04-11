@@ -8,7 +8,10 @@ use bmux_plugin_sdk::{
     PluginCliCommandRequest, PluginCliCommandResponse, PluginCommandError, RustPlugin,
 };
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
@@ -129,7 +132,10 @@ fn run_doctor_command(context: &NativeCommandContext) -> Result<i32, String> {
         .filter(|plugin| enabled_ids.contains(&plugin.id))
         .collect::<Vec<_>>();
 
+    let manifest_index = discover_manifest_index(context)?;
+
     let mut issues = Vec::new();
+    let mut warnings = Vec::new();
     for plugin_id in &context.enabled_plugins {
         if !context
             .registered_plugins
@@ -158,10 +164,22 @@ fn run_doctor_command(context: &NativeCommandContext) -> Result<i32, String> {
         }
     }
 
+    for plugin in &enabled_plugins {
+        check_plugin_manifest_readiness(
+            plugin,
+            &manifest_index,
+            context,
+            &mut issues,
+            &mut warnings,
+        );
+    }
+
     let report = PluginDoctorReport {
         healthy: issues.is_empty(),
         enabled_plugins: context.enabled_plugins.clone(),
+        inspected_plugins: enabled_plugins.len(),
         issues,
+        warnings,
     };
 
     if as_json {
@@ -170,17 +188,224 @@ fn run_doctor_command(context: &NativeCommandContext) -> Result<i32, String> {
         println!("{output}");
     } else if report.healthy {
         println!(
-            "plugin doctor: ok ({} enabled plugins)",
-            report.enabled_plugins.len()
+            "plugin doctor: ok ({} enabled plugins inspected)",
+            report.inspected_plugins
         );
+        if !report.warnings.is_empty() {
+            println!("plugin doctor: {} warning(s)", report.warnings.len());
+            for warning in &report.warnings {
+                println!("- {warning}");
+            }
+        }
     } else {
         println!("plugin doctor: found {} issue(s)", report.issues.len());
         for issue in &report.issues {
             println!("- {issue}");
         }
+        if !report.warnings.is_empty() {
+            println!("plugin doctor: {} warning(s)", report.warnings.len());
+            for warning in &report.warnings {
+                println!("- {warning}");
+            }
+        }
     }
 
     Ok(if report.healthy { EXIT_OK } else { 1 })
+}
+
+fn discover_manifest_index(
+    context: &NativeCommandContext,
+) -> Result<BTreeMap<String, ManifestRecord>, String> {
+    let mut manifest_index = BTreeMap::new();
+    for root in plugin_roots(context) {
+        let Ok(report) = bmux_plugin::discover_plugin_manifests(&root) else {
+            continue;
+        };
+        for manifest_path in report.manifest_paths {
+            let manifest = bmux_plugin::PluginManifest::from_path(&manifest_path)
+                .map_err(|error| format!("failed parsing {}: {error}", manifest_path.display()))?;
+            manifest_index
+                .entry(manifest.id.clone())
+                .or_insert(ManifestRecord {
+                    manifest,
+                    manifest_path,
+                });
+        }
+    }
+    Ok(manifest_index)
+}
+
+fn check_plugin_manifest_readiness(
+    plugin: &bmux_plugin_sdk::RegisteredPluginInfo,
+    manifest_index: &BTreeMap<String, ManifestRecord>,
+    context: &NativeCommandContext,
+    issues: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(record) = manifest_index.get(&plugin.id) else {
+        issues.push(format!(
+            "plugin '{}' is enabled but no manifest was discovered under configured plugin roots",
+            plugin.id
+        ));
+        return;
+    };
+
+    let declaration = match record.manifest.to_declaration() {
+        Ok(declaration) => declaration,
+        Err(error) => {
+            issues.push(format!(
+                "plugin '{}' manifest failed declaration validation: {error}",
+                plugin.id
+            ));
+            return;
+        }
+    };
+
+    if !declaration
+        .plugin_api
+        .contains(context.host.plugin_api_version)
+    {
+        issues.push(format!(
+            "plugin '{}' plugin_api range '{}' is incompatible with host API version {}",
+            plugin.id, declaration.plugin_api, context.host.plugin_api_version
+        ));
+    }
+    if !declaration
+        .native_abi
+        .contains(context.host.plugin_abi_version)
+    {
+        issues.push(format!(
+            "plugin '{}' native_abi range '{}' is incompatible with host ABI version {}",
+            plugin.id, declaration.native_abi, context.host.plugin_abi_version
+        ));
+    }
+
+    check_plugin_runtime_readiness(plugin, record, issues, warnings);
+}
+
+fn check_plugin_runtime_readiness(
+    plugin: &bmux_plugin_sdk::RegisteredPluginInfo,
+    record: &ManifestRecord,
+    issues: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    match record.manifest.runtime {
+        bmux_plugin::PluginRuntime::Native => {
+            if plugin.bundled_static {
+                return;
+            }
+            let Some(entry_path) = record.manifest.resolve_entry_path(
+                record
+                    .manifest_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(".")),
+            ) else {
+                issues.push(format!(
+                    "plugin '{}' is missing an entry path for native runtime",
+                    plugin.id
+                ));
+                return;
+            };
+
+            if !entry_path.exists() {
+                issues.push(format!(
+                    "plugin '{}' native entry does not exist: {}",
+                    plugin.id,
+                    entry_path.display()
+                ));
+            }
+        }
+        bmux_plugin::PluginRuntime::Process => {
+            let Some(command) = record
+                .manifest
+                .entry
+                .as_ref()
+                .and_then(|entry| entry.to_str())
+            else {
+                issues.push(format!(
+                    "plugin '{}' process runtime is missing entry command",
+                    plugin.id
+                ));
+                return;
+            };
+
+            match process_command_status(command, record) {
+                ProcessCommandStatus::Available => {}
+                ProcessCommandStatus::Missing(path) => issues.push(format!(
+                    "plugin '{}' process command was not found: {}",
+                    plugin.id,
+                    path.display()
+                )),
+                ProcessCommandStatus::NotExecutable(path) => issues.push(format!(
+                    "plugin '{}' process command is not executable: {}",
+                    plugin.id,
+                    path.display()
+                )),
+            }
+            warnings.push(format!(
+                "plugin '{}' uses process runtime; ensure stdout emits only framed protocol responses",
+                plugin.id
+            ));
+        }
+    }
+}
+
+fn process_command_status(command: &str, record: &ManifestRecord) -> ProcessCommandStatus {
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        let resolved = record.manifest.resolve_entry_path(
+            record
+                .manifest_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        );
+        return match resolved {
+            Some(path) if command_is_executable(&path) => ProcessCommandStatus::Available,
+            Some(path) if path.exists() => ProcessCommandStatus::NotExecutable(path),
+            Some(path) => ProcessCommandStatus::Missing(path),
+            None => ProcessCommandStatus::Missing(PathBuf::from(command)),
+        };
+    }
+
+    let mut first_non_exec: Option<PathBuf> = None;
+    let available = std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths)
+            .map(|path| path.join(command))
+            .any(|candidate| {
+                if command_is_executable(&candidate) {
+                    return true;
+                }
+                if first_non_exec.is_none() && candidate.exists() {
+                    first_non_exec = Some(candidate);
+                }
+                false
+            })
+    });
+
+    if available {
+        ProcessCommandStatus::Available
+    } else if let Some(path) = first_non_exec {
+        ProcessCommandStatus::NotExecutable(path)
+    } else {
+        ProcessCommandStatus::Missing(PathBuf::from(command))
+    }
+}
+
+fn command_is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
@@ -802,6 +1027,19 @@ struct BundledPlugin {
     crate_name: String,
 }
 
+#[derive(Debug)]
+struct ManifestRecord {
+    manifest: bmux_plugin::PluginManifest,
+    manifest_path: PathBuf,
+}
+
+#[derive(Debug)]
+enum ProcessCommandStatus {
+    Available,
+    Missing(PathBuf),
+    NotExecutable(PathBuf),
+}
+
 #[derive(Debug, Serialize)]
 struct RebuildSelectionReport {
     profile: String,
@@ -824,7 +1062,9 @@ struct PluginListEntry {
 struct PluginDoctorReport {
     healthy: bool,
     enabled_plugins: Vec<String>,
+    inspected_plugins: usize,
     issues: Vec<String>,
+    warnings: Vec<String>,
 }
 
 bmux_plugin_sdk::export_plugin!(PluginCliPlugin, include_str!("../plugin.toml"));
