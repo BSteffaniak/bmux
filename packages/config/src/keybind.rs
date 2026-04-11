@@ -4,8 +4,8 @@
 //! for modal keybindings (Normal, Insert, Visual, Command modes).
 
 use bmux_config_doc_derive::ConfigDoc;
-use bmux_event::{KeyCode, KeyEvent, Mode};
-use bmux_keybind::{RuntimeAction, action_to_name};
+use bmux_event::{KeyCode, KeyEvent};
+use bmux_keybind::{RuntimeAction, action_to_name, parse_action};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -18,15 +18,18 @@ const PROFILE_SLOW: &str = "slow";
 
 /// Keyboard shortcuts organized by scope.
 ///
-/// Prefix-chord bindings (runtime) require pressing the prefix key first.
-/// Modal bindings (normal, insert, visual, command) are active only in
-/// their respective interaction modes.
+/// Modal bindings are first-class and defined in `modes`.
+/// Legacy prefix/runtime/global bindings remain available for compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "keybindings")]
 #[serde(default)]
 pub struct KeyBindingConfig {
+    /// Initial interaction mode id. Mode ids are matched case-insensitively.
+    pub initial_mode: String,
+    /// First-class modal keymap definitions keyed by mode id.
+    pub modes: BTreeMap<String, ModeBindingConfig>,
     /// Prefix key for runtime key chords (e.g. "ctrl+a"). All runtime
-    /// bindings require pressing this key first.
+    /// bindings require pressing this key first. Legacy path only.
     pub prefix: String,
     /// Exact timeout in milliseconds for multi-stroke chord resolution.
     /// Takes precedence over `timeout_profile`. Valid range: 50-5000.
@@ -47,25 +50,34 @@ pub struct KeyBindingConfig {
     /// Key bindings active in scrollback/copy mode. No prefix required
     /// unless the chord explicitly includes it.
     pub scroll: BTreeMap<String, String>,
-    /// Key bindings for Normal mode, the default mode for navigation and
-    /// pane management. Keystrokes are intercepted by bmux, not forwarded
-    /// to the pane.
-    pub normal: BTreeMap<String, String>,
-    /// Key bindings for Insert mode, where keystrokes are forwarded directly
-    /// to the focused pane process. Typically only Escape is bound to return
-    /// to Normal mode.
-    pub insert: BTreeMap<String, String>,
-    /// Key bindings for Visual mode, used for text selection and copy
-    /// operations in scrollback
-    pub visual: BTreeMap<String, String>,
-    /// Key bindings for Command mode, the : command-line for executing
-    /// runtime commands by name
-    pub command: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[serde(default)]
+pub struct ModeBindingConfig {
+    /// Human-friendly label shown in attach status and hints.
+    pub label: String,
+    /// If true, unmatched keys are forwarded to the focused pane.
+    pub passthrough: bool,
+    /// Bindings active while this mode is selected.
+    pub bindings: BTreeMap<String, String>,
+}
+
+impl Default for ModeBindingConfig {
+    fn default() -> Self {
+        Self {
+            label: "Mode".to_string(),
+            passthrough: false,
+            bindings: BTreeMap::new(),
+        }
+    }
 }
 
 impl Default for KeyBindingConfig {
     fn default() -> Self {
         Self {
+            initial_mode: "normal".to_string(),
+            modes: default_modal_modes(),
             prefix: "ctrl+a".to_string(),
             timeout_ms: None,
             timeout_profile: None,
@@ -73,10 +85,6 @@ impl Default for KeyBindingConfig {
             runtime: default_runtime_bindings(),
             global: default_global_runtime_bindings(),
             scroll: default_scroll_bindings(),
-            normal: default_normal_bindings(),
-            insert: default_insert_bindings(),
-            visual: default_visual_bindings(),
-            command: default_command_bindings(),
         }
     }
 }
@@ -245,6 +253,70 @@ fn action_bindings(pairs: &[(&str, RuntimeAction)]) -> BTreeMap<String, String> 
 
 impl KeyBindingConfig {
     #[must_use]
+    pub fn canonical_mode_id(mode_id: &str) -> String {
+        mode_id.trim().to_ascii_lowercase()
+    }
+
+    #[must_use]
+    pub fn mode_id_eq(left: &str, right: &str) -> bool {
+        Self::canonical_mode_id(left) == Self::canonical_mode_id(right)
+    }
+
+    /// Validate modal keybinding configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when modal configuration is invalid.
+    pub fn validate_modes(&self) -> Result<(), String> {
+        if self.modes.is_empty() {
+            return Err("keybindings.modes must define at least one mode".to_string());
+        }
+
+        let mut canonical_modes = BTreeMap::new();
+        for mode_id in self.modes.keys() {
+            let canonical = Self::canonical_mode_id(mode_id);
+            if canonical.is_empty() {
+                return Err("keybindings.modes contains an empty mode id".to_string());
+            }
+            if let Some(existing) = canonical_modes.insert(canonical.clone(), mode_id.clone()) {
+                return Err(format!(
+                    "keybindings.modes has case-insensitive duplicate mode ids '{existing}' and '{mode_id}'"
+                ));
+            }
+        }
+
+        let initial_mode = Self::canonical_mode_id(&self.initial_mode);
+        if initial_mode.is_empty() {
+            return Err("keybindings.initial_mode must not be empty".to_string());
+        }
+        if !canonical_modes.contains_key(&initial_mode) {
+            return Err(format!(
+                "keybindings.initial_mode '{}' is not defined in keybindings.modes",
+                self.initial_mode
+            ));
+        }
+
+        for (mode_id, mode_config) in &self.modes {
+            for action_name in mode_config.bindings.values() {
+                let action = parse_action(action_name).map_err(|error| {
+                    format!(
+                        "keybindings.modes.{mode_id}.bindings contains invalid action '{action_name}' ({error})"
+                    )
+                })?;
+                if let RuntimeAction::EnterMode(target_mode) = action
+                    && !canonical_modes.contains_key(&target_mode)
+                {
+                    return Err(format!(
+                        "keybindings.modes.{mode_id}.bindings enter_mode target '{target_mode}' is not defined"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[must_use]
     pub fn built_in_timeout_profiles() -> BTreeMap<String, u64> {
         BTreeMap::from([
             (PROFILE_FAST.to_string(), 200),
@@ -303,45 +375,15 @@ impl KeyBindingConfig {
         })
     }
 
-    /// Get key bindings for a specific mode
     #[must_use]
-    pub const fn get_bindings_for_mode(&self, mode: Mode) -> &BTreeMap<String, String> {
-        match mode {
-            Mode::Normal => &self.normal,
-            Mode::Insert => &self.insert,
-            Mode::Visual => &self.visual,
-            Mode::Command => &self.command,
-        }
-    }
-
-    /// Get a command for a key in a specific mode
-    #[must_use]
-    pub fn get_command(&self, mode: Mode, key: &str) -> Option<&str> {
-        self.get_bindings_for_mode(mode)
-            .get(key)
-            .map(String::as_str)
-    }
-
-    /// Add or update a key binding for a specific mode
-    pub fn set_binding(&mut self, mode: Mode, key: String, command: String) {
-        let bindings = match mode {
-            Mode::Normal => &mut self.normal,
-            Mode::Insert => &mut self.insert,
-            Mode::Visual => &mut self.visual,
-            Mode::Command => &mut self.command,
-        };
-        bindings.insert(key, command);
-    }
-
-    /// Remove a key binding for a specific mode
-    pub fn remove_binding(&mut self, mode: Mode, key: &str) -> Option<String> {
-        let bindings = match mode {
-            Mode::Normal => &mut self.normal,
-            Mode::Insert => &mut self.insert,
-            Mode::Visual => &mut self.visual,
-            Mode::Command => &mut self.command,
-        };
-        bindings.remove(key)
+    pub fn mode_config(&self, mode_id: &str) -> Option<&ModeBindingConfig> {
+        let canonical = Self::canonical_mode_id(mode_id);
+        self.modes
+            .iter()
+            .find(|(configured_mode_id, _)| {
+                Self::canonical_mode_id(configured_mode_id) == canonical
+            })
+            .map(|(_, config)| config)
     }
 }
 
@@ -406,92 +448,91 @@ pub fn key_event_to_string(event: &KeyEvent) -> String {
     result
 }
 
-/// Default key bindings for Normal mode
 fn default_normal_bindings() -> BTreeMap<String, String> {
-    let mut bindings = BTreeMap::new();
-
-    // Navigation
-    bindings.insert("h".to_string(), "move-pane-left".to_string());
-    bindings.insert("j".to_string(), "move-pane-down".to_string());
-    bindings.insert("k".to_string(), "move-pane-up".to_string());
-    bindings.insert("l".to_string(), "move-pane-right".to_string());
-
-    // Window management
-    bindings.insert("c".to_string(), "new-window".to_string());
-    bindings.insert("n".to_string(), "next-window".to_string());
-    bindings.insert("p".to_string(), "prev-window".to_string());
-    bindings.insert("&".to_string(), "kill-window".to_string());
-
-    // Pane management
-    bindings.insert("\"".to_string(), "split-horizontal".to_string());
-    bindings.insert("%".to_string(), "split-vertical".to_string());
-    bindings.insert("x".to_string(), "kill-pane".to_string());
-    bindings.insert("z".to_string(), "zoom_pane".to_string());
-
-    // Mode switching
-    bindings.insert("i".to_string(), "enter-insert-mode".to_string());
-    bindings.insert("v".to_string(), "enter-visual-mode".to_string());
-    bindings.insert(":".to_string(), "enter-command-mode".to_string());
-
-    // Other commands
-    bindings.insert("f".to_string(), "fuzzy-find".to_string());
-    bindings.insert("/".to_string(), "search".to_string());
-    bindings.insert("d".to_string(), "detach".to_string());
-    bindings.insert("r".to_string(), "refresh".to_string());
-    bindings.insert("?".to_string(), "show-help".to_string());
-
-    // Resize
-    bindings.insert("H".to_string(), "resize-pane-left".to_string());
-    bindings.insert("J".to_string(), "resize-pane-down".to_string());
-    bindings.insert("K".to_string(), "resize-pane-up".to_string());
-    bindings.insert("L".to_string(), "resize-pane-right".to_string());
-
+    let mut bindings = default_runtime_bindings();
+    bindings.insert("i".to_string(), "enter_mode insert".to_string());
+    bindings.insert(
+        "c".to_string(),
+        "plugin:bmux.windows:new-window".to_string(),
+    );
     bindings
 }
 
-/// Default key bindings for Insert mode
 fn default_insert_bindings() -> BTreeMap<String, String> {
     let mut bindings = BTreeMap::new();
-
-    // Only Escape to return to Normal mode
-    bindings.insert("Esc".to_string(), "enter-normal-mode".to_string());
-
+    bindings.insert("escape".to_string(), "enter_mode normal".to_string());
     bindings
 }
 
-/// Default key bindings for Visual mode
-fn default_visual_bindings() -> BTreeMap<String, String> {
-    let mut bindings = BTreeMap::new();
-
-    // Basic movement (same as Normal mode)
-    bindings.insert("h".to_string(), "move-left".to_string());
-    bindings.insert("j".to_string(), "move-down".to_string());
-    bindings.insert("k".to_string(), "move-up".to_string());
-    bindings.insert("l".to_string(), "move-right".to_string());
-
-    // Text selection commands
-    bindings.insert("y".to_string(), "copy-selection".to_string());
-    bindings.insert("d".to_string(), "cut-selection".to_string());
-
-    // Mode switching
-    bindings.insert("Esc".to_string(), "enter-normal-mode".to_string());
-    bindings.insert(":".to_string(), "enter-command-mode".to_string());
-
-    bindings
+fn default_modal_modes() -> BTreeMap<String, ModeBindingConfig> {
+    BTreeMap::from([
+        (
+            "normal".to_string(),
+            ModeBindingConfig {
+                label: "NORMAL".to_string(),
+                passthrough: false,
+                bindings: default_normal_bindings(),
+            },
+        ),
+        (
+            "insert".to_string(),
+            ModeBindingConfig {
+                label: "INSERT".to_string(),
+                passthrough: true,
+                bindings: default_insert_bindings(),
+            },
+        ),
+    ])
 }
 
-/// Default key bindings for Command mode
-fn default_command_bindings() -> BTreeMap<String, String> {
-    let mut bindings = BTreeMap::new();
+#[cfg(test)]
+mod tests {
+    use super::{KeyBindingConfig, ModeBindingConfig};
+    use std::collections::BTreeMap;
 
-    // Return to Normal mode
-    bindings.insert("Esc".to_string(), "enter-normal-mode".to_string());
-    bindings.insert("Enter".to_string(), "execute-command".to_string());
+    #[test]
+    fn validate_modes_rejects_case_insensitive_duplicate_mode_ids() {
+        let mut config = KeyBindingConfig {
+            initial_mode: "normal".to_string(),
+            ..KeyBindingConfig::default()
+        };
+        config.modes = BTreeMap::from([
+            ("normal".to_string(), ModeBindingConfig::default()),
+            ("NORMAL".to_string(), ModeBindingConfig::default()),
+        ]);
 
-    // Basic editing
-    bindings.insert("Backspace".to_string(), "backspace".to_string());
-    bindings.insert("C-w".to_string(), "delete-word".to_string());
-    bindings.insert("C-u".to_string(), "clear-line".to_string());
+        let error = config
+            .validate_modes()
+            .expect_err("duplicate mode ids should fail");
+        assert!(error.contains("duplicate mode ids"));
+    }
 
-    bindings
+    #[test]
+    fn validate_modes_rejects_unknown_enter_mode_target() {
+        let config = KeyBindingConfig {
+            modes: BTreeMap::from([(
+                "normal".to_string(),
+                ModeBindingConfig {
+                    label: "NORMAL".to_string(),
+                    passthrough: false,
+                    bindings: BTreeMap::from([("i".to_string(), "enter_mode typing".to_string())]),
+                },
+            )]),
+            ..KeyBindingConfig::default()
+        };
+
+        let error = config
+            .validate_modes()
+            .expect_err("unknown mode target should fail");
+        assert!(error.contains("enter_mode target 'typing'"));
+    }
+
+    #[test]
+    fn validate_modes_accepts_case_insensitive_initial_mode_lookup() {
+        let config = KeyBindingConfig {
+            initial_mode: "INSERT".to_string(),
+            ..KeyBindingConfig::default()
+        };
+        assert!(config.validate_modes().is_ok());
+    }
 }

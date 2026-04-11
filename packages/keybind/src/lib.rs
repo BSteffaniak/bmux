@@ -60,6 +60,7 @@ pub enum RuntimeAction {
     WindowGoto8,
     WindowGoto9,
     WindowClose,
+    EnterMode(String),
     PluginCommand {
         plugin_id: String,
         command_name: String,
@@ -125,6 +126,7 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::WindowGoto8 => "window_goto_8",
         RuntimeAction::WindowGoto9 => "window_goto_9",
         RuntimeAction::WindowClose => "window_close",
+        RuntimeAction::EnterMode(_) => "enter_mode",
         RuntimeAction::PluginCommand { .. } => "plugin_command",
         RuntimeAction::ForwardToPane(_) => "forward_to_pane",
     }
@@ -133,6 +135,7 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
 #[must_use]
 pub fn action_to_config_name(action: &RuntimeAction) -> String {
     match action {
+        RuntimeAction::EnterMode(mode_id) => format!("enter_mode {mode_id}"),
         RuntimeAction::PluginCommand {
             plugin_id,
             command_name,
@@ -159,6 +162,9 @@ pub fn action_to_config_name(action: &RuntimeAction) -> String {
 /// Returns an error if the action name is not recognized.
 pub fn parse_action(value: &str) -> Result<RuntimeAction> {
     let trimmed = value.trim();
+    if let Some(mode_action) = parse_enter_mode_action(trimmed) {
+        return mode_action;
+    }
     // Try plugin action first on the original string so that arguments
     // preserve their original case (e.g. file paths, user-entered values).
     if let Some(plugin_action) = parse_plugin_action(trimmed) {
@@ -224,6 +230,20 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
         "window_close" => Ok(RuntimeAction::WindowClose),
         unknown => bail!("unknown keymap action '{unknown}'"),
     }
+}
+
+fn parse_enter_mode_action(value: &str) -> Option<Result<RuntimeAction>> {
+    let (command, target_mode) = value.split_once(' ')?;
+    if !command.eq_ignore_ascii_case("enter_mode") {
+        return None;
+    }
+    let mode_id = target_mode.trim();
+    if mode_id.is_empty() {
+        return Some(Err(anyhow::anyhow!(
+            "invalid enter_mode action '{value}' (mode id is required)"
+        )));
+    }
+    Some(Ok(RuntimeAction::EnterMode(mode_id.to_ascii_lowercase())))
 }
 
 fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
@@ -390,6 +410,30 @@ mod tests {
         assert_eq!(
             parse_action("Focus_Next_Pane").expect("mixed case built-in should parse"),
             RuntimeAction::FocusNext
+        );
+    }
+
+    #[test]
+    fn parse_action_accepts_enter_mode_action() {
+        assert_eq!(
+            parse_action("enter_mode insert").expect("enter_mode should parse"),
+            RuntimeAction::EnterMode("insert".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_action_normalizes_enter_mode_target_case() {
+        assert_eq!(
+            parse_action("ENTER_MODE InSeRt").expect("mixed case enter_mode should parse"),
+            RuntimeAction::EnterMode("insert".to_string())
+        );
+    }
+
+    #[test]
+    fn action_to_config_name_serializes_enter_mode_action() {
+        assert_eq!(
+            action_to_config_name(&RuntimeAction::EnterMode("normal".to_string())),
+            "enter_mode normal"
         );
     }
 }

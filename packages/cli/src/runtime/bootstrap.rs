@@ -685,8 +685,8 @@ mod tests {
     #[test]
     fn initial_attach_status_mentions_help_and_typing() {
         let keymap = attach_keymap_from_config(&BmuxConfig::default());
-        let status = initial_attach_status(&keymap, true);
+        let status = initial_attach_status(&keymap, "normal", true);
         assert!(status.contains("help"));
-        assert!(status.contains("typing goes to pane"));
+        assert!(status.contains("modal input enabled"));
     }
 }

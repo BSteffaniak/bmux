@@ -33,6 +33,22 @@ pub struct Keymap {
     global_bindings: Vec<KeyBinding>,
     runtime_bindings: Vec<KeyBinding>,
     scroll_bindings: Vec<KeyBinding>,
+    modal_modes: BTreeMap<String, ModalMode>,
+    initial_mode: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModalModeConfig {
+    pub label: String,
+    pub passthrough: bool,
+    pub bindings: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct ModalMode {
+    label: String,
+    passthrough: bool,
+    bindings: Vec<KeyBinding>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +83,7 @@ pub struct InputProcessor {
     decoder: ByteDecoder,
     pending: Option<PendingChord>,
     scroll_mode: bool,
+    active_mode: Option<String>,
     enhanced: bool,
     key_encoding_modes: KeyEncodingModes,
 }
@@ -199,22 +216,172 @@ impl Keymap {
             global_bindings,
             runtime_bindings,
             scroll_bindings,
+            modal_modes: BTreeMap::new(),
+            initial_mode: None,
+        })
+    }
+
+    pub(crate) fn from_modal_parts_with_scroll(
+        timeout_ms: Option<u64>,
+        initial_mode: &str,
+        modes: &BTreeMap<String, ModalModeConfig>,
+        global: &BTreeMap<String, String>,
+        scroll: &BTreeMap<String, String>,
+    ) -> Result<Self> {
+        if let Some(timeout_ms) = timeout_ms
+            && !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms)
+        {
+            bail!("keymap timeout_ms must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS}");
+        }
+
+        let mut modal_modes = BTreeMap::new();
+        for (mode_id, mode_config) in modes {
+            let canonical_mode_id = canonical_mode_id(mode_id);
+            if canonical_mode_id.is_empty() {
+                bail!("keybindings.modes contains an empty mode id");
+            }
+            if modal_modes.contains_key(&canonical_mode_id) {
+                bail!("duplicate modal mode id '{canonical_mode_id}'");
+            }
+
+            let mut mode_bindings = Vec::new();
+            for (binding, action_name) in &mode_config.bindings {
+                mode_bindings.push(KeyBinding {
+                    chord: parse_chord(binding)?,
+                    action: parse_action(action_name)?,
+                });
+            }
+            validate_no_duplicate_chords(&mode_bindings, &format!("mode.{mode_id}"))?;
+
+            modal_modes.insert(
+                canonical_mode_id,
+                ModalMode {
+                    label: mode_config.label.clone(),
+                    passthrough: mode_config.passthrough,
+                    bindings: mode_bindings,
+                },
+            );
+        }
+
+        let initial_mode = canonical_mode_id(initial_mode);
+        if initial_mode.is_empty() {
+            bail!("keybindings.initial_mode must not be empty");
+        }
+        if !modal_modes.contains_key(&initial_mode) {
+            bail!("keybindings.initial_mode '{initial_mode}' is not defined");
+        }
+
+        for (mode_id, mode) in &modal_modes {
+            for binding in &mode.bindings {
+                if let RuntimeAction::EnterMode(target_mode) = &binding.action
+                    && !modal_modes.contains_key(target_mode)
+                {
+                    bail!(
+                        "mode '{mode_id}' references undefined enter_mode target '{target_mode}'"
+                    );
+                }
+            }
+        }
+
+        let mut global_bindings = Vec::new();
+        for (binding, action_name) in global {
+            global_bindings.push(KeyBinding {
+                chord: parse_chord(binding)?,
+                action: parse_action(action_name)?,
+            });
+        }
+        validate_no_duplicate_chords(&global_bindings, "global")?;
+
+        let mut scroll_bindings = Vec::new();
+        for (binding, action_name) in scroll {
+            scroll_bindings.push(KeyBinding {
+                chord: parse_chord(binding)?,
+                action: parse_action(action_name)?,
+            });
+        }
+        validate_no_duplicate_chords(&scroll_bindings, "scroll")?;
+
+        Ok(Self {
+            timeout: timeout_ms.map(Duration::from_millis),
+            global_bindings,
+            runtime_bindings: Vec::new(),
+            scroll_bindings,
+            modal_modes,
+            initial_mode: Some(initial_mode),
         })
     }
 
     fn exact_action(&self, strokes: &[KeyStroke]) -> Option<RuntimeAction> {
+        if let Some(initial_mode) = &self.initial_mode {
+            return self.exact_action_for_mode(initial_mode, strokes);
+        }
         find_exact(&self.global_bindings, strokes)
             .or_else(|| find_exact(&self.runtime_bindings, strokes))
     }
 
+    fn exact_action_for_mode(&self, mode_id: &str, strokes: &[KeyStroke]) -> Option<RuntimeAction> {
+        self.modal_mode(mode_id).map_or_else(
+            || self.exact_action(strokes),
+            |mode| {
+                find_exact(&self.global_bindings, strokes)
+                    .or_else(|| find_exact(&mode.bindings, strokes))
+            },
+        )
+    }
+
     fn has_longer_match(&self, strokes: &[KeyStroke]) -> bool {
+        if let Some(initial_mode) = &self.initial_mode {
+            return self.has_longer_match_for_mode(initial_mode, strokes);
+        }
         has_longer_prefix(&self.global_bindings, strokes)
             || has_longer_prefix(&self.runtime_bindings, strokes)
     }
 
+    fn has_longer_match_for_mode(&self, mode_id: &str, strokes: &[KeyStroke]) -> bool {
+        self.modal_mode(mode_id).map_or_else(
+            || self.has_longer_match(strokes),
+            |mode| {
+                has_longer_prefix(&self.global_bindings, strokes)
+                    || has_longer_prefix(&mode.bindings, strokes)
+            },
+        )
+    }
+
     fn has_any_prefix(&self, strokes: &[KeyStroke]) -> bool {
+        if let Some(initial_mode) = &self.initial_mode {
+            return self.has_any_prefix_for_mode(initial_mode, strokes);
+        }
         has_any_prefix(&self.global_bindings, strokes)
             || has_any_prefix(&self.runtime_bindings, strokes)
+    }
+
+    fn has_any_prefix_for_mode(&self, mode_id: &str, strokes: &[KeyStroke]) -> bool {
+        self.modal_mode(mode_id).map_or_else(
+            || self.has_any_prefix(strokes),
+            |mode| {
+                has_any_prefix(&self.global_bindings, strokes)
+                    || has_any_prefix(&mode.bindings, strokes)
+            },
+        )
+    }
+
+    fn mode_passthrough(&self, mode_id: &str) -> bool {
+        self.modal_mode(mode_id)
+            .is_some_and(|mode| mode.passthrough)
+    }
+
+    fn modal_mode(&self, mode_id: &str) -> Option<&ModalMode> {
+        self.modal_modes.get(&canonical_mode_id(mode_id))
+    }
+
+    #[must_use]
+    pub fn mode_label(&self, mode_id: &str) -> Option<&str> {
+        self.modal_mode(mode_id).map(|mode| mode.label.as_str())
+    }
+
+    #[must_use]
+    pub fn initial_mode_id(&self) -> Option<&str> {
+        self.initial_mode.as_deref()
     }
 
     fn exact_scroll_action(&self, strokes: &[KeyStroke]) -> Option<RuntimeAction> {
@@ -312,6 +479,9 @@ impl Keymap {
 
     #[must_use]
     pub fn primary_binding_for_action(&self, action: &RuntimeAction) -> Option<String> {
+        if let Some(mode_id) = self.initial_mode.as_deref() {
+            return self.primary_binding_for_action_in_mode(mode_id, action);
+        }
         primary_binding_for_sets(
             action,
             [
@@ -324,6 +494,27 @@ impl Keymap {
     #[must_use]
     pub fn primary_scroll_binding_for_action(&self, action: &RuntimeAction) -> Option<String> {
         primary_binding_for_sets(action, [(0_u8, &self.scroll_bindings)])
+    }
+
+    #[must_use]
+    pub fn primary_binding_for_action_in_mode(
+        &self,
+        mode_id: &str,
+        action: &RuntimeAction,
+    ) -> Option<String> {
+        if let Some(mode) = self.modal_mode(mode_id) {
+            return primary_binding_for_sets(
+                action,
+                [(0_u8, &self.global_bindings), (1_u8, &mode.bindings)],
+            );
+        }
+        primary_binding_for_sets(
+            action,
+            [
+                (0_u8, &self.global_bindings),
+                (1_u8, &self.runtime_bindings),
+            ],
+        )
     }
 
     #[must_use]
@@ -383,11 +574,13 @@ fn default_scroll_bindings() -> BTreeMap<String, String> {
 
 impl InputProcessor {
     pub(crate) fn new(keymap: Keymap, enhanced: bool) -> Self {
+        let active_mode = keymap.initial_mode.clone();
         Self {
             keymap,
             decoder: ByteDecoder::default(),
             pending: None,
             scroll_mode: false,
+            active_mode,
             enhanced,
             key_encoding_modes: KeyEncodingModes::default(),
         }
@@ -490,9 +683,19 @@ impl InputProcessor {
                 }
             }
 
-            let exact = self.keymap.exact_action(&strokes);
-            let longer = self.keymap.has_longer_match(&strokes);
-            let any_prefix = self.keymap.has_any_prefix(&strokes);
+            let active_mode = self.active_mode.as_deref();
+            let exact = active_mode.map_or_else(
+                || self.keymap.exact_action(&strokes),
+                |mode_id| self.keymap.exact_action_for_mode(mode_id, &strokes),
+            );
+            let longer = active_mode.map_or_else(
+                || self.keymap.has_longer_match(&strokes),
+                |mode_id| self.keymap.has_longer_match_for_mode(mode_id, &strokes),
+            );
+            let any_prefix = active_mode.map_or_else(
+                || self.keymap.has_any_prefix(&strokes),
+                |mode_id| self.keymap.has_any_prefix_for_mode(mode_id, &strokes),
+            );
 
             if let Some(action) = exact {
                 if longer && !force_timeout {
@@ -509,7 +712,7 @@ impl InputProcessor {
 
             let pending_len = strokes.len();
             if let Some((matched_len, action)) =
-                self.best_exact_prefix_len(pending_len.saturating_sub(1))
+                self.best_exact_prefix_len(active_mode, pending_len.saturating_sub(1))
             {
                 let remainder = self.consume_prefix(matched_len);
                 actions.push(action);
@@ -524,14 +727,20 @@ impl InputProcessor {
                 continue;
             }
 
-            if let Some(raw) = self.pending.take().map(pending_bytes) {
+            if let Some(raw) = self.pending.take().map(pending_bytes)
+                && active_mode.is_none_or(|mode_id| self.keymap.mode_passthrough(mode_id))
+            {
                 actions.push(RuntimeAction::ForwardToPane(raw));
             }
             break;
         }
     }
 
-    fn best_exact_prefix_len(&self, max_len: usize) -> Option<(usize, RuntimeAction)> {
+    fn best_exact_prefix_len(
+        &self,
+        active_mode: Option<&str>,
+        max_len: usize,
+    ) -> Option<(usize, RuntimeAction)> {
         let pending = self.pending.as_ref()?;
         for len in (1..=max_len).rev() {
             let strokes: Vec<KeyStroke> = pending
@@ -540,7 +749,11 @@ impl InputProcessor {
                 .take(len)
                 .map(|item| item.stroke)
                 .collect();
-            if let Some(action) = self.keymap.exact_action(&strokes) {
+            let action = active_mode.map_or_else(
+                || self.keymap.exact_action(&strokes),
+                |mode_id| self.keymap.exact_action_for_mode(mode_id, &strokes),
+            );
+            if let Some(action) = action {
                 return Some((len, action));
             }
         }
@@ -564,9 +777,22 @@ impl InputProcessor {
             match action {
                 RuntimeAction::EnterScrollMode => self.scroll_mode = true,
                 RuntimeAction::ExitScrollMode => self.scroll_mode = false,
+                RuntimeAction::EnterMode(mode_id) => {
+                    self.active_mode = Some(canonical_mode_id(mode_id));
+                }
                 _ => {}
             }
         }
+    }
+
+    #[must_use]
+    pub fn active_mode_id(&self) -> Option<&str> {
+        self.active_mode.as_deref()
+    }
+
+    #[must_use]
+    pub const fn keymap(&self) -> &Keymap {
+        &self.keymap
     }
 
     pub(crate) const fn set_scroll_mode(&mut self, enabled: bool) {
@@ -621,6 +847,10 @@ fn validate_no_duplicate_chords(bindings: &[KeyBinding], scope: &str) -> Result<
         }
     }
     Ok(())
+}
+
+fn canonical_mode_id(mode_id: &str) -> String {
+    mode_id.trim().to_ascii_lowercase()
 }
 
 fn pending_bytes(pending: PendingChord) -> Vec<u8> {
@@ -858,6 +1088,18 @@ mod tests {
             .iter()
             .map(|(key, action)| ((*key).to_string(), action_to_config_name(action)))
             .collect()
+    }
+
+    fn modal_mode(
+        label: &str,
+        passthrough: bool,
+        pairs: &[(&str, RuntimeAction)],
+    ) -> super::ModalModeConfig {
+        super::ModalModeConfig {
+            label: label.to_string(),
+            passthrough,
+            bindings: action_bindings(pairs),
+        }
     }
 
     // Helper: create a processor with enhanced=false (legacy mode) for backward compat tests.
@@ -1405,5 +1647,90 @@ mod tests {
                 args: vec![],
             }
         );
+    }
+
+    #[test]
+    fn modal_keymap_starts_in_configured_mode() {
+        let modes = BTreeMap::from([
+            (
+                "normal".to_string(),
+                modal_mode(
+                    "NORMAL",
+                    false,
+                    &[
+                        ("i", RuntimeAction::EnterMode("insert".to_string())),
+                        ("q", RuntimeAction::Quit),
+                    ],
+                ),
+            ),
+            (
+                "insert".to_string(),
+                modal_mode(
+                    "INSERT",
+                    true,
+                    &[("escape", RuntimeAction::EnterMode("normal".to_string()))],
+                ),
+            ),
+        ]);
+
+        let keymap = Keymap::from_modal_parts_with_scroll(
+            Some(250),
+            "NoRmAl",
+            &modes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("modal keymap should parse");
+        let processor = new_processor(keymap);
+        assert_eq!(processor.active_mode_id(), Some("normal"));
+    }
+
+    #[test]
+    fn modal_keymap_switches_modes_and_passthrough_behavior() {
+        let modes = BTreeMap::from([
+            (
+                "normal".to_string(),
+                modal_mode(
+                    "NORMAL",
+                    false,
+                    &[("i", RuntimeAction::EnterMode("insert".to_string()))],
+                ),
+            ),
+            (
+                "insert".to_string(),
+                modal_mode(
+                    "INSERT",
+                    true,
+                    &[("escape", RuntimeAction::EnterMode("normal".to_string()))],
+                ),
+            ),
+        ]);
+
+        let keymap = Keymap::from_modal_parts_with_scroll(
+            Some(250),
+            "normal",
+            &modes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("modal keymap should parse");
+        let mut processor = new_processor(keymap);
+
+        assert_eq!(processor.process_chunk(b"x"), Vec::<RuntimeAction>::new());
+        assert_eq!(
+            processor.process_chunk(b"i"),
+            vec![RuntimeAction::EnterMode("insert".to_string())]
+        );
+        assert_eq!(processor.active_mode_id(), Some("insert"));
+        assert_eq!(
+            processor.process_chunk(b"x"),
+            vec![RuntimeAction::ForwardToPane(vec![b'x'])]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x1b]),
+            vec![RuntimeAction::EnterMode("normal".to_string())]
+        );
+        assert_eq!(processor.active_mode_id(), Some("normal"));
+        assert_eq!(processor.process_chunk(b"x"), Vec::<RuntimeAction>::new());
     }
 }

@@ -1667,16 +1667,16 @@ impl BmuxConfig {
             });
         }
 
-        if self.keybindings.prefix.trim().is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field: "keybindings.prefix".to_string(),
-                value: self.keybindings.prefix.clone(),
-            });
-        }
-
         if let Err(error) = self.keybindings.resolve_timeout() {
             return Err(ConfigError::InvalidValue {
                 field: "keybindings".to_string(),
+                value: error,
+            });
+        }
+
+        if let Err(error) = self.keybindings.validate_modes() {
+            return Err(ConfigError::InvalidValue {
+                field: "keybindings.modes".to_string(),
                 value: error,
             });
         }
@@ -1782,14 +1782,6 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "general.server_timeout=0 -> {}",
                 general_defaults.server_timeout
-            ));
-        }
-
-        if self.keybindings.prefix.trim().is_empty() {
-            self.keybindings.prefix.clone_from(&keybind_defaults.prefix);
-            repaired_fields.push(format!(
-                "keybindings.prefix=<empty> -> {}",
-                keybind_defaults.prefix
             ));
         }
 
@@ -2179,7 +2171,7 @@ fast = 10
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
         assert_eq!(config.general.scrollback_limit, 10_000);
         assert_eq!(config.general.server_timeout, 5_000);
-        assert_eq!(config.keybindings.prefix, "ctrl+a");
+        assert_eq!(config.keybindings.prefix, "");
         assert_eq!(
             config
                 .keybindings
