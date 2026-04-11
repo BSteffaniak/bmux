@@ -1620,30 +1620,64 @@ fn parse_cluster_events_since(value: &str) -> Result<u64, String> {
         return Ok(absolute_unix_ms);
     }
 
-    let (amount_text, unit, unit_ms) = if let Some(amount) = trimmed.strip_suffix("ms") {
-        (amount, "ms", 1_u64)
-    } else if let Some(amount) = trimmed.strip_suffix('s') {
-        (amount, "s", 1_000_u64)
-    } else if let Some(amount) = trimmed.strip_suffix('m') {
-        (amount, "m", 60_000_u64)
-    } else if let Some(amount) = trimmed.strip_suffix('h') {
-        (amount, "h", 3_600_000_u64)
-    } else if let Some(amount) = trimmed.strip_suffix('d') {
-        (amount, "d", 86_400_000_u64)
-    } else {
-        return Err(format!(
-            "invalid --since value '{value}' (expected unix ms integer or relative duration like 500ms, 30s, 15m, 2h, 1d)"
-        ));
-    };
-
-    let amount = amount_text
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| format!("invalid --since value '{value}' (invalid {unit} duration amount)"))?;
-    let duration_ms = amount.checked_mul(unit_ms).ok_or_else(|| {
-        format!("invalid --since value '{value}' ({unit} duration overflows supported range)")
+    let duration_ms = parse_relative_duration_ms(trimmed).map_err(|reason| {
+        format!(
+            "invalid --since value '{value}' ({reason}; expected unix ms integer or relative duration like 500ms, 30s, 15m, 2h, 1d, 1h30m)"
+        )
     })?;
     Ok(now_unix_ms().saturating_sub(duration_ms))
+}
+
+fn parse_relative_duration_ms(value: &str) -> Result<u64, &'static str> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err("duration is empty");
+    }
+
+    let bytes = normalized.as_bytes();
+    let mut index = 0_usize;
+    let mut total_ms = 0_u64;
+
+    while index < bytes.len() {
+        let number_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if number_start == index {
+            return Err("duration segment is missing a numeric value");
+        }
+
+        let amount = normalized[number_start..index]
+            .parse::<u64>()
+            .map_err(|_| "duration segment numeric value is invalid")?;
+
+        let (unit_ms, unit_len) = relative_duration_unit(&bytes[index..])?;
+        index += unit_len;
+        let segment_ms = amount
+            .checked_mul(unit_ms)
+            .ok_or("duration segment overflows supported range")?;
+        total_ms = total_ms
+            .checked_add(segment_ms)
+            .ok_or("duration overflows supported range")?;
+    }
+
+    Ok(total_ms)
+}
+
+fn relative_duration_unit(remaining: &[u8]) -> Result<(u64, usize), &'static str> {
+    if remaining.starts_with(b"ms") {
+        return Ok((1_u64, 2));
+    }
+    let Some(first) = remaining.first().copied() else {
+        return Err("duration segment is missing a unit");
+    };
+    match first {
+        b's' => Ok((1_000_u64, 1)),
+        b'm' => Ok((60_000_u64, 1)),
+        b'h' => Ok((3_600_000_u64, 1)),
+        b'd' => Ok((86_400_000_u64, 1)),
+        _ => Err("duration segment has an unsupported unit"),
+    }
 }
 
 fn normalized_non_empty(value: &str) -> Option<String> {
@@ -2317,10 +2351,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_cluster_events_since_accepts_compound_duration() {
+        let before = now_unix_ms();
+        let parsed =
+            parse_cluster_events_since("1h30m").expect("compound relative since should parse");
+        let after = now_unix_ms();
+        assert!(parsed <= after.saturating_sub(5_400_000));
+        assert!(parsed >= before.saturating_sub(5_400_000));
+    }
+
+    #[test]
     fn parse_cluster_events_since_accepts_absolute_unix_ms() {
         let parsed =
             parse_cluster_events_since("1712345678000").expect("absolute unix ms should parse");
         assert_eq!(parsed, 1_712_345_678_000);
+    }
+
+    #[test]
+    fn parse_cluster_events_since_rejects_malformed_compound_duration() {
+        let error = parse_cluster_events_since("1h30")
+            .expect_err("malformed compound duration should be rejected");
+        assert!(error.contains("missing a unit"));
     }
 
     #[test]
