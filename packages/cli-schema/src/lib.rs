@@ -1569,6 +1569,11 @@ pub enum ConfigProfilesCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Set active profile in config file
+    Switch {
+        /// Profile id to activate
+        profile: String,
+    },
     /// Diff two resolved profile configurations
     Diff {
         /// From profile id

@@ -78,7 +78,8 @@ use cli_parse::{
 use config_cli::{
     run_config_get, run_config_path, run_config_profiles_diff, run_config_profiles_evaluate,
     run_config_profiles_lint, run_config_profiles_list, run_config_profiles_resolve,
-    run_config_profiles_set_active, run_config_profiles_show, run_config_set, run_config_show,
+    run_config_profiles_set_active, run_config_profiles_set_active_at_path,
+    run_config_profiles_show, run_config_set, run_config_show,
 };
 use dispatch::run_command;
 use doctor_cli::run_doctor;

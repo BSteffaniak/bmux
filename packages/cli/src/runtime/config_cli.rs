@@ -277,10 +277,16 @@ pub(super) fn run_config_profiles_evaluate(as_json: bool) -> Result<u8> {
 }
 
 pub(super) fn run_config_profiles_set_active(profile: &str) -> Result<()> {
-    let paths = ConfigPaths::default();
-    let path = paths.config_file();
+    let path = ConfigPaths::default().config_file();
+    run_config_profiles_set_active_at_path(profile, &path)
+}
+
+pub(super) fn run_config_profiles_set_active_at_path(
+    profile: &str,
+    path: &std::path::Path,
+) -> Result<()> {
     let source = if path.exists() {
-        std::fs::read_to_string(&path)
+        std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?
     } else {
         String::new()
@@ -302,7 +308,7 @@ pub(super) fn run_config_profiles_set_active(profile: &str) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config directory {}", parent.display()))?;
     }
-    std::fs::write(&path, doc.to_string())
+    std::fs::write(path, doc.to_string())
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }

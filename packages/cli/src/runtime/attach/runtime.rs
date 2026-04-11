@@ -2749,9 +2749,23 @@ pub fn apply_attach_profile_switch(
     view_state: &mut AttachViewState,
 ) -> Result<()> {
     let config_path = ConfigPaths::default().config_file();
+    apply_attach_profile_switch_with_path(
+        profile_id,
+        attach_input_processor,
+        view_state,
+        &config_path,
+    )
+}
+
+fn apply_attach_profile_switch_with_path(
+    profile_id: &str,
+    attach_input_processor: &mut InputProcessor,
+    view_state: &mut AttachViewState,
+    config_path: &std::path::Path,
+) -> Result<()> {
     let previous_config_source = if config_path.exists() {
         Some(
-            std::fs::read_to_string(&config_path)
+            std::fs::read_to_string(config_path)
                 .with_context(|| format!("failed reading {}", config_path.display()))?,
         )
     } else {
@@ -2762,13 +2776,15 @@ pub fn apply_attach_profile_switch(
     let previous_mouse_config = view_state.mouse.config.clone();
     let previous_status_position = view_state.status_position;
 
-    if let Err(error) = super::super::run_config_profiles_set_active(profile_id) {
+    if let Err(error) =
+        super::super::run_config_profiles_set_active_at_path(profile_id, config_path)
+    {
         return Err(error.context("failed updating composition.active_profile"));
     }
 
     let result = (|| -> Result<()> {
         let (resolved_config, resolution) =
-            bmux_config::BmuxConfig::load_with_forced_profile(profile_id)
+            bmux_config::BmuxConfig::load_from_path_with_resolution(config_path, Some(profile_id))
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
         let keymap = attach_keymap_from_config(&resolved_config);
         attach_input_processor.replace_keymap(keymap);
@@ -2800,10 +2816,10 @@ pub fn apply_attach_profile_switch(
     if let Err(error) = result {
         match previous_config_source {
             Some(source) => {
-                let _ = std::fs::write(&config_path, source);
+                let _ = std::fs::write(config_path, source);
             }
             None => {
-                let _ = std::fs::remove_file(&config_path);
+                let _ = std::fs::remove_file(config_path);
             }
         }
         attach_input_processor.replace_keymap(previous_keymap);
@@ -7587,5 +7603,45 @@ mod tests {
 
         // This must not panic or return Err.
         let _keymap = attach_keymap_from_config(&config);
+    }
+
+    #[test]
+    fn apply_attach_profile_switch_rolls_back_on_resolution_failure() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "bmux-switch-profile-rollback-{}-{}.toml",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let initial_config = r#"
+[composition]
+active_profile = "good"
+layer_order = ["defaults", "profile:active", "config"]
+
+[composition.profiles.good.patch.general]
+server_timeout = 1234
+"#;
+        std::fs::write(&temp_path, initial_config).expect("write temp config");
+
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::new_v4(),
+            can_write: true,
+        });
+        let original_mode = processor.active_mode_id().map(ToString::to_string);
+
+        let error = apply_attach_profile_switch_with_path(
+            "missing_profile",
+            &mut processor,
+            &mut view_state,
+            &temp_path,
+        )
+        .expect_err("missing profile should fail and rollback");
+        assert!(error.to_string().contains("rolled back profile switch"));
+
+        let after = std::fs::read_to_string(&temp_path).expect("read temp config");
+        assert_eq!(after, initial_config);
+        assert_eq!(processor.active_mode_id(), original_mode.as_deref());
     }
 }

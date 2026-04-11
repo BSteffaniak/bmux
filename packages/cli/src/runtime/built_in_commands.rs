@@ -74,6 +74,7 @@ pub enum BuiltInHandlerId {
     ConfigProfilesList,
     ConfigProfilesShow,
     ConfigProfilesResolve,
+    ConfigProfilesSwitch,
     ConfigProfilesDiff,
     ConfigProfilesLint,
     ConfigProfilesEvaluate,
@@ -505,6 +506,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ConfigProfilesResolve,
             &["config", "profiles", "resolve"],
             "Show active profile resolution metadata",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ConfigProfilesSwitch,
+            &["config", "profiles", "switch"],
+            "Set active composition profile",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::ConfigProfilesDiff,
