@@ -7,6 +7,7 @@ owns_namespaces = [
     "cluster-status",
     "cluster-doctor",
     "cluster-hosts",
+    "cluster-events",
     "cluster-pane-new",
     "cluster-pane-move",
     "cluster-pane-retry",
@@ -114,6 +115,20 @@ name       = "target"
 position   = 0
 required   = false
 value_name = "CLUSTER_OR_HOST"
+
+[[commands]]
+aliases       = [["cluster", "events"]]
+expose_in_cli = true
+name          = "cluster-events"
+path          = ["cluster-events"]
+summary       = "Show cluster connection lifecycle events"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
 
 [[commands]]
 aliases       = [["cluster", "hosts"]]

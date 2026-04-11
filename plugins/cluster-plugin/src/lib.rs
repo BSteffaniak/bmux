@@ -29,6 +29,7 @@ impl RustPlugin for ClusterPlugin {
             "cluster-hosts" => run_cluster_hosts(&context).map_err(PluginCommandError::from),
             "cluster-status" => run_cluster_status(&context).map_err(PluginCommandError::from),
             "cluster-doctor" => run_cluster_doctor(&context).map_err(PluginCommandError::from),
+            "cluster-events" => run_cluster_events(&context).map_err(PluginCommandError::from),
             "cluster-up" => run_cluster_up(&context).map_err(PluginCommandError::from),
             "cluster-pane-new" => run_cluster_pane_new(&context).map_err(PluginCommandError::from),
             "cluster-pane-move" => run_cluster_pane_move(&context).map_err(PluginCommandError::from),
@@ -325,6 +326,12 @@ struct ClusterConnectionEventsListResponse {
     events: Vec<ClusterConnectionEvent>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClusterEventsFormat {
+    Text,
+    Json,
+}
+
 fn run_cluster_hosts(context: &NativeCommandContext) -> Result<i32, String> {
     let inventory = load_cluster_inventory(context)?;
     let selected = positional_argument(&context.arguments);
@@ -386,6 +393,36 @@ fn run_cluster_up(context: &NativeCommandContext) -> Result<i32, String> {
         .count();
 
     Ok(if launched_count > 0 { EXIT_OK } else { 1 })
+}
+
+fn run_cluster_events(context: &NativeCommandContext) -> Result<i32, String> {
+    let format = parse_cluster_events_format(&context.arguments)?;
+    let events = get_cluster_connection_events(context)?;
+    if matches!(format, ClusterEventsFormat::Json) {
+        let json = serde_json::to_string_pretty(&events)
+            .map_err(|error| format!("failed encoding cluster events as json: {error}"))?;
+        println!("{json}");
+        return Ok(EXIT_OK);
+    }
+
+    println!("cluster events");
+    if events.is_empty() {
+        println!("  (no events)");
+        return Ok(EXIT_OK);
+    }
+    for event in events {
+        println!(
+            "  - ts={} state={} pane_id={} cluster={} target={} source={} message={}",
+            event.ts_unix_ms,
+            connection_state_label(&event.state),
+            event.pane_id.as_deref().unwrap_or("-"),
+            event.cluster.as_deref().unwrap_or("-"),
+            event.target.as_deref().unwrap_or("-"),
+            event.source.as_deref().unwrap_or("-"),
+            event.message
+        );
+    }
+    Ok(EXIT_OK)
 }
 
 fn run_cluster_pane_new(context: &NativeCommandContext) -> Result<i32, String> {
@@ -1393,6 +1430,49 @@ fn parse_cluster_up_args(arguments: &[String]) -> Result<ClusterUpArgs, String> 
     })
 }
 
+fn parse_cluster_events_format(arguments: &[String]) -> Result<ClusterEventsFormat, String> {
+    let mut format = ClusterEventsFormat::Text;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--format" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--format requires a value".to_string())?;
+            format = parse_cluster_events_format_value(value)?;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--format=") {
+            format = parse_cluster_events_format_value(value)?;
+            index += 1;
+            continue;
+        }
+        index += 1;
+    }
+    Ok(format)
+}
+
+fn parse_cluster_events_format_value(value: &str) -> Result<ClusterEventsFormat, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "text" => Ok(ClusterEventsFormat::Text),
+        "json" => Ok(ClusterEventsFormat::Json),
+        _ => Err(format!(
+            "invalid --format value '{value}' (expected: text|json)"
+        )),
+    }
+}
+
+const fn connection_state_label(state: &ClusterConnectionState) -> &'static str {
+    match state {
+        ClusterConnectionState::Connecting => "connecting",
+        ClusterConnectionState::Ready => "ready",
+        ClusterConnectionState::Degraded => "degraded",
+        ClusterConnectionState::Retrying => "retrying",
+        ClusterConnectionState::Failed => "failed",
+    }
+}
+
 fn parse_cluster_pane_new_args(arguments: &[String]) -> Result<ClusterPaneNewArgs, String> {
     let mut host = None;
     let mut name = None;
@@ -1983,6 +2063,19 @@ mod tests {
         .expect("retry args should parse");
         assert_eq!(parsed.on_failure, RetryFailurePolicy::Prompt);
         assert_eq!(parsed.retries, 2);
+    }
+
+    #[test]
+    fn parse_cluster_events_format_defaults_to_text() {
+        let parsed = parse_cluster_events_format(&[]).expect("events args should parse");
+        assert_eq!(parsed, ClusterEventsFormat::Text);
+    }
+
+    #[test]
+    fn parse_cluster_events_format_supports_json() {
+        let parsed = parse_cluster_events_format(&["--format".to_string(), "json".to_string()])
+            .expect("events args should parse");
+        assert_eq!(parsed, ClusterEventsFormat::Json);
     }
 
     #[test]
