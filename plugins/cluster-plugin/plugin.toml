@@ -130,6 +130,34 @@ name       = "format"
 required   = false
 value_name = "FORMAT"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "target"
+name       = "target"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "state"
+name       = "state"
+required   = false
+value_name = "STATE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "limit"
+name       = "limit"
+required   = false
+value_name = "COUNT"
+
 [[commands]]
 aliases       = [["cluster", "hosts"]]
 expose_in_cli = true

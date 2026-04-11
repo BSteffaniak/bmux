@@ -332,6 +332,15 @@ enum ClusterEventsFormat {
     Json,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClusterEventsArgs {
+    format: ClusterEventsFormat,
+    cluster: Option<String>,
+    target: Option<String>,
+    state: Option<ClusterConnectionState>,
+    limit: Option<usize>,
+}
+
 fn run_cluster_hosts(context: &NativeCommandContext) -> Result<i32, String> {
     let inventory = load_cluster_inventory(context)?;
     let selected = positional_argument(&context.arguments);
@@ -396,21 +405,22 @@ fn run_cluster_up(context: &NativeCommandContext) -> Result<i32, String> {
 }
 
 fn run_cluster_events(context: &NativeCommandContext) -> Result<i32, String> {
-    let format = parse_cluster_events_format(&context.arguments)?;
+    let args = parse_cluster_events_args(&context.arguments)?;
     let events = get_cluster_connection_events(context)?;
-    if matches!(format, ClusterEventsFormat::Json) {
-        let json = serde_json::to_string_pretty(&events)
+    let filtered = filter_cluster_events(events, &args);
+    if matches!(args.format, ClusterEventsFormat::Json) {
+        let json = serde_json::to_string_pretty(&filtered)
             .map_err(|error| format!("failed encoding cluster events as json: {error}"))?;
         println!("{json}");
         return Ok(EXIT_OK);
     }
 
     println!("cluster events");
-    if events.is_empty() {
+    if filtered.is_empty() {
         println!("  (no events)");
         return Ok(EXIT_OK);
     }
-    for event in events {
+    for event in filtered {
         println!(
             "  - ts={} state={} pane_id={} cluster={} target={} source={} message={}",
             event.ts_unix_ms,
@@ -423,6 +433,40 @@ fn run_cluster_events(context: &NativeCommandContext) -> Result<i32, String> {
         );
     }
     Ok(EXIT_OK)
+}
+
+fn filter_cluster_events(
+    events: Vec<ClusterConnectionEvent>,
+    args: &ClusterEventsArgs,
+) -> Vec<ClusterConnectionEvent> {
+    let mut filtered = events
+        .into_iter()
+        .filter(|event| {
+            if let Some(cluster) = args.cluster.as_deref()
+                && event.cluster.as_deref() != Some(cluster)
+            {
+                return false;
+            }
+            if let Some(target) = args.target.as_deref()
+                && event.target.as_deref() != Some(target)
+            {
+                return false;
+            }
+            if let Some(state) = args.state.as_ref()
+                && &event.state != state
+            {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+    if let Some(limit) = args.limit
+        && filtered.len() > limit
+    {
+        let to_drop = filtered.len() - limit;
+        filtered.drain(0..to_drop);
+    }
+    filtered
 }
 
 fn run_cluster_pane_new(context: &NativeCommandContext) -> Result<i32, String> {
@@ -1430,8 +1474,12 @@ fn parse_cluster_up_args(arguments: &[String]) -> Result<ClusterUpArgs, String> 
     })
 }
 
-fn parse_cluster_events_format(arguments: &[String]) -> Result<ClusterEventsFormat, String> {
+fn parse_cluster_events_args(arguments: &[String]) -> Result<ClusterEventsArgs, String> {
     let mut format = ClusterEventsFormat::Text;
+    let mut cluster = None;
+    let mut target = None;
+    let mut state = None;
+    let mut limit = None;
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -1448,9 +1496,67 @@ fn parse_cluster_events_format(arguments: &[String]) -> Result<ClusterEventsForm
             index += 1;
             continue;
         }
+        if argument == "--cluster" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--cluster requires a value".to_string())?;
+            cluster = normalized_non_empty(value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--cluster=") {
+            cluster = normalized_non_empty(value);
+            index += 1;
+            continue;
+        }
+        if argument == "--target" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--target requires a value".to_string())?;
+            target = normalized_non_empty(value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--target=") {
+            target = normalized_non_empty(value);
+            index += 1;
+            continue;
+        }
+        if argument == "--state" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--state requires a value".to_string())?;
+            state = Some(parse_cluster_connection_state(value)?);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--state=") {
+            state = Some(parse_cluster_connection_state(value)?);
+            index += 1;
+            continue;
+        }
+        if argument == "--limit" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--limit requires a value".to_string())?;
+            limit = Some(parse_cluster_events_limit(value)?);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--limit=") {
+            limit = Some(parse_cluster_events_limit(value)?);
+            index += 1;
+            continue;
+        }
         index += 1;
     }
-    Ok(format)
+    Ok(ClusterEventsArgs {
+        format,
+        cluster,
+        target,
+        state,
+        limit,
+    })
 }
 
 fn parse_cluster_events_format_value(value: &str) -> Result<ClusterEventsFormat, String> {
@@ -1460,6 +1566,39 @@ fn parse_cluster_events_format_value(value: &str) -> Result<ClusterEventsFormat,
         _ => Err(format!(
             "invalid --format value '{value}' (expected: text|json)"
         )),
+    }
+}
+
+fn parse_cluster_connection_state(value: &str) -> Result<ClusterConnectionState, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "connecting" => Ok(ClusterConnectionState::Connecting),
+        "ready" => Ok(ClusterConnectionState::Ready),
+        "degraded" => Ok(ClusterConnectionState::Degraded),
+        "retrying" => Ok(ClusterConnectionState::Retrying),
+        "failed" => Ok(ClusterConnectionState::Failed),
+        _ => Err(format!(
+            "invalid --state value '{value}' (expected: connecting|ready|degraded|retrying|failed)"
+        )),
+    }
+}
+
+fn parse_cluster_events_limit(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("invalid --limit value '{value}' (expected positive integer)"))?;
+    if parsed == 0 {
+        return Err("--limit must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
+
+fn normalized_non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -2066,16 +2205,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_cluster_events_format_defaults_to_text() {
-        let parsed = parse_cluster_events_format(&[]).expect("events args should parse");
-        assert_eq!(parsed, ClusterEventsFormat::Text);
+    fn parse_cluster_events_args_defaults_to_text() {
+        let parsed = parse_cluster_events_args(&[]).expect("events args should parse");
+        assert_eq!(parsed.format, ClusterEventsFormat::Text);
+        assert_eq!(parsed.cluster, None);
+        assert_eq!(parsed.target, None);
+        assert_eq!(parsed.state, None);
+        assert_eq!(parsed.limit, None);
     }
 
     #[test]
-    fn parse_cluster_events_format_supports_json() {
-        let parsed = parse_cluster_events_format(&["--format".to_string(), "json".to_string()])
-            .expect("events args should parse");
-        assert_eq!(parsed, ClusterEventsFormat::Json);
+    fn parse_cluster_events_args_supports_filters() {
+        let parsed = parse_cluster_events_args(&[
+            "--format".to_string(),
+            "json".to_string(),
+            "--cluster".to_string(),
+            "prod".to_string(),
+            "--target".to_string(),
+            "db-a".to_string(),
+            "--state".to_string(),
+            "retrying".to_string(),
+            "--limit".to_string(),
+            "25".to_string(),
+        ])
+        .expect("events args should parse");
+        assert_eq!(parsed.format, ClusterEventsFormat::Json);
+        assert_eq!(parsed.cluster.as_deref(), Some("prod"));
+        assert_eq!(parsed.target.as_deref(), Some("db-a"));
+        assert_eq!(parsed.state, Some(ClusterConnectionState::Retrying));
+        assert_eq!(parsed.limit, Some(25));
+    }
+
+    #[test]
+    fn parse_cluster_events_args_rejects_zero_limit() {
+        let error = parse_cluster_events_args(&["--limit".to_string(), "0".to_string()])
+            .expect_err("limit zero should be rejected");
+        assert!(error.contains("greater than zero"));
     }
 
     #[test]
