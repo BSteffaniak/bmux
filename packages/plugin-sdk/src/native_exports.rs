@@ -2,7 +2,7 @@ use crate::{
     NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginEvent,
     ServiceEnvelopeKind, ServiceResponse, decode_service_envelope, encode_service_envelope,
 };
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CString, c_char};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
@@ -246,9 +246,10 @@ pub fn manifest_toml_ptr(
 #[doc(hidden)]
 pub fn run_command_export<P: RustPlugin>(
     instance: &'static Mutex<P>,
-    context: *const c_char,
+    input_ptr: *const u8,
+    input_len: usize,
 ) -> i32 {
-    parse_json_input::<NativeCommandContext>(context, 2, 3).map_or_else(
+    parse_binary_input::<NativeCommandContext>(input_ptr, input_len, 2, 3).map_or_else(
         |code| code,
         |payload| {
             instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
@@ -259,8 +260,12 @@ pub fn run_command_export<P: RustPlugin>(
 }
 
 #[doc(hidden)]
-pub fn activate_export<P: RustPlugin>(instance: &'static Mutex<P>, context: *const c_char) -> i32 {
-    parse_json_input::<NativeLifecycleContext>(context, 2, 3).map_or_else(
+pub fn activate_export<P: RustPlugin>(
+    instance: &'static Mutex<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+) -> i32 {
+    parse_binary_input::<NativeLifecycleContext>(input_ptr, input_len, 2, 3).map_or_else(
         |code| code,
         |payload| {
             instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
@@ -273,9 +278,10 @@ pub fn activate_export<P: RustPlugin>(instance: &'static Mutex<P>, context: *con
 #[doc(hidden)]
 pub fn deactivate_export<P: RustPlugin>(
     instance: &'static Mutex<P>,
-    context: *const c_char,
+    input_ptr: *const u8,
+    input_len: usize,
 ) -> i32 {
-    parse_json_input::<NativeLifecycleContext>(context, 2, 3).map_or_else(
+    parse_binary_input::<NativeLifecycleContext>(input_ptr, input_len, 2, 3).map_or_else(
         |code| code,
         |payload| {
             instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
@@ -288,9 +294,10 @@ pub fn deactivate_export<P: RustPlugin>(
 #[doc(hidden)]
 pub fn handle_event_export<P: RustPlugin>(
     instance: &'static Mutex<P>,
-    event: *const c_char,
+    input_ptr: *const u8,
+    input_len: usize,
 ) -> i32 {
-    parse_json_input::<PluginEvent>(event, 2, 3).map_or_else(
+    parse_binary_input::<PluginEvent>(input_ptr, input_len, 2, 3).map_or_else(
         |code| code,
         |payload| {
             instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
@@ -345,21 +352,18 @@ pub fn invoke_service_export<P: RustPlugin>(
     SERVICE_STATUS_OK
 }
 
-fn parse_json_input<T>(ptr: *const c_char, null_code: i32, parse_code: i32) -> Result<T, i32>
+fn parse_binary_input<T>(
+    input_ptr: *const u8,
+    input_len: usize,
+    null_code: i32,
+    parse_code: i32,
+) -> Result<T, i32>
 where
     T: serde::de::DeserializeOwned,
 {
-    let payload = c_str_to_string(ptr).map_err(|()| null_code)?;
-    serde_json::from_str(&payload).map_err(|_| parse_code)
-}
-
-fn c_str_to_string(ptr: *const c_char) -> Result<String, ()> {
-    if ptr.is_null() {
-        return Err(());
+    if input_ptr.is_null() {
+        return Err(null_code);
     }
-
-    unsafe { CStr::from_ptr(ptr) }
-        .to_str()
-        .map(str::to_owned)
-        .map_err(|_| ())
+    let payload = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    bmux_codec::from_bytes(payload).map_err(|_| parse_code)
 }

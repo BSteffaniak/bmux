@@ -285,24 +285,42 @@ macro_rules! export_plugin {
 
             #[unsafe(no_mangle)]
             pub extern "C" fn bmux_plugin_run_command_with_context_v1(
-                context: *const ::std::ffi::c_char,
+                input_ptr: *const u8,
+                input_len: usize,
             ) -> i32 {
-                $crate::__private::run_command_export(__bmux_plugin_instance(), context)
+                $crate::__private::run_command_export(
+                    __bmux_plugin_instance(),
+                    input_ptr,
+                    input_len,
+                )
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_activate_v1(context: *const ::std::ffi::c_char) -> i32 {
-                $crate::__private::activate_export(__bmux_plugin_instance(), context)
+            pub extern "C" fn bmux_plugin_activate_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+            ) -> i32 {
+                $crate::__private::activate_export(__bmux_plugin_instance(), input_ptr, input_len)
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_deactivate_v1(context: *const ::std::ffi::c_char) -> i32 {
-                $crate::__private::deactivate_export(__bmux_plugin_instance(), context)
+            pub extern "C" fn bmux_plugin_deactivate_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+            ) -> i32 {
+                $crate::__private::deactivate_export(__bmux_plugin_instance(), input_ptr, input_len)
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn bmux_plugin_handle_event_v1(event: *const ::std::ffi::c_char) -> i32 {
-                $crate::__private::handle_event_export(__bmux_plugin_instance(), event)
+            pub extern "C" fn bmux_plugin_handle_event_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+            ) -> i32 {
+                $crate::__private::handle_event_export(
+                    __bmux_plugin_instance(),
+                    input_ptr,
+                    input_len,
+                )
             }
 
             #[unsafe(no_mangle)]
@@ -355,20 +373,20 @@ macro_rules! bundled_plugin_vtable {
             $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
         }
 
-        fn __run_command_with_context(context: *const ::std::ffi::c_char) -> i32 {
-            $crate::__private::run_command_export(__instance(), context)
+        fn __run_command_with_context(input_ptr: *const u8, input_len: usize) -> i32 {
+            $crate::__private::run_command_export(__instance(), input_ptr, input_len)
         }
 
-        fn __activate(context: *const ::std::ffi::c_char) -> i32 {
-            $crate::__private::activate_export(__instance(), context)
+        fn __activate(input_ptr: *const u8, input_len: usize) -> i32 {
+            $crate::__private::activate_export(__instance(), input_ptr, input_len)
         }
 
-        fn __deactivate(context: *const ::std::ffi::c_char) -> i32 {
-            $crate::__private::deactivate_export(__instance(), context)
+        fn __deactivate(input_ptr: *const u8, input_len: usize) -> i32 {
+            $crate::__private::deactivate_export(__instance(), input_ptr, input_len)
         }
 
-        fn __handle_event(event: *const ::std::ffi::c_char) -> i32 {
-            $crate::__private::handle_event_export(__instance(), event)
+        fn __handle_event(input_ptr: *const u8, input_len: usize) -> i32 {
+            $crate::__private::handle_event_export(__instance(), input_ptr, input_len)
         }
 
         fn __invoke_service(
@@ -403,10 +421,10 @@ macro_rules! bundled_plugin_vtable {
 #[derive(Clone, Copy)]
 pub struct StaticPluginVtable {
     pub entry: fn() -> *const std::ffi::c_char,
-    pub run_command_with_context: fn(*const std::ffi::c_char) -> i32,
-    pub activate: fn(*const std::ffi::c_char) -> i32,
-    pub deactivate: fn(*const std::ffi::c_char) -> i32,
-    pub handle_event: fn(*const std::ffi::c_char) -> i32,
+    pub run_command_with_context: fn(*const u8, usize) -> i32,
+    pub activate: fn(*const u8, usize) -> i32,
+    pub deactivate: fn(*const u8, usize) -> i32,
+    pub handle_event: fn(*const u8, usize) -> i32,
     pub invoke_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
 }
 

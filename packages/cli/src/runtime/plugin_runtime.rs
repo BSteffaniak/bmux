@@ -8,6 +8,8 @@ use bmux_plugin_sdk::{
     HostScope, NativeCommandContext, NativeLifecycleContext, PluginCommandEffect,
     PluginCommandOutcome, PluginEvent, PluginEventKind, RegisteredService,
 };
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +23,21 @@ use super::{
     plugin_commands::PluginCommandRegistry, plugin_host, server_event_name,
     service_descriptors_from_declarations,
 };
+
+#[derive(Clone)]
+struct RuntimeCommandState {
+    config: BmuxConfig,
+    paths: ConfigPaths,
+    registry: Arc<PluginRegistry>,
+    enabled_plugins: Vec<String>,
+    available_capability_providers: BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
+    plugin_search_roots: Vec<String>,
+    registered_plugin_infos: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
+}
+
+thread_local! {
+    static RUNTIME_COMMAND_STATE_CACHE: RefCell<Option<RuntimeCommandState>> = const { RefCell::new(None) };
+}
 
 pub(super) fn plugin_host_metadata() -> HostMetadata {
     HostMetadata {
@@ -207,6 +224,36 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
         }
     }
     Ok(registry)
+}
+
+fn runtime_command_state() -> Result<RuntimeCommandState> {
+    RUNTIME_COMMAND_STATE_CACHE.with(|slot| {
+        if let Some(state) = slot.borrow().clone() {
+            return Ok(state);
+        }
+
+        let config = BmuxConfig::load()?;
+        let paths = ConfigPaths::default();
+        let registry = Arc::new(scan_available_plugins(&config, &paths)?);
+        let enabled_plugins = effective_enabled_plugins(&config, &registry);
+        let available_capability_providers = available_capability_providers(&config, &registry)?;
+        let plugin_search_roots = resolve_plugin_search_paths(&config, &paths)?
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let registered_plugin_infos = registered_plugin_infos_from_registry(&registry);
+        let state = RuntimeCommandState {
+            config,
+            paths,
+            registry,
+            enabled_plugins,
+            available_capability_providers,
+            plugin_search_roots,
+            registered_plugin_infos,
+        };
+        *slot.borrow_mut() = Some(state.clone());
+        Ok(state)
+    })
 }
 
 pub(super) fn resolve_plugin_search_paths(
@@ -1017,15 +1064,17 @@ pub(super) fn plugin_command_policy_hints(
     plugin_id: &str,
     command_name: &str,
 ) -> Result<PluginCommandPolicyHints> {
-    let config = BmuxConfig::load()?;
-    let paths = ConfigPaths::default();
-    let registry = scan_available_plugins(&config, &paths)?;
+    let state = runtime_command_state()?;
+    let registry = &state.registry;
     let available = registry.plugin_ids();
     let plugin = registry
         .get(plugin_id)
         .with_context(|| format_plugin_not_found_message(plugin_id, &available))?;
-    let enabled_plugins = effective_enabled_plugins(&config, &registry);
-    if !enabled_plugins.iter().any(|enabled| enabled == plugin_id) {
+    if !state
+        .enabled_plugins
+        .iter()
+        .any(|enabled| enabled == plugin_id)
+    {
         anyhow::bail!(format_plugin_not_enabled_message(plugin_id));
     }
 
@@ -1061,14 +1110,15 @@ pub(super) fn run_plugin_command_internal(
     args: &[String],
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<PluginCommandExecution> {
-    let config = BmuxConfig::load()?;
-    let paths = ConfigPaths::default();
-    let registry = scan_available_plugins(&config, &paths)?;
+    let state = runtime_command_state()?;
+    let config = &state.config;
+    let paths = &state.paths;
+    let registry = &state.registry;
     let available = registry.plugin_ids();
     let plugin = registry
         .get(plugin_id)
         .with_context(|| format_plugin_not_found_message(plugin_id, &available))?;
-    let enabled_plugins = effective_enabled_plugins(&config, &registry);
+    let enabled_plugins = state.enabled_plugins.clone();
 
     if !enabled_plugins.iter().any(|enabled| enabled == plugin_id) {
         anyhow::bail!(format_plugin_not_enabled_message(plugin_id));
@@ -1077,28 +1127,26 @@ pub(super) fn run_plugin_command_internal(
     let loaded = load_plugin(
         plugin,
         &plugin_host_metadata(),
-        &available_capability_providers(&config, &registry)?,
+        &state.available_capability_providers,
     )
     .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
-    let plugin_search_roots = resolve_plugin_search_paths(&config, &paths)?
-        .into_iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    let available_capabilities = available_capability_providers(&config, &registry)?
-        .into_keys()
-        .map(|capability| capability.to_string())
+    let plugin_search_roots = state.plugin_search_roots.clone();
+    let available_capabilities = state
+        .available_capability_providers
+        .keys()
+        .map(ToString::to_string)
         .collect::<Vec<_>>();
     let context = plugin_command_context(
-        &config,
-        &paths,
+        config,
+        paths,
         &plugin.declaration,
         command_name,
         args,
-        available_service_descriptors(&config, &registry)?,
+        available_service_descriptors(config, registry)?,
         available_capabilities,
         enabled_plugins,
         plugin_search_roots,
-        registered_plugin_infos_from_registry(&registry),
+        state.registered_plugin_infos.clone(),
     );
     begin_host_kernel_effect_capture();
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());

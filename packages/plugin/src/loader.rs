@@ -40,9 +40,9 @@ use tracing::{debug, error, info, trace, warn};
 
 type PluginEntryFn = unsafe extern "C" fn() -> *const c_char;
 type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *const c_char) -> i32;
-type NativeRunCommandWithContextFn = unsafe extern "C" fn(*const c_char) -> i32;
-type NativeLifecycleFn = unsafe extern "C" fn(*const c_char) -> i32;
-type NativeEventFn = unsafe extern "C" fn(*const c_char) -> i32;
+type NativeRunCommandWithContextFn = unsafe extern "C" fn(*const u8, usize) -> i32;
+type NativeLifecycleFn = unsafe extern "C" fn(*const u8, usize) -> i32;
+type NativeEventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 type NativeInvokeServiceFn =
     unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
 
@@ -1006,9 +1006,6 @@ impl LoadedPlugin {
     /// command symbol cannot be loaded, or any command input contains an
     /// interior NUL byte.
     ///
-    /// # Panics
-    ///
-    /// Panics if the native command context fails to serialize to JSON.
     pub fn run_command_with_context_and_outcome(
         &self,
         command_name: &str,
@@ -1023,18 +1020,17 @@ impl LoadedPlugin {
         }
 
         if let Some(context) = context {
-            let payload = CString::new(
-                serde_json::to_string(context).expect("native command context should serialize"),
-            )
-            .map_err(|_| PluginError::InvalidNativeCommandInput {
-                plugin_id: self.declaration.id.as_str().to_string(),
-                field: "context",
+            let payload = encode_service_message(context).map_err(|_| {
+                PluginError::InvalidNativeCommandInput {
+                    plugin_id: self.declaration.id.as_str().to_string(),
+                    field: "context",
+                }
             })?;
 
             match &self.backend {
                 PluginBackend::Static(vtable) => {
                     begin_command_outcome_capture();
-                    let status = (vtable.run_command_with_context)(payload.as_ptr());
+                    let status = (vtable.run_command_with_context)(payload.as_ptr(), payload.len());
                     let outcome = finish_command_outcome_capture();
                     return Ok((status, outcome));
                 }
@@ -1045,7 +1041,7 @@ impl LoadedPlugin {
                         )
                     } {
                         begin_command_outcome_capture();
-                        let status = unsafe { command_symbol(payload.as_ptr()) };
+                        let status = unsafe { command_symbol(payload.as_ptr(), payload.len()) };
                         let outcome = finish_command_outcome_capture();
                         return Ok((status, outcome));
                     }
@@ -1139,23 +1135,18 @@ impl LoadedPlugin {
     /// Returns an error when the event symbol cannot be loaded or the event
     /// payload cannot be encoded.
     ///
-    /// # Panics
-    ///
-    /// Panics if the plugin event payload fails to serialize to JSON.
     pub fn dispatch_event(&self, event: &PluginEvent) -> Result<Option<i32>> {
         if !self.receives_event(event) {
             return Ok(None);
         }
 
-        let payload = CString::new(
-            serde_json::to_string(event).expect("plugin event payload should serialize"),
-        )
-        .map_err(|_| PluginError::InvalidNativeEventInput {
-            plugin_id: self.declaration.id.as_str().to_string(),
-        })?;
+        let payload =
+            encode_service_message(event).map_err(|_| PluginError::InvalidNativeEventInput {
+                plugin_id: self.declaration.id.as_str().to_string(),
+            })?;
 
         let status = match &self.backend {
-            PluginBackend::Static(vtable) => (vtable.handle_event)(payload.as_ptr()),
+            PluginBackend::Static(vtable) => (vtable.handle_event)(payload.as_ptr(), payload.len()),
             PluginBackend::Dynamic(library) => {
                 let event_symbol: Symbol<'_, NativeEventFn> =
                     unsafe { library.get(DEFAULT_NATIVE_EVENT_SYMBOL.as_bytes()) }.map_err(
@@ -1165,7 +1156,7 @@ impl LoadedPlugin {
                             details: error.to_string(),
                         },
                     )?;
-                unsafe { event_symbol(payload.as_ptr()) }
+                unsafe { event_symbol(payload.as_ptr(), payload.len()) }
             }
         };
 
@@ -1259,11 +1250,10 @@ impl LoadedPlugin {
     }
 
     fn run_lifecycle_symbol(&self, symbol: &str, context: &NativeLifecycleContext) -> Result<i32> {
-        let payload = CString::new(
-            serde_json::to_string(context).expect("native lifecycle context should serialize"),
-        )
-        .map_err(|_| PluginError::InvalidNativeLifecycleInput {
-            plugin_id: self.declaration.id.as_str().to_string(),
+        let payload = encode_service_message(context).map_err(|_| {
+            PluginError::InvalidNativeLifecycleInput {
+                plugin_id: self.declaration.id.as_str().to_string(),
+            }
         })?;
 
         let status = match &self.backend {
@@ -1279,7 +1269,7 @@ impl LoadedPlugin {
                         details: "unknown lifecycle symbol for static plugin".to_string(),
                     });
                 };
-                func(payload.as_ptr())
+                func(payload.as_ptr(), payload.len())
             }
             PluginBackend::Dynamic(library) => {
                 let lifecycle_symbol: Symbol<'_, NativeLifecycleFn> = unsafe {
@@ -1290,7 +1280,7 @@ impl LoadedPlugin {
                     symbol: symbol.to_string(),
                     details: error.to_string(),
                 })?;
-                unsafe { lifecycle_symbol(payload.as_ptr()) }
+                unsafe { lifecycle_symbol(payload.as_ptr(), payload.len()) }
             }
         };
 
