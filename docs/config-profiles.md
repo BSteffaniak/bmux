@@ -21,6 +21,12 @@ BMUX ships these profiles as normal profiles (not special-case code paths):
 - `tmux_compat`
 - `zellij_compat`
 
+Built-in intent:
+
+- `vim`: richer modal defaults (normal/insert/visual/command mode baseline)
+- `tmux_compat`: tmux-like prefix-oriented transitions
+- `zellij_compat`: zellij-style additions layered on top of `vim`
+
 Built-in patch content is sourced from regular TOML profile files in
 `packages/config/profiles/` and merged through the same deep-merge logic as
 user-defined profiles.

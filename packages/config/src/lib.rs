@@ -2518,6 +2518,31 @@ extends = ["left", "right"]
     }
 
     #[test]
+    fn composition_built_in_vim_profile_loads_file_backed_modes() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+active_profile = "vim"
+"#,
+        )
+        .expect("write temp config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(
+            config
+                .keybindings
+                .modes
+                .get("normal")
+                .and_then(|mode| mode.bindings.get(":")),
+            Some(&"enter_mode command".to_string())
+        );
+        assert!(config.keybindings.modes.contains_key("visual"));
+        assert!(config.keybindings.modes.contains_key("command"));
+    }
+
+    #[test]
     fn composition_user_profile_can_extend_built_in_profiles() {
         let path = temp_config_path();
         std::fs::write(
@@ -2533,7 +2558,7 @@ extends = ["tmux_compat", "zellij_compat"]
         .expect("write temp config");
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
-        assert_eq!(config.keybindings.initial_mode, "insert");
+        assert_eq!(config.keybindings.initial_mode, "normal");
         assert_eq!(
             config
                 .keybindings
@@ -2541,6 +2566,33 @@ extends = ["tmux_compat", "zellij_compat"]
                 .get("insert")
                 .and_then(|mode| mode.bindings.get("ctrl+a")),
             Some(&"enter_mode normal".to_string())
+        );
+        assert_eq!(
+            config.keybindings.global.get("alt+n"),
+            Some(&"split_focused_horizontal".to_string())
+        );
+    }
+
+    #[test]
+    fn composition_built_in_zellij_extends_built_in_vim_profile() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+active_profile = "zellij_compat"
+"#,
+        )
+        .expect("write temp config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(
+            config
+                .keybindings
+                .modes
+                .get("normal")
+                .and_then(|mode| mode.bindings.get(":")),
+            Some(&"enter_mode command".to_string())
         );
         assert_eq!(
             config.keybindings.global.get("alt+n"),

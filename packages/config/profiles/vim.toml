@@ -1,1 +1,35 @@
+[keybindings]
+initial_mode = "normal"
 
+[keybindings.modes.normal.bindings]
+":" = "enter_mode command"
+a   = "enter_mode insert"
+i   = "enter_mode insert"
+v   = "enter_mode visual"
+
+[keybindings.modes.insert.bindings]
+"ctrl+c" = "enter_mode normal"
+escape   = "enter_mode normal"
+
+[keybindings.modes.visual]
+label       = "VISUAL"
+passthrough = false
+
+[keybindings.modes.visual.bindings]
+enter  = "confirm_scrollback"
+escape = "enter_mode normal"
+h      = "move_cursor_left"
+j      = "move_cursor_down"
+k      = "move_cursor_up"
+l      = "move_cursor_right"
+y      = "copy_scrollback"
+
+[keybindings.modes.command]
+label       = "COMMAND"
+passthrough = false
+
+[keybindings.modes.command.bindings]
+"?"    = "show_help"
+d      = "detach"
+escape = "enter_mode normal"
+q      = "quit"
