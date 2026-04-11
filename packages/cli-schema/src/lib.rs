@@ -1118,7 +1118,7 @@ pub enum SandboxCommand {
     /// Inspect a sandbox by id or absolute path
     Inspect {
         /// Sandbox id (bmux-sbx-...) or full path
-        target: Option<String>,
+        sandbox: Option<String>,
         /// Inspect the most recent sandbox
         #[arg(long, conflicts_with_all = ["latest_failed", "target"])]
         latest: bool,
@@ -1144,7 +1144,7 @@ pub enum SandboxCommand {
     /// Bundle sandbox diagnostics and logs into a single directory
     Bundle {
         /// Sandbox id (bmux-sbx-...) or full path
-        target: String,
+        sandbox: String,
         /// Optional output directory path (default: ./sandbox-bundles)
         #[arg(long)]
         output: Option<String>,
@@ -4037,7 +4037,7 @@ mod tests {
         assert!(matches!(
             command,
             SandboxCommand::Inspect {
-                target: Some(target),
+                sandbox: Some(target),
                 latest: false,
                 latest_failed: false,
                 tail: 25,
@@ -4053,7 +4053,7 @@ mod tests {
         assert!(matches!(
             command,
             SandboxCommand::Inspect {
-                target: None,
+                sandbox: None,
                 latest: true,
                 latest_failed: false,
                 tail: 80,
@@ -4076,7 +4076,7 @@ mod tests {
         assert!(matches!(
             command,
             SandboxCommand::Inspect {
-                target: None,
+                sandbox: None,
                 latest: false,
                 latest_failed: true,
                 tail: 40,
@@ -4126,7 +4126,7 @@ mod tests {
         assert!(matches!(
             command,
             SandboxCommand::Bundle {
-                target,
+                sandbox: target,
                 output: Some(output),
                 json: true,
             } if target == "bmux-sbx-123" && output == "./artifacts"

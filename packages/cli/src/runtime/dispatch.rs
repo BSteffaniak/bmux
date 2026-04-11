@@ -1443,14 +1443,14 @@ pub(super) async fn dispatch_built_in_command(
             Command::Sandbox {
                 command:
                     SandboxCommand::Inspect {
-                        target,
+                        sandbox,
                         latest,
                         latest_failed,
                         tail,
                         json,
                     },
             },
-        ) => run_sandbox_inspect(target.as_deref(), *latest, *latest_failed, *tail, *json),
+        ) => run_sandbox_inspect(sandbox.as_deref(), *latest, *latest_failed, *tail, *json),
         (
             BuiltInHandlerId::SandboxDoctor,
             Command::Sandbox {
@@ -1462,12 +1462,12 @@ pub(super) async fn dispatch_built_in_command(
             Command::Sandbox {
                 command:
                     SandboxCommand::Bundle {
-                        target,
+                        sandbox,
                         output,
                         json,
                     },
             },
-        ) => run_sandbox_bundle(target, output.as_deref(), *json),
+        ) => run_sandbox_bundle(sandbox, output.as_deref(), *json),
         (
             BuiltInHandlerId::SandboxCleanup,
             Command::Sandbox {
