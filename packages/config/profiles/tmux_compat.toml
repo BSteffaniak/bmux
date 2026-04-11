@@ -1,0 +1,8 @@
+[keybindings]
+initial_mode = "insert"
+
+[keybindings.modes.insert.bindings]
+"ctrl+a" = "enter_mode normal"
+
+[keybindings.modes.normal.bindings]
+escape = "enter_mode insert"

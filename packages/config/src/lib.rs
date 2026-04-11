@@ -83,29 +83,29 @@ pub struct CompositionResolution {
 }
 
 fn built_in_composition_profiles() -> BTreeMap<String, CompositionProfile> {
-    fn parse_patch(source: &str) -> toml::Table {
-        toml::from_str::<toml::Table>(source).unwrap_or_else(|_| toml::Table::new())
+    fn parse_builtin_patch(profile_id: &str, source: &str) -> toml::Table {
+        match toml::from_str::<toml::Table>(source) {
+            Ok(table) => table,
+            Err(error) => {
+                panic!("invalid built-in composition profile '{profile_id}': {error}")
+            }
+        }
     }
 
     let mut profiles = BTreeMap::new();
-    profiles.insert("vim".to_string(), CompositionProfile::default());
+    profiles.insert(
+        "vim".to_string(),
+        CompositionProfile {
+            extends: vec![],
+            patch: parse_builtin_patch("vim", include_str!("../profiles/vim.toml")),
+        },
+    );
 
     profiles.insert(
         "tmux_compat".to_string(),
         CompositionProfile {
             extends: vec![],
-            patch: parse_patch(
-                r#"
-[keybindings]
-initial_mode = "insert"
-
-[keybindings.modes.insert.bindings]
-"ctrl+a" = "enter_mode normal"
-
-[keybindings.modes.normal.bindings]
-escape = "enter_mode insert"
-"#,
-            ),
+            patch: parse_builtin_patch("tmux_compat", include_str!("../profiles/tmux_compat.toml")),
         },
     );
 
@@ -113,11 +113,9 @@ escape = "enter_mode insert"
         "zellij_compat".to_string(),
         CompositionProfile {
             extends: vec!["vim".to_string()],
-            patch: parse_patch(
-                r#"
-[keybindings.global]
-"alt+n" = "split_focused_horizontal"
-"#,
+            patch: parse_builtin_patch(
+                "zellij_compat",
+                include_str!("../profiles/zellij_compat.toml"),
             ),
         },
     );
@@ -2517,6 +2515,37 @@ extends = ["left", "right"]
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
         assert_eq!(config.general.server_timeout, 200);
+    }
+
+    #[test]
+    fn composition_user_profile_can_extend_built_in_profiles() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+active_profile = "team"
+
+[composition.profiles.team]
+extends = ["tmux_compat", "zellij_compat"]
+"#,
+        )
+        .expect("write temp config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.keybindings.initial_mode, "insert");
+        assert_eq!(
+            config
+                .keybindings
+                .modes
+                .get("insert")
+                .and_then(|mode| mode.bindings.get("ctrl+a")),
+            Some(&"enter_mode normal".to_string())
+        );
+        assert_eq!(
+            config.keybindings.global.get("alt+n"),
+            Some(&"split_focused_horizontal".to_string())
+        );
     }
 
     #[test]

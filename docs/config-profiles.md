@@ -21,6 +21,10 @@ BMUX ships these profiles as normal profiles (not special-case code paths):
 - `tmux_compat`
 - `zellij_compat`
 
+Built-in patch content is sourced from regular TOML profile files in
+`packages/config/profiles/` and merged through the same deep-merge logic as
+user-defined profiles.
+
 You can override or extend them the same way as user-defined profiles.
 
 ## Merge and Precedence Rules
