@@ -203,9 +203,8 @@ Examples:
 - `examples/process-plugin-node/`
 - `examples/process-plugin-python/`
 
-These examples focus on frame transport and process lifecycle behavior. They use
-JSON payloads for portability and do not implement the BMUX service codec.
-Production process plugins must use the host service codec payload format.
+These examples focus on frame transport and process lifecycle behavior and emit
+BMUX service-codec-compatible response payloads.
 
 Troubleshooting:
 

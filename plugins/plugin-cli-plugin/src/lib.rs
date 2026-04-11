@@ -121,10 +121,11 @@ fn run_list_command(context: &NativeCommandContext) -> Result<i32, String> {
 
 fn run_doctor_command(context: &NativeCommandContext) -> Result<i32, String> {
     let as_json = has_flag(&context.arguments, "json");
+    let strict = has_flag(&context.arguments, "strict");
     let enabled_plugins = collect_enabled_plugins(context);
     let manifest_index = discover_manifest_index(context)?;
     let findings = collect_doctor_findings(context, &enabled_plugins, &manifest_index);
-    let report = build_doctor_report(context, enabled_plugins.len(), findings);
+    let report = build_doctor_report(context, enabled_plugins.len(), strict, findings);
 
     if as_json {
         let output = serde_json::to_string_pretty(&report)
@@ -193,12 +194,15 @@ fn collect_doctor_findings(
         check_plugin_manifest_readiness(plugin, manifest_index, context, &mut findings);
     }
 
+    check_manifest_cli_path_conflicts(enabled_plugins, manifest_index, &mut findings);
+
     findings
 }
 
 fn build_doctor_report(
     context: &NativeCommandContext,
     inspected_plugins: usize,
+    strict_mode: bool,
     findings: Vec<DoctorFinding>,
 ) -> PluginDoctorReport {
     let error_count = findings
@@ -226,7 +230,8 @@ fn build_doctor_report(
         .collect::<Vec<_>>();
 
     PluginDoctorReport {
-        healthy: error_count == 0,
+        healthy: error_count == 0 && (!strict_mode || warning_count == 0),
+        strict_mode,
         enabled_plugins: context.enabled_plugins.clone(),
         inspected_plugins,
         findings,
@@ -238,14 +243,55 @@ fn build_doctor_report(
     }
 }
 
+fn check_manifest_cli_path_conflicts(
+    enabled_plugins: &[&bmux_plugin_sdk::RegisteredPluginInfo],
+    manifest_index: &BTreeMap<String, ManifestRecord>,
+    findings: &mut Vec<DoctorFinding>,
+) {
+    let mut owners: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
+
+    for plugin in enabled_plugins {
+        let Some(record) = manifest_index.get(&plugin.id) else {
+            continue;
+        };
+        for command in &record.manifest.commands {
+            if !command.expose_in_cli {
+                continue;
+            }
+            for path in command.cli_paths() {
+                owners.entry(path).or_default().push(plugin.id.clone());
+            }
+        }
+    }
+
+    for (path, mut path_owners) in owners {
+        path_owners.sort();
+        path_owners.dedup();
+        if path_owners.len() <= 1 {
+            continue;
+        }
+        let path_label = path.join(" ");
+        findings.push(DoctorFinding::warning(
+            "cli_path_multi_owner",
+            format!(
+                "CLI path '{}' is declared by multiple enabled plugins: {}",
+                path_label,
+                path_owners.join(", ")
+            ),
+            Some("Disable one owner plugin or adjust command path/aliases to remove overlap."),
+        ));
+    }
+}
+
 fn print_doctor_report(report: &PluginDoctorReport) {
     println!(
-        "plugin doctor: {} (inspected={} errors={} warnings={} info={})",
+        "plugin doctor: {} (inspected={} errors={} warnings={} info={} strict={})",
         if report.healthy { "ok" } else { "issues found" },
         report.inspected_plugins,
         report.error_count,
         report.warning_count,
-        report.info_count
+        report.info_count,
+        report.strict_mode
     );
 
     print_doctor_findings(report, DoctorSeverity::Error, "errors", true);
@@ -590,17 +636,7 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
     let bundled_plugins = discover_bundled_plugins(context)?;
 
     if matches!(options.mode, RebuildMode::List) {
-        if options.json {
-            let report = RebuildSelectionReport {
-                profile: rebuild_profile_name(options.profile),
-                base_ref: resolved_base_ref,
-                selected_targets: Vec::new(),
-                mode: "list".to_string(),
-            };
-            let output = serde_json::to_string_pretty(&report)
-                .map_err(|error| format!("failed encoding rebuild json: {error}"))?;
-            println!("{output}");
-        }
+        emit_rebuild_selection_json(&options, resolved_base_ref, Vec::new())?;
         print_discovered_plugins(&bundled_plugins, &workspace_plugin_crates);
         return Ok(EXIT_OK);
     }
@@ -621,27 +657,13 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
         );
     }
 
-    for crate_name in &targets {
-        if !workspace_plugin_crates
-            .iter()
-            .any(|known| known == crate_name)
-        {
-            return Err(format!(
-                "selected crate '{crate_name}' is not a workspace plugin cdylib crate"
-            ));
-        }
-    }
+    validate_selected_targets(&targets, &workspace_plugin_crates)?;
 
-    if options.json {
-        let report = RebuildSelectionReport {
-            profile: rebuild_profile_name(options.profile),
-            base_ref: resolved_base_ref,
-            selected_targets: targets.clone(),
-            mode: rebuild_mode_name(&options),
-        };
-        let output = serde_json::to_string_pretty(&report)
-            .map_err(|error| format!("failed encoding rebuild json: {error}"))?;
-        println!("{output}");
+    emit_rebuild_selection_json(&options, resolved_base_ref, targets.clone())?;
+
+    if matches!(options.execution_mode, ExecutionMode::DryRun) {
+        println!("dry-run enabled; skipping cargo build execution");
+        return Ok(EXIT_OK);
     }
 
     println!(
@@ -654,12 +676,73 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
         targets.join(" ")
     );
 
+    execute_rebuild_build(options.profile, &targets)?;
+
+    Ok(EXIT_OK)
+}
+
+fn emit_rebuild_selection_json(
+    options: &RebuildOptions,
+    base_ref: Option<String>,
+    targets: Vec<String>,
+) -> Result<(), String> {
+    if !matches!(options.output_mode, OutputMode::Json) {
+        return Ok(());
+    }
+
+    let selected_by = targets
+        .iter()
+        .map(|crate_name| {
+            let reason = if !options.selectors.is_empty() {
+                "selector"
+            } else if matches!(options.mode, RebuildMode::Changed) {
+                "changed"
+            } else {
+                "workspace-default"
+            };
+            RebuildTargetSelection {
+                crate_name: crate_name.clone(),
+                reason: reason.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let report = RebuildSelectionReport {
+        profile: rebuild_profile_name(options.profile),
+        base_ref,
+        selected_targets: targets,
+        selected_by,
+        mode: rebuild_mode_name(options),
+    };
+    let output = serde_json::to_string_pretty(&report)
+        .map_err(|error| format!("failed encoding rebuild json: {error}"))?;
+    println!("{output}");
+    Ok(())
+}
+
+fn validate_selected_targets(
+    targets: &[String],
+    workspace_plugin_crates: &[String],
+) -> Result<(), String> {
+    for crate_name in targets {
+        if !workspace_plugin_crates
+            .iter()
+            .any(|known| known == crate_name)
+        {
+            return Err(format!(
+                "selected crate '{crate_name}' is not a workspace plugin cdylib crate"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn execute_rebuild_build(profile: BuildProfile, targets: &[String]) -> Result<(), String> {
     let mut command = ProcessCommand::new("cargo");
     command.arg("build");
-    if matches!(options.profile, BuildProfile::Release) {
+    if matches!(profile, BuildProfile::Release) {
         command.arg("--release");
     }
-    for crate_name in &targets {
+    for crate_name in targets {
         command.arg("-p");
         command.arg(crate_name);
     }
@@ -667,12 +750,11 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
     let status = command
         .status()
         .map_err(|error| format!("failed executing cargo build: {error}"))?;
-
-    if !status.success() {
-        return Err("cargo build failed for selected plugin crates".to_string());
+    if status.success() {
+        Ok(())
+    } else {
+        Err("cargo build failed for selected plugin crates".to_string())
     }
-
-    Ok(EXIT_OK)
 }
 
 fn rebuild_profile_name(profile: BuildProfile) -> String {
@@ -719,14 +801,17 @@ fn select_rebuild_targets(
 
     match options.mode {
         RebuildMode::Changed => {
-            for crate_name in
-                changed_workspace_plugin_crates(base_ref, bundled_plugins, workspace_plugin_crates)?
-            {
+            for crate_name in changed_workspace_plugin_crates(
+                base_ref,
+                options.diff_range_mode,
+                bundled_plugins,
+                workspace_plugin_crates,
+            )? {
                 add_target(&crate_name);
             }
         }
         RebuildMode::AllWorkspace | RebuildMode::List => {
-            if options.all_workspace_plugins {
+            if matches!(options.workspace_flag, WorkspaceFlag::ExplicitAll) {
                 println!("--all-workspace-plugins is now the default behavior");
             }
             for crate_name in workspace_plugin_crates {
@@ -740,10 +825,11 @@ fn select_rebuild_targets(
 
 fn changed_workspace_plugin_crates(
     base_ref: Option<&str>,
+    diff_range_mode: DiffRangeMode,
     bundled: &[BundledPlugin],
     workspace_crates: &[String],
 ) -> Result<Vec<String>, String> {
-    let changed_paths = collect_changed_paths(base_ref)?;
+    let changed_paths = collect_changed_paths(base_ref, diff_range_mode)?;
     let mut selected = BTreeSet::new();
 
     if changed_paths.iter().any(|path| {
@@ -777,16 +863,24 @@ fn changed_workspace_plugin_crates(
     Ok(selected.into_iter().collect())
 }
 
-fn collect_changed_paths(base_ref: Option<&str>) -> Result<Vec<String>, String> {
+fn collect_changed_paths(
+    base_ref: Option<&str>,
+    diff_range_mode: DiffRangeMode,
+) -> Result<Vec<String>, String> {
     let mut changed = BTreeSet::new();
 
     let mut command_sets = Vec::new();
     if let Some(base_ref) = base_ref {
+        let range_sep = if matches!(diff_range_mode, DiffRangeMode::MergeBase) {
+            "..."
+        } else {
+            ".."
+        };
         command_sets.push(vec![
             "diff".to_string(),
             "--name-only".to_string(),
             "--relative".to_string(),
-            format!("{base_ref}...HEAD"),
+            format!("{base_ref}{range_sep}HEAD"),
         ]);
     } else {
         command_sets.push(vec![
@@ -833,18 +927,20 @@ fn collect_changed_paths(base_ref: Option<&str>) -> Result<Vec<String>, String> 
 }
 
 fn resolve_changed_base_ref(options: &RebuildOptions) -> Result<Option<String>, String> {
-    if let Some(base_ref) = &options.base_ref {
-        return Ok(Some(base_ref.clone()));
+    match &options.base_selector {
+        BaseSelector::Explicit(base_ref) => Ok(Some(base_ref.clone())),
+        BaseSelector::None => Ok(None),
+        BaseSelector::AgainstMaster => {
+            if git_ref_exists("origin/master")? {
+                Ok(Some("origin/master".to_string()))
+            } else {
+                Err(
+                    "--against-master requested but origin/master does not exist locally"
+                        .to_string(),
+                )
+            }
+        }
     }
-    if !options.against_master {
-        return Ok(None);
-    }
-
-    if git_ref_exists("origin/master")? {
-        return Ok(Some("origin/master".to_string()));
-    }
-
-    Err("--against-master requested but origin/master does not exist locally".to_string())
 }
 
 fn git_ref_exists(reference: &str) -> Result<bool, String> {
@@ -1017,6 +1113,8 @@ fn workspace_plugin_cdylib_crates(metadata: &serde_json::Value) -> Vec<String> {
 fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, String> {
     let mut options = RebuildOptions::default();
     let mut positional_mode = false;
+    let mut saw_base = false;
+    let mut saw_against_master = false;
 
     let mut index = 0_usize;
     while index < arguments.len() {
@@ -1040,7 +1138,7 @@ fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, String>
                     continue;
                 }
                 "--json" => {
-                    options.json = true;
+                    options.output_mode = OutputMode::Json;
                     index += 1;
                     continue;
                 }
@@ -1049,13 +1147,24 @@ fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, String>
                     index += 1;
                     continue;
                 }
+                "--merge-base" => {
+                    options.diff_range_mode = DiffRangeMode::MergeBase;
+                    index += 1;
+                    continue;
+                }
+                "--dry-run" => {
+                    options.execution_mode = ExecutionMode::DryRun;
+                    index += 1;
+                    continue;
+                }
                 "--against-master" => {
-                    options.against_master = true;
+                    options.base_selector = BaseSelector::AgainstMaster;
+                    saw_against_master = true;
                     index += 1;
                     continue;
                 }
                 "--all-workspace-plugins" => {
-                    options.all_workspace_plugins = true;
+                    options.workspace_flag = WorkspaceFlag::ExplicitAll;
                     index += 1;
                     continue;
                 }
@@ -1063,7 +1172,8 @@ fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, String>
                     let Some(base_ref) = arguments.get(index + 1) else {
                         return Err("--base requires a git ref argument".to_string());
                     };
-                    options.base_ref = Some(base_ref.clone());
+                    options.base_selector = BaseSelector::Explicit(base_ref.clone());
+                    saw_base = true;
                     index += 2;
                     continue;
                 }
@@ -1072,7 +1182,8 @@ fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, String>
                     if base_ref.is_empty() {
                         return Err("--base requires a non-empty git ref".to_string());
                     }
-                    options.base_ref = Some(base_ref.to_string());
+                    options.base_selector = BaseSelector::Explicit(base_ref.to_string());
+                    saw_base = true;
                     index += 1;
                     continue;
                 }
@@ -1087,7 +1198,7 @@ fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, String>
         index += 1;
     }
 
-    if options.base_ref.is_some() && options.against_master {
+    if saw_base && saw_against_master {
         return Err("--base and --against-master cannot be used together".to_string());
     }
 
@@ -1191,7 +1302,10 @@ fn levenshtein(left: &str, right: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{RebuildMode, core_proxy_command_path, parse_rebuild_options, suggest_top_matches};
+    use super::{
+        BaseSelector, RebuildMode, core_proxy_command_path, parse_rebuild_options,
+        suggest_top_matches,
+    };
 
     #[test]
     fn generated_proxy_command_mapping_resolves_known_entries() {
@@ -1229,13 +1343,15 @@ mod tests {
         ])
         .expect("options should parse");
         assert!(matches!(options.mode, RebuildMode::Changed));
-        assert_eq!(options.base_ref.as_deref(), Some("origin/master"));
-        assert!(!options.against_master);
+        assert!(matches!(options.base_selector, BaseSelector::Explicit(_)));
 
         let against_master =
             parse_rebuild_options(&["--changed".to_string(), "--against-master".to_string()])
                 .expect("against-master should parse");
-        assert!(against_master.against_master);
+        assert!(matches!(
+            against_master.base_selector,
+            BaseSelector::AgainstMaster
+        ));
     }
 
     #[test]
@@ -1252,12 +1368,49 @@ mod tests {
 #[derive(Debug, Default)]
 struct RebuildOptions {
     profile: BuildProfile,
-    json: bool,
-    all_workspace_plugins: bool,
+    output_mode: OutputMode,
+    workspace_flag: WorkspaceFlag,
+    execution_mode: ExecutionMode,
     mode: RebuildMode,
-    base_ref: Option<String>,
-    against_master: bool,
+    diff_range_mode: DiffRangeMode,
+    base_selector: BaseSelector,
     selectors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum OutputMode {
+    #[default]
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum WorkspaceFlag {
+    #[default]
+    ImplicitAll,
+    ExplicitAll,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum ExecutionMode {
+    #[default]
+    Execute,
+    DryRun,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum DiffRangeMode {
+    #[default]
+    Direct,
+    MergeBase,
+}
+
+#[derive(Debug, Clone, Default)]
+enum BaseSelector {
+    #[default]
+    None,
+    AgainstMaster,
+    Explicit(String),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1301,6 +1454,13 @@ struct RebuildSelectionReport {
     mode: String,
     base_ref: Option<String>,
     selected_targets: Vec<String>,
+    selected_by: Vec<RebuildTargetSelection>,
+}
+
+#[derive(Debug, Serialize)]
+struct RebuildTargetSelection {
+    crate_name: String,
+    reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1317,6 +1477,7 @@ struct PluginListEntry {
 #[derive(Debug, Serialize)]
 struct PluginDoctorReport {
     healthy: bool,
+    strict_mode: bool,
     enabled_plugins: Vec<String>,
     inspected_plugins: usize,
     findings: Vec<DoctorFinding>,

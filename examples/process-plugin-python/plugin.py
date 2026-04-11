@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import json
 import struct
 import sys
 
@@ -23,42 +22,83 @@ def encode_frame(payload: bytes) -> bytes:
     return MAGIC + struct.pack(">I", len(payload)) + payload
 
 
-def handle_request(payload: bytes) -> dict:
+def encode_u32_leb128(value: int) -> bytes:
+    out = bytearray()
+    current = value & 0xFFFFFFFF
+    while True:
+        byte = current & 0x7F
+        current >>= 7
+        if current:
+            byte |= 0x80
+        out.append(byte)
+        if not current:
+            break
+    return bytes(out)
+
+
+def encode_i32_zigzag(value: int) -> bytes:
+    zigzag = ((value << 1) ^ (value >> 31)) & 0xFFFFFFFF
+    return encode_u32_leb128(zigzag)
+
+
+def decode_u32_leb128(payload: bytes, offset: int = 0) -> tuple[int, int]:
+    result = 0
+    shift = 0
+    index = offset
+    while index < len(payload):
+        byte = payload[index]
+        result |= (byte & 0x7F) << shift
+        index += 1
+        if byte & 0x80 == 0:
+            return result, index
+        shift += 7
+        if shift > 28:
+            raise ValueError("varint too large")
+    raise ValueError("truncated varint")
+
+
+def encode_string(value: str) -> bytes:
+    payload = value.encode("utf-8")
+    return encode_u32_leb128(len(payload)) + payload
+
+
+def encode_command_success_response() -> bytes:
+    # ProcessInvocationResponse::Command {
+    #   protocol_version: 1,
+    #   status: 0,
+    #   outcome: Some(PluginCommandOutcome { effects: [] }),
+    # }
+    return bytes([0x00, 0x01, 0x00, 0x01, 0x00])
+
+
+def encode_error_response(details: str, status_code: int) -> bytes:
+    # ProcessInvocationResponse::Error variant index = 4.
+    return (
+        encode_u32_leb128(4)
+        + encode_u32_leb128(1)
+        + encode_string(details)
+        + bytes([0x01])
+        + encode_i32_zigzag(status_code)
+    )
+
+
+def handle_request(payload: bytes) -> bytes:
     try:
-        request = json.loads(payload.decode("utf-8"))
+        request_variant, _ = decode_u32_leb128(payload, 0)
     except Exception:
-        return {
-            "Error": {
-                "protocol_version": 1,
-                "details": "invalid request payload",
-                "status": 2,
-            }
-        }
+        return encode_error_response("invalid BMUX service-codec request payload", 2)
 
-    if "Command" in request:
-        return {
-            "Command": {
-                "protocol_version": 1,
-                "status": 0,
-                "outcome": {"effects": []},
-            }
-        }
+    if request_variant == 0:
+        return encode_command_success_response()
 
-    return {
-        "Error": {
-            "protocol_version": 1,
-            "details": "unsupported request kind in python example",
-            "status": 2,
-        }
-    }
+    return encode_error_response("unsupported request kind in python example", 2)
 
 
 def main() -> int:
     try:
         request_bytes = sys.stdin.buffer.read()
         payload = read_frame(request_bytes)
-        response = handle_request(payload)
-        encoded = encode_frame(json.dumps(response).encode("utf-8"))
+        encoded = encode_frame(handle_request(payload))
         sys.stdout.buffer.write(encoded)
         sys.stdout.buffer.flush()
         return 0

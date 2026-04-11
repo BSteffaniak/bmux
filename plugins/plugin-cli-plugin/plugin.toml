@@ -204,6 +204,16 @@ name = "changed"
 
 [[commands.arguments]]
 kind = "boolean"
+long = "merge-base"
+name = "merge-base"
+
+[[commands.arguments]]
+kind = "boolean"
+long = "dry-run"
+name = "dry-run"
+
+[[commands.arguments]]
+kind = "boolean"
 long = "against-master"
 name = "against-master"
 
@@ -237,6 +247,11 @@ kind  = "boolean"
 long  = "json"
 name  = "json"
 short = "j"
+
+[[commands.arguments]]
+kind = "boolean"
+long = "strict"
+name = "strict"
 
 [[commands]]
 expose_in_cli = true

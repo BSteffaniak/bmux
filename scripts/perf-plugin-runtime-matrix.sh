@@ -72,6 +72,11 @@ run_case() {
 	shift 3
 	local args=("$@")
 
+	if [[ "$COLD_MODE" == "1" ]]; then
+		max_p95_ms=$((max_p95_ms * 20))
+		max_p99_ms=$((max_p99_ms * 20))
+	fi
+
 	echo
 	echo "=== ${title} ==="
 	local cmd=(
@@ -94,6 +99,11 @@ run_case_allow_nonzero() {
 	local max_p99_ms="$3"
 	shift 3
 	local args=("$@")
+
+	if [[ "$COLD_MODE" == "1" ]]; then
+		max_p95_ms=$((max_p95_ms * 20))
+		max_p99_ms=$((max_p99_ms * 20))
+	fi
 
 	echo
 	echo "=== ${title} ==="
