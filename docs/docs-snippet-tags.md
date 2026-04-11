@@ -41,3 +41,9 @@ In GitHub Actions, this report is uploaded as `docs-snippet-coverage` with:
 
 - `docs-snippet-coverage.md`
 - `docs-snippet-coverage.json`
+
+On pull requests, the workflow also posts/updates a sticky comment with:
+
+- current coverage percent
+- base branch coverage percent
+- delta in percentage points

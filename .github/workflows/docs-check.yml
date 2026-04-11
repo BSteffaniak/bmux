@@ -36,8 +36,13 @@ on:
 jobs:
   docs-check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -61,6 +66,139 @@ jobs:
         with:
           name: docs-snippet-coverage
           path: target/docs-check/docs-snippet-coverage.*
+          if-no-files-found: warn
+
+      - name: Collect base branch docs snippet coverage
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          BMUX_DOCS_COVERAGE_OUTPUT_DIR: ${{ github.workspace }}/target/docs-check-base
+        run: |
+          git worktree add ../docs-check-base "origin/${{ github.base_ref }}"
+          cargo test -p bmux_docs_site_ui markdown_snippet_coverage_report -- --nocapture
+        working-directory: ../docs-check-base
+
+      - name: Cleanup base branch worktree
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        run: git worktree remove --force ../docs-check-base
+
+      - name: Build docs coverage summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          current_json_path = workspace / "target/docs-check/docs-snippet-coverage.json"
+          base_json_path = workspace / "target/docs-check-base/docs-snippet-coverage.json"
+          summary_path = workspace / "target/docs-check/docs-snippet-summary.md"
+
+          def load(path: Path):
+              if not path.exists():
+                  return None
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          current = load(current_json_path)
+          base = load(base_json_path)
+
+          if current is None:
+              summary = "## Docs Snippet Coverage\n\nCoverage data is unavailable for this run."
+          else:
+              current_pct = float(current.get("opt_in_percent", 0.0))
+              current_opt_in = int(current.get("total_opt_in", 0))
+              current_fenced = int(current.get("total_fenced", 0))
+              lines = [
+                  "## Docs Snippet Coverage",
+                  "",
+                  f"- Current: **{current_pct:.1f}%** ({current_opt_in}/{current_fenced})",
+              ]
+
+              if base is not None:
+                  base_pct = float(base.get("opt_in_percent", 0.0))
+                  base_opt_in = int(base.get("total_opt_in", 0))
+                  base_fenced = int(base.get("total_fenced", 0))
+                  delta = current_pct - base_pct
+                  sign = "+" if delta >= 0 else ""
+                  lines.extend([
+                      f"- Base (`${{ github.base_ref }}`): **{base_pct:.1f}%** ({base_opt_in}/{base_fenced})",
+                      f"- Delta: **{sign}{delta:.1f}pp**",
+                  ])
+              else:
+                  lines.append("- Base: unavailable (could not compute base branch coverage)")
+
+              summary = "\n".join(lines)
+
+          summary_path.parent.mkdir(parents=True, exist_ok=True)
+          summary_path.write_text(summary + "\n", encoding="utf-8")
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as f:
+                  f.write(summary + "\n")
+
+          env_path = os.environ.get("GITHUB_ENV")
+          if env_path:
+              with open(env_path, "a", encoding="utf-8") as f:
+                  f.write("DOCS_COVERAGE_SUMMARY_PATH=" + str(summary_path) + "\n")
+          PY
+
+      - name: Comment docs coverage summary on PR
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs')
+            const summaryPath = process.env.DOCS_COVERAGE_SUMMARY_PATH
+            if (!summaryPath || !fs.existsSync(summaryPath)) {
+              core.info('No docs coverage summary file found; skipping PR comment')
+              return
+            }
+
+            const marker = '<!-- bmux-docs-snippet-coverage -->'
+            const body = `${marker}\n${fs.readFileSync(summaryPath, 'utf8')}`
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const issue_number = context.issue.number
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            })
+
+            const existing = comments.find((comment) =>
+              comment.user?.type === 'Bot' && comment.body?.includes(marker),
+            )
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              })
+              core.info(`Updated docs coverage comment ${existing.id}`)
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              })
+              core.info('Created docs coverage comment')
+            }
+
+      - name: Upload docs snippet summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-snippet-summary
+          path: target/docs-check/docs-snippet-summary.md
           if-no-files-found: warn
 
       - name: Validate docs source sections
