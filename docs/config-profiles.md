@@ -158,3 +158,22 @@ can patch the whole keybinding block or only specific nested keys.
 
 `enter_mode <mode_id>` targets are validated at startup. Invalid targets fail
 startup with a configuration error.
+
+## CLI Helpers
+
+Profile composition commands:
+
+- `bmux config profiles list`
+- `bmux config profiles show <profile-id>`
+- `bmux config profiles resolve [profile-id]`
+- `bmux config profiles explain [profile-id]`
+- `bmux config profiles diff <from> <to>`
+- `bmux config profiles lint`
+- `bmux config profiles evaluate`
+- `bmux config profiles switch <profile-id>`
+- `bmux config profiles switch <profile-id> --dry-run`
+
+Keybinding explain command:
+
+- `bmux keymap explain "ctrl+b %"`
+- `bmux keymap explain "h" --mode normal`

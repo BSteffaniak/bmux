@@ -10,6 +10,7 @@ use super::{
     effective_enabled_plugins, primary_da_for_profile, protocol_profile_name,
     scan_available_plugins, secondary_da_for_profile, supported_query_names,
 };
+use crate::input::canonical_chord_key;
 
 pub(super) fn run_terminal_install_terminfo(yes: bool, check_only: bool) -> Result<u8> {
     let configured = BmuxConfig::load().map_or_else(
@@ -665,6 +666,91 @@ pub(super) fn run_keymap_doctor(as_json: bool) -> Result<u8> {
             entry.chord,
             entry.action_name
         );
+    }
+
+    Ok(0)
+}
+
+pub(super) fn run_keymap_explain(key: &str, mode: Option<&str>, as_json: bool) -> Result<u8> {
+    let config = BmuxConfig::load().map_err(|error| anyhow::anyhow!("{error}"))?;
+    let (_runtime_bindings, global_bindings, _scroll_bindings) =
+        crate::runtime::attach::runtime::filtered_attach_keybindings(&config);
+    let canonical = canonical_chord_key(key);
+
+    let global_action = global_bindings.get(&canonical).cloned();
+    let requested_mode = mode.map_or_else(
+        || config.keybindings.initial_mode.clone(),
+        std::string::ToString::to_string,
+    );
+    let mode_action = config
+        .keybindings
+        .modes
+        .iter()
+        .find(|(mode_id, _)| mode_id.eq_ignore_ascii_case(&requested_mode))
+        .and_then(|(_, mode_cfg)| {
+            mode_cfg.bindings.iter().find_map(|(raw, action)| {
+                (canonical_chord_key(raw) == canonical).then(|| action.clone())
+            })
+        });
+
+    let runtime_action = if mode.is_none() && config.keybindings.modes.is_empty() {
+        let prefix = canonical_chord_key(&config.keybindings.prefix);
+        canonical
+            .strip_prefix(&format!("{prefix} "))
+            .and_then(|suffix| {
+                config.keybindings.runtime.iter().find_map(|(raw, action)| {
+                    (canonical_chord_key(raw) == suffix).then(|| action.clone())
+                })
+            })
+    } else {
+        None
+    };
+
+    let selected = global_action
+        .as_ref()
+        .map(|action| ("global", action.clone()))
+        .or_else(|| mode_action.as_ref().map(|action| ("mode", action.clone())))
+        .or_else(|| {
+            runtime_action
+                .as_ref()
+                .map(|action| ("runtime", action.clone()))
+        });
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "input": key,
+                "canonical": canonical,
+                "mode": requested_mode,
+                "global_action": global_action,
+                "mode_action": mode_action,
+                "runtime_action": runtime_action,
+                "selected": selected.as_ref().map(|(source, action)| serde_json::json!({
+                    "source": source,
+                    "action": action,
+                })),
+            }))
+            .context("failed to encode keymap explain json")?
+        );
+        return Ok(0);
+    }
+
+    println!("input: {key}");
+    println!("canonical: {canonical}");
+    println!("mode: {requested_mode}");
+    if let Some(action) = &global_action {
+        println!("global match: {action}");
+    }
+    if let Some(action) = &mode_action {
+        println!("mode match: {action}");
+    }
+    if let Some(action) = &runtime_action {
+        println!("runtime match: {action}");
+    }
+    match selected {
+        Some((source, action)) => println!("effective: {action} ({source})"),
+        None => println!("effective: <unbound>"),
     }
 
     Ok(0)

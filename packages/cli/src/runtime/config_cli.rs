@@ -1,5 +1,10 @@
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_keybind::{RuntimeAction, parse_action};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use crate::input::{ModalModeConfig, canonical_chord_key};
+use crate::runtime::attach::runtime::filtered_attach_keybindings;
 
 fn config_file_path() -> std::path::PathBuf {
     ConfigPaths::default().config_file()
@@ -201,6 +206,61 @@ pub(super) fn run_config_profiles_resolve(profile: Option<&str>, as_json: bool) 
     Ok(0)
 }
 
+pub(super) fn run_config_profiles_explain(profile: Option<&str>, as_json: bool) -> Result<u8> {
+    let path = config_file_path();
+    let (_config, explain) = BmuxConfig::load_from_path_with_explain(&path, profile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&explain).context("failed to encode explain json")?
+        );
+        return Ok(0);
+    }
+
+    println!(
+        "selected_profile: {}",
+        explain
+            .resolution
+            .selected_profile
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!(
+        "source: {}",
+        explain
+            .resolution
+            .selected_profile_source
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!(
+        "layer_order: {}",
+        explain.resolution.layer_order.join(" -> ")
+    );
+    println!("applied layers:");
+    for layer in &explain.applied_layers {
+        if layer.changed_paths.is_empty() {
+            println!("  - {}: no changes", layer.layer);
+            continue;
+        }
+        println!(
+            "  - {}: {} changed paths",
+            layer.layer,
+            layer.changed_paths.len()
+        );
+        for path in layer.changed_paths.iter().take(12) {
+            println!("      {path}");
+        }
+        if layer.changed_paths.len() > 12 {
+            println!("      ... {} more", layer.changed_paths.len() - 12);
+        }
+    }
+
+    Ok(0)
+}
+
 pub(super) fn run_config_profiles_diff(from: &str, to: &str, as_json: bool) -> Result<u8> {
     let path = config_file_path();
     let (from_config, _) = BmuxConfig::load_from_path_with_resolution(&path, Some(from))
@@ -210,12 +270,16 @@ pub(super) fn run_config_profiles_diff(from: &str, to: &str, as_json: bool) -> R
     let from_value =
         toml::Value::try_from(&from_config).context("failed to serialize from config")?;
     let to_value = toml::Value::try_from(&to_config).context("failed to serialize to config")?;
+    let changed_paths = diff_toml_paths(&from_value, &to_value);
+    let top_level_changes = summarize_top_level_changes(&changed_paths);
     if as_json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "from": from,
                 "to": to,
+                "changed_paths": changed_paths,
+                "top_level_changes": top_level_changes,
                 "from_config": from_value,
                 "to_config": to_value,
             }))
@@ -224,10 +288,23 @@ pub(super) fn run_config_profiles_diff(from: &str, to: &str, as_json: bool) -> R
     } else {
         println!("from profile: {from}");
         println!("to profile: {to}");
-        if from_value == to_value {
+        if changed_paths.is_empty() {
             println!("no differences");
         } else {
             println!("resolved configurations differ");
+            println!("changed paths: {}", changed_paths.len());
+            if !top_level_changes.is_empty() {
+                println!("top-level sections changed:");
+                for (section, count) in top_level_changes {
+                    println!("  - {section}: {count}");
+                }
+            }
+            for path in changed_paths.iter().take(20) {
+                println!("  - {path}");
+            }
+            if changed_paths.len() > 20 {
+                println!("  ... {} more", changed_paths.len() - 20);
+            }
         }
     }
     Ok(0)
@@ -235,14 +312,55 @@ pub(super) fn run_config_profiles_diff(from: &str, to: &str, as_json: bool) -> R
 
 pub(super) fn run_config_profiles_lint(as_json: bool) -> Result<u8> {
     let path = config_file_path();
-    let (_config, resolution) = BmuxConfig::load_from_path_with_resolution(&path, None)
+    let (config, resolution) = BmuxConfig::load_from_path_with_resolution(&path, None)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut warnings = Vec::new();
+    warnings.extend(unreachable_mode_warnings(&config));
+    warnings.extend(global_vs_mode_conflict_warnings(&config));
+
+    let timeout_ms = config
+        .keybindings
+        .resolve_timeout()
+        .map_err(anyhow::Error::msg)
+        .context("failed resolving keymap timeout")?
+        .timeout_ms();
+    let (_runtime_bindings, global_bindings, scroll_bindings) =
+        filtered_attach_keybindings(&config);
+    let modal_modes = config
+        .keybindings
+        .modes
+        .iter()
+        .map(|(mode_id, mode)| {
+            (
+                mode_id.clone(),
+                ModalModeConfig {
+                    label: mode.label.clone(),
+                    passthrough: mode.passthrough,
+                    bindings: mode.bindings.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let keymap = crate::input::Keymap::from_modal_parts_with_scroll(
+        timeout_ms,
+        &config.keybindings.initial_mode,
+        &modal_modes,
+        &global_bindings,
+        &scroll_bindings,
+    )
+    .context("failed compiling modal keymap for lint")?;
+    warnings.extend(keymap.overlap_warnings());
+
     if as_json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
                 "available_profiles": resolution.available_profiles,
+                "warning_count": warnings.len(),
+                "warnings": warnings,
             }))
             .context("failed to encode lint json")?
         );
@@ -251,6 +369,14 @@ pub(super) fn run_config_profiles_lint(as_json: bool) -> Result<u8> {
             "ok: {} profiles validated",
             resolution.available_profiles.len()
         );
+        if warnings.is_empty() {
+            println!("lint warnings: none");
+        } else {
+            println!("lint warnings: {}", warnings.len());
+            for warning in warnings {
+                println!("  - {warning}");
+            }
+        }
     }
     Ok(0)
 }
@@ -273,6 +399,62 @@ pub(super) fn run_config_profiles_evaluate(as_json: bool) -> Result<u8> {
             println!("matched auto_select rule: {index}");
         }
     }
+    Ok(0)
+}
+
+pub(super) fn run_config_profiles_switch(
+    profile: &str,
+    dry_run: bool,
+    as_json: bool,
+) -> Result<u8> {
+    let path = config_file_path();
+    let (before_config, before_resolution) =
+        BmuxConfig::load_from_path_with_resolution(&path, None)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (after_config, after_resolution) =
+        BmuxConfig::load_from_path_with_resolution(&path, Some(profile))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let before_value =
+        toml::Value::try_from(&before_config).context("failed to serialize previous config")?;
+    let after_value =
+        toml::Value::try_from(&after_config).context("failed to serialize switched config")?;
+    let changed_paths = diff_toml_paths(&before_value, &after_value);
+
+    if !dry_run {
+        run_config_profiles_set_active(profile)?;
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": dry_run,
+                "requested_profile": profile,
+                "previous_profile": before_resolution.selected_profile,
+                "next_profile": after_resolution.selected_profile,
+                "changed_paths": changed_paths,
+                "changed_path_count": changed_paths.len(),
+                "wrote_config": !dry_run,
+            }))
+            .context("failed to encode switch json")?
+        );
+        return Ok(0);
+    }
+
+    if dry_run {
+        println!("dry-run: switch_profile {profile}");
+    } else {
+        println!("switched active profile to {profile}");
+    }
+    println!("changed paths: {}", changed_paths.len());
+    for path in changed_paths.iter().take(16) {
+        println!("  - {path}");
+    }
+    if changed_paths.len() > 16 {
+        println!("  ... {} more", changed_paths.len() - 16);
+    }
+
     Ok(0)
 }
 
@@ -339,6 +521,126 @@ fn toml_value_to_json(value: &toml::Value) -> serde_json::Value {
             serde_json::Value::Object(map)
         }
     }
+}
+
+fn collect_toml_diff_paths(
+    before: Option<&toml::Value>,
+    after: Option<&toml::Value>,
+    prefix: &str,
+    out: &mut BTreeSet<String>,
+) {
+    match (before, after) {
+        (None, None) => {}
+        (Some(left), Some(right)) if left == right => {}
+        (Some(toml::Value::Table(left)), Some(toml::Value::Table(right))) => {
+            let keys = left
+                .keys()
+                .chain(right.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for key in keys {
+                let next_prefix = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect_toml_diff_paths(left.get(&key), right.get(&key), &next_prefix, out);
+            }
+        }
+        _ => {
+            if prefix.is_empty() {
+                out.insert("<root>".to_string());
+            } else {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+}
+
+fn diff_toml_paths(before: &toml::Value, after: &toml::Value) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    collect_toml_diff_paths(Some(before), Some(after), "", &mut out);
+    out.into_iter().collect()
+}
+
+fn summarize_top_level_changes(changed_paths: &[String]) -> Vec<(String, usize)> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for path in changed_paths {
+        let section = path
+            .split('.')
+            .next()
+            .map_or_else(|| path.clone(), std::string::ToString::to_string);
+        *counts.entry(section).or_default() += 1;
+    }
+    counts.into_iter().collect()
+}
+
+fn unreachable_mode_warnings(config: &BmuxConfig) -> Vec<String> {
+    let known_modes = config
+        .keybindings
+        .modes
+        .keys()
+        .map(|id| id.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mode_lookup = config
+        .keybindings
+        .modes
+        .iter()
+        .map(|(id, mode)| (id.to_ascii_lowercase(), mode))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    let initial = config.keybindings.initial_mode.to_ascii_lowercase();
+    queue.push_back(initial.clone());
+    visited.insert(initial);
+
+    while let Some(mode_id) = queue.pop_front() {
+        let Some(mode) = mode_lookup.get(&mode_id) else {
+            continue;
+        };
+        for action_name in mode.bindings.values() {
+            if let Ok(RuntimeAction::EnterMode(target_mode)) = parse_action(action_name) {
+                let canonical = target_mode.to_ascii_lowercase();
+                if known_modes.contains(&canonical) && !visited.contains(&canonical) {
+                    visited.insert(canonical.clone());
+                    queue.push_back(canonical);
+                }
+            }
+        }
+    }
+
+    known_modes
+        .iter()
+        .filter(|mode_id| !visited.contains(*mode_id))
+        .map(|mode_id| {
+            format!(
+                "mode '{mode_id}' is unreachable from initial_mode '{}'",
+                config.keybindings.initial_mode
+            )
+        })
+        .collect()
+}
+
+fn global_vs_mode_conflict_warnings(config: &BmuxConfig) -> Vec<String> {
+    let global = config
+        .keybindings
+        .global
+        .keys()
+        .map(|key| canonical_chord_key(key))
+        .collect::<BTreeSet<_>>();
+    let mut warnings = Vec::new();
+    for (mode_id, mode) in &config.keybindings.modes {
+        for key in mode.bindings.keys() {
+            let canonical = canonical_chord_key(key);
+            if global.contains(&canonical) {
+                warnings.push(format!(
+                    "global chord '{canonical}' overrides mode '{mode_id}' chord '{key}'"
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 fn parse_cli_value(raw: &str) -> toml_edit::Value {

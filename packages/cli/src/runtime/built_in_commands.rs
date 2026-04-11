@@ -74,6 +74,7 @@ pub enum BuiltInHandlerId {
     ConfigProfilesList,
     ConfigProfilesShow,
     ConfigProfilesResolve,
+    ConfigProfilesExplain,
     ConfigProfilesSwitch,
     ConfigProfilesDiff,
     ConfigProfilesLint,
@@ -85,6 +86,7 @@ pub enum BuiltInHandlerId {
     Doctor,
     Keymap,
     KeymapDoctor,
+    KeymapExplain,
     Terminal,
     TerminalDoctor,
     TerminalInstallTerminfo,
@@ -510,6 +512,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             "Show active profile resolution metadata",
         ),
         BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ConfigProfilesExplain,
+            &["config", "profiles", "explain"],
+            "Explain layer-by-layer composition changes",
+        ),
+        BuiltInExecutionCommand::new(
             BuiltInHandlerId::ConfigProfilesSwitch,
             &["config", "profiles", "switch"],
             "Set active composition profile",
@@ -563,6 +570,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::KeymapDoctor,
             &["keymap", "doctor"],
             "Inspect keymap configuration",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::KeymapExplain,
+            &["keymap", "explain"],
+            "Explain effective keybinding resolution",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Terminal,

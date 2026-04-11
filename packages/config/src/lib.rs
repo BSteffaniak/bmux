@@ -82,6 +82,18 @@ pub struct CompositionResolution {
     pub available_profiles: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompositionLayerChange {
+    pub layer: String,
+    pub changed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompositionExplain {
+    pub resolution: CompositionResolution,
+    pub applied_layers: Vec<CompositionLayerChange>,
+}
+
 fn built_in_composition_profiles() -> BTreeMap<String, CompositionProfile> {
     fn parse_builtin_patch(profile_id: &str, source: &str) -> toml::Table {
         match toml::from_str::<toml::Table>(source) {
@@ -186,6 +198,46 @@ fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
+fn collect_changed_paths(
+    before: Option<&toml::Value>,
+    after: Option<&toml::Value>,
+    prefix: &str,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    match (before, after) {
+        (None, None) => {}
+        (Some(left), Some(right)) if left == right => {}
+        (Some(toml::Value::Table(left)), Some(toml::Value::Table(right))) => {
+            let keys = left
+                .keys()
+                .chain(right.keys())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            for key in keys {
+                let next_prefix = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect_changed_paths(left.get(&key), right.get(&key), &next_prefix, out);
+            }
+        }
+        _ => {
+            if prefix.is_empty() {
+                out.insert("<root>".to_string());
+            } else {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+}
+
+fn changed_paths(before: &toml::Value, after: &toml::Value) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    collect_changed_paths(Some(before), Some(after), "", &mut out);
+    out.into_iter().collect()
+}
+
 fn parse_composition_config(
     root: &toml::Table,
 ) -> std::result::Result<CompositionConfig, ConfigError> {
@@ -263,6 +315,23 @@ fn resolve_profile_patch(
 fn resolve_composed_config_value(
     raw: &toml::Value,
 ) -> std::result::Result<(toml::Value, CompositionResolution), ConfigError> {
+    let (resolved, resolution, _applied_layers) = resolve_composed_config_value_with_explain(raw)?;
+    Ok((resolved, resolution))
+}
+
+#[allow(clippy::too_many_lines)]
+// Composition resolution intentionally keeps validation and merge flow in one place
+// so precedence behavior is easy to audit end-to-end.
+fn resolve_composed_config_value_with_explain(
+    raw: &toml::Value,
+) -> std::result::Result<
+    (
+        toml::Value,
+        CompositionResolution,
+        Vec<CompositionLayerChange>,
+    ),
+    ConfigError,
+> {
     let mut raw_table = raw
         .as_table()
         .cloned()
@@ -328,8 +397,10 @@ fn resolve_composed_config_value(
             .cloned()
             .unwrap_or_else(toml::Table::new),
     );
+    let mut applied_layers = Vec::new();
 
     for layer in &layer_order {
+        let before = resolved.clone();
         match layer.as_str() {
             "defaults" => {}
             "config" => {
@@ -358,6 +429,11 @@ fn resolve_composed_config_value(
                 });
             }
         }
+
+        applied_layers.push(CompositionLayerChange {
+            layer: layer.clone(),
+            changed_paths: changed_paths(&before, &resolved),
+        });
     }
 
     let mut available_profiles = profiles.keys().cloned().collect::<Vec<_>>();
@@ -376,7 +452,7 @@ fn resolve_composed_config_value(
         available_profiles,
     };
 
-    Ok((resolved, resolution))
+    Ok((resolved, resolution, applied_layers))
 }
 
 /// Root configuration structure for bmux, deserialized from `bmux.toml`
@@ -1897,6 +1973,16 @@ impl BmuxConfig {
         Self::load_from_path_with_resolution(&paths.config_file(), Some(profile_id))
     }
 
+    /// Load configuration and include layer-by-layer composition explain data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_with_explain(profile_id: Option<&str>) -> Result<(Self, CompositionExplain)> {
+        let paths = ConfigPaths::default();
+        Self::load_from_path_with_explain(&paths.config_file(), profile_id)
+    }
+
     /// Load the configured global theme.
     ///
     /// Returns the built-in default theme when `appearance.theme` is empty or
@@ -2013,6 +2099,87 @@ impl BmuxConfig {
 
         config.validate()?;
         Ok((config, resolution))
+    }
+
+    /// Load configuration from a specific path with layer-by-layer explain data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_from_path_with_explain(
+        path: &std::path::Path,
+        forced_profile: Option<&str>,
+    ) -> Result<(Self, CompositionExplain)> {
+        if !path.exists() {
+            let resolution = CompositionResolution {
+                selected_profile: None,
+                selected_profile_source: None,
+                matched_auto_select_index: None,
+                layer_order: vec!["defaults".to_string(), "config".to_string()],
+                available_profiles: built_in_composition_profiles().keys().cloned().collect(),
+            };
+            return Ok((
+                Self::default(),
+                CompositionExplain {
+                    resolution,
+                    applied_layers: Vec::new(),
+                },
+            ));
+        }
+
+        let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadError {
+            error: e.to_string(),
+        })?;
+
+        let mut raw_value: toml::Value =
+            toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
+                error: e.to_string(),
+            })?;
+        if let Some(profile_id) = forced_profile
+            && let Some(root) = raw_value.as_table_mut()
+        {
+            let composition_value = root
+                .entry("composition".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            let composition_table =
+                composition_value
+                    .as_table_mut()
+                    .ok_or_else(|| ConfigError::ParseError {
+                        error: "[composition] must be a table".to_string(),
+                    })?;
+            composition_table.insert(
+                "active_profile".to_string(),
+                toml::Value::String(profile_id.to_string()),
+            );
+        }
+        let (resolved_value, resolution, applied_layers) =
+            resolve_composed_config_value_with_explain(&raw_value)?;
+        let mut config: Self = resolved_value
+            .try_into()
+            .map_err(|e| ConfigError::ParseError {
+                error: format!("failed to deserialize resolved config: {e}"),
+            })?;
+
+        let interpolation_warnings = config.interpolate_path_fields();
+        for warning in interpolation_warnings {
+            eprintln!("bmux warning: {warning}");
+        }
+
+        let repaired_fields = config.sanitize_invalid_values();
+        if !repaired_fields.is_empty() {
+            for warning in &repaired_fields {
+                eprintln!("bmux warning: repaired invalid config value {warning}");
+            }
+        }
+
+        config.validate()?;
+        Ok((
+            config,
+            CompositionExplain {
+                resolution,
+                applied_layers,
+            },
+        ))
     }
 
     /// Save configuration to default location
@@ -2742,6 +2909,51 @@ server_timeout = 222
         assert_eq!(
             resolution.selected_profile_source,
             Some("composition.active_profile".to_string())
+        );
+    }
+
+    #[test]
+    fn composition_explain_reports_changed_paths_per_layer() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+active_profile = "tmux_compat"
+
+[general]
+server_timeout = 1234
+"#,
+        )
+        .expect("write temp config");
+
+        let (_config, explain) =
+            BmuxConfig::load_from_path_with_explain(&path, None).expect("failed loading config");
+        assert_eq!(
+            explain.resolution.selected_profile.as_deref(),
+            Some("tmux_compat")
+        );
+        let profile_layer = explain
+            .applied_layers
+            .iter()
+            .find(|layer| layer.layer == "profile:active")
+            .expect("profile layer should exist");
+        assert!(
+            profile_layer
+                .changed_paths
+                .iter()
+                .any(|path| path == "keybindings.prefix")
+        );
+        let config_layer = explain
+            .applied_layers
+            .iter()
+            .find(|layer| layer.layer == "config")
+            .expect("config layer should exist");
+        assert!(
+            config_layer
+                .changed_paths
+                .iter()
+                .any(|path| path == "general.server_timeout")
         );
     }
 

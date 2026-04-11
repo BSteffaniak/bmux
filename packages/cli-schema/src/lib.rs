@@ -1467,6 +1467,17 @@ pub enum KeymapCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Explain effective action for a key chord
+    Explain {
+        /// Key chord to resolve (e.g. "ctrl+b n", "alt+h", "escape")
+        key: String,
+        /// Resolve inside a specific modal mode id
+        #[arg(long)]
+        mode: Option<String>,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1616,10 +1627,24 @@ pub enum ConfigProfilesCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Explain layer-by-layer composition changes
+    Explain {
+        /// Optional forced profile id
+        profile: Option<String>,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Set active profile in config file
     Switch {
         /// Profile id to activate
         profile: String,
+        /// Preview changes without writing config
+        #[arg(long)]
+        dry_run: bool,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Diff two resolved profile configurations
     Diff {
