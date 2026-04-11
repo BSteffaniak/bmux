@@ -50,7 +50,7 @@ jobs:
         run: npm install --global markdownlint-cli
 
       - name: Lint Markdown
-        run: markdownlint "**/*.md"
+        run: markdownlint "**/*.md" --ignore "**/target/**" --ignore "**/dist/**"
 
       - name: Validate docs snippets
         run: cargo test -p bmux_docs_site_ui markdown_opt_in_snippets_are_valid
