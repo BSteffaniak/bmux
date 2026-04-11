@@ -19,7 +19,7 @@ Use this skill when you need to:
 
 Do not use this skill for static code review with no runtime behavior.
 
----
+______________________________________________________________________
 
 ## Core principles
 
@@ -29,7 +29,7 @@ Do not use this skill for static code review with no runtime behavior.
 - Hydrate evidence windows only after a signal (`watchpoint_hit`).
 - Keep analysis tied to `seq`/`mono_ns` timeline.
 
----
+______________________________________________________________________
 
 ## Event model quick reference
 
@@ -49,22 +49,22 @@ Hydration modes:
 - `event_window`
 - `incident`
 
----
+______________________________________________________________________
 
 ## Fast-start workflow
 
-1. Start interactive playbook session.
-2. Connect to socket and send `hello`.
-3. Create/attach session via `command` DSL.
-4. Subscribe with low-token defaults.
-5. Configure watchpoints for expected anomaly channels.
-6. Execute repro command(s).
-7. On `watchpoint_hit`, hydrate `incident`.
-8. If needed, hydrate `event_window` with tighter range.
-9. Summarize root cause hypothesis with evidence seqs.
+01. Start interactive playbook session.
+02. Connect to socket and send `hello`.
+03. Create/attach session via `command` DSL.
+04. Subscribe with low-token defaults.
+05. Configure watchpoints for expected anomaly channels.
+06. Execute repro command(s).
+07. On `watchpoint_hit`, hydrate `incident`.
+08. If needed, hydrate `event_window` with tighter range.
+09. Summarize root cause hypothesis with evidence seqs.
 10. Propose and run minimal confirmatory command(s).
 
----
+______________________________________________________________________
 
 ## Canonical JSON ops
 
@@ -209,7 +209,7 @@ Hydration modes:
 {"op":"quit","request_id":"r-quit"}
 ```
 
----
+______________________________________________________________________
 
 ## Investigation playbook
 
@@ -246,7 +246,7 @@ Hydration modes:
 - Re-check with targeted watchpoint or narrow event window.
 - Avoid broad replays unless new evidence contradicts hypothesis.
 
----
+______________________________________________________________________
 
 ## nvim cursor-jump recipe
 
@@ -265,7 +265,7 @@ Hydration modes:
    - did server event indicate attach/view churn?
 8. issue one confirmatory command and compare windows.
 
----
+______________________________________________________________________
 
 ## Token-efficiency defaults
 
@@ -284,7 +284,7 @@ Escalate only when needed:
 - Add `server_event` for runtime/system-level context.
 - Increase budgets temporarily, then reduce again.
 
----
+______________________________________________________________________
 
 ## Guardrails
 
@@ -294,7 +294,7 @@ Escalate only when needed:
 - Do not emit conclusions without citing concrete `seq` evidence bands.
 - Keep one active hypothesis per loop to prevent token sprawl.
 
----
+______________________________________________________________________
 
 ## Output contract (what to report)
 
@@ -311,7 +311,7 @@ Example evidence line:
 
 - `seq 1842-1868`: `request_lifecycle:start(nvim)` followed by `cursor_delta` burst and `screen_delta` burst, no server error events.
 
----
+______________________________________________________________________
 
 ## Failure handling
 
@@ -324,7 +324,7 @@ If no useful signal appears:
 - Re-run repro once.
 - If still empty, report "insufficient runtime signal" and list exactly what telemetry is missing.
 
----
+______________________________________________________________________
 
 ## Minimal command sequence template
 

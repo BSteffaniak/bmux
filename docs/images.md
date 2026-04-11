@@ -53,11 +53,13 @@ timg -pi /path/to/image.png
 You can test each protocol with raw escape sequences. This sends a tiny 1x1 red pixel:
 
 **Kitty:**
+
 ```bash
 printf '\e_Gf=32,s=1,v=1,a=T;/w8AAP8=\e\\'
 ```
 
 **Sixel (small red block):**
+
 ```bash
 printf '\ePq"1;1;1;1#0;2;100;0;0#0!6~-!6~-!6~-!6~-!6~-!6~\e\\'
 ```
@@ -108,6 +110,7 @@ bmux recording stop \
 If auto-export cannot run (for example no display track data is present), bmux still completes the recording command and prints a warning.
 
 Supported decode formats in GIF export:
+
 - **Sixel**: Full native decode to RGBA pixels
 - **Kitty**: Raw RGB/RGBA pixels and PNG-compressed payloads
 - **iTerm2**: PNG, JPEG, GIF, and BMP via the `image` crate

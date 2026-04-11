@@ -28,4 +28,4 @@ use bmux_terminal_models::{PaneSize, Window, SplitDirection};
 
 let size = PaneSize::new(80, 24);
 let window = Window::new(size, Some("my-window".to_string()));
-``` 
+```

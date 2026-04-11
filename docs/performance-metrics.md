@@ -39,7 +39,6 @@ These commands change runtime settings immediately (including already attached
 clients), but they do not modify `bmux.toml`. On server restart, settings reset
 to config defaults.
 
-
 ## Capture workflow
 
 1. Start a recording (`bmux recording start ...`).
@@ -69,33 +68,42 @@ Rate-limited streams may also include:
 ## Event catalog
 
 - `iroh.connect.summary`
+
   - basic: connect and total timings
   - detailed: staged iroh timings (bind/online/open_bi/ipc/etc)
   - trace: endpoint id + configured timeout
 
 - `attach.first_frame`
+
   - startup latency from attach start to first rendered frame
 
 - `attach.interactive.ready`
+
   - startup latency from attach start to first hydrated interactive frame
 
 - `attach.window`
+
   - periodic attach-loop aggregates (drain IPC + render)
   - trace includes additional drain behavior (`drain_budget_hits`, etc)
 
 - `attach.frame.trace`
+
   - per-frame render timing (trace level)
 
 - `attach.exit`
+
   - attach lifetime and final exit reason
 
 - `iroh.reconnect.outage`
+
   - outage duration for reconnect attempts
 
 - `iroh.attach.attempt`
+
   - attach attempt duration and stream-closed outcome (on reconnect paths)
 
 - `server.push.window`
+
   - periodic server event-push health (events/bytes/lag)
 
 ## Level guidance

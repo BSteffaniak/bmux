@@ -18,12 +18,12 @@ the server. Use `--target-server` to run against a live server instead.
 
 **Two input formats** parse into the same internal representation:
 
-| Format            | Extension        | Typical use                             |
+| Format | Extension | Typical use |
 | ----------------- | ---------------- | --------------------------------------- |
-| Line-oriented DSL | `.dsl` or stdin  | Quick authoring, LLM generation, piping |
-| TOML              | `.playbook.toml` | Structured config, version control      |
+| Line-oriented DSL | `.dsl` or stdin | Quick authoring, LLM generation, piping |
+| TOML | `.playbook.toml` | Structured config, version control |
 
----
+______________________________________________________________________
 
 ## CLI Commands
 
@@ -35,19 +35,19 @@ Run a playbook and report results.
 bmux playbook run <source> [flags]
 ```
 
-| Argument/Flag            | Type   | Default  | Description                                      |
+| Argument/Flag | Type | Default | Description |
 | ------------------------ | ------ | -------- | ------------------------------------------------ |
-| `<source>`               | string | required | Path to playbook file, or `-` for stdin          |
-| `--json`                 | bool   | false    | Output results as JSON to stdout                 |
-| `--interactive`          | bool   | false    | Pause before each step for interactive control   |
-| `--target-server`        | bool   | false    | Run against the live server instead of a sandbox |
-| `--record`               | bool   | false    | Record the execution (overrides playbook config) |
-| `--export-gif <path>`    | string | none     | Export recording as GIF (implies `--record`)     |
-| `--viewport <COLSxROWS>` | string | none     | Override viewport dimensions (e.g. `120x40`)     |
-| `--timeout <secs>`       | u64    | none     | Override max playbook timeout in seconds         |
-| `--shell <path>`         | string | none     | Override shell binary                            |
-| `--var KEY=VALUE`        | string | none     | Define a variable (repeatable, overrides `@var`) |
-| `--verbose` / `-v`       | bool   | false    | Print step-by-step progress to stderr            |
+| `<source>` | string | required | Path to playbook file, or `-` for stdin |
+| `--json` | bool | false | Output results as JSON to stdout |
+| `--interactive` | bool | false | Pause before each step for interactive control |
+| `--target-server` | bool | false | Run against the live server instead of a sandbox |
+| `--record` | bool | false | Record the execution (overrides playbook config) |
+| `--export-gif <path>` | string | none | Export recording as GIF (implies `--record`) |
+| `--viewport <COLSxROWS>` | string | none | Override viewport dimensions (e.g. `120x40`) |
+| `--timeout <secs>` | u64 | none | Override max playbook timeout in seconds |
+| `--shell <path>` | string | none | Override shell binary |
+| `--var KEY=VALUE` | string | none | Define a variable (repeatable, overrides `@var`) |
+| `--verbose` / `-v` | bool | false | Print step-by-step progress to stderr |
 
 Note: global recording auto-export settings (`recording.auto_export` or `--recording-auto-export`) do not auto-export playbook recordings. Use `--export-gif <path>` for playbook runs.
 
@@ -95,10 +95,10 @@ Parse, validate, and print the execution plan without running.
 bmux playbook dry-run <source> [--json]
 ```
 
-| Argument/Flag | Type   | Default  | Description                             |
+| Argument/Flag | Type | Default | Description |
 | ------------- | ------ | -------- | --------------------------------------- |
-| `<source>`    | string | required | Path to playbook file, or `-` for stdin |
-| `--json`      | bool   | false    | Output as structured JSON               |
+| `<source>` | string | required | Path to playbook file, or `-` for stdin |
+| `--json` | bool | false | Output as structured JSON |
 
 **Exit codes:** `0` = playbook is valid, `1` = validation errors found.
 
@@ -156,6 +156,7 @@ bmux playbook diff <left.json> <right.json> [flags]
 - `timing_regressions` -- steps that exceeded the timing threshold
 
 **Usage pattern for before/after verification:**
+
 ```sh
 # Run before fix
 bmux playbook run --json test.dsl > before.json
@@ -190,13 +191,13 @@ Start an interactive playbook session with a socket for agent control.
 bmux playbook interactive [flags]
 ```
 
-| Flag                     | Type   | Default        | Description          |
+| Flag | Type | Default | Description |
 | ------------------------ | ------ | -------------- | -------------------- |
-| `--socket <path>`        | string | auto           | Socket path override |
-| `--record`               | bool   | false          | Record the session   |
-| `--viewport <COLSxROWS>` | string | `80x24`        | Viewport dimensions  |
-| `--shell <path>`         | string | system default | Shell binary         |
-| `--timeout <secs>`       | u64    | no limit       | Max session lifetime |
+| `--socket <path>` | string | auto | Socket path override |
+| `--record` | bool | false | Record the session |
+| `--viewport <COLSxROWS>` | string | `80x24` | Viewport dimensions |
+| `--shell <path>` | string | system default | Shell binary |
+| `--timeout <secs>` | u64 | no limit | Max session lifetime |
 
 See [Interactive Mode Protocol](#interactive-mode-protocol) for the wire format.
 
@@ -212,18 +213,18 @@ If `--output` is omitted, writes to stdout. The generated playbook includes
 `wait-for` barriers and `assert-screen` checks derived from the recorded output.
 See [Recording to Playbook Conversion](#recording-to-playbook-conversion).
 
----
+______________________________________________________________________
 
 ## DSL Format
 
 Each line is one of:
 
-| Line type          | Prefix      | Example                      |
+| Line type | Prefix | Example |
 | ------------------ | ----------- | ---------------------------- |
-| Blank / whitespace | (empty)     | Ignored                      |
-| Comment            | `#`         | `# this is a comment`        |
-| Config directive   | `@`         | `@viewport cols=80 rows=24`  |
-| Action             | action name | `send-keys keys='echo hi\r'` |
+| Blank / whitespace | (empty) | Ignored |
+| Comment | `#` | `# this is a comment` |
+| Config directive | `@` | `@viewport cols=80 rows=24` |
+| Action | action name | `send-keys keys='echo hi\r'` |
 
 ### Argument Format
 
@@ -235,29 +236,29 @@ action-name key1=value1 key2='value with spaces' key3="also quoted"
 
 **Quoting rules:**
 
-| Form          | Example             | Notes                         |
+| Form | Example | Notes |
 | ------------- | ------------------- | ----------------------------- |
-| Bare          | `key=value`         | Terminated by next whitespace |
-| Single-quoted | `key='hello world'` | Supports C-style escapes      |
-| Double-quoted | `key="hello world"` | Supports C-style escapes      |
+| Bare | `key=value` | Terminated by next whitespace |
+| Single-quoted | `key='hello world'` | Supports C-style escapes |
+| Double-quoted | `key="hello world"` | Supports C-style escapes |
 
 **C-style escape sequences** (inside quoted values and `send-keys keys=`):
 
-| Escape | Byte   | Name                 |
+| Escape | Byte | Name |
 | ------ | ------ | -------------------- |
-| `\r`   | `0x0D` | Carriage return      |
-| `\n`   | `0x0A` | Line feed            |
-| `\t`   | `0x09` | Tab                  |
-| `\0`   | `0x00` | Null                 |
-| `\a`   | `0x07` | Bell                 |
-| `\b`   | `0x08` | Backspace            |
-| `\e`   | `0x1B` | Escape (ESC)         |
-| `\\`   | `0x5C` | Literal backslash    |
-| `\'`   | `0x27` | Literal single quote |
-| `\"`   | `0x22` | Literal double quote |
-| `\xNN` | `0xNN` | Arbitrary hex byte   |
+| `\r` | `0x0D` | Carriage return |
+| `\n` | `0x0A` | Line feed |
+| `\t` | `0x09` | Tab |
+| `\0` | `0x00` | Null |
+| `\a` | `0x07` | Bell |
+| `\b` | `0x08` | Backspace |
+| `\e` | `0x1B` | Escape (ESC) |
+| `\\` | `0x5C` | Literal backslash |
+| `\'` | `0x27` | Literal single quote |
+| `\"` | `0x22` | Literal double quote |
+| `\xNN` | `0xNN` | Arbitrary hex byte |
 
----
+______________________________________________________________________
 
 ## Config Directives
 
@@ -265,31 +266,31 @@ Directives set playbook-wide configuration. They must appear before any action
 lines (or be interspersed; order relative to actions does not matter since
 directives are processed in a first pass).
 
-| Directive      | Syntax                                          | Default        | Description                                             |
+| Directive | Syntax | Default | Description |
 | -------------- | ----------------------------------------------- | -------------- | ------------------------------------------------------- |
-| `@viewport`    | `@viewport cols=<u16> rows=<u16>`               | `80x24`        | Terminal viewport dimensions                            |
-| `@shell`       | `@shell <path>`                                 | system default | Shell binary for the sandbox                            |
-| `@timeout`     | `@timeout <ms>`                                 | `30000`        | Max playbook execution time in milliseconds             |
-| `@record`      | `@record true\|false`                           | `false`        | Enable recording of the execution                       |
-| `@name`        | `@name <string>`                                | none           | Playbook name (included in JSON output)                 |
-| `@description` | `@description <string>`                         | none           | Playbook description                                    |
-| `@plugin`      | `@plugin enable=<id>` or `@plugin disable=<id>` | all enabled    | Enable/disable specific plugins                         |
-| `@var`         | `@var NAME=VALUE`                               | none           | Define a static variable for `${NAME}` substitution     |
-| `@env`         | `@env NAME=VALUE`                               | none           | Set an environment variable in the sandbox process      |
-| `@env-mode`    | `@env-mode inherit\|clean`                      | `inherit`      | Sandbox environment isolation mode                      |
-| `@include`     | `@include <path>`                               | none           | Include another playbook file (recursive, max depth 10) |
+| `@viewport` | `@viewport cols=<u16> rows=<u16>` | `80x24` | Terminal viewport dimensions |
+| `@shell` | `@shell <path>` | system default | Shell binary for the sandbox |
+| `@timeout` | `@timeout <ms>` | `30000` | Max playbook execution time in milliseconds |
+| `@record` | `@record true\|false` | `false` | Enable recording of the execution |
+| `@name` | `@name <string>` | none | Playbook name (included in JSON output) |
+| `@description` | `@description <string>` | none | Playbook description |
+| `@plugin` | `@plugin enable=<id>` or `@plugin disable=<id>` | all enabled | Enable/disable specific plugins |
+| `@var` | `@var NAME=VALUE` | none | Define a static variable for `${NAME}` substitution |
+| `@env` | `@env NAME=VALUE` | none | Set an environment variable in the sandbox process |
+| `@env-mode` | `@env-mode inherit\|clean` | `inherit` | Sandbox environment isolation mode |
+| `@include` | `@include <path>` | none | Include another playbook file (recursive, max depth 10) |
 
 ### Environment Modes
 
-| Mode      | Behavior                                                                                                                                                                                                                      |
+| Mode | Behavior |
 | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `inherit` | Sandbox inherits the full parent environment, then overlays deterministic defaults for `TERM` (`xterm-256color`), `LANG` (`C.UTF-8`), `LC_ALL` (`C.UTF-8`), and `HOME` (sandbox temp dir). `@env` entries are applied on top. |
-| `clean`   | Sandbox starts with an empty environment. Only `PATH`, `USER`, and `SHELL` are inherited from the parent. All other variables use deterministic defaults or explicit `@env` entries.                                          |
+| `clean` | Sandbox starts with an empty environment. Only `PATH`, `USER`, and `SHELL` are inherited from the parent. All other variables use deterministic defaults or explicit `@env` entries. |
 
 **Resolution chain:** `@env-mode` in playbook (if set) > `BMUX_PLAYBOOK_ENV_MODE`
 environment variable (if set) > `inherit`.
 
----
+______________________________________________________________________
 
 ## Actions Reference
 
@@ -303,9 +304,9 @@ Create a new session. Must be the first action in a sandbox playbook.
 new-session [name=<string>]
 ```
 
-| Arg    | Type   | Required | Default | Description  |
+| Arg | Type | Required | Default | Description |
 | ------ | ------ | -------- | ------- | ------------ |
-| `name` | string | no       | auto    | Session name |
+| `name` | string | no | auto | Session name |
 
 Sets `${SESSION_ID}`, `${SESSION_NAME}`, `${PANE_COUNT}` (=1), `${FOCUSED_PANE}` (=1).
 
@@ -317,9 +318,9 @@ Kill a session by name.
 kill-session name=<string>
 ```
 
-| Arg    | Type   | Required | Default | Description  |
+| Arg | Type | Required | Default | Description |
 | ------ | ------ | -------- | ------- | ------------ |
-| `name` | string | yes      | -       | Session name |
+| `name` | string | yes | - | Session name |
 
 ### Pane Management
 
@@ -331,10 +332,10 @@ Split the current pane.
 split-pane [direction=vertical|horizontal|v|h] [ratio=<f64>]
 ```
 
-| Arg         | Type   | Required | Default               | Description                                         |
+| Arg | Type | Required | Default | Description |
 | ----------- | ------ | -------- | --------------------- | --------------------------------------------------- |
-| `direction` | string | no       | `vertical`            | Split direction. `v`/`vertical` or `h`/`horizontal` |
-| `ratio`     | f64    | no       | none (server default) | Split ratio (0.0-1.0)                               |
+| `direction` | string | no | `vertical` | Split direction. `v`/`vertical` or `h`/`horizontal` |
+| `ratio` | f64 | no | none (server default) | Split ratio (0.0-1.0) |
 
 Increments `${PANE_COUNT}`.
 
@@ -346,9 +347,9 @@ Change the focused pane.
 focus-pane target=<u32>
 ```
 
-| Arg      | Type | Required | Default | Description                   |
+| Arg | Type | Required | Default | Description |
 | -------- | ---- | -------- | ------- | ----------------------------- |
-| `target` | u32  | yes      | -       | Pane index to focus (1-based) |
+| `target` | u32 | yes | - | Pane index to focus (1-based) |
 
 Updates `${FOCUSED_PANE}`.
 
@@ -360,9 +361,9 @@ Close a pane.
 close-pane [target=<u32>]
 ```
 
-| Arg      | Type | Required | Default      | Description                   |
+| Arg | Type | Required | Default | Description |
 | -------- | ---- | -------- | ------------ | ----------------------------- |
-| `target` | u32  | no       | focused pane | Pane index to close (1-based) |
+| `target` | u32 | no | focused pane | Pane index to close (1-based) |
 
 Decrements `${PANE_COUNT}`.
 
@@ -376,10 +377,10 @@ Send input bytes to a pane. This is the primary way to type commands.
 send-keys keys=<escaped-string> [pane=<u32>]
 ```
 
-| Arg    | Type   | Required | Default      | Description                                                                 |
+| Arg | Type | Required | Default | Description |
 | ------ | ------ | -------- | ------------ | --------------------------------------------------------------------------- |
-| `keys` | string | yes      | -            | Input bytes with C-style escapes. Use `\r` for Enter.                       |
-| `pane` | u32    | no       | focused pane | Target pane index (1-based). Uses `PaneDirectInput` for race-free delivery. |
+| `keys` | string | yes | - | Input bytes with C-style escapes. Use `\r` for Enter. |
+| `pane` | u32 | no | focused pane | Target pane index (1-based). Uses `PaneDirectInput` for race-free delivery. |
 
 **Examples:**
 
@@ -398,9 +399,9 @@ Send raw bytes specified as a hex string.
 send-bytes hex=<hex-string>
 ```
 
-| Arg   | Type   | Required | Default | Description                                       |
+| Arg | Type | Required | Default | Description |
 | ----- | ------ | -------- | ------- | ------------------------------------------------- |
-| `hex` | string | yes      | -       | Hex-encoded bytes (e.g. `1b5b41` for ESC `[` `A`) |
+| `hex` | string | yes | - | Hex-encoded bytes (e.g. `1b5b41` for ESC `[` `A`) |
 
 #### `send-attach`
 
@@ -412,9 +413,9 @@ keybinding-driven pane focus, and runtime/plugin commands.
 send-attach key=<chord>
 ```
 
-| Arg   | Type   | Required | Default | Description                                  |
+| Arg | Type | Required | Default | Description |
 | ----- | ------ | -------- | ------- | -------------------------------------------- |
-| `key` | string | yes      | -       | Key chord string (e.g. `ctrl+a [`, `k`, `esc`) |
+| `key` | string | yes | - | Key chord string (e.g. `ctrl+a [`, `k`, `esc`) |
 
 #### `prefix-key`
 
@@ -424,9 +425,9 @@ Compatibility alias that sends `Ctrl-A` plus one key via `send-attach`.
 prefix-key key=<char>
 ```
 
-| Arg   | Type | Required | Default | Description                               |
+| Arg | Type | Required | Default | Description |
 | ----- | ---- | -------- | ------- | ----------------------------------------- |
-| `key` | char | yes      | -       | Single character to send after the prefix |
+| `key` | char | yes | - | Single character to send after the prefix |
 
 Do not mix attach UI-mode entry with `send-keys` for follow-up navigation keys.
 `send-keys` writes bytes to the pane shell; `send-attach` runs attach key handling.
@@ -454,12 +455,12 @@ proceeding.
 wait-for pattern=<regex> [pane=<u32>] [timeout=<ms>] [retry=<u32>]
 ```
 
-| Arg       | Type  | Required | Default      | Description                                |
+| Arg | Type | Required | Default | Description |
 | --------- | ----- | -------- | ------------ | ------------------------------------------ |
-| `pattern` | regex | yes      | -            | Regex pattern to match against screen text |
-| `pane`    | u32   | no       | focused pane | Pane index (1-based)                       |
-| `timeout` | u64   | no       | `5000`       | Max wait time in milliseconds              |
-| `retry`   | u32   | no       | `1`          | Number of attempts (1 = no retry)          |
+| `pattern` | regex | yes | - | Regex pattern to match against screen text |
+| `pane` | u32 | no | focused pane | Pane index (1-based) |
+| `timeout` | u64 | no | `5000` | Max wait time in milliseconds |
+| `retry` | u32 | no | `1` | Number of attempts (1 = no retry) |
 
 **Polling behavior:** Exponential backoff starting at 10ms, doubling up to
 200ms max (10, 20, 40, 80, 160, 200, 200...). Each poll drains output and
@@ -482,9 +483,9 @@ Pause execution for a fixed duration. Prefer `wait-for` when possible.
 sleep ms=<u64>
 ```
 
-| Arg  | Type | Required | Default | Description              |
+| Arg | Type | Required | Default | Description |
 | ---- | ---- | -------- | ------- | ------------------------ |
-| `ms` | u64  | yes      | -       | Duration in milliseconds |
+| `ms` | u64 | yes | - | Duration in milliseconds |
 
 #### `wait-for-event`
 
@@ -494,21 +495,21 @@ Wait for a server-side event.
 wait-for-event event=<name> [timeout=<ms>]
 ```
 
-| Arg       | Type   | Required | Default | Description                   |
+| Arg | Type | Required | Default | Description |
 | --------- | ------ | -------- | ------- | ----------------------------- |
-| `event`   | string | yes      | -       | Event name (exact match)      |
-| `timeout` | u64    | no       | `5000`  | Max wait time in milliseconds |
+| `event` | string | yes | - | Event name (exact match) |
+| `timeout` | u64 | no | `5000` | Max wait time in milliseconds |
 
 **Supported event names:**
 
-| Event name            | Triggered when                   |
+| Event name | Triggered when |
 | --------------------- | -------------------------------- |
-| `server_started`      | Server finishes startup          |
-| `server_stopping`     | Server begins shutdown           |
-| `session_created`     | A new session is created         |
-| `session_removed`     | A session is destroyed           |
-| `client_attached`     | A client attaches to a session   |
-| `client_detached`     | A client detaches                |
+| `server_started` | Server finishes startup |
+| `server_stopping` | Server begins shutdown |
+| `session_created` | A new session is created |
+| `session_removed` | A session is destroyed |
+| `client_attached` | A client attaches to a session |
+| `client_detached` | A client detaches |
 | `attach_view_changed` | The attached view layout changes |
 
 ### Assertions
@@ -522,12 +523,12 @@ Assert conditions on the visible screen text. At least one of `contains`,
 assert-screen [pane=<u32>] [contains=<string>] [not_contains=<string>] [matches=<regex>]
 ```
 
-| Arg            | Type   | Required | Default      | Description                        |
+| Arg | Type | Required | Default | Description |
 | -------------- | ------ | -------- | ------------ | ---------------------------------- |
-| `pane`         | u32    | no       | focused pane | Pane index (1-based)               |
-| `contains`     | string | no       | -            | Substring that must be present     |
-| `not_contains` | string | no       | -            | Substring that must NOT be present |
-| `matches`      | regex  | no       | -            | Regex pattern that must match      |
+| `pane` | u32 | no | focused pane | Pane index (1-based) |
+| `contains` | string | no | - | Substring that must be present |
+| `not_contains` | string | no | - | Substring that must NOT be present |
+| `matches` | regex | no | - | Regex pattern that must match |
 
 Checks are evaluated in order: `contains` first, then `not_contains`, then
 `matches`. All specified checks must pass.
@@ -552,9 +553,9 @@ Assert the number of panes.
 assert-layout pane_count=<u32>
 ```
 
-| Arg          | Type | Required | Default | Description              |
+| Arg | Type | Required | Default | Description |
 | ------------ | ---- | -------- | ------- | ------------------------ |
-| `pane_count` | u32  | yes      | -       | Expected number of panes |
+| `pane_count` | u32 | yes | - | Expected number of panes |
 
 #### `assert-cursor`
 
@@ -564,11 +565,11 @@ Assert the cursor position in a pane.
 assert-cursor [pane=<u32>] row=<u16> col=<u16>
 ```
 
-| Arg    | Type | Required | Default      | Description                      |
+| Arg | Type | Required | Default | Description |
 | ------ | ---- | -------- | ------------ | -------------------------------- |
-| `pane` | u32  | no       | focused pane | Pane index (1-based)             |
-| `row`  | u16  | yes      | -            | Expected cursor row (0-based)    |
-| `col`  | u16  | yes      | -            | Expected cursor column (0-based) |
+| `pane` | u32 | no | focused pane | Pane index (1-based) |
+| `row` | u16 | yes | - | Expected cursor row (0-based) |
+| `col` | u16 | yes | - | Expected cursor column (0-based) |
 
 ### Inspection
 
@@ -581,9 +582,9 @@ Capture the current screen state of all panes. Snapshots are included in the
 snapshot id=<string>
 ```
 
-| Arg  | Type   | Required | Default | Description                                              |
+| Arg | Type | Required | Default | Description |
 | ---- | ------ | -------- | ------- | -------------------------------------------------------- |
-| `id` | string | yes      | -       | Label for this snapshot (used to identify it in results) |
+| `id` | string | yes | - | Label for this snapshot (used to identify it in results) |
 
 Each snapshot captures every pane's visible text, cursor position, focus state,
 and index.
@@ -621,10 +622,10 @@ Change the terminal viewport dimensions.
 resize-viewport cols=<u16> rows=<u16>
 ```
 
-| Arg    | Type | Required | Default | Description      |
+| Arg | Type | Required | Default | Description |
 | ------ | ---- | -------- | ------- | ---------------- |
-| `cols` | u16  | yes      | -       | New column count |
-| `rows` | u16  | yes      | -       | New row count    |
+| `cols` | u16 | yes | - | New column count |
+| `rows` | u16 | yes | - | New row count |
 
 ### Services
 
@@ -636,15 +637,15 @@ Invoke a plugin service.
 invoke-service capability=<cap> interface=<id> operation=<op> [kind=query|command] [payload=<json>]
 ```
 
-| Arg          | Type   | Required | Default   | Description                    |
+| Arg | Type | Required | Default | Description |
 | ------------ | ------ | -------- | --------- | ------------------------------ |
-| `capability` | string | yes      | -         | Plugin capability name         |
-| `interface`  | string | yes      | -         | Service interface ID           |
-| `operation`  | string | yes      | -         | Operation name                 |
-| `kind`       | string | no       | `command` | `query`/`q` or `command`/`cmd` |
-| `payload`    | string | no       | `""`      | JSON payload string            |
+| `capability` | string | yes | - | Plugin capability name |
+| `interface` | string | yes | - | Service interface ID |
+| `operation` | string | yes | - | Operation name |
+| `kind` | string | no | `command` | `query`/`q` or `command`/`cmd` |
+| `payload` | string | no | `""` | JSON payload string |
 
----
+______________________________________________________________________
 
 ## Step Modifiers
 
@@ -698,12 +699,12 @@ the literal string `${HOME}`.
 
 ### Runtime Variables
 
-| Variable          | Type           | Set by                                    | Description          |
+| Variable | Type | Set by | Description |
 | ----------------- | -------------- | ----------------------------------------- | -------------------- |
-| `${SESSION_ID}`   | UUID string    | `new-session`                             | Current session UUID |
-| `${SESSION_NAME}` | string         | `new-session`                             | Current session name |
-| `${PANE_COUNT}`   | integer string | `new-session`, `split-pane`, `close-pane` | Number of panes      |
-| `${FOCUSED_PANE}` | integer string | `new-session`, `focus-pane`               | Focused pane index   |
+| `${SESSION_ID}` | UUID string | `new-session` | Current session UUID |
+| `${SESSION_NAME}` | string | `new-session` | Current session name |
+| `${PANE_COUNT}` | integer string | `new-session`, `split-pane`, `close-pane` | Number of panes |
+| `${FOCUSED_PANE}` | integer string | `new-session`, `focus-pane` | Focused pane index |
 
 ### Static Variables
 
@@ -719,7 +720,7 @@ wait-for pattern='${MARKER}'
 
 Static variables take priority over environment variables with the same name.
 
----
+______________________________________________________________________
 
 ## TOML Format
 
@@ -727,21 +728,21 @@ TOML playbooks use `[playbook]` for config and `[[step]]` for actions.
 
 ### `[playbook]` Section
 
-| Field             | Type     | Default        | Description                         |
+| Field | Type | Default | Description |
 | ----------------- | -------- | -------------- | ----------------------------------- |
-| `name`            | string   | none           | Playbook name                       |
-| `description`     | string   | none           | Description                         |
-| `viewport.cols`   | u16      | 80             | Viewport columns                    |
-| `viewport.rows`   | u16      | 24             | Viewport rows                       |
-| `shell`           | string   | system default | Shell binary                        |
-| `timeout_ms`      | u64      | 30000          | Max execution time in ms            |
-| `record`          | bool     | false          | Enable recording                    |
-| `plugins.enable`  | string[] | []             | Plugin IDs to enable                |
-| `plugins.disable` | string[] | []             | Plugin IDs to disable               |
-| `vars`            | table    | {}             | Static variables (`NAME = "VALUE"`) |
-| `env`             | table    | {}             | Environment variables               |
-| `env_mode`        | string   | none           | `"inherit"` or `"clean"`            |
-| `include`         | string[] | []             | Paths to include                    |
+| `name` | string | none | Playbook name |
+| `description` | string | none | Description |
+| `viewport.cols` | u16 | 80 | Viewport columns |
+| `viewport.rows` | u16 | 24 | Viewport rows |
+| `shell` | string | system default | Shell binary |
+| `timeout_ms` | u64 | 30000 | Max execution time in ms |
+| `record` | bool | false | Enable recording |
+| `plugins.enable` | string[] | [] | Plugin IDs to enable |
+| `plugins.disable` | string[] | [] | Plugin IDs to disable |
+| `vars` | table | {} | Static variables (`NAME = "VALUE"`) |
+| `env` | table | {} | Environment variables |
+| `env_mode` | string | none | `"inherit"` or `"clean"` |
+| `include` | string[] | [] | Paths to include |
 
 ### `[[step]]` Entries
 
@@ -803,7 +804,7 @@ action = "assert-screen"
 contains = "hello_world"
 ```
 
----
+______________________________________________________________________
 
 ## Sandbox Environment
 
@@ -830,7 +831,7 @@ By default, all bundled plugins are available. Use `@plugin` to control this:
 
 When any `enable` is specified, all other plugins are implicitly disabled.
 
----
+______________________________________________________________________
 
 ## Assertions and Synchronization
 
@@ -863,7 +864,7 @@ When any `enable` is specified, all other plugins are implicitly disabled.
 6. **Prefer `contains` over `matches` when possible.** Substring matching is
    simpler and less fragile than regex.
 
----
+______________________________________________________________________
 
 <div id="interactive-mode-protocol"></div>
 
@@ -928,36 +929,36 @@ JSON op examples:
 
 All fields except `status` are optional and omitted when not applicable.
 
-| Field          | Present when                    | Type                           |
+| Field | Present when | Type |
 | -------------- | ------------------------------- | ------------------------------ |
-| `status`       | always                          | `"ok"`, `"fail"`, or `"error"` |
-| `action`       | action executed                 | string                         |
-| `elapsed_ms`   | action executed                 | u64                            |
-| `detail`       | action has detail output        | string                         |
-| `error`        | status is `"fail"` or `"error"` | string                         |
-| `snapshot`     | `snapshot` action executed      | object                         |
-| `panes`        | `screen` command executed       | array of PaneCapture           |
-| `session_id`   | `status` command executed       | UUID string                    |
-| `pane_count`   | `status` command executed       | u32                            |
-| `focused_pane` | `status` command executed       | u32                            |
-| `type`         | always                          | message class (`response`, `event`, `error`) |
-| `seq`          | always                          | monotonic message sequence number |
-| `mono_ns`      | always                          | monotonic nanoseconds since interactive session start |
-| `request_id`   | JSON `command`/op requests      | correlation id echoed in response |
+| `status` | always | `"ok"`, `"fail"`, or `"error"` |
+| `action` | action executed | string |
+| `elapsed_ms` | action executed | u64 |
+| `detail` | action has detail output | string |
+| `error` | status is `"fail"` or `"error"` | string |
+| `snapshot` | `snapshot` action executed | object |
+| `panes` | `screen` command executed | array of PaneCapture |
+| `session_id` | `status` command executed | UUID string |
+| `pane_count` | `status` command executed | u32 |
+| `focused_pane` | `status` command executed | u32 |
+| `type` | always | message class (`response`, `event`, `error`) |
+| `seq` | always | monotonic message sequence number |
+| `mono_ns` | always | monotonic nanoseconds since interactive session start |
+| `request_id` | JSON `command`/op requests | correlation id echoed in response |
 
 ### Special Commands
 
-| Op                | Description |
+| Op | Description |
 | ----------------- | ----------- |
-| `hello`           | Optional capability handshake. |
-| `command`         | Execute one DSL action line via `dsl` field (for example `new-session`, `send-keys`, `assert-screen`). |
-| `status`          | Return session metadata (`session_id`, `pane_count`, `focused_pane`). |
-| `hydrate`         | Hydrate detailed data (`screen_full`, `event_window`, `incident`). |
-| `subscribe`       | Start live event streaming with filters and budgets. |
-| `unsubscribe`     | Stop live event streaming. |
-| `set_watchpoint`  | Register anomaly watchpoint (`kind: "event_burst"`). |
+| `hello` | Optional capability handshake. |
+| `command` | Execute one DSL action line via `dsl` field (for example `new-session`, `send-keys`, `assert-screen`). |
+| `status` | Return session metadata (`session_id`, `pane_count`, `focused_pane`). |
+| `hydrate` | Hydrate detailed data (`screen_full`, `event_window`, `incident`). |
+| `subscribe` | Start live event streaming with filters and budgets. |
+| `unsubscribe` | Stop live event streaming. |
+| `set_watchpoint` | Register anomaly watchpoint (`kind: "event_burst"`). |
 | `clear_watchpoint`| Remove a watchpoint by id. |
-| `quit`            | End the interactive session. |
+| `quit` | End the interactive session. |
 
 ### Push Output Events
 
@@ -1032,10 +1033,10 @@ Push events have `event_type` set (e.g. `"output"`), which distinguishes them
 from command responses. They may arrive between commands or interleaved with
 command responses.
 
-| Field         | Type   | Description                                               |
+| Field | Type | Description |
 | ------------- | ------ | --------------------------------------------------------- |
-| `event_type`  | string | Push event type (`pane_output`, `pane_input`, `cursor_delta`, `screen_delta`, `server_event`, `request_lifecycle`, `watchpoint_hit`) |
-| `pane_index`  | u32    | The pane that produced the output                         |
+| `event_type` | string | Push event type (`pane_output`, `pane_input`, `cursor_delta`, `screen_delta`, `server_event`, `request_lifecycle`, `watchpoint_hit`) |
+| `pane_index` | u32 | The pane that produced the output |
 | `output_data` | string | The new output text (UTF-8, may contain escape sequences) |
 
 Watchpoint hit event:
@@ -1116,7 +1117,7 @@ Use `unsubscribe` to stop receiving push events.
 ← {"status":"ok","action":"quit"}
 ```
 
----
+______________________________________________________________________
 
 <div id="recording-to-playbook-conversion"></div>
 
@@ -1127,16 +1128,16 @@ runnable playbook.
 
 ### What Gets Generated
 
-| Element         | Source                                   | How                                                                                                             |
+| Element | Source | How |
 | --------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `new-session`   | `NewSession` request in recording        | Direct mapping                                                                                                  |
-| `split-pane`    | `SplitPane` request                      | Direct mapping with direction                                                                                   |
-| `focus-pane`    | `FocusPane` request                      | Direct mapping with target index                                                                                |
-| `send-keys`     | `AttachInput` / `PaneDirectInput` events | Consecutive inputs within 100ms are coalesced. `pane=N` added when input targets a non-focused pane.            |
-| `wait-for`      | `PaneOutputRaw` events after a command   | Last non-empty line of vt100-parsed output becomes the barrier pattern. Digit sequences are collapsed to `\d+`. |
-| `assert-screen` | `PaneOutputRaw` events                   | Up to 3 distinctive content lines per response window become `contains=` checks.                                |
-| `sleep`         | Gaps > 200ms with no input/output        | Mapped to `sleep ms=N`                                                                                          |
-| `@viewport`     | First `AttachSetViewport` request        | Emitted as a directive                                                                                          |
+| `new-session` | `NewSession` request in recording | Direct mapping |
+| `split-pane` | `SplitPane` request | Direct mapping with direction |
+| `focus-pane` | `FocusPane` request | Direct mapping with target index |
+| `send-keys` | `AttachInput` / `PaneDirectInput` events | Consecutive inputs within 100ms are coalesced. `pane=N` added when input targets a non-focused pane. |
+| `wait-for` | `PaneOutputRaw` events after a command | Last non-empty line of vt100-parsed output becomes the barrier pattern. Digit sequences are collapsed to `\d+`. |
+| `assert-screen` | `PaneOutputRaw` events | Up to 3 distinctive content lines per response window become `contains=` checks. |
+| `sleep` | Gaps > 200ms with no input/output | Mapped to `sleep ms=N` |
+| `@viewport` | First `AttachSetViewport` request | Emitted as a directive |
 
 ### Pattern Robustness
 
@@ -1155,7 +1156,7 @@ Generated patterns are made robust to non-deterministic content:
 - Some manual editing may be needed for complex workflows (e.g., interactive
   programs, timing-sensitive sequences).
 
----
+______________________________________________________________________
 
 ## JSON Output Schema
 
@@ -1176,17 +1177,17 @@ When using `--json`, `bmux playbook run` outputs a `PlaybookResult`:
 }
 ```
 
-| Field              | Type              | Always present | Description                             |
+| Field | Type | Always present | Description |
 | ------------------ | ----------------- | -------------- | --------------------------------------- |
-| `playbook_name`    | string \| null    | yes            | From `@name` directive                  |
-| `pass`             | bool              | yes            | `true` if all steps passed              |
-| `steps`            | StepResult[]      | yes            | Per-step results                        |
-| `snapshots`        | SnapshotCapture[] | yes            | Captured snapshots (may be empty)       |
-| `recording_id`     | string \| null    | no             | Recording UUID if recording was enabled |
-| `recording_path`   | string \| null    | no             | Path to recording directory             |
-| `total_elapsed_ms` | u64               | yes            | Wall-clock execution time               |
-| `error`            | string \| null    | no             | Top-level error (sandbox failure, etc.) |
-| `sandbox_root`     | string \| null    | no             | Sandbox temp dir path (only on failure, for inspection) |
+| `playbook_name` | string | null | yes | From `@name` directive |
+| `pass` | bool | yes | `true` if all steps passed |
+| `steps` | StepResult[] | yes | Per-step results |
+| `snapshots` | SnapshotCapture[] | yes | Captured snapshots (may be empty) |
+| `recording_id` | string | null | no | Recording UUID if recording was enabled |
+| `recording_path` | string | null | no | Path to recording directory |
+| `total_elapsed_ms` | u64 | yes | Wall-clock execution time |
+| `error` | string | null | no | Top-level error (sandbox failure, etc.) |
+| `sandbox_root` | string | null | no | Sandbox temp dir path (only on failure, for inspection) |
 
 ### `StepResult`
 
@@ -1223,16 +1224,16 @@ On failure, additional structured fields are included:
 }
 ```
 
-| Field              | Type                  | Description                                                                |
+| Field | Type | Description |
 | ------------------ | --------------------- | -------------------------------------------------------------------------- |
-| `index`            | u64                   | Step index (0-based)                                                       |
-| `action`           | string                | Action name                                                                |
-| `status`           | string                | `"pass"`, `"fail"`, or `"skip"`                                            |
-| `elapsed_ms`       | u64                   | Step execution time                                                        |
-| `detail`           | string \| null        | Action-specific detail. For failures, a human-readable error message.      |
-| `expected`         | string \| null        | The expected value/pattern for assertion failures. Only present on `fail`. |
-| `actual`           | string \| null        | The actual value/screen text found. Only present on `fail`.                |
-| `failure_captures` | PaneCapture[] \| null | Screen capture of all panes at time of failure. Only present on `fail`.    |
+| `index` | u64 | Step index (0-based) |
+| `action` | string | Action name |
+| `status` | string | `"pass"`, `"fail"`, or `"skip"` |
+| `elapsed_ms` | u64 | Step execution time |
+| `detail` | string | null | Action-specific detail. For failures, a human-readable error message. |
+| `expected` | string | null | The expected value/pattern for assertion failures. Only present on `fail`. |
+| `actual` | string | null | The actual value/screen text found. Only present on `fail`. |
+| `failure_captures` | PaneCapture[] | null | Screen capture of all panes at time of failure. Only present on `fail`. |
 
 The `expected` and `actual` fields allow machine consumers (LLMs) to compare
 expected vs actual values without parsing the `detail` string. The
@@ -1260,15 +1261,15 @@ moment of failure, regardless of which pane was being asserted on.
 }
 ```
 
-| Field         | Type   | Description                                        |
+| Field | Type | Description |
 | ------------- | ------ | -------------------------------------------------- |
-| `index`       | u32    | Pane index (1-based)                               |
-| `focused`     | bool   | Whether this pane has focus                        |
+| `index` | u32 | Pane index (1-based) |
+| `focused` | bool | Whether this pane has focus |
 | `screen_text` | string | Visible text, trailing whitespace trimmed per line |
-| `cursor_row`  | u16    | Cursor row (0-based)                               |
-| `cursor_col`  | u16    | Cursor column (0-based)                            |
+| `cursor_row` | u16 | Cursor row (0-based) |
+| `cursor_col` | u16 | Cursor column (0-based) |
 
----
+______________________________________________________________________
 
 ## Examples
 
@@ -1474,6 +1475,7 @@ screen content.
    patterns may need adjustment for your environment.
 
 4. Run it:
+
    ```sh
    bmux playbook run repro.dsl --json
    ```
