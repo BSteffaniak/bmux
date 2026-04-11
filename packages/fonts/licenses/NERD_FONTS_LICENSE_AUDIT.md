@@ -123,4 +123,4 @@ All files created such as `font-patcher` and any `ph` or `sh` script/source file
 | Victor Mono              | OFL-1.1-no-RFN                  |
 | Zed Mono                 | OFL-1.1-no-RFN                  |
 
-_LicenseRef licenses have no SPDX value_
+### LicenseRef licenses have no SPDX value

@@ -866,8 +866,6 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-<div id="interactive-mode-protocol"></div>
-
 ## Interactive Mode Protocol
 
 Interactive mode provides a socket-based REPL for LLM agents to control bmux
@@ -1119,8 +1117,6 @@ Use `unsubscribe` to stop receiving push events.
 
 ______________________________________________________________________
 
-<div id="recording-to-playbook-conversion"></div>
-
 ## Recording to Playbook Conversion
 
 `bmux playbook from-recording` converts a recorded bmux session into a
@@ -1272,8 +1268,6 @@ moment of failure, regardless of which pane was being asserted on.
 ______________________________________________________________________
 
 ## Examples
-
-<div id="example-1-basic-echo--assert"></div>
 
 ### Example 1: Basic echo + assert
 
