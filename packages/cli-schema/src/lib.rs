@@ -151,6 +151,7 @@ pub enum HostedModeArg {
 pub enum SandboxEnvModeArg {
     Clean,
     Inherit,
+    Hermetic,
 }
 
 fn parse_cell_size(value: &str) -> Result<(u16, u16), String> {
@@ -1053,6 +1054,12 @@ pub enum SandboxCommand {
         /// Output sandbox metadata as JSON
         #[arg(long)]
         json: bool,
+        /// Print fully resolved environment map before executing command
+        #[arg(long)]
+        print_env: bool,
+        /// Kill sandbox command if it exceeds this timeout in seconds
+        #[arg(long)]
+        timeout: Option<u64>,
         /// Optional human-friendly sandbox label
         #[arg(long)]
         name: Option<String>,
@@ -1066,15 +1073,61 @@ pub enum SandboxCommand {
         )]
         command: Vec<String>,
     },
+    /// List known sandbox directories and runtime status
+    List {
+        /// Filter to matching status only
+        #[arg(long, value_enum, default_value = "all")]
+        status: SandboxStatusArg,
+        /// Maximum entries to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a sandbox by id or absolute path
+    Inspect {
+        /// Sandbox id (bmux-sbx-...) or full path
+        target: String,
+        /// Number of log lines to tail from sandbox logs
+        #[arg(long, default_value_t = 80)]
+        tail: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnose sandbox readiness and health checks
+    Doctor {
+        /// Optional sandbox id/path for targeted checks
+        #[arg(long)]
+        id: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove orphaned sandbox temp directories from sandbox runs
     Cleanup {
         /// Only list orphaned dirs without deleting
         #[arg(long)]
         dry_run: bool,
+        /// Remove only failed/aborted sandboxes
+        #[arg(long)]
+        failed_only: bool,
+        /// Minimum age in seconds before sandbox is eligible for cleanup
+        #[arg(long)]
+        older_than: Option<u64>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SandboxStatusArg {
+    Running,
+    Stopped,
+    Failed,
+    All,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1560,8 +1613,8 @@ mod tests {
         RecordingEventKindArg, RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg,
         RecordingListStatusArg, RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode,
         RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, SandboxCommand,
-        SandboxEnvModeArg, ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand,
-        TraceFamily,
+        SandboxEnvModeArg, SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand,
+        TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -3689,6 +3742,8 @@ mod tests {
                 env_mode: SandboxEnvModeArg::Clean,
                 keep: false,
                 json: false,
+                print_env: false,
+                timeout: None,
                 name: None,
                 command,
             } if command == vec!["server".to_string(), "status".to_string()]
@@ -3707,6 +3762,9 @@ mod tests {
             "inherit",
             "--keep",
             "--json",
+            "--print-env",
+            "--timeout",
+            "30",
             "--name",
             "my-check",
             "--",
@@ -3723,6 +3781,8 @@ mod tests {
                 env_mode: SandboxEnvModeArg::Inherit,
                 keep: true,
                 json: true,
+                print_env: true,
+                timeout: Some(30),
                 name: Some(ref name),
                 command,
             } if bin == "./target/debug/bmux"
@@ -3732,9 +3792,75 @@ mod tests {
     }
 
     #[test]
+    fn parses_sandbox_list_and_inspect() {
+        let list = Cli::try_parse_from([
+            "bmux", "sandbox", "list", "--status", "failed", "--limit", "5", "--json",
+        ])
+        .expect("valid list args");
+        let Some(Command::Sandbox { command }) = list.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::List {
+                status: SandboxStatusArg::Failed,
+                limit: 5,
+                json: true,
+            }
+        ));
+
+        let inspect =
+            Cli::try_parse_from(["bmux", "sandbox", "inspect", "bmux-sbx-abc", "--tail", "25"])
+                .expect("valid inspect args");
+        let Some(Command::Sandbox { command }) = inspect.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Inspect {
+                target,
+                tail: 25,
+                json: false,
+            } if target == "bmux-sbx-abc"
+        ));
+    }
+
+    #[test]
+    fn parses_sandbox_doctor() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "sandbox",
+            "doctor",
+            "--id",
+            "bmux-sbx-123",
+            "--json",
+        ])
+        .expect("valid doctor args");
+        let Some(Command::Sandbox { command }) = cli.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Doctor {
+                id: Some(id),
+                json: true,
+            } if id == "bmux-sbx-123"
+        ));
+    }
+
+    #[test]
     fn parses_sandbox_cleanup_flags() {
-        let cli = Cli::try_parse_from(["bmux", "sandbox", "cleanup", "--dry-run", "--json"])
-            .expect("valid CLI args");
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "sandbox",
+            "cleanup",
+            "--dry-run",
+            "--failed-only",
+            "--older-than",
+            "600",
+            "--json",
+        ])
+        .expect("valid CLI args");
         let Some(Command::Sandbox { command }) = cli.command else {
             panic!("expected sandbox command");
         };
@@ -3742,7 +3868,9 @@ mod tests {
             command,
             SandboxCommand::Cleanup {
                 dry_run: true,
-                json: true
+                failed_only: true,
+                older_than: Some(600),
+                json: true,
             }
         ));
     }

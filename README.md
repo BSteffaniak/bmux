@@ -107,6 +107,9 @@ bmux --runtime dev host
 # Ephemeral sandbox run (fully isolated config/runtime/data/state/logs)
 bmux sandbox run -- server status
 bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode inherit -- --version
+bmux sandbox list --limit 10
+bmux sandbox inspect bmux-sbx-123 --tail 120
+bmux sandbox doctor --json
 bmux sandbox cleanup --dry-run --json
 # Optional control-plane mode for account/share links
 bmux setup --mode control-plane

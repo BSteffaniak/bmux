@@ -1,19 +1,37 @@
 use anyhow::{Context, Result};
 use bmux_cli_schema::SandboxEnvModeArg;
 use bmux_config::ConfigPaths;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SANDBOX_PREFIX: &str = "bmux-sbx-";
-const CLEANUP_MIN_AGE: Duration = Duration::from_secs(300);
+const MANIFEST_FILE: &str = "sandbox.json";
+const PID_MARKER_FILE: &str = "sandbox.pid";
+const DEFAULT_CLEANUP_MIN_AGE: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct CleanupEntry {
     path: String,
     age_secs: u64,
+    status: String,
     removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SandboxListEntry {
+    id: String,
+    root: String,
+    status: String,
+    age_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorCheck {
+    name: String,
+    ok: bool,
+    detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -96,61 +114,227 @@ impl SandboxPaths {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SandboxManifestPaths {
+    root: String,
+    logs: String,
+    runtime: String,
+    state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SandboxManifest {
+    id: String,
+    created_at_unix_ms: u128,
+    updated_at_unix_ms: u128,
+    pid: u32,
+    bmux_bin: String,
+    command: Vec<String>,
+    env_mode: String,
+    status: String,
+    exit_code: Option<i32>,
+    kept: bool,
+    paths: SandboxManifestPaths,
+}
+
 #[derive(Debug, Serialize)]
 struct SandboxRunReport {
+    sandbox_id: String,
     sandbox_root: String,
     bmux_bin: String,
-    env_mode: &'static str,
+    env_mode: String,
+    status: String,
     keep_requested: bool,
     kept: bool,
-    exit_code: u8,
+    exit_code: i32,
+    duration_ms: u128,
+}
+
+struct RunOutcome<'a> {
+    binary: &'a Path,
+    options: &'a RunSandboxOptions<'a>,
+    kept: bool,
+    keep_on_failure: bool,
+    raw_exit_code: i32,
+    final_status: &'a str,
+    duration_ms: u128,
+}
+
+pub(super) struct RunSandboxOptions<'a> {
+    pub(super) bmux_bin: Option<&'a str>,
+    pub(super) env_mode: SandboxEnvModeArg,
+    pub(super) keep: bool,
+    pub(super) json: bool,
+    pub(super) print_env: bool,
+    pub(super) timeout_secs: Option<u64>,
+    pub(super) name: Option<&'a str>,
 }
 
 pub(super) async fn run_sandbox_run(
-    bmux_bin: Option<&str>,
-    env_mode: SandboxEnvModeArg,
-    keep: bool,
-    json: bool,
-    name: Option<&str>,
+    options: RunSandboxOptions<'_>,
     command_args: &[String],
 ) -> Result<u8> {
-    let sandbox = SandboxPaths::new(name);
+    let sandbox = SandboxPaths::new(options.name);
     sandbox.ensure_dirs()?;
     write_pid_marker(&sandbox.root_dir)?;
 
-    let binary = resolve_bmux_binary(bmux_bin)?;
-    let mut command = ProcessCommand::new(&binary);
+    let binary = resolve_bmux_binary(options.bmux_bin)?;
+    let mut manifest = build_manifest(
+        &sandbox,
+        &binary,
+        command_args,
+        options.env_mode,
+        options.keep,
+    );
+    write_manifest(&sandbox.root_dir, &manifest)?;
+
+    if options.print_env {
+        let env = collect_effective_sandbox_env(&sandbox, options.env_mode);
+        println!("{}", serde_json::to_string_pretty(&env)?);
+    }
+
+    let (status, timed_out, duration_ms) = spawn_and_wait(
+        &binary,
+        &sandbox,
+        options.env_mode,
+        command_args,
+        options.timeout_secs.map(Duration::from_secs),
+    )
+    .await?;
+
+    let raw_exit_code = status.code().unwrap_or(if timed_out { 124 } else { 1 });
+    let keep_on_failure = !status.success() || timed_out;
+    let kept = options.keep || keep_on_failure;
+    let final_status = if timed_out {
+        "timed_out"
+    } else if status.success() {
+        "succeeded"
+    } else {
+        "failed"
+    };
+
+    manifest.updated_at_unix_ms = unix_millis_now();
+    manifest.status = final_status.to_string();
+    manifest.exit_code = Some(raw_exit_code);
+    manifest.kept = kept;
+    write_manifest(&sandbox.root_dir, &manifest)?;
+
+    emit_run_output(
+        &sandbox,
+        &RunOutcome {
+            binary: &binary,
+            options: &options,
+            kept,
+            keep_on_failure,
+            raw_exit_code,
+            final_status,
+            duration_ms,
+        },
+        &manifest,
+    )?;
+
+    if !kept {
+        let _ = std::fs::remove_dir_all(&sandbox.root_dir);
+    }
+
+    Ok(exit_code_to_u8(raw_exit_code))
+}
+
+fn build_manifest(
+    sandbox: &SandboxPaths,
+    binary: &Path,
+    command_args: &[String],
+    env_mode: SandboxEnvModeArg,
+    keep: bool,
+) -> SandboxManifest {
+    SandboxManifest {
+        id: sandbox_id_from_root(&sandbox.root_dir),
+        created_at_unix_ms: unix_millis_now(),
+        updated_at_unix_ms: unix_millis_now(),
+        pid: std::process::id(),
+        bmux_bin: binary.to_string_lossy().to_string(),
+        command: command_args.to_vec(),
+        env_mode: sandbox_env_mode_name(env_mode).to_string(),
+        status: "running".to_string(),
+        exit_code: None,
+        kept: keep,
+        paths: SandboxManifestPaths {
+            root: sandbox.root_dir.to_string_lossy().to_string(),
+            logs: sandbox.log_dir.to_string_lossy().to_string(),
+            runtime: sandbox.runtime_dir.to_string_lossy().to_string(),
+            state: sandbox.state_dir.to_string_lossy().to_string(),
+        },
+    }
+}
+
+async fn spawn_and_wait(
+    binary: &Path,
+    sandbox: &SandboxPaths,
+    env_mode: SandboxEnvModeArg,
+    command_args: &[String],
+    timeout: Option<Duration>,
+) -> Result<(ExitStatus, bool, u128)> {
+    let mut command = ProcessCommand::new(binary);
     command.args(command_args);
     command.stdin(Stdio::inherit());
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
-    apply_sandbox_env(&mut command, &sandbox, env_mode);
+    apply_sandbox_env(&mut command, sandbox, env_mode);
 
-    let status = command
-        .status()
-        .with_context(|| format!("failed running sandbox command with {}", binary.display()))?;
+    let start = Instant::now();
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed spawning sandbox command with {}",
+            binary.to_string_lossy()
+        )
+    })?;
 
-    let exit_code = status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .unwrap_or(1);
-    let keep_on_failure = !status.success();
-    let kept = keep || keep_on_failure;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed waiting for sandbox child")?
+        {
+            break status;
+        }
 
-    if json {
+        if timeout.is_some_and(|limit| start.elapsed() >= limit) {
+            timed_out = true;
+            let _ = child.kill();
+            break child
+                .wait()
+                .context("failed waiting after sandbox timeout")?;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    Ok((status, timed_out, start.elapsed().as_millis()))
+}
+
+fn emit_run_output(
+    sandbox: &SandboxPaths,
+    outcome: &RunOutcome<'_>,
+    manifest: &SandboxManifest,
+) -> Result<()> {
+    if outcome.options.json {
         let report = SandboxRunReport {
+            sandbox_id: manifest.id.clone(),
             sandbox_root: sandbox.root_dir.to_string_lossy().to_string(),
-            bmux_bin: binary.to_string_lossy().to_string(),
-            env_mode: sandbox_env_mode_name(env_mode),
-            keep_requested: keep,
-            kept,
-            exit_code,
+            bmux_bin: outcome.binary.to_string_lossy().to_string(),
+            env_mode: sandbox_env_mode_name(outcome.options.env_mode).to_string(),
+            status: outcome.final_status.to_string(),
+            keep_requested: outcome.options.keep,
+            kept: outcome.kept,
+            exit_code: outcome.raw_exit_code,
+            duration_ms: outcome.duration_ms,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if kept {
-        if keep_on_failure {
+    } else if outcome.kept {
+        if outcome.keep_on_failure {
             eprintln!(
-                "sandbox command exited with {exit_code}; keeping sandbox at {}",
+                "sandbox command exited with {}; keeping sandbox at {}",
+                outcome.raw_exit_code,
                 sandbox.root_dir.display()
             );
         } else {
@@ -158,16 +342,157 @@ pub(super) async fn run_sandbox_run(
         }
         eprintln!("sandbox logs: {}", sandbox.log_dir.display());
     }
-
-    if !kept {
-        let _ = std::fs::remove_dir_all(&sandbox.root_dir);
-    }
-
-    Ok(exit_code)
+    Ok(())
 }
 
-pub(super) fn run_sandbox_cleanup(dry_run: bool, json: bool) -> Result<u8> {
-    let (scanned, entries) = cleanup_orphaned_sandboxes(dry_run);
+pub(super) fn run_sandbox_list(
+    status_filter: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<u8> {
+    let mut entries = collect_sandbox_directories()
+        .into_iter()
+        .map(|root| sandbox_list_entry(&root))
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|left, right| right.age_secs.cmp(&left.age_secs));
+
+    if let Some(filter) = status_filter {
+        entries.retain(|entry| entry.status == filter);
+    }
+    if limit > 0 {
+        entries.truncate(limit);
+    }
+
+    if json {
+        let payload = serde_json::json!({ "sandboxes": entries });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if entries.is_empty() {
+        println!("no sandboxes found");
+    } else {
+        for entry in entries {
+            println!(
+                "{} [{}] age={}s root={}",
+                entry.id, entry.status, entry.age_secs, entry.root
+            );
+        }
+    }
+
+    Ok(0)
+}
+
+pub(super) fn run_sandbox_inspect(target: &str, tail: usize, json: bool) -> Result<u8> {
+    let root = resolve_sandbox_target(target)?;
+    let manifest = read_manifest(&root)?;
+    let log_tail = read_log_tail(&root, tail);
+    let running = sandbox_process_alive(&root) || sandbox_socket_alive(&root);
+
+    if json {
+        let payload = serde_json::json!({
+            "manifest": manifest,
+            "running": running,
+            "log_tail": log_tail,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("id: {}", manifest.id);
+        println!("status: {}", manifest.status);
+        println!("running: {running}");
+        println!("root: {}", root.display());
+        println!("bmux_bin: {}", manifest.bmux_bin);
+        println!("command: {}", manifest.command.join(" "));
+        println!("logs:");
+        for line in log_tail {
+            println!("  {line}");
+        }
+    }
+
+    Ok(0)
+}
+
+pub(super) fn run_sandbox_doctor(id: Option<&str>, json: bool) -> Result<u8> {
+    let mut checks = Vec::new();
+
+    let temp_dir = std::env::temp_dir();
+    checks.push(DoctorCheck {
+        name: "temp_dir_writable".to_string(),
+        ok: std::fs::create_dir_all(&temp_dir).is_ok(),
+        detail: temp_dir.display().to_string(),
+    });
+
+    let current_exe = std::env::current_exe();
+    checks.push(DoctorCheck {
+        name: "current_bmux_executable".to_string(),
+        ok: current_exe.is_ok(),
+        detail: current_exe.ok().map_or_else(
+            || "unavailable".to_string(),
+            |path| path.display().to_string(),
+        ),
+    });
+
+    if let Some(target) = id {
+        append_target_doctor_checks(&mut checks, target);
+    }
+
+    let ok = checks.iter().all(|check| check.ok);
+    if json {
+        let payload = serde_json::json!({
+            "ok": ok,
+            "checks": checks,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("sandbox doctor: {}", if ok { "ok" } else { "issues found" });
+        for check in checks {
+            println!(
+                "  {} {} ({})",
+                if check.ok { "OK" } else { "FAIL" },
+                check.name,
+                check.detail
+            );
+        }
+    }
+
+    Ok(u8::from(!ok))
+}
+
+fn append_target_doctor_checks(checks: &mut Vec<DoctorCheck>, target: &str) {
+    match resolve_sandbox_target(target) {
+        Ok(root) => {
+            let manifest_exists = root.join(MANIFEST_FILE).exists();
+            let runtime_exists = root.join("runtime").exists();
+            checks.push(DoctorCheck {
+                name: "target_exists".to_string(),
+                ok: root.exists(),
+                detail: root.display().to_string(),
+            });
+            checks.push(DoctorCheck {
+                name: "target_manifest_present".to_string(),
+                ok: manifest_exists,
+                detail: root.join(MANIFEST_FILE).display().to_string(),
+            });
+            checks.push(DoctorCheck {
+                name: "target_runtime_dir_present".to_string(),
+                ok: runtime_exists,
+                detail: root.join("runtime").display().to_string(),
+            });
+        }
+        Err(error) => checks.push(DoctorCheck {
+            name: "target_resolve".to_string(),
+            ok: false,
+            detail: error.to_string(),
+        }),
+    }
+}
+
+pub(super) fn run_sandbox_cleanup(
+    dry_run: bool,
+    failed_only: bool,
+    older_than_secs: Option<u64>,
+    json: bool,
+) -> Result<u8> {
+    let older_than = older_than_secs.map_or(DEFAULT_CLEANUP_MIN_AGE, Duration::from_secs);
+    let (scanned, entries) = cleanup_orphaned_sandboxes(dry_run, failed_only, older_than);
     let orphaned = entries.len();
 
     if json {
@@ -175,13 +500,18 @@ pub(super) fn run_sandbox_cleanup(dry_run: bool, json: bool) -> Result<u8> {
             "scanned": scanned,
             "orphaned": orphaned,
             "dry_run": dry_run,
+            "failed_only": failed_only,
+            "older_than_secs": older_than.as_secs(),
             "entries": entries,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if orphaned > 0 {
         for entry in &entries {
             let status = if entry.removed { "removed" } else { "found" };
-            println!("  {status}: {} (age: {}s)", entry.path, entry.age_secs);
+            println!(
+                "  {status}: {} (status: {}, age: {}s)",
+                entry.path, entry.status, entry.age_secs
+            );
         }
         if dry_run {
             println!("{orphaned} orphaned sandbox(es) found (dry run, not removed)");
@@ -196,37 +526,32 @@ pub(super) fn run_sandbox_cleanup(dry_run: bool, json: bool) -> Result<u8> {
     Ok(0)
 }
 
-fn cleanup_orphaned_sandboxes(dry_run: bool) -> (usize, Vec<CleanupEntry>) {
-    let temp_dir = std::env::temp_dir();
+fn cleanup_orphaned_sandboxes(
+    dry_run: bool,
+    failed_only: bool,
+    older_than: Duration,
+) -> (usize, Vec<CleanupEntry>) {
     let now = SystemTime::now();
     let mut scanned = 0;
     let mut entries = Vec::new();
 
-    let Ok(dir_entries) = std::fs::read_dir(temp_dir) else {
-        return (0, entries);
-    };
-
-    for dir_entry in dir_entries {
-        let Ok(dir_entry) = dir_entry else { continue };
-        let name = dir_entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with(SANDBOX_PREFIX) || !dir_entry.path().is_dir() {
-            continue;
-        }
-
+    for root_path in collect_sandbox_directories() {
         scanned += 1;
-        let age = dir_entry
+        let age = root_path
             .metadata()
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| now.duration_since(modified).ok())
             .unwrap_or_default();
-        if age < CLEANUP_MIN_AGE {
+        if age < older_than {
             continue;
         }
 
-        let root_path = dir_entry.path();
-        if sandbox_process_alive(&root_path) || sandbox_socket_alive(&root_path) {
+        let status = sandbox_status_for_dir(&root_path);
+        if status == "running" {
+            continue;
+        }
+        if failed_only && status != "failed" {
             continue;
         }
 
@@ -239,6 +564,7 @@ fn cleanup_orphaned_sandboxes(dry_run: bool) -> (usize, Vec<CleanupEntry>) {
         entries.push(CleanupEntry {
             path: root_path.to_string_lossy().to_string(),
             age_secs: age.as_secs(),
+            status: status.to_string(),
             removed,
         });
     }
@@ -246,8 +572,129 @@ fn cleanup_orphaned_sandboxes(dry_run: bool) -> (usize, Vec<CleanupEntry>) {
     (scanned, entries)
 }
 
+fn collect_sandbox_directories() -> Vec<PathBuf> {
+    let Ok(dir_entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return Vec::new();
+    };
+
+    dir_entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(SANDBOX_PREFIX))
+        })
+        .collect()
+}
+
+fn sandbox_list_entry(root: &Path) -> SandboxListEntry {
+    let now = SystemTime::now();
+    let age = root
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| now.duration_since(modified).ok())
+        .unwrap_or_default();
+
+    SandboxListEntry {
+        id: sandbox_id_from_root(root),
+        root: root.to_string_lossy().to_string(),
+        status: sandbox_status_for_dir(root).to_string(),
+        age_secs: age.as_secs(),
+    }
+}
+
+fn sandbox_status_for_dir(root: &Path) -> &'static str {
+    if sandbox_process_alive(root) || sandbox_socket_alive(root) {
+        return "running";
+    }
+
+    if let Ok(manifest) = read_manifest(root) {
+        if matches!(manifest.status.as_str(), "failed" | "timed_out" | "killed") {
+            "failed"
+        } else {
+            "stopped"
+        }
+    } else {
+        "stopped"
+    }
+}
+
+fn read_manifest(root: &Path) -> Result<SandboxManifest> {
+    let manifest_path = root.join(MANIFEST_FILE);
+    let bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("failed reading {}", manifest_path.display()))?;
+    serde_json::from_slice::<SandboxManifest>(&bytes)
+        .with_context(|| format!("failed parsing {}", manifest_path.display()))
+}
+
+fn write_manifest(root: &Path, manifest: &SandboxManifest) -> Result<()> {
+    let manifest_path = root.join(MANIFEST_FILE);
+    let encoded = serde_json::to_vec_pretty(manifest)?;
+    std::fs::write(&manifest_path, encoded)
+        .with_context(|| format!("failed writing {}", manifest_path.display()))
+}
+
+fn resolve_sandbox_target(target: &str) -> Result<PathBuf> {
+    let maybe_path = PathBuf::from(target);
+    if maybe_path.is_absolute() && maybe_path.exists() {
+        return Ok(maybe_path);
+    }
+
+    let direct = std::env::temp_dir().join(target);
+    if direct.exists() {
+        return Ok(direct);
+    }
+
+    if let Some(found) = collect_sandbox_directories()
+        .iter()
+        .find(|candidate| sandbox_id_from_root(candidate).starts_with(target))
+    {
+        return Ok(found.clone());
+    }
+
+    anyhow::bail!("sandbox target not found: {target}")
+}
+
+fn read_log_tail(root: &Path, tail: usize) -> Vec<String> {
+    let log_dir = root.join("logs");
+    let Some(log_path) = newest_regular_file(&log_dir) else {
+        return vec!["<no log files found>".to_string()];
+    };
+
+    let Ok(contents) = std::fs::read_to_string(&log_path) else {
+        return vec![format!("<failed reading {}>", log_path.display())];
+    };
+
+    let mut lines = contents.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+    let keep = tail.max(1);
+    if lines.len() > keep {
+        lines.drain(0..(lines.len() - keep));
+    }
+    lines
+}
+
+fn newest_regular_file(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            if path.is_file() {
+                Some((path, modified))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(path, _)| path)
+}
+
 fn write_pid_marker(root_dir: &Path) -> Result<()> {
-    let marker_path = root_dir.join("sandbox.pid");
+    let marker_path = root_dir.join(PID_MARKER_FILE);
     std::fs::write(&marker_path, std::process::id().to_string())
         .with_context(|| format!("failed writing {}", marker_path.display()))
 }
@@ -257,7 +704,10 @@ fn apply_sandbox_env(
     sandbox: &SandboxPaths,
     env_mode: SandboxEnvModeArg,
 ) {
-    if matches!(env_mode, SandboxEnvModeArg::Clean) {
+    if matches!(
+        env_mode,
+        SandboxEnvModeArg::Clean | SandboxEnvModeArg::Hermetic
+    ) {
         command.env_clear();
     }
 
@@ -287,6 +737,102 @@ fn apply_sandbox_env(
             command.env("SHELL", shell);
         }
     }
+
+    if matches!(env_mode, SandboxEnvModeArg::Hermetic) {
+        command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    }
+}
+
+fn collect_effective_sandbox_env(
+    sandbox: &SandboxPaths,
+    env_mode: SandboxEnvModeArg,
+) -> serde_json::Value {
+    let mut vars = serde_json::Map::new();
+    vars.insert(
+        "BMUX_CONFIG_DIR".to_string(),
+        serde_json::Value::String(
+            sandbox
+                .config_paths
+                .config_dir
+                .to_string_lossy()
+                .to_string(),
+        ),
+    );
+    vars.insert(
+        "BMUX_RUNTIME_DIR".to_string(),
+        serde_json::Value::String(
+            sandbox
+                .config_paths
+                .runtime_dir
+                .to_string_lossy()
+                .to_string(),
+        ),
+    );
+    vars.insert(
+        "BMUX_DATA_DIR".to_string(),
+        serde_json::Value::String(sandbox.config_paths.data_dir.to_string_lossy().to_string()),
+    );
+    vars.insert(
+        "BMUX_STATE_DIR".to_string(),
+        serde_json::Value::String(sandbox.config_paths.state_dir.to_string_lossy().to_string()),
+    );
+    vars.insert(
+        "BMUX_LOG_DIR".to_string(),
+        serde_json::Value::String(sandbox.log_dir.to_string_lossy().to_string()),
+    );
+    vars.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        serde_json::Value::String(sandbox.config_home.to_string_lossy().to_string()),
+    );
+    vars.insert(
+        "XDG_DATA_HOME".to_string(),
+        serde_json::Value::String(sandbox.data_home.to_string_lossy().to_string()),
+    );
+    vars.insert(
+        "XDG_RUNTIME_DIR".to_string(),
+        serde_json::Value::String(sandbox.runtime_dir.to_string_lossy().to_string()),
+    );
+    vars.insert(
+        "TMPDIR".to_string(),
+        serde_json::Value::String(sandbox.tmp_dir.to_string_lossy().to_string()),
+    );
+    vars.insert(
+        "HOME".to_string(),
+        serde_json::Value::String(sandbox.home_dir.to_string_lossy().to_string()),
+    );
+    vars.insert(
+        "TERM".to_string(),
+        serde_json::Value::String("xterm-256color".to_string()),
+    );
+    vars.insert(
+        "LANG".to_string(),
+        serde_json::Value::String("C.UTF-8".to_string()),
+    );
+    vars.insert(
+        "LC_ALL".to_string(),
+        serde_json::Value::String("C.UTF-8".to_string()),
+    );
+
+    if matches!(env_mode, SandboxEnvModeArg::Clean) {
+        if let Ok(path) = std::env::var("PATH") {
+            vars.insert("PATH".to_string(), serde_json::Value::String(path));
+        }
+        if let Ok(user) = std::env::var("USER") {
+            vars.insert("USER".to_string(), serde_json::Value::String(user));
+        }
+        if let Ok(shell) = std::env::var("SHELL") {
+            vars.insert("SHELL".to_string(), serde_json::Value::String(shell));
+        }
+    }
+
+    if matches!(env_mode, SandboxEnvModeArg::Hermetic) {
+        vars.insert(
+            "PATH".to_string(),
+            serde_json::Value::String("/usr/bin:/bin:/usr/sbin:/sbin".to_string()),
+        );
+    }
+
+    serde_json::Value::Object(vars)
 }
 
 fn resolve_bmux_binary(bmux_bin: Option<&str>) -> Result<PathBuf> {
@@ -319,7 +865,29 @@ const fn sandbox_env_mode_name(mode: SandboxEnvModeArg) -> &'static str {
     match mode {
         SandboxEnvModeArg::Clean => "clean",
         SandboxEnvModeArg::Inherit => "inherit",
+        SandboxEnvModeArg::Hermetic => "hermetic",
     }
+}
+
+fn sandbox_id_from_root(root: &Path) -> String {
+    root.file_name()
+        .map_or_else(String::new, |value| value.to_string_lossy().to_string())
+}
+
+fn exit_code_to_u8(code: i32) -> u8 {
+    if code < 0 {
+        1
+    } else if code > i32::from(u8::MAX) {
+        u8::MAX
+    } else {
+        u8::try_from(code).unwrap_or(1)
+    }
+}
+
+fn unix_millis_now() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
 }
 
 fn sanitize_component(value: &str) -> String {
@@ -338,7 +906,7 @@ fn sanitize_component(value: &str) -> String {
 }
 
 fn sandbox_process_alive(root_dir: &Path) -> bool {
-    let marker_path = root_dir.join("sandbox.pid");
+    let marker_path = root_dir.join(PID_MARKER_FILE);
     std::fs::read_to_string(marker_path)
         .ok()
         .and_then(|contents| contents.trim().parse::<u32>().ok())
@@ -399,7 +967,9 @@ fn is_pid_alive(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxEnvModeArg, SandboxPaths, apply_sandbox_env, sanitize_component};
+    use super::{
+        SandboxEnvModeArg, SandboxPaths, apply_sandbox_env, exit_code_to_u8, sanitize_component,
+    };
 
     fn env_value(command: &std::process::Command, key: &str) -> Option<std::ffi::OsString> {
         command.get_envs().find_map(|(name, value)| {
@@ -456,5 +1026,30 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn sandbox_env_sets_hermetic_path() {
+        let sandbox = SandboxPaths::new(None);
+        sandbox
+            .ensure_dirs()
+            .expect("sandbox dirs should be created");
+        let mut command = std::process::Command::new("sh");
+        apply_sandbox_env(&mut command, &sandbox, SandboxEnvModeArg::Hermetic);
+        let root_dir = sandbox.root_dir.clone();
+
+        assert_eq!(
+            env_value(&command, "PATH"),
+            Some(std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
+        );
+
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn exit_code_conversion_clamps() {
+        assert_eq!(exit_code_to_u8(-1), 1);
+        assert_eq!(exit_code_to_u8(300), 255);
+        assert_eq!(exit_code_to_u8(7), 7);
     }
 }

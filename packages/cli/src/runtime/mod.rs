@@ -117,7 +117,10 @@ use remote_cli::{
     run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade, run_setup,
     run_share, run_target_proxy_from_current_argv, run_unshare, should_proxy_to_target,
 };
-use sandbox_cli::{run_sandbox_cleanup, run_sandbox_run};
+use sandbox_cli::{
+    RunSandboxOptions, run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect,
+    run_sandbox_list, run_sandbox_run,
+};
 use server_commands::{
     run_server_bridge, run_server_gateway, run_server_recording_clear, run_server_recording_path,
     run_server_recording_start, run_server_recording_status, run_server_recording_stop,

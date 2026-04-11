@@ -106,6 +106,9 @@ pub enum BuiltInHandlerId {
     PlaybookCleanup,
     Sandbox,
     SandboxRun,
+    SandboxList,
+    SandboxInspect,
+    SandboxDoctor,
     SandboxCleanup,
 }
 
@@ -656,6 +659,21 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::SandboxRun,
             &["sandbox", "run"],
             "Run a bmux command in an ephemeral sandbox",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxList,
+            &["sandbox", "list"],
+            "List known bmux sandbox runs",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxInspect,
+            &["sandbox", "inspect"],
+            "Inspect bmux sandbox metadata and logs",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxDoctor,
+            &["sandbox", "doctor"],
+            "Run health checks for sandbox workflows",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SandboxCleanup,

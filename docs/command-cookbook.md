@@ -49,6 +49,23 @@ bmux sandbox run --keep --bmux-bin ./target/debug/bmux -- server start
 # Override to inherit parent environment instead of clean mode
 bmux sandbox run --env-mode inherit -- server status
 
+# More strict mode with minimal inherited environment
+bmux sandbox run --env-mode hermetic -- server status
+
+# Kill long-running sandbox command after 45 seconds
+bmux sandbox run --timeout 45 -- server start
+
+# Print resolved sandbox env map for reproducibility
+bmux sandbox run --print-env -- server status
+
+# Discover recent sandboxes and inspect one
+bmux sandbox list --limit 10
+bmux sandbox inspect bmux-sbx-123 --tail 120
+
+# Health checks for sandbox runtime
+bmux sandbox doctor --json
+
 # Clean up orphaned sandbox directories
 bmux sandbox cleanup --dry-run --json
+bmux sandbox cleanup --failed-only --older-than 600
 ```
