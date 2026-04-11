@@ -1,0 +1,20 @@
+{
+  "name": "@bmux/darwin-x64",
+  "version": "0.0.1-alpha.0",
+  "description": "bmux binary for macOS x64",
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BSteffaniak/bmux.git"
+  },
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "preferUnplugged": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
+}

@@ -25,3 +25,9 @@ node_modules
 .env
 .direnv
 .codeql
+
+# infra state
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.backup
+infra/wrangler/.wrangler/

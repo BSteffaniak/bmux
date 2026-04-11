@@ -1,0 +1,33 @@
+{
+  "name": "bmux",
+  "version": "0.0.1-alpha.0",
+  "description": "bmux terminal multiplexer",
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BSteffaniak/bmux.git"
+  },
+  "bin": {
+    "bmux": "bin/bmux"
+  },
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@bmux/darwin-arm64": "0.0.1-alpha.0",
+    "@bmux/darwin-x64": "0.0.1-alpha.0",
+    "@bmux/linux-arm64": "0.0.1-alpha.0",
+    "@bmux/linux-x64": "0.0.1-alpha.0",
+    "@bmux/linux-x64-musl": "0.0.1-alpha.0",
+    "@bmux/win32-x64": "0.0.1-alpha.0"
+  },
+  "files": [
+    "bin/",
+    "src/"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
+}

@@ -27,7 +27,7 @@ Today, bmux includes a working server-backed CLI, session and window management 
 
 ## Installation
 
-bmux is currently installed by building from source:
+### Source build
 
 ```bash
 git clone https://github.com/BSteffaniak/bmux.git
@@ -35,6 +35,30 @@ cd bmux
 cargo build --all-targets
 cargo test --all-targets
 ```
+
+### npm
+
+```bash
+npm install -g bmux
+# or
+npm install -g @bmux/cli
+```
+
+### packages.bmux.dev channels
+
+Stable is the default channel.
+
+```bash
+curl -fsSL https://packages.bmux.dev/install | sh
+curl -fsSL "https://packages.bmux.dev/install?channel=nightly" | sh
+```
+
+APT and RPM repository roots:
+
+- `https://packages.bmux.dev/stable/apt`
+- `https://packages.bmux.dev/stable/rpm`
+- `https://packages.bmux.dev/nightly/apt`
+- `https://packages.bmux.dev/nightly/rpm`
 
 ## Current CLI Workflow
 

@@ -1,0 +1,272 @@
+name: Release Distribution
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel"
+        type: choice
+        options: [stable, nightly]
+        default: stable
+      version:
+        description: "Version override"
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-artifacts:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            bin: bmux
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            bin: bmux
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            bin: bmux
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            bin: bmux
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin: bmux.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve archive version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="dev-${GITHUB_SHA::7}"
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p ~/.cargo
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> ~/.cargo/config.toml
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build bmux CLI
+        run: cargo build --release --target ${{ matrix.target }} -p bmux_cli
+
+      - name: Prepare archive
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.value }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
+          tar -czf "bmux-${VERSION}-${{ matrix.target }}.tar.gz" -C dist "${{ matrix.bin }}"
+
+      - name: Upload release archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: bmux-*.tar.gz
+
+  package-linux:
+    name: Build deb/rpm packages
+    runs-on: ubuntu-latest
+    needs: [build-artifacts]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            rpm_arch: x86_64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            rpm_arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu rpm createrepo-c dpkg-dev apt-utils gnupg
+
+      - name: Configure linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p ~/.cargo
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> ~/.cargo/config.toml
+
+      - name: Install nfpm
+        run: |
+          curl -fsSL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_Linux_x86_64.tar.gz | tar -xz
+          sudo mv nfpm /usr/local/bin/nfpm
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          CHANNEL="${{ inputs.channel || 'stable' }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CHANNEL="stable"
+          fi
+          BASE="${GITHUB_REF_NAME#v}"
+          if [ -n "${{ inputs.version }}" ]; then
+            BASE="${{ inputs.version }}"
+          fi
+          if [ "$CHANNEL" = "nightly" ]; then
+            VERSION="${BASE}-nightly.$(date -u +%Y%m%d)+${GITHUB_SHA::7}"
+          else
+            VERSION="$BASE"
+          fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build bmux binary
+        run: cargo build --release --target ${{ matrix.target }} -p bmux_cli
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/bmux" "dist/${{ matrix.target }}/bmux"
+
+      - name: Build deb package
+        shell: bash
+        run: |
+          export VERSION="${{ steps.meta.outputs.version }}"
+          export TARGET="${{ matrix.target }}"
+          export ARCH="${{ matrix.arch }}"
+          CFG="packaging/nfpm/${{ steps.meta.outputs.channel }}.yaml"
+          nfpm package --packager deb --target "out/${{ steps.meta.outputs.channel }}/artifacts" --config "$CFG"
+
+      - name: Build rpm package
+        shell: bash
+        run: |
+          export VERSION="${{ steps.meta.outputs.version }}"
+          export TARGET="${{ matrix.target }}"
+          export ARCH="${{ matrix.rpm_arch }}"
+          CFG="packaging/nfpm/${{ steps.meta.outputs.channel }}.yaml"
+          nfpm package --packager rpm --target "out/${{ steps.meta.outputs.channel }}/artifacts" --config "$CFG"
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages-${{ matrix.target }}
+          path: out/${{ steps.meta.outputs.channel }}/artifacts/*
+
+  publish:
+    name: Publish release and package indexes
+    runs-on: ubuntu-latest
+    needs: [build-artifacts, package-linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact archives
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release files
+        shell: bash
+        run: |
+          mkdir -p release-files
+          find artifacts -name '*.tar.gz' -type f -exec cp {} release-files/ \;
+          find artifacts -name '*.deb' -type f -exec cp {} release-files/ \;
+          find artifacts -name '*.rpm' -type f -exec cp {} release-files/ \;
+          (cd release-files && shasum -a 256 * > SHA256SUMS)
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          CHANNEL="${{ inputs.channel || 'stable' }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CHANNEL="stable"
+          fi
+          BASE="${GITHUB_REF_NAME#v}"
+          if [ -n "${{ inputs.version }}" ]; then
+            BASE="${{ inputs.version }}"
+          fi
+          if [ "$CHANNEL" = "nightly" ]; then
+            VERSION="${BASE}-nightly.$(date -u +%Y%m%d)+${GITHUB_SHA::7}"
+            TAG="nightly-${BASE}-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+            PRERELEASE=true
+          else
+            VERSION="$BASE"
+            TAG="v$VERSION"
+            PRERELEASE=false
+          fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Build apt repository metadata
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils gnupg createrepo-c
+          mkdir -p out/${{ steps.meta.outputs.channel }}/artifacts
+          cp release-files/*.deb out/${{ steps.meta.outputs.channel }}/artifacts/ || true
+          cp release-files/*.rpm out/${{ steps.meta.outputs.channel }}/artifacts/ || true
+          chmod +x packaging/repo/build-apt-repo.sh
+          ./packaging/repo/build-apt-repo.sh "${{ steps.meta.outputs.channel }}" out
+
+      - name: Build rpm repository metadata
+        shell: bash
+        run: |
+          chmod +x packaging/repo/build-rpm-repo.sh
+          ./packaging/repo/build-rpm-repo.sh "${{ steps.meta.outputs.channel }}" out
+
+      - name: Upload release to GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: bmux ${{ steps.meta.outputs.version }}
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          files: |
+            release-files/*
+
+      - name: Upload artifacts and repos to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          R2_ENDPOINT: ${{ secrets.CLOUDFLARE_R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
+        shell: bash
+        run: |
+          python -m pip install --user awscli
+          export PATH="$HOME/.local/bin:$PATH"
+          CHANNEL="${{ steps.meta.outputs.channel }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp release-files "s3://$R2_BUCKET/$CHANNEL/artifacts/$VERSION" --recursive
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp out/$CHANNEL/apt "s3://$R2_BUCKET/$CHANNEL/apt" --recursive
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp out/$CHANNEL/rpm "s3://$R2_BUCKET/$CHANNEL/rpm" --recursive

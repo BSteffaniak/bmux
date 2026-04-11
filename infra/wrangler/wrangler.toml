@@ -1,0 +1,8 @@
+name = "bmux-packages"
+main = "src/index.js"
+compatibility_date = "2026-04-11"
+
+[vars]
+PACKAGES_HOST = "packages.bmux.dev"
+STABLE_VERSION = "0.0.1-alpha.0"
+NIGHTLY_VERSION = "0.0.1-nightly.20260411+dev"
