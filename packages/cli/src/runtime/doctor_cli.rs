@@ -63,14 +63,14 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
     };
 
     let host_state_path = paths.runtime_dir.join("host-state.json");
-    let host_runtime_ok = host_state_path.exists();
+    let host_runtime_ok = hosted_runtime_is_running(&host_state_path);
     let share_lookup_ok = !config.connections.share_links.is_empty();
 
     let lines = vec![
         (
             "auth",
             auth_ok,
-            "run 'bmux auth login'",
+            "bmux auth login",
             format!("state: {}", auth_path.display()),
         ),
         (
@@ -82,13 +82,13 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
         (
             "host-runtime",
             host_runtime_ok,
-            "run 'bmux host'",
+            "bmux host --daemon",
             format!("state: {}", host_state_path.display()),
         ),
         (
             "share-lookup",
             share_lookup_ok,
-            "run 'bmux share --name <name>'",
+            "bmux share <target> --name <name>",
             format!("known links: {}", config.connections.share_links.len()),
         ),
     ];
@@ -99,7 +99,7 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
             .map(|(name, ok, hint, detail)| {
                 (
                     (*name).to_string(),
-                    serde_json::json!({ "ok": ok, "detail": detail, "hint": if *ok { serde_json::Value::Null } else { serde_json::Value::String((*hint).to_string()) }}),
+                    serde_json::json!({ "ok": ok, "detail": detail, "fix": if *ok { serde_json::Value::Null } else { serde_json::Value::String("bmux setup".to_string()) }, "advanced": if *ok { serde_json::Value::Null } else { serde_json::Value::String((*hint).to_string()) }}),
                 )
             })
             .collect();
@@ -114,13 +114,50 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
                 println!("{name}: PASS ({detail})");
             } else {
                 println!("{name}: FAIL ({detail})");
-                println!("  fix: {hint}");
+                println!("  Fix: bmux setup");
+                println!("  Advanced: {hint}");
             }
         }
     }
 
     let has_failures = lines.iter().any(|(_, ok, _, _)| !*ok);
     Ok(u8::from(has_failures))
+}
+
+fn hosted_runtime_is_running(path: &PathBuf) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    let Some(pid) = json
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return false;
+    };
+
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(windows)]
+    {
+        return std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            });
+    }
 }
 
 // ── text output ─────────────────────────────────────────────────────────

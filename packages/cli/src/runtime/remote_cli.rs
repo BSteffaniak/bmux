@@ -612,26 +612,38 @@ fn map_connect_target_resolution_error(target: &str, error: anyhow::Error) -> an
 }
 
 pub(super) async fn run_setup(check: bool, mode: Option<HostedModeArg>) -> Result<u8> {
-    let config = BmuxConfig::load()?;
+    let mut config = BmuxConfig::load()?;
     let hosted_mode = resolve_hosted_mode(&config, mode);
     if check {
         return run_setup_check(hosted_mode);
     }
 
     println!("bmux setup");
+    let mut auth_state = None;
     if hosted_mode == HostedMode::ControlPlane {
         println!("Step 1/2: auth");
-        let _ = ensure_authenticated(&config).await?;
+        auth_state = Some(ensure_authenticated(&config).await?);
         println!("Step 2/2: host");
     } else {
         println!("Step 1/1: host");
     }
     let _ = spawn_host_daemon("127.0.0.1:7443", None, hosted_mode)?;
-    let host_state = wait_for_running_host_state(std::time::Duration::from_secs(5)).await?;
+    let mut host_state = wait_for_running_host_state(std::time::Duration::from_secs(5)).await?;
+
+    if hosted_mode == HostedMode::ControlPlane
+        && let Some(auth_state) = auth_state.as_ref()
+    {
+        let repaired_share = ensure_setup_share_link(&mut config, auth_state, &host_state).await?;
+        if host_state.share_link.as_deref() != repaired_share.as_deref() {
+            host_state.share_link = repaired_share;
+            save_host_runtime_state(&ConfigPaths::default(), &host_state)?;
+        }
+    }
 
     let account = if hosted_mode == HostedMode::ControlPlane {
-        load_auth_state_optional(&ConfigPaths::default())?
-            .and_then(|state| state.account_name)
+        auth_state
+            .as_ref()
+            .and_then(|state| state.account_name.clone())
             .or_else(|| config.connections.default_target.clone())
     } else {
         None
@@ -659,13 +671,17 @@ fn run_setup_check(mode: HostedMode) -> Result<u8> {
     let paths = ConfigPaths::default();
     let auth_state = load_auth_state_optional(&paths)?;
     let host_state = load_host_runtime_state(&paths)?;
+    let share_ready = host_state
+        .as_ref()
+        .and_then(|state| state.share_link.as_deref())
+        .is_some();
     let auth_ready = auth_state.is_some();
     let auth_required = mode == HostedMode::ControlPlane;
     let host_alive = host_state
         .as_ref()
         .is_some_and(|state| is_process_alive(state.pid));
 
-    if (!auth_required || auth_ready) && host_alive {
+    if (!auth_required || auth_ready) && host_alive && (mode == HostedMode::P2p || share_ready) {
         let account = auth_state
             .as_ref()
             .and_then(|state| state.account_name.as_deref());
@@ -687,32 +703,77 @@ fn run_setup_check(mode: HostedMode) -> Result<u8> {
         return Ok(0);
     }
 
-    for line in format_setup_check_not_ready_lines(
-        auth_required,
-        auth_ready,
-        host_state.as_ref(),
-        host_alive,
-    ) {
+    let auth_check = if auth_required {
+        if auth_ready {
+            SetupAuthCheck::Ready
+        } else {
+            SetupAuthCheck::RequiredMissing
+        }
+    } else {
+        SetupAuthCheck::NotRequired
+    };
+    let host_check = if host_alive {
+        SetupHostCheck::Running
+    } else {
+        host_state
+            .as_ref()
+            .map_or(SetupHostCheck::Offline, |state| {
+                SetupHostCheck::Stale(state.pid)
+            })
+    };
+    let share_check = if mode == HostedMode::ControlPlane {
+        if share_ready {
+            SetupShareCheck::Ready
+        } else {
+            SetupShareCheck::RequiredMissing
+        }
+    } else {
+        SetupShareCheck::NotRequired
+    };
+
+    for line in format_setup_check_not_ready_lines(auth_check, host_check, share_check) {
         println!("{line}");
     }
     Ok(1)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupAuthCheck {
+    RequiredMissing,
+    Ready,
+    NotRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupHostCheck {
+    Offline,
+    Stale(u32),
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupShareCheck {
+    RequiredMissing,
+    Ready,
+    NotRequired,
+}
+
 fn format_setup_check_not_ready_lines(
-    auth_required: bool,
-    auth_ready: bool,
-    host_state: Option<&HostRuntimeState>,
-    host_alive: bool,
+    auth_check: SetupAuthCheck,
+    host_check: SetupHostCheck,
+    share_check: SetupShareCheck,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
-    if auth_required && !auth_ready {
+    if auth_check == SetupAuthCheck::RequiredMissing {
         reasons.push("not signed in".to_string());
     }
-    if !host_alive {
-        reasons.push(host_state.map_or_else(
-            || "host is offline".to_string(),
-            |state| format!("host state is stale (pid {})", state.pid),
-        ));
+    match host_check {
+        SetupHostCheck::Offline => reasons.push("host is offline".to_string()),
+        SetupHostCheck::Stale(pid) => reasons.push(format!("host state is stale (pid {pid})")),
+        SetupHostCheck::Running => {}
+    }
+    if share_check == SetupShareCheck::RequiredMissing && host_check == SetupHostCheck::Running {
+        reasons.push("share link unavailable".to_string());
     }
 
     let reason_text = if reasons.is_empty() {
@@ -726,13 +787,18 @@ fn format_setup_check_not_ready_lines(
         format!("Reason: {reason_text}"),
         "Fix: bmux setup".to_string(),
     ];
-    if auth_required && !auth_ready {
+    if auth_check == SetupAuthCheck::RequiredMissing {
         lines.push("Advanced: bmux auth login".to_string());
-    } else if !host_alive {
-        lines.push(match host_state {
-            Some(_) => "Advanced: bmux host --restart".to_string(),
-            None => "Advanced: bmux host --daemon".to_string(),
-        });
+    } else if share_check == SetupShareCheck::RequiredMissing
+        && host_check == SetupHostCheck::Running
+    {
+        lines.push("Advanced: bmux share <target> --name <name>".to_string());
+    } else {
+        match host_check {
+            SetupHostCheck::Stale(_) => lines.push("Advanced: bmux host --restart".to_string()),
+            SetupHostCheck::Offline => lines.push("Advanced: bmux host --daemon".to_string()),
+            SetupHostCheck::Running => {}
+        }
     }
     lines
 }
@@ -1149,12 +1215,40 @@ pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Resul
     run_connect(Some(&target), resumed_session, None, false, true).await
 }
 
-pub(super) fn run_hosts() -> Result<u8> {
+pub(super) fn run_hosts(verbose: bool) -> Result<u8> {
     let config = BmuxConfig::load()?;
-    if !config.connections.recent_targets.is_empty() {
-        println!("recent:");
-        for target in &config.connections.recent_targets {
-            println!("- {target}");
+    let paths = ConfigPaths::default();
+    let auth_ready = load_auth_state_optional(&paths)?.is_some();
+    let host_state = load_host_runtime_state(&paths)?;
+    let host_running = host_state
+        .as_ref()
+        .is_some_and(|state| is_process_alive(state.pid));
+    if auth_ready && host_running {
+        println!("Status: ready");
+    } else {
+        println!("Status: not ready");
+        let reason = match (auth_ready, host_running, host_state.as_ref()) {
+            (false, false, Some(state)) => {
+                format!("not signed in; host state is stale (pid {})", state.pid)
+            }
+            (false, false, None) => "not signed in; host is offline".to_string(),
+            (false, true, _) => "not signed in".to_string(),
+            (true, false, Some(state)) => format!("host state is stale (pid {})", state.pid),
+            (true, false, None) => "host is offline".to_string(),
+            (true, true, _) => "not ready".to_string(),
+        };
+        println!("Reason: {reason}");
+        println!("Fix: bmux setup");
+    }
+
+    if !config.connections.share_links.is_empty() {
+        println!("share links:");
+        for (name, target) in &config.connections.share_links {
+            println!("- bmux://{name}");
+            println!("  next: bmux join bmux://{name}");
+            if verbose {
+                println!("  target: {target}");
+            }
         }
     }
     if !config.connections.targets.is_empty() {
@@ -1166,21 +1260,29 @@ pub(super) fn run_hosts() -> Result<u8> {
                 ConnectionTransport::Tls => "tls",
                 ConnectionTransport::Iroh => "iroh",
             };
-            println!("- {name} ({transport})");
+            println!("- {name}");
+            println!("  next: bmux connect {name}");
+            if verbose {
+                println!("  transport: {transport}");
+            }
         }
     }
-    if !config.connections.share_links.is_empty() {
-        println!("share links:");
-        for (name, target) in &config.connections.share_links {
-            println!("- bmux://{name} -> {target}");
-            println!("  join: bmux join bmux://{name}");
+    if !config.connections.recent_targets.is_empty() {
+        println!("recent:");
+        for target in &config.connections.recent_targets {
+            println!("- {target}");
+            if verbose {
+                println!("  next: bmux join {target}");
+            }
         }
     }
     if config.connections.recent_targets.is_empty()
         && config.connections.targets.is_empty()
         && config.connections.share_links.is_empty()
     {
-        println!("no hosts configured");
+        println!("No saved hosts yet.");
+        println!("Fix: bmux setup");
+        println!("Advanced: bmux host --daemon");
     }
     Ok(0)
 }
@@ -1205,9 +1307,11 @@ pub(super) async fn run_auth_login(no_browser: bool) -> Result<u8> {
         println!("Waiting for confirmation...");
         wait_for_device_token(&control_plane_url, &started).await?
     } else {
-        anyhow::bail!(
-            "BMUX_AUTH_TOKEN is required in non-interactive mode; interactive login supports device flow"
-        );
+        return Err(actionable_error(
+            "BMUX_AUTH_TOKEN is required in non-interactive mode",
+            "bmux setup",
+            Some("export BMUX_AUTH_TOKEN=<token>"),
+        ));
     };
 
     let whoami = verify_access_token(&control_plane_url, &token).await?;
@@ -1232,10 +1336,12 @@ pub(super) async fn run_auth_login(no_browser: bool) -> Result<u8> {
 pub(super) fn run_auth_status() -> Result<u8> {
     let paths = ConfigPaths::default();
     let Some(state) = load_auth_state_optional(&paths)? else {
-        println!("not authenticated");
+        println!("auth: not authenticated");
+        println!("Fix: bmux setup");
+        println!("Advanced: bmux auth login");
         return Ok(1);
     };
-    println!("authenticated");
+    println!("auth: authenticated");
     if let Some(account_name) = state.account_name.as_deref() {
         println!("account: {account_name}");
     }
@@ -1300,34 +1406,43 @@ pub(super) async fn run_share(
             .cloned()
             .unwrap_or_else(|| "local".to_string())
     };
-    let slug = name.map_or_else(
-        || format!("share-{}", Uuid::new_v4().simple()),
-        ToString::to_string,
-    );
-
     let control_plane_url = control_plane_url(&config);
     let auth_state = load_auth_state_optional(&ConfigPaths::default())?.ok_or_else(|| {
         actionable_error("not authenticated", "bmux setup", Some("bmux auth login"))
     })?;
-    let created = create_share_link(
+    let slug = suggest_share_link_name(
+        name,
+        &resolved_target,
+        &config,
+        auth_state.account_name.as_deref(),
+    );
+    let reserved_names = config
+        .connections
+        .share_links
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let create_spec = ShareCreateSpec {
+        target: &resolved_target,
+        role,
+        ttl: ttl.map(ToString::to_string),
+        one_time,
+    };
+    let (created_name, created) = create_share_link_with_fallback_name(
         &control_plane_url,
         &auth_state.access_token,
-        &build_create_share_request(
-            slug.clone(),
-            resolved_target.clone(),
-            role.to_string(),
-            ttl.map(ToString::to_string),
-            one_time,
-        ),
+        &slug,
+        &create_spec,
+        &reserved_names,
     )
     .await?;
 
     config
         .connections
         .share_links
-        .insert(slug.clone(), resolved_target.clone());
+        .insert(created_name.clone(), resolved_target.clone());
     config.save()?;
-    let link_name = created.name.clone().unwrap_or(slug);
+    let link_name = created.name.clone().unwrap_or(created_name);
     let invite_url = created.url;
     println!("Share link: bmux://{link_name}");
     if let Some(url) = invite_url.as_deref() {
@@ -1713,13 +1828,18 @@ fn format_host_status_lines(state: &HostRuntimeState) -> Vec<String> {
 fn run_host_stop() -> Result<u8> {
     let paths = ConfigPaths::default();
     let Some(state) = load_host_runtime_state(&paths)? else {
-        println!("host runtime is not running");
+        println!("host runtime: not running");
+        println!("Fix: bmux setup");
+        println!("Advanced: bmux host --daemon");
         return Ok(0);
     };
 
     if !is_process_alive(state.pid) {
         clear_host_runtime_state(&paths)?;
-        println!("host runtime is not running");
+        println!("host runtime: not running");
+        println!("Reason: stale runtime state was cleared");
+        println!("Fix: bmux setup");
+        println!("Advanced: bmux host --restart");
         return Ok(0);
     }
 
@@ -1805,12 +1925,18 @@ async fn ensure_local_ipc_backend_ready(paths: &ConfigPaths, mode: HostedMode) -
     }
 
     let endpoint_label = local_ipc_endpoint_label(paths);
-    anyhow::bail!(
-        "host bridge could not reach local IPC endpoint '{}' for runtime '{}'.\nRun `bmux --runtime {} server start --daemon` and retry.",
-        endpoint_label,
-        active_runtime_name(),
-        active_runtime_name(),
-    );
+    Err(actionable_error(
+        &format!(
+            "host bridge could not reach local IPC endpoint '{}' for runtime '{}'",
+            endpoint_label,
+            active_runtime_name(),
+        ),
+        "bmux setup",
+        Some(&format!(
+            "bmux --runtime {} server start --daemon",
+            active_runtime_name()
+        )),
+    ))
 }
 
 async fn local_ipc_connectable(endpoint: &IpcEndpoint) -> bool {
@@ -1896,8 +2022,23 @@ fn save_auth_state(paths: &ConfigPaths, state: &AuthState) -> Result<()> {
 
 async fn ensure_authenticated(config: &BmuxConfig) -> Result<AuthState> {
     let paths = ConfigPaths::default();
-    if let Some(state) = load_auth_state_optional(&paths)? {
-        return Ok(state);
+    let control_plane = control_plane_url(config);
+    if let Some(mut state) = load_auth_state_optional(&paths)? {
+        match verify_access_token(&control_plane, &state.access_token).await {
+            Ok(whoami) => {
+                if state.account_name.is_none() {
+                    state.account_name = whoami.account_name;
+                }
+                if state.account_id.is_none() {
+                    state.account_id = whoami.account_id;
+                }
+                return Ok(state);
+            }
+            Err(error) => {
+                println!("Auth state is stale ({error}); re-authenticating...");
+                let _ = std::fs::remove_file(auth_state_path(&paths));
+            }
+        }
     }
     println!("not authenticated; starting login...");
     run_auth_login(false).await?;
@@ -1941,6 +2082,54 @@ fn suggest_share_name(name: Option<&str>, auth_state: &AuthState) -> String {
     format!("host-{}", Uuid::new_v4().simple())
 }
 
+fn suggest_share_link_name(
+    requested_name: Option<&str>,
+    target: &str,
+    config: &BmuxConfig,
+    account_name: Option<&str>,
+) -> String {
+    if let Some(value) = requested_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return value.to_string();
+    }
+    if let Some((name, _)) = config
+        .connections
+        .share_links
+        .iter()
+        .find(|(_, existing_target)| existing_target == &target)
+    {
+        return name.clone();
+    }
+    if let Some(account) = account_name {
+        let slug = sanitize_slug(account);
+        if !slug.is_empty() {
+            return format!("{slug}-share");
+        }
+    }
+    let target_slug = sanitize_slug(target.trim_start_matches("bmux://"));
+    if !target_slug.is_empty() {
+        return format!("{target_slug}-share");
+    }
+    "share".to_string()
+}
+
+fn sanitize_slug(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
 async fn ensure_host_share_link(
     config: &mut BmuxConfig,
     control_plane_url: &str,
@@ -1950,28 +2139,136 @@ async fn ensure_host_share_link(
 ) -> Result<String> {
     if let Some(mapped) = config.connections.share_links.get(name)
         && mapped == target
+        && share_link_matches_target(control_plane_url, token, name, target).await?
     {
         return Ok(name.to_string());
     }
-    let created = create_share_link(
+    let reserved_names = config
+        .connections
+        .share_links
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let create_spec = ShareCreateSpec {
+        target,
+        role: "control",
+        ttl: None,
+        one_time: false,
+    };
+    let (resolved_name, _) = create_share_link_with_fallback_name(
         control_plane_url,
         token,
-        &build_create_share_request(
-            name.to_string(),
-            target.to_string(),
-            "control".to_string(),
-            None,
-            false,
-        ),
+        name,
+        &create_spec,
+        &reserved_names,
     )
     .await?;
-    let resolved_name = created.name.unwrap_or_else(|| name.to_string());
     config
         .connections
         .share_links
         .insert(resolved_name.clone(), target.to_string());
     config.save()?;
     Ok(resolved_name)
+}
+
+async fn ensure_setup_share_link(
+    config: &mut BmuxConfig,
+    auth_state: &AuthState,
+    host_state: &HostRuntimeState,
+) -> Result<Option<String>> {
+    let control_plane_url = control_plane_url(config);
+    let token = auth_state.access_token.as_str();
+    let existing_name = host_state
+        .share_link
+        .as_deref()
+        .and_then(|value| value.strip_prefix("bmux://"));
+    let share_name = existing_name.map_or_else(
+        || suggest_share_name(host_state.name.as_deref(), auth_state),
+        ToString::to_string,
+    );
+    let resolved = ensure_host_share_link(
+        config,
+        &control_plane_url,
+        token,
+        &share_name,
+        &host_state.target,
+    )
+    .await?;
+    Ok(Some(format!("bmux://{resolved}")))
+}
+
+async fn share_link_matches_target(
+    control_plane_url: &str,
+    token: &str,
+    name: &str,
+    expected_target: &str,
+) -> Result<bool> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{control_plane_url}/v1/share-links/{name}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("failed contacting {control_plane_url}"))?;
+    if response.status().as_u16() == 404 {
+        return Ok(false);
+    }
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "share lookup failed (status {})",
+            response.status().as_u16()
+        );
+    }
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .context("failed parsing share lookup response")?;
+    Ok(payload
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value == expected_target))
+}
+
+struct ShareCreateSpec<'a> {
+    target: &'a str,
+    role: &'a str,
+    ttl: Option<String>,
+    one_time: bool,
+}
+
+async fn create_share_link_with_fallback_name(
+    control_plane_url: &str,
+    token: &str,
+    base_name: &str,
+    create_spec: &ShareCreateSpec<'_>,
+    reserved_names: &std::collections::BTreeSet<String>,
+) -> Result<(String, ShareLinkResponse)> {
+    for attempt in 0..10 {
+        let candidate = if attempt == 0 {
+            base_name.to_string()
+        } else {
+            format!("{base_name}-{}", attempt + 1)
+        };
+        if reserved_names.contains(&candidate) && candidate != base_name {
+            continue;
+        }
+        let request = build_create_share_request(
+            candidate.clone(),
+            create_spec.target.to_string(),
+            create_spec.role.to_string(),
+            create_spec.ttl.clone(),
+            create_spec.one_time,
+        );
+        match create_share_link(control_plane_url, token, &request).await {
+            Ok(created) => {
+                let resolved_name = created.name.clone().unwrap_or_else(|| candidate.clone());
+                return Ok((resolved_name, created));
+            }
+            Err(error) if error.to_string().contains("status 409") => {}
+            Err(error) => return Err(error),
+        }
+    }
+    anyhow::bail!("share creation failed: could not allocate unique share name")
 }
 
 async fn register_host_presence(
@@ -4380,6 +4677,24 @@ mod tests {
     }
 
     #[test]
+    fn suggest_share_link_name_reuses_existing_target_mapping() {
+        let mut config = BmuxConfig::default();
+        config
+            .connections
+            .share_links
+            .insert("alice-share".to_string(), "iroh://demo".to_string());
+        let name = suggest_share_link_name(None, "iroh://demo", &config, Some("alice"));
+        assert_eq!(name, "alice-share");
+    }
+
+    #[test]
+    fn suggest_share_link_name_prefers_account_slug() {
+        let config = BmuxConfig::default();
+        let name = suggest_share_link_name(None, "iroh://demo", &config, Some("alice@example.com"));
+        assert_eq!(name, "alice-example-com-share");
+    }
+
+    #[test]
     fn render_text_qr_produces_multiline_output() {
         let lines = render_text_qr("bmux://demo").expect("render qr");
         assert!(lines.len() > 4);
@@ -4461,7 +4776,11 @@ mod tests {
 
     #[test]
     fn setup_check_not_ready_lines_prefers_setup_fix_and_auth_advanced() {
-        let lines = format_setup_check_not_ready_lines(true, false, None, false);
+        let lines = format_setup_check_not_ready_lines(
+            SetupAuthCheck::RequiredMissing,
+            SetupHostCheck::Offline,
+            SetupShareCheck::RequiredMissing,
+        );
         assert_eq!(lines[0], "Setup check: not ready");
         assert_eq!(lines[1], "Reason: not signed in; host is offline");
         assert_eq!(lines[2], "Fix: bmux setup");
@@ -4477,7 +4796,11 @@ mod tests {
             name: Some("demo-host".to_string()),
             started_at_unix: 1,
         };
-        let lines = format_setup_check_not_ready_lines(true, true, Some(&state), false);
+        let lines = format_setup_check_not_ready_lines(
+            SetupAuthCheck::Ready,
+            SetupHostCheck::Stale(state.pid),
+            SetupShareCheck::RequiredMissing,
+        );
         assert_eq!(lines[1], "Reason: host state is stale (pid 4242)");
         assert_eq!(lines[2], "Fix: bmux setup");
         assert_eq!(lines[3], "Advanced: bmux host --restart");
@@ -4485,10 +4808,25 @@ mod tests {
 
     #[test]
     fn setup_check_not_ready_lines_p2p_does_not_require_auth() {
-        let lines = format_setup_check_not_ready_lines(false, false, None, false);
+        let lines = format_setup_check_not_ready_lines(
+            SetupAuthCheck::NotRequired,
+            SetupHostCheck::Offline,
+            SetupShareCheck::NotRequired,
+        );
         assert_eq!(lines[1], "Reason: host is offline");
         assert_eq!(lines[2], "Fix: bmux setup");
         assert_eq!(lines[3], "Advanced: bmux host --daemon");
+    }
+
+    #[test]
+    fn setup_check_not_ready_lines_report_missing_share_when_host_running() {
+        let lines = format_setup_check_not_ready_lines(
+            SetupAuthCheck::Ready,
+            SetupHostCheck::Running,
+            SetupShareCheck::RequiredMissing,
+        );
+        assert_eq!(lines[1], "Reason: share link unavailable");
+        assert_eq!(lines[3], "Advanced: bmux share <target> --name <name>");
     }
 
     #[test]

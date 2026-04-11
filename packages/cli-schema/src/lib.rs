@@ -322,7 +322,11 @@ pub enum Command {
         session: Option<String>,
     },
     /// List known hosts/targets (recent first)
-    Hosts,
+    Hosts {
+        /// Include detailed target mappings and diagnostics
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Authentication commands
     Auth {
         #[command(subcommand)]
@@ -1606,6 +1610,24 @@ mod tests {
             panic!("expected setup command");
         };
         assert_eq!(mode, Some(HostedModeArg::ControlPlane));
+    }
+
+    #[test]
+    fn parses_hosts_defaults() {
+        let cli = Cli::try_parse_from(["bmux", "hosts"]).expect("valid CLI args");
+        let Some(Command::Hosts { verbose }) = cli.command else {
+            panic!("expected hosts command");
+        };
+        assert!(!verbose);
+    }
+
+    #[test]
+    fn parses_hosts_verbose_flag() {
+        let cli = Cli::try_parse_from(["bmux", "hosts", "--verbose"]).expect("valid CLI args");
+        let Some(Command::Hosts { verbose }) = cli.command else {
+            panic!("expected hosts command");
+        };
+        assert!(verbose);
     }
 
     #[test]

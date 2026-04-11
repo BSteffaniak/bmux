@@ -47,7 +47,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
         Command::Setup { .. } => BuiltInHandlerId::Setup,
         Command::Host { .. } => BuiltInHandlerId::Host,
         Command::Join { .. } => BuiltInHandlerId::Join,
-        Command::Hosts => BuiltInHandlerId::Hosts,
+        Command::Hosts { .. } => BuiltInHandlerId::Hosts,
         Command::Auth { command } => match command {
             AuthCommand::Login { .. } => BuiltInHandlerId::AuthLogin,
             AuthCommand::Status => BuiltInHandlerId::AuthStatus,
@@ -206,7 +206,7 @@ pub(super) async fn dispatch_built_in_command(
         (BuiltInHandlerId::Join, Command::Join { link, session }) => {
             run_join(link.as_deref(), session.as_deref()).await
         }
-        (BuiltInHandlerId::Hosts, Command::Hosts) => run_hosts(),
+        (BuiltInHandlerId::Hosts, Command::Hosts { verbose }) => run_hosts(*verbose),
         (
             BuiltInHandlerId::AuthLogin,
             Command::Auth {
