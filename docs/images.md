@@ -4,11 +4,11 @@ bmux supports inline terminal images through three protocols: **Sixel**, **Kitty
 
 ## Supported Image Protocols
 
-| Protocol | Origin | How It Works |
-|----------|--------|-------------|
-| **Sixel** | DEC, 1980s | ASCII-encoded raster data in DCS escape sequences. Widely supported by modern terminals (foot, WezTerm, mlterm, contour, xterm with `-ti vt340`). |
-| **Kitty Graphics** | kitty terminal | Binary pixel data or PNG in APC escape sequences. Supports transparency, animation, and efficient placement. Used by kitty, WezTerm, Ghostty. |
-| **iTerm2** | iTerm2 | Base64-encoded image files (PNG, JPEG, GIF) in OSC sequences. Used by iTerm2, WezTerm, mintty. |
+| Protocol           | Origin         | How It Works                                                                                                                                      |
+| ------------------ | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Sixel**          | DEC, 1980s     | ASCII-encoded raster data in DCS escape sequences. Widely supported by modern terminals (foot, WezTerm, mlterm, contour, xterm with `-ti vt340`). |
+| **Kitty Graphics** | kitty terminal | Binary pixel data or PNG in APC escape sequences. Supports transparency, animation, and efficient placement. Used by kitty, WezTerm, Ghostty.     |
+| **iTerm2**         | iTerm2         | Base64-encoded image files (PNG, JPEG, GIF) in OSC sequences. Used by iTerm2, WezTerm, mintty.                                                    |
 
 ## How It Works
 

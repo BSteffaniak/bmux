@@ -11,19 +11,19 @@ written -- struct fields are serialized in declaration order.
 
 ## Wire Format
 
-| Rust type | Wire encoding |
-|-----------|---------------|
-| `bool` | single byte (0/1) |
-| `u8` | single byte |
-| `u16`..`u64` | unsigned LEB128 |
-| `i8`..`i64` | ZigZag + unsigned LEB128 |
-| `f32`/`f64` | little-endian IEEE 754 |
-| `&str`/`String` | varint length + UTF-8 bytes |
-| `&[u8]`/`Vec<u8>` | varint length + raw bytes |
-| `Option<T>` | 0x00 (None) or 0x01 + value |
-| `enum` variant | varint discriminant + fields |
-| `Vec<T>` / maps | varint length + elements |
-| structs | fields in order, no names |
+| Rust type         | Wire encoding                |
+| ----------------- | ---------------------------- |
+| `bool`            | single byte (0/1)            |
+| `u8`              | single byte                  |
+| `u16`..`u64`      | unsigned LEB128              |
+| `i8`..`i64`       | ZigZag + unsigned LEB128     |
+| `f32`/`f64`       | little-endian IEEE 754       |
+| `&str`/`String`   | varint length + UTF-8 bytes  |
+| `&[u8]`/`Vec<u8>` | varint length + raw bytes    |
+| `Option<T>`       | 0x00 (None) or 0x01 + value  |
+| `enum` variant    | varint discriminant + fields |
+| `Vec<T>` / maps   | varint length + elements     |
+| structs           | fields in order, no names    |
 
 ## Core Types
 

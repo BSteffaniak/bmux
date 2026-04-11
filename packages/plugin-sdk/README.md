@@ -66,13 +66,13 @@ static-bundled = []
 
 Every plugin implements `RustPlugin`. All five methods have default implementations -- override only what your plugin needs:
 
-| Method | Return type | When to override |
-|--------|------------|-----------------|
-| `run_command` | `Result<i32, PluginCommandError>` | Plugin provides CLI commands |
-| `invoke_service` | `ServiceResponse` | Plugin provides services to other plugins |
-| `activate` | `Result<i32, PluginCommandError>` | Plugin needs setup on activation |
-| `deactivate` | `Result<i32, PluginCommandError>` | Plugin needs cleanup on deactivation |
-| `handle_event` | `Result<i32, PluginCommandError>` | Plugin subscribes to system events |
+| Method           | Return type                       | When to override                          |
+| ---------------- | --------------------------------- | ----------------------------------------- |
+| `run_command`    | `Result<i32, PluginCommandError>` | Plugin provides CLI commands              |
+| `invoke_service` | `ServiceResponse`                 | Plugin provides services to other plugins |
+| `activate`       | `Result<i32, PluginCommandError>` | Plugin needs setup on activation          |
+| `deactivate`     | `Result<i32, PluginCommandError>` | Plugin needs cleanup on deactivation      |
+| `handle_event`   | `Result<i32, PluginCommandError>` | Plugin subscribes to system events        |
 
 The trait requires `Default + Send + 'static`. Use `#[derive(Default)]` on your struct.
 
@@ -117,12 +117,12 @@ Err(PluginCommandError::unavailable("feature not supported on this platform"))
 
 ### Exit codes
 
-| Constant | Value | Meaning |
-|----------|-------|---------|
-| `EXIT_OK` | 0 | Success |
-| `EXIT_ERROR` | 1 | Generic failure |
-| `EXIT_USAGE` | 64 | Bad arguments or unknown command |
-| `EXIT_UNAVAILABLE` | 70 | Plugin unavailable |
+| Constant           | Value | Meaning                          |
+| ------------------ | ----- | -------------------------------- |
+| `EXIT_OK`          | 0     | Success                          |
+| `EXIT_ERROR`       | 1     | Generic failure                  |
+| `EXIT_USAGE`       | 64    | Bad arguments or unknown command |
+| `EXIT_UNAVAILABLE` | 70    | Plugin unavailable               |
 
 ### Arguments
 
@@ -210,20 +210,20 @@ Simple plugins that only handle commands or receive service calls do **not** nee
 
 ### Top-Level Fields
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `id` | string | **Yes** | -- | Unique plugin identifier (e.g. `"bmux.clipboard"`) |
-| `name` | string | **Yes** | -- | Human-readable display name |
-| `version` | string | **Yes** | -- | Plugin version (semver) |
-| `description` | string | No | -- | Optional description |
-| `homepage` | string | No | -- | Optional URL |
-| `runtime` | string | No | `"native"` | Runtime type (only `"native"` supported) |
-| `entry` | path | No | -- | Path to `.dylib`/`.so` (only for external plugins) |
-| `entry_symbol` | string | No | `"bmux_plugin_entry_v1"` | FFI entry symbol |
-| `provider_priority` | integer | No | `0` | Ordering when multiple plugins provide the same capability |
-| `required_capabilities` | list | No | `[]` | Host capabilities this plugin needs |
-| `provided_capabilities` | list | No | `[]` | Capabilities this plugin provides |
-| `provided_features` | list | No | `[]` | Feature flags this plugin provides |
+| Field                   | Type    | Required | Default                  | Description                                                |
+| ----------------------- | ------- | -------- | ------------------------ | ---------------------------------------------------------- |
+| `id`                    | string  | **Yes**  | --                       | Unique plugin identifier (e.g. `"bmux.clipboard"`)         |
+| `name`                  | string  | **Yes**  | --                       | Human-readable display name                                |
+| `version`               | string  | **Yes**  | --                       | Plugin version (semver)                                    |
+| `description`           | string  | No       | --                       | Optional description                                       |
+| `homepage`              | string  | No       | --                       | Optional URL                                               |
+| `runtime`               | string  | No       | `"native"`               | Runtime type (only `"native"` supported)                   |
+| `entry`                 | path    | No       | --                       | Path to `.dylib`/`.so` (only for external plugins)         |
+| `entry_symbol`          | string  | No       | `"bmux_plugin_entry_v1"` | FFI entry symbol                                           |
+| `provider_priority`     | integer | No       | `0`                      | Ordering when multiple plugins provide the same capability |
+| `required_capabilities` | list    | No       | `[]`                     | Host capabilities this plugin needs                        |
+| `provided_capabilities` | list    | No       | `[]`                     | Capabilities this plugin provides                          |
+| `provided_features`     | list    | No       | `[]`                     | Feature flags this plugin provides                         |
 
 ### Compatibility (optional)
 
