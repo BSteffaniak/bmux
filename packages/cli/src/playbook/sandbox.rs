@@ -14,6 +14,13 @@ use bmux_client::BmuxClient;
 use bmux_config::ConfigPaths;
 use tracing::warn;
 
+use crate::sandbox_meta::{
+    SandboxManifest, SandboxManifestPaths, clear_lock as clear_sandbox_lock,
+    read_manifest as read_sandbox_manifest, sandbox_id_from_root as sandbox_id_from_root_meta,
+    unix_millis_now as unix_millis_now_meta, write_lock as write_sandbox_lock,
+    write_manifest as write_sandbox_manifest,
+};
+
 use super::types::PluginConfig;
 
 /// Handle to a running sandbox server.
@@ -71,6 +78,18 @@ impl SandboxServer {
             None => std::env::current_exe().context("failed resolving bmux binary path")?,
         };
 
+        write_playbook_manifest(
+            &root_dir,
+            &paths,
+            &bmux_binary,
+            &["server".to_string(), "start".to_string()],
+            env_mode,
+            "running",
+            None,
+            true,
+        )?;
+        let _ = write_sandbox_lock(&root_dir, std::process::id());
+
         let handle = start_sandbox_server(
             &bmux_binary,
             &paths,
@@ -120,6 +139,23 @@ impl SandboxServer {
     pub async fn shutdown(mut self, retain_on_failure: bool) -> Result<()> {
         self.cleaned_up = true;
         let result = self.stop_server().await;
+        let status = if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        let keep = retain_on_failure || result.is_err();
+        let _ = write_playbook_manifest(
+            &self.root_dir,
+            self.paths(),
+            &std::env::current_exe().unwrap_or_else(|_| PathBuf::from("bmux")),
+            &["server".to_string(), "stop".to_string()],
+            super::types::SandboxEnvMode::Inherit,
+            status,
+            None,
+            keep,
+        );
+        clear_sandbox_lock(&self.root_dir);
         if !retain_on_failure || result.is_ok() {
             let _ = std::fs::remove_dir_all(&self.root_dir);
         }
@@ -176,6 +212,7 @@ impl Drop for SandboxServer {
                 }
             }
         }
+        clear_sandbox_lock(&self.root_dir);
         let _ = std::fs::remove_dir_all(&self.root_dir);
     }
 }
@@ -194,6 +231,45 @@ fn create_temp_paths() -> (ConfigPaths, PathBuf) {
         root.join("s"),
     );
     (paths, root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_playbook_manifest(
+    root_dir: &Path,
+    paths: &ConfigPaths,
+    bmux_binary: &Path,
+    command: &[String],
+    env_mode: super::types::SandboxEnvMode,
+    status: &str,
+    exit_code: Option<i32>,
+    kept: bool,
+) -> Result<()> {
+    let env_mode = match env_mode {
+        super::types::SandboxEnvMode::Clean => "clean",
+        super::types::SandboxEnvMode::Inherit => "inherit",
+    };
+    let manifest = SandboxManifest {
+        id: sandbox_id_from_root_meta(root_dir),
+        source: "playbook".to_string(),
+        created_at_unix_ms: read_sandbox_manifest(root_dir)
+            .ok()
+            .map_or_else(unix_millis_now_meta, |existing| existing.created_at_unix_ms),
+        updated_at_unix_ms: unix_millis_now_meta(),
+        pid: std::process::id(),
+        bmux_bin: bmux_binary.to_string_lossy().to_string(),
+        command: command.to_vec(),
+        env_mode: env_mode.to_string(),
+        status: status.to_string(),
+        exit_code,
+        kept,
+        paths: SandboxManifestPaths {
+            root: root_dir.to_string_lossy().to_string(),
+            logs: root_dir.join("logs").to_string_lossy().to_string(),
+            runtime: paths.runtime_dir.to_string_lossy().to_string(),
+            state: paths.state_dir.to_string_lossy().to_string(),
+        },
+    };
+    write_sandbox_manifest(root_dir, &manifest)
 }
 
 // ── Sandbox environment ─────────────────────────────────────────────────────

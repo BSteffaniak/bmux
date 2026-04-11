@@ -2,8 +2,8 @@ use anyhow::Result;
 use bmux_cli_schema::{
     AccessCommand, AuthCommand, Command, ConfigCommand, ConfigProfilesCommand, KeymapCommand,
     LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand, RecordingCommand,
-    RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxStatusArg,
-    ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand,
+    RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxSourceArg,
+    SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand,
 };
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
 
@@ -1425,6 +1425,7 @@ pub(super) async fn dispatch_built_in_command(
                 command:
                     SandboxCommand::List {
                         status,
+                        source,
                         limit,
                         json,
                     },
@@ -1436,7 +1437,13 @@ pub(super) async fn dispatch_built_in_command(
                 SandboxStatusArg::Failed => Some("failed"),
                 SandboxStatusArg::All => None,
             };
-            run_sandbox_list(status_filter, *limit, *json)
+            let source_filter = match source {
+                SandboxSourceArg::SandboxCli => Some("sandbox-cli"),
+                SandboxSourceArg::Playbook => Some("playbook"),
+                SandboxSourceArg::RecordingVerify => Some("recording-verify"),
+                SandboxSourceArg::All => None,
+            };
+            run_sandbox_list(status_filter, source_filter, *limit, *json)
         }
         (
             BuiltInHandlerId::SandboxInspect,
@@ -1476,10 +1483,19 @@ pub(super) async fn dispatch_built_in_command(
                         dry_run,
                         failed_only,
                         older_than,
+                        source,
                         json,
                     },
             },
-        ) => run_sandbox_cleanup(*dry_run, *failed_only, *older_than, *json),
+        ) => {
+            let source_filter = match source {
+                SandboxSourceArg::SandboxCli => Some("sandbox-cli"),
+                SandboxSourceArg::Playbook => Some("playbook"),
+                SandboxSourceArg::RecordingVerify => Some("recording-verify"),
+                SandboxSourceArg::All => None,
+            };
+            run_sandbox_cleanup(*dry_run, *failed_only, *older_than, source_filter, *json)
+        }
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }

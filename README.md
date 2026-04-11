@@ -109,11 +109,13 @@ bmux sandbox run -- server status
 bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode inherit -- --version
 bmux sandbox dev -- server status
 bmux sandbox list --limit 10
+bmux sandbox list --source playbook --limit 10
 bmux sandbox inspect --latest
 bmux sandbox inspect --latest-failed --tail 120
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 bmux sandbox doctor --json
 bmux sandbox cleanup --dry-run --json
+bmux sandbox cleanup --source recording-verify --older-than 600
 # Optional control-plane mode for account/share links
 bmux setup --mode control-plane
 bmux host --mode control-plane

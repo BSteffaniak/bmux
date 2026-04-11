@@ -63,6 +63,7 @@ bmux sandbox run --print-env -- server status
 
 # Discover recent sandboxes and inspect one
 bmux sandbox list --limit 10
+bmux sandbox list --source playbook --limit 10
 bmux sandbox inspect bmux-sbx-123 --tail 120
 bmux sandbox inspect --latest
 bmux sandbox inspect --latest-failed --tail 120
@@ -77,6 +78,7 @@ bmux sandbox bundle bmux-sbx-123 --json
 # Clean up orphaned sandbox directories
 bmux sandbox cleanup --dry-run --json
 bmux sandbox cleanup --failed-only --older-than 600
+bmux sandbox cleanup --source recording-verify --older-than 600
 ```
 
 ## Sandbox Daily Loop

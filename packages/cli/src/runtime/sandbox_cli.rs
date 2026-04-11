@@ -1,15 +1,21 @@
 use anyhow::{Context, Result};
 use bmux_cli_schema::SandboxEnvModeArg;
 use bmux_config::ConfigPaths;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::sandbox_meta::{
+    LOCK_FILE, MANIFEST_FILE, SandboxManifest, SandboxManifestPaths,
+    clear_lock as clear_sandbox_lock, read_lock as read_sandbox_lock,
+    read_manifest as read_sandbox_manifest, sandbox_id_from_root as sandbox_id_from_root_meta,
+    unix_millis_now as unix_millis_now_meta, write_lock as write_sandbox_lock,
+    write_manifest as write_sandbox_manifest,
+};
+
 const SANDBOX_PREFIX: &str = "bmux-sbx-";
-const MANIFEST_FILE: &str = "sandbox.json";
 const PID_MARKER_FILE: &str = "sandbox.pid";
-const LOCK_FILE: &str = "sandbox.lock";
 const DEFAULT_CLEANUP_MIN_AGE: Duration = Duration::from_secs(300);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const LOCK_FRESHNESS: Duration = Duration::from_secs(15);
@@ -17,6 +23,7 @@ const LOCK_FRESHNESS: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct CleanupEntry {
     path: String,
+    source: String,
     age_secs: u64,
     status: String,
     removed: bool,
@@ -39,6 +46,7 @@ struct CleanupScan {
 #[derive(Debug, Clone, Serialize)]
 struct SandboxListEntry {
     id: String,
+    source: String,
     root: String,
     status: String,
     age_secs: u64,
@@ -133,35 +141,6 @@ impl SandboxPaths {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SandboxManifestPaths {
-    root: String,
-    logs: String,
-    runtime: String,
-    state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SandboxManifest {
-    id: String,
-    created_at_unix_ms: u128,
-    updated_at_unix_ms: u128,
-    pid: u32,
-    bmux_bin: String,
-    command: Vec<String>,
-    env_mode: String,
-    status: String,
-    exit_code: Option<i32>,
-    kept: bool,
-    paths: SandboxManifestPaths,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SandboxLock {
-    pid: u32,
-    updated_at_unix_ms: u128,
-}
-
 #[derive(Debug, Serialize)]
 struct SandboxRunReport {
     sandbox_id: String,
@@ -246,7 +225,7 @@ pub(super) async fn run_sandbox_run(
         "failed"
     };
 
-    manifest.updated_at_unix_ms = unix_millis_now();
+    manifest.updated_at_unix_ms = unix_millis_now_meta();
     manifest.status = final_status.to_string();
     manifest.exit_code = Some(raw_exit_code);
     manifest.kept = kept;
@@ -282,9 +261,10 @@ fn build_manifest(
     keep: bool,
 ) -> SandboxManifest {
     SandboxManifest {
-        id: sandbox_id_from_root(&sandbox.root_dir),
-        created_at_unix_ms: unix_millis_now(),
-        updated_at_unix_ms: unix_millis_now(),
+        id: sandbox_id_from_root_meta(&sandbox.root_dir),
+        source: "sandbox-cli".to_string(),
+        created_at_unix_ms: unix_millis_now_meta(),
+        updated_at_unix_ms: unix_millis_now_meta(),
         pid: std::process::id(),
         bmux_bin: binary.to_string_lossy().to_string(),
         command: command_args.to_vec(),
@@ -392,6 +372,7 @@ fn emit_run_output(
 
 pub(super) fn run_sandbox_list(
     status_filter: Option<&str>,
+    source_filter: Option<&str>,
     limit: usize,
     json: bool,
 ) -> Result<u8> {
@@ -405,6 +386,9 @@ pub(super) fn run_sandbox_list(
     if let Some(filter) = status_filter {
         entries.retain(|entry| entry.status == filter);
     }
+    if let Some(filter) = source_filter {
+        entries.retain(|entry| entry.source == filter);
+    }
     if limit > 0 {
         entries.truncate(limit);
     }
@@ -415,11 +399,14 @@ pub(super) fn run_sandbox_list(
     } else if entries.is_empty() {
         println!("no sandboxes found");
     } else {
-        println!("ID                               STATUS   AGE   EXIT  KEPT  ROOT");
+        println!(
+            "ID                               SOURCE            STATUS   AGE   EXIT  KEPT  ROOT"
+        );
         for entry in entries {
             println!(
-                "{:<32} {:<8} {:>4}s {:>5} {:>5}  {}",
+                "{:<32} {:<17} {:<8} {:>4}s {:>5} {:>5}  {}",
                 entry.id,
+                entry.source,
                 entry.status,
                 entry.age_secs,
                 entry
@@ -458,6 +445,7 @@ pub(super) fn run_sandbox_inspect(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("id: {}", manifest.id);
+        println!("source: {}", manifest.source);
         println!("status: {}", manifest.status);
         println!("running: {running}");
         println!(
@@ -586,7 +574,7 @@ pub(super) fn run_sandbox_bundle(target: &str, output: Option<&str>, json: bool)
     std::fs::create_dir_all(&output_root)
         .with_context(|| format!("failed creating {}", output_root.display()))?;
 
-    let bundle_dir = output_root.join(format!("{}-{}", manifest.id, unix_millis_now()));
+    let bundle_dir = output_root.join(format!("{}-{}", manifest.id, unix_millis_now_meta()));
     std::fs::create_dir_all(&bundle_dir)
         .with_context(|| format!("failed creating {}", bundle_dir.display()))?;
 
@@ -682,10 +670,11 @@ pub(super) fn run_sandbox_cleanup(
     dry_run: bool,
     failed_only: bool,
     older_than_secs: Option<u64>,
+    source_filter: Option<&str>,
     json: bool,
 ) -> Result<u8> {
     let older_than = older_than_secs.map_or(DEFAULT_CLEANUP_MIN_AGE, Duration::from_secs);
-    let scan = cleanup_orphaned_sandboxes(dry_run, failed_only, older_than);
+    let scan = cleanup_orphaned_sandboxes(dry_run, failed_only, older_than, source_filter);
     let orphaned = scan.entries.len();
 
     if json {
@@ -695,6 +684,7 @@ pub(super) fn run_sandbox_cleanup(
             "dry_run": dry_run,
             "failed_only": failed_only,
             "older_than_secs": older_than.as_secs(),
+            "source": source_filter,
             "skipped_running": scan.skipped.running,
             "skipped_recent": scan.skipped.recent,
             "skipped_not_failed": scan.skipped.not_failed,
@@ -705,8 +695,8 @@ pub(super) fn run_sandbox_cleanup(
         for entry in &scan.entries {
             let status = if entry.removed { "removed" } else { "found" };
             println!(
-                "  {status}: {} (status: {}, age: {}s)",
-                entry.path, entry.status, entry.age_secs
+                "  {status}: {} (source: {}, status: {}, age: {}s)",
+                entry.path, entry.source, entry.status, entry.age_secs
             );
         }
         if dry_run {
@@ -733,6 +723,7 @@ fn cleanup_orphaned_sandboxes(
     dry_run: bool,
     failed_only: bool,
     older_than: Duration,
+    source_filter: Option<&str>,
 ) -> CleanupScan {
     let now = SystemTime::now();
     let mut scanned = 0;
@@ -745,6 +736,12 @@ fn cleanup_orphaned_sandboxes(
 
     for root_path in collect_sandbox_directories() {
         scanned += 1;
+        let source = sandbox_source_for_dir(&root_path);
+        if let Some(filter) = source_filter
+            && source != filter
+        {
+            continue;
+        }
         let age = root_path
             .metadata()
             .ok()
@@ -774,6 +771,7 @@ fn cleanup_orphaned_sandboxes(
 
         entries.push(CleanupEntry {
             path: root_path.to_string_lossy().to_string(),
+            source: source.to_string(),
             age_secs: age.as_secs(),
             status: status.to_string(),
             removed,
@@ -796,10 +794,16 @@ fn collect_sandbox_directories() -> Vec<PathBuf> {
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
-            path.is_dir()
-                && path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with(SANDBOX_PREFIX))
+            if !path.is_dir() {
+                return false;
+            }
+
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(SANDBOX_PREFIX)
+                    || name.starts_with("bpb-")
+                    || name.starts_with("brv-")
+            })
         })
         .collect()
 }
@@ -815,12 +819,38 @@ fn sandbox_list_entry(root: &Path) -> SandboxListEntry {
 
     let manifest = read_manifest(root).ok();
     SandboxListEntry {
-        id: sandbox_id_from_root(root),
+        id: sandbox_id_from_root_meta(root),
+        source: manifest.as_ref().map_or_else(
+            || sandbox_source_for_dir(root).to_string(),
+            |value| value.source.clone(),
+        ),
         root: root.to_string_lossy().to_string(),
         status: sandbox_status_for_dir(root).to_string(),
         age_secs: age.as_secs(),
         exit_code: manifest.as_ref().and_then(|value| value.exit_code),
         kept: manifest.as_ref().map(|value| value.kept),
+    }
+}
+
+fn sandbox_source_for_dir(root: &Path) -> &'static str {
+    if let Ok(manifest) = read_manifest(root) {
+        return match manifest.source.as_str() {
+            "playbook" => "playbook",
+            "recording-verify" => "recording-verify",
+            _ => "sandbox-cli",
+        };
+    }
+
+    let Some(name) = root.file_name() else {
+        return "sandbox-cli";
+    };
+    let name = name.to_string_lossy();
+    if name.starts_with("bpb-") {
+        "playbook"
+    } else if name.starts_with("brv-") {
+        "recording-verify"
+    } else {
+        "sandbox-cli"
     }
 }
 
@@ -841,18 +871,11 @@ fn sandbox_status_for_dir(root: &Path) -> &'static str {
 }
 
 fn read_manifest(root: &Path) -> Result<SandboxManifest> {
-    let manifest_path = root.join(MANIFEST_FILE);
-    let bytes = std::fs::read(&manifest_path)
-        .with_context(|| format!("failed reading {}", manifest_path.display()))?;
-    serde_json::from_slice::<SandboxManifest>(&bytes)
-        .with_context(|| format!("failed parsing {}", manifest_path.display()))
+    read_sandbox_manifest(root)
 }
 
 fn write_manifest(root: &Path, manifest: &SandboxManifest) -> Result<()> {
-    let manifest_path = root.join(MANIFEST_FILE);
-    let encoded = serde_json::to_vec_pretty(manifest)?;
-    write_atomic_file(&manifest_path, &encoded)
-        .with_context(|| format!("failed writing {}", manifest_path.display()))
+    write_sandbox_manifest(root, manifest)
 }
 
 fn resolve_sandbox_target(target: &str) -> Result<PathBuf> {
@@ -868,7 +891,7 @@ fn resolve_sandbox_target(target: &str) -> Result<PathBuf> {
 
     if let Some(found) = collect_sandbox_directories()
         .iter()
-        .find(|candidate| sandbox_id_from_root(candidate).starts_with(target))
+        .find(|candidate| sandbox_id_from_root_meta(candidate).starts_with(target))
     {
         return Ok(found.clone());
     }
@@ -918,45 +941,22 @@ fn write_pid_marker(root_dir: &Path) -> Result<()> {
 }
 
 fn write_lock(root_dir: &Path) -> Result<()> {
-    let lock_path = root_dir.join(LOCK_FILE);
-    let lock = SandboxLock {
-        pid: std::process::id(),
-        updated_at_unix_ms: unix_millis_now(),
-    };
-    let bytes = serde_json::to_vec(&lock)?;
-    write_atomic_file(&lock_path, &bytes)
+    write_sandbox_lock(root_dir, std::process::id())
 }
 
 fn clear_lock(root_dir: &Path) {
-    let _ = std::fs::remove_file(root_dir.join(LOCK_FILE));
+    clear_sandbox_lock(root_dir);
 }
 
 fn sandbox_lock_is_fresh(root_dir: &Path) -> bool {
-    let lock_path = root_dir.join(LOCK_FILE);
-    let Ok(bytes) = std::fs::read(lock_path) else {
+    let Some(lock) = read_sandbox_lock(root_dir) else {
         return false;
     };
-    let Ok(lock) = serde_json::from_slice::<SandboxLock>(&bytes) else {
-        return false;
-    };
-    let now = unix_millis_now();
+    let now = unix_millis_now_meta();
     if now.saturating_sub(lock.updated_at_unix_ms) > LOCK_FRESHNESS.as_millis() {
         return false;
     }
     is_pid_alive(lock.pid)
-}
-
-fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp_path = path.with_extension("tmp");
-    std::fs::write(&temp_path, bytes)
-        .with_context(|| format!("failed writing {}", temp_path.display()))?;
-    std::fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed renaming {} to {}",
-            temp_path.display(),
-            path.display()
-        )
-    })
 }
 
 fn format_repro_command(options: &RunSandboxOptions<'_>, command_args: &[String]) -> String {
@@ -1179,11 +1179,6 @@ const fn sandbox_env_mode_name(mode: SandboxEnvModeArg) -> &'static str {
     }
 }
 
-fn sandbox_id_from_root(root: &Path) -> String {
-    root.file_name()
-        .map_or_else(String::new, |value| value.to_string_lossy().to_string())
-}
-
 fn exit_code_to_u8(code: i32) -> u8 {
     if code < 0 {
         1
@@ -1192,12 +1187,6 @@ fn exit_code_to_u8(code: i32) -> u8 {
     } else {
         u8::try_from(code).unwrap_or(1)
     }
-}
-
-fn unix_millis_now() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis())
 }
 
 fn sanitize_component(value: &str) -> String {

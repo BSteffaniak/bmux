@@ -13,6 +13,7 @@ pub use bmux_terminal::{TerminalInstance, TerminalManager};
 
 mod connection;
 mod runtime;
+pub(crate) mod sandbox_meta;
 mod ssh_access;
 mod status;
 

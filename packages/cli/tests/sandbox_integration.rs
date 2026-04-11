@@ -76,6 +76,41 @@ fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
         .unwrap_or_else(|error| panic!("stdout was not json: {error}; stdout={stdout}"))
 }
 
+fn create_manifest_sandbox(root: &Path, dir_name: &str, source: &str, status: &str) {
+    let dir = root.join(dir_name);
+    let logs = dir.join("logs");
+    let runtime = dir.join("runtime");
+    let state = dir.join("state");
+    std::fs::create_dir_all(&logs).expect("create logs dir");
+    std::fs::create_dir_all(&runtime).expect("create runtime dir");
+    std::fs::create_dir_all(&state).expect("create state dir");
+
+    let manifest = serde_json::json!({
+        "id": dir_name,
+        "source": source,
+        "created_at_unix_ms": 1,
+        "updated_at_unix_ms": 1,
+        "pid": 999_999,
+        "bmux_bin": "bmux",
+        "command": ["--version"],
+        "env_mode": "clean",
+        "status": status,
+        "exit_code": if status == "failed" { serde_json::json!(1) } else { serde_json::json!(0) },
+        "kept": true,
+        "paths": {
+            "root": dir.to_string_lossy(),
+            "logs": logs.to_string_lossy(),
+            "runtime": runtime.to_string_lossy(),
+            "state": state.to_string_lossy(),
+        }
+    });
+    std::fs::write(
+        dir.join("sandbox.json"),
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write sandbox manifest");
+}
+
 #[test]
 #[serial]
 fn sandbox_dev_prefers_workspace_debug_binary() {
@@ -304,4 +339,88 @@ fn sandbox_inspect_explicit_id_resolves_target_manifest() {
         .as_str()
         .expect("inspect output should include manifest id");
     assert_eq!(manifest_id, sandbox_id);
+}
+
+#[test]
+#[serial]
+fn sandbox_list_source_filter_returns_matching_source_only() {
+    let sandbox = CommandSandbox::new("list-source-filter");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bpb-source-playbook", "playbook", "succeeded");
+    create_manifest_sandbox(
+        &tmp_root,
+        "brv-source-recording",
+        "recording-verify",
+        "failed",
+    );
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-source-cli", "sandbox-cli", "succeeded");
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox", "list", "--source", "playbook", "--limit", "50", "--json",
+        ])
+        .output()
+        .expect("run sandbox list with source filter");
+    assert!(
+        output.status.success(),
+        "sandbox list should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    let sandboxes = json["sandboxes"]
+        .as_array()
+        .expect("sandbox list should include sandboxes array");
+    assert_eq!(sandboxes.len(), 1, "only playbook source should be listed");
+    assert_eq!(sandboxes[0]["source"].as_str(), Some("playbook"));
+    assert_eq!(sandboxes[0]["id"].as_str(), Some("bpb-source-playbook"));
+}
+
+#[test]
+#[serial]
+fn sandbox_cleanup_source_filter_only_reports_requested_source() {
+    let sandbox = CommandSandbox::new("cleanup-source-filter");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bpb-cleanup-playbook", "playbook", "failed");
+    create_manifest_sandbox(
+        &tmp_root,
+        "brv-cleanup-recording",
+        "recording-verify",
+        "failed",
+    );
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "cleanup",
+            "--dry-run",
+            "--older-than",
+            "0",
+            "--source",
+            "recording-verify",
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox cleanup with source filter");
+    assert!(
+        output.status.success(),
+        "sandbox cleanup should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    let entries = json["entries"]
+        .as_array()
+        .expect("sandbox cleanup should include entries array");
+    assert_eq!(entries.len(), 1, "only recording-verify should match");
+    assert_eq!(entries[0]["source"].as_str(), Some("recording-verify"));
+    let path = entries[0]["path"]
+        .as_str()
+        .expect("cleanup entry path should be present");
+    assert!(
+        path.contains("brv-cleanup-recording"),
+        "cleanup entry should point to recording sandbox"
+    );
 }

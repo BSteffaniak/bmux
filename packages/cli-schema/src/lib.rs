@@ -1108,6 +1108,9 @@ pub enum SandboxCommand {
         /// Filter to matching status only
         #[arg(long, value_enum, default_value = "all")]
         status: SandboxStatusArg,
+        /// Filter to a sandbox source
+        #[arg(long, value_enum, default_value = "all")]
+        source: SandboxSourceArg,
         /// Maximum entries to show
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -1120,10 +1123,10 @@ pub enum SandboxCommand {
         /// Sandbox id (bmux-sbx-...) or full path
         sandbox: Option<String>,
         /// Inspect the most recent sandbox
-        #[arg(long, conflicts_with_all = ["latest_failed", "target"])]
+        #[arg(long, conflicts_with_all = ["latest_failed", "sandbox"])]
         latest: bool,
         /// Inspect the most recent failed sandbox
-        #[arg(long, conflicts_with_all = ["latest", "target"])]
+        #[arg(long, conflicts_with_all = ["latest", "sandbox"])]
         latest_failed: bool,
         /// Number of log lines to tail from sandbox logs
         #[arg(long, default_value_t = 80)]
@@ -1163,6 +1166,9 @@ pub enum SandboxCommand {
         /// Minimum age in seconds before sandbox is eligible for cleanup
         #[arg(long)]
         older_than: Option<u64>,
+        /// Filter to a sandbox source
+        #[arg(long, value_enum, default_value = "all")]
+        source: SandboxSourceArg,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1174,6 +1180,14 @@ pub enum SandboxStatusArg {
     Running,
     Stopped,
     Failed,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SandboxSourceArg {
+    SandboxCli,
+    Playbook,
+    RecordingVerify,
     All,
 }
 
@@ -1743,8 +1757,9 @@ mod tests {
         RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
         RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
         RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-        RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg, SandboxStatusArg,
-        ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand, TraceFamily,
+        RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg,
+        SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand,
+        TraceFamily,
     };
     use clap::Parser;
 
@@ -4013,7 +4028,8 @@ mod tests {
     #[test]
     fn parses_sandbox_list_and_inspect() {
         let list = Cli::try_parse_from([
-            "bmux", "sandbox", "list", "--status", "failed", "--limit", "5", "--json",
+            "bmux", "sandbox", "list", "--status", "failed", "--source", "playbook", "--limit",
+            "5", "--json",
         ])
         .expect("valid list args");
         let Some(Command::Sandbox { command }) = list.command else {
@@ -4023,6 +4039,7 @@ mod tests {
             command,
             SandboxCommand::List {
                 status: SandboxStatusArg::Failed,
+                source: SandboxSourceArg::Playbook,
                 limit: 5,
                 json: true,
             }
@@ -4143,6 +4160,8 @@ mod tests {
             "--failed-only",
             "--older-than",
             "600",
+            "--source",
+            "recording-verify",
             "--json",
         ])
         .expect("valid CLI args");
@@ -4155,6 +4174,7 @@ mod tests {
                 dry_run: true,
                 failed_only: true,
                 older_than: Some(600),
+                source: SandboxSourceArg::RecordingVerify,
                 json: true,
             }
         ));

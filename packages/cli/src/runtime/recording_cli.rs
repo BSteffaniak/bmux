@@ -21,6 +21,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::sandbox_meta::{
+    SandboxManifest, SandboxManifestPaths, clear_lock as clear_sandbox_lock,
+    read_manifest as read_sandbox_manifest, sandbox_id_from_root as sandbox_id_from_root_meta,
+    unix_millis_now as unix_millis_now_meta, write_lock as write_sandbox_lock,
+    write_manifest as write_sandbox_manifest,
+};
+
 use super::{
     ConnectionContext, VERIFY_SERVER_START_TIMEOUT_DEFAULT, bundled_plugin_roots,
     map_cli_client_error, parse_pid_content, recording, registered_plugin_entry_exists,
@@ -1085,6 +1092,8 @@ pub(super) async fn run_target_verify_capture(
     paths
         .ensure_dirs()
         .context("failed preparing verify temp paths")?;
+    write_verify_manifest(&root_dir, &paths, target_binary, "running", None, true)?;
+    let _ = write_sandbox_lock(&root_dir, std::process::id());
     write_verify_config(&paths)?;
 
     let verify_start_timeout =
@@ -1177,6 +1186,21 @@ pub(super) async fn run_target_verify_capture(
     .await;
 
     let stop_result = server.shutdown().await;
+    let status = if run_result.is_ok() && stop_result.is_ok() {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    let kept = !(run_result.is_ok() && stop_result.is_ok());
+    let _ = write_verify_manifest(
+        &root_dir,
+        &paths,
+        target_binary,
+        status,
+        if run_result.is_ok() { Some(0) } else { Some(1) },
+        kept,
+    );
+    clear_sandbox_lock(&root_dir);
     if run_result.is_ok() && stop_result.is_ok() {
         let _ = std::fs::remove_dir_all(&root_dir);
     } else {
@@ -1602,6 +1626,42 @@ pub(super) fn verify_temp_paths() -> (ConfigPaths, PathBuf) {
         root.join("s"),
     );
     (paths, root)
+}
+
+fn write_verify_manifest(
+    root_dir: &Path,
+    paths: &ConfigPaths,
+    target_binary: &Path,
+    status: &str,
+    exit_code: Option<i32>,
+    kept: bool,
+) -> Result<()> {
+    let manifest = SandboxManifest {
+        id: sandbox_id_from_root_meta(root_dir),
+        source: "recording-verify".to_string(),
+        created_at_unix_ms: read_sandbox_manifest(root_dir)
+            .ok()
+            .map_or_else(unix_millis_now_meta, |existing| existing.created_at_unix_ms),
+        updated_at_unix_ms: unix_millis_now_meta(),
+        pid: std::process::id(),
+        bmux_bin: target_binary.to_string_lossy().to_string(),
+        command: vec![
+            "recording".to_string(),
+            "verify-smoke".to_string(),
+            "capture".to_string(),
+        ],
+        env_mode: "inherit".to_string(),
+        status: status.to_string(),
+        exit_code,
+        kept,
+        paths: SandboxManifestPaths {
+            root: root_dir.to_string_lossy().to_string(),
+            logs: root_dir.join("logs").to_string_lossy().to_string(),
+            runtime: paths.runtime_dir.to_string_lossy().to_string(),
+            state: paths.state_dir.to_string_lossy().to_string(),
+        },
+    };
+    write_sandbox_manifest(root_dir, &manifest)
 }
 
 pub(super) fn write_verify_config(paths: &ConfigPaths) -> Result<()> {
