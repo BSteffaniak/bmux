@@ -1040,6 +1040,36 @@ pub enum PlaybookCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SandboxCommand {
+    /// Run bmux in a dev-friendly isolated sandbox (prefers local debug build)
+    Dev {
+        /// Path to bmux binary to execute (default: ./target/debug/bmux if present)
+        #[arg(long)]
+        bmux_bin: Option<String>,
+        /// Sandbox environment mode
+        #[arg(long, value_enum, default_value = "clean")]
+        env_mode: SandboxEnvModeArg,
+        /// Output sandbox metadata as JSON
+        #[arg(long)]
+        json: bool,
+        /// Print fully resolved environment map before executing command
+        #[arg(long)]
+        print_env: bool,
+        /// Kill sandbox command if it exceeds this timeout in seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Optional human-friendly sandbox label
+        #[arg(long)]
+        name: Option<String>,
+        /// bmux arguments to execute inside sandbox (pass after --)
+        #[arg(
+            required = true,
+            num_args = 1..,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        command: Vec<String>,
+    },
     /// Run bmux in an isolated ephemeral environment
     Run {
         /// Path to bmux binary to execute (default: current executable)
@@ -1088,7 +1118,13 @@ pub enum SandboxCommand {
     /// Inspect a sandbox by id or absolute path
     Inspect {
         /// Sandbox id (bmux-sbx-...) or full path
-        target: String,
+        target: Option<String>,
+        /// Inspect the most recent sandbox
+        #[arg(long, conflicts_with_all = ["latest_failed", "target"])]
+        latest: bool,
+        /// Inspect the most recent failed sandbox
+        #[arg(long, conflicts_with_all = ["latest", "target"])]
+        latest_failed: bool,
         /// Number of log lines to tail from sandbox logs
         #[arg(long, default_value_t = 80)]
         tail: usize,
@@ -3809,6 +3845,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_sandbox_dev_defaults() {
+        let cli = Cli::try_parse_from(["bmux", "sandbox", "dev", "--", "attach"])
+            .expect("valid CLI args");
+        let Some(Command::Sandbox { command }) = cli.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Dev {
+                bmux_bin: None,
+                env_mode: SandboxEnvModeArg::Clean,
+                json: false,
+                print_env: false,
+                timeout: None,
+                name: None,
+                command,
+            } if command == vec!["attach".to_string()]
+        ));
+    }
+
+    #[test]
     fn parses_sandbox_run_overrides() {
         let cli = Cli::try_parse_from([
             "bmux",
@@ -3876,10 +3933,51 @@ mod tests {
         assert!(matches!(
             command,
             SandboxCommand::Inspect {
-                target,
+                target: Some(target),
+                latest: false,
+                latest_failed: false,
                 tail: 25,
                 json: false,
             } if target == "bmux-sbx-abc"
+        ));
+
+        let latest = Cli::try_parse_from(["bmux", "sandbox", "inspect", "--latest", "--json"])
+            .expect("valid latest inspect args");
+        let Some(Command::Sandbox { command }) = latest.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Inspect {
+                target: None,
+                latest: true,
+                latest_failed: false,
+                tail: 80,
+                json: true,
+            }
+        ));
+
+        let latest_failed = Cli::try_parse_from([
+            "bmux",
+            "sandbox",
+            "inspect",
+            "--latest-failed",
+            "--tail",
+            "40",
+        ])
+        .expect("valid latest failed inspect args");
+        let Some(Command::Sandbox { command }) = latest_failed.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Inspect {
+                target: None,
+                latest: false,
+                latest_failed: true,
+                tail: 40,
+                json: false,
+            }
         ));
     }
 

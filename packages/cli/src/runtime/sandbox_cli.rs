@@ -437,8 +437,14 @@ pub(super) fn run_sandbox_list(
     Ok(0)
 }
 
-pub(super) fn run_sandbox_inspect(target: &str, tail: usize, json: bool) -> Result<u8> {
-    let root = resolve_sandbox_target(target)?;
+pub(super) fn run_sandbox_inspect(
+    target: Option<&str>,
+    latest: bool,
+    latest_failed: bool,
+    tail: usize,
+    json: bool,
+) -> Result<u8> {
+    let root = resolve_inspect_target(target, latest, latest_failed)?;
     let manifest = read_manifest(&root)?;
     let log_tail = read_log_tail(&root, tail);
     let running = sandbox_process_alive(&root) || sandbox_socket_alive(&root);
@@ -473,6 +479,50 @@ pub(super) fn run_sandbox_inspect(target: &str, tail: usize, json: bool) -> Resu
     }
 
     Ok(0)
+}
+
+fn resolve_inspect_target(
+    target: Option<&str>,
+    latest: bool,
+    latest_failed: bool,
+) -> Result<PathBuf> {
+    if let Some(target) = target {
+        return resolve_sandbox_target(target);
+    }
+
+    if latest || latest_failed {
+        return resolve_latest_sandbox(latest_failed);
+    }
+
+    anyhow::bail!("inspect target required (provide <id|path>, --latest, or --latest-failed)")
+}
+
+fn resolve_latest_sandbox(failed_only: bool) -> Result<PathBuf> {
+    let mut candidates = collect_sandbox_directories()
+        .into_iter()
+        .map(|path| {
+            let age = path
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .unwrap_or_default();
+            (path, age)
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| left.1.cmp(&right.1));
+    for (path, _) in candidates {
+        if !failed_only || matches!(sandbox_status_for_dir(&path), "failed") {
+            return Ok(path);
+        }
+    }
+
+    if failed_only {
+        anyhow::bail!("no failed sandboxes found");
+    }
+
+    anyhow::bail!("no sandboxes found")
 }
 
 pub(super) fn run_sandbox_doctor(id: Option<&str>, json: bool) -> Result<u8> {

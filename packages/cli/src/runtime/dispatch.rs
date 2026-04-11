@@ -174,6 +174,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             PlaybookCommand::Cleanup { .. } => BuiltInHandlerId::PlaybookCleanup,
         },
         Command::Sandbox { command } => match command {
+            SandboxCommand::Dev { .. } => BuiltInHandlerId::SandboxDev,
             SandboxCommand::Run { .. } => BuiltInHandlerId::SandboxRun,
             SandboxCommand::List { .. } => BuiltInHandlerId::SandboxList,
             SandboxCommand::Inspect { .. } => BuiltInHandlerId::SandboxInspect,
@@ -1342,6 +1343,33 @@ pub(super) async fn dispatch_built_in_command(
             },
         ) => run_playbook_cleanup(*dry_run, *json),
         (
+            BuiltInHandlerId::SandboxDev,
+            Command::Sandbox {
+                command:
+                    SandboxCommand::Dev {
+                        bmux_bin,
+                        env_mode,
+                        json,
+                        print_env,
+                        timeout,
+                        name,
+                        command,
+                    },
+            },
+        ) => {
+            let dev_bmux_bin = default_dev_bmux_bin();
+            let options = RunSandboxOptions {
+                bmux_bin: bmux_bin.as_deref().or(dev_bmux_bin.as_deref()),
+                env_mode: *env_mode,
+                keep: true,
+                json: *json,
+                print_env: *print_env,
+                timeout_secs: *timeout,
+                name: name.as_deref(),
+            };
+            run_sandbox_run(options, command).await
+        }
+        (
             BuiltInHandlerId::SandboxRun,
             Command::Sandbox {
                 command:
@@ -1390,9 +1418,16 @@ pub(super) async fn dispatch_built_in_command(
         (
             BuiltInHandlerId::SandboxInspect,
             Command::Sandbox {
-                command: SandboxCommand::Inspect { target, tail, json },
+                command:
+                    SandboxCommand::Inspect {
+                        target,
+                        latest,
+                        latest_failed,
+                        tail,
+                        json,
+                    },
             },
-        ) => run_sandbox_inspect(target, *tail, *json),
+        ) => run_sandbox_inspect(target.as_deref(), *latest, *latest_failed, *tail, *json),
         (
             BuiltInHandlerId::SandboxDoctor,
             Command::Sandbox {
@@ -1413,6 +1448,13 @@ pub(super) async fn dispatch_built_in_command(
         ) => run_sandbox_cleanup(*dry_run, *failed_only, *older_than, *json),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
+}
+
+fn default_dev_bmux_bin() -> Option<String> {
+    let candidate = std::path::Path::new("target").join("debug").join("bmux");
+    candidate
+        .exists()
+        .then(|| candidate.to_string_lossy().to_string())
 }
 
 const fn bool_override(positive: bool, negative: bool) -> Option<bool> {

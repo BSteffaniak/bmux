@@ -112,6 +112,7 @@ pub enum BuiltInHandlerId {
     PlaybookDiff,
     PlaybookCleanup,
     Sandbox,
+    SandboxDev,
     SandboxRun,
     SandboxList,
     SandboxInspect,
@@ -701,6 +702,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::SandboxRun,
             &["sandbox", "run"],
             "Run a bmux command in an ephemeral sandbox",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxDev,
+            &["sandbox", "dev"],
+            "Run a bmux command in a dev sandbox",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SandboxList,
