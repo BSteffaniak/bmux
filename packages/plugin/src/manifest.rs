@@ -81,6 +81,10 @@ pub struct PluginManifest {
     pub runtime: PluginRuntime,
     #[serde(default)]
     pub entry: Option<PathBuf>,
+    #[serde(default)]
+    pub entry_args: Vec<String>,
+    #[serde(default)]
+    pub process_persistent_worker: bool,
     #[serde(default = "default_entry_symbol")]
     pub entry_symbol: String,
     #[serde(default)]
@@ -169,7 +173,8 @@ impl PluginManifest {
                         })?;
                     PluginEntrypoint::Process {
                         command,
-                        args: Vec::new(),
+                        args: self.entry_args.clone(),
+                        persistent_worker: self.process_persistent_worker,
                     }
                 }
             },
@@ -438,6 +443,8 @@ name = "Process Runtime"
 version = "0.1.0"
 runtime = "process"
 entry = "python3"
+entry_args = ["plugin.py", "--stdio"]
+process_persistent_worker = true
 "#,
         )
         .expect("manifest should parse");
@@ -448,7 +455,11 @@ entry = "python3"
             .expect("declaration should support process runtime");
         assert!(matches!(
             declaration.entrypoint,
-            PluginEntrypoint::Process { ref command, .. } if command == "python3"
+            PluginEntrypoint::Process {
+                ref command,
+                ref args,
+                persistent_worker: true,
+            } if command == "python3" && args == &vec!["plugin.py".to_string(), "--stdio".to_string()]
         ));
     }
 

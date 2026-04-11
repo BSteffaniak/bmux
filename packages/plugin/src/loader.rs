@@ -20,11 +20,11 @@ use bmux_plugin_sdk::{
     CoreCliCommandRequest, CoreCliCommandResponse, CurrentClientResponse, HostConnectionInfo,
     HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, HostMetadata, HostScope,
     LogWriteLevel, NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
-    PROCESS_RUNTIME_ENV_PLUGIN_ID, PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1,
-    PROCESS_RUNTIME_TRANSPORT_STDIO_V1, PaneCloseRequest, PaneCloseResponse,
-    PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
-    PaneLaunchRequest, PaneLaunchResponse, PaneListRequest, PaneListResponse, PaneResizeRequest,
-    PaneResizeResponse, PaneSelector as HostPaneSelector,
+    PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
+    PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1, PROCESS_RUNTIME_TRANSPORT_STDIO_V1,
+    PaneCloseRequest, PaneCloseResponse, PaneFocusDirection as HostPaneFocusDirection,
+    PaneFocusRequest, PaneFocusResponse, PaneLaunchRequest, PaneLaunchResponse, PaneListRequest,
+    PaneListResponse, PaneResizeRequest, PaneResizeResponse, PaneSelector as HostPaneSelector,
     PaneSplitDirection as HostPaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
     PaneSummary as HostPaneSummary, PluginCliCommandRequest, PluginCliCommandResponse, PluginError,
     PluginEvent, ProcessInvocationRequest, ProcessInvocationResponse, RecordingWriteEventRequest,
@@ -43,12 +43,16 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::process::Stdio;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::{io::ErrorKind, os::unix::process::ExitStatusExt};
+#[cfg(windows)]
+use std::{io::ErrorKind, os::windows::process::ExitStatusExt};
 use tracing::{debug, error, info, trace, warn};
 
 type PluginEntryFn = unsafe extern "C" fn() -> *const c_char;
@@ -82,10 +86,32 @@ struct ProcessPluginRuntime {
     command: String,
     args: Vec<String>,
     current_dir: Option<PathBuf>,
+    persistent_worker: bool,
+    persistent: Arc<Mutex<Option<PersistentProcessWorker>>>,
+}
+
+#[derive(Debug)]
+struct PersistentProcessWorker {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    stderr_capture: Arc<Mutex<Vec<u8>>>,
 }
 
 impl ProcessPluginRuntime {
     fn invoke(
+        &self,
+        plugin_id: &str,
+        argv: &[String],
+        request: &ProcessInvocationRequest,
+    ) -> Result<(Option<ProcessInvocationResponse>, std::process::ExitStatus)> {
+        if self.persistent_worker {
+            return self.invoke_persistent(plugin_id, request);
+        }
+        self.invoke_one_shot(plugin_id, argv, request)
+    }
+
+    fn invoke_one_shot(
         &self,
         plugin_id: &str,
         argv: &[String],
@@ -193,6 +219,139 @@ impl ProcessPluginRuntime {
         })?;
         Ok((Some(response), status))
     }
+
+    fn invoke_persistent(
+        &self,
+        plugin_id: &str,
+        request: &ProcessInvocationRequest,
+    ) -> Result<(Option<ProcessInvocationResponse>, std::process::ExitStatus)> {
+        let frame = encode_process_invocation_request(request)?;
+        let timeout = process_plugin_timeout();
+
+        let mut guard = self
+            .persistent
+            .lock()
+            .map_err(|_| PluginError::ServiceProtocol {
+                details: "persistent worker mutex poisoned".to_string(),
+            })?;
+        if guard.is_none() {
+            *guard = Some(self.spawn_persistent_worker(plugin_id)?);
+        }
+
+        let worker = guard.as_mut().ok_or_else(|| PluginError::ServiceProtocol {
+            details: "persistent process worker unavailable".to_string(),
+        })?;
+
+        worker
+            .stdin
+            .write_all(&frame)
+            .and_then(|()| worker.stdin.flush())
+            .map_err(|error| PluginError::ServiceProtocol {
+                details: format!("failed writing persistent process request frame: {error}"),
+            })?;
+
+        let response_bytes = read_framed_payload_with_timeout(&mut worker.stdout, timeout)
+            .map_err(|error| PluginError::ServiceProtocol {
+                details: format!(
+                    "failed reading persistent process response frame: {error}{}",
+                    summarize_stderr_suffix(
+                        &worker
+                            .stderr_capture
+                            .lock()
+                            .map(|buffer| buffer.clone())
+                            .unwrap_or_default()
+                    )
+                ),
+            })?;
+
+        let response = decode_process_invocation_response(&response_bytes).map_err(|error| {
+            PluginError::ServiceProtocol {
+                details: format!(
+                    "failed decoding persistent process response frame: {error}{}",
+                    summarize_stderr_suffix(
+                        &worker
+                            .stderr_capture
+                            .lock()
+                            .map(|buffer| buffer.clone())
+                            .unwrap_or_default()
+                    )
+                ),
+            }
+        })?;
+
+        let status = worker
+            .child
+            .try_wait()
+            .map_err(|error| PluginError::ServiceProtocol {
+                details: format!("failed polling persistent process worker: {error}"),
+            })?
+            .unwrap_or_else(success_exit_status);
+        drop(guard);
+        Ok((Some(response), status))
+    }
+
+    fn spawn_persistent_worker(&self, plugin_id: &str) -> Result<PersistentProcessWorker> {
+        let mut command = Command::new(&self.command);
+        if let Some(current_dir) = &self.current_dir {
+            command.current_dir(current_dir);
+        }
+        command.args(&self.args);
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        command.env(
+            PROCESS_RUNTIME_ENV_PROTOCOL,
+            PROCESS_RUNTIME_TRANSPORT_STDIO_V1,
+        );
+        command.env(PROCESS_RUNTIME_ENV_PLUGIN_ID, plugin_id);
+        command.env(PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, "1");
+
+        let mut child = command
+            .spawn()
+            .map_err(|error| PluginError::ProcessPluginSpawn {
+                plugin_id: plugin_id.to_string(),
+                command: self.command.clone(),
+                details: error.to_string(),
+            })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| PluginError::ServiceProtocol {
+                details: "persistent process stdin pipe missing".to_string(),
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| PluginError::ServiceProtocol {
+                details: "persistent process stdout pipe missing".to_string(),
+            })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| PluginError::ServiceProtocol {
+                details: "persistent process stderr pipe missing".to_string(),
+            })?;
+
+        let stderr_capture = Arc::new(Mutex::new(Vec::new()));
+        let stderr_capture_clone = Arc::clone(&stderr_capture);
+        let _stderr_thread = thread::spawn(move || {
+            let mut reader = stderr;
+            let mut buffer = Vec::new();
+            if reader.read_to_end(&mut buffer).is_ok()
+                && let Ok(mut captured) = stderr_capture_clone.lock()
+            {
+                *captured = buffer;
+            }
+        });
+
+        Ok(PersistentProcessWorker {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr_capture,
+        })
+    }
 }
 
 fn process_plugin_timeout() -> Duration {
@@ -202,6 +361,58 @@ fn process_plugin_timeout() -> Duration {
         .filter(|value| *value > 0)
         .unwrap_or(PROCESS_PLUGIN_TIMEOUT_DEFAULT_MS);
     Duration::from_millis(timeout_ms)
+}
+
+fn read_framed_payload_with_timeout(
+    reader: &mut BufReader<ChildStdout>,
+    timeout: Duration,
+) -> std::io::Result<Vec<u8>> {
+    let started = Instant::now();
+    let mut header = [0_u8; 12];
+    let mut read = 0_usize;
+    while read < header.len() {
+        match reader.read(&mut header[read..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "unexpected EOF",
+                ));
+            }
+            Ok(n) => read += n,
+            Err(error) if error.kind() == ErrorKind::Interrupted => (),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if started.elapsed() >= timeout {
+                    return Err(std::io::Error::new(ErrorKind::TimedOut, "read timeout"));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if &header[..8] != bmux_plugin_sdk::PROCESS_RUNTIME_MAGIC_V1 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid process frame magic",
+        ));
+    }
+    let payload_len = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    let mut payload = vec![0_u8; payload_len];
+    reader.read_exact(&mut payload)?;
+
+    let mut frame = header.to_vec();
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+#[cfg(unix)]
+fn success_exit_status() -> std::process::ExitStatus {
+    std::process::ExitStatus::from_raw(0)
+}
+
+#[cfg(windows)]
+fn success_exit_status() -> std::process::ExitStatus {
+    std::process::ExitStatus::from_raw(0)
 }
 
 fn read_stream_to_end<R: Read + Send + 'static>(
@@ -1809,8 +2020,11 @@ impl NativePluginLoader {
             available_capabilities,
         )?;
 
-        if let PluginEntrypoint::Process { command, args } =
-            &registered_plugin.declaration.entrypoint
+        if let PluginEntrypoint::Process {
+            command,
+            args,
+            persistent_worker,
+        } = &registered_plugin.declaration.entrypoint
         {
             return Ok(LoadedPlugin {
                 registered: registered_plugin.clone(),
@@ -1823,6 +2037,8 @@ impl NativePluginLoader {
                         .parent()
                         .filter(|path| !path.as_os_str().is_empty())
                         .map(Path::to_path_buf),
+                    persistent_worker: *persistent_worker,
+                    persistent: Arc::new(Mutex::new(None)),
                 }),
             });
         }

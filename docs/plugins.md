@@ -189,6 +189,13 @@ Environment passed to the process runtime:
 
 - `BMUX_PLUGIN_RUNTIME_PROTOCOL=stdio-v1`
 - `BMUX_PLUGIN_ID=<plugin-id>`
+- `BMUX_PLUGIN_RUNTIME_PERSISTENT_WORKER=1` (only when `process_persistent_worker = true`)
+
+Process runtime manifest knobs:
+
+- `entry` - process command/path to execute
+- `entry_args` - default process arguments
+- `process_persistent_worker = true|false` - optional worker mode (reuse one process for multiple invocations)
 
 Runtime behavior and constraints:
 

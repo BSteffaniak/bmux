@@ -50,8 +50,14 @@ impl PluginId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginEntrypoint {
-    Native { symbol: String },
-    Process { command: String, args: Vec<String> },
+    Native {
+        symbol: String,
+    },
+    Process {
+        command: String,
+        args: Vec<String>,
+        persistent_worker: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
