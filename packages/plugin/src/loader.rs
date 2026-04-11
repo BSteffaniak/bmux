@@ -112,6 +112,15 @@ impl PersistentProcessWorker {
     }
 }
 
+impl Drop for PersistentProcessWorker {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => self.terminate(),
+        }
+    }
+}
+
 impl ProcessPluginRuntime {
     fn invoke(
         &self,
@@ -2384,7 +2393,10 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_char;
+    use std::process::{Command, Stdio};
     use std::ptr;
+    use std::thread;
+    use std::time::Duration;
 
     thread_local! {
         static KERNEL_REQUESTS: RefCell<Vec<bmux_ipc::Request>> = const { RefCell::new(Vec::new()) };
@@ -2403,6 +2415,41 @@ mod tests {
         "execution = \"provider_exec\"\n",
         "\0"
     );
+
+    #[cfg(unix)]
+    const PERSISTENT_WORKER_DROP_SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
+import os
+import struct
+import sys
+import time
+
+MAGIC = b"BMUXPRC1"
+
+with open({pid_file:?}, "w", encoding="utf-8") as pid_file:
+    pid_file.write(str(os.getpid()))
+    pid_file.flush()
+
+def read_exact(n):
+    data = sys.stdin.buffer.read(n)
+    if len(data) != n:
+        return None
+    return data
+
+header = read_exact(12)
+if header is None or header[:8] != MAGIC:
+    sys.exit(1)
+payload_len = struct.unpack(">I", header[8:12])[0]
+payload = read_exact(payload_len)
+if payload is None:
+    sys.exit(1)
+
+response_payload = bytes([0x00, 0x01, 0x02, 0x00])
+response_frame = MAGIC + struct.pack(">I", len(response_payload)) + response_payload
+sys.stdout.buffer.write(response_frame)
+sys.stdout.buffer.flush()
+
+time.sleep(60)
+"#;
 
     #[unsafe(no_mangle)]
     extern "C" fn bmux_plugin_entry_v1() -> *const c_char {
@@ -2757,6 +2804,73 @@ minimum = "1.0"
     }
 
     #[cfg(unix)]
+    fn unix_process_exists(pid: u32) -> bool {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn load_persistent_worker_plugin(
+        plugin_id: &str,
+        plugin_name: &str,
+        script_path: &std::path::Path,
+    ) -> LoadedPlugin {
+        let manifest = PluginManifest::from_toml_str(&format!(
+            r#"
+id = "{}"
+name = "{}"
+version = "0.1.0"
+runtime = "process"
+entry = "python3"
+entry_args = ["{}"]
+process_persistent_worker = true
+
+[[commands]]
+name = "hello"
+summary = "hello"
+execution = "provider_exec"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+            plugin_id,
+            plugin_name,
+            script_path.display()
+        ))
+        .expect("manifest should parse");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
+            .expect("manifest should register");
+        let registered = registry
+            .get(plugin_id)
+            .expect("plugin should register")
+            .clone();
+
+        super::load_registered_plugin(
+            &registered,
+            &HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            &BTreeMap::new(),
+        )
+        .expect("process runtime worker plugin should load")
+    }
+
+    #[cfg(unix)]
     #[test]
     fn process_runtime_plugin_loads_and_runs_command() {
         let manifest = PluginManifest::from_toml_str(
@@ -3017,6 +3131,71 @@ minimum = "1.0"
         assert_eq!(second, 1);
 
         let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_runtime_persistent_worker_drop_terminates_child_process() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "bmux-persistent-worker-drop-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("temp test root should be created");
+        let script_path = temp_root.join("worker_hang.py");
+        let pid_path = temp_root.join("worker.pid");
+        let script_contents = PERSISTENT_WORKER_DROP_SCRIPT_TEMPLATE.replace(
+            "{pid_file:?}",
+            &format!("{:?}", pid_path.display().to_string()),
+        );
+        std::fs::write(&script_path, script_contents).expect("worker script should be written");
+
+        let loaded = load_persistent_worker_plugin(
+            "process.worker.drop.plugin",
+            "Process Worker Drop Plugin",
+            &script_path,
+        );
+
+        let args: Vec<String> = Vec::new();
+        let first = loaded
+            .run_command("hello", &args)
+            .expect("first worker command should run");
+        assert_eq!(first, 1);
+
+        let mut worker_pid: Option<u32> = None;
+        for _ in 0..100 {
+            if let Ok(pid_text) = std::fs::read_to_string(&pid_path)
+                && let Ok(parsed) = pid_text.trim().parse::<u32>()
+            {
+                worker_pid = Some(parsed);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let worker_pid = worker_pid.expect("worker pid should be written");
+        assert!(unix_process_exists(worker_pid));
+
+        drop(loaded);
+
+        let mut exited_after_drop = false;
+        for _ in 0..200 {
+            if !unix_process_exists(worker_pid) {
+                exited_after_drop = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            exited_after_drop,
+            "persistent worker should terminate when plugin runtime drops"
+        );
+
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&pid_path);
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 
