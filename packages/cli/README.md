@@ -78,6 +78,11 @@ bmux host
 # optional runtime instance selection (parallel local runtimes)
 bmux --runtime dev server start --daemon
 bmux --runtime dev host
+
+# sandboxed runs (isolated config/runtime/data/state/logs)
+bmux sandbox run -- server status
+bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode inherit -- attach
+bmux sandbox cleanup --dry-run --json
 # opt-in control-plane mode (hard-fails if control-plane operations fail)
 bmux setup --mode control-plane
 bmux host --mode control-plane

@@ -147,6 +147,12 @@ pub enum HostedModeArg {
     ControlPlane,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SandboxEnvModeArg {
+    Clean,
+    Inherit,
+}
+
 fn parse_cell_size(value: &str) -> Result<(u16, u16), String> {
     let trimmed = value.trim();
     let (width_raw, height_raw) = trimmed
@@ -495,6 +501,11 @@ pub enum Command {
     Playbook {
         #[command(subcommand)]
         command: PlaybookCommand,
+    },
+    /// Run bmux in an isolated ephemeral sandbox environment
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
     },
     #[command(external_subcommand)]
     External(Vec<String>),
@@ -1027,6 +1038,46 @@ pub enum PlaybookCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum SandboxCommand {
+    /// Run bmux in an isolated ephemeral environment
+    Run {
+        /// Path to bmux binary to execute (default: current executable)
+        #[arg(long)]
+        bmux_bin: Option<String>,
+        /// Sandbox environment mode
+        #[arg(long, value_enum, default_value = "clean")]
+        env_mode: SandboxEnvModeArg,
+        /// Keep sandbox directory after command exits
+        #[arg(long)]
+        keep: bool,
+        /// Output sandbox metadata as JSON
+        #[arg(long)]
+        json: bool,
+        /// Optional human-friendly sandbox label
+        #[arg(long)]
+        name: Option<String>,
+        /// bmux arguments to execute inside sandbox (pass after --)
+        #[arg(
+            required = true,
+            num_args = 1..,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        command: Vec<String>,
+    },
+    /// Remove orphaned sandbox temp directories from sandbox runs
+    Cleanup {
+        /// Only list orphaned dirs without deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum SessionCommand {
     /// Create a new session
     New {
@@ -1508,8 +1559,9 @@ mod tests {
         RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
         RecordingEventKindArg, RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg,
         RecordingListStatusArg, RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode,
-        RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand,
-        ServerRecordingCommand, SessionCommand, TerminalCommand, TraceFamily,
+        RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, SandboxCommand,
+        SandboxEnvModeArg, ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand,
+        TraceFamily,
     };
     use clap::Parser;
 
@@ -3619,6 +3671,78 @@ mod tests {
             PlaybookCommand::Run {
                 interactive: true,
                 ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_sandbox_run_defaults() {
+        let cli = Cli::try_parse_from(["bmux", "sandbox", "run", "--", "server", "status"])
+            .expect("valid CLI args");
+        let Some(Command::Sandbox { command }) = cli.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Run {
+                bmux_bin: None,
+                env_mode: SandboxEnvModeArg::Clean,
+                keep: false,
+                json: false,
+                name: None,
+                command,
+            } if command == vec!["server".to_string(), "status".to_string()]
+        ));
+    }
+
+    #[test]
+    fn parses_sandbox_run_overrides() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "sandbox",
+            "run",
+            "--bmux-bin",
+            "./target/debug/bmux",
+            "--env-mode",
+            "inherit",
+            "--keep",
+            "--json",
+            "--name",
+            "my-check",
+            "--",
+            "attach",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Sandbox { command }) = cli.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Run {
+                bmux_bin: Some(ref bin),
+                env_mode: SandboxEnvModeArg::Inherit,
+                keep: true,
+                json: true,
+                name: Some(ref name),
+                command,
+            } if bin == "./target/debug/bmux"
+                && name == "my-check"
+                && command == vec!["attach".to_string()]
+        ));
+    }
+
+    #[test]
+    fn parses_sandbox_cleanup_flags() {
+        let cli = Cli::try_parse_from(["bmux", "sandbox", "cleanup", "--dry-run", "--json"])
+            .expect("valid CLI args");
+        let Some(Command::Sandbox { command }) = cli.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Cleanup {
+                dry_run: true,
+                json: true
             }
         ));
     }

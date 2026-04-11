@@ -2,8 +2,8 @@ use anyhow::Result;
 use bmux_cli_schema::{
     AccessCommand, AuthCommand, Command, ConfigCommand, KeymapCommand, LogsCommand,
     LogsProfilesCommand, PerfCommand, PlaybookCommand, RecordingCommand, RecordingEventKindArg,
-    RemoteCommand, RemoteCompleteCommand, ServerCommand, ServerRecordingCommand, SessionCommand,
-    TerminalCommand,
+    RemoteCommand, RemoteCompleteCommand, SandboxCommand, ServerCommand, ServerRecordingCommand,
+    SessionCommand, TerminalCommand,
 };
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
 
@@ -22,13 +22,13 @@ use super::{
     run_recording_replay, run_recording_start, run_recording_status, run_recording_stop,
     run_recording_verify_smoke, run_remote_complete_sessions, run_remote_complete_targets,
     run_remote_doctor, run_remote_init, run_remote_install_server, run_remote_list,
-    run_remote_test, run_remote_upgrade, run_server_bridge, run_server_gateway,
-    run_server_recording_clear, run_server_recording_path, run_server_recording_start,
-    run_server_recording_status, run_server_recording_stop, run_server_restore, run_server_save,
-    run_server_start, run_server_status, run_server_stop, run_server_whoami_principal,
-    run_session_attach, run_session_detach, run_session_kill, run_session_kill_all,
-    run_session_list, run_session_new, run_setup, run_share, run_terminal_doctor,
-    run_terminal_install_terminfo, run_unfollow, run_unshare,
+    run_remote_test, run_remote_upgrade, run_sandbox_cleanup, run_sandbox_run, run_server_bridge,
+    run_server_gateway, run_server_recording_clear, run_server_recording_path,
+    run_server_recording_start, run_server_recording_status, run_server_recording_stop,
+    run_server_restore, run_server_save, run_server_start, run_server_status, run_server_stop,
+    run_server_whoami_principal, run_session_attach, run_session_detach, run_session_kill,
+    run_session_kill_all, run_session_list, run_session_new, run_setup, run_share,
+    run_terminal_doctor, run_terminal_install_terminfo, run_unfollow, run_unshare,
 };
 
 pub(super) async fn run_command(
@@ -159,6 +159,10 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             PlaybookCommand::DryRun { .. } => BuiltInHandlerId::PlaybookDryRun,
             PlaybookCommand::Diff { .. } => BuiltInHandlerId::PlaybookDiff,
             PlaybookCommand::Cleanup { .. } => BuiltInHandlerId::PlaybookCleanup,
+        },
+        Command::Sandbox { command } => match command {
+            SandboxCommand::Run { .. } => BuiltInHandlerId::SandboxRun,
+            SandboxCommand::Cleanup { .. } => BuiltInHandlerId::SandboxCleanup,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1255,6 +1259,36 @@ pub(super) async fn dispatch_built_in_command(
                 command: PlaybookCommand::Cleanup { dry_run, json },
             },
         ) => run_playbook_cleanup(*dry_run, *json),
+        (
+            BuiltInHandlerId::SandboxRun,
+            Command::Sandbox {
+                command:
+                    SandboxCommand::Run {
+                        bmux_bin,
+                        env_mode,
+                        keep,
+                        json,
+                        name,
+                        command,
+                    },
+            },
+        ) => {
+            run_sandbox_run(
+                bmux_bin.as_deref(),
+                *env_mode,
+                *keep,
+                *json,
+                name.as_deref(),
+                command,
+            )
+            .await
+        }
+        (
+            BuiltInHandlerId::SandboxCleanup,
+            Command::Sandbox {
+                command: SandboxCommand::Cleanup { dry_run, json },
+            },
+        ) => run_sandbox_cleanup(*dry_run, *json),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }

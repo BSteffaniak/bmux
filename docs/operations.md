@@ -22,3 +22,11 @@ bmux recording prune --older-than 14 --json
 ```bmux-cli
 bmux playbook cleanup --dry-run --json
 ```
+
+## Sandbox Maintenance
+
+```bmux-cli
+bmux sandbox run -- server status
+bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode clean -- server start
+bmux sandbox cleanup --dry-run --json
+```

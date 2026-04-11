@@ -104,6 +104,9 @@ pub enum BuiltInHandlerId {
     PlaybookDryRun,
     PlaybookDiff,
     PlaybookCleanup,
+    Sandbox,
+    SandboxRun,
+    SandboxCleanup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,6 +646,21 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::PlaybookCleanup,
             &["playbook", "cleanup"],
             "Remove orphaned sandbox temp directories",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Sandbox,
+            &["sandbox"],
+            "Run bmux commands in isolated sandboxes",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxRun,
+            &["sandbox", "run"],
+            "Run a bmux command in an ephemeral sandbox",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxCleanup,
+            &["sandbox", "cleanup"],
+            "Remove orphaned sandbox run temp directories",
         ),
     ]
 }

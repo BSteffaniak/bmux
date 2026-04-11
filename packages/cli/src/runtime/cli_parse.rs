@@ -47,6 +47,9 @@ fn apply_runtime_override_from_raw_args(argv: &[std::ffi::OsString]) -> Result<(
     let mut index = 1usize;
     while index < argv.len() {
         let arg = argv[index].to_string_lossy();
+        if arg == "--" {
+            break;
+        }
         if let Some(value) = arg.strip_prefix("--runtime=") {
             let runtime = validate_runtime_name(value)?;
             // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
