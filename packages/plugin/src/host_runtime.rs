@@ -5,15 +5,16 @@
 //! in the SDK.
 
 use bmux_plugin_sdk::{
-    ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
-    ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
-    CoreCliCommandRequest, CoreCliCommandResponse, CurrentClientResponse, LogWriteRequest,
-    PaneCloseRequest, PaneCloseResponse, PaneFocusRequest, PaneFocusResponse, PaneListRequest,
-    PaneListResponse, PaneResizeRequest, PaneResizeResponse, PaneSplitRequest, PaneSplitResponse,
-    RecordingWriteEventRequest, RecordingWriteEventResponse, Result, ServiceKind,
-    SessionCreateRequest, SessionCreateResponse, SessionKillRequest, SessionKillResponse,
-    SessionListResponse, SessionSelectRequest, SessionSelectResponse, StorageGetRequest,
-    StorageGetResponse, StorageSetRequest,
+    CORE_CLI_COMMAND_CAPABILITY, CORE_CLI_COMMAND_INTERFACE_V1,
+    CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, ContextCloseRequest, ContextCloseResponse,
+    ContextCreateRequest, ContextCreateResponse, ContextCurrentResponse, ContextListResponse,
+    ContextSelectRequest, ContextSelectResponse, CoreCliCommandRequest, CoreCliCommandResponse,
+    CurrentClientResponse, LogWriteRequest, PaneCloseRequest, PaneCloseResponse, PaneFocusRequest,
+    PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
+    PaneSplitRequest, PaneSplitResponse, RecordingWriteEventRequest, RecordingWriteEventResponse,
+    Result, ServiceKind, SessionCreateRequest, SessionCreateResponse, SessionKillRequest,
+    SessionKillResponse, SessionListResponse, SessionSelectRequest, SessionSelectResponse,
+    StorageGetRequest, StorageGetResponse, StorageSetRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -75,10 +76,10 @@ pub trait HostRuntimeApi: ServiceCaller {
         request: &CoreCliCommandRequest,
     ) -> Result<CoreCliCommandResponse> {
         self.call_service(
-            "bmux.commands",
+            CORE_CLI_COMMAND_CAPABILITY,
             ServiceKind::Command,
-            "cli-command/v1",
-            "run_path",
+            CORE_CLI_COMMAND_INTERFACE_V1,
+            CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1,
             request,
         )
     }

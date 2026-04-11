@@ -5,8 +5,8 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::InvokeServiceKind;
 use bmux_plugin::PluginRegistry;
 use bmux_plugin_sdk::{
-    HostConnectionInfo, HostScope, PluginCommandEffect, RegisteredService, ServiceKind,
-    ServiceRequest,
+    CORE_CLI_COMMAND_CAPABILITY, CORE_CLI_COMMAND_INTERFACE_V1, HostConnectionInfo, HostScope,
+    PluginCommandEffect, RegisteredService, ServiceKind, ServiceRequest,
 };
 use bmux_server::{BmuxServer, ServiceInvokeContext};
 use clap::Parser;
@@ -27,7 +27,8 @@ pub(super) type KernelClientFactory =
 
 use super::{
     ConnectionContext, dispatch::dispatch_built_in_command, effective_enabled_plugins, load_plugin,
-    plugin_host_metadata, resolve_plugin_search_paths,
+    plugin_host_metadata, resolve_plugin_search_paths, run_keymap_doctor, run_logs_level,
+    run_logs_path, run_recording_path, run_terminal_install_terminfo,
 };
 
 thread_local! {
@@ -233,7 +234,7 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
         bmux_plugin_sdk::decode_host_kernel_bridge_cli_command_payload(&request.payload)
     {
         let response = match run_core_built_in_command(&command_request) {
-            Ok(exit_code) => bmux_plugin_sdk::CoreCliCommandResponse { exit_code },
+            Ok(exit_code) => bmux_plugin_sdk::CoreCliCommandResponse::new(exit_code),
             Err(_) => return 5,
         };
         let Ok(payload) = bmux_plugin_sdk::encode_service_message(&response) else {
@@ -300,6 +301,10 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
 }
 
 fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -> Result<i32> {
+    if let Some(result) = run_core_built_in_command_fast_path(request)? {
+        return Ok(result);
+    }
+
     let mut argv = Vec::with_capacity(2 + request.command_path.len() + request.arguments.len());
     argv.push("bmux".to_string());
     argv.push("--core-builtins-only".to_string());
@@ -331,6 +336,66 @@ fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -
             })
             .map(i32::from)
     }
+}
+
+fn run_core_built_in_command_fast_path(
+    request: &bmux_plugin_sdk::CoreCliCommandRequest,
+) -> Result<Option<i32>> {
+    let path = request.command_path.as_slice();
+    match path {
+        [logs, path] if logs == "logs" && path == "path" => {
+            let as_json = parse_json_only_flag(&request.arguments)?;
+            return run_sync_built_in(|| run_logs_path(as_json)).map(Some);
+        }
+        [logs, level] if logs == "logs" && level == "level" => {
+            let as_json = parse_json_only_flag(&request.arguments)?;
+            return run_sync_built_in(|| run_logs_level(as_json)).map(Some);
+        }
+        [keymap, doctor] if keymap == "keymap" && doctor == "doctor" => {
+            let as_json = parse_json_only_flag(&request.arguments)?;
+            return run_sync_built_in(|| run_keymap_doctor(as_json)).map(Some);
+        }
+        [recording, path] if recording == "recording" && path == "path" => {
+            let as_json = parse_json_only_flag(&request.arguments)?;
+            return run_sync_built_in(|| run_recording_path(as_json)).map(Some);
+        }
+        [terminal, install_terminfo]
+            if terminal == "terminal" && install_terminfo == "install-terminfo" =>
+        {
+            let (yes, check_only) = parse_install_terminfo_flags(&request.arguments)?;
+            return run_sync_built_in(|| run_terminal_install_terminfo(yes, check_only)).map(Some);
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+fn parse_json_only_flag(arguments: &[String]) -> Result<bool> {
+    match arguments {
+        [] => Ok(false),
+        [flag] if flag == "--json" => Ok(true),
+        _ => anyhow::bail!("unsupported arguments for bridged core command"),
+    }
+}
+
+fn parse_install_terminfo_flags(arguments: &[String]) -> Result<(bool, bool)> {
+    let mut yes = false;
+    let mut check_only = false;
+    for flag in arguments {
+        match flag.as_str() {
+            "--yes" => yes = true,
+            "--check" => check_only = true,
+            _ => anyhow::bail!("unsupported arguments for bridged core command"),
+        }
+    }
+    Ok((yes, check_only))
+}
+
+fn run_sync_built_in<F>(f: F) -> Result<i32>
+where
+    F: FnOnce() -> Result<u8>,
+{
+    f().map(i32::from)
 }
 
 pub(super) fn core_provided_capabilities() -> Vec<HostScope> {
@@ -391,9 +456,10 @@ pub(super) fn core_service_descriptors() -> Vec<RegisteredService> {
             provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
-            capability: HostScope::new("bmux.commands").expect("capability should parse"),
+            capability: HostScope::new(CORE_CLI_COMMAND_CAPABILITY)
+                .expect("capability should parse"),
             kind: ServiceKind::Command,
-            interface_id: "cli-command/v1".to_string(),
+            interface_id: CORE_CLI_COMMAND_INTERFACE_V1.to_string(),
             provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {

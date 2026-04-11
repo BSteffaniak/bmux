@@ -80,10 +80,10 @@ fn run_core_proxy_command(
     context: &NativeCommandContext,
     command_path: &[&str],
 ) -> Result<i32, PluginCommandError> {
-    let request = CoreCliCommandRequest {
-        command_path: command_path.iter().map(ToString::to_string).collect(),
-        arguments: context.arguments.clone(),
-    };
+    let request = CoreCliCommandRequest::new(
+        command_path.iter().map(ToString::to_string).collect(),
+        context.arguments.clone(),
+    );
     let response: CoreCliCommandResponse =
         context
             .core_cli_command_run_path(&request)

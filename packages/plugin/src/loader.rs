@@ -12,21 +12,22 @@ use bmux_ipc::{
     SessionSelector as IpcSessionSelector,
 };
 use bmux_plugin_sdk::{
-    ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
-    ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
-    ContextSelector as HostContextSelector, ContextSummary as HostContextSummary,
-    CoreCliCommandRequest, CoreCliCommandResponse, CurrentClientResponse, HostConnectionInfo,
-    HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, HostMetadata, HostScope,
-    LogWriteLevel, NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
-    PaneCloseRequest, PaneCloseResponse, PaneFocusDirection as HostPaneFocusDirection,
-    PaneFocusRequest, PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest,
-    PaneResizeResponse, PaneSelector as HostPaneSelector,
-    PaneSplitDirection as HostPaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
-    PaneSummary as HostPaneSummary, PluginError, PluginEvent, RecordingWriteEventRequest,
-    RecordingWriteEventResponse, RegisteredService, Result, ServiceEnvelopeKind, ServiceKind,
-    ServiceRequest, ServiceResponse, SessionCreateRequest, SessionCreateResponse,
-    SessionKillRequest, SessionKillResponse, SessionListResponse, SessionSelectRequest,
-    SessionSelectResponse, SessionSelector as HostSessionSelector,
+    CORE_CLI_BRIDGE_PROTOCOL_V1, CORE_CLI_COMMAND_INTERFACE_V1,
+    CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, ContextCloseRequest, ContextCloseResponse,
+    ContextCreateRequest, ContextCreateResponse, ContextCurrentResponse, ContextListResponse,
+    ContextSelectRequest, ContextSelectResponse, ContextSelector as HostContextSelector,
+    ContextSummary as HostContextSummary, CoreCliCommandRequest, CoreCliCommandResponse,
+    CurrentClientResponse, HostConnectionInfo, HostKernelBridge, HostKernelBridgeRequest,
+    HostKernelBridgeResponse, HostMetadata, HostScope, LogWriteLevel, NativeCommandContext,
+    NativeLifecycleContext, NativeServiceContext, PaneCloseRequest, PaneCloseResponse,
+    PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
+    PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
+    PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
+    PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary, PluginError, PluginEvent,
+    RecordingWriteEventRequest, RecordingWriteEventResponse, RegisteredService, Result,
+    ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse, SessionCreateRequest,
+    SessionCreateResponse, SessionKillRequest, SessionKillResponse, SessionListResponse,
+    SessionSelectRequest, SessionSelectResponse, SessionSelector as HostSessionSelector,
     SessionSummary as HostSessionSummary, StaticPluginVtable, decode_service_envelope,
     decode_service_message, encode_host_kernel_bridge_cli_command_payload, encode_service_envelope,
     encode_service_message,
@@ -420,7 +421,7 @@ fn handle_core_service_call(
             emit_plugin_log(caller_plugin_id, &request)?;
             encode_service_message(&())
         }
-        ("cli-command/v1", "run_path") => {
+        (CORE_CLI_COMMAND_INTERFACE_V1, CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1) => {
             let request: CoreCliCommandRequest = decode_service_message(payload)?;
             let response = execute_cli_command_request(host_kernel_bridge, &request)?;
             encode_service_message(&response)
@@ -903,12 +904,29 @@ fn execute_cli_command_request(
     host_kernel_bridge: Option<HostKernelBridge>,
     request: &CoreCliCommandRequest,
 ) -> Result<CoreCliCommandResponse> {
+    if request.protocol_version != CORE_CLI_BRIDGE_PROTOCOL_V1 {
+        return Err(PluginError::ServiceProtocol {
+            details: format!(
+                "unsupported core CLI bridge request protocol version: {}",
+                request.protocol_version
+            ),
+        });
+    }
     let bridge = host_kernel_bridge.ok_or(PluginError::UnsupportedHostOperation {
         operation: "call_service",
     })?;
     let payload = encode_host_kernel_bridge_cli_command_payload(request)?;
     let encoded_response = invoke_host_kernel_bridge(bridge, payload)?;
-    decode_service_message(&encoded_response)
+    let response: CoreCliCommandResponse = decode_service_message(&encoded_response)?;
+    if response.protocol_version != CORE_CLI_BRIDGE_PROTOCOL_V1 {
+        return Err(PluginError::ServiceProtocol {
+            details: format!(
+                "unsupported core CLI bridge response protocol version: {}",
+                response.protocol_version
+            ),
+        });
+    }
+    Ok(response)
 }
 
 fn invoke_host_kernel_bridge(bridge: HostKernelBridge, payload: Vec<u8>) -> Result<Vec<u8>> {
@@ -1673,6 +1691,35 @@ mod tests {
             Ok(request) => request,
             Err(_) => return 1,
         };
+
+        if let Ok(Some(command_request)) =
+            bmux_plugin_sdk::decode_host_kernel_bridge_cli_command_payload(&bridge_request.payload)
+        {
+            let exit_code = if command_request.command_path
+                == vec!["playbook".to_string(), "run".to_string()]
+            {
+                0
+            } else {
+                11
+            };
+            let response = super::CoreCliCommandResponse::new(exit_code);
+            let Ok(encoded) = encode_service_message(&super::HostKernelBridgeResponse {
+                payload: encode_service_message(&response).expect("response should encode"),
+            }) else {
+                return 1;
+            };
+            unsafe {
+                *output_len = encoded.len();
+            }
+            if output_ptr.is_null() || encoded.len() > output_capacity {
+                return 4;
+            }
+            unsafe {
+                ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+            }
+            return 0;
+        }
+
         let kernel_request: bmux_ipc::Request = match bmux_ipc::decode(&bridge_request.payload) {
             Ok(request) => request,
             Err(_) => return 1,
@@ -2411,6 +2458,115 @@ minimum = "1.0"
                 .is_some_and(|r| matches!(r, bmux_ipc::Request::NewSession { .. }))
         });
         assert!(last_is_new_session);
+    }
+
+    #[test]
+    fn command_context_calls_core_cli_command_service_via_kernel_bridge() {
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "proxy-cli".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.commands".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.commands")
+                    .expect("capability should parse"),
+                kind: bmux_plugin_sdk::ServiceKind::Command,
+                interface_id: "cli-command/v1".to_string(),
+                provider: bmux_plugin_sdk::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.commands".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            registered_plugins: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: bmux_plugin_sdk::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+                state_dir: "/state".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let response: bmux_plugin_sdk::CoreCliCommandResponse = context
+            .call_service(
+                bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY,
+                bmux_plugin_sdk::ServiceKind::Command,
+                bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1,
+                bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1,
+                &bmux_plugin_sdk::CoreCliCommandRequest::new(
+                    vec!["playbook".to_string(), "run".to_string()],
+                    Vec::new(),
+                ),
+            )
+            .expect("core cli command service should succeed");
+        assert_eq!(response.exit_code, 0);
+    }
+
+    #[test]
+    fn command_context_rejects_unsupported_core_cli_request_version() {
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "proxy-cli".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.commands".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.commands")
+                    .expect("capability should parse"),
+                kind: bmux_plugin_sdk::ServiceKind::Command,
+                interface_id: "cli-command/v1".to_string(),
+                provider: bmux_plugin_sdk::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.commands".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            registered_plugins: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: bmux_plugin_sdk::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+                state_dir: "/state".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let mut request = bmux_plugin_sdk::CoreCliCommandRequest::new(
+            vec!["playbook".to_string(), "run".to_string()],
+            Vec::new(),
+        );
+        request.protocol_version = bmux_plugin_sdk::CORE_CLI_BRIDGE_PROTOCOL_V1 + 1;
+
+        let error = context
+            .call_service::<_, bmux_plugin_sdk::CoreCliCommandResponse>(
+                bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY,
+                bmux_plugin_sdk::ServiceKind::Command,
+                bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1,
+                bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1,
+                &request,
+            )
+            .expect_err("unsupported protocol version should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported core CLI bridge request protocol version")
+        );
     }
 
     #[test]

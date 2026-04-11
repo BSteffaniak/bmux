@@ -162,6 +162,20 @@ Resolution behavior is deterministic:
 - conflicting plugin claims fail startup
 - unmet required claims fail startup
 
+## Compatibility Policy
+
+- Pre-baseline plugin command bridge behavior is intentionally unsupported (clean break).
+- Current baseline is versioned and explicit:
+  - capability: `bmux.commands`
+  - service interface: `cli-command/v1`
+  - operation: `run_path`
+  - bridge protocol marker: `BMUXCMD1`
+  - bridge protocol version: `1`
+- Future compatibility changes should be additive:
+  - add `.../v2` interfaces or operations, do not mutate `v1` semantics silently
+  - negotiate by advertised capabilities/interfaces before selecting newer versions
+  - keep compatibility seams in shared constants/helpers rather than ad-hoc call sites
+
 ## Migration Direction
 
 As context substrate work lands:

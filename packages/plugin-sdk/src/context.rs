@@ -17,7 +17,7 @@
 //! | **Advanced** | `plugin_search_roots`, `settings`, `plugin_settings_map` |
 
 use crate::{
-    HostConnectionInfo, HostMetadata, RegisteredService, Result, ServiceRequest,
+    HostConnectionInfo, HostMetadata, PluginError, RegisteredService, Result, ServiceRequest,
     decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
@@ -289,17 +289,49 @@ pub struct HostKernelBridgeResponse {
     pub payload: Vec<u8>,
 }
 
-const HOST_KERNEL_CLI_BRIDGE_PREFIX: &[u8] = b"BMUXCMD1";
+/// Capability required for host-dispatched core CLI command execution.
+pub const CORE_CLI_COMMAND_CAPABILITY: &str = "bmux.commands";
+/// Service interface for host-dispatched core CLI command execution.
+pub const CORE_CLI_COMMAND_INTERFACE_V1: &str = "cli-command/v1";
+/// Service operation for executing a core CLI command path.
+pub const CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1: &str = "run_path";
+/// Marker prefix for host-kernel bridge CLI command payloads.
+pub const CORE_CLI_BRIDGE_MAGIC_V1: &[u8] = b"BMUXCMD1";
+/// Protocol version for `CoreCliCommandRequest`/`CoreCliCommandResponse`.
+pub const CORE_CLI_BRIDGE_PROTOCOL_V1: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreCliCommandRequest {
+    pub protocol_version: u16,
     pub command_path: Vec<String>,
     pub arguments: Vec<String>,
 }
 
+impl CoreCliCommandRequest {
+    #[must_use]
+    pub const fn new(command_path: Vec<String>, arguments: Vec<String>) -> Self {
+        Self {
+            protocol_version: CORE_CLI_BRIDGE_PROTOCOL_V1,
+            command_path,
+            arguments,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreCliCommandResponse {
+    pub protocol_version: u16,
     pub exit_code: i32,
+}
+
+impl CoreCliCommandResponse {
+    #[must_use]
+    pub const fn new(exit_code: i32) -> Self {
+        Self {
+            protocol_version: CORE_CLI_BRIDGE_PROTOCOL_V1,
+            exit_code,
+        }
+    }
 }
 
 /// Encode a host-kernel bridge payload representing an in-process core CLI
@@ -311,7 +343,7 @@ pub struct CoreCliCommandResponse {
 pub fn encode_host_kernel_bridge_cli_command_payload(
     request: &CoreCliCommandRequest,
 ) -> Result<Vec<u8>> {
-    let mut payload = HOST_KERNEL_CLI_BRIDGE_PREFIX.to_vec();
+    let mut payload = CORE_CLI_BRIDGE_MAGIC_V1.to_vec();
     payload.extend(encode_service_message(request)?);
     Ok(payload)
 }
@@ -327,9 +359,63 @@ pub fn encode_host_kernel_bridge_cli_command_payload(
 pub fn decode_host_kernel_bridge_cli_command_payload(
     payload: &[u8],
 ) -> Result<Option<CoreCliCommandRequest>> {
-    if !payload.starts_with(HOST_KERNEL_CLI_BRIDGE_PREFIX) {
+    if !payload.starts_with(CORE_CLI_BRIDGE_MAGIC_V1) {
         return Ok(None);
     }
-    let encoded = &payload[HOST_KERNEL_CLI_BRIDGE_PREFIX.len()..];
-    decode_service_message(encoded).map(Some)
+    let encoded = &payload[CORE_CLI_BRIDGE_MAGIC_V1.len()..];
+    let request: CoreCliCommandRequest = decode_service_message(encoded)?;
+    if request.protocol_version != CORE_CLI_BRIDGE_PROTOCOL_V1 {
+        return Err(PluginError::ServiceProtocol {
+            details: format!(
+                "unsupported core CLI bridge request protocol version: {}",
+                request.protocol_version
+            ),
+        });
+    }
+    Ok(Some(request))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CORE_CLI_BRIDGE_PROTOCOL_V1, CoreCliCommandRequest,
+        decode_host_kernel_bridge_cli_command_payload,
+        encode_host_kernel_bridge_cli_command_payload,
+    };
+
+    #[test]
+    fn cli_bridge_payload_round_trip_preserves_request() {
+        let request = CoreCliCommandRequest::new(
+            vec!["logs".to_string(), "path".to_string()],
+            vec!["--json".to_string()],
+        );
+        let encoded =
+            encode_host_kernel_bridge_cli_command_payload(&request).expect("request should encode");
+        let decoded = decode_host_kernel_bridge_cli_command_payload(&encoded)
+            .expect("payload should decode")
+            .expect("payload should be recognized");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn cli_bridge_payload_ignores_unknown_prefix() {
+        let decoded = decode_host_kernel_bridge_cli_command_payload(b"not-a-cli-bridge-payload")
+            .expect("decode should succeed");
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn cli_bridge_payload_rejects_unsupported_protocol_version() {
+        let mut request = CoreCliCommandRequest::new(Vec::new(), Vec::new());
+        request.protocol_version = CORE_CLI_BRIDGE_PROTOCOL_V1 + 1;
+        let encoded =
+            encode_host_kernel_bridge_cli_command_payload(&request).expect("request should encode");
+        let error = decode_host_kernel_bridge_cli_command_payload(&encoded)
+            .expect_err("decode should fail for unsupported protocol version");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported core CLI bridge request protocol version")
+        );
+    }
 }

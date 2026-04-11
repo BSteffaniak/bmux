@@ -252,6 +252,20 @@ jobs:
               label: "Tests"
               strategy: "sequential"
 
+            plugin-command-perf:
+              commands: |
+                if [ "{{matrix.package.name}}" != "bmux_cli" ]; then
+                  echo "Skipping plugin command perf gate for package {{matrix.package.name}}"
+                  exit 0
+                fi
+                if [ "${{ matrix.package.os }}" != "ubuntu-latest" ]; then
+                  echo "Skipping plugin command perf gate on ${{ matrix.package.os }}"
+                  exit 0
+                fi
+                ./scripts/perf-plugin-command-latency.sh --iterations 20 --warmup 5 --max-p95-ms 250 --max-p99-ms 350
+              label: "Plugin Command Perf Gate"
+              strategy: "combined"
+
             doctests:
               commands: |
                 PACKAGE_PATH="{{matrix.package.path}}"
