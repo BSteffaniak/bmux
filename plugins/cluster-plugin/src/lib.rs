@@ -8,11 +8,14 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, NativeCommandContext, PaneCloseRequest, PaneLaunchCommand,
     PaneLaunchRequest, PaneListRequest, PaneSelector, PaneSplitDirection, SessionCreateRequest,
-    SessionSelectRequest, SessionSelector,
+    SessionSelectRequest, SessionSelector, StorageGetRequest, StorageSetRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const CLUSTER_PANE_BINDING_PREFIX: &str = "cluster.pane.";
 
 #[derive(Default)]
 pub struct ClusterPlugin;
@@ -31,13 +34,76 @@ impl RustPlugin for ClusterPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
-        ServiceResponse::error(
-            "not_implemented",
-            format!(
-                "service {}:{} is not implemented yet",
-                context.request.service.interface_id, context.request.operation
-            ),
-        )
+        bmux_plugin_sdk::route_service!(context, {
+            "cluster-query/v1", "list_clusters" => |_: ClusterQueryListClustersRequest, ctx| {
+                let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
+                    .map_err(|error| ServiceResponse::error("list_clusters_failed", error))?;
+                Ok(ClusterQueryListClustersResponse {
+                    clusters: inventory.clusters,
+                })
+            },
+            "cluster-query/v1", "status" => |req: ClusterQueryStatusRequest, ctx| {
+                let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
+                    .map_err(|error| ServiceResponse::error("status_failed", error))?;
+                let probe = if req.doctor.unwrap_or(false) {
+                    HealthProbe::Doctor
+                } else {
+                    HealthProbe::Test
+                };
+                let statuses = collect_statuses_for_selector(ctx, &inventory, req.selector.as_deref(), probe)
+                    .map_err(|error| ServiceResponse::error("status_failed", error))?;
+                Ok(ClusterQueryStatusResponse { statuses })
+            },
+            "cluster-command/v1", "up" => |req: ClusterCommandUpRequest, ctx| {
+                let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
+                    .map_err(|error| ServiceResponse::error("up_failed", error))?;
+                let result = execute_cluster_up(
+                    ctx,
+                    &inventory,
+                    ClusterUpArgs {
+                        cluster: req.cluster,
+                        hosts: req.hosts,
+                    },
+                )
+                .map_err(|error| ServiceResponse::error("up_failed", error))?;
+                Ok(ClusterCommandUpResponse {
+                    session_id: result.session_id,
+                    statuses: result.statuses,
+                })
+            },
+            "cluster-command/v1", "pane_new" => |req: ClusterCommandPaneNewRequest, ctx| {
+                let result = execute_cluster_pane_new(
+                    ctx,
+                    ClusterPaneNewArgs {
+                        host: req.host,
+                        name: req.name,
+                    },
+                )
+                .map_err(|error| ServiceResponse::error("pane_new_failed", error))?;
+                Ok(result)
+            },
+            "cluster-command/v1", "pane_retry" => |req: ClusterCommandPaneRetryRequest, ctx| {
+                let pane = parse_pane_retry_ref(req.pane.unwrap_or_else(|| "active".to_string()));
+                let result = execute_cluster_pane_retry(ctx, &ClusterPaneRetryArgs { pane })
+                    .map_err(|error| ServiceResponse::error("pane_retry_failed", error))?;
+                Ok(result)
+            },
+            "cluster-command/v1", "pane_move" => |req: ClusterCommandPaneMoveRequest, ctx| {
+                let pane = parse_pane_retry_ref(req.pane.unwrap_or_else(|| "active".to_string()));
+                let result = execute_cluster_pane_move(
+                    ctx,
+                    ClusterPaneMoveArgs {
+                        pane,
+                        host: req.host,
+                    },
+                )
+                .map_err(|error| ServiceResponse::error("pane_move_failed", error))?;
+                Ok(result)
+            },
+            "cluster-connection-events/v1", "list" => |_: ClusterConnectionEventsListRequest, _ctx| {
+                Ok(ClusterConnectionEventsListResponse { events: Vec::new() })
+            },
+        })
     }
 }
 
@@ -71,14 +137,14 @@ struct ClusterInventory {
     known_targets: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ClusterHostState {
     Ready,
     Degraded,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClusterHostStatus {
     cluster: String,
     target: String,
@@ -98,7 +164,7 @@ struct ClusterUpArgs {
     hosts: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClusterLaunchStatus {
     target: String,
     state: ClusterHostState,
@@ -128,6 +194,85 @@ struct ClusterPaneRetryArgs {
 struct ClusterPaneMoveArgs {
     pane: PaneRetryRef,
     host: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterUpExecution {
+    session_id: String,
+    statuses: Vec<ClusterLaunchStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterPaneBinding {
+    target: String,
+    cluster: Option<String>,
+    source: String,
+    updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterQueryListClustersRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterQueryListClustersResponse {
+    clusters: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterQueryStatusRequest {
+    selector: Option<String>,
+    doctor: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterQueryStatusResponse {
+    statuses: Vec<ClusterHostStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterCommandUpRequest {
+    cluster: String,
+    hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterCommandUpResponse {
+    session_id: String,
+    statuses: Vec<ClusterLaunchStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterCommandPaneNewRequest {
+    host: String,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterCommandPaneRetryRequest {
+    pane: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterCommandPaneMoveRequest {
+    pane: Option<String>,
+    host: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterCommandPaneMutationResponse {
+    target: String,
+    old_pane_id: Option<String>,
+    old_name: Option<String>,
+    new_pane_id: String,
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterConnectionEventsListRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterConnectionEventsListResponse {
+    events: Vec<String>,
 }
 
 fn run_cluster_hosts(context: &NativeCommandContext) -> Result<i32, String> {
@@ -181,7 +326,63 @@ fn run_cluster_doctor(context: &NativeCommandContext) -> Result<i32, String> {
 fn run_cluster_up(context: &NativeCommandContext) -> Result<i32, String> {
     let inventory = load_cluster_inventory(context)?;
     let args = parse_cluster_up_args(&context.arguments)?;
+    let result = execute_cluster_up(context, &inventory, args.clone())?;
 
+    print_cluster_up_summary(&args.cluster, &result.session_id, &result.statuses);
+    let launched_count = result
+        .statuses
+        .iter()
+        .filter(|entry| entry.pane_id.is_some())
+        .count();
+
+    Ok(if launched_count > 0 { EXIT_OK } else { 1 })
+}
+
+fn run_cluster_pane_new(context: &NativeCommandContext) -> Result<i32, String> {
+    let args = parse_cluster_pane_new_args(&context.arguments)?;
+    let response = execute_cluster_pane_new(context, args)?;
+
+    println!(
+        "cluster pane new: target={} pane_id={} session_id={}",
+        response.target, response.new_pane_id, response.session_id
+    );
+    Ok(EXIT_OK)
+}
+
+fn run_cluster_pane_retry(context: &NativeCommandContext) -> Result<i32, String> {
+    let args = parse_cluster_pane_retry_args(&context.arguments)?;
+    let result = execute_cluster_pane_retry(context, &args)?;
+
+    println!(
+        "cluster pane retry: target={} old_pane_id={} new_pane_id={} session_id={}",
+        result.target,
+        result.old_pane_id.as_deref().unwrap_or("unknown"),
+        result.new_pane_id,
+        result.session_id
+    );
+    Ok(EXIT_OK)
+}
+
+fn run_cluster_pane_move(context: &NativeCommandContext) -> Result<i32, String> {
+    let args = parse_cluster_pane_move_args(&context.arguments)?;
+    let result = execute_cluster_pane_move(context, args)?;
+
+    println!(
+        "cluster pane move: old_pane_id={} new_pane_id={} old_name={:?} new_target={} session_id={}",
+        result.old_pane_id.as_deref().unwrap_or("unknown"),
+        result.new_pane_id,
+        result.old_name,
+        result.target,
+        result.session_id
+    );
+    Ok(EXIT_OK)
+}
+
+fn execute_cluster_up(
+    caller: &impl HostRuntimeApi,
+    inventory: &ClusterInventory,
+    args: ClusterUpArgs,
+) -> Result<ClusterUpExecution, String> {
     let configured_hosts = inventory
         .clusters
         .get(&args.cluster)
@@ -199,99 +400,39 @@ fn run_cluster_up(context: &NativeCommandContext) -> Result<i32, String> {
         ));
     }
 
-    let mut statuses = Vec::new();
-    for target in &selected_hosts {
-        if !inventory.known_targets.contains(target) {
-            statuses.push(ClusterLaunchStatus {
-                target: target.clone(),
-                state: ClusterHostState::Degraded,
-                reason: Some("target is missing from [connections.targets]".to_string()),
-                pane_id: None,
-            });
-            continue;
-        }
-        match run_health_probe(context, target, HealthProbe::Test) {
-            Ok(()) => statuses.push(ClusterLaunchStatus {
-                target: target.clone(),
-                state: ClusterHostState::Ready,
-                reason: None,
-                pane_id: None,
-            }),
-            Err(error) => statuses.push(ClusterLaunchStatus {
-                target: target.clone(),
-                state: ClusterHostState::Degraded,
-                reason: Some(error),
-                pane_id: None,
-            }),
-        }
-    }
+    let mut statuses =
+        build_cluster_launch_statuses(caller, &selected_hosts, &inventory.known_targets);
 
     let session_name = format!("cluster-{}", args.cluster);
-    let session_selector = ensure_cluster_session(context, &session_name)?;
+    let session_selector = ensure_cluster_session(caller, &session_name)?;
     let session_id_text = match &session_selector {
         SessionSelector::ById(id) => id.to_string(),
         SessionSelector::ByName(name) => name.clone(),
     };
-    context
+    caller
         .session_select(&SessionSelectRequest {
             selector: session_selector.clone(),
         })
         .map_err(|error| format!("failed selecting cluster session '{session_name}': {error}"))?;
 
-    for status in &mut statuses {
-        if matches!(status.state, ClusterHostState::Degraded) {
-            continue;
-        }
+    launch_ready_cluster_panes(caller, &session_selector, &args.cluster, &mut statuses);
 
-        let response = context.pane_launch(&PaneLaunchRequest {
-            session: Some(session_selector.clone()),
-            target: None,
-            direction: PaneSplitDirection::Vertical,
-            name: Some(format!("{}:{}", args.cluster, status.target)),
-            command: PaneLaunchCommand {
-                program: "bmux".to_string(),
-                args: vec![
-                    "connect".to_string(),
-                    status.target.clone(),
-                    "--reconnect-forever".to_string(),
-                ],
-                cwd: None,
-                env: BTreeMap::from([
-                    ("BMUX_CLUSTER".to_string(), args.cluster.clone()),
-                    ("BMUX_CLUSTER_TARGET".to_string(), status.target.clone()),
-                ]),
-            },
-        });
-
-        match response {
-            Ok(result) => {
-                status.pane_id = Some(result.id.to_string());
-            }
-            Err(error) => {
-                status.state = ClusterHostState::Degraded;
-                status.reason = Some(format!("pane launch failed: {error}"));
-            }
-        }
-    }
-
-    print_cluster_up_summary(&args.cluster, &session_id_text, &statuses);
-    let launched_count = statuses
-        .iter()
-        .filter(|entry| entry.pane_id.is_some())
-        .count();
-
-    Ok(if launched_count > 0 { EXIT_OK } else { 1 })
+    Ok(ClusterUpExecution {
+        session_id: session_id_text,
+        statuses,
+    })
 }
 
-fn run_cluster_pane_new(context: &NativeCommandContext) -> Result<i32, String> {
-    let args = parse_cluster_pane_new_args(&context.arguments)?;
+fn execute_cluster_pane_new(
+    caller: &impl HostRuntimeApi,
+    args: ClusterPaneNewArgs,
+) -> Result<ClusterCommandPaneMutationResponse, String> {
     let host = args.host.as_str();
-
-    run_health_probe(context, host, HealthProbe::Test)
+    run_health_probe(caller, host, HealthProbe::Test)
         .map_err(|error| format!("target '{host}' is not ready: {error}"))?;
 
-    let pane_name = args.name.or_else(|| Some(format!("host:{}", args.host)));
-    let response = context
+    let pane_name = args.name.or_else(|| Some(format!("host:{host}")));
+    let response = caller
         .pane_launch(&PaneLaunchRequest {
             session: None,
             target: None,
@@ -310,36 +451,74 @@ fn run_cluster_pane_new(context: &NativeCommandContext) -> Result<i32, String> {
         })
         .map_err(|error| format!("failed to create cluster pane for '{host}': {error}"))?;
 
-    println!(
-        "cluster pane new: target={} pane_id={} session_id={}",
-        host, response.id, response.session_id
-    );
-    Ok(EXIT_OK)
+    let binding = ClusterPaneBinding {
+        target: host.to_string(),
+        cluster: None,
+        source: "new".to_string(),
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    set_cluster_pane_binding(caller, &response.id.to_string(), Some(&binding))?;
+
+    Ok(ClusterCommandPaneMutationResponse {
+        target: host.to_string(),
+        old_pane_id: None,
+        old_name: None,
+        new_pane_id: response.id.to_string(),
+        session_id: response.session_id.to_string(),
+    })
 }
 
-fn run_cluster_pane_retry(context: &NativeCommandContext) -> Result<i32, String> {
-    let args = parse_cluster_pane_retry_args(&context.arguments)?;
-    let list = context
-        .pane_list(&PaneListRequest { session: None })
-        .map_err(|error| format!("failed listing panes: {error}"))?;
+fn build_cluster_launch_statuses(
+    caller: &impl HostRuntimeApi,
+    selected_hosts: &[String],
+    known_targets: &BTreeSet<String>,
+) -> Vec<ClusterLaunchStatus> {
+    let mut statuses = Vec::new();
+    for target in selected_hosts {
+        if !known_targets.contains(target) {
+            statuses.push(ClusterLaunchStatus {
+                target: target.clone(),
+                state: ClusterHostState::Degraded,
+                reason: Some("target is missing from [connections.targets]".to_string()),
+                pane_id: None,
+            });
+            continue;
+        }
+        match run_health_probe(caller, target, HealthProbe::Test) {
+            Ok(()) => statuses.push(ClusterLaunchStatus {
+                target: target.clone(),
+                state: ClusterHostState::Ready,
+                reason: None,
+                pane_id: None,
+            }),
+            Err(error) => statuses.push(ClusterLaunchStatus {
+                target: target.clone(),
+                state: ClusterHostState::Degraded,
+                reason: Some(error),
+                pane_id: None,
+            }),
+        }
+    }
+    statuses
+}
 
-    let pane = resolve_retry_pane(&list.panes, &args.pane)?;
-    let target = parse_cluster_target_from_pane_name(pane.name.as_deref()).ok_or_else(|| {
-        format!(
-            "cannot infer cluster target from pane name {:?}; expected '<cluster>:<target>' or 'host:<target>'",
-            pane.name
-        )
-    })?;
+fn launch_ready_cluster_panes(
+    caller: &impl HostRuntimeApi,
+    session_selector: &SessionSelector,
+    cluster: &str,
+    statuses: &mut [ClusterLaunchStatus],
+) {
+    for status in statuses {
+        if matches!(status.state, ClusterHostState::Degraded) {
+            continue;
+        }
 
-    run_health_probe(context, &target, HealthProbe::Test)
-        .map_err(|error| format!("target '{target}' is not ready: {error}"))?;
-
-    let launch = context
-        .pane_launch(&PaneLaunchRequest {
-            session: None,
-            target: Some(PaneSelector::ById(pane.id)),
+        let target = status.target.clone();
+        let response = caller.pane_launch(&PaneLaunchRequest {
+            session: Some(session_selector.clone()),
+            target: None,
             direction: PaneSplitDirection::Vertical,
-            name: pane.name.clone(),
+            name: Some(format!("{cluster}:{target}")),
             command: PaneLaunchCommand {
                 program: "bmux".to_string(),
                 args: vec![
@@ -348,40 +527,118 @@ fn run_cluster_pane_retry(context: &NativeCommandContext) -> Result<i32, String>
                     "--reconnect-forever".to_string(),
                 ],
                 cwd: None,
-                env: BTreeMap::from([("BMUX_CLUSTER_TARGET".to_string(), target.clone())]),
+                env: BTreeMap::from([
+                    ("BMUX_CLUSTER".to_string(), cluster.to_string()),
+                    ("BMUX_CLUSTER_TARGET".to_string(), target.clone()),
+                ]),
+            },
+        });
+
+        match response {
+            Ok(result) => {
+                status.pane_id = Some(result.id.to_string());
+                let binding = ClusterPaneBinding {
+                    target: target.clone(),
+                    cluster: Some(cluster.to_string()),
+                    source: "up".to_string(),
+                    updated_at_unix_ms: now_unix_ms(),
+                };
+                if let Err(error) =
+                    set_cluster_pane_binding(caller, &result.id.to_string(), Some(&binding))
+                {
+                    status.state = ClusterHostState::Degraded;
+                    status.reason = Some(format!("pane metadata write failed: {error}"));
+                }
+            }
+            Err(error) => {
+                status.state = ClusterHostState::Degraded;
+                status.reason = Some(format!("pane launch failed: {error}"));
+            }
+        }
+    }
+}
+
+fn execute_cluster_pane_retry(
+    caller: &impl HostRuntimeApi,
+    args: &ClusterPaneRetryArgs,
+) -> Result<ClusterCommandPaneMutationResponse, String> {
+    let list = caller
+        .pane_list(&PaneListRequest { session: None })
+        .map_err(|error| format!("failed listing panes: {error}"))?;
+
+    let pane = resolve_retry_pane(&list.panes, &args.pane)?;
+    let binding = resolve_cluster_binding_for_pane(caller, pane)?;
+    run_health_probe(caller, &binding.target, HealthProbe::Test)
+        .map_err(|error| format!("target '{}' is not ready: {error}", binding.target))?;
+
+    let launch = caller
+        .pane_launch(&PaneLaunchRequest {
+            session: None,
+            target: Some(PaneSelector::ById(pane.id)),
+            direction: PaneSplitDirection::Vertical,
+            name: pane.name.clone().or_else(|| {
+                Some(format_pane_name(
+                    binding.cluster.as_deref(),
+                    &binding.target,
+                ))
+            }),
+            command: PaneLaunchCommand {
+                program: "bmux".to_string(),
+                args: vec![
+                    "connect".to_string(),
+                    binding.target.clone(),
+                    "--reconnect-forever".to_string(),
+                ],
+                cwd: None,
+                env: BTreeMap::from([("BMUX_CLUSTER_TARGET".to_string(), binding.target.clone())]),
             },
         })
-        .map_err(|error| format!("failed relaunching pane for '{target}': {error}"))?;
+        .map_err(|error| format!("failed relaunching pane for '{}': {error}", binding.target))?;
 
-    context
+    let new_binding = ClusterPaneBinding {
+        target: binding.target.clone(),
+        cluster: binding.cluster.clone(),
+        source: "retry".to_string(),
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    set_cluster_pane_binding(caller, &launch.id.to_string(), Some(&new_binding))?;
+
+    caller
         .pane_close(&PaneCloseRequest {
             session: None,
             target: Some(PaneSelector::ById(pane.id)),
         })
         .map_err(|error| format!("failed closing old pane {}: {error}", pane.id))?;
+    set_cluster_pane_binding(caller, &pane.id.to_string(), None)?;
 
-    println!(
-        "cluster pane retry: target={} old_pane_id={} new_pane_id={} session_id={}",
-        target, pane.id, launch.id, launch.session_id
-    );
-    Ok(EXIT_OK)
+    Ok(ClusterCommandPaneMutationResponse {
+        target: binding.target,
+        old_pane_id: Some(pane.id.to_string()),
+        old_name: pane.name.clone(),
+        new_pane_id: launch.id.to_string(),
+        session_id: launch.session_id.to_string(),
+    })
 }
 
-fn run_cluster_pane_move(context: &NativeCommandContext) -> Result<i32, String> {
-    let args = parse_cluster_pane_move_args(&context.arguments)?;
-    let host = args.host.as_str();
-    let list = context
+fn execute_cluster_pane_move(
+    caller: &impl HostRuntimeApi,
+    args: ClusterPaneMoveArgs,
+) -> Result<ClusterCommandPaneMutationResponse, String> {
+    let list = caller
         .pane_list(&PaneListRequest { session: None })
         .map_err(|error| format!("failed listing panes: {error}"))?;
 
     let pane = resolve_retry_pane(&list.panes, &args.pane)?;
-    let original = pane.name.clone();
-    let pane_name = retarget_pane_name(pane.name.as_deref(), host);
+    let previous_binding = resolve_cluster_binding_for_pane(caller, pane)?;
+    run_health_probe(caller, &args.host, HealthProbe::Test)
+        .map_err(|error| format!("target '{}' is not ready: {error}", args.host))?;
 
-    run_health_probe(context, host, HealthProbe::Test)
-        .map_err(|error| format!("target '{host}' is not ready: {error}"))?;
-
-    let launch = context
+    let pane_name = retarget_pane_name_with_cluster(
+        pane.name.as_deref(),
+        previous_binding.cluster.as_deref(),
+        &args.host,
+    );
+    let launch = caller
         .pane_launch(&PaneLaunchRequest {
             session: None,
             target: Some(PaneSelector::ById(pane.id)),
@@ -391,27 +648,38 @@ fn run_cluster_pane_move(context: &NativeCommandContext) -> Result<i32, String> 
                 program: "bmux".to_string(),
                 args: vec![
                     "connect".to_string(),
-                    host.to_string(),
+                    args.host.clone(),
                     "--reconnect-forever".to_string(),
                 ],
                 cwd: None,
-                env: BTreeMap::from([("BMUX_CLUSTER_TARGET".to_string(), host.to_string())]),
+                env: BTreeMap::from([("BMUX_CLUSTER_TARGET".to_string(), args.host.clone())]),
             },
         })
-        .map_err(|error| format!("failed moving pane to '{host}': {error}"))?;
+        .map_err(|error| format!("failed moving pane to '{}': {error}", args.host))?;
 
-    context
+    let new_binding = ClusterPaneBinding {
+        target: args.host.clone(),
+        cluster: previous_binding.cluster,
+        source: "move".to_string(),
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    set_cluster_pane_binding(caller, &launch.id.to_string(), Some(&new_binding))?;
+
+    caller
         .pane_close(&PaneCloseRequest {
             session: None,
             target: Some(PaneSelector::ById(pane.id)),
         })
         .map_err(|error| format!("failed closing old pane {}: {error}", pane.id))?;
+    set_cluster_pane_binding(caller, &pane.id.to_string(), None)?;
 
-    println!(
-        "cluster pane move: old_pane_id={} new_pane_id={} old_name={:?} new_target={} session_id={}",
-        pane.id, launch.id, original, host, launch.session_id
-    );
-    Ok(EXIT_OK)
+    Ok(ClusterCommandPaneMutationResponse {
+        target: args.host,
+        old_pane_id: Some(pane.id.to_string()),
+        old_name: pane.name.clone(),
+        new_pane_id: launch.id.to_string(),
+        session_id: launch.session_id.to_string(),
+    })
 }
 
 fn collect_statuses(
@@ -419,18 +687,31 @@ fn collect_statuses(
     probe: HealthProbe,
 ) -> Result<Vec<ClusterHostStatus>, String> {
     let inventory = load_cluster_inventory(context)?;
+    collect_statuses_for_selector(
+        context,
+        &inventory,
+        positional_argument(&context.arguments),
+        probe,
+    )
+}
+
+fn collect_statuses_for_selector(
+    caller: &impl HostRuntimeApi,
+    inventory: &ClusterInventory,
+    selector: Option<&str>,
+    probe: HealthProbe,
+) -> Result<Vec<ClusterHostStatus>, String> {
     if inventory.clusters.is_empty() {
         return Err(
             "no clusters configured in [plugins.settings.\"bmux.cluster\"].clusters".to_string(),
         );
     }
 
-    let selector = positional_argument(&context.arguments);
     let mut statuses = Vec::new();
     if let Some(selector) = selector {
         if let Some(hosts) = inventory.clusters.get(selector) {
             collect_cluster_statuses(
-                context,
+                caller,
                 selector,
                 hosts,
                 &inventory.known_targets,
@@ -446,7 +727,7 @@ fn collect_statuses(
                 matched_any = true;
                 let selected = vec![selector.to_string()];
                 collect_cluster_statuses(
-                    context,
+                    caller,
                     cluster_name,
                     &selected,
                     &inventory.known_targets,
@@ -464,7 +745,7 @@ fn collect_statuses(
 
     for (cluster_name, hosts) in &inventory.clusters {
         collect_cluster_statuses(
-            context,
+            caller,
             cluster_name,
             hosts,
             &inventory.known_targets,
@@ -476,7 +757,7 @@ fn collect_statuses(
 }
 
 fn collect_cluster_statuses(
-    context: &NativeCommandContext,
+    caller: &impl HostRuntimeApi,
     cluster_name: &str,
     hosts: &[String],
     known_targets: &BTreeSet<String>,
@@ -494,7 +775,7 @@ fn collect_cluster_statuses(
             continue;
         }
 
-        match run_health_probe(context, host, probe) {
+        match run_health_probe(caller, host, probe) {
             Ok(()) => statuses.push(ClusterHostStatus {
                 cluster: cluster_name.to_string(),
                 target: host.clone(),
@@ -512,7 +793,7 @@ fn collect_cluster_statuses(
 }
 
 fn run_health_probe(
-    context: &NativeCommandContext,
+    caller: &impl HostRuntimeApi,
     target: &str,
     probe: HealthProbe,
 ) -> Result<(), String> {
@@ -521,7 +802,7 @@ fn run_health_probe(
         HealthProbe::Doctor => vec!["remote".to_string(), "doctor".to_string()],
     };
     let request = CoreCliCommandRequest::new(command_path, vec![target.to_string()]);
-    let response = context
+    let response = caller
         .core_cli_command_run_path(&request)
         .map_err(|error| format!("probe failed to run: {error}"))?;
     if response.exit_code == EXIT_OK {
@@ -532,13 +813,18 @@ fn run_health_probe(
 }
 
 fn load_cluster_inventory(context: &NativeCommandContext) -> Result<ClusterInventory, String> {
-    let config_path = PathBuf::from(&context.connection.config_dir).join("bmux.toml");
+    load_cluster_inventory_for_context(&context.connection.config_dir, context.settings.clone())
+}
+
+fn load_cluster_inventory_for_context(
+    config_dir: &str,
+    settings: Option<toml::Value>,
+) -> Result<ClusterInventory, String> {
+    let config_path = PathBuf::from(config_dir).join("bmux.toml");
     let config = BmuxConfig::load_from_path(&config_path)
         .map_err(|error| format!("failed loading config {}: {error}", config_path.display()))?;
 
-    let settings_value = context
-        .settings
-        .clone()
+    let settings_value = settings
         .or_else(|| config.plugins.settings.get("bmux.cluster").cloned())
         .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
     let settings: ClusterSettings = settings_value
@@ -818,13 +1104,7 @@ fn parse_cluster_pane_retry_args(arguments: &[String]) -> Result<ClusterPaneRetr
     let raw = pane
         .or_else(|| positional.into_iter().find(|value| !value.is_empty()))
         .unwrap_or_else(|| "active".to_string());
-    let pane = if raw.eq_ignore_ascii_case("active") {
-        PaneRetryRef::Active
-    } else if let Ok(index) = raw.parse::<u32>() {
-        PaneRetryRef::Index(index)
-    } else {
-        PaneRetryRef::Name(raw)
-    };
+    let pane = parse_pane_retry_ref(raw);
     Ok(ClusterPaneRetryArgs { pane })
 }
 
@@ -894,15 +1174,19 @@ fn parse_cluster_pane_move_args(arguments: &[String]) -> Result<ClusterPaneMoveA
     let raw_pane = pane
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "active".to_string());
-    let pane = if raw_pane.eq_ignore_ascii_case("active") {
-        PaneRetryRef::Active
-    } else if let Ok(index) = raw_pane.parse::<u32>() {
-        PaneRetryRef::Index(index)
-    } else {
-        PaneRetryRef::Name(raw_pane)
-    };
+    let pane = parse_pane_retry_ref(raw_pane);
 
     Ok(ClusterPaneMoveArgs { pane, host })
+}
+
+fn parse_pane_retry_ref(raw: String) -> PaneRetryRef {
+    if raw.eq_ignore_ascii_case("active") {
+        PaneRetryRef::Active
+    } else if let Ok(index) = raw.parse::<u32>() {
+        PaneRetryRef::Index(index)
+    } else {
+        PaneRetryRef::Name(raw)
+    }
 }
 
 fn resolve_retry_pane<'a>(
@@ -925,6 +1209,7 @@ fn resolve_retry_pane<'a>(
     }
 }
 
+#[cfg(test)]
 fn parse_cluster_target_from_pane_name(name: Option<&str>) -> Option<String> {
     let value = name?.trim();
     if value.is_empty() {
@@ -939,6 +1224,123 @@ fn parse_cluster_target_from_pane_name(name: Option<&str>) -> Option<String> {
     }
 }
 
+fn parse_cluster_and_target_from_pane_name(name: Option<&str>) -> Option<(Option<String>, String)> {
+    let value = name?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (prefix, target) = value.split_once(':')?;
+    let prefix = prefix.trim();
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let cluster = if prefix.eq_ignore_ascii_case("host") || prefix.is_empty() {
+        None
+    } else {
+        Some(prefix.to_string())
+    };
+    Some((cluster, target.to_string()))
+}
+
+fn format_pane_name(cluster: Option<&str>, target: &str) -> String {
+    if let Some(cluster) = cluster
+        && !cluster.trim().is_empty()
+    {
+        return format!("{}:{target}", cluster.trim());
+    }
+    format!("host:{target}")
+}
+
+fn retarget_pane_name_with_cluster(
+    name: Option<&str>,
+    cluster: Option<&str>,
+    target: &str,
+) -> Option<String> {
+    if let Some(cluster) = cluster
+        && !cluster.trim().is_empty()
+    {
+        return Some(format_pane_name(Some(cluster), target));
+    }
+    retarget_pane_name(name, target)
+}
+
+fn pane_binding_storage_key(pane_id: &str) -> String {
+    format!("{CLUSTER_PANE_BINDING_PREFIX}{pane_id}")
+}
+
+fn set_cluster_pane_binding(
+    caller: &impl HostRuntimeApi,
+    pane_id: &str,
+    binding: Option<&ClusterPaneBinding>,
+) -> Result<(), String> {
+    let value = if let Some(binding) = binding {
+        serde_json::to_vec(binding)
+            .map_err(|error| format!("failed encoding pane metadata: {error}"))?
+    } else {
+        Vec::new()
+    };
+    caller
+        .storage_set(&StorageSetRequest {
+            key: pane_binding_storage_key(pane_id),
+            value,
+        })
+        .map_err(|error| format!("failed writing pane metadata: {error}"))
+}
+
+fn get_cluster_pane_binding(
+    caller: &impl HostRuntimeApi,
+    pane_id: &str,
+) -> Result<Option<ClusterPaneBinding>, String> {
+    let response = caller
+        .storage_get(&StorageGetRequest {
+            key: pane_binding_storage_key(pane_id),
+        })
+        .map_err(|error| format!("failed reading pane metadata: {error}"))?;
+    let Some(value) = response.value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice::<ClusterPaneBinding>(&value)
+        .map(Some)
+        .map_err(|error| format!("failed decoding pane metadata: {error}"))
+}
+
+fn resolve_cluster_binding_for_pane(
+    caller: &impl HostRuntimeApi,
+    pane: &bmux_plugin_sdk::PaneSummary,
+) -> Result<ClusterPaneBinding, String> {
+    let pane_id = pane.id.to_string();
+    if let Some(binding) = get_cluster_pane_binding(caller, &pane_id)?
+        && !binding.target.trim().is_empty()
+    {
+        return Ok(binding);
+    }
+    let (cluster, target) = parse_cluster_and_target_from_pane_name(pane.name.as_deref())
+        .ok_or_else(|| {
+            format!(
+                "cannot infer cluster target from pane name {:?}; expected '<cluster>:<target>' or 'host:<target>'",
+                pane.name
+            )
+        })?;
+    Ok(ClusterPaneBinding {
+        target,
+        cluster,
+        source: "name-fallback".to_string(),
+        updated_at_unix_ms: now_unix_ms(),
+    })
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 fn retarget_pane_name(name: Option<&str>, target: &str) -> Option<String> {
     let current = name?.trim();
     if current.is_empty() {
@@ -951,10 +1353,10 @@ fn retarget_pane_name(name: Option<&str>, target: &str) -> Option<String> {
 }
 
 fn ensure_cluster_session(
-    context: &NativeCommandContext,
+    caller: &impl HostRuntimeApi,
     session_name: &str,
 ) -> Result<SessionSelector, String> {
-    let sessions = context
+    let sessions = caller
         .session_list()
         .map_err(|error| format!("failed listing sessions: {error}"))?;
     if let Some(existing) = sessions
@@ -965,7 +1367,7 @@ fn ensure_cluster_session(
         return Ok(SessionSelector::ById(existing.id));
     }
 
-    let created = context
+    let created = caller
         .session_create(&SessionCreateRequest {
             name: Some(session_name.to_string()),
         })
@@ -1113,6 +1515,26 @@ mod tests {
         assert_eq!(
             retarget_pane_name(Some("host:cache-a"), "cache-b").as_deref(),
             Some("host:cache-b")
+        );
+    }
+
+    #[test]
+    fn parse_cluster_and_target_from_pane_name_handles_cluster_and_host_prefix() {
+        assert_eq!(
+            parse_cluster_and_target_from_pane_name(Some("prod:db-a")),
+            Some((Some("prod".to_string()), "db-a".to_string()))
+        );
+        assert_eq!(
+            parse_cluster_and_target_from_pane_name(Some("host:db-a")),
+            Some((None, "db-a".to_string()))
+        );
+    }
+
+    #[test]
+    fn retarget_pane_name_with_cluster_prefers_cluster_metadata() {
+        assert_eq!(
+            retarget_pane_name_with_cluster(Some("host:cache-a"), Some("prod"), "db-b").as_deref(),
+            Some("prod:db-b")
         );
     }
 }

@@ -19,6 +19,7 @@ bmux_config     = { workspace = true }
 bmux_plugin     = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 serde           = { workspace = true, features = ["derive", "std"] }
+serde_json      = { workspace = true }
 toml            = { workspace = true }
 
 [features]

@@ -17,6 +17,8 @@ Current scope:
 - `cluster pane new` creates an ad-hoc host-bound pane via the generic pane launch API
 - `cluster pane move` relocates a pane to a destination host and retargets pane naming
 - `cluster pane retry` relaunches a host-bound pane by inferring target from pane naming convention
+- Cluster pane target metadata is persisted in plugin storage for robust move/retry behavior
+- Cluster service interfaces are implemented for query/command/event-list integrations
 
 ## Commands (Scaffolded)
 
@@ -28,7 +30,7 @@ Current scope:
 - `cluster pane move`
 - `cluster pane retry`
 
-## Services (Scaffolded)
+## Services
 
 - **`cluster-query/v1`**
 - **`cluster-command/v1`**
