@@ -21,6 +21,7 @@ members = [
     "packages/keybind",
     "packages/plugin",
     "packages/plugin-sdk",
+    "packages/perf-tools",
     "packages/server",
     "packages/session",
     "packages/session/models",

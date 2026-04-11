@@ -1214,6 +1214,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_perf_tools"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "bmux_permissions_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [

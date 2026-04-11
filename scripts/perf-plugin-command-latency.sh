@@ -14,6 +14,7 @@ MAX_RUNTIME_TIMEOUTS="${MAX_RUNTIME_TIMEOUTS:-}"
 ALLOW_NONZERO="0"
 
 BMUX_BIN="${BMUX_BIN:-}"
+BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
 TARGET_ARGS=(plugin list --json)
 
 usage() {
@@ -152,6 +153,16 @@ fi
 
 cd "$ROOT_DIR"
 
+if [[ -z "$BMUX_PERF_TOOLS_BIN" ]]; then
+	cargo build -q -p bmux_perf_tools
+	BMUX_PERF_TOOLS_BIN="$ROOT_DIR/target/debug/bmux-perf-tools"
+fi
+
+if [[ ! -x "$BMUX_PERF_TOOLS_BIN" ]]; then
+	echo "bmux perf tools binary not executable: $BMUX_PERF_TOOLS_BIN" >&2
+	exit 2
+fi
+
 if [[ -z "$BMUX_BIN" ]]; then
 	cargo build -q -p bmux_cli
 	BMUX_BIN="$ROOT_DIR/target/debug/bmux"
@@ -187,134 +198,44 @@ for ((i = 0; i < WARMUP; i += 1)); do
 	fi
 done
 
-SAMPLES_FILE="$SANDBOX/samples_ms.txt"
-RUNTIME_METRICS_FILE="$SANDBOX/runtime_metrics.txt"
-BMUX_PERF_ALLOW_NONZERO="$ALLOW_NONZERO" python3 - "$ITERATIONS" "$SAMPLES_FILE" "$RUNTIME_METRICS_FILE" -- "$BMUX_BIN" -- "${TARGET_ARGS[@]}" <<'PY'
-import pathlib
-import subprocess
-import sys
-import time
+SAMPLE_JSON_FILE="$SANDBOX/sample.json"
 
-iterations = int(sys.argv[1])
-samples_path = pathlib.Path(sys.argv[2])
-metrics_path = pathlib.Path(sys.argv[3])
+"$BMUX_PERF_TOOLS_BIN" sample \
+	--iterations "$ITERATIONS" \
+	--allow-nonzero "$ALLOW_NONZERO" \
+	--out-json "$SAMPLE_JSON_FILE" \
+	-- "$BMUX_BIN" "${TARGET_ARGS[@]}"
 
-argv = sys.argv[4:]
-first_sep = argv.index("--")
-second_sep = argv.index("--", first_sep + 1)
-cmd = argv[first_sep + 1:second_sep]
-target = argv[second_sep + 1:]
-allow_nonzero = bool(int(__import__("os").environ.get("BMUX_PERF_ALLOW_NONZERO", "0")))
-
-samples = []
-runtime_retries = 0
-runtime_respawns = 0
-runtime_timeouts = 0
-for _ in range(iterations):
-    start_ns = time.perf_counter_ns()
-    completed = subprocess.run([*cmd, *target], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    end_ns = time.perf_counter_ns()
-    if completed.returncode != 0 and not allow_nonzero:
-        print(f"command exited with non-zero status: {completed.returncode}", file=sys.stderr)
-        sys.exit(completed.returncode)
-    stderr_text = completed.stderr or ""
-    runtime_retries += stderr_text.count("persistent process worker write failed; recycling worker")
-    runtime_retries += stderr_text.count("persistent process worker read failed; recycling worker")
-    runtime_respawns += stderr_text.count("persistent process worker exited; respawning")
-    runtime_timeouts += stderr_text.count("persistent process worker read timed out; recycling worker")
-    runtime_timeouts += stderr_text.count("process runtime one-shot invocation timed out")
-    samples.append((end_ns - start_ns) / 1_000_000)
-
-samples_path.write_text("\n".join(f"{value:.3f}" for value in samples), encoding="utf-8")
-metrics_path.write_text(
-    "\n".join(
-        [
-            f"retries={runtime_retries}",
-            f"respawns={runtime_respawns}",
-            f"timeouts={runtime_timeouts}",
-        ]
-    ),
-    encoding="utf-8",
+latency_cmd=(
+	"$BMUX_PERF_TOOLS_BIN"
+	report-latency
+	--input "$SAMPLE_JSON_FILE"
 )
-PY
+if [[ -n "$MAX_P99_MS" ]]; then
+	latency_cmd+=(--max-p99-ms "$MAX_P99_MS")
+fi
+if [[ -n "$MAX_P95_MS" ]]; then
+	latency_cmd+=(--max-p95-ms "$MAX_P95_MS")
+fi
+if [[ -n "$MAX_AVG_MS" ]]; then
+	latency_cmd+=(--max-avg-ms "$MAX_AVG_MS")
+fi
+"${latency_cmd[@]}"
 
-python3 - "$SAMPLES_FILE" "$MAX_P99_MS" "$MAX_P95_MS" "$MAX_AVG_MS" <<'PY'
-import math
-import pathlib
-import sys
-
-samples = [float(line) for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines() if line]
-max_p99 = int(sys.argv[2]) if sys.argv[2] else None
-max_p95 = int(sys.argv[3]) if sys.argv[3] else None
-max_avg = int(sys.argv[4]) if sys.argv[4] else None
-
-if not samples:
-    print("no samples collected", file=sys.stderr)
-    sys.exit(2)
-
-samples.sort()
-
-def percentile_nearest_rank(values, p):
-    rank = max(1, math.ceil((p / 100.0) * len(values)))
-    return values[rank - 1]
-
-p50 = percentile_nearest_rank(samples, 50)
-p95 = percentile_nearest_rank(samples, 95)
-p99 = percentile_nearest_rank(samples, 99)
-avg = sum(samples) / len(samples)
-min_v = samples[0]
-max_v = samples[-1]
-
-print(f"latency_ms min={min_v:.3f} p50={p50:.3f} p95={p95:.3f} p99={p99:.3f} avg={avg:.3f} max={max_v:.3f}")
-
-violations = []
-if max_p99 is not None and p99 > max_p99:
-    violations.append(f"p99 {p99:.3f} > {max_p99}")
-if max_p95 is not None and p95 > max_p95:
-    violations.append(f"p95 {p95:.3f} > {max_p95}")
-if max_avg is not None and avg > max_avg:
-    violations.append(f"avg {avg:.3f} > {max_avg}")
-
-if violations:
-    print("SLO check failed: " + "; ".join(violations), file=sys.stderr)
-    sys.exit(1)
-PY
-
-python3 - "$RUNTIME_METRICS_FILE" "$MAX_RUNTIME_RETRIES" "$MAX_RUNTIME_RESPAWNS" "$MAX_RUNTIME_TIMEOUTS" <<'PY'
-import pathlib
-import sys
-
-lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
-metrics = {}
-for line in lines:
-    if not line or "=" not in line:
-        continue
-    key, value = line.split("=", 1)
-    metrics[key] = int(value)
-
-max_retries = int(sys.argv[2]) if sys.argv[2] else None
-max_respawns = int(sys.argv[3]) if sys.argv[3] else None
-max_timeouts = int(sys.argv[4]) if sys.argv[4] else None
-
-retries = metrics.get("retries", 0)
-respawns = metrics.get("respawns", 0)
-timeouts = metrics.get("timeouts", 0)
-
-print(
-    f"runtime_faults retries={retries} respawns={respawns} timeouts={timeouts}"
+fault_cmd=(
+	"$BMUX_PERF_TOOLS_BIN"
+	report-faults
+	--input "$SAMPLE_JSON_FILE"
 )
-
-violations = []
-if max_retries is not None and retries > max_retries:
-    violations.append(f"retries {retries} > {max_retries}")
-if max_respawns is not None and respawns > max_respawns:
-    violations.append(f"respawns {respawns} > {max_respawns}")
-if max_timeouts is not None and timeouts > max_timeouts:
-    violations.append(f"timeouts {timeouts} > {max_timeouts}")
-
-if violations:
-    print("runtime fault check failed: " + "; ".join(violations), file=sys.stderr)
-    sys.exit(1)
-PY
+if [[ -n "$MAX_RUNTIME_RETRIES" ]]; then
+	fault_cmd+=(--max-runtime-retries "$MAX_RUNTIME_RETRIES")
+fi
+if [[ -n "$MAX_RUNTIME_RESPAWNS" ]]; then
+	fault_cmd+=(--max-runtime-respawns "$MAX_RUNTIME_RESPAWNS")
+fi
+if [[ -n "$MAX_RUNTIME_TIMEOUTS" ]]; then
+	fault_cmd+=(--max-runtime-timeouts "$MAX_RUNTIME_TIMEOUTS")
+fi
+"${fault_cmd[@]}"
 
 echo "perf check passed"

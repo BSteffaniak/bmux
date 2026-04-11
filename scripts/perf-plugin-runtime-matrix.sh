@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE_SCRIPT="$ROOT_DIR/scripts/perf-plugin-command-latency.sh"
 
 BMUX_BIN="${BMUX_BIN:-}"
+BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
 ITERATIONS="${ITERATIONS:-30}"
 WARMUP="${WARMUP:-5}"
 COLD_MODE="0"
@@ -129,45 +130,7 @@ run_case_allow_nonzero() {
 }
 
 find_happy_plugin_run_args() {
-	local bmux_cmd=(cargo run -q -p bmux_cli --bin bmux --)
-	if [[ -n "$BMUX_BIN" ]]; then
-		bmux_cmd=("$BMUX_BIN")
-	fi
-
-	local list_json
-	if ! list_json=$("${bmux_cmd[@]}" plugin list --json 2>/dev/null); then
-		return 1
-	fi
-
-	local candidates
-	if ! candidates=$(
-		python3 - "$list_json" <<'PY'
-import json
-import sys
-
-payload = json.loads(sys.argv[1])
-for entry in payload:
-    plugin_id = entry.get("id")
-    if plugin_id == "bmux.plugin_cli":
-        continue
-    for command in entry.get("commands", []):
-        print(f"{plugin_id}\t{command}")
-PY
-	); then
-		return 1
-	fi
-
-	while IFS=$'\t' read -r plugin_id command; do
-		if [[ -z "$plugin_id" || -z "$command" ]]; then
-			continue
-		fi
-		if "${bmux_cmd[@]}" plugin run "$plugin_id" "$command" >/dev/null 2>&1; then
-			printf '%s\n' "$plugin_id" "$command"
-			return 0
-		fi
-	done <<<"$candidates"
-
-	return 1
+	"$BMUX_PERF_TOOLS_BIN" discover-run-candidate --bmux-bin "$BMUX_BIN"
 }
 
 parse_args "$@"
@@ -180,6 +143,28 @@ fi
 
 if [[ ! -x "$BASE_SCRIPT" ]]; then
 	echo "missing executable script: $BASE_SCRIPT" >&2
+	exit 2
+fi
+
+cd "$ROOT_DIR"
+
+if [[ -z "$BMUX_PERF_TOOLS_BIN" ]]; then
+	cargo build -q -p bmux_perf_tools
+	BMUX_PERF_TOOLS_BIN="$ROOT_DIR/target/debug/bmux-perf-tools"
+fi
+
+if [[ ! -x "$BMUX_PERF_TOOLS_BIN" ]]; then
+	echo "bmux perf tools binary not executable: $BMUX_PERF_TOOLS_BIN" >&2
+	exit 2
+fi
+
+if [[ -z "$BMUX_BIN" ]]; then
+	cargo build -q -p bmux_cli
+	BMUX_BIN="$ROOT_DIR/target/debug/bmux"
+fi
+
+if [[ ! -x "$BMUX_BIN" ]]; then
+	echo "bmux binary not executable: $BMUX_BIN" >&2
 	exit 2
 fi
 

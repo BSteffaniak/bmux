@@ -36,6 +36,9 @@ For changes under `plugins/**`:
 - `./scripts/perf-plugin-command-latency.sh --iterations 20 --warmup 5 --max-p95-ms 250 --max-p99-ms 350`
 - `./scripts/perf-plugin-runtime-matrix.sh --iterations 20 --warmup 5`
 
+Perf scripts are Python-free and use the workspace helper binary (`bmux-perf-tools`).
+The scripts auto-build the helper on first use.
+
 ### 5) Plugin runtime command matrix SLO
 
 `scripts/perf-plugin-runtime-matrix.sh` enforces per-scenario p95/p99 SLOs:

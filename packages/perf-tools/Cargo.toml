@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Performance helper utilities for bmux scripts"
+edition     = { workspace = true }
+keywords    = ["bmux", "perf", "benchmark"]
+license     = { workspace = true }
+name        = "bmux_perf_tools"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[[bin]]
+name = "bmux-perf-tools"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+
+[features]
+fail-on-warnings = []
