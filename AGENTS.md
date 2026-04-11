@@ -87,11 +87,11 @@ Key rules when addressing unused dependency findings:
 
 If a change touches `plugins/**`, rebuild bundled plugins before finishing:
 
-- `bmux plugin rebuild`
+- `bmux plugin rebuild --all-workspace-plugins`
 
-During iteration you may run targeted rebuilds with selectors (plugin id, short name, or crate name), but final validation for plugin changes should run the command without selectors.
+During iteration you may run targeted rebuilds with selectors (plugin id, short name, or crate name), but final validation for plugin changes should run with `--all-workspace-plugins`.
 
-If `bmux plugin rebuild` is unavailable in the current environment, run direct cargo builds for plugin crates (for example, `cargo build -p <plugin-crate> ...`).
+If `bmux plugin rebuild --all-workspace-plugins` is unavailable in the current environment, run direct cargo builds for plugin crates (for example, `cargo build -p <plugin-crate> ...`).
 
 ## Minimum Required Commands (CLI/runtime work)
 
@@ -126,7 +126,7 @@ This includes edits under:
 - Config-only changes
   - Run at least 1-3; include 4 if behavior affects runtime startup.
 - Any plugin changes under `plugins/**`
-  - Run `bmux plugin rebuild`.
+  - Run `bmux plugin rebuild --all-workspace-plugins`.
 - Docs-only changes
   - No mandatory runtime commands.
 
@@ -147,6 +147,6 @@ Agents should report test execution in final response using this format:
 - `cargo machete --with-metadata` - PASS/FAIL
 - `./scripts/smoke-pty-runtime.sh` - PASS/FAIL
 - `./scripts/compat-matrix.sh` - PASS/FAIL (if required)
-- `bmux plugin rebuild` - PASS/FAIL (if required)
+- `bmux plugin rebuild --all-workspace-plugins` - PASS/FAIL (if required)
 
 If any required command is skipped, explain why.
