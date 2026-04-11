@@ -1226,62 +1226,140 @@ pub(super) fn run_hosts(verbose: bool) -> Result<u8> {
     if auth_ready && host_running {
         println!("Status: ready");
     } else {
-        let reason = match (auth_ready, host_running, host_state.as_ref()) {
-            (false, false, Some(state)) => {
-                format!("not signed in; host state is stale (pid {})", state.pid)
-            }
-            (false, false, None) => "not signed in; host is offline".to_string(),
-            (false, true, _) => "not signed in".to_string(),
-            (true, false, Some(state)) => format!("host state is stale (pid {})", state.pid),
-            (true, false, None) => "host is offline".to_string(),
-            (true, true, _) => "not ready".to_string(),
-        };
+        let reason = hosts_status_reason(auth_ready, host_running, host_state.as_ref());
         println!("Status: not ready ({reason})");
         println!("Fix: bmux setup");
     }
+    if verbose {
+        println!("runtime:");
+        println!("- name: {}", active_runtime_name());
+        println!("- auth: {}", if auth_ready { "ready" } else { "missing" });
+        println!(
+            "- host: {}",
+            if host_running {
+                "running".to_string()
+            } else if let Some(state) = host_state.as_ref() {
+                format!("stale (pid {})", state.pid)
+            } else {
+                "offline".to_string()
+            }
+        );
+        println!("- local ipc endpoint: {}", local_ipc_endpoint_label(&paths));
+        if let Some(state) = host_state.as_ref() {
+            println!("- target: {}", state.target);
+            if let Some(link) = state.share_link.as_deref() {
+                println!("- share link: {link}");
+            }
+        }
+    }
 
-    if !config.connections.share_links.is_empty() {
-        println!("share links:");
-        for (name, target) in &config.connections.share_links {
-            println!("- bmux://{name} (join: bmux join bmux://{name})");
-            if verbose {
-                println!("  target: {target}");
-            }
-        }
-    }
-    if !config.connections.targets.is_empty() {
-        println!("configured targets:");
-        for (name, target) in &config.connections.targets {
-            let transport = match target.transport {
-                ConnectionTransport::Local => "local",
-                ConnectionTransport::Ssh => "ssh",
-                ConnectionTransport::Tls => "tls",
-                ConnectionTransport::Iroh => "iroh",
-            };
-            println!("- {name} (connect: bmux connect {name})");
-            if verbose {
-                println!("  transport: {transport}");
-            }
-        }
-    }
-    if !config.connections.recent_targets.is_empty() {
-        println!("recent:");
-        for target in &config.connections.recent_targets {
-            println!("- {target}");
-            if verbose {
-                println!("  join: bmux join {target}");
-            }
-        }
-    }
-    if config.connections.recent_targets.is_empty()
-        && config.connections.targets.is_empty()
-        && config.connections.share_links.is_empty()
-    {
+    print_share_links(config.connections.share_links.iter(), verbose);
+    print_configured_targets(config.connections.targets.iter(), verbose);
+    print_recent_targets(config.connections.recent_targets.iter(), verbose);
+    if has_no_saved_hosts(&config) {
         println!("No saved hosts yet.");
         println!("Fix: bmux setup");
         println!("Advanced: bmux host --daemon");
     }
     Ok(0)
+}
+
+fn hosts_status_reason(
+    auth_ready: bool,
+    host_running: bool,
+    host_state: Option<&HostRuntimeState>,
+) -> String {
+    match (auth_ready, host_running, host_state) {
+        (false, false, Some(state)) => {
+            format!("not signed in; host state is stale (pid {})", state.pid)
+        }
+        (false, false, None) => "not signed in; host is offline".to_string(),
+        (false, true, _) => "not signed in".to_string(),
+        (true, false, Some(state)) => format!("host state is stale (pid {})", state.pid),
+        (true, false, None) => "host is offline".to_string(),
+        (true, true, _) => "not ready".to_string(),
+    }
+}
+
+fn print_share_links<'a>(links: impl Iterator<Item = (&'a String, &'a String)>, verbose: bool) {
+    let values = links.collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    println!("share links{}:", if verbose { " (detailed)" } else { "" });
+    for (name, target) in values {
+        println!("- bmux://{name} (join: bmux join bmux://{name})");
+        if verbose {
+            println!("  target: {target}");
+            println!("  unshare: bmux unshare {name}");
+        }
+    }
+}
+
+fn print_configured_targets<'a>(
+    targets: impl Iterator<Item = (&'a String, &'a ConnectionTargetConfig)>,
+    verbose: bool,
+) {
+    let values = targets.collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    println!(
+        "configured targets{}:",
+        if verbose { " (detailed)" } else { "" }
+    );
+    for (name, target) in values {
+        let transport = match target.transport {
+            ConnectionTransport::Local => "local",
+            ConnectionTransport::Ssh => "ssh",
+            ConnectionTransport::Tls => "tls",
+            ConnectionTransport::Iroh => "iroh",
+        };
+        println!("- {name} (connect: bmux connect {name})");
+        if verbose {
+            println!("  transport: {transport}");
+            match target.transport {
+                ConnectionTransport::Local => {}
+                ConnectionTransport::Ssh | ConnectionTransport::Tls => {
+                    if let Some(host) = target.host.as_deref() {
+                        if let Some(port) = target.port {
+                            println!("  endpoint: {host}:{port}");
+                        } else {
+                            println!("  endpoint: {host}");
+                        }
+                    }
+                }
+                ConnectionTransport::Iroh => {
+                    if let Some(endpoint_id) = target.endpoint_id.as_deref() {
+                        println!("  endpoint id: {endpoint_id}");
+                    }
+                    if let Some(relay_url) = target.relay_url.as_deref() {
+                        println!("  relay: {relay_url}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn print_recent_targets<'a>(targets: impl Iterator<Item = &'a String>, verbose: bool) {
+    let values = targets.collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    println!("recent:");
+    for target in values {
+        println!("- {target}");
+        if verbose {
+            println!("  join: bmux join {target}");
+        }
+    }
+}
+
+fn has_no_saved_hosts(config: &BmuxConfig) -> bool {
+    config.connections.recent_targets.is_empty()
+        && config.connections.targets.is_empty()
+        && config.connections.share_links.is_empty()
 }
 
 pub(super) async fn run_auth_login(no_browser: bool) -> Result<u8> {
