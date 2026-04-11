@@ -164,7 +164,33 @@ pub struct PaneSplitRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneLaunchCommand {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneLaunchRequest {
+    pub session: Option<SessionSelector>,
+    pub target: Option<PaneSelector>,
+    pub direction: PaneSplitDirection,
+    pub name: Option<String>,
+    pub command: PaneLaunchCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSplitResponse {
+    pub id: Uuid,
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneLaunchResponse {
     pub id: Uuid,
     pub session_id: Uuid,
 }

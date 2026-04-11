@@ -10,12 +10,13 @@ use bmux_plugin_sdk::{
     ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
     ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
     CoreCliCommandRequest, CoreCliCommandResponse, CurrentClientResponse, LogWriteRequest,
-    PaneCloseRequest, PaneCloseResponse, PaneFocusRequest, PaneFocusResponse, PaneListRequest,
-    PaneListResponse, PaneResizeRequest, PaneResizeResponse, PaneSplitRequest, PaneSplitResponse,
-    PluginCliCommandRequest, PluginCliCommandResponse, RecordingWriteEventRequest,
-    RecordingWriteEventResponse, Result, ServiceKind, SessionCreateRequest, SessionCreateResponse,
-    SessionKillRequest, SessionKillResponse, SessionListResponse, SessionSelectRequest,
-    SessionSelectResponse, StorageGetRequest, StorageGetResponse, StorageSetRequest,
+    PaneCloseRequest, PaneCloseResponse, PaneFocusRequest, PaneFocusResponse, PaneLaunchRequest,
+    PaneLaunchResponse, PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
+    PaneSplitRequest, PaneSplitResponse, PluginCliCommandRequest, PluginCliCommandResponse,
+    RecordingWriteEventRequest, RecordingWriteEventResponse, Result, ServiceKind,
+    SessionCreateRequest, SessionCreateResponse, SessionKillRequest, SessionKillResponse,
+    SessionListResponse, SessionSelectRequest, SessionSelectResponse, StorageGetRequest,
+    StorageGetResponse, StorageSetRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -279,6 +280,21 @@ pub trait HostRuntimeApi: ServiceCaller {
             ServiceKind::Command,
             "pane-command/v1",
             "split",
+            request,
+        )
+    }
+
+    /// Launch a pane with explicit command metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
+    fn pane_launch(&self, request: &PaneLaunchRequest) -> Result<PaneLaunchResponse> {
+        self.call_service(
+            "bmux.panes.write",
+            ServiceKind::Command,
+            "pane-command/v1",
+            "launch",
             request,
         )
     }

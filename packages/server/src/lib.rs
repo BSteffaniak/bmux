@@ -19,12 +19,13 @@ use bmux_ipc::{
     AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector,
     ContextSessionBindingSummary, ContextSummary, ControlCatalogScope, ControlCatalogSnapshot,
     Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
-    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
-    PerformanceRecordingLevel, PerformanceRuntimeSettings, ProtocolContract, RecordingEventKind,
-    RecordingPayload, RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
-    RecordingRollingStatus, RecordingRollingUsage, RecordingSummary, Request, Response,
-    ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
-    default_supported_capabilities, encode, negotiate_protocol,
+    PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection,
+    PaneState, PaneSummary, PerformanceRecordingLevel, PerformanceRuntimeSettings,
+    ProtocolContract, RecordingEventKind, RecordingPayload, RecordingProfile,
+    RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
+    RecordingRollingUsage, RecordingSummary, Request, Response, ResponsePayload,
+    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
+    encode, negotiate_protocol,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -1236,10 +1237,19 @@ struct FloatingSurfaceRuntime {
 }
 
 #[derive(Debug, Clone)]
+struct PaneLaunchSpec {
+    program: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
 struct PaneRuntimeMeta {
     id: Uuid,
     name: Option<String>,
     shell: String,
+    launch: Option<PaneLaunchSpec>,
     resurrection: PaneResurrectionSnapshot,
 }
 
@@ -3261,6 +3271,18 @@ fn runtime_layout_from_snapshot(node: &PaneLayoutNodeSnapshotV2) -> PaneLayoutNo
     }
 }
 
+fn pane_launch_spec_from_command(command: PaneLaunchCommand) -> Result<PaneLaunchSpec> {
+    if command.program.trim().is_empty() {
+        anyhow::bail!("pane launch command program cannot be empty");
+    }
+    Ok(PaneLaunchSpec {
+        program: command.program,
+        args: command.args,
+        cwd: command.cwd,
+        env: command.env,
+    })
+}
+
 impl SessionRuntimeManager {
     #[allow(clippy::too_many_arguments)]
     const fn new(
@@ -3298,6 +3320,7 @@ impl SessionRuntimeManager {
             id: first_pane_id,
             name: Some("pane-1".to_string()),
             shell: self.shell.clone(),
+            launch: None,
             resurrection: PaneResurrectionSnapshot::default(),
         };
         let first_pane = self.spawn_pane_runtime(session_id, pane_meta);
@@ -3381,6 +3404,7 @@ impl SessionRuntimeManager {
         )));
         let last_requested_size = Arc::new(std::sync::Mutex::new((24_u16, 80_u16)));
         let shell = pane_meta.shell.clone();
+        let launch = pane_meta.launch.clone();
         let pane_term = self.pane_term.clone();
         let protocol_profile = self.protocol_profile;
         let pane_id = pane_meta.id;
@@ -3464,27 +3488,50 @@ impl SessionRuntimeManager {
                 return;
             };
 
-            let mut command = CommandBuilder::new(&shell);
-            command.env("TERM", &pane_term);
-            if let Some(cwd) = initial_cwd.as_deref()
-                && !cwd.is_empty()
-            {
-                command.cwd(cwd);
-            }
-            if let Err(error) = configure_shell_integration_command(
-                &mut command,
-                &shell,
-                shell_integration_root.as_deref(),
-            ) {
-                warn!("failed configuring shell integration for pane {pane_id}: {error:#}");
-            }
+            let (command, failed_spawn_label) = launch.as_ref().map_or_else(
+                || {
+                    let mut command = CommandBuilder::new(&shell);
+                    command.env("TERM", &pane_term);
+                    if let Some(cwd) = initial_cwd.as_deref()
+                        && !cwd.is_empty()
+                    {
+                        command.cwd(cwd);
+                    }
+                    if let Err(error) = configure_shell_integration_command(
+                        &mut command,
+                        &shell,
+                        shell_integration_root.as_deref(),
+                    ) {
+                        warn!("failed configuring shell integration for pane {pane_id}: {error:#}");
+                    }
+                    (command, format!("shell '{shell}'"))
+                },
+                |launch| {
+                    let mut command = CommandBuilder::new(&launch.program);
+                    command.env("TERM", &pane_term);
+                    for arg in &launch.args {
+                        command.arg(arg);
+                    }
+                    for (key, value) in &launch.env {
+                        command.env(key, value);
+                    }
+                    if let Some(cwd) = launch.cwd.as_deref().or(initial_cwd.as_deref())
+                        && !cwd.is_empty()
+                    {
+                        command.cwd(cwd);
+                    }
+                    (command, format!("command '{}'", launch.program))
+                },
+            );
             let Ok(mut child) = pty_pair.slave.spawn_command(command) else {
                 if let Ok(mut reason) = exit_reason_for_task.lock() {
-                    *reason = Some(format!("failed to spawn shell '{shell}'"));
+                    *reason = Some(format!("failed to spawn {failed_spawn_label}"));
                 }
                 push_pane_runtime_notice(
                     &output_buffer_for_reader,
-                    format!("\r\n[bmux] pane failed to start: failed to spawn shell '{shell}'\r\n"),
+                    format!(
+                        "\r\n[bmux] pane failed to start: failed to spawn {failed_spawn_label}\r\n"
+                    ),
                 );
                 exited_for_task.store(true, Ordering::SeqCst);
                 return;
@@ -3528,7 +3575,8 @@ impl SessionRuntimeManager {
             };
             let writer = Arc::new(std::sync::Mutex::new(writer));
 
-            if let Some(command_text) = replay_command.as_deref()
+            if launch.is_none()
+                && let Some(command_text) = replay_command.as_deref()
                 && let Ok(mut writer_guard) = writer.lock()
             {
                 let mut replay_bytes = command_text.as_bytes().to_vec();
@@ -3912,6 +3960,29 @@ impl SessionRuntimeManager {
         target: Option<PaneSelector>,
         direction: PaneSplitDirection,
     ) -> Result<Uuid> {
+        self.create_split_pane(session_id, target, direction, None, None)
+    }
+
+    fn launch_pane(
+        &mut self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        direction: PaneSplitDirection,
+        name: Option<String>,
+        command: PaneLaunchCommand,
+    ) -> Result<Uuid> {
+        let launch = pane_launch_spec_from_command(command)?;
+        self.create_split_pane(session_id, target, direction, name, Some(launch))
+    }
+
+    fn create_split_pane(
+        &mut self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        direction: PaneSplitDirection,
+        name: Option<String>,
+        launch: Option<PaneLaunchSpec>,
+    ) -> Result<Uuid> {
         // Auto-unzoom on layout mutation.
         if let Some(session) = self.runtimes.get_mut(&session_id) {
             session.zoomed_pane_id = None;
@@ -3934,7 +4005,7 @@ impl SessionRuntimeManager {
             };
             (
                 target_pane_id,
-                Some(format!("{name_prefix}-pane-{}", session.panes.len() + 1)),
+                name.or_else(|| Some(format!("{name_prefix}-pane-{}", session.panes.len() + 1))),
                 focused.meta.shell.clone(),
                 session.attached_clients.iter().copied().collect::<Vec<_>>(),
             )
@@ -3945,6 +4016,7 @@ impl SessionRuntimeManager {
             id: pane_id,
             name: next_pane_name,
             shell,
+            launch,
             resurrection: PaneResurrectionSnapshot::default(),
         };
         let handle = self.spawn_pane_runtime(session_id, pane_meta);
@@ -4099,6 +4171,7 @@ impl SessionRuntimeManager {
                 id: pane_id,
                 name: pane.meta.name.clone(),
                 shell: pane.meta.shell.clone(),
+                launch: pane.meta.launch.clone(),
                 resurrection: PaneResurrectionSnapshot {
                     active_command: None,
                     active_command_source: None,
@@ -6341,6 +6414,14 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
                                             id: pane.meta.id,
                                             name: pane.meta.name.clone(),
                                             shell: pane.meta.shell.clone(),
+                                            launch_command: pane.meta.launch.as_ref().map(
+                                                |command| PaneLaunchCommand {
+                                                    program: command.program.clone(),
+                                                    args: command.args.clone(),
+                                                    cwd: command.cwd.clone(),
+                                                    env: command.env.clone(),
+                                                },
+                                            ),
                                             process_group_id,
                                             active_command: resurrection_snapshot.active_command,
                                             active_command_source: resurrection_snapshot
@@ -6777,6 +6858,12 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
                     id: pane.id,
                     name: pane.name.clone(),
                     shell: pane.shell.clone(),
+                    launch: pane.launch_command.as_ref().map(|command| PaneLaunchSpec {
+                        program: command.program.clone(),
+                        args: command.args.clone(),
+                        cwd: command.cwd.clone(),
+                        env: command.env.clone(),
+                    }),
                     resurrection: PaneResurrectionSnapshot {
                         active_command: pane.active_command.clone(),
                         active_command_source: pane.active_command_source,
@@ -7463,6 +7550,60 @@ async fn handle_request(
             drop(runtime_manager);
             emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneSplit {
+                id: pane_id,
+                session_id: session_id.0,
+            })
+        }
+        Request::LaunchPane {
+            session,
+            target,
+            direction,
+            name,
+            command,
+        } => {
+            let session_id = {
+                let manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                match resolve_session_request_session_id(
+                    &manager,
+                    session.as_ref(),
+                    selected_session.as_ref(),
+                ) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                }
+            };
+            if let Err(response) = ensure_session_mutation_allowed(
+                state,
+                shutdown_tx,
+                session_id,
+                client_id,
+                client_principal_id,
+                "pane.launch",
+            )
+            .await
+            {
+                return Ok(Response::Err(response));
+            }
+            let mut runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            let pane_id =
+                match runtime_manager.launch_pane(session_id, target, direction, name, command) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        return Ok(Response::Err(ErrorResponse {
+                            code: ErrorCode::Internal,
+                            message: format!("failed launching pane: {error:#}"),
+                        }));
+                    }
+                };
+            drop(runtime_manager);
+            emit_attach_view_changed_for_layout(state, session_id)?;
+            Response::Ok(ResponsePayload::PaneLaunched {
                 id: pane_id,
                 session_id: session_id.0,
             })
@@ -9510,6 +9651,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::CloseContext { .. }
             | Request::KillSession { .. }
             | Request::SplitPane { .. }
+            | Request::LaunchPane { .. }
             | Request::FocusPane { .. }
             | Request::ResizePane { .. }
             | Request::ClosePane { .. }
@@ -9547,6 +9689,7 @@ const fn response_requires_snapshot(response: &Response) -> bool {
                 | ResponsePayload::ContextSelected { .. }
                 | ResponsePayload::ContextClosed { .. }
                 | ResponsePayload::PaneSplit { .. }
+                | ResponsePayload::PaneLaunched { .. }
                 | ResponsePayload::PaneFocused { .. }
                 | ResponsePayload::PaneResized { .. }
                 | ResponsePayload::PaneClosed { .. }
@@ -9584,6 +9727,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::KillSession { .. } => "kill_session",
         Request::ListPanes { .. } => "list_panes",
         Request::SplitPane { .. } => "split_pane",
+        Request::LaunchPane { .. } => "launch_pane",
         Request::FocusPane { .. } => "focus_pane",
         Request::ResizePane { .. } => "resize_pane",
         Request::ClosePane { .. } => "close_pane",
@@ -9868,6 +10012,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::SessionKilled { .. } => "session_killed",
         ResponsePayload::PaneList { .. } => "pane_list",
         ResponsePayload::PaneSplit { .. } => "pane_split",
+        ResponsePayload::PaneLaunched { .. } => "pane_launched",
         ResponsePayload::PaneFocused { .. } => "pane_focused",
         ResponsePayload::PaneResized { .. } => "pane_resized",
         ResponsePayload::PaneClosed { .. } => "pane_closed",

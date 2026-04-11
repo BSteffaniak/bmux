@@ -1,4 +1,5 @@
 use bmux_config::ConfigPaths;
+use bmux_ipc::PaneLaunchCommand;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -74,6 +75,8 @@ pub struct PaneSnapshotV2 {
     pub id: Uuid,
     pub name: Option<String>,
     pub shell: String,
+    #[serde(default)]
+    pub launch_command: Option<PaneLaunchCommand>,
     #[serde(default)]
     pub process_group_id: Option<i32>,
     #[serde(default)]
@@ -351,6 +354,14 @@ fn validate_pane_resurrection_fields(
     session_id: Uuid,
     pane: &PaneSnapshotV2,
 ) -> Result<(), SnapshotError> {
+    if let Some(command) = pane.launch_command.as_ref()
+        && command.program.trim().is_empty()
+    {
+        return Err(SnapshotError::Validation(format!(
+            "pane {} in session {} has empty launch command program",
+            pane.id, session_id
+        )));
+    }
     if let Some(command) = pane.active_command.as_deref() {
         if command.trim().is_empty() {
             return Err(SnapshotError::Validation(format!(
@@ -574,6 +585,7 @@ mod tests {
                     id: window_id,
                     name: Some("pane-1".to_string()),
                     shell: "/bin/sh".to_string(),
+                    launch_command: None,
                     process_group_id: None,
                     active_command: None,
                     active_command_source: None,
@@ -646,6 +658,7 @@ mod tests {
                     id: Uuid::new_v4(),
                     name: Some("pane-1".to_string()),
                     shell: "/bin/sh".to_string(),
+                    launch_command: None,
                     process_group_id: None,
                     active_command: None,
                     active_command_source: None,
@@ -711,6 +724,7 @@ mod tests {
                     id: pane_id,
                     name: Some("pane-1".to_string()),
                     shell: "/bin/sh".to_string(),
+                    launch_command: None,
                     process_group_id: None,
                     active_command: None,
                     active_command_source: Some(crate::PaneCommandSource::Verbatim),

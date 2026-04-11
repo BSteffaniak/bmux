@@ -336,6 +336,17 @@ pub enum PaneSplitDirection {
     Horizontal,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneLaunchCommand {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneFocusDirection {
@@ -479,6 +490,14 @@ pub enum Request {
         /// protocol but not yet used by the server runtime (layout-level feature).
         #[serde(default)]
         ratio_pct: Option<u32>,
+    },
+    LaunchPane {
+        session: Option<SessionSelector>,
+        target: Option<PaneSelector>,
+        direction: PaneSplitDirection,
+        #[serde(default)]
+        name: Option<String>,
+        command: PaneLaunchCommand,
     },
     FocusPane {
         session: Option<SessionSelector>,
@@ -1174,6 +1193,10 @@ pub enum ResponsePayload {
         id: Uuid,
     },
     PaneSplit {
+        id: Uuid,
+        session_id: Uuid,
+    },
+    PaneLaunched {
         id: Uuid,
         session_id: Uuid,
     },
@@ -1992,6 +2015,22 @@ mod tests {
                 direction: PaneSplitDirection::Vertical,
                 ratio_pct: None,
             },
+            Request::LaunchPane {
+                session: Some(SessionSelector::ById(id)),
+                target: Some(PaneSelector::ById(id2)),
+                direction: PaneSplitDirection::Horizontal,
+                name: Some("remote-a".into()),
+                command: PaneLaunchCommand {
+                    program: "ssh".into(),
+                    args: vec!["host-a".into()],
+                    cwd: Some("/tmp".into()),
+                    env: {
+                        let mut env = BTreeMap::new();
+                        env.insert("FOO".into(), "bar".into());
+                        env
+                    },
+                },
+            },
             Request::FocusPane {
                 session: None,
                 target: None,
@@ -2389,6 +2428,10 @@ mod tests {
             ResponsePayload::SessionKilled { id },
             ResponsePayload::PaneSplit {
                 id: pane_id,
+                session_id: id,
+            },
+            ResponsePayload::PaneLaunched {
+                id: id2,
                 session_id: id,
             },
             ResponsePayload::PaneFocused {

@@ -7,9 +7,9 @@ use crate::{
 };
 use bmux_ipc::{
     ContextSelector as IpcContextSelector, PaneFocusDirection as IpcPaneFocusDirection,
-    PaneSelector as IpcPaneSelector, PaneSplitDirection as IpcPaneSplitDirection,
-    Request as IpcRequest, Response as IpcResponse, ResponsePayload as IpcResponsePayload,
-    SessionSelector as IpcSessionSelector,
+    PaneLaunchCommand as IpcPaneLaunchCommand, PaneSelector as IpcPaneSelector,
+    PaneSplitDirection as IpcPaneSplitDirection, Request as IpcRequest, Response as IpcResponse,
+    ResponsePayload as IpcResponsePayload, SessionSelector as IpcSessionSelector,
 };
 use bmux_plugin_sdk::{
     CORE_CLI_BRIDGE_PROTOCOL_V1, CORE_CLI_COMMAND_INTERFACE_V1,
@@ -23,17 +23,17 @@ use bmux_plugin_sdk::{
     PROCESS_RUNTIME_ENV_PLUGIN_ID, PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1,
     PROCESS_RUNTIME_TRANSPORT_STDIO_V1, PaneCloseRequest, PaneCloseResponse,
     PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
-    PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
-    PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
-    PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary, PluginCliCommandRequest,
-    PluginCliCommandResponse, PluginError, PluginEvent, ProcessInvocationRequest,
-    ProcessInvocationResponse, RecordingWriteEventRequest, RecordingWriteEventResponse,
-    RegisteredService, Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse,
-    SessionCreateRequest, SessionCreateResponse, SessionKillRequest, SessionKillResponse,
-    SessionListResponse, SessionSelectRequest, SessionSelectResponse,
-    SessionSelector as HostSessionSelector, SessionSummary as HostSessionSummary,
-    StaticPluginVtable, decode_process_invocation_response, decode_service_envelope,
-    decode_service_message, encode_host_kernel_bridge_cli_command_payload,
+    PaneLaunchRequest, PaneLaunchResponse, PaneListRequest, PaneListResponse, PaneResizeRequest,
+    PaneResizeResponse, PaneSelector as HostPaneSelector,
+    PaneSplitDirection as HostPaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
+    PaneSummary as HostPaneSummary, PluginCliCommandRequest, PluginCliCommandResponse, PluginError,
+    PluginEvent, ProcessInvocationRequest, ProcessInvocationResponse, RecordingWriteEventRequest,
+    RecordingWriteEventResponse, RegisteredService, Result, ServiceEnvelopeKind, ServiceKind,
+    ServiceRequest, ServiceResponse, SessionCreateRequest, SessionCreateResponse,
+    SessionKillRequest, SessionKillResponse, SessionListResponse, SessionSelectRequest,
+    SessionSelectResponse, SessionSelector as HostSessionSelector,
+    SessionSummary as HostSessionSummary, StaticPluginVtable, decode_process_invocation_response,
+    decode_service_envelope, decode_service_message, encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload, encode_process_invocation_request,
     encode_service_envelope, encode_service_message,
 };
@@ -889,6 +889,32 @@ fn handle_core_service_call(
                 }
                 _ => Err(PluginError::ServiceProtocol {
                     details: "unexpected response payload for pane-command/v1:split".to_string(),
+                }),
+            }
+        }
+        ("pane-command/v1", "launch") => {
+            let request: PaneLaunchRequest = decode_service_message(payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::LaunchPane {
+                    session: request.session.map(session_selector_to_ipc),
+                    target: request.target.map(pane_selector_to_ipc),
+                    direction: pane_split_direction_to_ipc(request.direction),
+                    name: request.name,
+                    command: IpcPaneLaunchCommand {
+                        program: request.command.program,
+                        args: request.command.args,
+                        cwd: request.command.cwd,
+                        env: request.command.env,
+                    },
+                },
+            )?;
+            match response {
+                IpcResponsePayload::PaneLaunched { id, session_id } => {
+                    encode_service_message(&PaneLaunchResponse { id, session_id })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for pane-command/v1:launch".to_string(),
                 }),
             }
         }
