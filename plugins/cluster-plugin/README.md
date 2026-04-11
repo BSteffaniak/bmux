@@ -15,9 +15,8 @@ Current scope:
 - `cluster up` creates/reuses `cluster-<name>` session and launches host-bound panes
 - Partial-start semantics: unhealthy hosts are reported as degraded while healthy hosts still launch
 - `cluster pane new` creates an ad-hoc host-bound pane via the generic pane launch API
+- `cluster pane move` relocates a pane to a destination host and retargets pane naming
 - `cluster pane retry` relaunches a host-bound pane by inferring target from pane naming convention
-
-`cluster pane move` remains stubbed for a follow-up slice.
 
 ## Commands (Scaffolded)
 

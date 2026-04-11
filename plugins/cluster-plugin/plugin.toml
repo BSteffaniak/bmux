@@ -160,6 +160,14 @@ value_name = "PANE"
 kind       = "string"
 long       = "host"
 name       = "host"
+short      = "h"
+value_name = "HOST"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "host_ref"
+position   = 1
+required   = false
 value_name = "HOST"
 
 [[commands]]
@@ -173,4 +181,11 @@ summary       = "Retry a failed cluster pane"
 kind       = "string"
 long       = "pane"
 name       = "pane"
+value_name = "PANE"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "pane_ref"
+position   = 0
+required   = false
 value_name = "PANE"

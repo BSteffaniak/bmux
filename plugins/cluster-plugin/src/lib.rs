@@ -25,9 +25,7 @@ impl RustPlugin for ClusterPlugin {
             "cluster-doctor" => run_cluster_doctor(&context).map_err(PluginCommandError::from),
             "cluster-up" => run_cluster_up(&context).map_err(PluginCommandError::from),
             "cluster-pane-new" => run_cluster_pane_new(&context).map_err(PluginCommandError::from),
-            "cluster-pane-move" => Err(PluginCommandError::from(
-                "command 'cluster-pane-move' is not implemented yet"
-            )),
+            "cluster-pane-move" => run_cluster_pane_move(&context).map_err(PluginCommandError::from),
             "cluster-pane-retry" => run_cluster_pane_retry(&context).map_err(PluginCommandError::from)
         })
     }
@@ -124,6 +122,12 @@ enum PaneRetryRef {
 #[derive(Debug, Clone)]
 struct ClusterPaneRetryArgs {
     pane: PaneRetryRef,
+}
+
+#[derive(Debug, Clone)]
+struct ClusterPaneMoveArgs {
+    pane: PaneRetryRef,
+    host: String,
 }
 
 fn run_cluster_hosts(context: &NativeCommandContext) -> Result<i32, String> {
@@ -281,9 +285,10 @@ fn run_cluster_up(context: &NativeCommandContext) -> Result<i32, String> {
 
 fn run_cluster_pane_new(context: &NativeCommandContext) -> Result<i32, String> {
     let args = parse_cluster_pane_new_args(&context.arguments)?;
+    let host = args.host.as_str();
 
-    run_health_probe(context, &args.host, HealthProbe::Test)
-        .map_err(|error| format!("target '{}' is not ready: {error}", args.host))?;
+    run_health_probe(context, host, HealthProbe::Test)
+        .map_err(|error| format!("target '{host}' is not ready: {error}"))?;
 
     let pane_name = args.name.or_else(|| Some(format!("host:{}", args.host)));
     let response = context
@@ -296,18 +301,18 @@ fn run_cluster_pane_new(context: &NativeCommandContext) -> Result<i32, String> {
                 program: "bmux".to_string(),
                 args: vec![
                     "connect".to_string(),
-                    args.host.clone(),
+                    host.to_string(),
                     "--reconnect-forever".to_string(),
                 ],
                 cwd: None,
-                env: BTreeMap::from([("BMUX_CLUSTER_TARGET".to_string(), args.host.clone())]),
+                env: BTreeMap::from([("BMUX_CLUSTER_TARGET".to_string(), host.to_string())]),
             },
         })
-        .map_err(|error| format!("failed to create cluster pane for '{}': {error}", args.host))?;
+        .map_err(|error| format!("failed to create cluster pane for '{host}': {error}"))?;
 
     println!(
         "cluster pane new: target={} pane_id={} session_id={}",
-        args.host, response.id, response.session_id
+        host, response.id, response.session_id
     );
     Ok(EXIT_OK)
 }
@@ -358,6 +363,53 @@ fn run_cluster_pane_retry(context: &NativeCommandContext) -> Result<i32, String>
     println!(
         "cluster pane retry: target={} old_pane_id={} new_pane_id={} session_id={}",
         target, pane.id, launch.id, launch.session_id
+    );
+    Ok(EXIT_OK)
+}
+
+fn run_cluster_pane_move(context: &NativeCommandContext) -> Result<i32, String> {
+    let args = parse_cluster_pane_move_args(&context.arguments)?;
+    let host = args.host.as_str();
+    let list = context
+        .pane_list(&PaneListRequest { session: None })
+        .map_err(|error| format!("failed listing panes: {error}"))?;
+
+    let pane = resolve_retry_pane(&list.panes, &args.pane)?;
+    let original = pane.name.clone();
+    let pane_name = retarget_pane_name(pane.name.as_deref(), host);
+
+    run_health_probe(context, host, HealthProbe::Test)
+        .map_err(|error| format!("target '{host}' is not ready: {error}"))?;
+
+    let launch = context
+        .pane_launch(&PaneLaunchRequest {
+            session: None,
+            target: Some(PaneSelector::ById(pane.id)),
+            direction: PaneSplitDirection::Vertical,
+            name: pane_name,
+            command: PaneLaunchCommand {
+                program: "bmux".to_string(),
+                args: vec![
+                    "connect".to_string(),
+                    host.to_string(),
+                    "--reconnect-forever".to_string(),
+                ],
+                cwd: None,
+                env: BTreeMap::from([("BMUX_CLUSTER_TARGET".to_string(), host.to_string())]),
+            },
+        })
+        .map_err(|error| format!("failed moving pane to '{host}': {error}"))?;
+
+    context
+        .pane_close(&PaneCloseRequest {
+            session: None,
+            target: Some(PaneSelector::ById(pane.id)),
+        })
+        .map_err(|error| format!("failed closing old pane {}: {error}", pane.id))?;
+
+    println!(
+        "cluster pane move: old_pane_id={} new_pane_id={} old_name={:?} new_target={} session_id={}",
+        pane.id, launch.id, original, host, launch.session_id
     );
     Ok(EXIT_OK)
 }
@@ -776,6 +828,83 @@ fn parse_cluster_pane_retry_args(arguments: &[String]) -> Result<ClusterPaneRetr
     Ok(ClusterPaneRetryArgs { pane })
 }
 
+fn parse_cluster_pane_move_args(arguments: &[String]) -> Result<ClusterPaneMoveArgs, String> {
+    let mut pane = None;
+    let mut host = None;
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--pane" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--pane requires a value".to_string())?;
+            if !value.trim().is_empty() {
+                pane = Some(value.trim().to_string());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--pane=") {
+            if !value.trim().is_empty() {
+                pane = Some(value.trim().to_string());
+            }
+            index += 1;
+            continue;
+        }
+        if argument == "--host" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--host requires a value".to_string())?;
+            if !value.trim().is_empty() {
+                host = Some(value.trim().to_string());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--host=") {
+            if !value.trim().is_empty() {
+                host = Some(value.trim().to_string());
+            }
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        positional.push(argument.trim().to_string());
+        index += 1;
+    }
+
+    if host.is_none() {
+        if positional.len() >= 2 {
+            pane = pane.or_else(|| positional.first().cloned());
+            host = positional.get(1).cloned();
+        } else if positional.len() == 1 {
+            host = positional.first().cloned();
+        }
+    } else if pane.is_none() {
+        pane = positional.first().cloned();
+    }
+
+    let host = host
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "cluster-pane-move requires --host <TARGET>".to_string())?;
+    let raw_pane = pane
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "active".to_string());
+    let pane = if raw_pane.eq_ignore_ascii_case("active") {
+        PaneRetryRef::Active
+    } else if let Ok(index) = raw_pane.parse::<u32>() {
+        PaneRetryRef::Index(index)
+    } else {
+        PaneRetryRef::Name(raw_pane)
+    };
+
+    Ok(ClusterPaneMoveArgs { pane, host })
+}
+
 fn resolve_retry_pane<'a>(
     panes: &'a [bmux_plugin_sdk::PaneSummary],
     pane_ref: &PaneRetryRef,
@@ -808,6 +937,17 @@ fn parse_cluster_target_from_pane_name(name: Option<&str>) -> Option<String> {
     } else {
         Some(target.to_string())
     }
+}
+
+fn retarget_pane_name(name: Option<&str>, target: &str) -> Option<String> {
+    let current = name?.trim();
+    if current.is_empty() {
+        return Some(format!("host:{target}"));
+    }
+    if let Some((prefix, _)) = current.split_once(':') {
+        return Some(format!("{}:{target}", prefix.trim()));
+    }
+    Some(format!("host:{target}"))
 }
 
 fn ensure_cluster_session(
@@ -939,5 +1079,40 @@ mod tests {
             Some("cache-b")
         );
         assert_eq!(parse_cluster_target_from_pane_name(Some("invalid")), None);
+    }
+
+    #[test]
+    fn parse_cluster_pane_move_args_supports_active_host_short_form() {
+        let parsed =
+            parse_cluster_pane_move_args(&["db-b".to_string()]).expect("move args should parse");
+        assert!(matches!(parsed.pane, PaneRetryRef::Active));
+        assert_eq!(parsed.host, "db-b");
+    }
+
+    #[test]
+    fn parse_cluster_pane_move_args_supports_pane_and_host_positional() {
+        let parsed = parse_cluster_pane_move_args(&["2".to_string(), "db-b".to_string()])
+            .expect("move args should parse");
+        assert!(matches!(parsed.pane, PaneRetryRef::Index(2)));
+        assert_eq!(parsed.host, "db-b");
+    }
+
+    #[test]
+    fn parse_cluster_pane_move_args_requires_host() {
+        let error = parse_cluster_pane_move_args(&["--pane".to_string(), "2".to_string()])
+            .expect_err("host should be required");
+        assert!(error.contains("requires --host"));
+    }
+
+    #[test]
+    fn retarget_pane_name_preserves_prefix() {
+        assert_eq!(
+            retarget_pane_name(Some("prod:db-a"), "db-b").as_deref(),
+            Some("prod:db-b")
+        );
+        assert_eq!(
+            retarget_pane_name(Some("host:cache-a"), "cache-b").as_deref(),
+            Some("host:cache-b")
+        );
     }
 }
