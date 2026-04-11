@@ -44,6 +44,7 @@ mod event;
 mod host;
 mod host_services;
 mod native_exports;
+mod process_runtime;
 pub mod prompt;
 mod service;
 mod version;
@@ -81,6 +82,12 @@ pub use host_services::{
 };
 pub use native_exports::{
     EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, PluginCommandError, RustPlugin,
+};
+pub use process_runtime::{
+    PROCESS_RUNTIME_ENV_PLUGIN_ID, PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_MAGIC_V1,
+    PROCESS_RUNTIME_PROTOCOL_V1, PROCESS_RUNTIME_TRANSPORT_STDIO_V1, ProcessInvocationRequest,
+    ProcessInvocationResponse, decode_process_invocation_response, decode_process_runtime_frame,
+    encode_process_invocation_request, encode_process_runtime_frame,
 };
 pub use service::{
     CURRENT_SERVICE_PROTOCOL_VERSION, PluginService, ProviderId, RegisteredService,

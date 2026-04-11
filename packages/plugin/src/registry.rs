@@ -2,6 +2,9 @@ use crate::{PluginDeclaration, PluginEntrypoint, PluginManifest};
 use bmux_plugin_sdk::{HostMetadata, HostScope, PluginError, RegisteredService, Result};
 use semver::Version;
 use std::collections::BTreeMap;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,11 +375,20 @@ impl PluginRegistry {
                 }
             }
             PluginEntrypoint::Process { command, .. } => {
-                if !process_command_is_available(registered_plugin, command) {
-                    return Err(PluginError::MissingEntryFile {
-                        plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                        path: PathBuf::from(command),
-                    });
+                match process_command_status(registered_plugin, command) {
+                    ProcessCommandStatus::Available => {}
+                    ProcessCommandStatus::Missing(path) => {
+                        return Err(PluginError::MissingEntryFile {
+                            plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                            path,
+                        });
+                    }
+                    ProcessCommandStatus::NotExecutable(path) => {
+                        return Err(PluginError::ProcessEntryNotExecutable {
+                            plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                            path,
+                        });
+                    }
                 }
             }
         }
@@ -502,25 +514,71 @@ impl PluginRegistry {
     }
 }
 
-fn process_command_is_available(registered_plugin: &RegisteredPlugin, command: &str) -> bool {
+enum ProcessCommandStatus {
+    Available,
+    Missing(PathBuf),
+    NotExecutable(PathBuf),
+}
+
+fn process_command_status(
+    registered_plugin: &RegisteredPlugin,
+    command: &str,
+) -> ProcessCommandStatus {
     let command_path = Path::new(command);
     if command_path.components().count() > 1 {
-        return registered_plugin
-            .manifest
-            .resolve_entry_path(
-                registered_plugin
-                    .manifest_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new(".")),
-            )
-            .is_some_and(|resolved| resolved.exists());
+        let resolved = registered_plugin.manifest.resolve_entry_path(
+            registered_plugin
+                .manifest_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        );
+        return match resolved {
+            Some(path) if command_is_executable(&path) => ProcessCommandStatus::Available,
+            Some(path) if path.exists() => ProcessCommandStatus::NotExecutable(path),
+            Some(path) => ProcessCommandStatus::Missing(path),
+            None => ProcessCommandStatus::Missing(PathBuf::from(command)),
+        };
     }
 
-    std::env::var_os("PATH").is_some_and(|paths| {
+    let mut first_non_exec: Option<PathBuf> = None;
+    let is_available = std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths)
             .map(|path| path.join(command))
-            .any(|candidate| candidate.exists())
-    })
+            .any(|candidate| {
+                if command_is_executable(&candidate) {
+                    return true;
+                }
+                if first_non_exec.is_none() && candidate.exists() {
+                    first_non_exec = Some(candidate);
+                }
+                false
+            })
+    });
+
+    if is_available {
+        ProcessCommandStatus::Available
+    } else if let Some(path) = first_non_exec {
+        ProcessCommandStatus::NotExecutable(path)
+    } else {
+        ProcessCommandStatus::Missing(PathBuf::from(command))
+    }
+}
+
+fn command_is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -834,5 +892,55 @@ minimum = "1.0"
         registry
             .validate_against_host(&host, &["process.plugin".to_string()], &[])
             .expect("process plugin command should validate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_rejects_non_executable_process_runtime_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        let script = dir.join("process-entry.sh");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").expect("script should be written");
+        let mut permissions = fs::metadata(&script)
+            .expect("script metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&script, permissions).expect("script permissions should update");
+
+        let manifest = PluginManifest::from_toml_str(&format!(
+            r#"
+id = "process.plugin"
+name = "Process Plugin"
+version = "0.1.0"
+runtime = "process"
+entry = "{}"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+            script.display()
+        ))
+        .expect("manifest should parse");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(&dir.join("plugin.toml"), manifest)
+            .expect("manifest should register");
+
+        let host = HostMetadata {
+            product_name: "bmux".to_string(),
+            product_version: "0.1.0".to_string(),
+            plugin_api_version: ApiVersion::new(1, 0),
+            plugin_abi_version: ApiVersion::new(1, 0),
+        };
+
+        let error = registry
+            .validate_against_host(&host, &["process.plugin".to_string()], &[])
+            .expect_err("non-executable process entry should fail validation");
+        assert!(error.to_string().contains("not executable"));
     }
 }

@@ -101,6 +101,9 @@ pub enum PluginError {
     #[error("plugin '{plugin_id}' entry file does not exist: {path:?}")]
     MissingEntryFile { plugin_id: String, path: PathBuf },
 
+    #[error("plugin '{plugin_id}' process entry is not executable: {path:?}")]
+    ProcessEntryNotExecutable { plugin_id: String, path: PathBuf },
+
     #[error("plugin '{plugin_id}' is registered as bundled-static but has no compiled vtable")]
     MissingStaticVtable { plugin_id: String },
 
@@ -165,6 +168,16 @@ pub enum PluginError {
     ProcessPluginSpawn {
         plugin_id: String,
         command: String,
+        details: String,
+    },
+
+    #[error(
+        "process plugin '{plugin_id}' command '{command}' timed out after {timeout_ms}ms ({details})"
+    )]
+    ProcessPluginTimeout {
+        plugin_id: String,
+        command: String,
+        timeout_ms: u128,
         details: String,
     },
 

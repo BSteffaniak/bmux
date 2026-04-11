@@ -192,6 +192,52 @@ fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
     let command_name = context.arguments[1].clone();
     let args = context.arguments[2..].to_vec();
 
+    let available_ids = context
+        .registered_plugins
+        .iter()
+        .map(|plugin| plugin.id.as_str())
+        .collect::<Vec<_>>();
+    let Some(target_plugin) = context
+        .registered_plugins
+        .iter()
+        .find(|plugin| plugin.id == plugin_id)
+    else {
+        let suggestion = suggest_closest(&plugin_id, &available_ids);
+        return Err(suggestion.map_or_else(
+            || {
+                format!(
+                    "plugin '{plugin_id}' was not found. Run 'bmux plugin list --json' to inspect available plugins."
+                )
+            },
+            |candidate| {
+                format!(
+                "plugin '{plugin_id}' was not found. Did you mean '{candidate}'? Run 'bmux plugin list --json' to inspect available plugins."
+                )
+            },
+        ));
+    };
+
+    if !target_plugin
+        .commands
+        .iter()
+        .any(|name| name == &command_name)
+    {
+        let known = target_plugin
+            .commands
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let suggestion = suggest_closest(&command_name, &known);
+        return Err(suggestion.map_or_else(
+            || format!("plugin '{plugin_id}' does not declare command '{command_name}'."),
+            |candidate| {
+                format!(
+                "plugin '{plugin_id}' does not declare command '{command_name}'. Did you mean '{candidate}'?"
+                )
+            },
+        ));
+    }
+
     if plugin_id == context.plugin_id {
         return Err(
             "running 'bmux.plugin_cli' via 'bmux plugin run' is not supported (self-invocation deadlock guard)"
@@ -212,34 +258,27 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
     let workspace_plugin_crates = workspace_plugin_cdylib_crates(&metadata);
     let bundled_plugins = discover_bundled_plugins(context)?;
 
-    if options.list_only {
+    if matches!(options.mode, RebuildMode::List) {
+        if options.json {
+            let report = RebuildSelectionReport {
+                profile: rebuild_profile_name(options.release),
+                selected_targets: Vec::new(),
+                mode: "list".to_string(),
+            };
+            let output = serde_json::to_string_pretty(&report)
+                .map_err(|error| format!("failed encoding rebuild json: {error}"))?;
+            println!("{output}");
+        }
         print_discovered_plugins(&bundled_plugins, &workspace_plugin_crates);
         return Ok(EXIT_OK);
     }
 
-    let mut targets = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut add_target = |crate_name: &str| {
-        if seen.insert(crate_name.to_string()) {
-            targets.push(crate_name.to_string());
-        }
-    };
-
-    if options.selectors.is_empty() {
-        if options.all_workspace_plugins {
-            println!("--all-workspace-plugins is now the default behavior");
-        }
-        for crate_name in &workspace_plugin_crates {
-            add_target(crate_name);
-        }
-    } else {
-        for selector in &options.selectors {
-            let resolved = resolve_selector(selector, &bundled_plugins, &workspace_plugin_crates)?;
-            add_target(&resolved);
-        }
-    }
+    let targets = select_rebuild_targets(&options, &bundled_plugins, &workspace_plugin_crates)?;
 
     if targets.is_empty() {
+        if matches!(options.mode, RebuildMode::Changed) {
+            return Err("no changed workspace plugin crates were detected".to_string());
+        }
         return Err(
             "no plugin crates selected to build; provide one or more selectors".to_string(),
         );
@@ -254,6 +293,17 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
                 "selected crate '{crate_name}' is not a workspace plugin cdylib crate"
             ));
         }
+    }
+
+    if options.json {
+        let report = RebuildSelectionReport {
+            profile: rebuild_profile_name(options.release),
+            selected_targets: targets.clone(),
+            mode: rebuild_mode_name(&options),
+        };
+        let output = serde_json::to_string_pretty(&report)
+            .map_err(|error| format!("failed encoding rebuild json: {error}"))?;
+        println!("{output}");
     }
 
     println!(
@@ -281,6 +331,137 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
     }
 
     Ok(EXIT_OK)
+}
+
+fn rebuild_profile_name(release: bool) -> String {
+    if release {
+        "release".to_string()
+    } else {
+        "debug".to_string()
+    }
+}
+
+fn rebuild_mode_name(options: &RebuildOptions) -> String {
+    if options.selectors.is_empty() {
+        match options.mode {
+            RebuildMode::List => "list".to_string(),
+            RebuildMode::Changed => "changed".to_string(),
+            RebuildMode::AllWorkspace => "all-workspace".to_string(),
+        }
+    } else {
+        "selectors".to_string()
+    }
+}
+
+fn select_rebuild_targets(
+    options: &RebuildOptions,
+    bundled_plugins: &[BundledPlugin],
+    workspace_plugin_crates: &[String],
+) -> Result<Vec<String>, String> {
+    let mut targets = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut add_target = |crate_name: &str| {
+        if seen.insert(crate_name.to_string()) {
+            targets.push(crate_name.to_string());
+        }
+    };
+
+    if !options.selectors.is_empty() {
+        for selector in &options.selectors {
+            let resolved = resolve_selector(selector, bundled_plugins, workspace_plugin_crates)?;
+            add_target(&resolved);
+        }
+        return Ok(targets);
+    }
+
+    match options.mode {
+        RebuildMode::Changed => {
+            for crate_name in
+                changed_workspace_plugin_crates(bundled_plugins, workspace_plugin_crates)?
+            {
+                add_target(&crate_name);
+            }
+        }
+        RebuildMode::AllWorkspace | RebuildMode::List => {
+            if options.all_workspace_plugins {
+                println!("--all-workspace-plugins is now the default behavior");
+            }
+            for crate_name in workspace_plugin_crates {
+                add_target(crate_name);
+            }
+        }
+    }
+
+    Ok(targets)
+}
+
+fn changed_workspace_plugin_crates(
+    bundled: &[BundledPlugin],
+    workspace_crates: &[String],
+) -> Result<Vec<String>, String> {
+    let changed_paths = collect_changed_paths()?;
+    let mut selected = BTreeSet::new();
+
+    if changed_paths.iter().any(|path| {
+        path.starts_with("packages/plugin/") || path.starts_with("packages/plugin-sdk/")
+    }) {
+        return Ok(workspace_crates.to_vec());
+    }
+
+    for path in changed_paths {
+        let mut segments = path.split('/');
+        if segments.next() != Some("plugins") {
+            continue;
+        }
+        let Some(short_name) = segments.next() else {
+            continue;
+        };
+        if let Some(entry) = bundled.iter().find(|entry| entry.short_name == short_name)
+            && workspace_crates
+                .iter()
+                .any(|name| name == &entry.crate_name)
+        {
+            selected.insert(entry.crate_name.clone());
+            continue;
+        }
+        let derived = dir_name_to_crate_name(short_name);
+        if workspace_crates.iter().any(|name| name == &derived) {
+            selected.insert(derived);
+        }
+    }
+
+    Ok(selected.into_iter().collect())
+}
+
+fn collect_changed_paths() -> Result<Vec<String>, String> {
+    let mut changed = BTreeSet::new();
+
+    for args in [
+        ["diff", "--name-only", "--relative", "HEAD"].as_slice(),
+        ["diff", "--name-only", "--relative", "--cached"].as_slice(),
+        ["ls-files", "--others", "--exclude-standard"].as_slice(),
+    ] {
+        let output = ProcessCommand::new("git")
+            .args(args)
+            .output()
+            .map_err(|error| format!("failed executing 'git {}': {error}", args.join(" ")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "'git {}' failed: {}",
+                args.join(" "),
+                stderr.trim()
+            ));
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                changed.insert(trimmed.to_string());
+            }
+        }
+    }
+
+    Ok(changed.into_iter().collect())
 }
 
 fn discover_bundled_plugins(context: &NativeCommandContext) -> Result<Vec<BundledPlugin>, String> {
@@ -459,7 +640,15 @@ fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, String>
                     continue;
                 }
                 "--list" => {
-                    options.list_only = true;
+                    options.mode = RebuildMode::List;
+                    continue;
+                }
+                "--json" => {
+                    options.json = true;
+                    continue;
+                }
+                "--changed" => {
+                    options.mode = RebuildMode::Changed;
                     continue;
                 }
                 "--all-workspace-plugins" => {
@@ -523,6 +712,48 @@ fn format_plugin_command_run_error(
     }
 }
 
+fn suggest_closest<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let lower_target = target.to_ascii_lowercase();
+
+    if let Some(exact_prefix) = candidates.iter().copied().find(|candidate| {
+        candidate.to_ascii_lowercase().starts_with(&lower_target)
+            || lower_target.starts_with(&candidate.to_ascii_lowercase())
+    }) {
+        return Some(exact_prefix);
+    }
+
+    candidates
+        .iter()
+        .copied()
+        .min_by_key(|candidate| levenshtein(&lower_target, &candidate.to_ascii_lowercase()))
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let left_chars = left.chars().collect::<Vec<_>>();
+    let right_chars = right.chars().collect::<Vec<_>>();
+    if left_chars.is_empty() {
+        return right_chars.len();
+    }
+    if right_chars.is_empty() {
+        return left_chars.len();
+    }
+
+    let mut prev = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut curr = vec![0; right_chars.len() + 1];
+    for (i, l) in left_chars.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, r) in right_chars.iter().enumerate() {
+            let cost = usize::from(l != r);
+            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[right_chars.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::core_proxy_command_path;
@@ -550,9 +781,18 @@ mod tests {
 #[derive(Debug, Default)]
 struct RebuildOptions {
     release: bool,
-    list_only: bool,
+    json: bool,
     all_workspace_plugins: bool,
+    mode: RebuildMode,
     selectors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum RebuildMode {
+    #[default]
+    AllWorkspace,
+    Changed,
+    List,
 }
 
 #[derive(Debug)]
@@ -560,6 +800,13 @@ struct BundledPlugin {
     plugin_id: String,
     short_name: String,
     crate_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RebuildSelectionReport {
+    profile: String,
+    mode: String,
+    selected_targets: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

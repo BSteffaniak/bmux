@@ -194,6 +194,16 @@ name = "list"
 
 [[commands.arguments]]
 kind = "boolean"
+long = "json"
+name = "json"
+
+[[commands.arguments]]
+kind = "boolean"
+long = "changed"
+name = "changed"
+
+[[commands.arguments]]
+kind = "boolean"
 long = "all-workspace-plugins"
 name = "all-workspace-plugins"
 

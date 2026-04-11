@@ -176,6 +176,34 @@ Resolution behavior is deterministic:
   - negotiate by advertised capabilities/interfaces before selecting newer versions
   - keep compatibility seams in shared constants/helpers rather than ad-hoc call sites
 
+## Process Runtime Protocol v1
+
+`runtime = "process"` plugins communicate with BMUX over framed stdio messages.
+
+- transport marker: `BMUXPRC1`
+- frame layout: `<magic><u32_be_payload_len><payload_bytes>`
+- payload encoding: service codec message (`encode_service_message` / `decode_service_message`)
+- protocol version field in request/response envelopes: `1`
+
+Environment passed to the process runtime:
+
+- `BMUX_PLUGIN_RUNTIME_PROTOCOL=stdio-v1`
+- `BMUX_PLUGIN_ID=<plugin-id>`
+
+Runtime behavior and constraints:
+
+- `stdout` is reserved for framed protocol responses only.
+- non-protocol diagnostics should be written to `stderr`.
+- host enforces a process timeout (default 30000ms).
+- timeout may be overridden with `BMUX_PROCESS_PLUGIN_TIMEOUT_MS`.
+- if a process exits without framed `stdout`, host treats it as unsupported for framed operations.
+
+Versioning policy for process runtime mirrors other plugin compatibility rules:
+
+- keep `v1` semantics stable once published
+- introduce `v2+` as additive protocol envelopes/operations
+- gate newer behavior via explicit protocol version/capability checks
+
 ## Migration Direction
 
 As context substrate work lands:

@@ -20,20 +20,22 @@ use bmux_plugin_sdk::{
     CoreCliCommandRequest, CoreCliCommandResponse, CurrentClientResponse, HostConnectionInfo,
     HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, HostMetadata, HostScope,
     LogWriteLevel, NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
-    PaneCloseRequest, PaneCloseResponse, PaneFocusDirection as HostPaneFocusDirection,
-    PaneFocusRequest, PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest,
-    PaneResizeResponse, PaneSelector as HostPaneSelector,
-    PaneSplitDirection as HostPaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
-    PaneSummary as HostPaneSummary, PluginCliCommandRequest, PluginCliCommandResponse, PluginError,
-    PluginEvent, RecordingWriteEventRequest, RecordingWriteEventResponse, RegisteredService,
-    Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse,
+    PROCESS_RUNTIME_ENV_PLUGIN_ID, PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1,
+    PROCESS_RUNTIME_TRANSPORT_STDIO_V1, PaneCloseRequest, PaneCloseResponse,
+    PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
+    PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
+    PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
+    PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary, PluginCliCommandRequest,
+    PluginCliCommandResponse, PluginError, PluginEvent, ProcessInvocationRequest,
+    ProcessInvocationResponse, RecordingWriteEventRequest, RecordingWriteEventResponse,
+    RegisteredService, Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse,
     SessionCreateRequest, SessionCreateResponse, SessionKillRequest, SessionKillResponse,
     SessionListResponse, SessionSelectRequest, SessionSelectResponse,
     SessionSelector as HostSessionSelector, SessionSummary as HostSessionSummary,
-    StaticPluginVtable, decode_service_envelope, decode_service_message,
-    encode_host_kernel_bridge_cli_command_payload,
-    encode_host_kernel_bridge_plugin_command_payload, encode_service_envelope,
-    encode_service_message,
+    StaticPluginVtable, decode_process_invocation_response, decode_service_envelope,
+    decode_service_message, encode_host_kernel_bridge_cli_command_payload,
+    encode_host_kernel_bridge_plugin_command_payload, encode_process_invocation_request,
+    encode_service_envelope, encode_service_message,
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
+use std::thread;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 
 type PluginEntryFn = unsafe extern "C" fn() -> *const c_char;
@@ -59,61 +63,8 @@ const NATIVE_SERVICE_STATUS_OK: i32 = 0;
 const NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 const KERNEL_STATUS_OK: i32 = 0;
 const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
-const PROCESS_RUNTIME_PROTOCOL_V1: u16 = 1;
-const PROCESS_RUNTIME_MAGIC_V1: &[u8] = b"BMUXPRC1";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum ProcessInvocationRequest {
-    Command {
-        protocol_version: u16,
-        plugin_id: String,
-        command_name: String,
-        arguments: Vec<String>,
-        context: Option<NativeCommandContext>,
-    },
-    Lifecycle {
-        protocol_version: u16,
-        plugin_id: String,
-        symbol: String,
-        context: NativeLifecycleContext,
-    },
-    Event {
-        protocol_version: u16,
-        plugin_id: String,
-        event: PluginEvent,
-    },
-    Service {
-        protocol_version: u16,
-        plugin_id: String,
-        context: NativeServiceContext,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum ProcessInvocationResponse {
-    Command {
-        protocol_version: u16,
-        status: i32,
-        outcome: Option<bmux_plugin_sdk::PluginCommandOutcome>,
-    },
-    Lifecycle {
-        protocol_version: u16,
-        status: i32,
-    },
-    Event {
-        protocol_version: u16,
-        status: Option<i32>,
-    },
-    Service {
-        protocol_version: u16,
-        response: ServiceResponse,
-    },
-    Error {
-        protocol_version: u16,
-        details: String,
-        status: Option<i32>,
-    },
-}
+const PROCESS_PLUGIN_TIMEOUT_ENV_VAR: &str = "BMUX_PROCESS_PLUGIN_TIMEOUT_MS";
+const PROCESS_PLUGIN_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 
 /// Backend that a [`LoadedPlugin`] uses to dispatch calls.
 #[derive(Debug)]
@@ -140,8 +91,7 @@ impl ProcessPluginRuntime {
         argv: &[String],
         request: &ProcessInvocationRequest,
     ) -> Result<(Option<ProcessInvocationResponse>, std::process::ExitStatus)> {
-        let request_payload = encode_service_message(request)?;
-        let frame = encode_process_frame(&request_payload)?;
+        let frame = encode_process_invocation_request(request)?;
 
         let mut command = Command::new(&self.command);
         if let Some(current_dir) = &self.current_dir {
@@ -151,8 +101,12 @@ impl ProcessPluginRuntime {
         command.args(argv);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
-        command.env("BMUX_PLUGIN_RUNTIME_PROTOCOL", "stdio-v1");
-        command.env("BMUX_PLUGIN_ID", plugin_id);
+        command.stderr(Stdio::piped());
+        command.env(
+            PROCESS_RUNTIME_ENV_PROTOCOL,
+            PROCESS_RUNTIME_TRANSPORT_STDIO_V1,
+        );
+        command.env(PROCESS_RUNTIME_ENV_PLUGIN_ID, plugin_id);
 
         let mut child = command
             .spawn()
@@ -176,24 +130,115 @@ impl ProcessPluginRuntime {
         }
         drop(child.stdin.take());
 
-        let mut stdout = Vec::new();
-        if let Some(out) = child.stdout.as_mut() {
-            out.read_to_end(&mut stdout)
-                .map_err(|error| PluginError::ServiceProtocol {
-                    details: format!("failed reading process runtime stdout: {error}"),
-                })?;
-        }
-        let status = child.wait().map_err(|error| PluginError::ServiceProtocol {
-            details: format!("failed waiting for process runtime child: {error}"),
+        let stdout_reader = child.stdout.take().map(read_stream_to_end).ok_or_else(|| {
+            PluginError::ServiceProtocol {
+                details: "process runtime stdout pipe missing".to_string(),
+            }
+        })?;
+        let stderr_reader = child.stderr.take().map(read_stream_to_end).ok_or_else(|| {
+            PluginError::ServiceProtocol {
+                details: "process runtime stderr pipe missing".to_string(),
+            }
         })?;
 
+        let timeout = process_plugin_timeout();
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) =
+                child
+                    .try_wait()
+                    .map_err(|error| PluginError::ServiceProtocol {
+                        details: format!("failed polling process runtime child: {error}"),
+                    })?
+            {
+                break status;
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = join_reader(stderr_reader, "stderr")?;
+                return Err(PluginError::ProcessPluginTimeout {
+                    plugin_id: plugin_id.to_string(),
+                    command: self.command.clone(),
+                    timeout_ms: timeout.as_millis(),
+                    details: summarize_stderr(&stderr),
+                });
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let stdout = join_reader(stdout_reader, "stdout")?;
+        let stderr = join_reader(stderr_reader, "stderr")?;
+
         if stdout.is_empty() {
-            return Ok((None, status));
+            if status.success() {
+                return Ok((None, status));
+            }
+            return Err(PluginError::ServiceProtocol {
+                details: format!(
+                    "process runtime exited with status {} without framed stdout response{}",
+                    status,
+                    summarize_stderr_suffix(&stderr)
+                ),
+            });
         }
 
-        let framed = decode_process_frame(&stdout)?;
-        let response: ProcessInvocationResponse = decode_service_message(framed)?;
+        let response = decode_process_invocation_response(&stdout).map_err(|error| {
+            PluginError::ServiceProtocol {
+                details: format!(
+                    "failed decoding process runtime stdout frame: {error}{}",
+                    summarize_stderr_suffix(&stderr)
+                ),
+            }
+        })?;
         Ok((Some(response), status))
+    }
+}
+
+fn process_plugin_timeout() -> Duration {
+    let timeout_ms = std::env::var(PROCESS_PLUGIN_TIMEOUT_ENV_VAR)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(PROCESS_PLUGIN_TIMEOUT_DEFAULT_MS);
+    Duration::from_millis(timeout_ms)
+}
+
+fn read_stream_to_end<R: Read + Send + 'static>(
+    mut reader: R,
+) -> thread::JoinHandle<Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| PluginError::ServiceProtocol {
+                details: format!("failed reading process runtime stream: {error}"),
+            })?;
+        Ok(bytes)
+    })
+}
+
+fn join_reader(handle: thread::JoinHandle<Result<Vec<u8>>>, stream: &str) -> Result<Vec<u8>> {
+    handle.join().map_err(|_| PluginError::ServiceProtocol {
+        details: format!("process runtime {stream} reader thread panicked"),
+    })?
+}
+
+fn summarize_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr).trim().to_string();
+    if text.is_empty() {
+        "no stderr output".to_string()
+    } else {
+        text
+    }
+}
+
+fn summarize_stderr_suffix(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr).trim().to_string();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {text}")
     }
 }
 
@@ -223,43 +268,6 @@ fn finish_command_outcome_capture() -> bmux_plugin_sdk::PluginCommandOutcome {
         .unwrap_or(bmux_plugin_sdk::PluginCommandOutcome {
             effects: Vec::new(),
         })
-}
-
-fn encode_process_frame(payload: &[u8]) -> Result<Vec<u8>> {
-    let payload_len = u32::try_from(payload.len()).map_err(|_| PluginError::ServiceProtocol {
-        details: "process runtime payload too large".to_string(),
-    })?;
-    let mut frame = Vec::with_capacity(PROCESS_RUNTIME_MAGIC_V1.len() + 4 + payload.len());
-    frame.extend_from_slice(PROCESS_RUNTIME_MAGIC_V1);
-    frame.extend_from_slice(&payload_len.to_be_bytes());
-    frame.extend_from_slice(payload);
-    Ok(frame)
-}
-
-fn decode_process_frame(bytes: &[u8]) -> Result<&[u8]> {
-    if !bytes.starts_with(PROCESS_RUNTIME_MAGIC_V1) {
-        return Err(PluginError::ServiceProtocol {
-            details: "process runtime output missing BMUXPRC1 frame prefix".to_string(),
-        });
-    }
-    let header_len = PROCESS_RUNTIME_MAGIC_V1.len() + 4;
-    if bytes.len() < header_len {
-        return Err(PluginError::ServiceProtocol {
-            details: "process runtime output truncated frame header".to_string(),
-        });
-    }
-    let mut len_buf = [0_u8; 4];
-    len_buf.copy_from_slice(&bytes[PROCESS_RUNTIME_MAGIC_V1.len()..header_len]);
-    let payload_len =
-        usize::try_from(u32::from_be_bytes(len_buf)).map_err(|_| PluginError::ServiceProtocol {
-            details: "process runtime payload length conversion failed".to_string(),
-        })?;
-    if bytes.len() < header_len + payload_len {
-        return Err(PluginError::ServiceProtocol {
-            details: "process runtime output truncated payload".to_string(),
-        });
-    }
-    Ok(&bytes[header_len..header_len + payload_len])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
