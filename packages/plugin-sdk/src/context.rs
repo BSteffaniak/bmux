@@ -16,7 +16,10 @@
 //! | **For introspection** | `registered_plugins`, `enabled_plugins`, `available_capabilities` |
 //! | **Advanced** | `plugin_search_roots`, `settings`, `plugin_settings_map` |
 
-use crate::{HostConnectionInfo, HostMetadata, RegisteredService, ServiceRequest};
+use crate::{
+    HostConnectionInfo, HostMetadata, RegisteredService, Result, ServiceRequest,
+    decode_service_message, encode_service_message,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -284,4 +287,49 @@ pub struct HostKernelBridgeRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostKernelBridgeResponse {
     pub payload: Vec<u8>,
+}
+
+const HOST_KERNEL_CLI_BRIDGE_PREFIX: &[u8] = b"BMUXCMD1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreCliCommandRequest {
+    pub command_path: Vec<String>,
+    pub arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreCliCommandResponse {
+    pub exit_code: i32,
+}
+
+/// Encode a host-kernel bridge payload representing an in-process core CLI
+/// command invocation request.
+///
+/// # Errors
+///
+/// Returns an error when serialization fails.
+pub fn encode_host_kernel_bridge_cli_command_payload(
+    request: &CoreCliCommandRequest,
+) -> Result<Vec<u8>> {
+    let mut payload = HOST_KERNEL_CLI_BRIDGE_PREFIX.to_vec();
+    payload.extend(encode_service_message(request)?);
+    Ok(payload)
+}
+
+/// Decode a host-kernel bridge payload for in-process core CLI command
+/// invocation.
+///
+/// Returns `Ok(None)` when the payload is not a CLI-command bridge payload.
+///
+/// # Errors
+///
+/// Returns an error when the payload has the CLI prefix but cannot be decoded.
+pub fn decode_host_kernel_bridge_cli_command_payload(
+    payload: &[u8],
+) -> Result<Option<CoreCliCommandRequest>> {
+    if !payload.starts_with(HOST_KERNEL_CLI_BRIDGE_PREFIX) {
+        return Ok(None);
+    }
+    let encoded = &payload[HOST_KERNEL_CLI_BRIDGE_PREFIX.len()..];
+    decode_service_message(encoded).map(Some)
 }

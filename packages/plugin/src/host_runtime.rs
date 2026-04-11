@@ -7,12 +7,13 @@
 use bmux_plugin_sdk::{
     ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
     ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
-    CurrentClientResponse, LogWriteRequest, PaneCloseRequest, PaneCloseResponse, PaneFocusRequest,
-    PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
-    PaneSplitRequest, PaneSplitResponse, RecordingWriteEventRequest, RecordingWriteEventResponse,
-    Result, ServiceKind, SessionCreateRequest, SessionCreateResponse, SessionKillRequest,
-    SessionKillResponse, SessionListResponse, SessionSelectRequest, SessionSelectResponse,
-    StorageGetRequest, StorageGetResponse, StorageSetRequest,
+    CoreCliCommandRequest, CoreCliCommandResponse, CurrentClientResponse, LogWriteRequest,
+    PaneCloseRequest, PaneCloseResponse, PaneFocusRequest, PaneFocusResponse, PaneListRequest,
+    PaneListResponse, PaneResizeRequest, PaneResizeResponse, PaneSplitRequest, PaneSplitResponse,
+    RecordingWriteEventRequest, RecordingWriteEventResponse, Result, ServiceKind,
+    SessionCreateRequest, SessionCreateResponse, SessionKillRequest, SessionKillResponse,
+    SessionListResponse, SessionSelectRequest, SessionSelectResponse, StorageGetRequest,
+    StorageGetResponse, StorageSetRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -64,6 +65,24 @@ pub trait ServiceCaller {
 }
 
 pub trait HostRuntimeApi: ServiceCaller {
+    /// Run a core built-in CLI command path in-process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
+    fn core_cli_command_run_path(
+        &self,
+        request: &CoreCliCommandRequest,
+    ) -> Result<CoreCliCommandResponse> {
+        self.call_service(
+            "bmux.commands",
+            ServiceKind::Command,
+            "cli-command/v1",
+            "run_path",
+            request,
+        )
+    }
+
     /// List all sessions.
     ///
     /// # Errors

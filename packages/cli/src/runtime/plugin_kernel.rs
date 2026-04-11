@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use bmux_cli_schema::Cli;
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::InvokeServiceKind;
@@ -8,6 +9,7 @@ use bmux_plugin_sdk::{
     ServiceRequest,
 };
 use bmux_server::{BmuxServer, ServiceInvokeContext};
+use clap::Parser;
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
@@ -24,7 +26,8 @@ pub(super) type KernelClientFactory =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<BmuxClient>> + Send>> + Send + Sync>;
 
 use super::{
-    effective_enabled_plugins, load_plugin, plugin_host_metadata, resolve_plugin_search_paths,
+    ConnectionContext, dispatch::dispatch_built_in_command, effective_enabled_plugins, load_plugin,
+    plugin_host_metadata, resolve_plugin_search_paths,
 };
 
 thread_local! {
@@ -226,6 +229,33 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
             Err(_) => return 3,
         };
 
+    if let Ok(Some(command_request)) =
+        bmux_plugin_sdk::decode_host_kernel_bridge_cli_command_payload(&request.payload)
+    {
+        let response = match run_core_built_in_command(&command_request) {
+            Ok(exit_code) => bmux_plugin_sdk::CoreCliCommandResponse { exit_code },
+            Err(_) => return 5,
+        };
+        let Ok(payload) = bmux_plugin_sdk::encode_service_message(&response) else {
+            return 5;
+        };
+        let response = bmux_plugin_sdk::HostKernelBridgeResponse { payload };
+        let Ok(encoded) = bmux_plugin_sdk::encode_service_message(&response) else {
+            return 5;
+        };
+
+        unsafe {
+            *output_len = encoded.len();
+        }
+        if output_ptr.is_null() || encoded.len() > output_capacity {
+            return 4;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+        }
+        return 0;
+    }
+
     let payload = if let Some(context) = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone()) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             tokio::task::block_in_place(|| {
@@ -267,6 +297,40 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
         std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
     }
     0
+}
+
+fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -> Result<i32> {
+    let mut argv = Vec::with_capacity(2 + request.command_path.len() + request.arguments.len());
+    argv.push("bmux".to_string());
+    argv.push("--core-builtins-only".to_string());
+    argv.extend(request.command_path.clone());
+    argv.extend(request.arguments.clone());
+
+    let cli = Cli::try_parse_from(argv).context("failed parsing core built-in command")?;
+    let command = cli.command.ok_or_else(|| {
+        anyhow::anyhow!("core built-in command path did not resolve to a command")
+    })?;
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                dispatch_built_in_command(&command, ConnectionContext::new(cli.target.as_deref()))
+                    .await
+            })
+        })
+        .map(i32::from)
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed creating runtime for core built-in command")?;
+        runtime
+            .block_on(async {
+                dispatch_built_in_command(&command, ConnectionContext::new(cli.target.as_deref()))
+                    .await
+            })
+            .map(i32::from)
+    }
 }
 
 pub(super) fn core_provided_capabilities() -> Vec<HostScope> {
@@ -324,6 +388,12 @@ pub(super) fn core_service_descriptors() -> Vec<RegisteredService> {
             capability: HostScope::new("bmux.logs.write").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "logging-command/v1".to_string(),
+            provider: bmux_plugin_sdk::ProviderId::Host,
+        },
+        RegisteredService {
+            capability: HostScope::new("bmux.commands").expect("capability should parse"),
+            kind: ServiceKind::Command,
+            interface_id: "cli-command/v1".to_string(),
             provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {

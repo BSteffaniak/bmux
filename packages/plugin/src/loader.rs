@@ -15,19 +15,21 @@ use bmux_plugin_sdk::{
     ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
     ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
     ContextSelector as HostContextSelector, ContextSummary as HostContextSummary,
-    CurrentClientResponse, HostConnectionInfo, HostKernelBridge, HostKernelBridgeRequest,
-    HostKernelBridgeResponse, HostMetadata, HostScope, LogWriteLevel, NativeCommandContext,
-    NativeLifecycleContext, NativeServiceContext, PaneCloseRequest, PaneCloseResponse,
-    PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
-    PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
-    PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
-    PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary, PluginError, PluginEvent,
-    RecordingWriteEventRequest, RecordingWriteEventResponse, RegisteredService, Result,
-    ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse, SessionCreateRequest,
-    SessionCreateResponse, SessionKillRequest, SessionKillResponse, SessionListResponse,
-    SessionSelectRequest, SessionSelectResponse, SessionSelector as HostSessionSelector,
+    CoreCliCommandRequest, CoreCliCommandResponse, CurrentClientResponse, HostConnectionInfo,
+    HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, HostMetadata, HostScope,
+    LogWriteLevel, NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
+    PaneCloseRequest, PaneCloseResponse, PaneFocusDirection as HostPaneFocusDirection,
+    PaneFocusRequest, PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest,
+    PaneResizeResponse, PaneSelector as HostPaneSelector,
+    PaneSplitDirection as HostPaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
+    PaneSummary as HostPaneSummary, PluginError, PluginEvent, RecordingWriteEventRequest,
+    RecordingWriteEventResponse, RegisteredService, Result, ServiceEnvelopeKind, ServiceKind,
+    ServiceRequest, ServiceResponse, SessionCreateRequest, SessionCreateResponse,
+    SessionKillRequest, SessionKillResponse, SessionListResponse, SessionSelectRequest,
+    SessionSelectResponse, SessionSelector as HostSessionSelector,
     SessionSummary as HostSessionSummary, StaticPluginVtable, decode_service_envelope,
-    decode_service_message, encode_service_envelope, encode_service_message,
+    decode_service_message, encode_host_kernel_bridge_cli_command_payload, encode_service_envelope,
+    encode_service_message,
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
@@ -417,6 +419,11 @@ fn handle_core_service_call(
             let request: bmux_plugin_sdk::LogWriteRequest = decode_service_message(payload)?;
             emit_plugin_log(caller_plugin_id, &request)?;
             encode_service_message(&())
+        }
+        ("cli-command/v1", "run_path") => {
+            let request: CoreCliCommandRequest = decode_service_message(payload)?;
+            let response = execute_cli_command_request(host_kernel_bridge, &request)?;
+            encode_service_message(&response)
         }
         ("recording-command/v1", "write_event") => {
             let request: RecordingWriteEventRequest = decode_service_message(payload)?;
@@ -890,6 +897,18 @@ fn execute_kernel_request(
             details: format!("kernel request failed: {}", error.message),
         }),
     }
+}
+
+fn execute_cli_command_request(
+    host_kernel_bridge: Option<HostKernelBridge>,
+    request: &CoreCliCommandRequest,
+) -> Result<CoreCliCommandResponse> {
+    let bridge = host_kernel_bridge.ok_or(PluginError::UnsupportedHostOperation {
+        operation: "call_service",
+    })?;
+    let payload = encode_host_kernel_bridge_cli_command_payload(request)?;
+    let encoded_response = invoke_host_kernel_bridge(bridge, payload)?;
+    decode_service_message(&encoded_response)
 }
 
 fn invoke_host_kernel_bridge(bridge: HostKernelBridge, payload: Vec<u8>) -> Result<Vec<u8>> {
