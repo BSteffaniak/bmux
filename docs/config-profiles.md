@@ -97,6 +97,42 @@ i = "enter_mode insert"
 scrollback_limit = 15000
 ```
 
+## Quick Preset: tmux
+
+```toml
+[composition]
+active_profile = "tmux_compat"
+```
+
+This enables the built-in tmux-style profile (including `ctrl+b` prefix and
+common pane/window keys) as your active profile.
+
+## Quick Preset: zellij
+
+```toml
+[composition]
+active_profile = "zellij_compat"
+```
+
+This enables the built-in zellij-style profile (which also layers on top of
+`vim` defaults).
+
+## Compose tmux + zellij + local overrides
+
+```toml
+[composition]
+active_profile = "my_combo"
+
+[composition.profiles.my_combo]
+extends = ["tmux_compat", "zellij_compat"]
+
+[composition.profiles.my_combo.patch.general]
+server_timeout = 9000
+```
+
+Because parent application is left-to-right, `zellij_compat` (rightmost here)
+wins on conflicting keys.
+
 ## Example: Rightmost Parent Wins
 
 ```toml
