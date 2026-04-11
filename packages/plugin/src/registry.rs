@@ -797,4 +797,42 @@ minimum = "1.0"
             .expect("service provider should be present");
         assert_eq!(selected.service.provider.to_string(), "one.plugin");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_validates_process_runtime_entry_command() {
+        let dir = temp_dir();
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "process.plugin"
+name = "Process Plugin"
+version = "0.1.0"
+runtime = "process"
+entry = "/usr/bin/true"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("manifest should parse");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(&dir.join("plugin.toml"), manifest)
+            .expect("manifest should register");
+
+        let host = HostMetadata {
+            product_name: "bmux".to_string(),
+            product_version: "0.1.0".to_string(),
+            plugin_api_version: ApiVersion::new(1, 0),
+            plugin_abi_version: ApiVersion::new(1, 0),
+        };
+
+        registry
+            .validate_against_host(&host, &["process.plugin".to_string()], &[])
+            .expect("process plugin command should validate");
+    }
 }

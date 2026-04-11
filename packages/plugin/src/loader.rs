@@ -41,8 +41,10 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
 use tracing::{debug, error, info, trace, warn};
 
 type PluginEntryFn = unsafe extern "C" fn() -> *const c_char;
@@ -57,6 +59,61 @@ const NATIVE_SERVICE_STATUS_OK: i32 = 0;
 const NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 const KERNEL_STATUS_OK: i32 = 0;
 const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
+const PROCESS_RUNTIME_PROTOCOL_V1: u16 = 1;
+const PROCESS_RUNTIME_MAGIC_V1: &[u8] = b"BMUXPRC1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ProcessInvocationRequest {
+    Command {
+        protocol_version: u16,
+        plugin_id: String,
+        command_name: String,
+        arguments: Vec<String>,
+        context: Option<NativeCommandContext>,
+    },
+    Lifecycle {
+        protocol_version: u16,
+        plugin_id: String,
+        symbol: String,
+        context: NativeLifecycleContext,
+    },
+    Event {
+        protocol_version: u16,
+        plugin_id: String,
+        event: PluginEvent,
+    },
+    Service {
+        protocol_version: u16,
+        plugin_id: String,
+        context: NativeServiceContext,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ProcessInvocationResponse {
+    Command {
+        protocol_version: u16,
+        status: i32,
+        outcome: Option<bmux_plugin_sdk::PluginCommandOutcome>,
+    },
+    Lifecycle {
+        protocol_version: u16,
+        status: i32,
+    },
+    Event {
+        protocol_version: u16,
+        status: Option<i32>,
+    },
+    Service {
+        protocol_version: u16,
+        response: ServiceResponse,
+    },
+    Error {
+        protocol_version: u16,
+        details: String,
+        status: Option<i32>,
+    },
+}
 
 /// Backend that a [`LoadedPlugin`] uses to dispatch calls.
 #[derive(Debug)]
@@ -74,6 +131,70 @@ struct ProcessPluginRuntime {
     command: String,
     args: Vec<String>,
     current_dir: Option<PathBuf>,
+}
+
+impl ProcessPluginRuntime {
+    fn invoke(
+        &self,
+        plugin_id: &str,
+        argv: &[String],
+        request: &ProcessInvocationRequest,
+    ) -> Result<(Option<ProcessInvocationResponse>, std::process::ExitStatus)> {
+        let request_payload = encode_service_message(request)?;
+        let frame = encode_process_frame(&request_payload)?;
+
+        let mut command = Command::new(&self.command);
+        if let Some(current_dir) = &self.current_dir {
+            command.current_dir(current_dir);
+        }
+        command.args(&self.args);
+        command.args(argv);
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.env("BMUX_PLUGIN_RUNTIME_PROTOCOL", "stdio-v1");
+        command.env("BMUX_PLUGIN_ID", plugin_id);
+
+        let mut child = command
+            .spawn()
+            .map_err(|error| PluginError::ProcessPluginSpawn {
+                plugin_id: plugin_id.to_string(),
+                command: self.command.clone(),
+                details: error.to_string(),
+            })?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(&frame)
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: format!("failed writing process runtime request frame: {error}"),
+                })?;
+            stdin
+                .flush()
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: format!("failed flushing process runtime stdin: {error}"),
+                })?;
+        }
+        drop(child.stdin.take());
+
+        let mut stdout = Vec::new();
+        if let Some(out) = child.stdout.as_mut() {
+            out.read_to_end(&mut stdout)
+                .map_err(|error| PluginError::ServiceProtocol {
+                    details: format!("failed reading process runtime stdout: {error}"),
+                })?;
+        }
+        let status = child.wait().map_err(|error| PluginError::ServiceProtocol {
+            details: format!("failed waiting for process runtime child: {error}"),
+        })?;
+
+        if stdout.is_empty() {
+            return Ok((None, status));
+        }
+
+        let framed = decode_process_frame(&stdout)?;
+        let response: ProcessInvocationResponse = decode_service_message(framed)?;
+        Ok((Some(response), status))
+    }
 }
 
 thread_local! {
@@ -102,6 +223,43 @@ fn finish_command_outcome_capture() -> bmux_plugin_sdk::PluginCommandOutcome {
         .unwrap_or(bmux_plugin_sdk::PluginCommandOutcome {
             effects: Vec::new(),
         })
+}
+
+fn encode_process_frame(payload: &[u8]) -> Result<Vec<u8>> {
+    let payload_len = u32::try_from(payload.len()).map_err(|_| PluginError::ServiceProtocol {
+        details: "process runtime payload too large".to_string(),
+    })?;
+    let mut frame = Vec::with_capacity(PROCESS_RUNTIME_MAGIC_V1.len() + 4 + payload.len());
+    frame.extend_from_slice(PROCESS_RUNTIME_MAGIC_V1);
+    frame.extend_from_slice(&payload_len.to_be_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+fn decode_process_frame(bytes: &[u8]) -> Result<&[u8]> {
+    if !bytes.starts_with(PROCESS_RUNTIME_MAGIC_V1) {
+        return Err(PluginError::ServiceProtocol {
+            details: "process runtime output missing BMUXPRC1 frame prefix".to_string(),
+        });
+    }
+    let header_len = PROCESS_RUNTIME_MAGIC_V1.len() + 4;
+    if bytes.len() < header_len {
+        return Err(PluginError::ServiceProtocol {
+            details: "process runtime output truncated frame header".to_string(),
+        });
+    }
+    let mut len_buf = [0_u8; 4];
+    len_buf.copy_from_slice(&bytes[PROCESS_RUNTIME_MAGIC_V1.len()..header_len]);
+    let payload_len =
+        usize::try_from(u32::from_be_bytes(len_buf)).map_err(|_| PluginError::ServiceProtocol {
+            details: "process runtime payload length conversion failed".to_string(),
+        })?;
+    if bytes.len() < header_len + payload_len {
+        return Err(PluginError::ServiceProtocol {
+            details: "process runtime output truncated payload".to_string(),
+        });
+    }
+    Ok(&bytes[header_len..header_len + payload_len])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1252,7 +1410,56 @@ impl LoadedPlugin {
                     )?;
                 unsafe { event_symbol(payload.as_ptr(), payload.len()) }
             }
-            PluginBackend::Process(_) => return Ok(None),
+            PluginBackend::Process(runtime) => {
+                let request = ProcessInvocationRequest::Event {
+                    protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+                    plugin_id: self.declaration.id.as_str().to_string(),
+                    event: event.clone(),
+                };
+                let empty_argv: Vec<String> = Vec::new();
+                let (response, _) =
+                    runtime.invoke(self.declaration.id.as_str(), &empty_argv, &request)?;
+                match response {
+                    None => return Ok(None),
+                    Some(ProcessInvocationResponse::Event {
+                        protocol_version,
+                        status,
+                    }) => {
+                        if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
+                            return Err(PluginError::ServiceProtocol {
+                                details: format!(
+                                    "unsupported process runtime event response protocol version: {protocol_version}"
+                                ),
+                            });
+                        }
+                        return Ok(status);
+                    }
+                    Some(ProcessInvocationResponse::Error {
+                        protocol_version,
+                        details,
+                        status,
+                    }) => {
+                        if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
+                            return Err(PluginError::ServiceProtocol {
+                                details: format!(
+                                    "unsupported process runtime error response protocol version: {protocol_version}"
+                                ),
+                            });
+                        }
+                        if let Some(status) = status {
+                            return Ok(Some(status));
+                        }
+                        return Err(PluginError::ServiceProtocol { details });
+                    }
+                    Some(other) => {
+                        return Err(PluginError::ServiceProtocol {
+                            details: format!(
+                                "unexpected process runtime response for event invocation: {other:?}"
+                            ),
+                        });
+                    }
+                }
+            }
         };
 
         Ok(Some(status))
@@ -1268,12 +1475,69 @@ impl LoadedPlugin {
     /// Panics if the resolved dynamic library symbol is unexpectedly `None`
     /// for a `Dynamic` backend (should not happen in practice).
     pub fn invoke_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
+        if let PluginBackend::Process(runtime) = &self.backend {
+            return self.invoke_process_service(runtime, context);
+        }
+
+        self.invoke_native_service(context)
+    }
+
+    fn invoke_process_service(
+        &self,
+        runtime: &ProcessPluginRuntime,
+        context: &NativeServiceContext,
+    ) -> Result<ServiceResponse> {
+        let request = ProcessInvocationRequest::Service {
+            protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+            plugin_id: self.declaration.id.as_str().to_string(),
+            context: context.clone(),
+        };
+        let empty_argv: Vec<String> = Vec::new();
+        let (response, _) = runtime.invoke(self.declaration.id.as_str(), &empty_argv, &request)?;
+        match response {
+            Some(ProcessInvocationResponse::Service {
+                protocol_version,
+                response,
+            }) => {
+                if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
+                    return Err(PluginError::ServiceProtocol {
+                        details: format!(
+                            "unsupported process runtime service response protocol version: {protocol_version}"
+                        ),
+                    });
+                }
+                Ok(response)
+            }
+            Some(ProcessInvocationResponse::Error {
+                protocol_version,
+                details,
+                status: _,
+            }) => {
+                if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
+                    return Err(PluginError::ServiceProtocol {
+                        details: format!(
+                            "unsupported process runtime error response protocol version: {protocol_version}"
+                        ),
+                    });
+                }
+                Err(PluginError::ServiceProtocol { details })
+            }
+            None => Err(PluginError::UnsupportedPluginRuntime {
+                plugin_id: self.declaration.id.as_str().to_string(),
+                runtime: "process-services".to_string(),
+            }),
+            Some(other) => Err(PluginError::ServiceProtocol {
+                details: format!(
+                    "unexpected process runtime response for service invocation: {other:?}"
+                ),
+            }),
+        }
+    }
+
+    fn invoke_native_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
         let payload = encode_service_envelope(0, ServiceEnvelopeKind::Request, context)?;
 
-        // For dynamic backends, resolve the symbol once up-front so we can
-        // return a proper error instead of panicking inside the closure.
         let resolved_symbol = match &self.backend {
-            PluginBackend::Static(_) => None,
             PluginBackend::Dynamic(library) => {
                 let sym: Symbol<'_, NativeInvokeServiceFn> =
                     unsafe { library.get(DEFAULT_NATIVE_SERVICE_SYMBOL.as_bytes()) }.map_err(
@@ -1285,12 +1549,7 @@ impl LoadedPlugin {
                     )?;
                 Some(sym)
             }
-            PluginBackend::Process(_) => {
-                return Err(PluginError::UnsupportedPluginRuntime {
-                    plugin_id: self.declaration.id.as_str().to_string(),
-                    runtime: "process-services".to_string(),
-                });
-            }
+            PluginBackend::Static(_) | PluginBackend::Process(_) => None,
         };
 
         let call_service = |payload: &[u8], output: &mut [u8], output_len: &mut usize| -> i32 {
@@ -1384,7 +1643,58 @@ impl LoadedPlugin {
                 })?;
                 unsafe { lifecycle_symbol(payload.as_ptr(), payload.len()) }
             }
-            PluginBackend::Process(_) => 0,
+            PluginBackend::Process(runtime) => {
+                let request = ProcessInvocationRequest::Lifecycle {
+                    protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+                    plugin_id: self.declaration.id.as_str().to_string(),
+                    symbol: symbol.to_string(),
+                    context: context.clone(),
+                };
+                let empty_argv: Vec<String> = Vec::new();
+                let (response, status) =
+                    runtime.invoke(self.declaration.id.as_str(), &empty_argv, &request)?;
+                match response {
+                    Some(ProcessInvocationResponse::Lifecycle {
+                        protocol_version,
+                        status,
+                    }) => {
+                        if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
+                            return Err(PluginError::ServiceProtocol {
+                                details: format!(
+                                    "unsupported process runtime lifecycle response protocol version: {protocol_version}"
+                                ),
+                            });
+                        }
+                        status
+                    }
+                    Some(ProcessInvocationResponse::Error {
+                        protocol_version,
+                        details,
+                        status,
+                    }) => {
+                        if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
+                            return Err(PluginError::ServiceProtocol {
+                                details: format!(
+                                    "unsupported process runtime error response protocol version: {protocol_version}"
+                                ),
+                            });
+                        }
+                        if let Some(status) = status {
+                            status
+                        } else {
+                            return Err(PluginError::ServiceProtocol { details });
+                        }
+                    }
+                    None => status.code().unwrap_or(0),
+                    Some(other) => {
+                        return Err(PluginError::ServiceProtocol {
+                            details: format!(
+                                "unexpected process runtime response for lifecycle invocation: {other:?}"
+                            ),
+                        });
+                    }
+                }
+            }
         };
 
         Ok(status)
@@ -1402,34 +1712,60 @@ impl LoadedPlugin {
             });
         };
 
-        let mut command = Command::new(&runtime.command);
-        if let Some(current_dir) = &runtime.current_dir {
-            command.current_dir(current_dir);
-        }
-        command.args(&runtime.args);
-        command.arg(command_name);
-        command.args(arguments);
-        command.env("BMUX_PLUGIN_ID", self.declaration.id.as_str());
-        command.env("BMUX_PLUGIN_COMMAND", command_name);
+        let request = ProcessInvocationRequest::Command {
+            protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+            plugin_id: self.declaration.id.as_str().to_string(),
+            command_name: command_name.to_string(),
+            arguments: arguments.to_vec(),
+            context: context.cloned(),
+        };
+        let argv = std::iter::once(command_name.to_string())
+            .chain(arguments.iter().cloned())
+            .collect::<Vec<_>>();
+        let (response, status) = runtime.invoke(self.declaration.id.as_str(), &argv, &request)?;
 
-        if let Ok(arguments_json) = serde_json::to_string(arguments) {
-            command.env("BMUX_PLUGIN_ARGUMENTS_JSON", arguments_json);
+        if let Some(response) = response {
+            return match response {
+                ProcessInvocationResponse::Command {
+                    protocol_version,
+                    status,
+                    outcome,
+                } => {
+                    if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
+                        return Err(PluginError::ServiceProtocol {
+                            details: format!(
+                                "unsupported process runtime command response protocol version: {protocol_version}"
+                            ),
+                        });
+                    }
+                    Ok((
+                        status,
+                        outcome.unwrap_or(bmux_plugin_sdk::PluginCommandOutcome {
+                            effects: Vec::new(),
+                        }),
+                    ))
+                }
+                ProcessInvocationResponse::Error {
+                    protocol_version,
+                    details,
+                    status: _,
+                } => {
+                    if protocol_version != PROCESS_RUNTIME_PROTOCOL_V1 {
+                        return Err(PluginError::ServiceProtocol {
+                            details: format!(
+                                "unsupported process runtime error response protocol version: {protocol_version}"
+                            ),
+                        });
+                    }
+                    Err(PluginError::ServiceProtocol { details })
+                }
+                other => Err(PluginError::ServiceProtocol {
+                    details: format!(
+                        "unexpected process runtime response for command invocation: {other:?}"
+                    ),
+                }),
+            };
         }
-        if let Some(context) = context {
-            let context_json =
-                serde_json::to_string(context).map_err(|error| PluginError::ServiceProtocol {
-                    details: format!("failed encoding process plugin context json: {error}"),
-                })?;
-            command.env("BMUX_PLUGIN_CONTEXT_JSON", context_json);
-        }
-
-        let status = command
-            .status()
-            .map_err(|error| PluginError::ProcessPluginSpawn {
-                plugin_id: self.declaration.id.as_str().to_string(),
-                command: runtime.command.clone(),
-                details: error.to_string(),
-            })?;
 
         Ok((
             status.code().unwrap_or(1),
@@ -1477,6 +1813,7 @@ impl NativePluginLoader {
                     current_dir: registered_plugin
                         .manifest_path
                         .parent()
+                        .filter(|path| !path.as_os_str().is_empty())
                         .map(Path::to_path_buf),
                 }),
             });
@@ -2130,6 +2467,58 @@ minimum = "1.0"
         assert_eq!(loaded.commands().len(), 1);
         assert!(loaded.supports_command("hello"));
         assert!(loaded.run_command("missing", &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_runtime_plugin_loads_and_runs_command() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "process.plugin"
+name = "Process Plugin"
+version = "0.1.0"
+runtime = "process"
+entry = "true"
+
+[[commands]]
+name = "hello"
+summary = "hello"
+execution = "provider_exec"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
+            .expect("manifest should register");
+        let registered = registry
+            .get("process.plugin")
+            .expect("plugin should register")
+            .clone();
+
+        let loaded = super::load_registered_plugin(
+            &registered,
+            &HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            &BTreeMap::new(),
+        )
+        .expect("process runtime plugin should load");
+
+        let args: Vec<String> = Vec::new();
+        let status = loaded
+            .run_command("hello", &args)
+            .expect("process runtime command should run");
+        assert_eq!(status, 0);
     }
 
     #[test]
