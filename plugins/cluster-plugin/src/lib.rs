@@ -23,9 +23,7 @@ impl RustPlugin for ClusterPlugin {
             "cluster-status" => run_cluster_status(&context).map_err(PluginCommandError::from),
             "cluster-doctor" => run_cluster_doctor(&context).map_err(PluginCommandError::from),
             "cluster-up" => run_cluster_up(&context).map_err(PluginCommandError::from),
-            "cluster-pane-new" => Err(PluginCommandError::from(
-                "command 'cluster-pane-new' is not implemented yet"
-            )),
+            "cluster-pane-new" => run_cluster_pane_new(&context).map_err(PluginCommandError::from),
             "cluster-pane-move" => Err(PluginCommandError::from(
                 "command 'cluster-pane-move' is not implemented yet"
             )),
@@ -109,6 +107,12 @@ struct ClusterLaunchStatus {
     state: ClusterHostState,
     reason: Option<String>,
     pane_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ClusterPaneNewArgs {
+    host: String,
+    name: Option<String>,
 }
 
 fn run_cluster_hosts(context: &NativeCommandContext) -> Result<i32, String> {
@@ -262,6 +266,39 @@ fn run_cluster_up(context: &NativeCommandContext) -> Result<i32, String> {
         .count();
 
     Ok(if launched_count > 0 { EXIT_OK } else { 1 })
+}
+
+fn run_cluster_pane_new(context: &NativeCommandContext) -> Result<i32, String> {
+    let args = parse_cluster_pane_new_args(&context.arguments)?;
+
+    run_health_probe(context, &args.host, HealthProbe::Test)
+        .map_err(|error| format!("target '{}' is not ready: {error}", args.host))?;
+
+    let pane_name = args.name.or_else(|| Some(format!("host:{}", args.host)));
+    let response = context
+        .pane_launch(&PaneLaunchRequest {
+            session: None,
+            target: None,
+            direction: PaneSplitDirection::Vertical,
+            name: pane_name,
+            command: PaneLaunchCommand {
+                program: "bmux".to_string(),
+                args: vec![
+                    "connect".to_string(),
+                    args.host.clone(),
+                    "--reconnect-forever".to_string(),
+                ],
+                cwd: None,
+                env: BTreeMap::from([("BMUX_CLUSTER_TARGET".to_string(), args.host.clone())]),
+            },
+        })
+        .map_err(|error| format!("failed to create cluster pane for '{}': {error}", args.host))?;
+
+    println!(
+        "cluster pane new: target={} pane_id={} session_id={}",
+        args.host, response.id, response.session_id
+    );
+    Ok(EXIT_OK)
 }
 
 fn collect_statuses(
@@ -577,6 +614,63 @@ fn parse_cluster_up_args(arguments: &[String]) -> Result<ClusterUpArgs, String> 
     })
 }
 
+fn parse_cluster_pane_new_args(arguments: &[String]) -> Result<ClusterPaneNewArgs, String> {
+    let mut host = None;
+    let mut name = None;
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--host" || argument == "-h" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--host requires a value".to_string())?;
+            if !value.trim().is_empty() {
+                host = Some(value.trim().to_string());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--host=") {
+            if !value.trim().is_empty() {
+                host = Some(value.trim().to_string());
+            }
+            index += 1;
+            continue;
+        }
+        if argument == "--name" || argument == "-n" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--name requires a value".to_string())?;
+            if !value.trim().is_empty() {
+                name = Some(value.trim().to_string());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--name=") {
+            if !value.trim().is_empty() {
+                name = Some(value.trim().to_string());
+            }
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        positional.push(argument.trim().to_string());
+        index += 1;
+    }
+
+    if host.is_none() {
+        host = positional.into_iter().find(|value| !value.is_empty());
+    }
+
+    let host = host.ok_or_else(|| "cluster-pane-new requires --host <TARGET>".to_string())?;
+    Ok(ClusterPaneNewArgs { host, name })
+}
+
 fn ensure_cluster_session(
     context: &NativeCommandContext,
     session_name: &str,
@@ -651,5 +745,34 @@ mod tests {
         let error = parse_cluster_up_args(&["--host".to_string(), "db-a".to_string()])
             .expect_err("cluster argument should be required");
         assert!(error.contains("requires CLUSTER"));
+    }
+
+    #[test]
+    fn parse_cluster_pane_new_args_parses_flags_and_aliases() {
+        let parsed = parse_cluster_pane_new_args(&[
+            "--host".to_string(),
+            "db-a".to_string(),
+            "-n".to_string(),
+            "primary-db".to_string(),
+        ])
+        .expect("arguments should parse");
+
+        assert_eq!(parsed.host, "db-a");
+        assert_eq!(parsed.name.as_deref(), Some("primary-db"));
+    }
+
+    #[test]
+    fn parse_cluster_pane_new_args_accepts_positional_host() {
+        let parsed = parse_cluster_pane_new_args(&["cache-a".to_string()])
+            .expect("positional host should parse");
+        assert_eq!(parsed.host, "cache-a");
+        assert_eq!(parsed.name, None);
+    }
+
+    #[test]
+    fn parse_cluster_pane_new_args_requires_host() {
+        let error = parse_cluster_pane_new_args(&["--name".to_string(), "x".to_string()])
+            .expect_err("host should be required");
+        assert!(error.contains("requires --host"));
     }
 }

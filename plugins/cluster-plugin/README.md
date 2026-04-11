@@ -14,8 +14,9 @@ Current scope:
 - Readiness probes delegated to core remote commands (`remote test` / `remote doctor`)
 - `cluster up` creates/reuses `cluster-<name>` session and launches host-bound panes
 - Partial-start semantics: unhealthy hosts are reported as degraded while healthy hosts still launch
+- `cluster pane new` creates an ad-hoc host-bound pane via the generic pane launch API
 
-Cluster pane mutation helpers (`cluster pane ...`) remain stubbed for follow-up slices.
+`cluster pane move` and `cluster pane retry` remain stubbed for follow-up slices.
 
 ## Commands (Scaffolded)
 
