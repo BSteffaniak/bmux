@@ -910,7 +910,9 @@ mod tests {
     use bmux_cli_schema::Cli;
     use bmux_config::{BmuxConfig, ConfigDocSchema};
     use clap::Parser;
+    use serde::Serialize;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1062,66 +1064,32 @@ mod tests {
 
     #[test]
     fn markdown_snippet_coverage_report() {
-        let mut file_rows = Vec::new();
-        let mut total_fenced = 0usize;
-        let mut total_opt_in = 0usize;
-        let mut tag_counts: BTreeMap<String, usize> = BTreeMap::new();
-
-        for file in markdown_sources() {
-            let content = fs::read_to_string(&file)
-                .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()));
-            let blocks = parse_fenced_blocks(&content);
-            let fenced = blocks.len();
-            let opt_in = blocks
-                .iter()
-                .filter(|block| is_opt_in_tag(&block.language))
-                .count();
-
-            for block in &blocks {
-                if is_opt_in_tag(&block.language) {
-                    *tag_counts.entry(block.language.clone()).or_default() += 1;
-                }
-            }
-
-            total_fenced += fenced;
-            total_opt_in += opt_in;
-
-            if fenced > 0 || opt_in > 0 {
-                file_rows.push((file, fenced, opt_in));
-            }
-        }
-
-        let percent = if total_fenced == 0 {
-            0.0
-        } else {
-            (total_opt_in as f64 / total_fenced as f64) * 100.0
-        };
-
-        let mut report = String::new();
-        report.push_str("docs snippet coverage report\n");
-        report.push_str(&format!(
-            "opt-in validated: {total_opt_in}/{total_fenced} ({percent:.1}%)\n"
-        ));
-        report.push_str("by tag:\n");
-        for (tag, count) in &tag_counts {
-            report.push_str(&format!("  - {tag}: {count}\n"));
-        }
-        report.push_str("by file:\n");
-        for (file, fenced, opt_in) in &file_rows {
-            report.push_str(&format!(
-                "  - {}: {opt_in}/{fenced}\n",
-                file.strip_prefix(workspace_root())
-                    .unwrap_or(file)
-                    .display()
-            ));
-        }
+        let coverage = collect_snippet_coverage();
+        let report = render_coverage_report(&coverage);
 
         eprintln!("{report}");
+        write_coverage_artifacts(&coverage, &report);
 
         assert!(
-            total_opt_in > 0,
+            coverage.total_opt_in > 0,
             "expected at least one opt-in snippet block; add a fenced block with one of: bmux-cli, bmux-playbook, bmux-config"
         );
+    }
+
+    #[derive(Debug, Serialize)]
+    struct SnippetCoverageReport {
+        total_fenced: usize,
+        total_opt_in: usize,
+        opt_in_percent: f64,
+        tag_counts: BTreeMap<String, usize>,
+        files: Vec<SnippetCoverageFileRow>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct SnippetCoverageFileRow {
+        path: String,
+        fenced: usize,
+        opt_in: usize,
     }
 
     #[derive(Debug)]
@@ -1176,6 +1144,125 @@ mod tests {
 
     fn is_opt_in_tag(language: &str) -> bool {
         matches!(language, "bmux-cli" | "bmux-playbook" | "bmux-config")
+    }
+
+    fn collect_snippet_coverage() -> SnippetCoverageReport {
+        let mut file_rows = Vec::new();
+        let mut total_fenced = 0usize;
+        let mut total_opt_in = 0usize;
+        let mut tag_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let workspace_root = workspace_root();
+
+        for file in markdown_sources() {
+            let content = fs::read_to_string(&file)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()));
+            let blocks = parse_fenced_blocks(&content);
+            let fenced = blocks.len();
+            let opt_in = blocks
+                .iter()
+                .filter(|block| is_opt_in_tag(&block.language))
+                .count();
+
+            for block in &blocks {
+                if is_opt_in_tag(&block.language) {
+                    *tag_counts.entry(block.language.clone()).or_default() += 1;
+                }
+            }
+
+            total_fenced += fenced;
+            total_opt_in += opt_in;
+
+            if fenced > 0 || opt_in > 0 {
+                let relative_path = file
+                    .strip_prefix(&workspace_root)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string();
+                file_rows.push(SnippetCoverageFileRow {
+                    path: relative_path,
+                    fenced,
+                    opt_in,
+                });
+            }
+        }
+
+        file_rows.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let opt_in_percent = if total_fenced == 0 {
+            0.0
+        } else {
+            (total_opt_in as f64 / total_fenced as f64) * 100.0
+        };
+
+        SnippetCoverageReport {
+            total_fenced,
+            total_opt_in,
+            opt_in_percent,
+            tag_counts,
+            files: file_rows,
+        }
+    }
+
+    fn render_coverage_report(coverage: &SnippetCoverageReport) -> String {
+        let mut report = String::new();
+        report.push_str("docs snippet coverage report\n");
+        report.push_str(&format!(
+            "opt-in validated: {}/{} ({:.1}%)\n",
+            coverage.total_opt_in, coverage.total_fenced, coverage.opt_in_percent
+        ));
+        report.push_str("by tag:\n");
+        for (tag, count) in &coverage.tag_counts {
+            report.push_str(&format!("  - {tag}: {count}\n"));
+        }
+        report.push_str("by file:\n");
+        for row in &coverage.files {
+            report.push_str(&format!(
+                "  - {}: {}/{}\n",
+                row.path, row.opt_in, row.fenced
+            ));
+        }
+        report
+    }
+
+    fn write_coverage_artifacts(coverage: &SnippetCoverageReport, markdown_report: &str) {
+        let Ok(raw_output_dir) = env::var("BMUX_DOCS_COVERAGE_OUTPUT_DIR") else {
+            return;
+        };
+        if raw_output_dir.trim().is_empty() {
+            return;
+        }
+
+        let output_dir = PathBuf::from(raw_output_dir);
+        if let Err(err) = fs::create_dir_all(&output_dir) {
+            eprintln!(
+                "warning: failed to create docs coverage output dir {}: {err}",
+                output_dir.display()
+            );
+            return;
+        }
+
+        let markdown_path = output_dir.join("docs-snippet-coverage.md");
+        if let Err(err) = fs::write(&markdown_path, markdown_report) {
+            eprintln!(
+                "warning: failed to write markdown coverage report {}: {err}",
+                markdown_path.display()
+            );
+        }
+
+        let json_path = output_dir.join("docs-snippet-coverage.json");
+        match serde_json::to_string_pretty(coverage) {
+            Ok(json) => {
+                if let Err(err) = fs::write(&json_path, json) {
+                    eprintln!(
+                        "warning: failed to write json coverage report {}: {err}",
+                        json_path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("warning: failed to serialize docs coverage report: {err}");
+            }
+        }
     }
 
     fn validate_cli_block(content: &str) -> Result<(), String> {

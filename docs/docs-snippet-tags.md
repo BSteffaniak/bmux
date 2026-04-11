@@ -36,3 +36,8 @@ scrollback_limit = 10000
 
 CI also prints a coverage report showing how many fenced code blocks are
 opt-in validated across docs files.
+
+In GitHub Actions, this report is uploaded as `docs-snippet-coverage` with:
+
+- `docs-snippet-coverage.md`
+- `docs-snippet-coverage.json`

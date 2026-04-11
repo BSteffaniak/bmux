@@ -47,8 +47,10 @@ fail-on-warnings = [
 ]
 
 [dev-dependencies]
-bmux_cli = { workspace = true }
-toml     = { workspace = true, features = ["parse"] }
+bmux_cli   = { workspace = true }
+serde      = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+toml       = { workspace = true, features = ["parse"] }
 
 [package.metadata.cargo-machete]
 ignored = [

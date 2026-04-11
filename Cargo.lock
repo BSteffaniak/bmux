@@ -1109,6 +1109,8 @@ dependencies = [
  "hyperchad_template",
  "hyperchad_transformer",
  "hyperchad_transformer_models",
+ "serde",
+ "serde_json",
  "toml 0.8.23",
 ]
 

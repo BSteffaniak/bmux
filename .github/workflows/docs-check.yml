@@ -51,7 +51,17 @@ jobs:
         run: cargo test -p bmux_docs_site_ui markdown_opt_in_snippets_are_valid
 
       - name: Report docs snippet coverage
+        env:
+          BMUX_DOCS_COVERAGE_OUTPUT_DIR: ${{ github.workspace }}/target/docs-check
         run: cargo test -p bmux_docs_site_ui markdown_snippet_coverage_report -- --nocapture
+
+      - name: Upload docs snippet coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-snippet-coverage
+          path: target/docs-check/docs-snippet-coverage.*
+          if-no-files-found: warn
 
       - name: Validate docs source sections
         run: cargo test -p bmux_docs_site_ui markdown_section_headings_used_by_docs_routes_exist
