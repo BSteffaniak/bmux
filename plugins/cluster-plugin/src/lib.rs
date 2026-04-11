@@ -1615,10 +1615,35 @@ fn parse_cluster_events_limit(value: &str) -> Result<usize, String> {
 }
 
 fn parse_cluster_events_since(value: &str) -> Result<u64, String> {
-    value
+    let trimmed = value.trim();
+    if let Ok(absolute_unix_ms) = trimmed.parse::<u64>() {
+        return Ok(absolute_unix_ms);
+    }
+
+    let (amount_text, unit, unit_ms) = if let Some(amount) = trimmed.strip_suffix("ms") {
+        (amount, "ms", 1_u64)
+    } else if let Some(amount) = trimmed.strip_suffix('s') {
+        (amount, "s", 1_000_u64)
+    } else if let Some(amount) = trimmed.strip_suffix('m') {
+        (amount, "m", 60_000_u64)
+    } else if let Some(amount) = trimmed.strip_suffix('h') {
+        (amount, "h", 3_600_000_u64)
+    } else if let Some(amount) = trimmed.strip_suffix('d') {
+        (amount, "d", 86_400_000_u64)
+    } else {
+        return Err(format!(
+            "invalid --since value '{value}' (expected unix ms integer or relative duration like 500ms, 30s, 15m, 2h, 1d)"
+        ));
+    };
+
+    let amount = amount_text
         .trim()
         .parse::<u64>()
-        .map_err(|_| format!("invalid --since value '{value}' (expected unix ms integer)"))
+        .map_err(|_| format!("invalid --since value '{value}' (invalid {unit} duration amount)"))?;
+    let duration_ms = amount.checked_mul(unit_ms).ok_or_else(|| {
+        format!("invalid --since value '{value}' ({unit} duration overflows supported range)")
+    })?;
+    Ok(now_unix_ms().saturating_sub(duration_ms))
 }
 
 fn normalized_non_empty(value: &str) -> Option<String> {
@@ -2279,7 +2304,23 @@ mod tests {
     fn parse_cluster_events_args_rejects_invalid_since() {
         let error = parse_cluster_events_args(&["--since".to_string(), "abc".to_string()])
             .expect_err("invalid since should be rejected");
-        assert!(error.contains("unix ms integer"));
+        assert!(error.contains("relative duration"));
+    }
+
+    #[test]
+    fn parse_cluster_events_since_accepts_relative_minutes() {
+        let before = now_unix_ms();
+        let parsed = parse_cluster_events_since("15m").expect("relative since should parse");
+        let after = now_unix_ms();
+        assert!(parsed <= after.saturating_sub(900_000));
+        assert!(parsed >= before.saturating_sub(900_000));
+    }
+
+    #[test]
+    fn parse_cluster_events_since_accepts_absolute_unix_ms() {
+        let parsed =
+            parse_cluster_events_since("1712345678000").expect("absolute unix ms should parse");
+        assert_eq!(parsed, 1_712_345_678_000);
     }
 
     #[test]
