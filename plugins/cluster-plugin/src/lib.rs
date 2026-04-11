@@ -3006,6 +3006,129 @@ mod tests {
     }
 
     #[test]
+    fn execute_cluster_up_continue_policy_allows_partial_launch_with_mixed_failures() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health("db-precheck-fail", false);
+        runtime.set_health("db-launch-fail", true);
+        runtime.set_health("db-ok", true);
+        runtime.fail_launch_for("db-launch-fail");
+
+        let inventory = ClusterInventory {
+            clusters: BTreeMap::from([(
+                "prod".to_string(),
+                vec![
+                    "db-precheck-fail".to_string(),
+                    "db-launch-fail".to_string(),
+                    "db-ok".to_string(),
+                ],
+            )]),
+            known_targets: BTreeSet::from([
+                "db-precheck-fail".to_string(),
+                "db-launch-fail".to_string(),
+                "db-ok".to_string(),
+            ]),
+        };
+
+        let result = execute_cluster_up(
+            &runtime,
+            &inventory,
+            ClusterUpArgs {
+                cluster: "prod".to_string(),
+                hosts: Vec::new(),
+                on_failure: RetryFailurePolicy::Continue,
+                retries: 0,
+            },
+        )
+        .expect("continue policy should allow partial launch");
+
+        let precheck_failed = result
+            .statuses
+            .iter()
+            .find(|status| status.target == "db-precheck-fail")
+            .expect("precheck-fail host status should exist");
+        assert!(matches!(precheck_failed.state, ClusterHostState::Degraded));
+        assert!(
+            precheck_failed
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("probe exited with status"))
+        );
+        assert!(precheck_failed.pane_id.is_none());
+
+        let launch_failed = result
+            .statuses
+            .iter()
+            .find(|status| status.target == "db-launch-fail")
+            .expect("launch-fail host status should exist");
+        assert!(matches!(launch_failed.state, ClusterHostState::Degraded));
+        assert!(
+            launch_failed
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("pane launch failed"))
+        );
+        assert!(launch_failed.pane_id.is_none());
+
+        let ready = result
+            .statuses
+            .iter()
+            .find(|status| status.target == "db-ok")
+            .expect("db-ok status should exist");
+        assert!(matches!(ready.state, ClusterHostState::Ready));
+        assert!(ready.pane_id.is_some());
+
+        let panes = runtime
+            .pane_list(&PaneListRequest { session: None })
+            .expect("pane list should succeed")
+            .panes;
+        assert_eq!(panes.len(), 1, "only db-ok should have launched a pane");
+    }
+
+    #[test]
+    fn execute_cluster_up_abort_policy_stops_on_launch_failure() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health("db-precheck-fail", false);
+        runtime.set_health("db-launch-fail", true);
+        runtime.set_health("db-ok", true);
+        runtime.fail_launch_for("db-launch-fail");
+
+        let inventory = ClusterInventory {
+            clusters: BTreeMap::from([(
+                "prod".to_string(),
+                vec![
+                    "db-precheck-fail".to_string(),
+                    "db-launch-fail".to_string(),
+                    "db-ok".to_string(),
+                ],
+            )]),
+            known_targets: BTreeSet::from([
+                "db-precheck-fail".to_string(),
+                "db-launch-fail".to_string(),
+                "db-ok".to_string(),
+            ]),
+        };
+
+        let error = execute_cluster_up(
+            &runtime,
+            &inventory,
+            ClusterUpArgs {
+                cluster: "prod".to_string(),
+                hosts: Vec::new(),
+                on_failure: RetryFailurePolicy::Abort,
+                retries: 0,
+            },
+        )
+        .expect_err("abort policy should stop cluster-up on launch failure");
+        assert!(error.contains("pane launch failed"));
+
+        let panes = runtime
+            .pane_list(&PaneListRequest { session: None })
+            .expect("pane list should succeed")
+            .panes;
+        assert!(panes.is_empty(), "abort should stop before launching db-ok");
+    }
+
+    #[test]
     fn execute_cluster_pane_retry_replaces_pane_and_promotes_ready() {
         let runtime = FakeRuntime::default();
         runtime.set_health("db-a", true);
