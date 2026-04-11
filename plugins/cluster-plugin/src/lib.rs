@@ -20,6 +20,98 @@ const CLUSTER_PANE_BINDING_PREFIX: &str = "cluster.pane.";
 const CLUSTER_CONNECTION_EVENTS_KEY: &str = "cluster.connection.events";
 const CLUSTER_CONNECTION_EVENTS_MAX: usize = 256;
 
+trait ClusterRuntimeOps {
+    fn core_cli_command_run_path(
+        &self,
+        request: &CoreCliCommandRequest,
+    ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String>;
+    fn session_list(&self) -> Result<bmux_plugin_sdk::SessionListResponse, String>;
+    fn session_create(
+        &self,
+        request: &SessionCreateRequest,
+    ) -> Result<bmux_plugin_sdk::SessionCreateResponse, String>;
+    fn session_select(
+        &self,
+        request: &SessionSelectRequest,
+    ) -> Result<bmux_plugin_sdk::SessionSelectResponse, String>;
+    fn pane_list(
+        &self,
+        request: &PaneListRequest,
+    ) -> Result<bmux_plugin_sdk::PaneListResponse, String>;
+    fn pane_launch(
+        &self,
+        request: &PaneLaunchRequest,
+    ) -> Result<bmux_plugin_sdk::PaneLaunchResponse, String>;
+    fn pane_close(
+        &self,
+        request: &PaneCloseRequest,
+    ) -> Result<bmux_plugin_sdk::PaneCloseResponse, String>;
+    fn storage_get(
+        &self,
+        request: &StorageGetRequest,
+    ) -> Result<bmux_plugin_sdk::StorageGetResponse, String>;
+    fn storage_set(&self, request: &StorageSetRequest) -> Result<(), String>;
+}
+
+impl<T: HostRuntimeApi + ?Sized> ClusterRuntimeOps for T {
+    fn core_cli_command_run_path(
+        &self,
+        request: &CoreCliCommandRequest,
+    ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String> {
+        HostRuntimeApi::core_cli_command_run_path(self, request).map_err(|error| error.to_string())
+    }
+
+    fn session_list(&self) -> Result<bmux_plugin_sdk::SessionListResponse, String> {
+        HostRuntimeApi::session_list(self).map_err(|error| error.to_string())
+    }
+
+    fn session_create(
+        &self,
+        request: &SessionCreateRequest,
+    ) -> Result<bmux_plugin_sdk::SessionCreateResponse, String> {
+        HostRuntimeApi::session_create(self, request).map_err(|error| error.to_string())
+    }
+
+    fn session_select(
+        &self,
+        request: &SessionSelectRequest,
+    ) -> Result<bmux_plugin_sdk::SessionSelectResponse, String> {
+        HostRuntimeApi::session_select(self, request).map_err(|error| error.to_string())
+    }
+
+    fn pane_list(
+        &self,
+        request: &PaneListRequest,
+    ) -> Result<bmux_plugin_sdk::PaneListResponse, String> {
+        HostRuntimeApi::pane_list(self, request).map_err(|error| error.to_string())
+    }
+
+    fn pane_launch(
+        &self,
+        request: &PaneLaunchRequest,
+    ) -> Result<bmux_plugin_sdk::PaneLaunchResponse, String> {
+        HostRuntimeApi::pane_launch(self, request).map_err(|error| error.to_string())
+    }
+
+    fn pane_close(
+        &self,
+        request: &PaneCloseRequest,
+    ) -> Result<bmux_plugin_sdk::PaneCloseResponse, String> {
+        HostRuntimeApi::pane_close(self, request).map_err(|error| error.to_string())
+    }
+
+    fn storage_get(
+        &self,
+        request: &StorageGetRequest,
+    ) -> Result<bmux_plugin_sdk::StorageGetResponse, String> {
+        HostRuntimeApi::storage_get(self, request).map_err(|error| error.to_string())
+    }
+
+    fn storage_set(&self, request: &StorageSetRequest) -> Result<(), String> {
+        HostRuntimeApi::storage_set(self, request).map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Default)]
 pub struct ClusterPlugin;
 
@@ -522,7 +614,7 @@ fn run_cluster_pane_move(context: &NativeCommandContext) -> Result<i32, String> 
 }
 
 fn execute_cluster_up(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     inventory: &ClusterInventory,
     args: ClusterUpArgs,
 ) -> Result<ClusterUpExecution, String> {
@@ -574,7 +666,7 @@ fn execute_cluster_up(
 }
 
 fn execute_cluster_pane_new(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     args: ClusterPaneNewArgs,
 ) -> Result<ClusterCommandPaneMutationResponse, String> {
     let host = args.host.as_str();
@@ -642,7 +734,7 @@ fn execute_cluster_pane_new(
 }
 
 fn build_cluster_launch_statuses(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     selected_hosts: &[String],
     known_targets: &BTreeSet<String>,
 ) -> Vec<ClusterLaunchStatus> {
@@ -676,7 +768,7 @@ fn build_cluster_launch_statuses(
 }
 
 fn launch_ready_cluster_panes(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     session_selector: &SessionSelector,
     cluster: &str,
     on_failure: RetryFailurePolicy,
@@ -732,7 +824,7 @@ fn launch_ready_cluster_panes(
 }
 
 fn launch_cluster_host(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     session_selector: &SessionSelector,
     cluster: &str,
     target: &str,
@@ -824,7 +916,7 @@ fn launch_cluster_host(
 }
 
 fn execute_cluster_pane_retry(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     args: &ClusterPaneRetryArgs,
 ) -> Result<ClusterCommandPaneMutationResponse, String> {
     let list = caller
@@ -913,7 +1005,7 @@ fn execute_cluster_pane_retry(
 }
 
 fn mark_retry_started(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     pane_id: &str,
     mut binding: ClusterPaneBinding,
 ) -> Result<ClusterPaneBinding, String> {
@@ -939,7 +1031,7 @@ fn mark_retry_started(
 }
 
 fn mark_retry_probe_failed(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     pane_id: &str,
     binding: &ClusterPaneBinding,
     error: &str,
@@ -977,7 +1069,7 @@ enum RetryPromptDecision {
 }
 
 fn run_retry_probe_with_policy(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     pane_id: &str,
     binding: &ClusterPaneBinding,
     args: &ClusterPaneRetryArgs,
@@ -1041,7 +1133,7 @@ fn run_retry_probe_with_policy(
 }
 
 fn verify_launched_binding(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     pane_id: &str,
     binding: &mut ClusterPaneBinding,
     on_failure: RetryFailurePolicy,
@@ -1165,7 +1257,7 @@ fn prompt_retry_decision(target: &str, error: &str) -> Option<RetryPromptDecisio
 }
 
 fn execute_cluster_pane_move(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     args: ClusterPaneMoveArgs,
 ) -> Result<ClusterCommandPaneMutationResponse, String> {
     let list = caller
@@ -1263,7 +1355,7 @@ fn collect_statuses(
 }
 
 fn collect_statuses_for_selector(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     inventory: &ClusterInventory,
     selector: Option<&str>,
     probe: HealthProbe,
@@ -1324,7 +1416,7 @@ fn collect_statuses_for_selector(
 }
 
 fn collect_cluster_statuses(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     cluster_name: &str,
     hosts: &[String],
     known_targets: &BTreeSet<String>,
@@ -1360,7 +1452,7 @@ fn collect_cluster_statuses(
 }
 
 fn run_health_probe(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     target: &str,
     probe: HealthProbe,
 ) -> Result<(), String> {
@@ -2140,7 +2232,7 @@ fn pane_binding_storage_key(pane_id: &str) -> String {
 }
 
 fn set_cluster_pane_binding(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     pane_id: &str,
     binding: Option<&ClusterPaneBinding>,
 ) -> Result<(), String> {
@@ -2159,7 +2251,7 @@ fn set_cluster_pane_binding(
 }
 
 fn get_cluster_pane_binding(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     pane_id: &str,
 ) -> Result<Option<ClusterPaneBinding>, String> {
     let response = caller
@@ -2179,7 +2271,7 @@ fn get_cluster_pane_binding(
 }
 
 fn get_cluster_connection_events(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
 ) -> Result<Vec<ClusterConnectionEvent>, String> {
     let response = caller
         .storage_get(&StorageGetRequest {
@@ -2197,7 +2289,7 @@ fn get_cluster_connection_events(
 }
 
 fn set_cluster_connection_events(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     events: &[ClusterConnectionEvent],
 ) -> Result<(), String> {
     let value = serde_json::to_vec(events)
@@ -2211,7 +2303,7 @@ fn set_cluster_connection_events(
 }
 
 fn append_cluster_connection_event(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     event: ClusterConnectionEvent,
 ) -> Result<(), String> {
     let mut events = get_cluster_connection_events(caller)?;
@@ -2224,7 +2316,7 @@ fn append_cluster_connection_event(
 }
 
 fn resolve_cluster_binding_for_pane(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     pane: &bmux_plugin_sdk::PaneSummary,
 ) -> Result<ClusterPaneBinding, String> {
     let pane_id = pane.id.to_string();
@@ -2271,7 +2363,7 @@ fn retarget_pane_name(name: Option<&str>, target: &str) -> Option<String> {
 }
 
 fn ensure_cluster_session(
-    caller: &impl HostRuntimeApi,
+    caller: &impl ClusterRuntimeOps,
     session_name: &str,
 ) -> Result<SessionSelector, String> {
     let sessions = caller
@@ -2296,6 +2388,233 @@ fn ensure_cluster_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct FakeRuntime {
+        inner: Mutex<FakeRuntimeState>,
+    }
+
+    #[derive(Default)]
+    struct FakeRuntimeState {
+        next_id: u128,
+        sessions: Vec<bmux_plugin_sdk::SessionSummary>,
+        selected_session: Option<Uuid>,
+        panes: Vec<bmux_plugin_sdk::PaneSummary>,
+        storage: BTreeMap<String, Vec<u8>>,
+        health: BTreeMap<String, bool>,
+        launch_fail_targets: BTreeSet<String>,
+    }
+
+    impl FakeRuntime {
+        fn set_health(&self, target: &str, healthy: bool) {
+            let mut guard = self.inner.lock().expect("runtime lock poisoned");
+            guard.health.insert(target.to_string(), healthy);
+        }
+
+        fn fail_launch_for(&self, target: &str) {
+            let mut guard = self.inner.lock().expect("runtime lock poisoned");
+            guard.launch_fail_targets.insert(target.to_string());
+        }
+
+        fn add_pane(&self, name: Option<String>, focused: bool) -> Uuid {
+            let mut guard = self.inner.lock().expect("runtime lock poisoned");
+            let pane_id = next_test_uuid(&mut guard.next_id);
+            let index = u32::try_from(guard.panes.len() + 1).expect("pane index should fit u32");
+            if focused {
+                for pane in &mut guard.panes {
+                    pane.focused = false;
+                }
+            }
+            guard.panes.push(bmux_plugin_sdk::PaneSummary {
+                id: pane_id,
+                index,
+                name,
+                focused,
+            });
+            pane_id
+        }
+    }
+
+    impl ClusterRuntimeOps for FakeRuntime {
+        fn core_cli_command_run_path(
+            &self,
+            request: &CoreCliCommandRequest,
+        ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String> {
+            let target = request
+                .arguments
+                .first()
+                .ok_or_else(|| "missing target argument".to_string())?;
+            let healthy = {
+                let guard = self.inner.lock().expect("runtime lock poisoned");
+                guard.health.get(target).copied().unwrap_or(false)
+            };
+            Ok(bmux_plugin_sdk::CoreCliCommandResponse {
+                protocol_version: request.protocol_version,
+                exit_code: i32::from(!healthy),
+            })
+        }
+
+        fn session_list(&self) -> Result<bmux_plugin_sdk::SessionListResponse, String> {
+            let guard = self.inner.lock().expect("runtime lock poisoned");
+            Ok(bmux_plugin_sdk::SessionListResponse {
+                sessions: guard.sessions.clone(),
+            })
+        }
+
+        fn session_create(
+            &self,
+            request: &SessionCreateRequest,
+        ) -> Result<bmux_plugin_sdk::SessionCreateResponse, String> {
+            let mut guard = self.inner.lock().expect("runtime lock poisoned");
+            let id = next_test_uuid(&mut guard.next_id);
+            guard.sessions.push(bmux_plugin_sdk::SessionSummary {
+                id,
+                name: request.name.clone(),
+                client_count: 1,
+            });
+            guard.selected_session = Some(id);
+            drop(guard);
+            Ok(bmux_plugin_sdk::SessionCreateResponse {
+                id,
+                name: request.name.clone(),
+            })
+        }
+
+        fn session_select(
+            &self,
+            request: &SessionSelectRequest,
+        ) -> Result<bmux_plugin_sdk::SessionSelectResponse, String> {
+            let mut guard = self.inner.lock().expect("runtime lock poisoned");
+            let session_id = match &request.selector {
+                SessionSelector::ById(id) => *id,
+                SessionSelector::ByName(name) => guard
+                    .sessions
+                    .iter()
+                    .find(|session| session.name.as_deref() == Some(name.as_str()))
+                    .map(|session| session.id)
+                    .ok_or_else(|| format!("unknown session '{name}'"))?,
+            };
+            guard.selected_session = Some(session_id);
+            Ok(bmux_plugin_sdk::SessionSelectResponse {
+                session_id,
+                attach_token: next_test_uuid(&mut guard.next_id),
+                expires_at_epoch_ms: 0,
+            })
+        }
+
+        fn pane_list(
+            &self,
+            _request: &PaneListRequest,
+        ) -> Result<bmux_plugin_sdk::PaneListResponse, String> {
+            let guard = self.inner.lock().expect("runtime lock poisoned");
+            Ok(bmux_plugin_sdk::PaneListResponse {
+                panes: guard.panes.clone(),
+            })
+        }
+
+        fn pane_launch(
+            &self,
+            request: &PaneLaunchRequest,
+        ) -> Result<bmux_plugin_sdk::PaneLaunchResponse, String> {
+            let mut guard = self.inner.lock().expect("runtime lock poisoned");
+            let target = request
+                .command
+                .args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            if guard.launch_fail_targets.contains(&target) {
+                return Err(format!("simulated launch failure for '{target}'"));
+            }
+            let id = next_test_uuid(&mut guard.next_id);
+            for pane in &mut guard.panes {
+                pane.focused = false;
+            }
+            let index = u32::try_from(guard.panes.len() + 1).expect("pane index should fit u32");
+            guard.panes.push(bmux_plugin_sdk::PaneSummary {
+                id,
+                index,
+                name: request.name.clone(),
+                focused: true,
+            });
+
+            let session_id = match request.session.as_ref() {
+                Some(SessionSelector::ById(id)) => *id,
+                Some(SessionSelector::ByName(name)) => guard
+                    .sessions
+                    .iter()
+                    .find(|session| session.name.as_deref() == Some(name.as_str()))
+                    .map(|session| session.id)
+                    .ok_or_else(|| format!("unknown session '{name}'"))?,
+                None => guard
+                    .selected_session
+                    .or_else(|| guard.sessions.first().map(|session| session.id))
+                    .unwrap_or_else(|| next_test_uuid(&mut guard.next_id)),
+            };
+            drop(guard);
+
+            Ok(bmux_plugin_sdk::PaneLaunchResponse { id, session_id })
+        }
+
+        fn pane_close(
+            &self,
+            request: &PaneCloseRequest,
+        ) -> Result<bmux_plugin_sdk::PaneCloseResponse, String> {
+            let mut guard = self.inner.lock().expect("runtime lock poisoned");
+            let target_id = match request.target.as_ref().unwrap_or(&PaneSelector::Active) {
+                PaneSelector::ById(id) => *id,
+                PaneSelector::ByIndex(index) => guard
+                    .panes
+                    .iter()
+                    .find(|pane| pane.index == *index)
+                    .map(|pane| pane.id)
+                    .ok_or_else(|| format!("pane index '{index}' not found"))?,
+                PaneSelector::Active => guard
+                    .panes
+                    .iter()
+                    .find(|pane| pane.focused)
+                    .map(|pane| pane.id)
+                    .ok_or_else(|| "no active pane".to_string())?,
+            };
+            guard.panes.retain(|pane| pane.id != target_id);
+            if guard.panes.iter().all(|pane| !pane.focused)
+                && let Some(first) = guard.panes.first_mut()
+            {
+                first.focused = true;
+            }
+            Ok(bmux_plugin_sdk::PaneCloseResponse {
+                id: target_id,
+                session_id: guard.selected_session.unwrap_or(target_id),
+                session_closed: false,
+            })
+        }
+
+        fn storage_get(
+            &self,
+            request: &StorageGetRequest,
+        ) -> Result<bmux_plugin_sdk::StorageGetResponse, String> {
+            let guard = self.inner.lock().expect("runtime lock poisoned");
+            Ok(bmux_plugin_sdk::StorageGetResponse {
+                value: guard.storage.get(&request.key).cloned(),
+            })
+        }
+
+        fn storage_set(&self, request: &StorageSetRequest) -> Result<(), String> {
+            self.inner
+                .lock()
+                .expect("runtime lock poisoned")
+                .storage
+                .insert(request.key.clone(), request.value.clone());
+            Ok(())
+        }
+    }
+
+    fn next_test_uuid(counter: &mut u128) -> Uuid {
+        *counter += 1;
+        Uuid::from_u128(*counter)
+    }
 
     #[test]
     fn target_from_host_ref_accepts_string_variant() {
@@ -2625,6 +2944,120 @@ mod tests {
         let error = parse_cluster_events_since("1h30")
             .expect_err("malformed compound duration should be rejected");
         assert!(error.contains("missing a unit"));
+    }
+
+    #[test]
+    fn execute_cluster_up_tracks_ready_and_degraded_hosts() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health("db-a", true);
+        runtime.set_health("db-b", true);
+        runtime.fail_launch_for("db-b");
+
+        let inventory = ClusterInventory {
+            clusters: BTreeMap::from([(
+                "prod".to_string(),
+                vec!["db-a".to_string(), "db-b".to_string()],
+            )]),
+            known_targets: BTreeSet::from(["db-a".to_string(), "db-b".to_string()]),
+        };
+        let result = execute_cluster_up(
+            &runtime,
+            &inventory,
+            ClusterUpArgs {
+                cluster: "prod".to_string(),
+                hosts: Vec::new(),
+                on_failure: RetryFailurePolicy::Continue,
+                retries: 0,
+            },
+        )
+        .expect("cluster up should complete with partial start");
+
+        let ready = result
+            .statuses
+            .iter()
+            .find(|status| status.target == "db-a")
+            .expect("db-a status should exist");
+        assert!(matches!(ready.state, ClusterHostState::Ready));
+        assert!(ready.pane_id.is_some());
+
+        let degraded = result
+            .statuses
+            .iter()
+            .find(|status| status.target == "db-b")
+            .expect("db-b status should exist");
+        assert!(matches!(degraded.state, ClusterHostState::Degraded));
+        assert!(
+            degraded
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("pane launch failed"))
+        );
+
+        let binding = get_cluster_pane_binding(
+            &runtime,
+            ready
+                .pane_id
+                .as_deref()
+                .expect("ready pane id should exist"),
+        )
+        .expect("binding lookup should succeed")
+        .expect("binding should exist");
+        assert_eq!(binding.state, ClusterConnectionState::Ready);
+    }
+
+    #[test]
+    fn execute_cluster_pane_retry_replaces_pane_and_promotes_ready() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health("db-a", true);
+        let old_pane = runtime.add_pane(Some("host:db-a".to_string()), true);
+        set_cluster_pane_binding(
+            &runtime,
+            &old_pane.to_string(),
+            Some(&ClusterPaneBinding {
+                target: "db-a".to_string(),
+                cluster: None,
+                source: "new".to_string(),
+                state: ClusterConnectionState::Degraded,
+                retry_count: 0,
+                last_error: Some("simulated failure".to_string()),
+                updated_at_unix_ms: 1,
+            }),
+        )
+        .expect("seed binding should succeed");
+
+        let result = execute_cluster_pane_retry(
+            &runtime,
+            &ClusterPaneRetryArgs {
+                pane: PaneRetryRef::Active,
+                on_failure: RetryFailurePolicy::Abort,
+                retries: 0,
+            },
+        )
+        .expect("retry should succeed");
+
+        assert_eq!(result.target, "db-a");
+        let old_pane_id = old_pane.to_string();
+        assert_eq!(result.old_pane_id.as_deref(), Some(old_pane_id.as_str()));
+        assert_ne!(
+            result.new_pane_id, old_pane_id,
+            "retry should create replacement pane"
+        );
+
+        let old_binding = get_cluster_pane_binding(&runtime, &old_pane.to_string())
+            .expect("old binding lookup should succeed");
+        assert!(old_binding.is_none(), "old pane binding should be cleared");
+
+        let new_binding = get_cluster_pane_binding(&runtime, &result.new_pane_id)
+            .expect("new binding lookup should succeed")
+            .expect("new binding should exist");
+        assert_eq!(new_binding.state, ClusterConnectionState::Ready);
+
+        let panes = runtime
+            .pane_list(&PaneListRequest { session: None })
+            .expect("pane list should succeed")
+            .panes;
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].id.to_string(), result.new_pane_id);
     }
 
     #[test]
