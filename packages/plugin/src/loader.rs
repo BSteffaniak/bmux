@@ -46,7 +46,10 @@ use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -88,6 +91,34 @@ struct ProcessPluginRuntime {
     current_dir: Option<PathBuf>,
     persistent_worker: bool,
     persistent: Arc<Mutex<Option<PersistentProcessWorker>>>,
+    metrics: Arc<ProcessRuntimeMetrics>,
+}
+
+#[derive(Debug, Default)]
+struct ProcessRuntimeMetrics {
+    one_shot_timeouts: AtomicU64,
+    persistent_retries: AtomicU64,
+    persistent_respawns: AtomicU64,
+    persistent_timeouts: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProcessRuntimeMetricsSnapshot {
+    one_shot_timeouts: u64,
+    persistent_retries: u64,
+    persistent_respawns: u64,
+    persistent_timeouts: u64,
+}
+
+impl ProcessRuntimeMetrics {
+    fn snapshot(&self) -> ProcessRuntimeMetricsSnapshot {
+        ProcessRuntimeMetricsSnapshot {
+            one_shot_timeouts: self.one_shot_timeouts.load(Ordering::Relaxed),
+            persistent_retries: self.persistent_retries.load(Ordering::Relaxed),
+            persistent_respawns: self.persistent_respawns.load(Ordering::Relaxed),
+            persistent_timeouts: self.persistent_timeouts.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -134,6 +165,8 @@ impl ProcessPluginRuntime {
         self.invoke_one_shot(plugin_id, argv, request)
     }
 
+    // Keep one-shot protocol handling in a single flow so timeout and stderr behavior stay obvious.
+    #[allow(clippy::too_many_lines)]
     fn invoke_one_shot(
         &self,
         plugin_id: &str,
@@ -203,9 +236,19 @@ impl ProcessPluginRuntime {
                 break status;
             }
             if started.elapsed() >= timeout {
+                self.metrics
+                    .one_shot_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
                 let _ = child.kill();
                 let _ = child.wait();
                 let stderr = join_reader(stderr_reader, "stderr")?;
+                warn!(
+                    plugin_id,
+                    command = self.command,
+                    timeout_ms = timeout.as_millis(),
+                    metrics = ?self.metrics.snapshot(),
+                    "process runtime one-shot invocation timed out"
+                );
                 return Err(PluginError::ProcessPluginTimeout {
                     plugin_id: plugin_id.to_string(),
                     command: self.command.clone(),
@@ -243,6 +286,8 @@ impl ProcessPluginRuntime {
         Ok((Some(response), status))
     }
 
+    // Keep retry/respawn state machine inline so persistent-worker recovery paths stay auditable.
+    #[allow(clippy::too_many_lines)]
     fn invoke_persistent(
         &self,
         plugin_id: &str,
@@ -250,6 +295,7 @@ impl ProcessPluginRuntime {
     ) -> Result<(Option<ProcessInvocationResponse>, std::process::ExitStatus)> {
         let frame = encode_process_invocation_request(request)?;
         let timeout = process_plugin_timeout();
+        let mut recovered_once = false;
 
         let mut guard = self
             .persistent
@@ -275,7 +321,17 @@ impl ProcessPluginRuntime {
                 .is_some()
             {
                 if attempt == 0 {
+                    self.metrics
+                        .persistent_respawns
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        plugin_id,
+                        command = self.command,
+                        metrics = ?self.metrics.snapshot(),
+                        "persistent process worker exited; respawning"
+                    );
                     Self::reset_persistent_worker(&mut guard, false);
+                    recovered_once = true;
                     continue;
                 }
 
@@ -293,7 +349,18 @@ impl ProcessPluginRuntime {
                 .and_then(|()| worker.stdin.flush())
             {
                 if attempt == 0 {
+                    self.metrics
+                        .persistent_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        plugin_id,
+                        command = self.command,
+                        error = %error,
+                        metrics = ?self.metrics.snapshot(),
+                        "persistent process worker write failed; recycling worker"
+                    );
                     Self::reset_persistent_worker(&mut guard, true);
+                    recovered_once = true;
                     continue;
                 }
 
@@ -310,7 +377,23 @@ impl ProcessPluginRuntime {
                 Ok(frame_bytes) => frame_bytes,
                 Err(error) => {
                     if attempt == 0 {
+                        self.metrics
+                            .persistent_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        if error.kind() == ErrorKind::TimedOut {
+                            self.metrics
+                                .persistent_timeouts
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        warn!(
+                            plugin_id,
+                            command = self.command,
+                            error = %error,
+                            metrics = ?self.metrics.snapshot(),
+                            "persistent process worker read failed; recycling worker"
+                        );
                         Self::reset_persistent_worker(&mut guard, true);
+                        recovered_once = true;
                         continue;
                     }
                     return Err(PluginError::ServiceProtocol {
@@ -339,6 +422,14 @@ impl ProcessPluginRuntime {
                     details: format!("failed polling persistent process worker: {error}"),
                 })?
                 .unwrap_or_else(success_exit_status);
+            if recovered_once {
+                debug!(
+                    plugin_id,
+                    command = self.command,
+                    metrics = ?self.metrics.snapshot(),
+                    "persistent process worker request recovered after retry/respawn"
+                );
+            }
             drop(guard);
             return Ok((Some(response), status));
         }
@@ -2105,6 +2196,7 @@ impl NativePluginLoader {
                         .map(Path::to_path_buf),
                     persistent_worker: *persistent_worker,
                     persistent: Arc::new(Mutex::new(None)),
+                    metrics: Arc::new(ProcessRuntimeMetrics::default()),
                 }),
             });
         }
@@ -2417,38 +2509,23 @@ mod tests {
     );
 
     #[cfg(unix)]
-    const PERSISTENT_WORKER_DROP_SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
-import os
-import struct
-import sys
-import time
+    const PERSISTENT_WORKER_REUSE_SCRIPT: &str = r"#!/bin/sh
+printf 'BMUXPRC1\000\000\000\004\000\001\002\000'
+sleep 0.05
+printf 'BMUXPRC1\000\000\000\004\000\001\004\000'
+sleep 60
+";
 
-MAGIC = b"BMUXPRC1"
+    #[cfg(unix)]
+    const PERSISTENT_WORKER_RESPAWN_SCRIPT: &str = r"#!/bin/sh
+printf 'BMUXPRC1\000\000\000\004\000\001\002\000'
+";
 
-with open({pid_file:?}, "w", encoding="utf-8") as pid_file:
-    pid_file.write(str(os.getpid()))
-    pid_file.flush()
-
-def read_exact(n):
-    data = sys.stdin.buffer.read(n)
-    if len(data) != n:
-        return None
-    return data
-
-header = read_exact(12)
-if header is None or header[:8] != MAGIC:
-    sys.exit(1)
-payload_len = struct.unpack(">I", header[8:12])[0]
-payload = read_exact(payload_len)
-if payload is None:
-    sys.exit(1)
-
-response_payload = bytes([0x00, 0x01, 0x02, 0x00])
-response_frame = MAGIC + struct.pack(">I", len(response_payload)) + response_payload
-sys.stdout.buffer.write(response_frame)
-sys.stdout.buffer.flush()
-
-time.sleep(60)
+    #[cfg(unix)]
+    const PERSISTENT_WORKER_DROP_SCRIPT_TEMPLATE: &str = r#"#!/bin/sh
+printf '%s' "$$" > {pid_file:?}
+printf 'BMUXPRC1\000\000\000\004\000\001\002\000'
+sleep 60
 "#;
 
     #[unsafe(no_mangle)]
@@ -2820,6 +2897,7 @@ minimum = "1.0"
         plugin_id: &str,
         plugin_name: &str,
         script_path: &std::path::Path,
+        entry_command: &str,
     ) -> LoadedPlugin {
         let manifest = PluginManifest::from_toml_str(&format!(
             r#"
@@ -2827,7 +2905,7 @@ id = "{}"
 name = "{}"
 version = "0.1.0"
 runtime = "process"
-entry = "python3"
+entry = "{}"
 entry_args = ["{}"]
 process_persistent_worker = true
 
@@ -2844,6 +2922,7 @@ minimum = "1.0"
 "#,
             plugin_id,
             plugin_name,
+            entry_command,
             script_path.display()
         ))
         .expect("manifest should parse");
@@ -2868,6 +2947,17 @@ minimum = "1.0"
             &BTreeMap::new(),
         )
         .expect("process runtime worker plugin should load")
+    }
+
+    fn process_runtime_metrics_snapshot(
+        loaded: &LoadedPlugin,
+    ) -> super::ProcessRuntimeMetricsSnapshot {
+        match &loaded.backend {
+            PluginBackend::Process(runtime) => runtime.metrics.snapshot(),
+            PluginBackend::Dynamic(_) | PluginBackend::Static(_) => {
+                panic!("expected process backend")
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -2934,87 +3024,16 @@ minimum = "1.0"
                 .as_nanos()
         ));
         std::fs::create_dir_all(&temp_root).expect("temp test root should be created");
-        let script_path = temp_root.join("worker.py");
-        std::fs::write(
+        let script_path = temp_root.join("worker.sh");
+        std::fs::write(&script_path, PERSISTENT_WORKER_REUSE_SCRIPT)
+            .expect("worker script should be written");
+
+        let loaded = load_persistent_worker_plugin(
+            "process.worker.plugin",
+            "Process Worker Plugin",
             &script_path,
-            r#"#!/usr/bin/env python3
-import struct
-import sys
-
-MAGIC = b"BMUXPRC1"
-counter = 0
-
-def read_exact(n):
-    data = sys.stdin.buffer.read(n)
-    if len(data) != n:
-        return None
-    return data
-
-while True:
-    header = read_exact(12)
-    if header is None:
-        break
-    if header[:8] != MAGIC:
-        break
-    payload_len = struct.unpack(">I", header[8:12])[0]
-    payload = read_exact(payload_len)
-    if payload is None:
-        break
-
-    counter += 1
-    zigzag_status = (counter << 1) & 0xFF
-    response_payload = bytes([0x00, 0x01, zigzag_status, 0x00])
-    response_frame = MAGIC + struct.pack(">I", len(response_payload)) + response_payload
-    sys.stdout.buffer.write(response_frame)
-    sys.stdout.buffer.flush()
-"#,
-        )
-        .expect("worker script should be written");
-
-        let manifest = PluginManifest::from_toml_str(&format!(
-            r#"
-id = "process.worker.plugin"
-name = "Process Worker Plugin"
-version = "0.1.0"
-runtime = "process"
-entry = "python3"
-entry_args = ["{}"]
-process_persistent_worker = true
-
-[[commands]]
-name = "hello"
-summary = "hello"
-execution = "provider_exec"
-
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
-"#,
-            script_path.display()
-        ))
-        .expect("manifest should parse");
-        let mut registry = PluginRegistry::new();
-        registry
-            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
-            .expect("manifest should register");
-        let registered = registry
-            .get("process.worker.plugin")
-            .expect("plugin should register")
-            .clone();
-
-        let loaded = super::load_registered_plugin(
-            &registered,
-            &HostMetadata {
-                product_name: "bmux".to_string(),
-                product_version: "0.1.0".to_string(),
-                plugin_api_version: ApiVersion::new(1, 0),
-                plugin_abi_version: ApiVersion::new(1, 0),
-            },
-            &BTreeMap::new(),
-        )
-        .expect("process runtime worker plugin should load");
+            "sh",
+        );
 
         let args: Vec<String> = Vec::new();
         let first = loaded
@@ -3043,81 +3062,16 @@ minimum = "1.0"
                 .as_nanos()
         ));
         std::fs::create_dir_all(&temp_root).expect("temp test root should be created");
-        let script_path = temp_root.join("worker_once.py");
-        std::fs::write(
+        let script_path = temp_root.join("worker_once.sh");
+        std::fs::write(&script_path, PERSISTENT_WORKER_RESPAWN_SCRIPT)
+            .expect("worker script should be written");
+
+        let loaded = load_persistent_worker_plugin(
+            "process.worker.respawn.plugin",
+            "Process Worker Respawn Plugin",
             &script_path,
-            r#"#!/usr/bin/env python3
-import struct
-import sys
-
-MAGIC = b"BMUXPRC1"
-
-def read_exact(n):
-    data = sys.stdin.buffer.read(n)
-    if len(data) != n:
-        return None
-    return data
-
-header = read_exact(12)
-if header is None or header[:8] != MAGIC:
-    sys.exit(1)
-payload_len = struct.unpack(">I", header[8:12])[0]
-payload = read_exact(payload_len)
-if payload is None:
-    sys.exit(1)
-
-response_payload = bytes([0x00, 0x01, 0x02, 0x00])
-response_frame = MAGIC + struct.pack(">I", len(response_payload)) + response_payload
-sys.stdout.buffer.write(response_frame)
-sys.stdout.buffer.flush()
-"#,
-        )
-        .expect("worker script should be written");
-
-        let manifest = PluginManifest::from_toml_str(&format!(
-            r#"
-id = "process.worker.respawn.plugin"
-name = "Process Worker Respawn Plugin"
-version = "0.1.0"
-runtime = "process"
-entry = "python3"
-entry_args = ["{}"]
-process_persistent_worker = true
-
-[[commands]]
-name = "hello"
-summary = "hello"
-execution = "provider_exec"
-
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
-"#,
-            script_path.display()
-        ))
-        .expect("manifest should parse");
-        let mut registry = PluginRegistry::new();
-        registry
-            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
-            .expect("manifest should register");
-        let registered = registry
-            .get("process.worker.respawn.plugin")
-            .expect("plugin should register")
-            .clone();
-
-        let loaded = super::load_registered_plugin(
-            &registered,
-            &HostMetadata {
-                product_name: "bmux".to_string(),
-                product_version: "0.1.0".to_string(),
-                plugin_api_version: ApiVersion::new(1, 0),
-                plugin_abi_version: ApiVersion::new(1, 0),
-            },
-            &BTreeMap::new(),
-        )
-        .expect("process runtime worker plugin should load");
+            "sh",
+        );
 
         let args: Vec<String> = Vec::new();
         let first = loaded
@@ -3129,6 +3083,8 @@ minimum = "1.0"
 
         assert_eq!(first, 1);
         assert_eq!(second, 1);
+        let metrics = process_runtime_metrics_snapshot(&loaded);
+        assert!(metrics.persistent_respawns + metrics.persistent_retries >= 1);
 
         let _ = std::fs::remove_file(&script_path);
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -3146,7 +3102,7 @@ minimum = "1.0"
                 .as_nanos()
         ));
         std::fs::create_dir_all(&temp_root).expect("temp test root should be created");
-        let script_path = temp_root.join("worker_hang.py");
+        let script_path = temp_root.join("worker_hang.sh");
         let pid_path = temp_root.join("worker.pid");
         let script_contents = PERSISTENT_WORKER_DROP_SCRIPT_TEMPLATE.replace(
             "{pid_file:?}",
@@ -3158,6 +3114,7 @@ minimum = "1.0"
             "process.worker.drop.plugin",
             "Process Worker Drop Plugin",
             &script_path,
+            "sh",
         );
 
         let args: Vec<String> = Vec::new();
