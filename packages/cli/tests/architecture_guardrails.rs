@@ -182,6 +182,10 @@ fn plugin_production_code_uses_generic_host_api_only() {
             "plugins/plugin-cli-plugin/src/lib.rs",
             include_str!("../../../plugins/plugin-cli-plugin/src/lib.rs"),
         ),
+        (
+            "plugins/cluster-plugin/src/lib.rs",
+            include_str!("../../../plugins/cluster-plugin/src/lib.rs"),
+        ),
     ];
 
     for (path, source) in plugin_sources {

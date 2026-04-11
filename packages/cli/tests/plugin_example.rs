@@ -39,6 +39,11 @@ fn bundled_plugin_manifests_include_core_shipped_plugins() {
     assert!(
         manifests
             .iter()
+            .any(|manifest| manifest.id.as_str() == "bmux.cluster")
+    );
+    assert!(
+        manifests
+            .iter()
             .any(|manifest| manifest.id.as_str() == "bmux.permissions")
     );
     assert!(
@@ -46,6 +51,74 @@ fn bundled_plugin_manifests_include_core_shipped_plugins() {
             .iter()
             .any(|manifest| manifest.id.as_str() == "bmux.plugin_cli")
     );
+}
+
+#[test]
+fn bundled_cluster_manifest_matches_pragmatic_command_surface() {
+    let cluster = bundled_manifest("bmux.cluster");
+    let commands = cluster
+        .commands
+        .iter()
+        .map(|command| {
+            (
+                command.name.as_str(),
+                command.path.clone(),
+                command.aliases.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let expected = [
+        (
+            "cluster-up",
+            vec!["cluster-up"],
+            vec![vec!["cluster", "up"]],
+        ),
+        (
+            "cluster-status",
+            vec!["cluster-status"],
+            vec![vec!["cluster", "status"]],
+        ),
+        (
+            "cluster-doctor",
+            vec!["cluster-doctor"],
+            vec![vec!["cluster", "doctor"]],
+        ),
+        (
+            "cluster-hosts",
+            vec!["cluster-hosts"],
+            vec![vec!["cluster", "hosts"]],
+        ),
+        (
+            "cluster-pane-new",
+            vec!["cluster-pane-new"],
+            vec![vec!["cluster", "pane", "new"]],
+        ),
+        (
+            "cluster-pane-move",
+            vec!["cluster-pane-move"],
+            vec![vec!["cluster", "pane", "move"]],
+        ),
+        (
+            "cluster-pane-retry",
+            vec!["cluster-pane-retry"],
+            vec![vec!["cluster", "pane", "retry"]],
+        ),
+    ];
+
+    for (name, path, aliases) in expected {
+        let entry = commands
+            .iter()
+            .find(|(command_name, _, _)| *command_name == name)
+            .unwrap_or_else(|| panic!("missing cluster command {name}"));
+        let expected_path = path.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(entry.1, expected_path, "{name} path mismatch");
+        let expected_aliases = aliases
+            .iter()
+            .map(|alias| alias.iter().map(ToString::to_string).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(entry.2, expected_aliases, "{name} aliases mismatch");
+    }
 }
 
 #[test]

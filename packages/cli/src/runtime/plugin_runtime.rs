@@ -80,7 +80,7 @@ pub(super) fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPat
 /// (returns the [`StaticPluginVtable`] for a given plugin id).
 ///
 /// Each entry is only compiled when its Cargo feature flag is active, so the
-/// binary only includes the plugin code the user opted into (all four by
+/// binary only includes the plugin code the user opted into (all bundled by
 /// default via the `bundled-plugins` feature).
 ///
 /// To add a new bundled plugin, append one three-line entry here -- no need to
@@ -123,6 +123,10 @@ declare_bundled_plugins! {
     feature = "bundled-plugin-clipboard",
     manifest = include_str!("../../../../plugins/clipboard-plugin/plugin.toml"),
     plugin_type = bmux_clipboard_plugin::ClipboardPlugin;
+
+    feature = "bundled-plugin-cluster",
+    manifest = include_str!("../../../../plugins/cluster-plugin/plugin.toml"),
+    plugin_type = bmux_cluster_plugin::ClusterPlugin;
 
     feature = "bundled-plugin-permissions",
     manifest = include_str!("../../../../plugins/permissions-plugin/plugin.toml"),

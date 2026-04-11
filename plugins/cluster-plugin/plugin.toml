@@ -1,0 +1,150 @@
+execution_class = "native_fast"
+id = "bmux.cluster"
+name = "bmux Server Clusters"
+owns_namespaces = [
+    "cluster",
+    "cluster-up",
+    "cluster-status",
+    "cluster-doctor",
+    "cluster-hosts",
+    "cluster-pane-new",
+    "cluster-pane-move",
+    "cluster-pane-retry",
+]
+provided_capabilities = [
+    "bmux.server_clusters.read",
+    "bmux.server_clusters.write",
+    "bmux.server_clusters.auth",
+]
+provided_features = ["bmux.server_clusters"]
+required_capabilities = [
+    "bmux.commands",
+    "bmux.sessions.read",
+    "bmux.sessions.write",
+    "bmux.storage",
+]
+version = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.server_clusters.read"
+interface_id = "cluster-query/v1"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.server_clusters.write"
+interface_id = "cluster-command/v1"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.server_clusters.read"
+interface_id = "cluster-connection-events/v1"
+kind         = "query"
+
+[[commands]]
+aliases       = [["cluster", "up"]]
+expose_in_cli = true
+name          = "cluster-up"
+path          = ["cluster-up"]
+summary       = "Start or attach a cluster session"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster"
+position   = 0
+required   = true
+value_name = "CLUSTER"
+
+[[commands]]
+aliases       = [["cluster", "status"]]
+expose_in_cli = true
+name          = "cluster-status"
+path          = ["cluster-status"]
+summary       = "Show cluster status"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster"
+position   = 0
+required   = false
+value_name = "CLUSTER"
+
+[[commands]]
+aliases       = [["cluster", "doctor"]]
+expose_in_cli = true
+name          = "cluster-doctor"
+path          = ["cluster-doctor"]
+summary       = "Run cluster readiness checks"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+required   = false
+value_name = "CLUSTER_OR_HOST"
+
+[[commands]]
+aliases       = [["cluster", "hosts"]]
+expose_in_cli = true
+name          = "cluster-hosts"
+path          = ["cluster-hosts"]
+summary       = "List hosts in a cluster"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster"
+position   = 0
+required   = false
+value_name = "CLUSTER"
+
+[[commands]]
+aliases       = [["cluster", "pane", "new"]]
+expose_in_cli = true
+name          = "cluster-pane-new"
+path          = ["cluster-pane-new"]
+summary       = "Create a cluster-bound pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "host"
+name       = "host"
+short      = "h"
+value_name = "HOST"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "name"
+name       = "name"
+short      = "n"
+value_name = "NAME"
+
+[[commands]]
+aliases       = [["cluster", "pane", "move"]]
+expose_in_cli = true
+name          = "cluster-pane-move"
+path          = ["cluster-pane-move"]
+summary       = "Move a pane to another host"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane"
+name       = "pane"
+value_name = "PANE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "host"
+name       = "host"
+value_name = "HOST"
+
+[[commands]]
+aliases       = [["cluster", "pane", "retry"]]
+expose_in_cli = true
+name          = "cluster-pane-retry"
+path          = ["cluster-pane-retry"]
+summary       = "Retry a failed cluster pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane"
+name       = "pane"
+value_name = "PANE"

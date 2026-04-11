@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shipped server clusters plugin for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "cluster"]
+license     = { workspace = true }
+name        = "bmux_cluster_plugin"
+publish     = false
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmux_plugin_sdk = { workspace = true }
+
+[features]
+fail-on-warnings = ["bmux_plugin_sdk/fail-on-warnings"]
+static-bundled   = []

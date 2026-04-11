@@ -33,6 +33,7 @@ members = [
     "packages/docs-site",
     "packages/docs-site/ui",
     "plugins/clipboard-plugin",
+    "plugins/cluster-plugin",
     "plugins/plugin-cli-plugin",
     "plugins/permissions-plugin",
     "plugins/prompted-actions-plugin",
@@ -109,6 +110,7 @@ bmux_terminal_protocol = { version = "0.0.1-alpha.0", default-features = false, 
 
 # Bundled plugin crates (used as optional rlib deps in bmux_cli)
 bmux_clipboard_plugin        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/clipboard-plugin" }
+bmux_cluster_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/cluster-plugin" }
 bmux_permissions_plugin      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/permissions-plugin" }
 bmux_plugin_cli_plugin       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/plugin-cli-plugin" }
 bmux_prompted_actions_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/prompted-actions-plugin" }
