@@ -196,10 +196,66 @@ jobs:
           workspace-path: .
           skip-on-no-changes: false
 
+  plugin-runtime-perf-gates:
+    name: Plugin Runtime Perf Gates
+    runs-on: ubuntu-latest
+    needs: [determine-affected-packages]
+    if: ${{ needs.determine-affected-packages.outputs.has-changes == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Detect plugin/runtime touching changes
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_ref="${{ github.event.pull_request.base.sha }}"
+          else
+            base_ref="${{ github.event.before }}"
+          fi
+
+          if [[ -z "$base_ref" || "$base_ref" == "0000000000000000000000000000000000000000" ]]; then
+            base_ref="HEAD^"
+          fi
+
+          changed_files=$(git diff --name-only "$base_ref" "${{ github.sha }}")
+
+          if echo "$changed_files" | grep -Eq '^(packages/plugin/|packages/plugin-sdk/|plugins/|packages/cli/src/runtime/plugin|scripts/perf-plugin-|docs/plugin-performance-usability-gates\.md)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "plugin/runtime changes detected"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no plugin/runtime changes detected"
+          fi
+
+      - name: Plugin command latency gate
+        if: ${{ steps.changes.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          ./scripts/perf-plugin-command-latency.sh --iterations 20 --warmup 5 --max-p95-ms 250 --max-p99-ms 350
+
+      - name: Plugin runtime matrix gate
+        if: ${{ steps.changes.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          ./scripts/perf-plugin-runtime-matrix.sh --iterations 20 --warmup 5
+
+      - name: Skip message when unchanged
+        if: ${{ steps.changes.outputs.run != 'true' }}
+        run: echo "Skipping plugin runtime perf gates (no plugin/runtime touching changes)."
+
   build:
     name: ${{ matrix.package.name }}${{ matrix.package.hasMultipleOs && format(' {0}', matrix.package.osEmoji) || '' }}${{ matrix.package.osCount > 1 && format(' {0}', matrix.package.osIndex) || '' }}
     runs-on: ${{ matrix.package.os }}
-    needs: [determine-affected-packages, build-cargo-machete]
+    needs: [determine-affected-packages, build-cargo-machete, plugin-runtime-perf-gates]
     if: ${{ needs.determine-affected-packages.outputs.has-changes == 'true' }}
     strategy:
       fail-fast: false
