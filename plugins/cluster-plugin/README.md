@@ -18,6 +18,7 @@ Current scope:
 - `cluster pane move` relocates a pane to a destination host and retargets pane naming
 - `cluster pane retry` relaunches a host-bound pane by inferring target from pane naming convention
 - Cluster pane target metadata is persisted in plugin storage for robust move/retry behavior
+- Connection lifecycle state (`connecting/retrying/degraded/failed`) is tracked in pane metadata
 - Cluster service interfaces are implemented for query/command/event-list integrations
 
 ## Commands (Scaffolded)

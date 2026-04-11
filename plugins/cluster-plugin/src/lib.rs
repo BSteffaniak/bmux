@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CLUSTER_PANE_BINDING_PREFIX: &str = "cluster.pane.";
+const CLUSTER_CONNECTION_EVENTS_KEY: &str = "cluster.connection.events";
+const CLUSTER_CONNECTION_EVENTS_MAX: usize = 256;
 
 #[derive(Default)]
 pub struct ClusterPlugin;
@@ -100,8 +102,10 @@ impl RustPlugin for ClusterPlugin {
                 .map_err(|error| ServiceResponse::error("pane_move_failed", error))?;
                 Ok(result)
             },
-            "cluster-connection-events/v1", "list" => |_: ClusterConnectionEventsListRequest, _ctx| {
-                Ok(ClusterConnectionEventsListResponse { events: Vec::new() })
+            "cluster-connection-events/v1", "list" => |_: ClusterConnectionEventsListRequest, ctx| {
+                let events = get_cluster_connection_events(ctx)
+                    .map_err(|error| ServiceResponse::error("connection_events_list_failed", error))?;
+                Ok(ClusterConnectionEventsListResponse { events })
             },
         })
     }
@@ -207,7 +211,35 @@ struct ClusterPaneBinding {
     target: String,
     cluster: Option<String>,
     source: String,
+    #[serde(default)]
+    state: ClusterConnectionState,
+    #[serde(default)]
+    retry_count: u32,
+    #[serde(default)]
+    last_error: Option<String>,
     updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum ClusterConnectionState {
+    #[default]
+    Connecting,
+    Ready,
+    Degraded,
+    Retrying,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterConnectionEvent {
+    ts_unix_ms: u64,
+    pane_id: Option<String>,
+    cluster: Option<String>,
+    target: Option<String>,
+    source: Option<String>,
+    state: ClusterConnectionState,
+    message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,7 +304,7 @@ struct ClusterConnectionEventsListRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClusterConnectionEventsListResponse {
-    events: Vec<String>,
+    events: Vec<ClusterConnectionEvent>,
 }
 
 fn run_cluster_hosts(context: &NativeCommandContext) -> Result<i32, String> {
@@ -455,9 +487,24 @@ fn execute_cluster_pane_new(
         target: host.to_string(),
         cluster: None,
         source: "new".to_string(),
+        state: ClusterConnectionState::Connecting,
+        retry_count: 0,
+        last_error: None,
         updated_at_unix_ms: now_unix_ms(),
     };
     set_cluster_pane_binding(caller, &response.id.to_string(), Some(&binding))?;
+    append_cluster_connection_event(
+        caller,
+        ClusterConnectionEvent {
+            ts_unix_ms: now_unix_ms(),
+            pane_id: Some(response.id.to_string()),
+            cluster: None,
+            target: Some(host.to_string()),
+            source: Some("new".to_string()),
+            state: ClusterConnectionState::Connecting,
+            message: "pane launched for reconnecting host session".to_string(),
+        },
+    )?;
 
     Ok(ClusterCommandPaneMutationResponse {
         target: host.to_string(),
@@ -541,6 +588,9 @@ fn launch_ready_cluster_panes(
                     target: target.clone(),
                     cluster: Some(cluster.to_string()),
                     source: "up".to_string(),
+                    state: ClusterConnectionState::Connecting,
+                    retry_count: 0,
+                    last_error: None,
                     updated_at_unix_ms: now_unix_ms(),
                 };
                 if let Err(error) =
@@ -548,11 +598,48 @@ fn launch_ready_cluster_panes(
                 {
                     status.state = ClusterHostState::Degraded;
                     status.reason = Some(format!("pane metadata write failed: {error}"));
+                    let _ = append_cluster_connection_event(
+                        caller,
+                        ClusterConnectionEvent {
+                            ts_unix_ms: now_unix_ms(),
+                            pane_id: Some(result.id.to_string()),
+                            cluster: Some(cluster.to_string()),
+                            target: Some(target.clone()),
+                            source: Some("up".to_string()),
+                            state: ClusterConnectionState::Failed,
+                            message: format!("pane metadata write failed: {error}"),
+                        },
+                    );
+                } else {
+                    let _ = append_cluster_connection_event(
+                        caller,
+                        ClusterConnectionEvent {
+                            ts_unix_ms: now_unix_ms(),
+                            pane_id: Some(result.id.to_string()),
+                            cluster: Some(cluster.to_string()),
+                            target: Some(target.clone()),
+                            source: Some("up".to_string()),
+                            state: ClusterConnectionState::Connecting,
+                            message: "pane launched for cluster host".to_string(),
+                        },
+                    );
                 }
             }
             Err(error) => {
                 status.state = ClusterHostState::Degraded;
                 status.reason = Some(format!("pane launch failed: {error}"));
+                let _ = append_cluster_connection_event(
+                    caller,
+                    ClusterConnectionEvent {
+                        ts_unix_ms: now_unix_ms(),
+                        pane_id: None,
+                        cluster: Some(cluster.to_string()),
+                        target: Some(target.clone()),
+                        source: Some("up".to_string()),
+                        state: ClusterConnectionState::Failed,
+                        message: format!("pane launch failed: {error}"),
+                    },
+                );
             }
         }
     }
@@ -567,9 +654,14 @@ fn execute_cluster_pane_retry(
         .map_err(|error| format!("failed listing panes: {error}"))?;
 
     let pane = resolve_retry_pane(&list.panes, &args.pane)?;
-    let binding = resolve_cluster_binding_for_pane(caller, pane)?;
+    let pane_id_text = pane.id.to_string();
+    let binding = mark_retry_started(
+        caller,
+        &pane_id_text,
+        resolve_cluster_binding_for_pane(caller, pane)?,
+    )?;
     run_health_probe(caller, &binding.target, HealthProbe::Test)
-        .map_err(|error| format!("target '{}' is not ready: {error}", binding.target))?;
+        .map_err(|error| mark_retry_probe_failed(caller, &pane_id_text, &binding, &error))?;
 
     let launch = caller
         .pane_launch(&PaneLaunchRequest {
@@ -599,9 +691,24 @@ fn execute_cluster_pane_retry(
         target: binding.target.clone(),
         cluster: binding.cluster.clone(),
         source: "retry".to_string(),
+        state: ClusterConnectionState::Connecting,
+        retry_count: binding.retry_count,
+        last_error: None,
         updated_at_unix_ms: now_unix_ms(),
     };
     set_cluster_pane_binding(caller, &launch.id.to_string(), Some(&new_binding))?;
+    append_cluster_connection_event(
+        caller,
+        ClusterConnectionEvent {
+            ts_unix_ms: now_unix_ms(),
+            pane_id: Some(launch.id.to_string()),
+            cluster: new_binding.cluster,
+            target: Some(binding.target.clone()),
+            source: Some("retry".to_string()),
+            state: ClusterConnectionState::Connecting,
+            message: "retry launched replacement pane".to_string(),
+        },
+    )?;
 
     caller
         .pane_close(&PaneCloseRequest {
@@ -618,6 +725,63 @@ fn execute_cluster_pane_retry(
         new_pane_id: launch.id.to_string(),
         session_id: launch.session_id.to_string(),
     })
+}
+
+fn mark_retry_started(
+    caller: &impl HostRuntimeApi,
+    pane_id: &str,
+    mut binding: ClusterPaneBinding,
+) -> Result<ClusterPaneBinding, String> {
+    binding.source = "retry".to_string();
+    binding.state = ClusterConnectionState::Retrying;
+    binding.retry_count = binding.retry_count.saturating_add(1);
+    binding.last_error = None;
+    binding.updated_at_unix_ms = now_unix_ms();
+    set_cluster_pane_binding(caller, pane_id, Some(&binding))?;
+    append_cluster_connection_event(
+        caller,
+        ClusterConnectionEvent {
+            ts_unix_ms: now_unix_ms(),
+            pane_id: Some(pane_id.to_string()),
+            cluster: binding.cluster.clone(),
+            target: Some(binding.target.clone()),
+            source: Some("retry".to_string()),
+            state: ClusterConnectionState::Retrying,
+            message: "retry started".to_string(),
+        },
+    )?;
+    Ok(binding)
+}
+
+fn mark_retry_probe_failed(
+    caller: &impl HostRuntimeApi,
+    pane_id: &str,
+    binding: &ClusterPaneBinding,
+    error: &str,
+) -> String {
+    let failed = ClusterPaneBinding {
+        target: binding.target.clone(),
+        cluster: binding.cluster.clone(),
+        source: "retry".to_string(),
+        state: ClusterConnectionState::Degraded,
+        retry_count: binding.retry_count,
+        last_error: Some(error.to_string()),
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    let _ = set_cluster_pane_binding(caller, pane_id, Some(&failed));
+    let _ = append_cluster_connection_event(
+        caller,
+        ClusterConnectionEvent {
+            ts_unix_ms: now_unix_ms(),
+            pane_id: Some(pane_id.to_string()),
+            cluster: failed.cluster,
+            target: Some(failed.target),
+            source: Some("retry".to_string()),
+            state: ClusterConnectionState::Degraded,
+            message: format!("retry health probe failed: {error}"),
+        },
+    );
+    format!("target '{}' is not ready: {error}", binding.target)
 }
 
 fn execute_cluster_pane_move(
@@ -661,9 +825,24 @@ fn execute_cluster_pane_move(
         target: args.host.clone(),
         cluster: previous_binding.cluster,
         source: "move".to_string(),
+        state: ClusterConnectionState::Connecting,
+        retry_count: previous_binding.retry_count,
+        last_error: None,
         updated_at_unix_ms: now_unix_ms(),
     };
     set_cluster_pane_binding(caller, &launch.id.to_string(), Some(&new_binding))?;
+    append_cluster_connection_event(
+        caller,
+        ClusterConnectionEvent {
+            ts_unix_ms: now_unix_ms(),
+            pane_id: Some(launch.id.to_string()),
+            cluster: new_binding.cluster,
+            target: Some(args.host.clone()),
+            source: Some("move".to_string()),
+            state: ClusterConnectionState::Connecting,
+            message: "move launched replacement pane".to_string(),
+        },
+    )?;
 
     caller
         .pane_close(&PaneCloseRequest {
@@ -1308,6 +1487,51 @@ fn get_cluster_pane_binding(
         .map_err(|error| format!("failed decoding pane metadata: {error}"))
 }
 
+fn get_cluster_connection_events(
+    caller: &impl HostRuntimeApi,
+) -> Result<Vec<ClusterConnectionEvent>, String> {
+    let response = caller
+        .storage_get(&StorageGetRequest {
+            key: CLUSTER_CONNECTION_EVENTS_KEY.to_string(),
+        })
+        .map_err(|error| format!("failed reading connection events: {error}"))?;
+    let Some(value) = response.value else {
+        return Ok(Vec::new());
+    };
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice::<Vec<ClusterConnectionEvent>>(&value)
+        .map_err(|error| format!("failed decoding connection events: {error}"))
+}
+
+fn set_cluster_connection_events(
+    caller: &impl HostRuntimeApi,
+    events: &[ClusterConnectionEvent],
+) -> Result<(), String> {
+    let value = serde_json::to_vec(events)
+        .map_err(|error| format!("failed encoding connection events: {error}"))?;
+    caller
+        .storage_set(&StorageSetRequest {
+            key: CLUSTER_CONNECTION_EVENTS_KEY.to_string(),
+            value,
+        })
+        .map_err(|error| format!("failed writing connection events: {error}"))
+}
+
+fn append_cluster_connection_event(
+    caller: &impl HostRuntimeApi,
+    event: ClusterConnectionEvent,
+) -> Result<(), String> {
+    let mut events = get_cluster_connection_events(caller)?;
+    events.push(event);
+    if events.len() > CLUSTER_CONNECTION_EVENTS_MAX {
+        let to_drop = events.len() - CLUSTER_CONNECTION_EVENTS_MAX;
+        events.drain(0..to_drop);
+    }
+    set_cluster_connection_events(caller, &events)
+}
+
 fn resolve_cluster_binding_for_pane(
     caller: &impl HostRuntimeApi,
     pane: &bmux_plugin_sdk::PaneSummary,
@@ -1329,6 +1553,9 @@ fn resolve_cluster_binding_for_pane(
         target,
         cluster,
         source: "name-fallback".to_string(),
+        state: ClusterConnectionState::Degraded,
+        retry_count: 0,
+        last_error: Some("metadata missing; inferred from pane name".to_string()),
         updated_at_unix_ms: now_unix_ms(),
     })
 }
