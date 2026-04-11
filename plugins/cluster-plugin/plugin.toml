@@ -73,6 +73,20 @@ required         = false
 trailing_var_arg = true
 value_name       = "TARGET"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "on-failure"
+name       = "on_failure"
+required   = false
+value_name = "POLICY"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "retries"
+name       = "retries"
+required   = false
+value_name = "COUNT"
+
 [[commands]]
 aliases       = [["cluster", "status"]]
 expose_in_cli = true

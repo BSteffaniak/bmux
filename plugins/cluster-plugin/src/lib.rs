@@ -66,6 +66,8 @@ impl RustPlugin for ClusterPlugin {
                     ClusterUpArgs {
                         cluster: req.cluster,
                         hosts: req.hosts,
+                        on_failure: RetryFailurePolicy::Continue,
+                        retries: 0,
                     },
                 )
                 .map_err(|error| ServiceResponse::error("up_failed", error))?;
@@ -171,6 +173,8 @@ enum HealthProbe {
 struct ClusterUpArgs {
     cluster: String,
     hosts: Vec<String>,
+    on_failure: RetryFailurePolicy,
+    retries: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -461,7 +465,14 @@ fn execute_cluster_up(
         })
         .map_err(|error| format!("failed selecting cluster session '{session_name}': {error}"))?;
 
-    launch_ready_cluster_panes(caller, &session_selector, &args.cluster, &mut statuses);
+    launch_ready_cluster_panes(
+        caller,
+        &session_selector,
+        &args.cluster,
+        args.on_failure,
+        args.retries,
+        &mut statuses,
+    )?;
 
     Ok(ClusterUpExecution {
         session_id: session_id_text,
@@ -567,15 +578,52 @@ fn launch_ready_cluster_panes(
     caller: &impl HostRuntimeApi,
     session_selector: &SessionSelector,
     cluster: &str,
+    on_failure: RetryFailurePolicy,
+    retries: u32,
     statuses: &mut [ClusterLaunchStatus],
-) {
+) -> Result<(), String> {
     for status in statuses {
         if matches!(status.state, ClusterHostState::Degraded) {
             continue;
         }
 
         let target = status.target.clone();
-        let response = caller.pane_launch(&PaneLaunchRequest {
+        let mut retries_remaining = retries;
+        loop {
+            match launch_cluster_host(caller, session_selector, cluster, &target) {
+                Ok(pane_id) => {
+                    status.pane_id = Some(pane_id);
+                    break;
+                }
+                Err(failure) => {
+                    if retries_remaining > 0 {
+                        retries_remaining -= 1;
+                        continue;
+                    }
+                    match decide_failure_policy_action(on_failure, &target, &failure) {
+                        RetryPromptDecision::Retry => {}
+                        RetryPromptDecision::Continue => {
+                            status.state = ClusterHostState::Degraded;
+                            status.reason = Some(failure);
+                            break;
+                        }
+                        RetryPromptDecision::Abort => return Err(failure),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn launch_cluster_host(
+    caller: &impl HostRuntimeApi,
+    session_selector: &SessionSelector,
+    cluster: &str,
+    target: &str,
+) -> Result<String, String> {
+    let response = caller
+        .pane_launch(&PaneLaunchRequest {
             session: Some(session_selector.clone()),
             target: None,
             direction: PaneSplitDirection::Vertical,
@@ -584,79 +632,73 @@ fn launch_ready_cluster_panes(
                 program: "bmux".to_string(),
                 args: vec![
                     "connect".to_string(),
-                    target.clone(),
+                    target.to_string(),
                     "--reconnect-forever".to_string(),
                 ],
                 cwd: None,
                 env: BTreeMap::from([
                     ("BMUX_CLUSTER".to_string(), cluster.to_string()),
-                    ("BMUX_CLUSTER_TARGET".to_string(), target.clone()),
+                    ("BMUX_CLUSTER_TARGET".to_string(), target.to_string()),
                 ]),
             },
-        });
-
-        match response {
-            Ok(result) => {
-                status.pane_id = Some(result.id.to_string());
-                let binding = ClusterPaneBinding {
-                    target: target.clone(),
+        })
+        .map_err(|error| {
+            let failure = format!("pane launch failed: {error}");
+            let _ = append_cluster_connection_event(
+                caller,
+                ClusterConnectionEvent {
+                    ts_unix_ms: now_unix_ms(),
+                    pane_id: None,
                     cluster: Some(cluster.to_string()),
-                    source: "up".to_string(),
-                    state: ClusterConnectionState::Connecting,
-                    retry_count: 0,
-                    last_error: None,
-                    updated_at_unix_ms: now_unix_ms(),
-                };
-                if let Err(error) =
-                    set_cluster_pane_binding(caller, &result.id.to_string(), Some(&binding))
-                {
-                    status.state = ClusterHostState::Degraded;
-                    status.reason = Some(format!("pane metadata write failed: {error}"));
-                    let _ = append_cluster_connection_event(
-                        caller,
-                        ClusterConnectionEvent {
-                            ts_unix_ms: now_unix_ms(),
-                            pane_id: Some(result.id.to_string()),
-                            cluster: Some(cluster.to_string()),
-                            target: Some(target.clone()),
-                            source: Some("up".to_string()),
-                            state: ClusterConnectionState::Failed,
-                            message: format!("pane metadata write failed: {error}"),
-                        },
-                    );
-                } else {
-                    let _ = append_cluster_connection_event(
-                        caller,
-                        ClusterConnectionEvent {
-                            ts_unix_ms: now_unix_ms(),
-                            pane_id: Some(result.id.to_string()),
-                            cluster: Some(cluster.to_string()),
-                            target: Some(target.clone()),
-                            source: Some("up".to_string()),
-                            state: ClusterConnectionState::Connecting,
-                            message: "pane launched for cluster host".to_string(),
-                        },
-                    );
-                }
-            }
-            Err(error) => {
-                status.state = ClusterHostState::Degraded;
-                status.reason = Some(format!("pane launch failed: {error}"));
-                let _ = append_cluster_connection_event(
-                    caller,
-                    ClusterConnectionEvent {
-                        ts_unix_ms: now_unix_ms(),
-                        pane_id: None,
-                        cluster: Some(cluster.to_string()),
-                        target: Some(target.clone()),
-                        source: Some("up".to_string()),
-                        state: ClusterConnectionState::Failed,
-                        message: format!("pane launch failed: {error}"),
-                    },
-                );
-            }
-        }
+                    target: Some(target.to_string()),
+                    source: Some("up".to_string()),
+                    state: ClusterConnectionState::Failed,
+                    message: failure.clone(),
+                },
+            );
+            failure
+        })?;
+
+    let pane_id = response.id.to_string();
+    let binding = ClusterPaneBinding {
+        target: target.to_string(),
+        cluster: Some(cluster.to_string()),
+        source: "up".to_string(),
+        state: ClusterConnectionState::Connecting,
+        retry_count: 0,
+        last_error: None,
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    if let Err(error) = set_cluster_pane_binding(caller, &pane_id, Some(&binding)) {
+        let failure = format!("pane metadata write failed: {error}");
+        let _ = append_cluster_connection_event(
+            caller,
+            ClusterConnectionEvent {
+                ts_unix_ms: now_unix_ms(),
+                pane_id: Some(pane_id),
+                cluster: Some(cluster.to_string()),
+                target: Some(target.to_string()),
+                source: Some("up".to_string()),
+                state: ClusterConnectionState::Failed,
+                message: failure.clone(),
+            },
+        );
+        return Err(failure);
     }
+
+    let _ = append_cluster_connection_event(
+        caller,
+        ClusterConnectionEvent {
+            ts_unix_ms: now_unix_ms(),
+            pane_id: Some(pane_id.clone()),
+            cluster: Some(cluster.to_string()),
+            target: Some(target.to_string()),
+            source: Some("up".to_string()),
+            state: ClusterConnectionState::Connecting,
+            message: "pane launched for cluster host".to_string(),
+        },
+    );
+    Ok(pane_id)
 }
 
 fn execute_cluster_pane_retry(
@@ -864,6 +906,20 @@ fn run_retry_probe_with_policy(
                     }
                 }
             }
+        }
+    }
+}
+
+fn decide_failure_policy_action(
+    policy: RetryFailurePolicy,
+    target: &str,
+    error: &str,
+) -> RetryPromptDecision {
+    match policy {
+        RetryFailurePolicy::Abort => RetryPromptDecision::Abort,
+        RetryFailurePolicy::Continue => RetryPromptDecision::Continue,
+        RetryFailurePolicy::Prompt => {
+            prompt_retry_decision(target, error).unwrap_or(RetryPromptDecision::Abort)
         }
     }
 }
@@ -1262,6 +1318,8 @@ fn positional_argument(arguments: &[String]) -> Option<&str> {
 fn parse_cluster_up_args(arguments: &[String]) -> Result<ClusterUpArgs, String> {
     let mut positional = Vec::new();
     let mut hosts = Vec::new();
+    let mut on_failure = RetryFailurePolicy::Continue;
+    let mut retries = 0_u32;
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -1279,6 +1337,32 @@ fn parse_cluster_up_args(arguments: &[String]) -> Result<ClusterUpArgs, String> 
             if !value.trim().is_empty() {
                 hosts.push(value.trim().to_string());
             }
+            index += 1;
+            continue;
+        }
+        if argument == "--on-failure" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--on-failure requires a value".to_string())?;
+            on_failure = parse_retry_failure_policy(value)?;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--on-failure=") {
+            on_failure = parse_retry_failure_policy(value)?;
+            index += 1;
+            continue;
+        }
+        if argument == "--retries" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--retries requires a value".to_string())?;
+            retries = parse_retry_count(value)?;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--retries=") {
+            retries = parse_retry_count(value)?;
             index += 1;
             continue;
         }
@@ -1304,6 +1388,8 @@ fn parse_cluster_up_args(arguments: &[String]) -> Result<ClusterUpArgs, String> 
     Ok(ClusterUpArgs {
         cluster,
         hosts: dedupe_preserve_order(hosts),
+        on_failure,
+        retries,
     })
 }
 
@@ -1812,6 +1898,25 @@ mod tests {
 
         assert_eq!(parsed.cluster, "prod");
         assert_eq!(parsed.hosts, vec!["db-a", "db-b", "cache-a"]);
+        assert_eq!(parsed.on_failure, RetryFailurePolicy::Continue);
+        assert_eq!(parsed.retries, 0);
+    }
+
+    #[test]
+    fn parse_cluster_up_args_supports_failure_policy_and_retries() {
+        let parsed = parse_cluster_up_args(&[
+            "prod".to_string(),
+            "--on-failure".to_string(),
+            "prompt".to_string(),
+            "--retries".to_string(),
+            "2".to_string(),
+        ])
+        .expect("arguments should parse");
+
+        assert_eq!(parsed.cluster, "prod");
+        assert!(parsed.hosts.is_empty());
+        assert_eq!(parsed.on_failure, RetryFailurePolicy::Prompt);
+        assert_eq!(parsed.retries, 2);
     }
 
     #[test]
