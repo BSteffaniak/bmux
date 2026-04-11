@@ -46,6 +46,239 @@ pub enum ConfigError {
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct CompositionConfig {
+    active_profile: Option<String>,
+    layer_order: Vec<String>,
+    profiles: BTreeMap<String, CompositionProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct CompositionProfile {
+    extends: Vec<String>,
+    patch: toml::Table,
+}
+
+fn built_in_composition_profiles() -> BTreeMap<String, CompositionProfile> {
+    fn parse_patch(source: &str) -> toml::Table {
+        toml::from_str::<toml::Table>(source).unwrap_or_else(|_| toml::Table::new())
+    }
+
+    let mut profiles = BTreeMap::new();
+    profiles.insert("vim".to_string(), CompositionProfile::default());
+
+    profiles.insert(
+        "tmux_compat".to_string(),
+        CompositionProfile {
+            extends: vec![],
+            patch: parse_patch(
+                r#"
+[keybindings]
+initial_mode = "insert"
+
+[keybindings.modes.insert.bindings]
+"ctrl+a" = "enter_mode normal"
+
+[keybindings.modes.normal.bindings]
+escape = "enter_mode insert"
+"#,
+            ),
+        },
+    );
+
+    profiles.insert(
+        "zellij_compat".to_string(),
+        CompositionProfile {
+            extends: vec!["vim".to_string()],
+            patch: parse_patch(
+                r#"
+[keybindings.global]
+"alt+n" = "split_focused_horizontal"
+"#,
+            ),
+        },
+    );
+
+    profiles
+}
+
+fn canonical_profile_id(profile_id: &str) -> String {
+    profile_id.trim().to_ascii_lowercase()
+}
+
+fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+            for (key, value) in overlay_table {
+                if let Some(existing) = base_table.get_mut(&key) {
+                    merge_toml_value(existing, value);
+                } else {
+                    base_table.insert(key, value);
+                }
+            }
+        }
+        (base_slot, overlay_value) => {
+            *base_slot = overlay_value;
+        }
+    }
+}
+
+fn parse_composition_config(
+    root: &toml::Table,
+) -> std::result::Result<CompositionConfig, ConfigError> {
+    let Some(value) = root.get("composition") else {
+        return Ok(CompositionConfig::default());
+    };
+    let parsed: CompositionConfig =
+        value
+            .clone()
+            .try_into()
+            .map_err(|error| ConfigError::ParseError {
+                error: format!("invalid [composition] config: {error}"),
+            })?;
+    Ok(parsed)
+}
+
+fn resolve_profile_patch(
+    requested_profile_id: &str,
+    profiles: &BTreeMap<String, CompositionProfile>,
+) -> std::result::Result<toml::Table, ConfigError> {
+    fn resolve_inner(
+        requested_profile_id: &str,
+        profiles: &BTreeMap<String, CompositionProfile>,
+        stack: &mut Vec<String>,
+        cache: &mut BTreeMap<String, toml::Table>,
+    ) -> std::result::Result<toml::Table, ConfigError> {
+        let canonical_id = canonical_profile_id(requested_profile_id);
+        if let Some(resolved) = cache.get(&canonical_id) {
+            return Ok(resolved.clone());
+        }
+        if stack.contains(&canonical_id) {
+            let mut cycle = stack.clone();
+            cycle.push(canonical_id.clone());
+            return Err(ConfigError::InvalidValue {
+                field: "composition.profiles".to_string(),
+                value: format!("profile inheritance cycle detected: {}", cycle.join(" -> ")),
+            });
+        }
+
+        let Some(profile) = profiles.get(&canonical_id) else {
+            return Err(ConfigError::InvalidValue {
+                field: "composition.active_profile".to_string(),
+                value: format!(
+                    "profile '{requested_profile_id}' is not defined (known profiles: {})",
+                    profiles.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            });
+        };
+
+        stack.push(canonical_id.clone());
+        let mut resolved = toml::Table::new();
+        for parent_id in &profile.extends {
+            let parent_patch = resolve_inner(parent_id, profiles, stack, cache)?;
+            let mut merged = toml::Value::Table(resolved);
+            merge_toml_value(&mut merged, toml::Value::Table(parent_patch));
+            resolved = merged.as_table().cloned().unwrap_or_else(toml::Table::new);
+        }
+        let mut merged = toml::Value::Table(resolved);
+        merge_toml_value(&mut merged, toml::Value::Table(profile.patch.clone()));
+        let resolved = merged.as_table().cloned().unwrap_or_else(toml::Table::new);
+        stack.pop();
+
+        cache.insert(canonical_id, resolved.clone());
+        Ok(resolved)
+    }
+
+    let mut stack = Vec::new();
+    let mut cache = BTreeMap::new();
+    resolve_inner(requested_profile_id, profiles, &mut stack, &mut cache)
+}
+
+fn resolve_composed_config_value(
+    raw: &toml::Value,
+) -> std::result::Result<toml::Value, ConfigError> {
+    let mut raw_table = raw
+        .as_table()
+        .cloned()
+        .ok_or_else(|| ConfigError::ParseError {
+            error: "config root must be a table".to_string(),
+        })?;
+    let composition = parse_composition_config(&raw_table)?;
+    raw_table.remove("composition");
+
+    let mut profiles = built_in_composition_profiles();
+    for (profile_id, profile) in composition.profiles {
+        let canonical_id = canonical_profile_id(&profile_id);
+        if canonical_id.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "composition.profiles".to_string(),
+                value: "profile id must not be empty".to_string(),
+            });
+        }
+        profiles.insert(canonical_id, profile);
+    }
+
+    let default_layers = if composition.active_profile.is_some() {
+        vec![
+            "defaults".to_string(),
+            "profile:active".to_string(),
+            "config".to_string(),
+        ]
+    } else {
+        vec!["defaults".to_string(), "config".to_string()]
+    };
+    let layer_order = if composition.layer_order.is_empty() {
+        default_layers
+    } else {
+        composition.layer_order
+    };
+
+    let mut resolved = toml::Value::Table(
+        toml::Value::try_from(BmuxConfig::default())
+            .map_err(|error| ConfigError::ParseError {
+                error: format!("failed to serialize default config: {error}"),
+            })?
+            .as_table()
+            .cloned()
+            .unwrap_or_else(toml::Table::new),
+    );
+
+    for layer in layer_order {
+        match layer.as_str() {
+            "defaults" => {}
+            "config" => {
+                merge_toml_value(&mut resolved, toml::Value::Table(raw_table.clone()));
+            }
+            "profile:active" => {
+                let Some(active_profile) = composition.active_profile.as_deref() else {
+                    return Err(ConfigError::InvalidValue {
+                        field: "composition.layer_order".to_string(),
+                        value: "layer 'profile:active' requires composition.active_profile"
+                            .to_string(),
+                    });
+                };
+                let patch = resolve_profile_patch(active_profile, &profiles)?;
+                merge_toml_value(&mut resolved, toml::Value::Table(patch));
+            }
+            _ if layer.starts_with("profile:") => {
+                let profile_id = layer.trim_start_matches("profile:");
+                let patch = resolve_profile_patch(profile_id, &profiles)?;
+                merge_toml_value(&mut resolved, toml::Value::Table(patch));
+            }
+            unknown => {
+                return Err(ConfigError::InvalidValue {
+                    field: "composition.layer_order".to_string(),
+                    value: format!("unknown layer '{unknown}'"),
+                });
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
 /// Root configuration structure for bmux, deserialized from `bmux.toml`
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[serde(default)]
@@ -1596,9 +1829,16 @@ impl BmuxConfig {
             error: e.to_string(),
         })?;
 
-        let mut config: Self = toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
-            error: e.to_string(),
-        })?;
+        let raw_value: toml::Value =
+            toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
+                error: e.to_string(),
+            })?;
+        let resolved_value = resolve_composed_config_value(&raw_value)?;
+        let mut config: Self = resolved_value
+            .try_into()
+            .map_err(|e| ConfigError::ParseError {
+                error: format!("failed to deserialize resolved config: {e}"),
+            })?;
 
         let interpolation_warnings = config.interpolate_path_fields();
         for warning in interpolation_warnings {
@@ -2056,6 +2296,129 @@ mod tests {
             .expect("prod target missing");
         assert_eq!(prod.host.as_deref(), Some("prod.example.com"));
         assert_eq!(prod.port, Some(2222));
+    }
+
+    #[test]
+    fn composition_active_profile_applies_full_config_patch() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+active_profile = "dev"
+layer_order = ["defaults", "config", "profile:active"]
+
+[composition.profiles.dev.patch.general]
+server_timeout = 7777
+
+[composition.profiles.dev.patch.behavior]
+pane_term = "xterm-256color"
+"#,
+        )
+        .expect("write temp config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.general.server_timeout, 7777);
+        assert_eq!(config.behavior.pane_term, "xterm-256color");
+    }
+
+    #[test]
+    fn composition_multiple_parent_rightmost_wins() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+active_profile = "child"
+
+[composition.profiles.left.patch.general]
+server_timeout = 100
+
+[composition.profiles.right.patch.general]
+server_timeout = 200
+
+[composition.profiles.child]
+extends = ["left", "right"]
+"#,
+        )
+        .expect("write temp config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.general.server_timeout, 200);
+    }
+
+    #[test]
+    fn composition_layer_order_is_configurable() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+active_profile = "dev"
+layer_order = ["defaults", "config", "profile:active"]
+
+[general]
+server_timeout = 200
+
+[composition.profiles.dev.patch.general]
+server_timeout = 900
+"#,
+        )
+        .expect("write temp config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.general.server_timeout, 900);
+    }
+
+    #[test]
+    fn composition_rejects_inheritance_cycles() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+active_profile = "a"
+
+[composition.profiles.a]
+extends = ["b"]
+
+[composition.profiles.b]
+extends = ["a"]
+"#,
+        )
+        .expect("write temp config");
+
+        let error = BmuxConfig::load_from_path(&path).expect_err("cycle should fail");
+        match error {
+            super::ConfigError::InvalidValue { field, value } => {
+                assert_eq!(field, "composition.profiles");
+                assert!(value.contains("cycle"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn composition_arrays_replace_instead_of_append() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            r#"
+[composition]
+active_profile = "dev"
+layer_order = ["defaults", "config", "profile:active"]
+
+[plugins]
+enabled = ["one", "two"]
+
+[composition.profiles.dev.patch.plugins]
+enabled = ["three"]
+"#,
+        )
+        .expect("write temp config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.plugins.enabled, vec!["three".to_string()]);
     }
 
     #[test]
