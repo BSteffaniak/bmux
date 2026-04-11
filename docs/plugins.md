@@ -198,6 +198,30 @@ Runtime behavior and constraints:
 - timeout may be overridden with `BMUX_PROCESS_PLUGIN_TIMEOUT_MS`.
 - if a process exits without framed `stdout`, host treats it as unsupported for framed operations.
 
+Examples:
+
+- `examples/process-plugin-node/`
+- `examples/process-plugin-python/`
+
+These examples focus on frame transport and process lifecycle behavior. They use
+JSON payloads for portability and do not implement the BMUX service codec.
+Production process plugins must use the host service codec payload format.
+
+Troubleshooting:
+
+- error: `missing BMUXPRC1 frame prefix`
+  - cause: process emitted non-protocol bytes to stdout
+  - fix: write diagnostics to stderr only; keep stdout framed responses only
+- error: `truncated frame header` or `truncated payload`
+  - cause: incomplete write to stdout
+  - fix: write a single complete frame and flush stdout before exit
+- error: process entry is not executable
+  - cause: entry path exists but lacks execute permissions
+  - fix: `chmod +x <entry>` (or use a launch command like `python3` with script args)
+- error: process plugin timed out
+  - cause: process did not return in time
+  - fix: optimize startup/handler path or increase `BMUX_PROCESS_PLUGIN_TIMEOUT_MS`
+
 Versioning policy for process runtime mirrors other plugin compatibility rules:
 
 - keep `v1` semantics stable once published

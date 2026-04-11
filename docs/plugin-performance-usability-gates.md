@@ -43,6 +43,10 @@ For changes under `plugins/**`:
 - `plugin list --json`: p95 <= 250ms, p99 <= 350ms
 - `plugin doctor --json`: p95 <= 350ms, p99 <= 500ms
 - `plugin rebuild --list --json`: p95 <= 550ms, p99 <= 750ms
+- `plugin run missing.plugin-id no-op`: p95 <= 350ms, p99 <= 550ms (expected non-zero path)
+- `plugin run <discovered-plugin> <discovered-command>`: p95 <= 450ms, p99 <= 650ms when an environment-supported command exists
+
+Use `--cold` to run the same matrix without warmup samples.
 
 ## Usability Acceptance Matrix
 

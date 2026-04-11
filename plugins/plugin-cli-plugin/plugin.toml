@@ -204,6 +204,17 @@ name = "changed"
 
 [[commands.arguments]]
 kind = "boolean"
+long = "against-master"
+name = "against-master"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "base"
+name       = "base"
+value_name = "REF"
+
+[[commands.arguments]]
+kind = "boolean"
 long = "all-workspace-plugins"
 name = "all-workspace-plugins"
 

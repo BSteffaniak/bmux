@@ -1,0 +1,12 @@
+entry      = "node"
+entry_args = ["plugin.js"]
+id         = "example.process.node"
+name       = "Process Plugin Node Example"
+runtime    = "process"
+version    = "0.1.0"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"

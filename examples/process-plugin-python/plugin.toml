@@ -1,0 +1,12 @@
+entry      = "python3"
+entry_args = ["plugin.py"]
+id         = "example.process.python"
+name       = "Process Plugin Python Example"
+runtime    = "process"
+version    = "0.1.0"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"

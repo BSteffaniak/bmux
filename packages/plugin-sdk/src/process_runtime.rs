@@ -104,6 +104,11 @@ pub fn decode_process_runtime_frame(bytes: &[u8]) -> Result<&[u8]> {
             details: "process runtime output truncated payload".to_string(),
         });
     }
+    if bytes.len() > header_len + payload_len {
+        return Err(PluginError::ServiceProtocol {
+            details: "process runtime output has trailing bytes after payload".to_string(),
+        });
+    }
     Ok(&bytes[header_len..header_len + payload_len])
 }
 
@@ -125,7 +130,10 @@ pub fn decode_process_invocation_response(bytes: &[u8]) -> Result<ProcessInvocat
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_process_runtime_frame, encode_process_runtime_frame};
+    use super::{
+        ProcessInvocationResponse, decode_process_invocation_response,
+        decode_process_runtime_frame, encode_process_runtime_frame,
+    };
 
     #[test]
     fn process_frame_round_trips_payload() {
@@ -149,5 +157,48 @@ mod tests {
         frame.extend_from_slice(b"hey");
         let error = decode_process_runtime_frame(&frame).expect_err("truncated payload must fail");
         assert!(error.to_string().contains("truncated payload"));
+    }
+
+    #[test]
+    fn process_frame_rejects_truncated_header() {
+        let frame = b"BMUXPRC1\0\0";
+        let error = decode_process_runtime_frame(frame).expect_err("truncated header must fail");
+        assert!(error.to_string().contains("truncated frame header"));
+    }
+
+    #[test]
+    fn process_frame_rejects_trailing_bytes() {
+        let mut frame = encode_process_runtime_frame(b"ok").expect("frame should encode");
+        frame.extend_from_slice(b"noise");
+        let error = decode_process_runtime_frame(&frame).expect_err("trailing data must fail");
+        assert!(error.to_string().contains("trailing bytes"));
+    }
+
+    #[test]
+    fn process_invocation_response_rejects_non_protocol_payload() {
+        let frame =
+            encode_process_runtime_frame(b"not-bmux-codec").expect("frame encoding should succeed");
+        let error =
+            decode_process_invocation_response(&frame).expect_err("invalid payload must fail");
+        assert!(error.to_string().contains("decode") || error.to_string().contains("invalid"));
+    }
+
+    #[test]
+    fn process_invocation_response_decodes_valid_message() {
+        let payload = crate::encode_service_message(&ProcessInvocationResponse::Event {
+            protocol_version: 1,
+            status: Some(0),
+        })
+        .expect("encoding should succeed");
+        let frame = encode_process_runtime_frame(&payload).expect("frame encoding should succeed");
+        let response = decode_process_invocation_response(&frame)
+            .expect("valid framed invocation response must decode");
+        assert!(matches!(
+            response,
+            ProcessInvocationResponse::Event {
+                protocol_version: 1,
+                status: Some(0)
+            }
+        ));
     }
 }

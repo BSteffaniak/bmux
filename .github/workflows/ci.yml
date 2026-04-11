@@ -210,6 +210,11 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Validate plugin/runtime matcher fixtures
+        shell: bash
+        run: |
+          ./scripts/test-plugin-runtime-ci-matcher.sh
+
       - name: Detect plugin/runtime touching changes
         id: changes
         shell: bash
@@ -230,9 +235,7 @@ jobs:
           echo "Changed files since base:"
           echo "$changed_files"
 
-          plugin_runtime_pattern='^(packages/plugin/|packages/plugin-sdk/|plugins/|packages/cli/src/runtime/plugin[^/]*\.rs$|scripts/perf-plugin-command-latency\.sh$|scripts/perf-plugin-runtime-matrix\.sh$|\.github/workflows/ci\.yml$)'
-
-          if echo "$changed_files" | grep -Eq "$plugin_runtime_pattern"; then
+          if echo "$changed_files" | ./scripts/plugin-runtime-ci-matcher.sh --any; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "plugin/runtime changes detected"
           else
@@ -311,20 +314,6 @@ jobs:
                 {{if matrix.package.env}}{{matrix.package.env}} {{endif}}cargo{{if matrix.package.nightly}} +nightly{{endif}} llvm-cov test --no-report {{if runner.debug}}-vv {{endif}}--no-default-features {{clippier.feature-flags}}{{if matrix.package.cargo}} {{matrix.package.cargo}}{{endif}} --no-fail-fast
               label: "Tests"
               strategy: "sequential"
-
-            plugin-command-perf:
-              commands: |
-                if [ "{{matrix.package.name}}" != "bmux_cli" ]; then
-                  echo "Skipping plugin command perf gate for package {{matrix.package.name}}"
-                  exit 0
-                fi
-                if [ "${{ matrix.package.os }}" != "ubuntu-latest" ]; then
-                  echo "Skipping plugin command perf gate on ${{ matrix.package.os }}"
-                  exit 0
-                fi
-                ./scripts/perf-plugin-command-latency.sh --iterations 20 --warmup 5 --max-p95-ms 250 --max-p99-ms 350
-              label: "Plugin Command Perf Gate"
-              strategy: "combined"
 
             doctests:
               commands: |

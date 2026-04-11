@@ -8,6 +8,7 @@ WARMUP="${WARMUP:-10}"
 MAX_P99_MS="${MAX_P99_MS:-}"
 MAX_P95_MS="${MAX_P95_MS:-}"
 MAX_AVG_MS="${MAX_AVG_MS:-}"
+ALLOW_NONZERO="0"
 
 BMUX_BIN="${BMUX_BIN:-}"
 TARGET_ARGS=(plugin list --json)
@@ -26,6 +27,7 @@ Options:
   --max-p99-ms N      Fail if measured p99 is above N milliseconds
   --max-p95-ms N      Fail if measured p95 is above N milliseconds
   --max-avg-ms N      Fail if measured average is above N milliseconds
+  --allow-nonzero     Allow non-zero command exit status during sampling
   -h, --help          Show this help message
 
 Examples:
@@ -68,6 +70,10 @@ parse_args() {
 		--max-avg-ms)
 			MAX_AVG_MS="$2"
 			shift 2
+			;;
+		--allow-nonzero)
+			ALLOW_NONZERO="1"
+			shift
 			;;
 		--)
 			positional_mode=1
@@ -147,11 +153,15 @@ echo "benchmarking: bmux ${TARGET_ARGS[*]}"
 echo "iterations=${ITERATIONS} warmup=${WARMUP}"
 
 for ((i = 0; i < WARMUP; i += 1)); do
-	"$BMUX_BIN" "${TARGET_ARGS[@]}" >/dev/null 2>&1
+	if [[ "$ALLOW_NONZERO" == "1" ]]; then
+		"$BMUX_BIN" "${TARGET_ARGS[@]}" >/dev/null 2>&1 || true
+	else
+		"$BMUX_BIN" "${TARGET_ARGS[@]}" >/dev/null 2>&1
+	fi
 done
 
 SAMPLES_FILE="$SANDBOX/samples_ms.txt"
-python3 - "$ITERATIONS" "$SAMPLES_FILE" -- "$BMUX_BIN" -- "${TARGET_ARGS[@]}" <<'PY'
+BMUX_PERF_ALLOW_NONZERO="$ALLOW_NONZERO" python3 - "$ITERATIONS" "$SAMPLES_FILE" -- "$BMUX_BIN" -- "${TARGET_ARGS[@]}" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -165,13 +175,14 @@ first_sep = argv.index("--")
 second_sep = argv.index("--", first_sep + 1)
 cmd = argv[first_sep + 1:second_sep]
 target = argv[second_sep + 1:]
+allow_nonzero = bool(int(__import__("os").environ.get("BMUX_PERF_ALLOW_NONZERO", "0")))
 
 samples = []
 for _ in range(iterations):
     start_ns = time.perf_counter_ns()
     completed = subprocess.run([*cmd, *target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     end_ns = time.perf_counter_ns()
-    if completed.returncode != 0:
+    if completed.returncode != 0 and not allow_nonzero:
         print(f"command exited with non-zero status: {completed.returncode}", file=sys.stderr)
         sys.exit(completed.returncode)
     samples.append((end_ns - start_ns) / 1_000_000)
