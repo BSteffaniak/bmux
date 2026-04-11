@@ -106,7 +106,7 @@ For changes in `packages/cli/**` (runtime, input, pane/layout, protocol, termina
 
 If the change touches terminal protocol behavior, TERM/profile logic, or query/reply handling, also run:
 
-5. `./scripts/compat-matrix.sh`
+- `./scripts/compat-matrix.sh` (command 5 in the full CLI/runtime validation sequence)
 
 This includes edits under:
 

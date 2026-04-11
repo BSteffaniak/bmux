@@ -13,7 +13,7 @@ When bundled-nerd-fonts is enabled, the crate embeds:
 
 Source: Nerd Fonts release assets
 
-- Repository: https://github.com/ryanoasis/nerd-fonts
+- Repository: <https://github.com/ryanoasis/nerd-fonts>
 - Release: v3.4.0
 - Asset: JetBrainsMono.tar.xz
 
