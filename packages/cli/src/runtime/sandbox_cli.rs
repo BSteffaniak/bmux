@@ -9,7 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SANDBOX_PREFIX: &str = "bmux-sbx-";
 const MANIFEST_FILE: &str = "sandbox.json";
 const PID_MARKER_FILE: &str = "sandbox.pid";
+const LOCK_FILE: &str = "sandbox.lock";
 const DEFAULT_CLEANUP_MIN_AGE: Duration = Duration::from_secs(300);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const LOCK_FRESHNESS: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct CleanupEntry {
@@ -19,12 +22,28 @@ struct CleanupEntry {
     removed: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CleanupSkipped {
+    running: usize,
+    recent: usize,
+    not_failed: usize,
+}
+
+#[derive(Debug)]
+struct CleanupScan {
+    scanned: usize,
+    entries: Vec<CleanupEntry>,
+    skipped: CleanupSkipped,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SandboxListEntry {
     id: String,
     root: String,
     status: String,
     age_secs: u64,
+    exit_code: Option<i32>,
+    kept: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +156,12 @@ struct SandboxManifest {
     paths: SandboxManifestPaths,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SandboxLock {
+    pid: u32,
+    updated_at_unix_ms: u128,
+}
+
 #[derive(Debug, Serialize)]
 struct SandboxRunReport {
     sandbox_id: String,
@@ -187,20 +212,28 @@ pub(super) async fn run_sandbox_run(
         options.keep,
     );
     write_manifest(&sandbox.root_dir, &manifest)?;
+    write_lock(&sandbox.root_dir)?;
 
     if options.print_env {
         let env = collect_effective_sandbox_env(&sandbox, options.env_mode);
         println!("{}", serde_json::to_string_pretty(&env)?);
     }
 
-    let (status, timed_out, duration_ms) = spawn_and_wait(
+    let (status, timed_out, duration_ms) = match spawn_and_wait(
         &binary,
         &sandbox,
         options.env_mode,
         command_args,
         options.timeout_secs.map(Duration::from_secs),
     )
-    .await?;
+    .await
+    {
+        Ok(values) => values,
+        Err(error) => {
+            clear_lock(&sandbox.root_dir);
+            return Err(error);
+        }
+    };
 
     let raw_exit_code = status.code().unwrap_or(if timed_out { 124 } else { 1 });
     let keep_on_failure = !status.success() || timed_out;
@@ -218,6 +251,7 @@ pub(super) async fn run_sandbox_run(
     manifest.exit_code = Some(raw_exit_code);
     manifest.kept = kept;
     write_manifest(&sandbox.root_dir, &manifest)?;
+    clear_lock(&sandbox.root_dir);
 
     emit_run_output(
         &sandbox,
@@ -282,6 +316,7 @@ async fn spawn_and_wait(
     apply_sandbox_env(&mut command, sandbox, env_mode);
 
     let start = Instant::now();
+    let mut last_heartbeat = Instant::now();
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed spawning sandbox command with {}",
@@ -291,6 +326,11 @@ async fn spawn_and_wait(
 
     let mut timed_out = false;
     let status = loop {
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            let _ = write_lock(&sandbox.root_dir);
+            last_heartbeat = Instant::now();
+        }
+
         if let Some(status) = child
             .try_wait()
             .context("failed waiting for sandbox child")?
@@ -317,6 +357,7 @@ fn emit_run_output(
     outcome: &RunOutcome<'_>,
     manifest: &SandboxManifest,
 ) -> Result<()> {
+    let repro = format_repro_command(outcome.options, manifest.command.as_slice());
     if outcome.options.json {
         let report = SandboxRunReport {
             sandbox_id: manifest.id.clone(),
@@ -330,17 +371,21 @@ fn emit_run_output(
             duration_ms: outcome.duration_ms,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if outcome.kept {
+    } else {
         if outcome.keep_on_failure {
             eprintln!(
                 "sandbox command exited with {}; keeping sandbox at {}",
                 outcome.raw_exit_code,
                 sandbox.root_dir.display()
             );
-        } else {
+            eprintln!("repro: {repro}");
+        } else if outcome.kept {
             println!("kept sandbox at {}", sandbox.root_dir.display());
         }
-        eprintln!("sandbox logs: {}", sandbox.log_dir.display());
+
+        if outcome.kept {
+            eprintln!("sandbox logs: {}", sandbox.log_dir.display());
+        }
     }
     Ok(())
 }
@@ -355,7 +400,7 @@ pub(super) fn run_sandbox_list(
         .map(|root| sandbox_list_entry(&root))
         .collect::<Vec<_>>();
 
-    entries.sort_by(|left, right| right.age_secs.cmp(&left.age_secs));
+    entries.sort_by(|left, right| left.age_secs.cmp(&right.age_secs));
 
     if let Some(filter) = status_filter {
         entries.retain(|entry| entry.status == filter);
@@ -370,10 +415,21 @@ pub(super) fn run_sandbox_list(
     } else if entries.is_empty() {
         println!("no sandboxes found");
     } else {
+        println!("ID                               STATUS   AGE   EXIT  KEPT  ROOT");
         for entry in entries {
             println!(
-                "{} [{}] age={}s root={}",
-                entry.id, entry.status, entry.age_secs, entry.root
+                "{:<32} {:<8} {:>4}s {:>5} {:>5}  {}",
+                entry.id,
+                entry.status,
+                entry.age_secs,
+                entry
+                    .exit_code
+                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                entry.kept.map_or_else(
+                    || "-".to_string(),
+                    |value| if value { "yes" } else { "no" }.to_string()
+                ),
+                entry.root,
             );
         }
     }
@@ -398,9 +454,18 @@ pub(super) fn run_sandbox_inspect(target: &str, tail: usize, json: bool) -> Resu
         println!("id: {}", manifest.id);
         println!("status: {}", manifest.status);
         println!("running: {running}");
+        println!(
+            "exit_code: {}",
+            manifest
+                .exit_code
+                .map_or_else(|| "-".to_string(), |value| value.to_string())
+        );
+        println!("kept: {}", if manifest.kept { "yes" } else { "no" });
+        println!("env_mode: {}", manifest.env_mode);
         println!("root: {}", root.display());
         println!("bmux_bin: {}", manifest.bmux_bin);
         println!("command: {}", manifest.command.join(" "));
+        println!("repro: {}", format_repro_command_from_manifest(&manifest));
         println!("logs:");
         for line in log_tail {
             println!("  {line}");
@@ -492,21 +557,24 @@ pub(super) fn run_sandbox_cleanup(
     json: bool,
 ) -> Result<u8> {
     let older_than = older_than_secs.map_or(DEFAULT_CLEANUP_MIN_AGE, Duration::from_secs);
-    let (scanned, entries) = cleanup_orphaned_sandboxes(dry_run, failed_only, older_than);
-    let orphaned = entries.len();
+    let scan = cleanup_orphaned_sandboxes(dry_run, failed_only, older_than);
+    let orphaned = scan.entries.len();
 
     if json {
         let report = serde_json::json!({
-            "scanned": scanned,
+            "scanned": scan.scanned,
             "orphaned": orphaned,
             "dry_run": dry_run,
             "failed_only": failed_only,
             "older_than_secs": older_than.as_secs(),
-            "entries": entries,
+            "skipped_running": scan.skipped.running,
+            "skipped_recent": scan.skipped.recent,
+            "skipped_not_failed": scan.skipped.not_failed,
+            "entries": scan.entries,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if orphaned > 0 {
-        for entry in &entries {
+        for entry in &scan.entries {
             let status = if entry.removed { "removed" } else { "found" };
             println!(
                 "  {status}: {} (status: {}, age: {}s)",
@@ -516,11 +584,18 @@ pub(super) fn run_sandbox_cleanup(
         if dry_run {
             println!("{orphaned} orphaned sandbox(es) found (dry run, not removed)");
         } else {
-            let removed = entries.iter().filter(|entry| entry.removed).count();
+            let removed = scan.entries.iter().filter(|entry| entry.removed).count();
             println!("{removed} orphaned sandbox(es) removed");
         }
+        println!(
+            "skipped: running={}, recent={}, not_failed={}",
+            scan.skipped.running, scan.skipped.recent, scan.skipped.not_failed
+        );
     } else {
-        println!("no orphaned sandboxes found ({scanned} scanned)");
+        println!(
+            "no orphaned sandboxes found ({} scanned; skipped running={}, recent={}, not_failed={})",
+            scan.scanned, scan.skipped.running, scan.skipped.recent, scan.skipped.not_failed
+        );
     }
 
     Ok(0)
@@ -530,10 +605,15 @@ fn cleanup_orphaned_sandboxes(
     dry_run: bool,
     failed_only: bool,
     older_than: Duration,
-) -> (usize, Vec<CleanupEntry>) {
+) -> CleanupScan {
     let now = SystemTime::now();
     let mut scanned = 0;
     let mut entries = Vec::new();
+    let mut skipped = CleanupSkipped {
+        running: 0,
+        recent: 0,
+        not_failed: 0,
+    };
 
     for root_path in collect_sandbox_directories() {
         scanned += 1;
@@ -544,14 +624,17 @@ fn cleanup_orphaned_sandboxes(
             .and_then(|modified| now.duration_since(modified).ok())
             .unwrap_or_default();
         if age < older_than {
+            skipped.recent += 1;
             continue;
         }
 
         let status = sandbox_status_for_dir(&root_path);
         if status == "running" {
+            skipped.running += 1;
             continue;
         }
         if failed_only && status != "failed" {
+            skipped.not_failed += 1;
             continue;
         }
 
@@ -569,7 +652,11 @@ fn cleanup_orphaned_sandboxes(
         });
     }
 
-    (scanned, entries)
+    CleanupScan {
+        scanned,
+        entries,
+        skipped,
+    }
 }
 
 fn collect_sandbox_directories() -> Vec<PathBuf> {
@@ -598,16 +685,19 @@ fn sandbox_list_entry(root: &Path) -> SandboxListEntry {
         .and_then(|modified| now.duration_since(modified).ok())
         .unwrap_or_default();
 
+    let manifest = read_manifest(root).ok();
     SandboxListEntry {
         id: sandbox_id_from_root(root),
         root: root.to_string_lossy().to_string(),
         status: sandbox_status_for_dir(root).to_string(),
         age_secs: age.as_secs(),
+        exit_code: manifest.as_ref().and_then(|value| value.exit_code),
+        kept: manifest.as_ref().map(|value| value.kept),
     }
 }
 
 fn sandbox_status_for_dir(root: &Path) -> &'static str {
-    if sandbox_process_alive(root) || sandbox_socket_alive(root) {
+    if sandbox_lock_is_fresh(root) || sandbox_process_alive(root) || sandbox_socket_alive(root) {
         return "running";
     }
 
@@ -633,7 +723,7 @@ fn read_manifest(root: &Path) -> Result<SandboxManifest> {
 fn write_manifest(root: &Path, manifest: &SandboxManifest) -> Result<()> {
     let manifest_path = root.join(MANIFEST_FILE);
     let encoded = serde_json::to_vec_pretty(manifest)?;
-    std::fs::write(&manifest_path, encoded)
+    write_atomic_file(&manifest_path, &encoded)
         .with_context(|| format!("failed writing {}", manifest_path.display()))
 }
 
@@ -697,6 +787,98 @@ fn write_pid_marker(root_dir: &Path) -> Result<()> {
     let marker_path = root_dir.join(PID_MARKER_FILE);
     std::fs::write(&marker_path, std::process::id().to_string())
         .with_context(|| format!("failed writing {}", marker_path.display()))
+}
+
+fn write_lock(root_dir: &Path) -> Result<()> {
+    let lock_path = root_dir.join(LOCK_FILE);
+    let lock = SandboxLock {
+        pid: std::process::id(),
+        updated_at_unix_ms: unix_millis_now(),
+    };
+    let bytes = serde_json::to_vec(&lock)?;
+    write_atomic_file(&lock_path, &bytes)
+}
+
+fn clear_lock(root_dir: &Path) {
+    let _ = std::fs::remove_file(root_dir.join(LOCK_FILE));
+}
+
+fn sandbox_lock_is_fresh(root_dir: &Path) -> bool {
+    let lock_path = root_dir.join(LOCK_FILE);
+    let Ok(bytes) = std::fs::read(lock_path) else {
+        return false;
+    };
+    let Ok(lock) = serde_json::from_slice::<SandboxLock>(&bytes) else {
+        return false;
+    };
+    let now = unix_millis_now();
+    if now.saturating_sub(lock.updated_at_unix_ms) > LOCK_FRESHNESS.as_millis() {
+        return false;
+    }
+    is_pid_alive(lock.pid)
+}
+
+fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_path = path.with_extension("tmp");
+    std::fs::write(&temp_path, bytes)
+        .with_context(|| format!("failed writing {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed renaming {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })
+}
+
+fn format_repro_command(options: &RunSandboxOptions<'_>, command_args: &[String]) -> String {
+    let mut parts = vec![
+        "bmux".to_string(),
+        "sandbox".to_string(),
+        "run".to_string(),
+        "--env-mode".to_string(),
+        sandbox_env_mode_name(options.env_mode).to_string(),
+    ];
+    if let Some(bin) = options.bmux_bin {
+        parts.push("--bmux-bin".to_string());
+        parts.push(shell_quote(bin));
+    }
+    if options.keep {
+        parts.push("--keep".to_string());
+    }
+    parts.push("--".to_string());
+    parts.extend(command_args.iter().map(|arg| shell_quote(arg)));
+    parts.join(" ")
+}
+
+fn format_repro_command_from_manifest(manifest: &SandboxManifest) -> String {
+    let env_mode = if matches!(manifest.env_mode.as_str(), "clean") {
+        SandboxEnvModeArg::Clean
+    } else if matches!(manifest.env_mode.as_str(), "hermetic") {
+        SandboxEnvModeArg::Hermetic
+    } else {
+        SandboxEnvModeArg::Inherit
+    };
+    let options = RunSandboxOptions {
+        bmux_bin: Some(&manifest.bmux_bin),
+        env_mode,
+        keep: manifest.kept,
+        json: false,
+        print_env: false,
+        timeout_secs: None,
+        name: None,
+    };
+    format_repro_command(&options, manifest.command.as_slice())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.' | ':'))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn apply_sandbox_env(
