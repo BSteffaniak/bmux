@@ -171,6 +171,9 @@ bmux playbook diff --json before.json after.json
 Remove orphaned sandbox temp directories from previous playbook runs. Useful
 after SIGKILL or crashes that prevent normal cleanup.
 
+This command now uses the shared sandbox cleanup engine with `source=playbook`
+under the hood, so behavior stays aligned with `bmux sandbox cleanup`.
+
 ```
 bmux playbook cleanup [--dry-run] [--json]
 ```
@@ -180,8 +183,11 @@ bmux playbook cleanup [--dry-run] [--json]
 | `--dry-run` | bool | false   | List orphaned dirs without deleting |
 | `--json`    | bool | false   | Output as JSON                      |
 
-Detection heuristic: directories matching `bpb-*` in the system temp dir that
-are older than 5 minutes and whose server process is no longer running.
+For advanced filters (for example `--older-than` or `--failed-only`), use:
+
+```sh
+bmux sandbox cleanup --source playbook [flags]
+```
 
 ### `bmux playbook interactive`
 
