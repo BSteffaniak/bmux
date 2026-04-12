@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use bmux_cli_schema::{RecordingExportFormat, RecordingRenderMode};
 use std::time::Duration;
 
-use super::{discover_bundled_plugin_ids, recording, run_recording_export};
+use super::{
+    discover_bundled_plugin_ids, recording, run_recording_export, sandbox_cli::run_sandbox_cleanup,
+};
 
 #[allow(
     clippy::too_many_lines,
@@ -290,33 +292,7 @@ pub(super) fn run_playbook_diff(
 }
 
 pub(super) fn run_playbook_cleanup(dry_run: bool, json: bool) -> Result<u8> {
-    let (scanned, entries) = crate::playbook::sandbox::cleanup_orphaned_sandboxes(dry_run);
-    let orphaned = entries.len();
-
-    if json {
-        let report = serde_json::json!({
-            "scanned": scanned,
-            "orphaned": orphaned,
-            "dry_run": dry_run,
-            "entries": entries,
-        });
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if orphaned > 0 {
-        for entry in &entries {
-            let status = if entry.removed { "removed" } else { "found" };
-            println!("  {status}: {} (age: {}s)", entry.path, entry.age_secs);
-        }
-        if dry_run {
-            println!("{orphaned} orphaned sandbox(es) found (dry run, not removed)");
-        } else {
-            let removed = entries.iter().filter(|e| e.removed).count();
-            println!("{removed} orphaned sandbox(es) removed");
-        }
-    } else {
-        println!("no orphaned sandboxes found ({scanned} scanned)");
-    }
-
-    Ok(0)
+    run_sandbox_cleanup(dry_run, false, None, Some("playbook"), json)
 }
 
 pub(super) async fn run_playbook_interactive(
