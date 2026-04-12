@@ -10,6 +10,7 @@ ITERATIONS="${ITERATIONS:-30}"
 WARMUP="${WARMUP:-5}"
 COLD_MODE="0"
 ARTIFACT_DIR="${ARTIFACT_DIR:-}"
+SCALE_PLUGIN_COUNT="${SCALE_PLUGIN_COUNT:-0}"
 
 usage() {
 	cat <<'USAGE'
@@ -23,6 +24,7 @@ Options:
   --warmup N          Warmup iterations per scenario (default: 5)
   --cold              Run without warmup (sets warmup to 0)
   --artifact-dir DIR  Write per-scenario JSON artifact reports
+  --scale-plugin-count N  Generate N synthetic plugin manifests for scale scenarios
   -h, --help          Show this help message
 USAGE
 }
@@ -57,6 +59,10 @@ parse_args() {
 			;;
 		--artifact-dir)
 			ARTIFACT_DIR="$2"
+			shift 2
+			;;
+		--scale-plugin-count)
+			SCALE_PLUGIN_COUNT="$2"
 			shift 2
 			;;
 		-h | --help)
@@ -113,6 +119,9 @@ run_case() {
 	if [[ -n "$artifact_json" ]]; then
 		cmd+=(--artifact-json "$artifact_json")
 	fi
+	if [[ "$SCALE_PLUGIN_COUNT" -gt 0 ]]; then
+		cmd+=(--scale-plugin-count "$SCALE_PLUGIN_COUNT")
+	fi
 	cmd+=(-- "${args[@]}")
 	"${cmd[@]}"
 }
@@ -159,6 +168,9 @@ run_case_allow_nonzero() {
 	if [[ -n "$artifact_json" ]]; then
 		cmd+=(--artifact-json "$artifact_json")
 	fi
+	if [[ "$SCALE_PLUGIN_COUNT" -gt 0 ]]; then
+		cmd+=(--scale-plugin-count "$SCALE_PLUGIN_COUNT")
+	fi
 	cmd+=(-- "${args[@]}")
 	"${cmd[@]}"
 }
@@ -170,6 +182,7 @@ find_happy_plugin_run_args() {
 parse_args "$@"
 require_number "$ITERATIONS" "--iterations"
 require_number "$WARMUP" "--warmup"
+require_number "$SCALE_PLUGIN_COUNT" "--scale-plugin-count"
 
 if [[ "$COLD_MODE" == "1" ]]; then
 	WARMUP=0
@@ -210,6 +223,11 @@ run_case "plugin list json" 250 350 250 350 plugin list --json
 run_case "plugin doctor json" 350 500 350 500 plugin doctor --json
 run_case "plugin rebuild list json" 550 750 550 750 plugin rebuild --list --json
 run_case_allow_nonzero "plugin run missing plugin" 350 550 350 550 plugin run missing.plugin-id no-op
+
+if [[ "$SCALE_PLUGIN_COUNT" -gt 0 ]]; then
+	run_case "plugin doctor json scale" 900 1300 850 1200 plugin doctor --json
+	run_case "plugin rebuild list json scale" 1200 1700 1100 1600 plugin rebuild --list --json
+fi
 
 if happy_args=$(find_happy_plugin_run_args); then
 	mapfile -t parts <<<"$happy_args"

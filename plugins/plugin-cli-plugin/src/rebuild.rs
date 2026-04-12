@@ -670,10 +670,16 @@ mod tests {
             selectors: vec!["bmux_windows_plugin".to_string()],
             ..RebuildOptions::default()
         };
-        let selected =
-            build_rebuild_target_selection(&options, &["bmux_windows_plugin".to_string()]);
-        assert_eq!(selected.len(), 1);
+        let selected = build_rebuild_target_selection(
+            &options,
+            &[
+                "bmux_windows_plugin".to_string(),
+                "bmux_permissions_plugin".to_string(),
+            ],
+        );
+        assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].reason, "selector");
+        assert_eq!(selected[1].reason, "selector");
     }
 
     #[test]

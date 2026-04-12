@@ -570,9 +570,18 @@ mod tests {
     fn doctor_next_steps_matches_failure_shape() {
         let strict_warning_only = doctor_next_steps(false, true, 0, 1);
         assert_eq!(strict_warning_only.len(), 2);
+        assert!(strict_warning_only[0].contains("warnings are treated as failures"));
+        assert_eq!(
+            strict_warning_only[1],
+            "run 'bmux plugin doctor --json --strict' for machine-readable diagnostics"
+        );
 
         let hard_errors = doctor_next_steps(false, true, 1, 0);
         assert_eq!(hard_errors.len(), 1);
+        assert_eq!(
+            hard_errors[0],
+            "run 'bmux plugin doctor --json --strict' for machine-readable diagnostics"
+        );
 
         let healthy = doctor_next_steps(true, false, 0, 0);
         assert!(healthy.is_empty());

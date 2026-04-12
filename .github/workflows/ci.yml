@@ -247,13 +247,61 @@ jobs:
         if: ${{ steps.changes.outputs.run == 'true' }}
         shell: bash
         run: |
-          ./scripts/perf-plugin-command-latency.sh --iterations 20 --warmup 5 --max-p95-ms 250 --max-p99-ms 350
+          mkdir -p "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix"
+          ./scripts/perf-plugin-command-latency.sh \
+            --iterations 20 \
+            --warmup 5 \
+            --max-p95-ms 250 \
+            --max-p99-ms 350 \
+            --artifact-json "$RUNNER_TEMP/plugin-perf-artifacts/plugin-command-latency.json"
 
       - name: Plugin runtime matrix gate
         if: ${{ steps.changes.outputs.run == 'true' }}
         shell: bash
         run: |
-          ./scripts/perf-plugin-runtime-matrix.sh --iterations 20 --warmup 5
+          ./scripts/perf-plugin-runtime-matrix.sh \
+            --iterations 20 \
+            --warmup 5 \
+            --artifact-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix"
+
+      - name: Plugin runtime matrix scale gate
+        if: ${{ steps.changes.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-scale"
+          ./scripts/perf-plugin-runtime-matrix.sh \
+            --iterations 8 \
+            --warmup 2 \
+            --scale-plugin-count 120 \
+            --artifact-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-scale"
+
+      - name: Plugin perf artifact compare (informational)
+        if: ${{ steps.changes.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          ./scripts/perf-plugin-artifact-compare.sh \
+            --candidate-dir "$RUNNER_TEMP/plugin-perf-artifacts" \
+            --baseline-dir "docs/perf-baselines" \
+            --warn-regression-ms 20
+          ./scripts/perf-plugin-artifact-compare.sh \
+            --candidate-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix" \
+            --baseline-dir "docs/perf-baselines/runtime-matrix" \
+            --warn-regression-ms 20
+          ./scripts/perf-plugin-artifact-compare.sh \
+            --candidate-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-scale" \
+            --baseline-dir "docs/perf-baselines/runtime-matrix-scale" \
+            --warn-regression-ms 30
+
+      - name: Upload plugin perf artifacts
+        if: ${{ steps.changes.outputs.run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-perf-artifacts
+          path: |
+            ${{ runner.temp }}/plugin-perf-artifacts/plugin-command-latency.json
+            ${{ runner.temp }}/plugin-perf-artifacts/runtime-matrix
+            ${{ runner.temp }}/plugin-perf-artifacts/runtime-matrix-scale
+          if-no-files-found: error
 
       - name: Skip message when unchanged
         if: ${{ steps.changes.outputs.run != 'true' }}

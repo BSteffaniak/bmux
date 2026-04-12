@@ -24,6 +24,8 @@ fn run() -> Result<(), String> {
         "report-latency" => run_report_latency(args),
         "report-faults" => run_report_faults(args),
         "report-json" => run_report_json(args),
+        "prepare-scale-fixture" => run_prepare_scale_fixture(args),
+        "compare-report" => run_compare_report(args),
         "discover-run-candidate" => run_discover_run_candidate(args),
         "-h" | "--help" => {
             println!("{}", usage());
@@ -39,6 +41,8 @@ fn usage() -> &'static str {
   report-latency --input PATH [--max-p95-ms N] [--max-p99-ms N] [--max-avg-ms N] [--max-steady-p95-ms N] [--max-steady-p99-ms N] [--max-steady-avg-ms N]
   report-faults --input PATH [--max-runtime-retries N] [--max-runtime-respawns N] [--max-runtime-timeouts N]
   report-json --input PATH --output PATH [threshold flags]
+  prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N
+  compare-report --baseline PATH --candidate PATH [--warn-regression-ms N]
   discover-run-candidate --bmux-bin PATH"
 }
 
@@ -507,6 +511,171 @@ fn run_report_json(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn run_prepare_scale_fixture(args: Vec<String>) -> Result<(), String> {
+    let mut config_dir = None;
+    let mut plugin_root = None;
+    let mut count = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config-dir" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--config-dir requires a value".to_string());
+                };
+                config_dir = Some(value.clone());
+                index += 2;
+            }
+            "--plugin-root" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--plugin-root requires a value".to_string());
+                };
+                plugin_root = Some(value.clone());
+                index += 2;
+            }
+            "--count" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--count requires a value".to_string());
+                };
+                count = Some(parse_u64(value, "--count")? as usize);
+                index += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument for prepare-scale-fixture: {other}"
+                ));
+            }
+        }
+    }
+
+    let config_dir = config_dir.ok_or_else(|| "--config-dir is required".to_string())?;
+    let plugin_root = plugin_root.ok_or_else(|| "--plugin-root is required".to_string())?;
+    let count = count.ok_or_else(|| "--count is required".to_string())?;
+
+    fs::create_dir_all(&config_dir)
+        .map_err(|error| format!("failed creating config dir {config_dir}: {error}"))?;
+    fs::create_dir_all(&plugin_root)
+        .map_err(|error| format!("failed creating plugin root {plugin_root}: {error}"))?;
+
+    for entry in fs::read_dir(&plugin_root)
+        .map_err(|error| format!("failed reading plugin root {plugin_root}: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("failed reading plugin root entry: {error}"))?;
+        if entry
+            .file_type()
+            .map_err(|error| format!("failed checking plugin root entry type: {error}"))?
+            .is_dir()
+        {
+            fs::remove_dir_all(entry.path())
+                .map_err(|error| format!("failed clearing fixture dir: {error}"))?;
+        }
+    }
+
+    for idx in 0..count {
+        let dir_name = format!("perf-plugin-{idx:04}");
+        let plugin_dir = Path::new(&plugin_root).join(&dir_name);
+        fs::create_dir_all(&plugin_dir)
+            .map_err(|error| format!("failed creating fixture plugin dir: {error}"))?;
+        let plugin_toml = plugin_dir.join("plugin.toml");
+        let plugin_id = format!("bench.synthetic.{idx:04}");
+        let content = format!(
+            "execution_class = \"native_fast\"\nid = \"{plugin_id}\"\nname = \"Synthetic Perf Plugin {idx:04}\"\nversion = \"0.0.0\"\n"
+        );
+        fs::write(&plugin_toml, content).map_err(|error| {
+            format!(
+                "failed writing fixture manifest {}: {error}",
+                plugin_toml.display()
+            )
+        })?;
+    }
+
+    let config_file = Path::new(&config_dir).join("bmux.toml");
+    let escaped_root = plugin_root.replace('\\', "\\\\");
+    let config =
+        format!("[plugins]\nsearch_paths = [\"{escaped_root}\"]\nenabled = []\ndisabled = []\n");
+    fs::write(&config_file, config)
+        .map_err(|error| format!("failed writing config {}: {error}", config_file.display()))?;
+
+    println!(
+        "prepared synthetic plugin fixture: count={} plugin_root={} config={}",
+        count,
+        plugin_root,
+        config_file.display()
+    );
+
+    Ok(())
+}
+
+fn run_compare_report(args: Vec<String>) -> Result<(), String> {
+    let mut baseline = None;
+    let mut candidate = None;
+    let mut warn_regression_ms = 10.0_f64;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--baseline" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--baseline requires a value".to_string());
+                };
+                baseline = Some(value.clone());
+                index += 2;
+            }
+            "--candidate" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--candidate requires a value".to_string());
+                };
+                candidate = Some(value.clone());
+                index += 2;
+            }
+            "--warn-regression-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--warn-regression-ms requires a value".to_string());
+                };
+                warn_regression_ms = parse_u64(value, "--warn-regression-ms")? as f64;
+                index += 2;
+            }
+            other => return Err(format!("unknown argument for compare-report: {other}")),
+        }
+    }
+
+    let baseline = baseline.ok_or_else(|| "--baseline is required".to_string())?;
+    let candidate = candidate.ok_or_else(|| "--candidate is required".to_string())?;
+
+    let baseline_json = read_json_file(&baseline)?;
+    let candidate_json = read_json_file(&candidate)?;
+
+    let baseline_latency = parse_report_latency_summary(&baseline_json)?;
+    let candidate_latency = parse_report_latency_summary(&candidate_json)?;
+
+    print_compare_line(
+        "startup_ms",
+        baseline_latency.startup_ms,
+        candidate_latency.startup_ms,
+        warn_regression_ms,
+    );
+    print_compare_line(
+        "p95_ms",
+        baseline_latency.p95_ms,
+        candidate_latency.p95_ms,
+        warn_regression_ms,
+    );
+    print_compare_line(
+        "p99_ms",
+        baseline_latency.p99_ms,
+        candidate_latency.p99_ms,
+        warn_regression_ms,
+    );
+    print_compare_line(
+        "avg_ms",
+        baseline_latency.avg_ms,
+        candidate_latency.avg_ms,
+        warn_regression_ms,
+    );
+
+    Ok(())
+}
+
 fn run_discover_run_candidate(args: Vec<String>) -> Result<(), String> {
     let mut bmux_bin = None;
 
@@ -680,6 +849,58 @@ fn extract_json_marker_payload(line: &str) -> Option<&str> {
     None
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReportLatencySummary {
+    startup_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    avg_ms: f64,
+}
+
+fn parse_report_latency_summary(payload: &Value) -> Result<ReportLatencySummary, String> {
+    let startup_ms = payload
+        .get("startup_ms")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "missing report startup_ms".to_string())?;
+    let latency = payload
+        .get("latency_ms")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "missing report latency_ms".to_string())?;
+    let p95_ms = latency
+        .get("p95")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "missing report latency_ms.p95".to_string())?;
+    let p99_ms = latency
+        .get("p99")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "missing report latency_ms.p99".to_string())?;
+    let avg_ms = latency
+        .get("avg")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "missing report latency_ms.avg".to_string())?;
+
+    Ok(ReportLatencySummary {
+        startup_ms,
+        p95_ms,
+        p99_ms,
+        avg_ms,
+    })
+}
+
+fn print_compare_line(label: &str, baseline: f64, candidate: f64, warn_regression_ms: f64) {
+    let delta = candidate - baseline;
+    let status = if delta > warn_regression_ms {
+        "WARN"
+    } else if delta < 0.0 {
+        "IMPROVED"
+    } else {
+        "OK"
+    };
+    println!(
+        "compare {label} baseline={baseline:.3} candidate={candidate:.3} delta={delta:+.3} status={status}"
+    );
+}
+
 fn parse_u64(value: &str, flag: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
@@ -846,8 +1067,10 @@ mod tests {
     use super::{
         LatencyBreakdown, LatencyStats, LatencyThresholds, RuntimeFaultCounts,
         RuntimeFaultThresholds, count_occurrences, count_runtime_faults, evaluate_fault_thresholds,
-        evaluate_latency_thresholds, parse_u64, percentile_nearest_rank,
+        evaluate_latency_thresholds, parse_report_latency_summary, parse_u64,
+        percentile_nearest_rank,
     };
+    use serde_json::json;
 
     #[test]
     fn count_occurrences_counts_multiple_matches() {
@@ -960,5 +1183,22 @@ mod tests {
             },
         );
         assert_eq!(faults.len(), 3);
+    }
+
+    #[test]
+    fn parse_report_latency_summary_reads_required_fields() {
+        let payload = json!({
+            "startup_ms": 111.0,
+            "latency_ms": {
+                "p95": 20.0,
+                "p99": 30.0,
+                "avg": 15.0,
+            }
+        });
+        let summary = parse_report_latency_summary(&payload).expect("summary should parse");
+        assert_eq!(summary.startup_ms, 111.0);
+        assert_eq!(summary.p95_ms, 20.0);
+        assert_eq!(summary.p99_ms, 30.0);
+        assert_eq!(summary.avg_ms, 15.0);
     }
 }

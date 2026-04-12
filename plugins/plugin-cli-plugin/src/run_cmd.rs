@@ -188,6 +188,9 @@ mod tests {
             &known,
             &["three".to_string()],
         );
+        assert!(message.contains("Problem:"));
+        assert!(message.contains("Why:"));
+        assert!(message.contains("Hint:"));
         assert!(message.contains("Known commands for 'bmux.example': one, two"));
         assert!(message.contains("Next: run 'bmux plugin run bmux.example --help'"));
     }

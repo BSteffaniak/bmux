@@ -36,6 +36,10 @@ For changes under `plugins/**`:
 - `./scripts/perf-plugin-command-latency.sh --iterations 20 --warmup 5 --max-p95-ms 250 --max-p99-ms 350`
 - `./scripts/perf-plugin-runtime-matrix.sh --iterations 20 --warmup 5`
 
+For scale-focused scenarios, generate synthetic manifests during sampling:
+
+- `./scripts/perf-plugin-runtime-matrix.sh --iterations 20 --warmup 5 --scale-plugin-count 200`
+
 Optional steady-state thresholds are available when you want to gate post-startup behavior:
 
 - `--max-steady-p95-ms`
@@ -49,6 +53,10 @@ For CI artifact archiving, use:
 
 - `./scripts/perf-plugin-command-latency.sh ... --artifact-json <path>.json`
 - `./scripts/perf-plugin-runtime-matrix.sh ... --artifact-dir <dir>`
+
+For baseline comparisons (informational):
+
+- `./scripts/perf-plugin-artifact-compare.sh --candidate-dir <dir> --baseline-dir docs/perf-baselines/runtime-matrix`
 
 ### 5) Plugin runtime command matrix SLO
 
