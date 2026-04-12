@@ -6,11 +6,13 @@ use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_ipc::{RecordingRollingStartOptions, SessionSummary};
+use bmux_ipc::{InvokeServiceKind, RecordingRollingStartOptions, SessionSummary};
+use bmux_plugin_sdk::{PluginCliCommandRequest, PluginCliCommandResponse};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
+use std::{collections::BTreeMap, collections::BTreeSet};
 use uuid::Uuid;
 
 use super::{
@@ -45,6 +47,30 @@ enum ResolvedTarget {
     Ssh(SshTarget),
     Tls(TlsTarget),
     Iroh(IrohTarget),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum ClusterGatewayMode {
+    #[default]
+    Auto,
+    Direct,
+    Pinned,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct ClusterGatewayDefinition {
+    targets: Vec<String>,
+    gateway_mode: ClusterGatewayMode,
+    gateway_candidates: Vec<String>,
+    gateway_target: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct ClusterGatewaySettings {
+    clusters: BTreeMap<String, ClusterGatewayDefinition>,
 }
 
 #[derive(Debug, Clone)]
@@ -2938,6 +2964,216 @@ pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
     }
 }
 
+pub(super) async fn maybe_run_cluster_plugin_command_via_gateway(
+    plugin_id: &str,
+    command_name: &str,
+    arguments: &[String],
+) -> Result<Option<u8>> {
+    if plugin_id != "bmux.cluster" {
+        return Ok(None);
+    }
+
+    let config = BmuxConfig::load()?;
+    let settings = cluster_gateway_settings_from_config(&config)?;
+    let Some(cluster_name) = resolve_cluster_name_for_gateway(command_name, arguments, &settings)
+    else {
+        return Ok(None);
+    };
+    let definition = settings
+        .clusters
+        .get(cluster_name.as_str())
+        .ok_or_else(|| anyhow::anyhow!("unknown cluster '{cluster_name}'"))?;
+
+    if definition.gateway_mode == ClusterGatewayMode::Direct {
+        return Ok(None);
+    }
+
+    let candidates = gateway_candidates_for_cluster(&cluster_name, definition)?;
+    let mut attempts = Vec::new();
+    for candidate in candidates {
+        match run_plugin_command_on_target(&config, &candidate, plugin_id, command_name, arguments)
+            .await
+        {
+            Ok(code) => return Ok(Some(code)),
+            Err(error) => attempts.push(format!("{candidate}: {error}")),
+        }
+    }
+
+    anyhow::bail!(
+        "all gateway candidates failed for cluster '{cluster_name}': {}",
+        attempts.join("; ")
+    )
+}
+
+fn cluster_gateway_settings_from_config(config: &BmuxConfig) -> Result<ClusterGatewaySettings> {
+    let settings = config
+        .plugins
+        .settings
+        .get("bmux.cluster")
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    settings
+        .try_into()
+        .map_err(|error| anyhow::anyhow!("invalid bmux.cluster settings: {error}"))
+}
+
+fn resolve_cluster_name_for_gateway(
+    command_name: &str,
+    arguments: &[String],
+    settings: &ClusterGatewaySettings,
+) -> Option<String> {
+    let explicit = match command_name {
+        "cluster-up" => first_positional_argument(arguments),
+        "cluster-events" => value_after_flag(arguments, "--cluster"),
+        "cluster-status" | "cluster-hosts" | "cluster-doctor" => {
+            let candidate = first_positional_argument(arguments);
+            candidate.filter(|value| settings.clusters.contains_key(value))
+        }
+        _ => None,
+    };
+
+    explicit.or_else(|| {
+        if settings.clusters.len() == 1 {
+            settings.clusters.keys().next().cloned()
+        } else {
+            None
+        }
+    })
+}
+
+fn first_positional_argument(arguments: &[String]) -> Option<String> {
+    let mut index = 0usize;
+    while index < arguments.len() {
+        let value = arguments[index].trim();
+        if value.is_empty() {
+            index += 1;
+            continue;
+        }
+        if value.starts_with('-') {
+            index += 1;
+            if index < arguments.len() && !arguments[index].starts_with('-') {
+                index += 1;
+            }
+            continue;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn value_after_flag(arguments: &[String], flag: &str) -> Option<String> {
+    arguments
+        .windows(2)
+        .find_map(|pair| (pair[0] == flag).then(|| pair[1].trim().to_string()))
+        .filter(|value| !value.is_empty())
+}
+
+fn gateway_candidates_for_cluster(
+    cluster_name: &str,
+    definition: &ClusterGatewayDefinition,
+) -> Result<Vec<String>> {
+    let mut ordered = match definition.gateway_mode {
+        ClusterGatewayMode::Direct => Vec::new(),
+        ClusterGatewayMode::Pinned => {
+            let target = definition
+                .gateway_target
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cluster '{cluster_name}' uses gateway_mode='pinned' but gateway_target is missing"
+                    )
+                })?;
+            vec![target.to_string()]
+        }
+        ClusterGatewayMode::Auto => {
+            if definition.gateway_candidates.is_empty() {
+                definition.targets.clone()
+            } else {
+                definition.gateway_candidates.clone()
+            }
+        }
+    };
+
+    let mut seen = BTreeSet::new();
+    ordered.retain(|candidate| {
+        let trimmed = candidate.trim();
+        !trimmed.is_empty() && seen.insert(trimmed.to_string())
+    });
+    if ordered.is_empty() {
+        anyhow::bail!(
+            "cluster '{cluster_name}' has no gateway candidates; configure targets or gateway_candidates"
+        );
+    }
+    Ok(ordered)
+}
+
+async fn run_plugin_command_on_target(
+    config: &BmuxConfig,
+    target: &str,
+    plugin_id: &str,
+    command_name: &str,
+    arguments: &[String],
+) -> Result<u8> {
+    let resolved = resolve_target_reference(config, target).await?;
+    let request = PluginCliCommandRequest::new(
+        plugin_id.to_string(),
+        command_name.to_string(),
+        arguments.to_vec(),
+    );
+    let payload = bmux_plugin_sdk::encode_service_message(&request)
+        .context("failed encoding plugin command request")?;
+    let response = match resolved {
+        ResolvedTarget::Local => {
+            let mut client =
+                connect(ConnectionPolicyScope::Normal, "bmux-cluster-gateway-local").await?;
+            run_plugin_bridge_service(&mut client, payload).await?
+        }
+        ResolvedTarget::Ssh(ssh_target) => {
+            let mut client =
+                connect_remote_bridge(&ssh_target, "bmux-cluster-gateway-ssh", None).await?;
+            run_plugin_bridge_service(&mut client, payload).await?
+        }
+        ResolvedTarget::Tls(tls_target) => {
+            let mut client = connect_tls_bridge(&tls_target, "bmux-cluster-gateway-tls").await?;
+            run_plugin_bridge_service(&mut client, payload).await?
+        }
+        ResolvedTarget::Iroh(iroh_target) => {
+            let (mut client, _) =
+                connect_iroh_bridge(&iroh_target, "bmux-cluster-gateway-iroh", None).await?;
+            run_plugin_bridge_service(&mut client, payload).await?
+        }
+    };
+
+    if let Some(error) = response.error {
+        anyhow::bail!(
+            "gateway plugin command failed on target '{target}': {error} (exit_code={})",
+            response.exit_code
+        );
+    }
+    u8::try_from(response.exit_code.clamp(0, i32::from(u8::MAX)))
+        .context("gateway plugin command returned out-of-range exit code")
+}
+
+async fn run_plugin_bridge_service(
+    client: &mut BmuxClient,
+    payload: Vec<u8>,
+) -> Result<PluginCliCommandResponse> {
+    let response_payload = client
+        .invoke_service_raw(
+            "bmux.commands",
+            InvokeServiceKind::Command,
+            "cli-command/v1",
+            "run_plugin",
+            payload,
+        )
+        .await
+        .map_err(map_cli_client_error)?;
+    bmux_plugin_sdk::decode_service_message(&response_payload)
+        .context("failed decoding plugin bridge response")
+}
+
 pub(super) async fn run_remote_init(
     name: &str,
     ssh: Option<&str>,
@@ -4846,6 +5082,56 @@ mod tests {
         config.connections.hosted_mode = HostedMode::ControlPlane;
         let mode = resolve_hosted_mode(&config, None);
         assert_eq!(mode, HostedMode::ControlPlane);
+    }
+
+    #[test]
+    fn gateway_candidates_auto_defaults_to_cluster_targets() {
+        let definition = ClusterGatewayDefinition {
+            targets: vec!["db-a".to_string(), "db-b".to_string()],
+            gateway_mode: ClusterGatewayMode::Auto,
+            gateway_candidates: Vec::new(),
+            gateway_target: None,
+        };
+
+        let candidates = gateway_candidates_for_cluster("prod", &definition)
+            .expect("auto mode should produce candidates");
+        assert_eq!(candidates, vec!["db-a".to_string(), "db-b".to_string()]);
+    }
+
+    #[test]
+    fn gateway_candidates_pinned_requires_target() {
+        let definition = ClusterGatewayDefinition {
+            gateway_mode: ClusterGatewayMode::Pinned,
+            ..ClusterGatewayDefinition::default()
+        };
+
+        let error = gateway_candidates_for_cluster("prod", &definition)
+            .expect_err("pinned mode without gateway_target should fail");
+        assert!(error.to_string().contains("gateway_target is missing"));
+    }
+
+    #[test]
+    fn resolve_cluster_name_for_gateway_prefers_explicit_cluster_flag() {
+        let settings = ClusterGatewaySettings {
+            clusters: BTreeMap::from([("prod".to_string(), ClusterGatewayDefinition::default())]),
+        };
+
+        let cluster = resolve_cluster_name_for_gateway(
+            "cluster-events",
+            &["--cluster".to_string(), "prod".to_string()],
+            &settings,
+        );
+        assert_eq!(cluster.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn resolve_cluster_name_for_gateway_uses_single_cluster_default() {
+        let settings = ClusterGatewaySettings {
+            clusters: BTreeMap::from([("prod".to_string(), ClusterGatewayDefinition::default())]),
+        };
+
+        let cluster = resolve_cluster_name_for_gateway("cluster-pane-retry", &[], &settings);
+        assert_eq!(cluster.as_deref(), Some("prod"));
     }
 
     #[test]

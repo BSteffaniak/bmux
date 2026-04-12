@@ -117,10 +117,11 @@ use recording_cli::{
     run_recording_verify_smoke, verify_recording_report,
 };
 use remote_cli::{
-    run_auth_login, run_auth_logout, run_auth_status, run_connect, run_host, run_hosts, run_join,
-    run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
-    run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade, run_setup,
-    run_share, run_target_proxy_from_current_argv, run_unshare, should_proxy_to_target,
+    maybe_run_cluster_plugin_command_via_gateway, run_auth_login, run_auth_logout, run_auth_status,
+    run_connect, run_host, run_hosts, run_join, run_remote_complete_sessions,
+    run_remote_complete_targets, run_remote_doctor, run_remote_init, run_remote_install_server,
+    run_remote_list, run_remote_test, run_remote_upgrade, run_setup, run_share,
+    run_target_proxy_from_current_argv, run_unshare, should_proxy_to_target,
 };
 use sandbox_cli::{
     RunSandboxOptions, run_sandbox_bundle, run_sandbox_cleanup, run_sandbox_doctor,
@@ -287,6 +288,12 @@ pub async fn run() -> Result<u8> {
         } => {
             let _config_override_guard = push_process_config_overrides(config_overrides);
             init_logging(false, Some(log_level), false);
+            if let Some(status) =
+                maybe_run_cluster_plugin_command_via_gateway(&plugin_id, &command_name, &arguments)
+                    .await?
+            {
+                return Ok(status);
+            }
             run_plugin_command(&plugin_id, &command_name, &arguments).await
         }
         ParsedRuntimeCli::ImmediateExit {

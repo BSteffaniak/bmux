@@ -31,6 +31,26 @@ Current scope:
 - `cluster up --on-failure=continue` keeps launching remaining hosts and reports failed hosts as degraded.
 - `cluster up --on-failure=prompt` asks for interactive retry/continue/abort decisions when prompt runtime is available; if unavailable, it safely falls back to abort.
 
+## Gateway Failover Mode
+
+- Cluster commands can execute through a cluster member gateway before orchestration runs. This is intended for topologies where private cluster members are reachable from peers but not directly from the caller machine.
+- `gateway_mode` defaults to `auto` for each cluster:
+  - `auto`: try gateway candidates in order until one succeeds.
+  - `direct`: run locally (no gateway indirection).
+  - `pinned`: require a single configured `gateway_target`.
+- In `auto`, candidates come from `gateway_candidates` when provided; otherwise they fall back to cluster `targets`.
+- If every gateway candidate fails, cluster command execution hard-fails (no silent direct fallback).
+
+Example:
+
+```toml
+[plugins.settings."bmux.cluster".clusters.prod]
+targets = ["prod-a", "prod-b", "prod-c"]
+gateway_mode = "auto"
+# optional; defaults to targets when omitted
+# gateway_candidates = ["prod-a", "prod-b"]
+```
+
 ## Commands
 
 - `cluster up`
