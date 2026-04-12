@@ -62,15 +62,44 @@ enum ClusterGatewayMode {
 #[serde(default)]
 struct ClusterGatewayDefinition {
     targets: Vec<String>,
+    hosts: Vec<ClusterGatewayHostRef>,
     gateway_mode: ClusterGatewayMode,
     gateway_candidates: Vec<String>,
     gateway_target: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ClusterGatewayHostRef {
+    Target(String),
+    Object {
+        target: Option<String>,
+        host: Option<String>,
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 struct ClusterGatewaySettings {
     clusters: BTreeMap<String, ClusterGatewayDefinition>,
+}
+
+impl ClusterGatewayDefinition {
+    fn declared_targets(&self) -> Vec<String> {
+        let mut merged = Vec::new();
+        for target in &self.targets {
+            if !target.trim().is_empty() {
+                merged.push(target.trim().to_string());
+            }
+        }
+        for host in &self.hosts {
+            if let Some(target) = cluster_gateway_target_from_host_ref(host) {
+                merged.push(target);
+            }
+        }
+        dedupe_preserve_order(merged)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3022,9 +3051,19 @@ fn resolve_cluster_name_for_gateway(
     arguments: &[String],
     settings: &ClusterGatewaySettings,
 ) -> Option<String> {
+    let cluster_flag =
+        value_after_flag(arguments, "--cluster").or_else(|| value_after_flag(arguments, "-c"));
     let explicit = match command_name {
         "cluster-up" => first_positional_argument(arguments),
-        "cluster-events" => value_after_flag(arguments, "--cluster"),
+        "cluster-events" | "cluster-pane-retry" => cluster_flag,
+        "cluster-pane-new" => cluster_flag.or_else(|| {
+            extract_host_argument(arguments)
+                .and_then(|host| infer_cluster_name_from_target(settings, host.as_str()))
+        }),
+        "cluster-pane-move" => cluster_flag.or_else(|| {
+            extract_host_argument(arguments)
+                .and_then(|host| infer_cluster_name_from_target(settings, host.as_str()))
+        }),
         "cluster-status" | "cluster-hosts" | "cluster-doctor" => {
             let candidate = first_positional_argument(arguments);
             candidate.filter(|value| settings.clusters.contains_key(value))
@@ -3062,10 +3101,60 @@ fn first_positional_argument(arguments: &[String]) -> Option<String> {
 }
 
 fn value_after_flag(arguments: &[String], flag: &str) -> Option<String> {
+    let inline_prefix = format!("{flag}=");
     arguments
-        .windows(2)
-        .find_map(|pair| (pair[0] == flag).then(|| pair[1].trim().to_string()))
+        .iter()
+        .find_map(|argument| {
+            if argument == flag {
+                return None;
+            }
+            argument
+                .strip_prefix(inline_prefix.as_str())
+                .map(|value| value.trim().to_string())
+        })
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            arguments
+                .windows(2)
+                .find_map(|pair| (pair[0] == flag).then(|| pair[1].trim().to_string()))
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn extract_host_argument(arguments: &[String]) -> Option<String> {
+    value_after_flag(arguments, "--host")
+        .or_else(|| value_after_flag(arguments, "-h"))
+        .or_else(|| {
+            let positional = arguments
+                .iter()
+                .filter(|value| !value.starts_with('-'))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            positional.last().cloned()
+        })
+}
+
+fn infer_cluster_name_from_target(
+    settings: &ClusterGatewaySettings,
+    target: &str,
+) -> Option<String> {
+    let matches = settings
+        .clusters
+        .iter()
+        .filter(|(_, definition)| {
+            definition
+                .declared_targets()
+                .iter()
+                .any(|value| value == target)
+        })
+        .map(|(cluster, _)| cluster.clone())
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
 }
 
 fn gateway_candidates_for_cluster(
@@ -3089,7 +3178,7 @@ fn gateway_candidates_for_cluster(
         }
         ClusterGatewayMode::Auto => {
             if definition.gateway_candidates.is_empty() {
-                definition.targets.clone()
+                definition.declared_targets()
             } else {
                 definition.gateway_candidates.clone()
             }
@@ -3107,6 +3196,37 @@ fn gateway_candidates_for_cluster(
         );
     }
     Ok(ordered)
+}
+
+fn cluster_gateway_target_from_host_ref(host: &ClusterGatewayHostRef) -> Option<String> {
+    match host {
+        ClusterGatewayHostRef::Target(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        ClusterGatewayHostRef::Object { target, host, name } => target
+            .as_deref()
+            .or(host.as_deref())
+            .or(name.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+    }
+}
+
+fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::with_capacity(values.len());
+    for value in values {
+        if seen.insert(value.clone()) {
+            deduped.push(value);
+        }
+    }
+    deduped
 }
 
 async fn run_plugin_command_on_target(
@@ -5088,6 +5208,7 @@ mod tests {
     fn gateway_candidates_auto_defaults_to_cluster_targets() {
         let definition = ClusterGatewayDefinition {
             targets: vec!["db-a".to_string(), "db-b".to_string()],
+            hosts: Vec::new(),
             gateway_mode: ClusterGatewayMode::Auto,
             gateway_candidates: Vec::new(),
             gateway_target: None,
@@ -5122,6 +5243,13 @@ mod tests {
             &settings,
         );
         assert_eq!(cluster.as_deref(), Some("prod"));
+
+        let cluster_inline = resolve_cluster_name_for_gateway(
+            "cluster-events",
+            &["--cluster=prod".to_string()],
+            &settings,
+        );
+        assert_eq!(cluster_inline.as_deref(), Some("prod"));
     }
 
     #[test]
@@ -5132,6 +5260,55 @@ mod tests {
 
         let cluster = resolve_cluster_name_for_gateway("cluster-pane-retry", &[], &settings);
         assert_eq!(cluster.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn resolve_cluster_name_for_gateway_infers_cluster_from_host_when_unique() {
+        let settings = ClusterGatewaySettings {
+            clusters: BTreeMap::from([
+                (
+                    "prod".to_string(),
+                    ClusterGatewayDefinition {
+                        targets: vec!["prod-a".to_string()],
+                        ..ClusterGatewayDefinition::default()
+                    },
+                ),
+                (
+                    "staging".to_string(),
+                    ClusterGatewayDefinition {
+                        targets: vec!["staging-a".to_string()],
+                        ..ClusterGatewayDefinition::default()
+                    },
+                ),
+            ]),
+        };
+
+        let cluster = resolve_cluster_name_for_gateway(
+            "cluster-pane-new",
+            &["--host".to_string(), "prod-a".to_string()],
+            &settings,
+        );
+        assert_eq!(cluster.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn gateway_candidates_auto_accepts_hosts_object_entries() {
+        let definition = ClusterGatewayDefinition {
+            hosts: vec![
+                ClusterGatewayHostRef::Object {
+                    target: Some("db-a".to_string()),
+                    host: None,
+                    name: None,
+                },
+                ClusterGatewayHostRef::Target("db-b".to_string()),
+            ],
+            gateway_mode: ClusterGatewayMode::Auto,
+            ..ClusterGatewayDefinition::default()
+        };
+
+        let candidates = gateway_candidates_for_cluster("prod", &definition)
+            .expect("hosts entries should be valid candidates");
+        assert_eq!(candidates, vec!["db-a".to_string(), "db-b".to_string()]);
     }
 
     #[test]

@@ -200,6 +200,14 @@ name       = "name"
 short      = "n"
 value_name = "NAME"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
+
 [[commands]]
 aliases       = [["cluster", "pane", "move"]]
 expose_in_cli = true
@@ -234,6 +242,14 @@ position   = 1
 required   = false
 value_name = "HOST"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
+
 [[commands]]
 aliases       = [["cluster", "pane", "retry"]]
 expose_in_cli = true
@@ -267,3 +283,11 @@ long       = "retries"
 name       = "retries"
 required   = false
 value_name = "COUNT"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
