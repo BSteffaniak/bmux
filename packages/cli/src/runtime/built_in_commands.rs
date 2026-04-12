@@ -704,7 +704,7 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::PlaybookCleanup,
             &["playbook", "cleanup"],
-            "Remove orphaned sandbox temp directories",
+            "Clean playbook sandbox temp directories",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Sandbox,
@@ -744,7 +744,7 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SandboxCleanup,
             &["sandbox", "cleanup"],
-            "Remove orphaned sandbox run temp directories",
+            "Clean sandbox run temp directories",
         ),
     ]
 }

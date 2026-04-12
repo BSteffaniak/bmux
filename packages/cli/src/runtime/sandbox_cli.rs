@@ -19,6 +19,7 @@ const PID_MARKER_FILE: &str = "sandbox.pid";
 const DEFAULT_CLEANUP_MIN_AGE: Duration = Duration::from_secs(300);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const LOCK_FRESHNESS: Duration = Duration::from_secs(15);
+const SANDBOX_JSON_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct CleanupEntry {
@@ -143,6 +144,7 @@ impl SandboxPaths {
 
 #[derive(Debug, Serialize)]
 struct SandboxRunReport {
+    schema_version: u32,
     sandbox_id: String,
     sandbox_root: String,
     bmux_bin: String,
@@ -340,6 +342,7 @@ fn emit_run_output(
     let repro = format_repro_command(outcome.options, manifest.command.as_slice());
     if outcome.options.json {
         let report = SandboxRunReport {
+            schema_version: SANDBOX_JSON_SCHEMA_VERSION,
             sandbox_id: manifest.id.clone(),
             sandbox_root: sandbox.root_dir.to_string_lossy().to_string(),
             bmux_bin: outcome.binary.to_string_lossy().to_string(),
@@ -394,7 +397,10 @@ pub(super) fn run_sandbox_list(
     }
 
     if json {
-        let payload = serde_json::json!({ "sandboxes": entries });
+        let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+            "sandboxes": entries,
+        });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if entries.is_empty() {
         println!("no sandboxes found");
@@ -428,16 +434,18 @@ pub(super) fn run_sandbox_inspect(
     target: Option<&str>,
     latest: bool,
     latest_failed: bool,
+    source_filter: Option<&str>,
     tail: usize,
     json: bool,
 ) -> Result<u8> {
-    let root = resolve_inspect_target(target, latest, latest_failed)?;
+    let root = resolve_inspect_target(target, latest, latest_failed, source_filter)?;
     let manifest = read_manifest(&root)?;
     let log_tail = read_log_tail(&root, tail);
     let running = sandbox_process_alive(&root) || sandbox_socket_alive(&root);
 
     if json {
         let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
             "manifest": manifest,
             "running": running,
             "log_tail": log_tail,
@@ -473,19 +481,20 @@ fn resolve_inspect_target(
     target: Option<&str>,
     latest: bool,
     latest_failed: bool,
+    source_filter: Option<&str>,
 ) -> Result<PathBuf> {
     if let Some(target) = target {
         return resolve_sandbox_target(target);
     }
 
     if latest || latest_failed {
-        return resolve_latest_sandbox(latest_failed);
+        return resolve_latest_sandbox(latest_failed, source_filter);
     }
 
     anyhow::bail!("inspect target required (provide <id|path>, --latest, or --latest-failed)")
 }
 
-fn resolve_latest_sandbox(failed_only: bool) -> Result<PathBuf> {
+fn resolve_latest_sandbox(failed_only: bool, source_filter: Option<&str>) -> Result<PathBuf> {
     let mut candidates = collect_sandbox_directories()
         .into_iter()
         .map(|path| {
@@ -501,9 +510,21 @@ fn resolve_latest_sandbox(failed_only: bool) -> Result<PathBuf> {
 
     candidates.sort_by(|left, right| left.1.cmp(&right.1));
     for (path, _) in candidates {
+        if let Some(source) = source_filter
+            && sandbox_source_for_dir(&path) != source
+        {
+            continue;
+        }
         if !failed_only || matches!(sandbox_status_for_dir(&path), "failed") {
             return Ok(path);
         }
+    }
+
+    if let Some(source) = source_filter {
+        if failed_only {
+            anyhow::bail!("no failed sandboxes found for source {source}");
+        }
+        anyhow::bail!("no sandboxes found for source {source}");
     }
 
     if failed_only {
@@ -540,6 +561,7 @@ pub(super) fn run_sandbox_doctor(id: Option<&str>, json: bool) -> Result<u8> {
     let ok = checks.iter().all(|check| check.ok);
     if json {
         let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
             "ok": ok,
             "checks": checks,
         });
@@ -596,6 +618,7 @@ pub(super) fn run_sandbox_bundle(target: &str, output: Option<&str>, json: bool)
 
     if json {
         let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
             "bundle_dir": bundle_dir.to_string_lossy().to_string(),
             "sandbox_root": root.to_string_lossy().to_string(),
             "sandbox_id": manifest.id,
@@ -679,6 +702,7 @@ pub(super) fn run_sandbox_cleanup(
 
     if json {
         let report = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
             "scanned": scan.scanned,
             "orphaned": orphaned,
             "dry_run": dry_run,

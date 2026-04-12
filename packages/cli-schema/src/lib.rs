@@ -1027,7 +1027,7 @@ pub enum PlaybookCommand {
         #[arg(long, default_value = "50")]
         timing_threshold: u64,
     },
-    /// Remove orphaned sandbox temp directories from previous playbook runs
+    /// Clean up sandbox temp directories from previous playbook runs
     Cleanup {
         /// Only list orphaned dirs without deleting
         #[arg(long)]
@@ -1128,6 +1128,9 @@ pub enum SandboxCommand {
         /// Inspect the most recent failed sandbox
         #[arg(long, conflicts_with_all = ["latest", "sandbox"])]
         latest_failed: bool,
+        /// Filter source when resolving --latest or --latest-failed
+        #[arg(long, value_enum, default_value = "all")]
+        source: SandboxSourceArg,
         /// Number of log lines to tail from sandbox logs
         #[arg(long, default_value_t = 80)]
         tail: usize,
@@ -1155,7 +1158,7 @@ pub enum SandboxCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove orphaned sandbox temp directories from sandbox runs
+    /// Clean up sandbox temp directories from sandbox runs
     Cleanup {
         /// Only list orphaned dirs without deleting
         #[arg(long)]
@@ -4057,6 +4060,7 @@ mod tests {
                 sandbox: Some(target),
                 latest: false,
                 latest_failed: false,
+                source: SandboxSourceArg::All,
                 tail: 25,
                 json: false,
             } if target == "bmux-sbx-abc"
@@ -4073,6 +4077,7 @@ mod tests {
                 sandbox: None,
                 latest: true,
                 latest_failed: false,
+                source: SandboxSourceArg::All,
                 tail: 80,
                 json: true,
             }
@@ -4096,8 +4101,28 @@ mod tests {
                 sandbox: None,
                 latest: false,
                 latest_failed: true,
+                source: SandboxSourceArg::All,
                 tail: 40,
                 json: false,
+            }
+        ));
+
+        let latest_by_source = Cli::try_parse_from([
+            "bmux", "sandbox", "inspect", "--latest", "--source", "playbook", "--json",
+        ])
+        .expect("valid latest inspect source args");
+        let Some(Command::Sandbox { command }) = latest_by_source.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Inspect {
+                sandbox: None,
+                latest: true,
+                latest_failed: false,
+                source: SandboxSourceArg::Playbook,
+                tail: 80,
+                json: true,
             }
         ));
     }

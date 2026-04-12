@@ -111,6 +111,7 @@ bmux sandbox dev -- server status
 bmux sandbox list --limit 10
 bmux sandbox list --source playbook --limit 10
 bmux sandbox inspect --latest
+bmux sandbox inspect --latest --source recording-verify
 bmux sandbox inspect --latest-failed --tail 120
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 bmux sandbox doctor --json

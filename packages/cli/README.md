@@ -86,6 +86,7 @@ bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode inherit -- attach
 bmux sandbox list --limit 10
 bmux sandbox list --source playbook --limit 10
 bmux sandbox inspect --latest
+bmux sandbox inspect --latest --source recording-verify
 bmux sandbox inspect --latest-failed --tail 120
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 bmux sandbox doctor --json

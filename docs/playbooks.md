@@ -168,7 +168,7 @@ bmux playbook diff --json before.json after.json
 
 ### `bmux playbook cleanup`
 
-Remove orphaned sandbox temp directories from previous playbook runs. Useful
+Clean up sandbox temp directories from previous playbook runs. Useful
 after SIGKILL or crashes that prevent normal cleanup.
 
 This command now uses the shared sandbox cleanup engine with `source=playbook`

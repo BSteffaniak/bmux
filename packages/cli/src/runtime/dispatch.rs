@@ -1453,11 +1453,27 @@ pub(super) async fn dispatch_built_in_command(
                         sandbox,
                         latest,
                         latest_failed,
+                        source,
                         tail,
                         json,
                     },
             },
-        ) => run_sandbox_inspect(sandbox.as_deref(), *latest, *latest_failed, *tail, *json),
+        ) => {
+            let source_filter = match source {
+                SandboxSourceArg::SandboxCli => Some("sandbox-cli"),
+                SandboxSourceArg::Playbook => Some("playbook"),
+                SandboxSourceArg::RecordingVerify => Some("recording-verify"),
+                SandboxSourceArg::All => None,
+            };
+            run_sandbox_inspect(
+                sandbox.as_deref(),
+                *latest,
+                *latest_failed,
+                source_filter,
+                *tail,
+                *json,
+            )
+        }
         (
             BuiltInHandlerId::SandboxDoctor,
             Command::Sandbox {

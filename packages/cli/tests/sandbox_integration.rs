@@ -76,6 +76,14 @@ fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
         .unwrap_or_else(|error| panic!("stdout was not json: {error}; stdout={stdout}"))
 }
 
+fn assert_schema_version(payload: &serde_json::Value) {
+    assert_eq!(
+        payload["schema_version"].as_u64(),
+        Some(1),
+        "json payload should include schema_version=1"
+    );
+}
+
 fn create_manifest_sandbox(root: &Path, dir_name: &str, source: &str, status: &str) {
     let dir = root.join(dir_name);
     let logs = dir.join("logs");
@@ -127,6 +135,7 @@ fn sandbox_dev_prefers_workspace_debug_binary() {
     );
 
     let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
     let expected = workspace_root().join("target").join("debug").join("bmux");
     if expected.exists() {
         let bmux_bin = json["bmux_bin"]
@@ -189,6 +198,7 @@ fn sandbox_inspect_latest_and_latest_failed_resolve_expected_runs() {
         .expect("inspect latest sandbox");
     assert!(latest.status.success(), "inspect latest should succeed");
     let latest_json = parse_json_stdout(&latest);
+    assert_schema_version(&latest_json);
     let latest_status = latest_json["manifest"]["status"]
         .as_str()
         .expect("latest inspect should include manifest status");
@@ -204,6 +214,7 @@ fn sandbox_inspect_latest_and_latest_failed_resolve_expected_runs() {
         "inspect latest failed should succeed"
     );
     let latest_failed_json = parse_json_stdout(&latest_failed);
+    assert_schema_version(&latest_failed_json);
     let command = latest_failed_json["manifest"]["command"]
         .as_array()
         .expect("latest failed inspect should include command array");
@@ -236,6 +247,7 @@ fn sandbox_bundle_writes_manifest_logs_and_repro() {
         "source sandbox should fail and be kept"
     );
     let run_json = parse_json_stdout(&run_output);
+    assert_schema_version(&run_json);
     let sandbox_id = run_json["sandbox_id"]
         .as_str()
         .expect("sandbox run json should include sandbox_id")
@@ -266,6 +278,7 @@ fn sandbox_bundle_writes_manifest_logs_and_repro() {
     );
 
     let bundle_json = parse_json_stdout(&bundle_output);
+    assert_schema_version(&bundle_json);
     let bundle_dir = PathBuf::from(
         bundle_json["bundle_dir"]
             .as_str()
@@ -318,6 +331,7 @@ fn sandbox_inspect_explicit_id_resolves_target_manifest() {
     );
 
     let run_json = parse_json_stdout(&run_output);
+    assert_schema_version(&run_json);
     let sandbox_id = run_json["sandbox_id"]
         .as_str()
         .expect("sandbox run json should include sandbox_id")
@@ -335,6 +349,7 @@ fn sandbox_inspect_explicit_id_resolves_target_manifest() {
     );
 
     let inspect_json = parse_json_stdout(&inspect_output);
+    assert_schema_version(&inspect_json);
     let manifest_id = inspect_json["manifest"]["id"]
         .as_str()
         .expect("inspect output should include manifest id");
@@ -369,6 +384,7 @@ fn sandbox_list_source_filter_returns_matching_source_only() {
     );
 
     let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
     let sandboxes = json["sandboxes"]
         .as_array()
         .expect("sandbox list should include sandboxes array");
@@ -411,6 +427,7 @@ fn sandbox_cleanup_source_filter_only_reports_requested_source() {
     );
 
     let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
     let entries = json["entries"]
         .as_array()
         .expect("sandbox cleanup should include entries array");
@@ -423,4 +440,39 @@ fn sandbox_cleanup_source_filter_only_reports_requested_source() {
         path.contains("brv-cleanup-recording"),
         "cleanup entry should point to recording sandbox"
     );
+}
+
+#[test]
+#[serial]
+fn sandbox_inspect_latest_source_filter_resolves_matching_source() {
+    let sandbox = CommandSandbox::new("inspect-source-filter");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bpb-inspect-playbook", "playbook", "succeeded");
+    create_manifest_sandbox(
+        &tmp_root,
+        "brv-inspect-recording",
+        "recording-verify",
+        "failed",
+    );
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox", "inspect", "--latest", "--source", "playbook", "--json",
+        ])
+        .output()
+        .expect("run sandbox inspect latest with source filter");
+    assert!(
+        output.status.success(),
+        "sandbox inspect should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    let id = json["manifest"]["id"]
+        .as_str()
+        .expect("sandbox inspect should include manifest id");
+    assert_eq!(id, "bpb-inspect-playbook");
+    assert_eq!(json["manifest"]["source"].as_str(), Some("playbook"));
 }
