@@ -2320,10 +2320,9 @@ fn resolve_cluster_binding_for_pane(
     pane: &bmux_plugin_sdk::PaneSummary,
 ) -> Result<ClusterPaneBinding, String> {
     let pane_id = pane.id.to_string();
-    if let Some(binding) = get_cluster_pane_binding(caller, &pane_id)?
-        && !binding.target.trim().is_empty()
-    {
-        return Ok(binding);
+    match get_cluster_pane_binding(caller, &pane_id) {
+        Ok(Some(binding)) if !binding.target.trim().is_empty() => return Ok(binding),
+        Ok(_) | Err(_) => {}
     }
     let (cluster, target) = parse_cluster_and_target_from_pane_name(pane.name.as_deref())
         .ok_or_else(|| {
@@ -2404,7 +2403,9 @@ mod tests {
         panes: Vec<bmux_plugin_sdk::PaneSummary>,
         storage: BTreeMap<String, Vec<u8>>,
         health: BTreeMap<String, bool>,
+        health_sequences: BTreeMap<String, Vec<bool>>,
         launch_fail_targets: BTreeSet<String>,
+        close_fail_panes: BTreeSet<Uuid>,
     }
 
     impl FakeRuntime {
@@ -2416,6 +2417,16 @@ mod tests {
         fn fail_launch_for(&self, target: &str) {
             let mut guard = self.inner.lock().expect("runtime lock poisoned");
             guard.launch_fail_targets.insert(target.to_string());
+        }
+
+        fn set_health_sequence(&self, target: &str, statuses: Vec<bool>) {
+            let mut guard = self.inner.lock().expect("runtime lock poisoned");
+            guard.health_sequences.insert(target.to_string(), statuses);
+        }
+
+        fn fail_close_for_pane(&self, pane_id: Uuid) {
+            let mut guard = self.inner.lock().expect("runtime lock poisoned");
+            guard.close_fail_panes.insert(pane_id);
         }
 
         fn add_pane(&self, name: Option<String>, focused: bool) -> Uuid {
@@ -2447,8 +2458,15 @@ mod tests {
                 .first()
                 .ok_or_else(|| "missing target argument".to_string())?;
             let healthy = {
-                let guard = self.inner.lock().expect("runtime lock poisoned");
-                guard.health.get(target).copied().unwrap_or(false)
+                let mut guard = self.inner.lock().expect("runtime lock poisoned");
+                if let Some(sequence) = guard.health_sequences.get_mut(target)
+                    && let Some(next) = sequence.first().copied()
+                {
+                    sequence.remove(0);
+                    next
+                } else {
+                    guard.health.get(target).copied().unwrap_or(false)
+                }
             };
             Ok(bmux_plugin_sdk::CoreCliCommandResponse {
                 protocol_version: request.protocol_version,
@@ -2578,6 +2596,9 @@ mod tests {
                     .map(|pane| pane.id)
                     .ok_or_else(|| "no active pane".to_string())?,
             };
+            if guard.close_fail_panes.contains(&target_id) {
+                return Err(format!("simulated close failure for pane '{target_id}'"));
+            }
             guard.panes.retain(|pane| pane.id != target_id);
             if guard.panes.iter().all(|pane| !pane.focused)
                 && let Some(first) = guard.panes.first_mut()
@@ -3163,6 +3184,209 @@ mod tests {
         assert!(
             panes.is_empty(),
             "prompt fallback abort should stop before launching db-ok"
+        );
+    }
+
+    #[test]
+    fn execute_cluster_up_abort_keeps_already_launched_panes() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health("db-ok", true);
+        runtime.set_health("db-launch-fail", true);
+        runtime.set_health("db-after", true);
+        runtime.fail_launch_for("db-launch-fail");
+
+        let inventory = ClusterInventory {
+            clusters: BTreeMap::from([(
+                "prod".to_string(),
+                vec![
+                    "db-ok".to_string(),
+                    "db-launch-fail".to_string(),
+                    "db-after".to_string(),
+                ],
+            )]),
+            known_targets: BTreeSet::from([
+                "db-ok".to_string(),
+                "db-launch-fail".to_string(),
+                "db-after".to_string(),
+            ]),
+        };
+
+        let error = execute_cluster_up(
+            &runtime,
+            &inventory,
+            ClusterUpArgs {
+                cluster: "prod".to_string(),
+                hosts: Vec::new(),
+                on_failure: RetryFailurePolicy::Abort,
+                retries: 0,
+            },
+        )
+        .expect_err("abort should stop cluster-up on launch failure");
+        assert!(error.contains("pane launch failed"));
+
+        let panes = runtime
+            .pane_list(&PaneListRequest { session: None })
+            .expect("pane list should succeed")
+            .panes;
+        assert_eq!(panes.len(), 1, "already-launched panes should be kept");
+
+        let first_pane_id = panes[0].id.to_string();
+        let binding = get_cluster_pane_binding(&runtime, &first_pane_id)
+            .expect("binding lookup should succeed")
+            .expect("binding should exist");
+        assert_eq!(binding.target, "db-ok");
+    }
+
+    #[test]
+    fn execute_cluster_up_retries_post_launch_probe_until_ready() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health_sequence("db-a", vec![true, false, true]);
+
+        let inventory = ClusterInventory {
+            clusters: BTreeMap::from([("prod".to_string(), vec!["db-a".to_string()])]),
+            known_targets: BTreeSet::from(["db-a".to_string()]),
+        };
+
+        let result = execute_cluster_up(
+            &runtime,
+            &inventory,
+            ClusterUpArgs {
+                cluster: "prod".to_string(),
+                hosts: Vec::new(),
+                on_failure: RetryFailurePolicy::Abort,
+                retries: 1,
+            },
+        )
+        .expect("post-launch retry should recover to ready");
+        assert_eq!(result.statuses.len(), 1);
+        assert!(matches!(result.statuses[0].state, ClusterHostState::Ready));
+
+        let events = get_cluster_connection_events(&runtime).expect("event lookup should succeed");
+        let target_events: Vec<&ClusterConnectionEvent> = events
+            .iter()
+            .filter(|event| event.target.as_deref() == Some("db-a"))
+            .collect();
+        assert!(
+            target_events
+                .iter()
+                .any(|event| event.state == ClusterConnectionState::Retrying),
+            "expected retrying event for db-a"
+        );
+        assert!(
+            target_events
+                .iter()
+                .any(|event| event.state == ClusterConnectionState::Ready),
+            "expected ready event for db-a"
+        );
+    }
+
+    #[test]
+    fn execute_cluster_pane_retry_falls_back_when_metadata_is_corrupt() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health("db-a", true);
+        let old_pane = runtime.add_pane(Some("host:db-a".to_string()), true);
+        runtime
+            .storage_set(&StorageSetRequest {
+                key: pane_binding_storage_key(&old_pane.to_string()),
+                value: vec![0xff, 0x00, 0x41],
+            })
+            .expect("seed corrupt pane metadata should succeed");
+
+        let result = execute_cluster_pane_retry(
+            &runtime,
+            &ClusterPaneRetryArgs {
+                pane: PaneRetryRef::Active,
+                on_failure: RetryFailurePolicy::Abort,
+                retries: 0,
+            },
+        )
+        .expect("retry should fall back to pane naming when metadata is corrupt");
+
+        assert_eq!(result.target, "db-a");
+        let new_binding = get_cluster_pane_binding(&runtime, &result.new_pane_id)
+            .expect("new binding lookup should succeed")
+            .expect("new binding should exist");
+        assert_eq!(new_binding.state, ClusterConnectionState::Ready);
+        assert_eq!(new_binding.source, "retry");
+    }
+
+    #[test]
+    fn execute_cluster_pane_move_preserves_replacement_when_old_close_fails() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health("db-a", true);
+        runtime.set_health("db-b", true);
+        let old_pane = runtime.add_pane(Some("prod:db-a".to_string()), true);
+        set_cluster_pane_binding(
+            &runtime,
+            &old_pane.to_string(),
+            Some(&ClusterPaneBinding {
+                target: "db-a".to_string(),
+                cluster: Some("prod".to_string()),
+                source: "new".to_string(),
+                state: ClusterConnectionState::Ready,
+                retry_count: 0,
+                last_error: None,
+                updated_at_unix_ms: 1,
+            }),
+        )
+        .expect("seed old pane binding should succeed");
+        runtime.fail_close_for_pane(old_pane);
+
+        let error = execute_cluster_pane_move(
+            &runtime,
+            ClusterPaneMoveArgs {
+                pane: PaneRetryRef::Active,
+                host: "db-b".to_string(),
+            },
+        )
+        .expect_err("move should surface old pane close failure");
+        assert!(error.contains("failed closing old pane"));
+
+        let panes = runtime
+            .pane_list(&PaneListRequest { session: None })
+            .expect("pane list should succeed")
+            .panes;
+        assert_eq!(
+            panes.len(),
+            2,
+            "replacement pane should still exist even when old close fails"
+        );
+        let replacement = panes
+            .iter()
+            .find(|pane| pane.id != old_pane)
+            .expect("replacement pane should exist");
+
+        let replacement_binding = get_cluster_pane_binding(&runtime, &replacement.id.to_string())
+            .expect("replacement binding lookup should succeed")
+            .expect("replacement binding should exist");
+        assert_eq!(replacement_binding.target, "db-b");
+    }
+
+    #[test]
+    fn append_cluster_connection_event_enforces_ring_buffer_limit() {
+        let runtime = FakeRuntime::default();
+        for index in 0..(CLUSTER_CONNECTION_EVENTS_MAX + 5) {
+            append_cluster_connection_event(
+                &runtime,
+                ClusterConnectionEvent {
+                    ts_unix_ms: u64::try_from(index).expect("index should fit u64"),
+                    pane_id: Some(format!("p{index}")),
+                    cluster: Some("prod".to_string()),
+                    target: Some("db-a".to_string()),
+                    source: Some("up".to_string()),
+                    state: ClusterConnectionState::Connecting,
+                    message: format!("event-{index}"),
+                },
+            )
+            .expect("event append should succeed");
+        }
+
+        let events = get_cluster_connection_events(&runtime).expect("event lookup should succeed");
+        assert_eq!(events.len(), CLUSTER_CONNECTION_EVENTS_MAX);
+        assert_eq!(events[0].message, "event-5");
+        assert_eq!(
+            events[CLUSTER_CONNECTION_EVENTS_MAX - 1].message,
+            format!("event-{}", CLUSTER_CONNECTION_EVENTS_MAX + 4)
         );
     }
 

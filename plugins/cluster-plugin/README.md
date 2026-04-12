@@ -25,6 +25,12 @@ Current scope:
 - `cluster pane retry` supports probe retry policy controls (`--retries`, `--on-failure=abort|continue|prompt`)
 - Cluster service interfaces are implemented for query/command/event-list integrations
 
+## Failure Semantics
+
+- `cluster up --on-failure=abort` stops launching additional hosts after the first terminal failure but preserves any panes already launched successfully.
+- `cluster up --on-failure=continue` keeps launching remaining hosts and reports failed hosts as degraded.
+- `cluster up --on-failure=prompt` asks for interactive retry/continue/abort decisions when prompt runtime is available; if unavailable, it safely falls back to abort.
+
 ## Commands
 
 - `cluster up`
