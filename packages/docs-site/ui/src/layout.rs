@@ -138,7 +138,7 @@ pub fn nav_bar() -> Containers {
 /// on tablet widths). On mobile it renders as a fixed overlay drawer that starts
 /// hidden and is toggled via the hamburger button in the nav bar.
 #[must_use]
-pub fn sidebar(current_path: &str) -> Containers {
+fn sidebar_sections(current_path: &str) -> Vec<Containers> {
     let mut sections = Vec::new();
 
     for section in nav::SECTIONS {
@@ -150,36 +150,53 @@ pub fn sidebar(current_path: &str) -> Containers {
         sections.push(sidebar_section(section.title, &items));
     }
 
+    sections
+}
+
+#[must_use]
+fn desktop_sidebar(current_path: &str) -> Containers {
+    let sections = sidebar_sections(current_path);
     container! {
         aside
-            #docs-sidebar
+            #docs-sidebar-desktop
             direction=column
-            // Tablet: 200px, desktop: 240px. On mobile this is overridden to
-            // 280px via the fixed overlay below.
             width=(if_responsive("tablet").then::<i32>(200).or_else(240))
             min-width=(if_responsive("tablet").then::<i32>(200).or_else(240))
             background=#010409
             border-right="1, #21262d"
             padding-y=24
             overflow-y=auto
-            // Mobile: fixed overlay, hidden by default (display=none).
-            // Desktop/tablet: normal flow, always visible.
-            position=(
-                if_responsive("mobile")
-                    .then::<hyperchad::transformer::models::Position>(
-                        hyperchad::transformer::models::Position::Fixed
-                    )
-                    .or_else(hyperchad::transformer::models::Position::Static)
-            )
+            hidden=(if_responsive("mobile").then::<bool>(true).or_else(false))
+        {
+            @for section in sections {
+                (section)
+            }
+        }
+    }
+}
+
+#[must_use]
+fn mobile_sidebar(current_path: &str) -> Containers {
+    let sections = sidebar_sections(current_path);
+    container! {
+        aside
+            #docs-sidebar
+            direction=column
+            width=280
+            min-width=280
+            background=#010409
+            border-right="1, #21262d"
+            padding-y=24
+            overflow-y=auto
+            position=fixed
             top=0
             left=0
             height=100%
-            hidden=(if_responsive("mobile").then::<bool>(true).or_else(false))
+            hidden=true
         {
             // Close button at top of mobile drawer
             div
                 #sidebar-close
-                hidden=(if_responsive("mobile").then::<bool>(false).or_else(true))
                 direction=row
                 justify-content=end
                 padding-x=16
@@ -299,9 +316,10 @@ pub fn docs_layout(current_path: &str, title: Option<&str>, content: &Containers
             min-height=0
             position=relative
         {
-            (sidebar(current_path))
+            (desktop_sidebar(current_path))
             // Backdrop overlay for mobile drawer
             (backdrop())
+            (mobile_sidebar(current_path))
             div
                 flex-grow=1
                 min-height=0
