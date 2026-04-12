@@ -117,6 +117,23 @@ struct GatewayBatchRequest<'a> {
     command_name: &'a str,
     arguments: &'a [String],
     respect_cooldown: bool,
+    no_failover: bool,
+}
+
+#[derive(Debug, Default)]
+struct GatewayCommandOverrides {
+    gateway_target: Option<String>,
+    gateway_mode: Option<ClusterGatewayMode>,
+    no_failover: bool,
+    passthrough_arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GatewayProbeResult {
+    ok: bool,
+    reason_code: &'static str,
+    detail: String,
+    latency_ms: u128,
 }
 
 const CLUSTER_GATEWAY_LAST_GOOD_TTL: Duration = Duration::from_secs(90);
@@ -3043,22 +3060,36 @@ pub(super) async fn maybe_run_cluster_plugin_command_via_gateway(
         return Ok(None);
     }
 
+    let overrides = parse_gateway_overrides(arguments)?;
     let config = BmuxConfig::load()?;
     let settings = cluster_gateway_settings_from_config(&config)?;
-    let Some(cluster_name) = resolve_cluster_name_for_gateway(command_name, arguments, &settings)?
+    let Some(cluster_name) = resolve_cluster_name_for_gateway(
+        command_name,
+        &overrides.passthrough_arguments,
+        &settings,
+    )?
     else {
         return Ok(None);
     };
-    let definition = settings
+    let base_definition = settings
         .clusters
         .get(cluster_name.as_str())
         .ok_or_else(|| anyhow::anyhow!("unknown cluster '{cluster_name}'"))?;
+    let definition = apply_gateway_overrides(base_definition.clone(), &overrides)?;
+
+    if command_name == "cluster-gateway-status" {
+        print_cluster_gateway_status(&cluster_name, &definition, &overrides)?;
+        return Ok(Some(0));
+    }
+    if command_name == "cluster-gateway-explain" {
+        return run_cluster_gateway_explain(&config, &cluster_name, &definition, &overrides).await;
+    }
 
     if definition.gateway_mode == ClusterGatewayMode::Direct {
         return Ok(None);
     }
 
-    let candidates = ordered_gateway_candidates_for_cluster(&cluster_name, definition)?;
+    let candidates = ordered_gateway_candidates_for_cluster(&cluster_name, &definition)?;
     tracing::info!(
         event = "cluster_gateway_selection_start",
         cluster = %cluster_name,
@@ -3076,8 +3107,9 @@ pub(super) async fn maybe_run_cluster_plugin_command_via_gateway(
             candidates: &candidates,
             plugin_id,
             command_name,
-            arguments,
+            arguments: &overrides.passthrough_arguments,
             respect_cooldown: definition.gateway_mode == ClusterGatewayMode::Auto,
+            no_failover: overrides.no_failover,
         },
         &mut failures,
     )
@@ -3100,8 +3132,9 @@ pub(super) async fn maybe_run_cluster_plugin_command_via_gateway(
                 candidates: &candidates,
                 plugin_id,
                 command_name,
-                arguments,
+                arguments: &overrides.passthrough_arguments,
                 respect_cooldown: false,
+                no_failover: overrides.no_failover,
             },
             &mut failures,
         )
@@ -3178,6 +3211,10 @@ async fn run_gateway_candidate_batch(
                 });
             }
         }
+
+        if request.no_failover {
+            break;
+        }
     }
     Ok(GatewayBatchOutcome::Exhausted { attempted })
 }
@@ -3204,6 +3241,9 @@ fn resolve_cluster_name_for_gateway(
     let explicit = match command_name {
         "cluster-up" => first_positional_argument(arguments),
         "cluster-events" => cluster_flag,
+        "cluster-gateway-status" | "cluster-gateway-explain" => {
+            cluster_flag.or_else(|| first_positional_argument(arguments))
+        }
         "cluster-pane-retry" => {
             if cluster_flag.is_none() && settings.clusters.len() > 1 {
                 anyhow::bail!(
@@ -3444,6 +3484,226 @@ fn format_gateway_failures(failures: &[GatewayAttemptFailure]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn parse_gateway_overrides(arguments: &[String]) -> Result<GatewayCommandOverrides> {
+    let mut overrides = GatewayCommandOverrides::default();
+    let mut index = 0usize;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--gateway-no-failover" {
+            overrides.no_failover = true;
+            index += 1;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--gateway=") {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("--gateway requires a non-empty target value");
+            }
+            overrides.gateway_target = Some(trimmed.to_string());
+            index += 1;
+            continue;
+        }
+        if argument == "--gateway" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| anyhow::anyhow!("--gateway requires a target value"))?
+                .trim()
+                .to_string();
+            if value.is_empty() || value.starts_with('-') {
+                anyhow::bail!("--gateway requires a non-empty target value");
+            }
+            overrides.gateway_target = Some(value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--gateway-mode=") {
+            overrides.gateway_mode = Some(parse_gateway_mode_value(value)?);
+            index += 1;
+            continue;
+        }
+        if argument == "--gateway-mode" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| anyhow::anyhow!("--gateway-mode requires a value"))?;
+            overrides.gateway_mode = Some(parse_gateway_mode_value(value)?);
+            index += 2;
+            continue;
+        }
+        overrides.passthrough_arguments.push(argument.clone());
+        index += 1;
+    }
+    Ok(overrides)
+}
+
+fn parse_gateway_mode_value(value: &str) -> Result<ClusterGatewayMode> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "auto" => Ok(ClusterGatewayMode::Auto),
+        "direct" => Ok(ClusterGatewayMode::Direct),
+        "pinned" => Ok(ClusterGatewayMode::Pinned),
+        _ => anyhow::bail!("unsupported gateway mode '{value}' (expected auto|direct|pinned)"),
+    }
+}
+
+fn apply_gateway_overrides(
+    mut definition: ClusterGatewayDefinition,
+    overrides: &GatewayCommandOverrides,
+) -> Result<ClusterGatewayDefinition> {
+    if let Some(mode) = overrides.gateway_mode {
+        definition.gateway_mode = mode;
+    }
+    if let Some(target) = overrides.gateway_target.as_ref() {
+        definition.gateway_mode = ClusterGatewayMode::Pinned;
+        definition.gateway_target = Some(target.clone());
+        definition.gateway_candidates = vec![target.clone()];
+    }
+    if definition.gateway_mode == ClusterGatewayMode::Pinned
+        && definition
+            .gateway_target
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    {
+        anyhow::bail!("gateway_mode='pinned' requires gateway_target or --gateway");
+    }
+    Ok(definition)
+}
+
+fn print_cluster_gateway_status(
+    cluster_name: &str,
+    definition: &ClusterGatewayDefinition,
+    overrides: &GatewayCommandOverrides,
+) -> Result<()> {
+    let candidates = ordered_gateway_candidates_for_cluster(cluster_name, definition)?;
+    let preferred = preferred_gateway_candidate(cluster_name);
+    println!(
+        "cluster gateway status: cluster='{cluster_name}' mode={:?} no_failover={}",
+        definition.gateway_mode, overrides.no_failover
+    );
+    if overrides.gateway_mode.is_some() || overrides.gateway_target.is_some() {
+        println!(
+            "overrides: mode={:?} gateway={:?}",
+            overrides.gateway_mode, overrides.gateway_target
+        );
+    }
+    println!("candidates:");
+    for candidate in candidates {
+        let preferred_marker = preferred.as_ref().is_some_and(|value| value == &candidate);
+        let cooldown = gateway_cooldown_remaining_ms(cluster_name, &candidate);
+        let suffix = if preferred_marker {
+            "preferred"
+        } else {
+            "normal"
+        };
+        match cooldown {
+            Some(ms) => println!("  - {candidate} [{suffix}] cooldown_ms={ms}"),
+            None => println!("  - {candidate} [{suffix}]"),
+        }
+    }
+    Ok(())
+}
+
+async fn run_cluster_gateway_explain(
+    config: &BmuxConfig,
+    cluster_name: &str,
+    definition: &ClusterGatewayDefinition,
+    overrides: &GatewayCommandOverrides,
+) -> Result<Option<u8>> {
+    let candidates = ordered_gateway_candidates_for_cluster(cluster_name, definition)?;
+    let preferred = preferred_gateway_candidate(cluster_name);
+    println!(
+        "cluster gateway explain: cluster='{cluster_name}' mode={:?} no_failover={}",
+        definition.gateway_mode, overrides.no_failover
+    );
+
+    for candidate in &candidates {
+        let cooldown = gateway_cooldown_remaining_ms(cluster_name, candidate);
+        let probe = probe_gateway_candidate(config, candidate, cluster_name).await;
+        let preferred_marker = preferred.as_ref().is_some_and(|value| value == candidate);
+        println!(
+            "  - candidate={candidate} preferred={} cooldown_ms={} ok={} reason={} latency_ms={} detail={}",
+            preferred_marker,
+            cooldown.unwrap_or(0),
+            probe.ok,
+            probe.reason_code,
+            probe.latency_ms,
+            probe.detail
+        );
+    }
+
+    let status_arguments = vec![cluster_name.to_string()];
+    let mut failures = Vec::new();
+    let outcome = run_gateway_candidate_batch(
+        GatewayBatchRequest {
+            config,
+            cluster_name,
+            candidates: &candidates,
+            plugin_id: "bmux.cluster",
+            command_name: "cluster-status",
+            arguments: &status_arguments,
+            respect_cooldown: definition.gateway_mode == ClusterGatewayMode::Auto,
+            no_failover: overrides.no_failover,
+        },
+        &mut failures,
+    )
+    .await?;
+
+    match outcome {
+        GatewayBatchOutcome::Success(_) => {
+            println!("selection result: at least one candidate is executable");
+            Ok(Some(0))
+        }
+        GatewayBatchOutcome::Exhausted { .. } => {
+            println!("selection result: no executable gateway candidate");
+            println!("failures: {}", format_gateway_failures(&failures));
+            Ok(Some(1))
+        }
+    }
+}
+
+async fn probe_gateway_candidate(
+    config: &BmuxConfig,
+    candidate: &str,
+    cluster_name: &str,
+) -> GatewayProbeResult {
+    let started = Instant::now();
+    let result = run_plugin_command_on_target(
+        config,
+        candidate,
+        "bmux.cluster",
+        "cluster-status",
+        &[cluster_name.to_string()],
+    )
+    .await;
+    match result {
+        Ok(_) => GatewayProbeResult {
+            ok: true,
+            reason_code: "ok",
+            detail: "gateway command bridge reachable".to_string(),
+            latency_ms: started.elapsed().as_millis(),
+        },
+        Err(error) => {
+            let classified = classify_gateway_error(&error);
+            GatewayProbeResult {
+                ok: false,
+                reason_code: classified.0,
+                detail: classified.1,
+                latency_ms: started.elapsed().as_millis(),
+            }
+        }
+    }
+}
+
+fn gateway_cooldown_remaining_ms(cluster_name: &str, candidate: &str) -> Option<u128> {
+    let state_map = cluster_gateway_state_map().lock().ok()?;
+    let state = state_map.get(cluster_name)?;
+    let until = state.cooldown_until.get(candidate)?;
+    if *until <= Instant::now() {
+        return None;
+    }
+    Some((*until - Instant::now()).as_millis())
 }
 
 #[cfg(test)]
@@ -5633,6 +5893,42 @@ mod tests {
         )
         .expect_err("ambiguous host mapping should hard fail");
         assert!(error.to_string().contains("matches multiple clusters"));
+    }
+
+    #[test]
+    fn resolve_cluster_name_for_gateway_status_accepts_positional_cluster() {
+        let settings = ClusterGatewaySettings {
+            clusters: BTreeMap::from([("prod".to_string(), ClusterGatewayDefinition::default())]),
+        };
+
+        let cluster = resolve_cluster_name_for_gateway(
+            "cluster-gateway-status",
+            &["prod".to_string()],
+            &settings,
+        )
+        .expect("gateway status positional cluster should resolve");
+        assert_eq!(cluster.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn parse_gateway_overrides_strips_gateway_flags() {
+        let overrides = parse_gateway_overrides(&[
+            "--gateway".to_string(),
+            "db-b".to_string(),
+            "--gateway-mode=auto".to_string(),
+            "--gateway-no-failover".to_string(),
+            "--cluster".to_string(),
+            "prod".to_string(),
+        ])
+        .expect("gateway overrides should parse");
+
+        assert_eq!(overrides.gateway_target.as_deref(), Some("db-b"));
+        assert_eq!(overrides.gateway_mode, Some(ClusterGatewayMode::Auto));
+        assert!(overrides.no_failover);
+        assert_eq!(
+            overrides.passthrough_arguments,
+            vec!["--cluster".to_string(), "prod".to_string()]
+        );
     }
 
     #[test]

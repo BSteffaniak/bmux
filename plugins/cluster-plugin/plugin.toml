@@ -11,6 +11,8 @@ owns_namespaces = [
     "cluster-pane-new",
     "cluster-pane-move",
     "cluster-pane-retry",
+    "cluster-gateway-status",
+    "cluster-gateway-explain",
 ]
 provided_capabilities = [
     "bmux.server_clusters.read",
@@ -178,6 +180,90 @@ name       = "cluster"
 position   = 0
 required   = false
 value_name = "CLUSTER"
+
+[[commands]]
+aliases       = [["cluster", "gateway", "status"]]
+expose_in_cli = true
+name          = "cluster-gateway-status"
+path          = ["cluster-gateway-status"]
+summary       = "Show cluster gateway selection state"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster_ref"
+position   = 0
+required   = false
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
+
+[[commands]]
+aliases       = [["cluster", "gateway", "explain"]]
+expose_in_cli = true
+name          = "cluster-gateway-explain"
+path          = ["cluster-gateway-explain"]
+summary       = "Explain gateway candidate selection"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster_ref"
+position   = 0
+required   = false
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
 
 [[commands]]
 aliases       = [["cluster", "pane", "new"]]

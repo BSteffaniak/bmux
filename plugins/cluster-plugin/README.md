@@ -24,6 +24,9 @@ Current scope:
 - Panes transition to `ready` only after post-launch health verification succeeds
 - `cluster pane retry` supports probe retry policy controls (`--retries`, `--on-failure=abort|continue|prompt`)
 - `cluster pane new|move|retry` accept `--cluster` for deterministic gateway routing; in multi-cluster layouts, commands hard-fail when cluster inference is ambiguous
+- Gateway overrides are available on cluster commands: `--gateway`, `--gateway-mode=auto|direct|pinned`, and `--gateway-no-failover`
+- `cluster gateway status` reports effective gateway mode, candidate order, preferred gateway cache, and cooldown state
+- `cluster gateway explain` probes candidates and explains why selection would succeed/fail
 - Cluster service interfaces are implemented for query/command/event-list integrations
 
 ## Failure Semantics
@@ -41,6 +44,7 @@ Current scope:
   - `pinned`: require a single configured `gateway_target`.
 - In `auto`, candidates come from `gateway_candidates` when provided; otherwise they fall back to cluster `targets`.
 - If every gateway candidate fails, cluster command execution hard-fails (no silent direct fallback).
+- Auto mode tracks a short-lived last-known-good gateway cache and temporary failure cooldown to reduce flap/retry churn.
 
 Example:
 
@@ -62,6 +66,8 @@ gateway_mode = "auto"
 - `cluster pane new`
 - `cluster pane move`
 - `cluster pane retry`
+- `cluster gateway status`
+- `cluster gateway explain`
 
 ## Services
 
