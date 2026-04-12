@@ -247,7 +247,7 @@ impl ProcessPluginRuntime {
                     command = self.command,
                     timeout_ms = timeout.as_millis(),
                     metrics = ?self.metrics.snapshot(),
-                    "[bmux-runtime-fault:one-shot-timeout] process runtime one-shot invocation timed out"
+                    "[bmux-runtime-fault-json]{{\"kind\":\"one-shot-timeout\"}} [bmux-runtime-fault:one-shot-timeout] process runtime one-shot invocation timed out"
                 );
                 return Err(PluginError::ProcessPluginTimeout {
                     plugin_id: plugin_id.to_string(),
@@ -328,7 +328,7 @@ impl ProcessPluginRuntime {
                         plugin_id,
                         command = self.command,
                         metrics = ?self.metrics.snapshot(),
-                        "[bmux-runtime-fault:persistent-respawn] persistent process worker exited; respawning"
+                        "[bmux-runtime-fault-json]{{\"kind\":\"persistent-respawn\"}} [bmux-runtime-fault:persistent-respawn] persistent process worker exited; respawning"
                     );
                     Self::reset_persistent_worker(&mut guard, false);
                     recovered_once = true;
@@ -357,7 +357,7 @@ impl ProcessPluginRuntime {
                         command = self.command,
                         error = %error,
                         metrics = ?self.metrics.snapshot(),
-                        "[bmux-runtime-fault:persistent-retry] persistent process worker write failed; recycling worker"
+                        "[bmux-runtime-fault-json]{{\"kind\":\"persistent-retry\"}} [bmux-runtime-fault:persistent-retry] persistent process worker write failed; recycling worker"
                     );
                     Self::reset_persistent_worker(&mut guard, true);
                     recovered_once = true;
@@ -389,7 +389,7 @@ impl ProcessPluginRuntime {
                                 command = self.command,
                                 error = %error,
                                 metrics = ?self.metrics.snapshot(),
-                                "[bmux-runtime-fault:persistent-timeout] persistent process worker read timed out; recycling worker"
+                                "[bmux-runtime-fault-json]{{\"kind\":\"persistent-timeout\"}} [bmux-runtime-fault:persistent-timeout] persistent process worker read timed out; recycling worker"
                             );
                         } else {
                             warn!(
@@ -397,7 +397,7 @@ impl ProcessPluginRuntime {
                                 command = self.command,
                                 error = %error,
                                 metrics = ?self.metrics.snapshot(),
-                                "[bmux-runtime-fault:persistent-retry] persistent process worker read failed; recycling worker"
+                                "[bmux-runtime-fault-json]{{\"kind\":\"persistent-retry\"}} [bmux-runtime-fault:persistent-retry] persistent process worker read failed; recycling worker"
                             );
                         }
                         Self::reset_persistent_worker(&mut guard, true);

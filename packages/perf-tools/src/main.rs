@@ -36,7 +36,7 @@ fn run() -> Result<(), String> {
 fn usage() -> &'static str {
     "bmux-perf-tools commands:
   sample --iterations N --allow-nonzero 0|1 --out-json PATH -- <command...>
-  report-latency --input PATH [--max-p95-ms N] [--max-p99-ms N] [--max-avg-ms N]
+  report-latency --input PATH [--max-p95-ms N] [--max-p99-ms N] [--max-avg-ms N] [--max-steady-p95-ms N] [--max-steady-p99-ms N] [--max-steady-avg-ms N]
   report-faults --input PATH [--max-runtime-retries N] [--max-runtime-respawns N] [--max-runtime-timeouts N]
   report-json --input PATH --output PATH [threshold flags]
   discover-run-candidate --bmux-bin PATH"
@@ -47,6 +47,9 @@ struct LatencyThresholds {
     max_p95_ms: Option<f64>,
     max_p99_ms: Option<f64>,
     max_avg_ms: Option<f64>,
+    max_steady_p95_ms: Option<f64>,
+    max_steady_p99_ms: Option<f64>,
+    max_steady_avg_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -64,6 +67,13 @@ struct LatencyStats {
     p99: f64,
     avg: f64,
     max: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LatencyBreakdown {
+    startup_ms: f64,
+    overall: LatencyStats,
+    steady_state: Option<LatencyStats>,
 }
 
 fn run_sample(args: Vec<String>) -> Result<(), String> {
@@ -172,6 +182,9 @@ fn run_report_latency(args: Vec<String>) -> Result<(), String> {
     let mut max_p95_ms = None;
     let mut max_p99_ms = None;
     let mut max_avg_ms = None;
+    let mut max_steady_p95_ms = None;
+    let mut max_steady_p99_ms = None;
+    let mut max_steady_avg_ms = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -204,6 +217,27 @@ fn run_report_latency(args: Vec<String>) -> Result<(), String> {
                 max_avg_ms = Some(parse_u64(value, "--max-avg-ms")? as f64);
                 index += 2;
             }
+            "--max-steady-p95-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--max-steady-p95-ms requires a value".to_string());
+                };
+                max_steady_p95_ms = Some(parse_u64(value, "--max-steady-p95-ms")? as f64);
+                index += 2;
+            }
+            "--max-steady-p99-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--max-steady-p99-ms requires a value".to_string());
+                };
+                max_steady_p99_ms = Some(parse_u64(value, "--max-steady-p99-ms")? as f64);
+                index += 2;
+            }
+            "--max-steady-avg-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--max-steady-avg-ms requires a value".to_string());
+                };
+                max_steady_avg_ms = Some(parse_u64(value, "--max-steady-avg-ms")? as f64);
+                index += 2;
+            }
             other => {
                 return Err(format!("unknown argument for report-latency: {other}"));
             }
@@ -212,20 +246,31 @@ fn run_report_latency(args: Vec<String>) -> Result<(), String> {
 
     let input = input.ok_or_else(|| "--input is required".to_string())?;
     let payload = read_json_file(&input)?;
-    let values = parse_samples_ms(&payload)?;
-    let stats = compute_latency_stats(&values);
+    let samples = parse_samples_ms(&payload)?;
+    let breakdown = compute_latency_breakdown(&samples);
+    let stats = breakdown.overall;
 
     println!(
         "latency_ms min={:.3} p50={:.3} p95={:.3} p99={:.3} avg={:.3} max={:.3}",
         stats.min, stats.p50, stats.p95, stats.p99, stats.avg, stats.max
     );
+    println!("latency_startup_ms value={:.3}", breakdown.startup_ms);
+    if let Some(steady) = breakdown.steady_state {
+        println!(
+            "latency_steady_ms min={:.3} p50={:.3} p95={:.3} p99={:.3} avg={:.3} max={:.3}",
+            steady.min, steady.p50, steady.p95, steady.p99, steady.avg, steady.max
+        );
+    }
 
     let violations = evaluate_latency_thresholds(
-        stats,
+        breakdown,
         LatencyThresholds {
             max_p95_ms,
             max_p99_ms,
             max_avg_ms,
+            max_steady_p95_ms,
+            max_steady_p99_ms,
+            max_steady_avg_ms,
         },
     );
 
@@ -350,6 +395,30 @@ fn run_report_json(args: Vec<String>) -> Result<(), String> {
                 latency_thresholds.max_avg_ms = Some(parse_u64(value, "--max-avg-ms")? as f64);
                 index += 2;
             }
+            "--max-steady-p95-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--max-steady-p95-ms requires a value".to_string());
+                };
+                latency_thresholds.max_steady_p95_ms =
+                    Some(parse_u64(value, "--max-steady-p95-ms")? as f64);
+                index += 2;
+            }
+            "--max-steady-p99-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--max-steady-p99-ms requires a value".to_string());
+                };
+                latency_thresholds.max_steady_p99_ms =
+                    Some(parse_u64(value, "--max-steady-p99-ms")? as f64);
+                index += 2;
+            }
+            "--max-steady-avg-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--max-steady-avg-ms requires a value".to_string());
+                };
+                latency_thresholds.max_steady_avg_ms =
+                    Some(parse_u64(value, "--max-steady-avg-ms")? as f64);
+                index += 2;
+            }
             "--max-runtime-retries" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err("--max-runtime-retries requires a value".to_string());
@@ -383,15 +452,18 @@ fn run_report_json(args: Vec<String>) -> Result<(), String> {
     let input = input.ok_or_else(|| "--input is required".to_string())?;
     let output = output.ok_or_else(|| "--output is required".to_string())?;
     let payload = read_json_file(&input)?;
-    let values = parse_samples_ms(&payload)?;
+    let samples = parse_samples_ms(&payload)?;
     let faults = parse_runtime_fault_counts(&payload)?;
-    let stats = compute_latency_stats(&values);
+    let breakdown = compute_latency_breakdown(&samples);
+    let stats = breakdown.overall;
 
     let mut violations = Vec::new();
-    violations.extend(evaluate_latency_thresholds(stats, latency_thresholds));
+    violations.extend(evaluate_latency_thresholds(breakdown, latency_thresholds));
     violations.extend(evaluate_fault_thresholds(faults, fault_thresholds));
 
     let report = json!({
+        "sample_count": samples.len(),
+        "startup_ms": breakdown.startup_ms,
         "latency_ms": {
             "min": stats.min,
             "p50": stats.p50,
@@ -400,6 +472,16 @@ fn run_report_json(args: Vec<String>) -> Result<(), String> {
             "avg": stats.avg,
             "max": stats.max,
         },
+        "steady_state_ms": breakdown.steady_state.map(|steady| {
+            json!({
+                "min": steady.min,
+                "p50": steady.p50,
+                "p95": steady.p95,
+                "p99": steady.p99,
+                "avg": steady.avg,
+                "max": steady.max,
+            })
+        }),
         "runtime_faults": {
             "retries": faults.retries,
             "respawns": faults.respawns,
@@ -409,6 +491,9 @@ fn run_report_json(args: Vec<String>) -> Result<(), String> {
             "max_p95_ms": latency_thresholds.max_p95_ms,
             "max_p99_ms": latency_thresholds.max_p99_ms,
             "max_avg_ms": latency_thresholds.max_avg_ms,
+            "max_steady_p95_ms": latency_thresholds.max_steady_p95_ms,
+            "max_steady_p99_ms": latency_thresholds.max_steady_p99_ms,
+            "max_steady_avg_ms": latency_thresholds.max_steady_avg_ms,
             "max_runtime_retries": fault_thresholds.max_runtime_retries,
             "max_runtime_respawns": fault_thresholds.max_runtime_respawns,
             "max_runtime_timeouts": fault_thresholds.max_runtime_timeouts,
@@ -512,6 +597,11 @@ struct RuntimeFaultCounts {
 }
 
 fn count_runtime_faults(stderr: &str) -> RuntimeFaultCounts {
+    let json_counts = count_runtime_faults_from_json_markers(stderr);
+    if json_counts.retries + json_counts.respawns + json_counts.timeouts > 0 {
+        return json_counts;
+    }
+
     let token_retries = count_occurrences(stderr, "[bmux-runtime-fault:persistent-retry]");
     let token_respawns = count_occurrences(stderr, "[bmux-runtime-fault:persistent-respawn]");
     let token_timeouts = count_occurrences(stderr, "[bmux-runtime-fault:persistent-timeout]")
@@ -541,6 +631,55 @@ fn count_runtime_faults(stderr: &str) -> RuntimeFaultCounts {
     }
 }
 
+fn count_runtime_faults_from_json_markers(stderr: &str) -> RuntimeFaultCounts {
+    let mut counts = RuntimeFaultCounts::default();
+    for line in stderr.lines() {
+        if let Some(payload) = extract_json_marker_payload(line) {
+            let Ok(value) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            let Some(kind) = value.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            match kind {
+                "persistent-retry" => counts.retries += 1,
+                "persistent-respawn" => counts.respawns += 1,
+                "persistent-timeout" | "one-shot-timeout" => counts.timeouts += 1,
+                _ => {}
+            }
+        }
+    }
+    counts
+}
+
+fn extract_json_marker_payload(line: &str) -> Option<&str> {
+    const PREFIX: &str = "[bmux-runtime-fault-json]";
+    let marker_index = line.find(PREFIX)?;
+    let after_prefix = &line[marker_index + PREFIX.len()..];
+    if !after_prefix.starts_with('{') {
+        return None;
+    }
+
+    let mut depth = 0_u32;
+    for (idx, ch) in after_prefix.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&after_prefix[..=idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn parse_u64(value: &str, flag: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
@@ -556,25 +695,26 @@ fn parse_samples_ms(payload: &Value) -> Result<Vec<f64>, String> {
         return Err("no samples collected".to_string());
     }
 
-    let mut values = samples
+    samples
         .iter()
         .map(|value| {
             value
                 .as_f64()
                 .ok_or_else(|| "samples_ms contains non-number".to_string())
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    values.sort_by(f64::total_cmp);
-    Ok(values)
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn compute_latency_stats(values: &[f64]) -> LatencyStats {
-    let min = values[0];
-    let max = values[values.len() - 1];
-    let p50 = percentile_nearest_rank(values, 50.0);
-    let p95 = percentile_nearest_rank(values, 95.0);
-    let p99 = percentile_nearest_rank(values, 99.0);
-    let avg = values.iter().sum::<f64>() / values.len() as f64;
+    let mut sorted_values = values.to_vec();
+    sorted_values.sort_by(f64::total_cmp);
+
+    let min = sorted_values[0];
+    let max = sorted_values[sorted_values.len() - 1];
+    let p50 = percentile_nearest_rank(&sorted_values, 50.0);
+    let p95 = percentile_nearest_rank(&sorted_values, 95.0);
+    let p99 = percentile_nearest_rank(&sorted_values, 99.0);
+    let avg = sorted_values.iter().sum::<f64>() / sorted_values.len() as f64;
     LatencyStats {
         min,
         p50,
@@ -582,6 +722,21 @@ fn compute_latency_stats(values: &[f64]) -> LatencyStats {
         p99,
         avg,
         max,
+    }
+}
+
+fn compute_latency_breakdown(samples: &[f64]) -> LatencyBreakdown {
+    let startup_ms = samples[0];
+    let overall = compute_latency_stats(samples);
+    let steady_state = if samples.len() > 1 {
+        Some(compute_latency_stats(&samples[1..]))
+    } else {
+        None
+    };
+    LatencyBreakdown {
+        startup_ms,
+        overall,
+        steady_state,
     }
 }
 
@@ -610,7 +765,11 @@ fn parse_runtime_fault_counts(payload: &Value) -> Result<RuntimeFaultCounts, Str
     })
 }
 
-fn evaluate_latency_thresholds(stats: LatencyStats, limits: LatencyThresholds) -> Vec<String> {
+fn evaluate_latency_thresholds(
+    breakdown: LatencyBreakdown,
+    limits: LatencyThresholds,
+) -> Vec<String> {
+    let stats = breakdown.overall;
     let mut violations = Vec::new();
     if let Some(limit) = limits.max_p99_ms
         && stats.p99 > limit
@@ -626,6 +785,23 @@ fn evaluate_latency_thresholds(stats: LatencyStats, limits: LatencyThresholds) -
         && stats.avg > limit
     {
         violations.push(format!("avg {:.3} > {:.0}", stats.avg, limit));
+    }
+    if let Some(steady) = breakdown.steady_state {
+        if let Some(limit) = limits.max_steady_p99_ms
+            && steady.p99 > limit
+        {
+            violations.push(format!("steady_p99 {:.3} > {:.0}", steady.p99, limit));
+        }
+        if let Some(limit) = limits.max_steady_p95_ms
+            && steady.p95 > limit
+        {
+            violations.push(format!("steady_p95 {:.3} > {:.0}", steady.p95, limit));
+        }
+        if let Some(limit) = limits.max_steady_avg_ms
+            && steady.avg > limit
+        {
+            violations.push(format!("steady_avg {:.3} > {:.0}", steady.avg, limit));
+        }
     }
     violations
 }
@@ -668,9 +844,9 @@ fn percentile_nearest_rank(values: &[f64], percentile: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        LatencyThresholds, RuntimeFaultCounts, RuntimeFaultThresholds, count_occurrences,
-        count_runtime_faults, evaluate_fault_thresholds, evaluate_latency_thresholds, parse_u64,
-        percentile_nearest_rank,
+        LatencyBreakdown, LatencyStats, LatencyThresholds, RuntimeFaultCounts,
+        RuntimeFaultThresholds, count_occurrences, count_runtime_faults, evaluate_fault_thresholds,
+        evaluate_latency_thresholds, parse_u64, percentile_nearest_rank,
     };
 
     #[test]
@@ -713,6 +889,19 @@ mod tests {
     }
 
     #[test]
+    fn count_runtime_faults_prefers_json_markers() {
+        let stderr = "INFO [bmux-runtime-fault-json]{\"kind\":\"persistent-retry\"} details\nWARN [bmux-runtime-fault-json]{\"kind\":\"persistent-timeout\"} details\n";
+        assert_eq!(
+            count_runtime_faults(stderr),
+            RuntimeFaultCounts {
+                retries: 1,
+                respawns: 0,
+                timeouts: 1
+            }
+        );
+    }
+
+    #[test]
     fn count_runtime_faults_supports_legacy_messages() {
         let stderr = "persistent process worker write failed; recycling worker\nprocess runtime one-shot invocation timed out\n";
         assert_eq!(
@@ -728,21 +917,35 @@ mod tests {
     #[test]
     fn evaluate_threshold_helpers_emit_expected_violations() {
         let latency = evaluate_latency_thresholds(
-            super::LatencyStats {
-                min: 1.0,
-                p50: 2.0,
-                p95: 10.0,
-                p99: 20.0,
-                avg: 5.0,
-                max: 20.0,
+            LatencyBreakdown {
+                startup_ms: 10.0,
+                overall: LatencyStats {
+                    min: 1.0,
+                    p50: 2.0,
+                    p95: 10.0,
+                    p99: 20.0,
+                    avg: 5.0,
+                    max: 20.0,
+                },
+                steady_state: Some(LatencyStats {
+                    min: 1.0,
+                    p50: 2.0,
+                    p95: 9.0,
+                    p99: 11.0,
+                    avg: 4.5,
+                    max: 11.0,
+                }),
             },
             LatencyThresholds {
                 max_p95_ms: Some(9.0),
                 max_p99_ms: Some(19.0),
                 max_avg_ms: Some(4.0),
+                max_steady_p95_ms: Some(8.0),
+                max_steady_p99_ms: Some(10.0),
+                max_steady_avg_ms: Some(4.0),
             },
         );
-        assert_eq!(latency.len(), 3);
+        assert_eq!(latency.len(), 6);
 
         let faults = evaluate_fault_thresholds(
             RuntimeFaultCounts {

@@ -8,6 +8,9 @@ WARMUP="${WARMUP:-10}"
 MAX_P99_MS="${MAX_P99_MS:-}"
 MAX_P95_MS="${MAX_P95_MS:-}"
 MAX_AVG_MS="${MAX_AVG_MS:-}"
+MAX_STEADY_P99_MS="${MAX_STEADY_P99_MS:-}"
+MAX_STEADY_P95_MS="${MAX_STEADY_P95_MS:-}"
+MAX_STEADY_AVG_MS="${MAX_STEADY_AVG_MS:-}"
 MAX_RUNTIME_RETRIES="${MAX_RUNTIME_RETRIES:-}"
 MAX_RUNTIME_RESPAWNS="${MAX_RUNTIME_RESPAWNS:-}"
 MAX_RUNTIME_TIMEOUTS="${MAX_RUNTIME_TIMEOUTS:-}"
@@ -32,6 +35,9 @@ Options:
   --max-p99-ms N      Fail if measured p99 is above N milliseconds
   --max-p95-ms N      Fail if measured p95 is above N milliseconds
   --max-avg-ms N      Fail if measured average is above N milliseconds
+  --max-steady-p99-ms N  Fail if steady-state p99 is above N milliseconds
+  --max-steady-p95-ms N  Fail if steady-state p95 is above N milliseconds
+  --max-steady-avg-ms N  Fail if steady-state average is above N milliseconds
   --max-runtime-retries N   Fail if runtime retry warnings exceed N
   --max-runtime-respawns N  Fail if runtime respawn warnings exceed N
   --max-runtime-timeouts N  Fail if runtime timeout warnings exceed N
@@ -78,6 +84,18 @@ parse_args() {
 			;;
 		--max-avg-ms)
 			MAX_AVG_MS="$2"
+			shift 2
+			;;
+		--max-steady-p99-ms)
+			MAX_STEADY_P99_MS="$2"
+			shift 2
+			;;
+		--max-steady-p95-ms)
+			MAX_STEADY_P95_MS="$2"
+			shift 2
+			;;
+		--max-steady-avg-ms)
+			MAX_STEADY_AVG_MS="$2"
 			shift 2
 			;;
 		--allow-nonzero)
@@ -140,6 +158,15 @@ if [[ -n "$MAX_P95_MS" ]]; then
 fi
 if [[ -n "$MAX_AVG_MS" ]]; then
 	require_number "$MAX_AVG_MS" "--max-avg-ms"
+fi
+if [[ -n "$MAX_STEADY_P99_MS" ]]; then
+	require_number "$MAX_STEADY_P99_MS" "--max-steady-p99-ms"
+fi
+if [[ -n "$MAX_STEADY_P95_MS" ]]; then
+	require_number "$MAX_STEADY_P95_MS" "--max-steady-p95-ms"
+fi
+if [[ -n "$MAX_STEADY_AVG_MS" ]]; then
+	require_number "$MAX_STEADY_AVG_MS" "--max-steady-avg-ms"
 fi
 if [[ -n "$MAX_RUNTIME_RETRIES" ]]; then
 	require_number "$MAX_RUNTIME_RETRIES" "--max-runtime-retries"
@@ -226,6 +253,15 @@ fi
 if [[ -n "$MAX_AVG_MS" ]]; then
 	latency_cmd+=(--max-avg-ms "$MAX_AVG_MS")
 fi
+if [[ -n "$MAX_STEADY_P99_MS" ]]; then
+	latency_cmd+=(--max-steady-p99-ms "$MAX_STEADY_P99_MS")
+fi
+if [[ -n "$MAX_STEADY_P95_MS" ]]; then
+	latency_cmd+=(--max-steady-p95-ms "$MAX_STEADY_P95_MS")
+fi
+if [[ -n "$MAX_STEADY_AVG_MS" ]]; then
+	latency_cmd+=(--max-steady-avg-ms "$MAX_STEADY_AVG_MS")
+fi
 "${latency_cmd[@]}"
 
 fault_cmd=(
@@ -259,6 +295,15 @@ if [[ -n "$ARTIFACT_JSON" ]]; then
 	fi
 	if [[ -n "$MAX_AVG_MS" ]]; then
 		artifact_cmd+=(--max-avg-ms "$MAX_AVG_MS")
+	fi
+	if [[ -n "$MAX_STEADY_P99_MS" ]]; then
+		artifact_cmd+=(--max-steady-p99-ms "$MAX_STEADY_P99_MS")
+	fi
+	if [[ -n "$MAX_STEADY_P95_MS" ]]; then
+		artifact_cmd+=(--max-steady-p95-ms "$MAX_STEADY_P95_MS")
+	fi
+	if [[ -n "$MAX_STEADY_AVG_MS" ]]; then
+		artifact_cmd+=(--max-steady-avg-ms "$MAX_STEADY_AVG_MS")
 	fi
 	if [[ -n "$MAX_RUNTIME_RETRIES" ]]; then
 		artifact_cmd+=(--max-runtime-retries "$MAX_RUNTIME_RETRIES")
