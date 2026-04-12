@@ -2751,6 +2751,51 @@ mod tests {
             .expect("cluster settings should parse")
     }
 
+    struct ServiceTestHarness {
+        fixture: ServiceTestConfigDir,
+        plugin: ClusterPlugin,
+    }
+
+    impl ServiceTestHarness {
+        fn new() -> Self {
+            Self {
+                fixture: ServiceTestConfigDir::create(),
+                plugin: ClusterPlugin,
+            }
+        }
+
+        fn invoke<T: Serialize>(
+            &mut self,
+            interface_id: &str,
+            operation: &str,
+            request: &T,
+        ) -> ServiceResponse {
+            let context = service_test_context(
+                self.fixture
+                    .dir
+                    .to_str()
+                    .expect("config path should be utf-8"),
+                interface_id,
+                operation,
+                request,
+                Some(cluster_settings_value()),
+            );
+            self.plugin.invoke_service(context)
+        }
+
+        fn expect_error_code<T: Serialize>(
+            &mut self,
+            interface_id: &str,
+            operation: &str,
+            request: &T,
+            expected_code: &str,
+        ) {
+            let response = self.invoke(interface_id, operation, request);
+            let error = response.error.expect("service call should fail");
+            assert_eq!(error.code, expected_code);
+        }
+    }
+
     #[test]
     fn target_from_host_ref_accepts_string_variant() {
         let host = ClusterHostRef::Target("prod-a".to_string());
@@ -2759,17 +2804,12 @@ mod tests {
 
     #[test]
     fn invoke_service_list_clusters_returns_inventory_from_settings() {
-        let fixture = ServiceTestConfigDir::create();
-        let mut plugin = ClusterPlugin;
-        let context = service_test_context(
-            fixture.dir.to_str().expect("config path should be utf-8"),
+        let mut harness = ServiceTestHarness::new();
+        let response = harness.invoke(
             "cluster-query/v1",
             "list_clusters",
             &ClusterQueryListClustersRequest {},
-            Some(cluster_settings_value()),
         );
-
-        let response = plugin.invoke_service(context);
         assert!(response.error.is_none(), "list_clusters should succeed");
         let decoded: ClusterQueryListClustersResponse =
             bmux_plugin_sdk::decode_service_message(&response.payload)
@@ -2782,20 +2822,15 @@ mod tests {
 
     #[test]
     fn invoke_service_status_returns_degraded_when_probe_runtime_is_unavailable() {
-        let fixture = ServiceTestConfigDir::create();
-        let mut plugin = ClusterPlugin;
-        let context = service_test_context(
-            fixture.dir.to_str().expect("config path should be utf-8"),
+        let mut harness = ServiceTestHarness::new();
+        let response = harness.invoke(
             "cluster-query/v1",
             "status",
             &ClusterQueryStatusRequest {
                 selector: Some("prod".to_string()),
                 doctor: Some(false),
             },
-            Some(cluster_settings_value()),
         );
-
-        let response = plugin.invoke_service(context);
         assert!(response.error.is_none(), "status should succeed");
         let decoded: ClusterQueryStatusResponse =
             bmux_plugin_sdk::decode_service_message(&response.payload)
@@ -2811,106 +2846,66 @@ mod tests {
 
     #[test]
     fn invoke_service_up_maps_runtime_failures_to_up_failed() {
-        let fixture = ServiceTestConfigDir::create();
-        let mut plugin = ClusterPlugin;
-        let context = service_test_context(
-            fixture.dir.to_str().expect("config path should be utf-8"),
+        let mut harness = ServiceTestHarness::new();
+        harness.expect_error_code(
             "cluster-command/v1",
             "up",
             &ClusterCommandUpRequest {
                 cluster: "prod".to_string(),
                 hosts: Vec::new(),
             },
-            Some(cluster_settings_value()),
+            "up_failed",
         );
-
-        let response = plugin.invoke_service(context);
-        let error = response
-            .error
-            .expect("up should fail without host runtime bridge");
-        assert_eq!(error.code, "up_failed");
     }
 
     #[test]
     fn invoke_service_pane_new_maps_runtime_failures_to_pane_new_failed() {
-        let fixture = ServiceTestConfigDir::create();
-        let mut plugin = ClusterPlugin;
-        let context = service_test_context(
-            fixture.dir.to_str().expect("config path should be utf-8"),
+        let mut harness = ServiceTestHarness::new();
+        harness.expect_error_code(
             "cluster-command/v1",
             "pane_new",
             &ClusterCommandPaneNewRequest {
                 host: "db-a".to_string(),
                 name: None,
             },
-            Some(cluster_settings_value()),
+            "pane_new_failed",
         );
-
-        let response = plugin.invoke_service(context);
-        let error = response
-            .error
-            .expect("pane_new should fail without host runtime bridge");
-        assert_eq!(error.code, "pane_new_failed");
     }
 
     #[test]
     fn invoke_service_pane_retry_maps_runtime_failures_to_pane_retry_failed() {
-        let fixture = ServiceTestConfigDir::create();
-        let mut plugin = ClusterPlugin;
-        let context = service_test_context(
-            fixture.dir.to_str().expect("config path should be utf-8"),
+        let mut harness = ServiceTestHarness::new();
+        harness.expect_error_code(
             "cluster-command/v1",
             "pane_retry",
             &ClusterCommandPaneRetryRequest { pane: None },
-            Some(cluster_settings_value()),
+            "pane_retry_failed",
         );
-
-        let response = plugin.invoke_service(context);
-        let error = response
-            .error
-            .expect("pane_retry should fail without host runtime bridge");
-        assert_eq!(error.code, "pane_retry_failed");
     }
 
     #[test]
     fn invoke_service_pane_move_maps_runtime_failures_to_pane_move_failed() {
-        let fixture = ServiceTestConfigDir::create();
-        let mut plugin = ClusterPlugin;
-        let context = service_test_context(
-            fixture.dir.to_str().expect("config path should be utf-8"),
+        let mut harness = ServiceTestHarness::new();
+        harness.expect_error_code(
             "cluster-command/v1",
             "pane_move",
             &ClusterCommandPaneMoveRequest {
                 pane: None,
                 host: "db-b".to_string(),
             },
-            Some(cluster_settings_value()),
+            "pane_move_failed",
         );
-
-        let response = plugin.invoke_service(context);
-        let error = response
-            .error
-            .expect("pane_move should fail without host runtime bridge");
-        assert_eq!(error.code, "pane_move_failed");
     }
 
     #[test]
     fn invoke_service_events_list_maps_runtime_failures_to_connection_events_list_failed() {
-        let fixture = ServiceTestConfigDir::create();
-        let mut plugin = ClusterPlugin;
-        let context = service_test_context(
-            fixture.dir.to_str().expect("config path should be utf-8"),
+        let mut harness = ServiceTestHarness::new();
+        harness.expect_error_code(
             "cluster-connection-events/v1",
             "list",
             &ClusterConnectionEventsListRequest {},
-            Some(cluster_settings_value()),
+            "connection_events_list_failed",
         );
-
-        let response = plugin.invoke_service(context);
-        let error = response
-            .error
-            .expect("events list should fail without host runtime bridge");
-        assert_eq!(error.code, "connection_events_list_failed");
     }
 
     #[test]
