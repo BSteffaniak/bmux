@@ -208,7 +208,7 @@ fn doctor_failure_notes(report: &PluginDoctorReport) -> Vec<String> {
         );
     }
     notes.push(
-        "next: run 'bmux plugin doctor --json --strict' for machine-readable diagnostics"
+        "Next: run 'bmux plugin doctor --json --strict' for machine-readable diagnostics"
             .to_string(),
     );
     notes
@@ -231,7 +231,8 @@ fn doctor_next_steps(
         );
     }
     steps.push(
-        "run 'bmux plugin doctor --json --strict' for machine-readable diagnostics".to_string(),
+        "Next: run 'bmux plugin doctor --json --strict' for machine-readable diagnostics"
+            .to_string(),
     );
     steps
 }
@@ -556,6 +557,7 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("bmux plugin doctor --json --strict"))
         );
+        assert!(notes.iter().any(|note| note.starts_with("Next:")));
     }
 
     #[test]
@@ -564,6 +566,7 @@ mod tests {
         let notes = doctor_failure_notes(&report);
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("bmux plugin doctor --json --strict"));
+        assert!(notes[0].starts_with("Next:"));
     }
 
     #[test]
@@ -573,14 +576,14 @@ mod tests {
         assert!(strict_warning_only[0].contains("warnings are treated as failures"));
         assert_eq!(
             strict_warning_only[1],
-            "run 'bmux plugin doctor --json --strict' for machine-readable diagnostics"
+            "Next: run 'bmux plugin doctor --json --strict' for machine-readable diagnostics"
         );
 
         let hard_errors = doctor_next_steps(false, true, 1, 0);
         assert_eq!(hard_errors.len(), 1);
         assert_eq!(
             hard_errors[0],
-            "run 'bmux plugin doctor --json --strict' for machine-readable diagnostics"
+            "Next: run 'bmux plugin doctor --json --strict' for machine-readable diagnostics"
         );
 
         let healthy = doctor_next_steps(true, false, 0, 0);

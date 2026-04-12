@@ -79,13 +79,15 @@ fn format_plugin_command_run_error(
     command_name: &str,
     error: &dyn std::fmt::Display,
 ) -> String {
-    let base = format!("failed running plugin command '{plugin_id}:{command_name}': {error}");
-    if base.contains("session policy denied for this operation") {
+    let error_text = format!("{error}");
+    if error_text.contains("session policy denied for this operation") {
         format!(
-            "{base}\nHint: operation denied by an active policy provider. Verify policy state or run with an authorized principal."
+            "Problem: failed running plugin command '{plugin_id}:{command_name}'.\nWhy: {error_text}\nHint: operation denied by an active policy provider.\nNext: verify policy state or run with an authorized principal."
         )
     } else {
-        base
+        format!(
+            "Problem: failed running plugin command '{plugin_id}:{command_name}'.\nWhy: {error_text}"
+        )
     }
 }
 
@@ -203,5 +205,12 @@ mod tests {
         );
         assert!(message.contains("Known commands: one, two"));
         assert!(message.contains("Next: run 'bmux plugin run bmux.example --help'"));
+    }
+
+    #[test]
+    fn format_plugin_command_run_error_uses_problem_why_shape() {
+        let message = super::format_plugin_command_run_error("bmux.example", "run", &"boom");
+        assert!(message.contains("Problem:"));
+        assert!(message.contains("Why: boom"));
     }
 }

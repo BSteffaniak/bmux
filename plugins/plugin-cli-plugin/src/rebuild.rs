@@ -678,6 +678,8 @@ mod tests {
             ],
         );
         assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].crate_name, "bmux_windows_plugin");
+        assert_eq!(selected[1].crate_name, "bmux_permissions_plugin");
         assert_eq!(selected[0].reason, "selector");
         assert_eq!(selected[1].reason, "selector");
     }
