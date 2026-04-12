@@ -297,6 +297,15 @@ fn print_doctor_report(report: &PluginDoctorReport) {
     print_doctor_findings(report, DoctorSeverity::Error, "errors", true);
     print_doctor_findings(report, DoctorSeverity::Warning, "warnings", true);
     print_doctor_findings(report, DoctorSeverity::Info, "info", false);
+
+    if !report.healthy {
+        if report.strict_mode && report.error_count == 0 && report.warning_count > 0 {
+            println!(
+                "strict mode failed because warnings are treated as failures. Fix warnings above or run without --strict."
+            );
+        }
+        println!("next: run 'bmux plugin doctor --json --strict' for machine-readable diagnostics");
+    }
 }
 
 fn print_doctor_findings(
@@ -579,16 +588,7 @@ fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
         .find(|plugin| plugin.id == plugin_id)
     else {
         let suggestions = suggest_top_matches(&plugin_id, &available_ids, 3);
-        return if suggestions.is_empty() {
-            Err(format!(
-                "plugin '{plugin_id}' was not found. Run 'bmux plugin list --json' to inspect available plugins."
-            ))
-        } else {
-            Err(format!(
-                "plugin '{plugin_id}' was not found. Did you mean: {}? Run 'bmux plugin list --json' to inspect available plugins.",
-                suggestions.join(", ")
-            ))
-        };
+        return Err(format_plugin_not_found_error(&plugin_id, &suggestions));
     };
 
     if !target_plugin
@@ -602,16 +602,12 @@ fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
             .map(String::as_str)
             .collect::<Vec<_>>();
         let suggestions = suggest_top_matches(&command_name, &known, 3);
-        return if suggestions.is_empty() {
-            Err(format!(
-                "plugin '{plugin_id}' does not declare command '{command_name}'."
-            ))
-        } else {
-            Err(format!(
-                "plugin '{plugin_id}' does not declare command '{command_name}'. Did you mean: {}?",
-                suggestions.join(", ")
-            ))
-        };
+        return Err(format_plugin_command_not_found_error(
+            &plugin_id,
+            &command_name,
+            &known,
+            &suggestions,
+        ));
     }
 
     if plugin_id == context.plugin_id {
@@ -636,7 +632,7 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
     let bundled_plugins = discover_bundled_plugins(context)?;
 
     if matches!(options.mode, RebuildMode::List) {
-        emit_rebuild_selection_json(&options, resolved_base_ref, Vec::new())?;
+        emit_rebuild_selection_report(&options, resolved_base_ref, Vec::new())?;
         print_discovered_plugins(&bundled_plugins, &workspace_plugin_crates);
         return Ok(EXIT_OK);
     }
@@ -659,7 +655,7 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
 
     validate_selected_targets(&targets, &workspace_plugin_crates)?;
 
-    emit_rebuild_selection_json(&options, resolved_base_ref, targets.clone())?;
+    emit_rebuild_selection_report(&options, resolved_base_ref, targets.clone())?;
 
     if matches!(options.execution_mode, ExecutionMode::DryRun) {
         println!("dry-run enabled; skipping cargo build execution");
@@ -681,16 +677,34 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
     Ok(EXIT_OK)
 }
 
-fn emit_rebuild_selection_json(
+fn emit_rebuild_selection_report(
     options: &RebuildOptions,
     base_ref: Option<String>,
     targets: Vec<String>,
 ) -> Result<(), String> {
-    if !matches!(options.output_mode, OutputMode::Json) {
-        return Ok(());
+    let selected_by = build_rebuild_target_selection(options, &targets);
+    let report = RebuildSelectionReport {
+        profile: rebuild_profile_name(options.profile),
+        base_ref,
+        selected_targets: targets,
+        selected_by,
+        mode: rebuild_mode_name(options),
+    };
+    if matches!(options.output_mode, OutputMode::Json) {
+        let output = serde_json::to_string_pretty(&report)
+            .map_err(|error| format!("failed encoding rebuild json: {error}"))?;
+        println!("{output}");
+    } else {
+        print_rebuild_selection_text(&report);
     }
+    Ok(())
+}
 
-    let selected_by = targets
+fn build_rebuild_target_selection(
+    options: &RebuildOptions,
+    targets: &[String],
+) -> Vec<RebuildTargetSelection> {
+    targets
         .iter()
         .map(|crate_name| {
             let reason = if !options.selectors.is_empty() {
@@ -705,18 +719,27 @@ fn emit_rebuild_selection_json(
                 reason: reason.to_string(),
             }
         })
-        .collect::<Vec<_>>();
-    let report = RebuildSelectionReport {
-        profile: rebuild_profile_name(options.profile),
-        base_ref,
-        selected_targets: targets,
-        selected_by,
-        mode: rebuild_mode_name(options),
-    };
-    let output = serde_json::to_string_pretty(&report)
-        .map_err(|error| format!("failed encoding rebuild json: {error}"))?;
-    println!("{output}");
-    Ok(())
+        .collect::<Vec<_>>()
+}
+
+fn print_rebuild_selection_text(report: &RebuildSelectionReport) {
+    println!(
+        "rebuild selection: mode={} profile={} targets={}",
+        report.mode,
+        report.profile,
+        report.selected_targets.len()
+    );
+    if let Some(base_ref) = &report.base_ref {
+        println!("base ref: {base_ref}");
+    }
+    if report.selected_by.is_empty() {
+        println!("selected by: (none)");
+        return;
+    }
+    println!("selected by:");
+    for entry in &report.selected_by {
+        println!("- {} ({})", entry.crate_name, entry.reason);
+    }
 }
 
 fn validate_selected_targets(
@@ -1249,6 +1272,45 @@ fn format_plugin_command_run_error(
     }
 }
 
+fn format_plugin_not_found_error(plugin_id: &str, suggestions: &[String]) -> String {
+    if suggestions.is_empty() {
+        format!(
+            "plugin '{plugin_id}' was not found. Run 'bmux plugin list --json' to inspect available plugins."
+        )
+    } else {
+        format!(
+            "plugin '{plugin_id}' was not found. Did you mean: {}? Run 'bmux plugin list --json' to inspect available plugins.",
+            suggestions.join(", ")
+        )
+    }
+}
+
+fn format_plugin_command_not_found_error(
+    plugin_id: &str,
+    command_name: &str,
+    known: &[&str],
+    suggestions: &[String],
+) -> String {
+    let known_commands = if known.is_empty() {
+        "(none)".to_string()
+    } else {
+        known.join(", ")
+    };
+
+    let base = if suggestions.is_empty() {
+        format!("plugin '{plugin_id}' does not declare command '{command_name}'.")
+    } else {
+        format!(
+            "plugin '{plugin_id}' does not declare command '{command_name}'. Did you mean: {}?",
+            suggestions.join(", ")
+        )
+    };
+
+    format!(
+        "{base}\nKnown commands for '{plugin_id}': {known_commands}\nTry: bmux plugin run {plugin_id} <command> --help"
+    )
+}
+
 fn suggest_top_matches(target: &str, candidates: &[&str], limit: usize) -> Vec<String> {
     if candidates.is_empty() || limit == 0 {
         return Vec::new();
@@ -1303,8 +1365,9 @@ fn levenshtein(left: &str, right: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseSelector, RebuildMode, core_proxy_command_path, parse_rebuild_options,
-        suggest_top_matches,
+        BaseSelector, BuildProfile, RebuildMode, RebuildOptions, build_rebuild_target_selection,
+        core_proxy_command_path, format_plugin_command_not_found_error,
+        format_plugin_not_found_error, parse_rebuild_options, suggest_top_matches,
     };
 
     #[test]
@@ -1362,6 +1425,38 @@ mod tests {
         ])
         .expect_err("conflicting modes should error");
         assert!(error.contains("cannot be used together"));
+    }
+
+    #[test]
+    fn format_plugin_not_found_error_includes_next_step() {
+        let message = format_plugin_not_found_error("missing.plugin", &[]);
+        assert!(message.contains("Run 'bmux plugin list --json'"));
+    }
+
+    #[test]
+    fn format_plugin_command_not_found_error_includes_known_and_try_hint() {
+        let known = vec!["one", "two"];
+        let message = format_plugin_command_not_found_error(
+            "bmux.example",
+            "thr",
+            &known,
+            &["three".to_string()],
+        );
+        assert!(message.contains("Known commands for 'bmux.example': one, two"));
+        assert!(message.contains("Try: bmux plugin run bmux.example <command> --help"));
+    }
+
+    #[test]
+    fn build_rebuild_target_selection_marks_selector_reason() {
+        let options = RebuildOptions {
+            profile: BuildProfile::Debug,
+            selectors: vec!["bmux_windows_plugin".to_string()],
+            ..RebuildOptions::default()
+        };
+        let selected =
+            build_rebuild_target_selection(&options, &["bmux_windows_plugin".to_string()]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].reason, "selector");
     }
 }
 
