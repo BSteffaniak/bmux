@@ -10,4 +10,8 @@ pub enum MobileCoreError {
     TargetNotFound(String),
     #[error("connection {0} is not active")]
     ConnectionNotActive(String),
+    #[error("ssh backend is not configured")]
+    SshBackendUnavailable,
+    #[error("ssh connection failed: {0}")]
+    SshConnectionFailed(String),
 }

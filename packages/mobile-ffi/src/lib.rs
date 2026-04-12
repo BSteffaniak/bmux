@@ -11,7 +11,7 @@ use bmux_mobile_core::{
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct MobileApi {
     manager: Arc<Mutex<ConnectionManager>>,
 }

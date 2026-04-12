@@ -1,7 +1,11 @@
 use crate::error::{MobileCoreError, Result};
-use crate::target::{CanonicalTarget, TargetInput, TargetRecord, canonicalize_target};
+use crate::ssh::{SshBackend, parse_ssh_target};
+use crate::target::{
+    CanonicalTarget, TargetInput, TargetRecord, TargetTransport, canonicalize_target,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,16 +33,26 @@ pub struct ConnectionState {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ConnectionManager {
     targets: BTreeMap<Uuid, TargetRecord>,
     connections: BTreeMap<Uuid, ConnectionState>,
+    ssh_backend: Option<Arc<dyn SshBackend>>,
 }
 
 impl ConnectionManager {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_ssh_backend(ssh_backend: Arc<dyn SshBackend>) -> Self {
+        Self {
+            targets: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            ssh_backend: Some(ssh_backend),
+        }
     }
 
     /// Import a target into in-memory storage.
@@ -78,12 +92,22 @@ impl ConnectionManager {
     ///
     /// # Errors
     ///
-    /// Returns [`MobileCoreError::TargetNotFound`] when `target_id` is unknown.
+    /// Returns [`MobileCoreError::TargetNotFound`] when `target_id` is unknown,
+    /// [`MobileCoreError::SshBackendUnavailable`] for SSH targets when no embedded
+    /// backend is configured, and parsing/backend errors for invalid SSH targets.
     pub fn connect(&mut self, request: ConnectionRequest) -> Result<ConnectionState> {
-        if !self.targets.contains_key(&request.target_id) {
-            return Err(MobileCoreError::TargetNotFound(
-                request.target_id.to_string(),
-            ));
+        let target = self
+            .targets
+            .get(&request.target_id)
+            .ok_or_else(|| MobileCoreError::TargetNotFound(request.target_id.to_string()))?;
+
+        if target.transport == TargetTransport::Ssh {
+            let parsed = parse_ssh_target(&target.canonical_target.value)?;
+            let backend = self
+                .ssh_backend
+                .as_ref()
+                .ok_or(MobileCoreError::SshBackendUnavailable)?;
+            backend.open(&parsed)?;
         }
 
         let state = ConnectionState {
@@ -144,6 +168,7 @@ impl ConnectionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh::MockSshBackend;
 
     #[test]
     fn import_and_connect_round_trip() {
@@ -179,5 +204,45 @@ mod tests {
         });
 
         assert!(matches!(result, Err(MobileCoreError::TargetNotFound(_))));
+    }
+
+    #[test]
+    fn connect_ssh_requires_backend() {
+        let mut manager = ConnectionManager::new();
+        let target = manager
+            .import_target(&TargetInput {
+                source: "ssh://ops@prod.example.com:22".to_string(),
+                display_name: None,
+            })
+            .expect("target import should work");
+
+        let result = manager.connect(ConnectionRequest {
+            target_id: target.id,
+            session: None,
+        });
+        assert!(matches!(
+            result,
+            Err(MobileCoreError::SshBackendUnavailable)
+        ));
+    }
+
+    #[test]
+    fn connect_ssh_with_embedded_backend() {
+        let mut manager = ConnectionManager::with_ssh_backend(Arc::new(MockSshBackend));
+        let target = manager
+            .import_target(&TargetInput {
+                source: "ops@prod.example.com:2222".to_string(),
+                display_name: Some("prod-ssh".to_string()),
+            })
+            .expect("target import should work");
+
+        let connection = manager
+            .connect(ConnectionRequest {
+                target_id: target.id,
+                session: Some("main".to_string()),
+            })
+            .expect("ssh connection should start");
+
+        assert_eq!(connection.status, ConnectionStatus::Connecting);
     }
 }
