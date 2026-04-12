@@ -1,3 +1,4 @@
+use crate::suggest::suggest_top_matches;
 use crate::{
     BaseSelector, BuildProfile, BundledPlugin, DiffRangeMode, ExecutionMode, OutputMode,
     RebuildMode, RebuildOptions, RebuildSelectionReport, RebuildTargetSelection, WorkspaceFlag,
@@ -454,9 +455,24 @@ fn resolve_selector(
         .collect::<Vec<_>>()
         .join(", ");
     let known_crates = workspace_crates.join(", ");
+    let suggestions = suggest_top_matches(
+        selector,
+        bundled
+            .iter()
+            .map(|entry| entry.plugin_id.as_str())
+            .chain(bundled.iter().map(|entry| entry.short_name.as_str()))
+            .chain(workspace_crates.iter().map(String::as_str)),
+        3,
+    );
+
+    let hint = if suggestions.is_empty() {
+        String::new()
+    } else {
+        format!("\nHint: did you mean {}?", suggestions.join(", "))
+    };
 
     Err(format!(
-        "unknown plugin selector '{selector}'\nknown bundled ids: {known_ids}\nknown bundled short names: {known_short}\nknown workspace plugin crates: {known_crates}"
+        "Problem: unknown plugin selector '{selector}'.\nWhy: selector did not match a bundled plugin id, short name, or workspace plugin crate.{hint}\nKnown bundled ids: {known_ids}\nKnown bundled short names: {known_short}\nKnown workspace plugin crates: {known_crates}\nNext: run 'bmux plugin rebuild --list' to inspect selectable plugin targets."
     ))
 }
 
@@ -614,8 +630,8 @@ pub fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, Str
 
 #[cfg(test)]
 mod tests {
-    use super::{build_rebuild_target_selection, parse_rebuild_options};
-    use crate::{BaseSelector, BuildProfile, RebuildMode, RebuildOptions};
+    use super::{build_rebuild_target_selection, parse_rebuild_options, resolve_selector};
+    use crate::{BaseSelector, BuildProfile, BundledPlugin, RebuildMode, RebuildOptions};
 
     #[test]
     fn parse_rebuild_options_supports_base_and_against_master() {
@@ -658,5 +674,20 @@ mod tests {
             build_rebuild_target_selection(&options, &["bmux_windows_plugin".to_string()]);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].reason, "selector");
+    }
+
+    #[test]
+    fn resolve_selector_error_is_actionable_and_includes_next_step() {
+        let bundled = vec![BundledPlugin {
+            plugin_id: "bmux.windows".to_string(),
+            short_name: "windows-plugin".to_string(),
+            crate_name: "bmux_windows_plugin".to_string(),
+        }];
+        let workspace = vec!["bmux_windows_plugin".to_string()];
+        let error =
+            resolve_selector("windos", &bundled, &workspace).expect_err("selector should fail");
+        assert!(error.contains("Problem:"));
+        assert!(error.contains("Why:"));
+        assert!(error.contains("Next: run 'bmux plugin rebuild --list'"));
     }
 }

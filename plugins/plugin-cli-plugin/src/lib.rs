@@ -6,6 +6,7 @@ mod doctor;
 mod list_cmd;
 mod rebuild;
 mod run_cmd;
+mod suggest;
 
 use bmux_plugin::HostRuntimeApi;
 use bmux_plugin_sdk::{
