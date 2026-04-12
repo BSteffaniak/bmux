@@ -272,7 +272,7 @@ jobs:
           ./scripts/perf-plugin-runtime-matrix.sh \
             --iterations 8 \
             --warmup 2 \
-            --scale-plugin-count 120 \
+            --scale-profile medium \
             --artifact-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-scale"
 
       - name: Plugin perf artifact compare (informational)

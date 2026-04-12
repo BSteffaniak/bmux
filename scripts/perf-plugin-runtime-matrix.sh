@@ -11,6 +11,7 @@ WARMUP="${WARMUP:-5}"
 COLD_MODE="0"
 ARTIFACT_DIR="${ARTIFACT_DIR:-}"
 SCALE_PLUGIN_COUNT="${SCALE_PLUGIN_COUNT:-0}"
+SCALE_PROFILE="${SCALE_PROFILE:-}"
 
 usage() {
 	cat <<'USAGE'
@@ -25,6 +26,7 @@ Options:
   --cold              Run without warmup (sets warmup to 0)
   --artifact-dir DIR  Write per-scenario JSON artifact reports
   --scale-plugin-count N  Generate N synthetic plugin manifests for scale scenarios
+  --scale-profile NAME    Synthetic profile: small, medium, or large
   -h, --help          Show this help message
 USAGE
 }
@@ -63,6 +65,10 @@ parse_args() {
 			;;
 		--scale-plugin-count)
 			SCALE_PLUGIN_COUNT="$2"
+			shift 2
+			;;
+		--scale-profile)
+			SCALE_PROFILE="$2"
 			shift 2
 			;;
 		-h | --help)
@@ -122,6 +128,9 @@ run_case() {
 	if [[ "$SCALE_PLUGIN_COUNT" -gt 0 ]]; then
 		cmd+=(--scale-plugin-count "$SCALE_PLUGIN_COUNT")
 	fi
+	if [[ -n "$SCALE_PROFILE" ]]; then
+		cmd+=(--scale-profile "$SCALE_PROFILE")
+	fi
 	cmd+=(-- "${args[@]}")
 	"${cmd[@]}"
 }
@@ -171,6 +180,9 @@ run_case_allow_nonzero() {
 	if [[ "$SCALE_PLUGIN_COUNT" -gt 0 ]]; then
 		cmd+=(--scale-plugin-count "$SCALE_PLUGIN_COUNT")
 	fi
+	if [[ -n "$SCALE_PROFILE" ]]; then
+		cmd+=(--scale-profile "$SCALE_PROFILE")
+	fi
 	cmd+=(-- "${args[@]}")
 	"${cmd[@]}"
 }
@@ -183,6 +195,24 @@ parse_args "$@"
 require_number "$ITERATIONS" "--iterations"
 require_number "$WARMUP" "--warmup"
 require_number "$SCALE_PLUGIN_COUNT" "--scale-plugin-count"
+
+if [[ -n "$SCALE_PROFILE" ]]; then
+	case "$SCALE_PROFILE" in
+	small | medium | large) ;;
+	*)
+		echo "--scale-profile must be one of: small, medium, large" >&2
+		exit 2
+		;;
+	esac
+fi
+
+if [[ "$SCALE_PLUGIN_COUNT" -eq 0 && -n "$SCALE_PROFILE" ]]; then
+	case "$SCALE_PROFILE" in
+	small) SCALE_PLUGIN_COUNT=40 ;;
+	medium) SCALE_PLUGIN_COUNT=120 ;;
+	large) SCALE_PLUGIN_COUNT=300 ;;
+	esac
+fi
 
 if [[ "$COLD_MODE" == "1" ]]; then
 	WARMUP=0
@@ -217,6 +247,10 @@ fi
 if [[ ! -x "$BMUX_BIN" ]]; then
 	echo "bmux binary not executable: $BMUX_BIN" >&2
 	exit 2
+fi
+
+if [[ "$SCALE_PLUGIN_COUNT" -gt 0 ]]; then
+	echo "scale fixture enabled: count=$SCALE_PLUGIN_COUNT profile=${SCALE_PROFILE:-medium}"
 fi
 
 run_case "plugin list json" 250 350 250 350 plugin list --json

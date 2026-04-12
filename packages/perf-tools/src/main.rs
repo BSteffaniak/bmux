@@ -41,7 +41,7 @@ fn usage() -> &'static str {
   report-latency --input PATH [--max-p95-ms N] [--max-p99-ms N] [--max-avg-ms N] [--max-steady-p95-ms N] [--max-steady-p99-ms N] [--max-steady-avg-ms N]
   report-faults --input PATH [--max-runtime-retries N] [--max-runtime-respawns N] [--max-runtime-timeouts N]
   report-json --input PATH --output PATH [threshold flags]
-  prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N
+  prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
   compare-report --baseline PATH --candidate PATH [--warn-regression-ms N]
   discover-run-candidate --bmux-bin PATH"
 }
@@ -515,6 +515,7 @@ fn run_prepare_scale_fixture(args: Vec<String>) -> Result<(), String> {
     let mut config_dir = None;
     let mut plugin_root = None;
     let mut count = None;
+    let mut profile = "medium".to_string();
 
     let mut index = 0;
     while index < args.len() {
@@ -538,6 +539,16 @@ fn run_prepare_scale_fixture(args: Vec<String>) -> Result<(), String> {
                     return Err("--count requires a value".to_string());
                 };
                 count = Some(parse_u64(value, "--count")? as usize);
+                index += 2;
+            }
+            "--profile" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--profile requires a value".to_string());
+                };
+                if !matches!(value.as_str(), "small" | "medium" | "large") {
+                    return Err("--profile must be one of: small, medium, large".to_string());
+                }
+                profile = value.clone();
                 index += 2;
             }
             other => {
@@ -578,9 +589,7 @@ fn run_prepare_scale_fixture(args: Vec<String>) -> Result<(), String> {
             .map_err(|error| format!("failed creating fixture plugin dir: {error}"))?;
         let plugin_toml = plugin_dir.join("plugin.toml");
         let plugin_id = format!("bench.synthetic.{idx:04}");
-        let content = format!(
-            "execution_class = \"native_fast\"\nid = \"{plugin_id}\"\nname = \"Synthetic Perf Plugin {idx:04}\"\nversion = \"0.0.0\"\n"
-        );
+        let content = synthetic_plugin_manifest(&profile, &plugin_id, idx);
         fs::write(&plugin_toml, content).map_err(|error| {
             format!(
                 "failed writing fixture manifest {}: {error}",
@@ -597,13 +606,59 @@ fn run_prepare_scale_fixture(args: Vec<String>) -> Result<(), String> {
         .map_err(|error| format!("failed writing config {}: {error}", config_file.display()))?;
 
     println!(
-        "prepared synthetic plugin fixture: count={} plugin_root={} config={}",
+        "prepared synthetic plugin fixture: profile={} count={} plugin_root={} config={}",
+        profile,
         count,
         plugin_root,
         config_file.display()
     );
 
     Ok(())
+}
+
+fn synthetic_plugin_manifest(profile: &str, plugin_id: &str, idx: usize) -> String {
+    let mut out = String::new();
+    out.push_str("execution_class = \"native_fast\"\n");
+    out.push_str(&format!("id = \"{plugin_id}\"\n"));
+    out.push_str(&format!("name = \"Synthetic Perf Plugin {idx:04}\"\n"));
+    out.push_str("version = \"0.0.0\"\n");
+
+    match profile {
+        "small" => {
+            if idx.is_multiple_of(2) {
+                out.push_str("provided_capabilities = [\"bench.synthetic.read\"]\n");
+            }
+        }
+        "medium" => {
+            out.push_str("required_capabilities = [\"bmux.commands\"]\n");
+            out.push_str("provided_capabilities = [\"bench.synthetic.read\"]\n");
+            out.push_str("\n[[commands]]\n");
+            out.push_str("name = \"bench-status\"\n");
+            out.push_str("path = [\"bench\", \"status\"]\n");
+            out.push_str("summary = \"Synthetic bench status command\"\n");
+            out.push_str("expose_in_cli = false\n");
+        }
+        "large" => {
+            out.push_str("required_capabilities = [\"bmux.commands\", \"bmux.contexts.read\"]\n");
+            out.push_str(
+                "provided_capabilities = [\"bench.synthetic.read\", \"bench.synthetic.write\"]\n",
+            );
+            out.push_str("owns_namespaces = [\"bench\", \"synthetic\"]\n");
+            out.push_str("\n[[commands]]\n");
+            out.push_str("name = \"bench-status\"\n");
+            out.push_str("path = [\"bench\", \"status\"]\n");
+            out.push_str("summary = \"Synthetic bench status command\"\n");
+            out.push_str("expose_in_cli = false\n");
+            out.push_str("\n[[commands]]\n");
+            out.push_str("name = \"bench-run\"\n");
+            out.push_str("path = [\"bench\", \"run\"]\n");
+            out.push_str("summary = \"Synthetic bench run command\"\n");
+            out.push_str("expose_in_cli = false\n");
+        }
+        _ => {}
+    }
+
+    out
 }
 
 fn run_compare_report(args: Vec<String>) -> Result<(), String> {
@@ -1068,7 +1123,7 @@ mod tests {
         LatencyBreakdown, LatencyStats, LatencyThresholds, RuntimeFaultCounts,
         RuntimeFaultThresholds, count_occurrences, count_runtime_faults, evaluate_fault_thresholds,
         evaluate_latency_thresholds, parse_report_latency_summary, parse_u64,
-        percentile_nearest_rank,
+        percentile_nearest_rank, synthetic_plugin_manifest,
     };
     use serde_json::json;
 
@@ -1200,5 +1255,18 @@ mod tests {
         assert_eq!(summary.p95_ms, 20.0);
         assert_eq!(summary.p99_ms, 30.0);
         assert_eq!(summary.avg_ms, 15.0);
+    }
+
+    #[test]
+    fn synthetic_plugin_manifest_profile_shapes_are_distinct() {
+        let small = synthetic_plugin_manifest("small", "bench.synthetic.0001", 1);
+        let medium = synthetic_plugin_manifest("medium", "bench.synthetic.0001", 1);
+        let large = synthetic_plugin_manifest("large", "bench.synthetic.0001", 1);
+
+        assert!(small.contains("execution_class = \"native_fast\""));
+        assert!(!small.contains("[[commands]]"));
+        assert!(medium.contains("[[commands]]"));
+        assert!(large.contains("owns_namespaces"));
+        assert!(large.matches("[[commands]]").count() >= 2);
     }
 }

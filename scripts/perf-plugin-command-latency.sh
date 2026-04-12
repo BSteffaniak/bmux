@@ -20,6 +20,7 @@ BMUX_BIN="${BMUX_BIN:-}"
 BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
 ARTIFACT_JSON="${ARTIFACT_JSON:-}"
 SCALE_PLUGIN_COUNT="${SCALE_PLUGIN_COUNT:-0}"
+SCALE_PROFILE="${SCALE_PROFILE:-}"
 TARGET_ARGS=(plugin list --json)
 
 usage() {
@@ -44,6 +45,7 @@ Options:
   --max-runtime-timeouts N  Fail if runtime timeout warnings exceed N
   --artifact-json PATH      Write machine-readable JSON artifact report
   --scale-plugin-count N    Generate N synthetic plugin manifests for scale scenarios
+  --scale-profile NAME      Synthetic profile: small, medium, or large
   --allow-nonzero     Allow non-zero command exit status during sampling
   -h, --help          Show this help message
 
@@ -124,6 +126,10 @@ parse_args() {
 			SCALE_PLUGIN_COUNT="$2"
 			shift 2
 			;;
+		--scale-profile)
+			SCALE_PROFILE="$2"
+			shift 2
+			;;
 		--)
 			positional_mode=1
 			TARGET_ARGS=()
@@ -185,6 +191,24 @@ if [[ -n "$MAX_RUNTIME_TIMEOUTS" ]]; then
 fi
 require_number "$SCALE_PLUGIN_COUNT" "--scale-plugin-count"
 
+if [[ -n "$SCALE_PROFILE" ]]; then
+	case "$SCALE_PROFILE" in
+	small | medium | large) ;;
+	*)
+		echo "--scale-profile must be one of: small, medium, large" >&2
+		exit 2
+		;;
+	esac
+fi
+
+if [[ "$SCALE_PLUGIN_COUNT" -eq 0 && -n "$SCALE_PROFILE" ]]; then
+	case "$SCALE_PROFILE" in
+	small) SCALE_PLUGIN_COUNT=40 ;;
+	medium) SCALE_PLUGIN_COUNT=120 ;;
+	large) SCALE_PLUGIN_COUNT=300 ;;
+	esac
+fi
+
 if [[ "${#TARGET_ARGS[@]}" -eq 0 ]]; then
 	echo "expected bmux command args after --" >&2
 	usage
@@ -228,10 +252,17 @@ export TMPDIR="$SANDBOX/tmp"
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR" "$BMUX_STATE_DIR" "$BMUX_LOG_DIR" "$TMPDIR"
 
 if [[ "$SCALE_PLUGIN_COUNT" -gt 0 ]]; then
-	"$BMUX_PERF_TOOLS_BIN" prepare-scale-fixture \
-		--config-dir "$XDG_CONFIG_HOME/bmux" \
-		--plugin-root "$XDG_DATA_HOME/perf-scale-plugins" \
+	prepare_args=(
+		"$BMUX_PERF_TOOLS_BIN"
+		prepare-scale-fixture
+		--config-dir "$XDG_CONFIG_HOME/bmux"
+		--plugin-root "$XDG_DATA_HOME/perf-scale-plugins"
 		--count "$SCALE_PLUGIN_COUNT"
+	)
+	if [[ -n "$SCALE_PROFILE" ]]; then
+		prepare_args+=(--profile "$SCALE_PROFILE")
+	fi
+	"${prepare_args[@]}"
 fi
 
 echo "benchmarking: bmux ${TARGET_ARGS[*]}"

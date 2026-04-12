@@ -38,7 +38,17 @@ For changes under `plugins/**`:
 
 For scale-focused scenarios, generate synthetic manifests during sampling:
 
-- `./scripts/perf-plugin-runtime-matrix.sh --iterations 20 --warmup 5 --scale-plugin-count 200`
+- `./scripts/perf-plugin-runtime-matrix.sh --iterations 20 --warmup 5 --scale-profile small`
+- `./scripts/perf-plugin-runtime-matrix.sh --iterations 20 --warmup 5 --scale-profile medium`
+- `./scripts/perf-plugin-runtime-matrix.sh --iterations 20 --warmup 5 --scale-profile large`
+
+Scale profile defaults:
+
+- `small` -> 40 synthetic plugins
+- `medium` -> 120 synthetic plugins
+- `large` -> 300 synthetic plugins
+
+Use `--scale-plugin-count <N>` when you need an explicit custom size.
 
 Optional steady-state thresholds are available when you want to gate post-startup behavior:
 

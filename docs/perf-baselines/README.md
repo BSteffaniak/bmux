@@ -40,6 +40,6 @@ Run from repository root:
   --iterations 1 \
   --warmup 0 \
   --cold \
-  --scale-plugin-count 120 \
+  --scale-profile medium \
   --artifact-dir docs/perf-baselines/runtime-matrix-scale
 ```
