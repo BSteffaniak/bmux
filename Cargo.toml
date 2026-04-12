@@ -205,6 +205,7 @@ toml_edit = { version = "0.22.26", default-features = false, features = [
 tracing = { version = "0.1.44", default-features = false }
 ttf-parser = { version = "0.25.1", default-features = true }
 unicode-width = { version = "0.2.2", default-features = false }
+uniffi = { version = "0.31.0" }
 uuid = { version = "1.21.0", default-features = false }
 vt100 = { version = "0.16.2", default-features = false }
 windows-sys = { version = "0.61.2" }

@@ -12,6 +12,8 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_mobile_core = { workspace = true }
+thiserror        = { workspace = true }
+uniffi           = { workspace = true, features = ["cli"] }
 uuid             = { workspace = true, features = ["v4"] }
 
 [features]

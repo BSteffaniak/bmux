@@ -5,13 +5,155 @@
 //! FFI-facing facade for bmux mobile-core.
 
 use bmux_mobile_core::{
-    ConnectionManager, ConnectionRequest, ConnectionState, HostKeyPinSuggestion, MobileCoreError,
-    ObservedHostKey, TargetInput, TargetRecord, apply_pin_query_fragment_to_target,
-    apply_pin_suggestion_to_target, observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
-    observe_ssh_host_key_with_pin_suggestion,
+    ConnectionManager, ConnectionRequest, ConnectionState, ConnectionStatus, HostKeyPinSuggestion,
+    MobileCoreError, ObservedHostKey, TargetInput, TargetRecord, TargetTransport,
+    apply_pin_query_fragment_to_target, apply_pin_suggestion_to_target, observe_ssh_host_key,
+    observe_ssh_host_key_fingerprint_sha256, observe_ssh_host_key_with_pin_suggestion,
 };
 use std::sync::{Arc, Mutex};
+use thiserror::Error;
 use uuid::Uuid;
+
+uniffi::setup_scaffolding!();
+
+#[derive(Debug, Error, uniffi::Error)]
+pub enum MobileFfiError {
+    #[error("invalid target: {0}")]
+    InvalidTarget(String),
+    #[error("target id not found: {0}")]
+    TargetNotFound(String),
+    #[error("connection {0} is not active")]
+    ConnectionNotActive(String),
+    #[error("ssh backend is not configured")]
+    SshBackendUnavailable,
+    #[error("ssh connection failed: {0}")]
+    SshConnectionFailed(String),
+}
+
+impl From<MobileCoreError> for MobileFfiError {
+    fn from(value: MobileCoreError) -> Self {
+        match value {
+            MobileCoreError::InvalidTarget(message) => Self::InvalidTarget(message),
+            MobileCoreError::TargetNotFound(message) => Self::TargetNotFound(message),
+            MobileCoreError::ConnectionNotActive(message) => Self::ConnectionNotActive(message),
+            MobileCoreError::SshBackendUnavailable => Self::SshBackendUnavailable,
+            MobileCoreError::SshConnectionFailed(message) => Self::SshConnectionFailed(message),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum TargetTransportFfi {
+    Local,
+    Ssh,
+    Tls,
+    Iroh,
+}
+
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum ConnectionStatusFfi {
+    Connecting,
+    Connected,
+    Reconnecting,
+    Disconnected,
+    Failed,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TargetRecordFfi {
+    pub id: String,
+    pub name: String,
+    pub canonical_target: String,
+    pub transport: TargetTransportFfi,
+    pub default_session: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ConnectionStateFfi {
+    pub id: String,
+    pub target_id: String,
+    pub status: ConnectionStatusFfi,
+    pub session: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ObservedHostKeyFfi {
+    pub endpoint: String,
+    pub algorithm: String,
+    pub fingerprint_sha256: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct HostKeyPinSuggestionFfi {
+    pub observed: ObservedHostKeyFfi,
+    pub pin_query_fragment: String,
+}
+
+const fn map_transport(value: TargetTransport) -> TargetTransportFfi {
+    match value {
+        TargetTransport::Local => TargetTransportFfi::Local,
+        TargetTransport::Ssh => TargetTransportFfi::Ssh,
+        TargetTransport::Tls => TargetTransportFfi::Tls,
+        TargetTransport::Iroh => TargetTransportFfi::Iroh,
+    }
+}
+
+const fn map_connection_status(value: ConnectionStatus) -> ConnectionStatusFfi {
+    match value {
+        ConnectionStatus::Connecting => ConnectionStatusFfi::Connecting,
+        ConnectionStatus::Connected => ConnectionStatusFfi::Connected,
+        ConnectionStatus::Reconnecting => ConnectionStatusFfi::Reconnecting,
+        ConnectionStatus::Disconnected => ConnectionStatusFfi::Disconnected,
+        ConnectionStatus::Failed => ConnectionStatusFfi::Failed,
+    }
+}
+
+fn map_target_record(value: TargetRecord) -> TargetRecordFfi {
+    TargetRecordFfi {
+        id: value.id.to_string(),
+        name: value.name,
+        canonical_target: value.canonical_target.value,
+        transport: map_transport(value.transport),
+        default_session: value.default_session,
+    }
+}
+
+fn map_connection_state(value: ConnectionState) -> ConnectionStateFfi {
+    ConnectionStateFfi {
+        id: value.id.to_string(),
+        target_id: value.target_id.to_string(),
+        status: map_connection_status(value.status),
+        session: value.session,
+        last_error: value.last_error,
+    }
+}
+
+fn map_observed_host_key(value: ObservedHostKey) -> ObservedHostKeyFfi {
+    ObservedHostKeyFfi {
+        endpoint: value.endpoint,
+        algorithm: value.algorithm,
+        fingerprint_sha256: value.fingerprint_sha256,
+    }
+}
+
+fn map_pin_suggestion(value: HostKeyPinSuggestion) -> HostKeyPinSuggestionFfi {
+    HostKeyPinSuggestionFfi {
+        observed: map_observed_host_key(value.observed),
+        pin_query_fragment: value.pin_query_fragment,
+    }
+}
+
+fn map_pin_suggestion_to_core(value: &HostKeyPinSuggestionFfi) -> HostKeyPinSuggestion {
+    HostKeyPinSuggestion {
+        observed: ObservedHostKey {
+            endpoint: value.observed.endpoint.clone(),
+            algorithm: value.observed.algorithm.clone(),
+            fingerprint_sha256: value.observed.fingerprint_sha256.clone(),
+        },
+        pin_query_fragment: value.pin_query_fragment.clone(),
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct MobileApi {
@@ -156,6 +298,179 @@ impl MobileApi {
         self.manager.lock().map_err(|_| {
             MobileCoreError::ConnectionNotActive("mobile api manager poisoned".to_string())
         })
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct MobileApiFfi {
+    inner: MobileApi,
+}
+
+impl Default for MobileApiFfi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[uniffi::export]
+// UniFFI generated bindings pass owned values for Rust String/Record inputs.
+#[allow(clippy::needless_pass_by_value)]
+impl MobileApiFfi {
+    #[uniffi::constructor]
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: MobileApi::new(),
+        }
+    }
+
+    /// Import and normalize a target.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped target parsing and storage errors from `mobile-core`.
+    pub fn import_target(
+        &self,
+        source: String,
+        display_name: Option<String>,
+    ) -> std::result::Result<TargetRecordFfi, MobileFfiError> {
+        self.inner
+            .import_target(&source, display_name)
+            .map(map_target_record)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// List imported targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped manager lock/state errors from `mobile-core`.
+    pub fn list_targets(&self) -> std::result::Result<Vec<TargetRecordFfi>, MobileFfiError> {
+        self.inner
+            .list_targets()
+            .map(|targets| targets.into_iter().map(map_target_record).collect())
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Start a connection for a target id.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped target lookup, parsing, and transport errors.
+    pub fn connect(
+        &self,
+        target_id: String,
+        session: Option<String>,
+    ) -> std::result::Result<ConnectionStateFfi, MobileFfiError> {
+        self.inner
+            .connect(&target_id, session)
+            .map(map_connection_state)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Mark a connection as connected.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped connection state errors from `mobile-core`.
+    pub fn mark_connected(
+        &self,
+        connection_id: String,
+    ) -> std::result::Result<ConnectionStateFfi, MobileFfiError> {
+        self.inner
+            .mark_connected(&connection_id)
+            .map(map_connection_state)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Mark a connection as disconnected.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped connection state errors from `mobile-core`.
+    pub fn disconnect(
+        &self,
+        connection_id: String,
+    ) -> std::result::Result<ConnectionStateFfi, MobileFfiError> {
+        self.inner
+            .disconnect(&connection_id)
+            .map(map_connection_state)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Observe only the SSH host-key SHA-256 fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped parse, network, handshake, and hash availability errors.
+    pub fn observe_ssh_host_key_fingerprint_sha256(
+        &self,
+        target: String,
+    ) -> std::result::Result<String, MobileFfiError> {
+        self.inner
+            .observe_ssh_host_key_fingerprint_sha256(&target)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Observe structured SSH host-key details.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped parse, network, handshake, and key availability errors.
+    pub fn observe_ssh_host_key(
+        &self,
+        target: String,
+    ) -> std::result::Result<ObservedHostKeyFfi, MobileFfiError> {
+        self.inner
+            .observe_ssh_host_key(&target)
+            .map(map_observed_host_key)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Observe SSH host key and derive a pin suggestion.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped parse, network, handshake, and key availability errors.
+    pub fn observe_ssh_host_key_with_pin_suggestion(
+        &self,
+        target: String,
+    ) -> std::result::Result<HostKeyPinSuggestionFfi, MobileFfiError> {
+        self.inner
+            .observe_ssh_host_key_with_pin_suggestion(&target)
+            .map(map_pin_suggestion)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Apply a pin query fragment to a target.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped target or pin validation errors.
+    pub fn apply_pin_query_fragment_to_target(
+        &self,
+        target: String,
+        pin_query_fragment: String,
+    ) -> std::result::Result<String, MobileFfiError> {
+        self.inner
+            .apply_pin_query_fragment_to_target(&target, &pin_query_fragment)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Apply a typed pin suggestion to a target.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped target or pin validation errors.
+    pub fn apply_pin_suggestion_to_target(
+        &self,
+        target: String,
+        suggestion: HostKeyPinSuggestionFfi,
+    ) -> std::result::Result<String, MobileFfiError> {
+        let core_suggestion = map_pin_suggestion_to_core(&suggestion);
+        self.inner
+            .apply_pin_suggestion_to_target(&target, &core_suggestion)
+            .map_err(MobileFfiError::from)
     }
 }
 
