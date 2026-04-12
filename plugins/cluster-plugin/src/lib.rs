@@ -3711,6 +3711,156 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_cluster_up_retry_and_events_flow_is_consistent() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health("db-a", true);
+        runtime.set_health_sequence("db-a", vec![true, false]);
+
+        let inventory = ClusterInventory {
+            clusters: BTreeMap::from([("prod".to_string(), vec!["db-a".to_string()])]),
+            known_targets: BTreeSet::from(["db-a".to_string()]),
+        };
+
+        let up = execute_cluster_up(
+            &runtime,
+            &inventory,
+            ClusterUpArgs {
+                cluster: "prod".to_string(),
+                hosts: Vec::new(),
+                on_failure: RetryFailurePolicy::Continue,
+                retries: 0,
+            },
+        )
+        .expect("cluster up should return partial success");
+        assert_eq!(up.statuses.len(), 1);
+        assert!(matches!(up.statuses[0].state, ClusterHostState::Degraded));
+        let degraded_pane_id = up.statuses[0]
+            .pane_id
+            .clone()
+            .expect("degraded launch should keep pane for retry");
+
+        let retry = execute_cluster_pane_retry(
+            &runtime,
+            &ClusterPaneRetryArgs {
+                pane: PaneRetryRef::Active,
+                on_failure: RetryFailurePolicy::Abort,
+                retries: 0,
+            },
+        )
+        .expect("retry should recover pane to ready");
+        assert_eq!(retry.target, "db-a");
+        assert_eq!(
+            retry.old_pane_id.as_deref(),
+            Some(degraded_pane_id.as_str())
+        );
+
+        let events = get_cluster_connection_events(&runtime).expect("events should load");
+        let target_events: Vec<&ClusterConnectionEvent> = events
+            .iter()
+            .filter(|event| event.target.as_deref() == Some("db-a"))
+            .collect();
+        assert!(
+            target_events
+                .iter()
+                .any(|event| event.state == ClusterConnectionState::Connecting),
+            "expected connecting event"
+        );
+        assert!(
+            target_events
+                .iter()
+                .any(|event| event.state == ClusterConnectionState::Degraded),
+            "expected degraded event"
+        );
+        assert!(
+            target_events
+                .iter()
+                .any(|event| event.state == ClusterConnectionState::Retrying),
+            "expected retrying event"
+        );
+        assert!(
+            target_events
+                .iter()
+                .any(|event| event.state == ClusterConnectionState::Ready),
+            "expected ready event"
+        );
+
+        let filtered_ready = filter_cluster_events(
+            events,
+            &ClusterEventsArgs {
+                format: ClusterEventsFormat::Text,
+                cluster: Some("prod".to_string()),
+                target: Some("db-a".to_string()),
+                state: Some(ClusterConnectionState::Ready),
+                since_unix_ms: None,
+                limit: Some(1),
+            },
+        );
+        assert_eq!(filtered_ready.len(), 1);
+        assert_eq!(filtered_ready[0].state, ClusterConnectionState::Ready);
+    }
+
+    #[test]
+    fn end_to_end_cluster_up_abort_preserves_partial_state_and_event_tail() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health("db-ok", true);
+        runtime.set_health("db-fail", true);
+        runtime.fail_launch_for("db-fail");
+
+        let inventory = ClusterInventory {
+            clusters: BTreeMap::from([(
+                "prod".to_string(),
+                vec![
+                    "db-ok".to_string(),
+                    "db-fail".to_string(),
+                    "db-after".to_string(),
+                ],
+            )]),
+            known_targets: BTreeSet::from([
+                "db-ok".to_string(),
+                "db-fail".to_string(),
+                "db-after".to_string(),
+            ]),
+        };
+
+        let error = execute_cluster_up(
+            &runtime,
+            &inventory,
+            ClusterUpArgs {
+                cluster: "prod".to_string(),
+                hosts: Vec::new(),
+                on_failure: RetryFailurePolicy::Abort,
+                retries: 0,
+            },
+        )
+        .expect_err("abort should stop on launch failure");
+        assert!(error.contains("pane launch failed"));
+
+        let panes = runtime
+            .pane_list(&PaneListRequest { session: None })
+            .expect("pane list should succeed")
+            .panes;
+        assert_eq!(panes.len(), 1, "already launched pane should remain");
+
+        let events = get_cluster_connection_events(&runtime).expect("events should load");
+        let filtered = filter_cluster_events(
+            events,
+            &ClusterEventsArgs {
+                format: ClusterEventsFormat::Text,
+                cluster: Some("prod".to_string()),
+                target: None,
+                state: None,
+                since_unix_ms: None,
+                limit: Some(1),
+            },
+        );
+        assert_eq!(filtered.len(), 1);
+        assert!(
+            filtered[0].message.contains("pane launch failed")
+                || filtered[0].state == ClusterConnectionState::Failed
+        );
+    }
+
+    #[test]
     fn decide_failure_policy_action_non_prompt_modes_are_deterministic() {
         assert_eq!(
             decide_failure_policy_action(RetryFailurePolicy::Abort, "db-a", "boom"),

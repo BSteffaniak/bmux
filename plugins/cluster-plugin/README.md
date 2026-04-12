@@ -47,3 +47,17 @@ Current scope:
 - **`cluster-query/v1`**
 - **`cluster-command/v1`**
 - **`cluster-connection-events/v1`**
+
+## Service Contract Notes
+
+- `cluster-query/v1`
+  - `list_clusters` returns settings-resolved cluster inventory.
+  - `status` returns host states from probe execution (`ready` or `degraded`).
+  - Errors use `list_clusters_failed` / `status_failed`.
+- `cluster-command/v1`
+  - `up` returns session id plus per-host launch status payload.
+  - `pane_new`, `pane_retry`, and `pane_move` return operation result payloads with pane/session ids.
+  - Errors use `up_failed`, `pane_new_failed`, `pane_retry_failed`, and `pane_move_failed`.
+- `cluster-connection-events/v1`
+  - `list` returns persisted lifecycle events ring buffer for cluster connections.
+  - Errors use `connection_events_list_failed`.
