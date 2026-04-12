@@ -3129,6 +3129,44 @@ mod tests {
     }
 
     #[test]
+    fn execute_cluster_up_prompt_policy_falls_back_to_abort_without_runtime() {
+        let runtime = FakeRuntime::default();
+        runtime.set_health("db-launch-fail", true);
+        runtime.set_health("db-ok", true);
+        runtime.fail_launch_for("db-launch-fail");
+
+        let inventory = ClusterInventory {
+            clusters: BTreeMap::from([(
+                "prod".to_string(),
+                vec!["db-launch-fail".to_string(), "db-ok".to_string()],
+            )]),
+            known_targets: BTreeSet::from(["db-launch-fail".to_string(), "db-ok".to_string()]),
+        };
+
+        let error = execute_cluster_up(
+            &runtime,
+            &inventory,
+            ClusterUpArgs {
+                cluster: "prod".to_string(),
+                hosts: Vec::new(),
+                on_failure: RetryFailurePolicy::Prompt,
+                retries: 0,
+            },
+        )
+        .expect_err("prompt policy should abort when prompt runtime is unavailable");
+        assert!(error.contains("pane launch failed"));
+
+        let panes = runtime
+            .pane_list(&PaneListRequest { session: None })
+            .expect("pane list should succeed")
+            .panes;
+        assert!(
+            panes.is_empty(),
+            "prompt fallback abort should stop before launching db-ok"
+        );
+    }
+
+    #[test]
     fn execute_cluster_pane_retry_replaces_pane_and_promotes_ready() {
         let runtime = FakeRuntime::default();
         runtime.set_health("db-a", true);
