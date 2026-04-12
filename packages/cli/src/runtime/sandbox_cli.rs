@@ -8,9 +8,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sandbox_meta::{
     LOCK_FILE, MANIFEST_FILE, SandboxManifest, SandboxManifestPaths,
-    clear_lock as clear_sandbox_lock, read_lock as read_sandbox_lock,
-    read_manifest as read_sandbox_manifest, sandbox_id_from_root as sandbox_id_from_root_meta,
-    unix_millis_now as unix_millis_now_meta, write_lock as write_sandbox_lock,
+    clear_lock as clear_sandbox_lock, prune_missing_index_entries,
+    read_index_entries as read_sandbox_index_entries, read_lock as read_sandbox_lock,
+    read_manifest as read_sandbox_manifest, remove_index_entry as remove_sandbox_index_entry,
+    sandbox_id_from_root as sandbox_id_from_root_meta, unix_millis_now as unix_millis_now_meta,
+    upsert_index_entry as upsert_sandbox_index_entry, write_lock as write_sandbox_lock,
     write_manifest as write_sandbox_manifest,
 };
 
@@ -211,6 +213,7 @@ pub(super) async fn run_sandbox_run(
         options.keep,
     );
     write_manifest(&sandbox.root_dir, &manifest)?;
+    let _ = upsert_sandbox_index_entry(&manifest);
     write_lock(&sandbox.root_dir)?;
     let lock_guard = SandboxLockGuard::new(&sandbox.root_dir);
 
@@ -231,6 +234,7 @@ pub(super) async fn run_sandbox_run(
         Ok(values) => values,
         Err(error) => {
             let _ = mark_manifest_aborted(&sandbox.root_dir, &mut manifest);
+            let _ = upsert_sandbox_index_entry(&manifest);
             return Err(error);
         }
     };
@@ -251,6 +255,7 @@ pub(super) async fn run_sandbox_run(
     manifest.exit_code = Some(raw_exit_code);
     manifest.kept = kept;
     write_manifest(&sandbox.root_dir, &manifest)?;
+    let _ = upsert_sandbox_index_entry(&manifest);
 
     emit_run_output(
         &sandbox,
@@ -269,6 +274,7 @@ pub(super) async fn run_sandbox_run(
     if !kept {
         drop(lock_guard);
         let _ = std::fs::remove_dir_all(&sandbox.root_dir);
+        let _ = remove_sandbox_index_entry(&sandbox.root_dir);
     }
 
     Ok(exit_code_to_u8(raw_exit_code))
@@ -406,7 +412,7 @@ pub(super) fn run_sandbox_list(
     limit: usize,
     json: bool,
 ) -> Result<u8> {
-    let mut entries = collect_sandbox_directories()
+    let mut entries = collect_sandbox_directories_index_first()
         .into_iter()
         .map(|root| sandbox_list_entry(&root))
         .collect::<Vec<_>>();
@@ -522,7 +528,7 @@ fn resolve_inspect_target(
 }
 
 fn resolve_latest_sandbox(failed_only: bool, source_filter: Option<&str>) -> Result<PathBuf> {
-    let mut candidates = collect_sandbox_directories()
+    let mut candidates = collect_sandbox_directories_index_first()
         .into_iter()
         .map(|path| {
             let age = path
@@ -785,7 +791,7 @@ fn cleanup_orphaned_sandboxes(
         not_failed: 0,
     };
 
-    for root_path in collect_sandbox_directories() {
+    for root_path in collect_sandbox_directories_index_first() {
         scanned += 1;
         let source = sandbox_source_for_dir(&root_path);
         if let Some(filter) = source_filter
@@ -824,7 +830,11 @@ fn cleanup_orphaned_sandboxes(
                 skipped.running += 1;
                 continue;
             }
-            std::fs::remove_dir_all(&root_path).is_ok()
+            let removed = std::fs::remove_dir_all(&root_path).is_ok();
+            if removed || !root_path.exists() {
+                let _ = remove_sandbox_index_entry(&root_path);
+            }
+            removed
         };
 
         entries.push(CleanupEntry {
@@ -864,6 +874,22 @@ fn collect_sandbox_directories() -> Vec<PathBuf> {
             })
         })
         .collect()
+}
+
+fn collect_sandbox_directories_index_first() -> Vec<PathBuf> {
+    if let Ok(entries) = read_sandbox_index_entries() {
+        let _ = prune_missing_index_entries();
+        let indexed = entries
+            .into_iter()
+            .map(|entry| PathBuf::from(entry.root))
+            .filter(|root| root.is_dir())
+            .collect::<Vec<_>>();
+        if !indexed.is_empty() {
+            return indexed;
+        }
+    }
+
+    collect_sandbox_directories()
 }
 
 fn sandbox_list_entry(root: &Path) -> SandboxListEntry {
@@ -950,7 +976,7 @@ fn resolve_sandbox_target(target: &str) -> Result<PathBuf> {
         return Ok(direct);
     }
 
-    if let Some(found) = collect_sandbox_directories()
+    if let Some(found) = collect_sandbox_directories_index_first()
         .iter()
         .find(|candidate| sandbox_id_from_root_meta(candidate).starts_with(target))
     {

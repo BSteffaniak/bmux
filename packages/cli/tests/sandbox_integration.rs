@@ -70,6 +70,14 @@ impl CommandSandbox {
         std::fs::write(self.root.path().join("config").join("bmux.toml"), toml)
             .expect("write sandbox config file");
     }
+
+    fn sandbox_index_path(&self) -> PathBuf {
+        self.root
+            .path()
+            .join("state")
+            .join("sandbox")
+            .join("index.json")
+    }
 }
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
@@ -122,6 +130,20 @@ fn create_manifest_sandbox(root: &Path, dir_name: &str, source: &str, status: &s
         serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
     )
     .expect("write sandbox manifest");
+}
+
+fn write_index_entries(path: &Path, entries: serde_json::Value) {
+    let parent = path.parent().expect("index path parent should exist");
+    std::fs::create_dir_all(parent).expect("create sandbox index dir");
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "entries": entries,
+    });
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&payload).expect("serialize index payload"),
+    )
+    .expect("write sandbox index payload");
 }
 
 #[test]
@@ -678,4 +700,114 @@ fn sandbox_run_spawn_failure_marks_manifest_aborted() {
     assert_schema_version(&inspect_json);
     assert_eq!(inspect_json["manifest"]["status"].as_str(), Some("aborted"));
     assert_eq!(inspect_json["running"].as_bool(), Some(false));
+}
+
+#[test]
+#[serial]
+fn sandbox_list_falls_back_to_scan_when_index_is_corrupt() {
+    let sandbox = CommandSandbox::new("index-corrupt-fallback");
+    let index_path = sandbox.sandbox_index_path();
+    std::fs::create_dir_all(
+        index_path
+            .parent()
+            .expect("sandbox index parent should exist"),
+    )
+    .expect("create sandbox index directory");
+    std::fs::write(index_path, b"{not-json").expect("write corrupt sandbox index");
+
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-index-fallback",
+        "sandbox-cli",
+        "succeeded",
+    );
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "list", "--limit", "50", "--json"])
+        .output()
+        .expect("run sandbox list with corrupt index");
+    assert!(
+        output.status.success(),
+        "sandbox list should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    let sandboxes = json["sandboxes"]
+        .as_array()
+        .expect("sandbox list should include sandboxes array");
+    assert!(
+        sandboxes
+            .iter()
+            .any(|entry| entry["id"].as_str() == Some("bmux-sbx-index-fallback")),
+        "list should fall back to temp scan when index is corrupt"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_cleanup_removes_deleted_index_entry() {
+    let sandbox = CommandSandbox::new("index-cleanup-prune");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    let sandbox_dir_name = "bmux-sbx-index-cleanup-delete";
+    create_manifest_sandbox(&tmp_root, sandbox_dir_name, "sandbox-cli", "failed");
+    let sandbox_path = tmp_root.join(sandbox_dir_name);
+    let sandbox_path_string = sandbox_path.to_string_lossy().to_string();
+
+    write_index_entries(
+        &sandbox.sandbox_index_path(),
+        serde_json::json!([
+            {
+                "id": sandbox_dir_name,
+                "root": sandbox_path_string,
+                "source": "sandbox-cli",
+                "status": "failed",
+                "created_at_unix_ms": 1,
+                "updated_at_unix_ms": 1,
+                "last_seen_unix_ms": 1
+            }
+        ]),
+    );
+
+    let cleanup_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "cleanup",
+            "--failed-only",
+            "--older-than",
+            "0",
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox cleanup to remove indexed sandbox");
+    assert!(
+        cleanup_output.status.success(),
+        "sandbox cleanup should succeed: {}",
+        String::from_utf8_lossy(&cleanup_output.stderr)
+    );
+
+    let cleanup_json = parse_json_stdout(&cleanup_output);
+    assert_schema_version(&cleanup_json);
+    let entries = cleanup_json["entries"]
+        .as_array()
+        .expect("sandbox cleanup should include entries array");
+    assert_eq!(entries.len(), 1, "cleanup should remove one sandbox");
+    assert_eq!(entries[0]["removed"].as_bool(), Some(true));
+    assert!(
+        !sandbox_path.exists(),
+        "sandbox directory should be removed"
+    );
+
+    let index_contents = std::fs::read_to_string(sandbox.sandbox_index_path())
+        .expect("read sandbox index after cleanup");
+    let index_json: serde_json::Value =
+        serde_json::from_str(&index_contents).expect("parse sandbox index json");
+    let index_entries = index_json["entries"]
+        .as_array()
+        .expect("index should contain entries array");
+    assert!(index_entries.is_empty(), "cleanup should prune index entry");
 }
