@@ -3697,13 +3697,18 @@ async fn probe_gateway_candidate(
 }
 
 fn gateway_cooldown_remaining_ms(cluster_name: &str, candidate: &str) -> Option<u128> {
-    let state_map = cluster_gateway_state_map().lock().ok()?;
-    let state = state_map.get(cluster_name)?;
-    let until = state.cooldown_until.get(candidate)?;
-    if *until <= Instant::now() {
+    let until = cluster_gateway_state_map()
+        .lock()
+        .ok()?
+        .get(cluster_name)?
+        .cooldown_until
+        .get(candidate)
+        .copied()?;
+    let now = Instant::now();
+    if until <= now {
         return None;
     }
-    Some((*until - Instant::now()).as_millis())
+    Some((until - now).as_millis())
 }
 
 #[cfg(test)]
