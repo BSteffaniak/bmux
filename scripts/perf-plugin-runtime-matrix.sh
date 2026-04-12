@@ -76,7 +76,9 @@ run_case() {
 	local title="$1"
 	local max_p95_ms="$2"
 	local max_p99_ms="$3"
-	shift 3
+	local max_steady_p95_ms="$4"
+	local max_steady_p99_ms="$5"
+	shift 5
 	local args=("$@")
 
 	if [[ "$COLD_MODE" == "1" ]]; then
@@ -99,6 +101,8 @@ run_case() {
 		--warmup "$WARMUP"
 		--max-p95-ms "$max_p95_ms"
 		--max-p99-ms "$max_p99_ms"
+		--max-steady-p95-ms "$max_steady_p95_ms"
+		--max-steady-p99-ms "$max_steady_p99_ms"
 		--max-runtime-retries 0
 		--max-runtime-respawns 0
 		--max-runtime-timeouts 0
@@ -117,7 +121,9 @@ run_case_allow_nonzero() {
 	local title="$1"
 	local max_p95_ms="$2"
 	local max_p99_ms="$3"
-	shift 3
+	local max_steady_p95_ms="$4"
+	local max_steady_p99_ms="$5"
+	shift 5
 	local args=("$@")
 
 	if [[ "$COLD_MODE" == "1" ]]; then
@@ -141,6 +147,8 @@ run_case_allow_nonzero() {
 		--warmup "$WARMUP"
 		--max-p95-ms "$max_p95_ms"
 		--max-p99-ms "$max_p99_ms"
+		--max-steady-p95-ms "$max_steady_p95_ms"
+		--max-steady-p99-ms "$max_steady_p99_ms"
 		--max-runtime-retries 0
 		--max-runtime-respawns 0
 		--max-runtime-timeouts 0
@@ -198,14 +206,14 @@ if [[ ! -x "$BMUX_BIN" ]]; then
 	exit 2
 fi
 
-run_case "plugin list json" 250 350 plugin list --json
-run_case "plugin doctor json" 350 500 plugin doctor --json
-run_case "plugin rebuild list json" 550 750 plugin rebuild --list --json
-run_case_allow_nonzero "plugin run missing plugin" 350 550 plugin run missing.plugin-id no-op
+run_case "plugin list json" 250 350 250 350 plugin list --json
+run_case "plugin doctor json" 350 500 350 500 plugin doctor --json
+run_case "plugin rebuild list json" 550 750 550 750 plugin rebuild --list --json
+run_case_allow_nonzero "plugin run missing plugin" 350 550 350 550 plugin run missing.plugin-id no-op
 
 if happy_args=$(find_happy_plugin_run_args); then
 	mapfile -t parts <<<"$happy_args"
-	run_case "plugin run discovered command" 450 650 plugin run "${parts[0]}" "${parts[1]}"
+	run_case "plugin run discovered command" 450 650 450 650 plugin run "${parts[0]}" "${parts[1]}"
 else
 	echo
 	echo "=== plugin run discovered command ==="

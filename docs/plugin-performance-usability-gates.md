@@ -60,6 +60,8 @@ For CI artifact archiving, use:
 - `plugin run missing.plugin-id no-op`: p95 \<= 350ms, p99 \<= 550ms (expected non-zero path)
 - `plugin run <discovered-plugin> <discovered-command>`: p95 \<= 450ms, p99 \<= 650ms when an environment-supported command exists
 
+The matrix also applies matching steady-state p95/p99 thresholds (excluding first measured sample) for each scenario.
+
 Use `--cold` to run the same matrix without warmup samples.
 
 ## Usability Acceptance Matrix
