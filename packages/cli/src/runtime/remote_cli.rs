@@ -33,7 +33,7 @@ use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -84,6 +84,47 @@ enum ClusterGatewayHostRef {
 struct ClusterGatewaySettings {
     clusters: BTreeMap<String, ClusterGatewayDefinition>,
 }
+
+#[derive(Debug, Clone)]
+struct ClusterGatewayRuntimeState {
+    last_good: Option<GatewayLastGood>,
+    cooldown_until: BTreeMap<String, Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct GatewayLastGood {
+    target: String,
+    observed_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct GatewayAttemptFailure {
+    candidate: String,
+    reason_code: &'static str,
+    detail: String,
+}
+
+enum GatewayBatchOutcome {
+    Success(u8),
+    Exhausted { attempted: bool },
+}
+
+struct GatewayBatchRequest<'a> {
+    config: &'a BmuxConfig,
+    cluster_name: &'a str,
+    candidates: &'a [String],
+    plugin_id: &'a str,
+    command_name: &'a str,
+    arguments: &'a [String],
+    respect_cooldown: bool,
+}
+
+const CLUSTER_GATEWAY_LAST_GOOD_TTL: Duration = Duration::from_secs(90);
+const CLUSTER_GATEWAY_FAILURE_COOLDOWN: Duration = Duration::from_secs(20);
+
+static CLUSTER_GATEWAY_RUNTIME_STATE: OnceLock<
+    Mutex<BTreeMap<String, ClusterGatewayRuntimeState>>,
+> = OnceLock::new();
 
 impl ClusterGatewayDefinition {
     fn declared_targets(&self) -> Vec<String> {
@@ -3004,7 +3045,7 @@ pub(super) async fn maybe_run_cluster_plugin_command_via_gateway(
 
     let config = BmuxConfig::load()?;
     let settings = cluster_gateway_settings_from_config(&config)?;
-    let Some(cluster_name) = resolve_cluster_name_for_gateway(command_name, arguments, &settings)
+    let Some(cluster_name) = resolve_cluster_name_for_gateway(command_name, arguments, &settings)?
     else {
         return Ok(None);
     };
@@ -3017,21 +3058,128 @@ pub(super) async fn maybe_run_cluster_plugin_command_via_gateway(
         return Ok(None);
     }
 
-    let candidates = gateway_candidates_for_cluster(&cluster_name, definition)?;
-    let mut attempts = Vec::new();
-    for candidate in candidates {
-        match run_plugin_command_on_target(&config, &candidate, plugin_id, command_name, arguments)
-            .await
+    let candidates = ordered_gateway_candidates_for_cluster(&cluster_name, definition)?;
+    tracing::info!(
+        event = "cluster_gateway_selection_start",
+        cluster = %cluster_name,
+        mode = ?definition.gateway_mode,
+        candidates = %candidates.join(","),
+        command = %command_name,
+        "selecting cluster gateway"
+    );
+
+    let mut failures = Vec::new();
+    let attempted = match run_gateway_candidate_batch(
+        GatewayBatchRequest {
+            config: &config,
+            cluster_name: &cluster_name,
+            candidates: &candidates,
+            plugin_id,
+            command_name,
+            arguments,
+            respect_cooldown: definition.gateway_mode == ClusterGatewayMode::Auto,
+        },
+        &mut failures,
+    )
+    .await?
+    {
+        GatewayBatchOutcome::Success(code) => return Ok(Some(code)),
+        GatewayBatchOutcome::Exhausted { attempted } => attempted,
+    };
+
+    if !attempted && definition.gateway_mode == ClusterGatewayMode::Auto {
+        tracing::warn!(
+            event = "cluster_gateway_cooldown_override",
+            cluster = %cluster_name,
+            "all gateway candidates were in cooldown; retrying immediately"
+        );
+        if let GatewayBatchOutcome::Success(code) = run_gateway_candidate_batch(
+            GatewayBatchRequest {
+                config: &config,
+                cluster_name: &cluster_name,
+                candidates: &candidates,
+                plugin_id,
+                command_name,
+                arguments,
+                respect_cooldown: false,
+            },
+            &mut failures,
+        )
+        .await?
         {
-            Ok(code) => return Ok(Some(code)),
-            Err(error) => attempts.push(format!("{candidate}: {error}")),
+            return Ok(Some(code));
         }
     }
 
     anyhow::bail!(
         "all gateway candidates failed for cluster '{cluster_name}': {}",
-        attempts.join("; ")
+        format_gateway_failures(&failures)
     )
+}
+
+async fn run_gateway_candidate_batch(
+    request: GatewayBatchRequest<'_>,
+    failures: &mut Vec<GatewayAttemptFailure>,
+) -> Result<GatewayBatchOutcome> {
+    let mut attempted = false;
+    for candidate in request.candidates {
+        if request.respect_cooldown && candidate_is_in_cooldown(request.cluster_name, candidate) {
+            tracing::debug!(
+                event = "cluster_gateway_candidate_skipped",
+                cluster = %request.cluster_name,
+                candidate = %candidate,
+                reason = "cooldown",
+                "skipping gateway candidate in cooldown"
+            );
+            failures.push(GatewayAttemptFailure {
+                candidate: candidate.clone(),
+                reason_code: "cooldown",
+                detail: "candidate in cooldown window".to_string(),
+            });
+            continue;
+        }
+
+        attempted = true;
+        match run_plugin_command_on_target(
+            request.config,
+            candidate,
+            request.plugin_id,
+            request.command_name,
+            request.arguments,
+        )
+        .await
+        {
+            Ok(code) => {
+                record_gateway_success(request.cluster_name, candidate);
+                tracing::info!(
+                    event = "cluster_gateway_selected",
+                    cluster = %request.cluster_name,
+                    candidate = %candidate,
+                    command = %request.command_name,
+                    "cluster gateway command succeeded"
+                );
+                return Ok(GatewayBatchOutcome::Success(code));
+            }
+            Err(error) => {
+                let classified = classify_gateway_error(&error);
+                record_gateway_failure(request.cluster_name, candidate);
+                tracing::warn!(
+                    event = "cluster_gateway_candidate_failed",
+                    cluster = %request.cluster_name,
+                    candidate = %candidate,
+                    reason_code = classified.0,
+                    detail = %classified.1,
+                    "cluster gateway candidate failed"
+                );
+                failures.push(GatewayAttemptFailure {
+                    candidate: candidate.clone(),
+                    reason_code: classified.0,
+                    detail: classified.1,
+                });
+            }
+        }
+    }
+    Ok(GatewayBatchOutcome::Exhausted { attempted })
 }
 
 fn cluster_gateway_settings_from_config(config: &BmuxConfig) -> Result<ClusterGatewaySettings> {
@@ -3050,20 +3198,51 @@ fn resolve_cluster_name_for_gateway(
     command_name: &str,
     arguments: &[String],
     settings: &ClusterGatewaySettings,
-) -> Option<String> {
+) -> Result<Option<String>> {
     let cluster_flag =
         value_after_flag(arguments, "--cluster").or_else(|| value_after_flag(arguments, "-c"));
     let explicit = match command_name {
         "cluster-up" => first_positional_argument(arguments),
-        "cluster-events" | "cluster-pane-retry" => cluster_flag,
-        "cluster-pane-new" => cluster_flag.or_else(|| {
-            extract_host_argument(arguments)
-                .and_then(|host| infer_cluster_name_from_target(settings, host.as_str()))
-        }),
-        "cluster-pane-move" => cluster_flag.or_else(|| {
-            extract_host_argument(arguments)
-                .and_then(|host| infer_cluster_name_from_target(settings, host.as_str()))
-        }),
+        "cluster-events" => cluster_flag,
+        "cluster-pane-retry" => {
+            if cluster_flag.is_none() && settings.clusters.len() > 1 {
+                anyhow::bail!(
+                    "cluster-pane-retry requires --cluster when multiple clusters are configured"
+                );
+            }
+            cluster_flag
+        }
+        "cluster-pane-new" | "cluster-pane-move" => {
+            if let Some(cluster) = cluster_flag {
+                Some(cluster)
+            } else if let Some(host) = extract_host_argument(arguments) {
+                let matches = infer_cluster_names_from_target(settings, host.as_str());
+                match matches.as_slice() {
+                    [single] => Some(single.clone()),
+                    [] => {
+                        if settings.clusters.len() > 1 {
+                            anyhow::bail!(
+                                "{command_name} cannot infer cluster for host '{host}'; pass --cluster"
+                            );
+                        }
+                        None
+                    }
+                    _ => {
+                        anyhow::bail!(
+                            "{command_name} host '{host}' matches multiple clusters ({}) - pass --cluster",
+                            matches.join(",")
+                        );
+                    }
+                }
+            } else {
+                if settings.clusters.len() > 1 {
+                    anyhow::bail!(
+                        "{command_name} requires --cluster in multi-cluster setups when host inference is unavailable"
+                    );
+                }
+                None
+            }
+        }
         "cluster-status" | "cluster-hosts" | "cluster-doctor" => {
             let candidate = first_positional_argument(arguments);
             candidate.filter(|value| settings.clusters.contains_key(value))
@@ -3071,13 +3250,13 @@ fn resolve_cluster_name_for_gateway(
         _ => None,
     };
 
-    explicit.or_else(|| {
+    Ok(explicit.or_else(|| {
         if settings.clusters.len() == 1 {
             settings.clusters.keys().next().cloned()
         } else {
             None
         }
-    })
+    }))
 }
 
 fn first_positional_argument(arguments: &[String]) -> Option<String> {
@@ -3135,11 +3314,8 @@ fn extract_host_argument(arguments: &[String]) -> Option<String> {
         })
 }
 
-fn infer_cluster_name_from_target(
-    settings: &ClusterGatewaySettings,
-    target: &str,
-) -> Option<String> {
-    let matches = settings
+fn infer_cluster_names_from_target(settings: &ClusterGatewaySettings, target: &str) -> Vec<String> {
+    settings
         .clusters
         .iter()
         .filter(|(_, definition)| {
@@ -3149,11 +3325,131 @@ fn infer_cluster_name_from_target(
                 .any(|value| value == target)
         })
         .map(|(cluster, _)| cluster.clone())
-        .collect::<Vec<_>>();
-    if matches.len() == 1 {
-        matches.into_iter().next()
-    } else {
+        .collect()
+}
+
+fn ordered_gateway_candidates_for_cluster(
+    cluster_name: &str,
+    definition: &ClusterGatewayDefinition,
+) -> Result<Vec<String>> {
+    let candidates = gateway_candidates_for_cluster(cluster_name, definition)?;
+    if definition.gateway_mode != ClusterGatewayMode::Auto {
+        return Ok(candidates);
+    }
+
+    let mut ordered = candidates;
+    if let Some(preferred) = preferred_gateway_candidate(cluster_name)
+        && let Some(index) = ordered.iter().position(|candidate| candidate == &preferred)
+    {
+        ordered.rotate_left(index);
+    }
+    Ok(ordered)
+}
+
+fn cluster_gateway_state_map() -> &'static Mutex<BTreeMap<String, ClusterGatewayRuntimeState>> {
+    CLUSTER_GATEWAY_RUNTIME_STATE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn preferred_gateway_candidate(cluster_name: &str) -> Option<String> {
+    let state = {
+        let state_map = cluster_gateway_state_map().lock().ok()?;
+        state_map.get(cluster_name)?.clone()
+    };
+    let last_good = state.last_good?;
+    if last_good.observed_at.elapsed() > CLUSTER_GATEWAY_LAST_GOOD_TTL {
+        if let Ok(mut state_map) = cluster_gateway_state_map().lock()
+            && let Some(cluster_state) = state_map.get_mut(cluster_name)
+        {
+            cluster_state.last_good = None;
+        }
         None
+    } else {
+        Some(last_good.target)
+    }
+}
+
+fn candidate_is_in_cooldown(cluster_name: &str, candidate: &str) -> bool {
+    let Ok(mut state_map) = cluster_gateway_state_map().lock() else {
+        return false;
+    };
+    let Some(cluster_state) = state_map.get_mut(cluster_name) else {
+        return false;
+    };
+    let Some(until) = cluster_state.cooldown_until.get(candidate).copied() else {
+        return false;
+    };
+    if Instant::now() >= until {
+        cluster_state.cooldown_until.remove(candidate);
+        return false;
+    }
+    true
+}
+
+fn record_gateway_success(cluster_name: &str, candidate: &str) {
+    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+        let cluster_state = state_map
+            .entry(cluster_name.to_string())
+            .or_insert_with(|| ClusterGatewayRuntimeState {
+                last_good: None,
+                cooldown_until: BTreeMap::new(),
+            });
+        cluster_state.last_good = Some(GatewayLastGood {
+            target: candidate.to_string(),
+            observed_at: Instant::now(),
+        });
+        cluster_state.cooldown_until.remove(candidate);
+    }
+}
+
+fn record_gateway_failure(cluster_name: &str, candidate: &str) {
+    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+        let cluster_state = state_map
+            .entry(cluster_name.to_string())
+            .or_insert_with(|| ClusterGatewayRuntimeState {
+                last_good: None,
+                cooldown_until: BTreeMap::new(),
+            });
+        cluster_state.cooldown_until.insert(
+            candidate.to_string(),
+            Instant::now() + CLUSTER_GATEWAY_FAILURE_COOLDOWN,
+        );
+    }
+}
+
+fn classify_gateway_error(error: &anyhow::Error) -> (&'static str, String) {
+    let message = error.to_string();
+    let lowered = message.to_ascii_lowercase();
+    let code = if lowered.contains("denied") || lowered.contains("forbidden") {
+        "service_denied"
+    } else if lowered.contains("auth") || lowered.contains("permission") {
+        "auth_failed"
+    } else if lowered.contains("timeout") || lowered.contains("timed out") {
+        "timeout"
+    } else if lowered.contains("not found") || lowered.contains("unreachable") {
+        "unreachable"
+    } else {
+        "gateway_error"
+    };
+    (code, message)
+}
+
+fn format_gateway_failures(failures: &[GatewayAttemptFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "{}[{}]={}",
+                failure.candidate, failure.reason_code, failure.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+fn clear_gateway_runtime_state_for_tests() {
+    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+        state_map.clear();
     }
 }
 
@@ -5241,14 +5537,16 @@ mod tests {
             "cluster-events",
             &["--cluster".to_string(), "prod".to_string()],
             &settings,
-        );
+        )
+        .expect("cluster flag should resolve");
         assert_eq!(cluster.as_deref(), Some("prod"));
 
         let cluster_inline = resolve_cluster_name_for_gateway(
             "cluster-events",
             &["--cluster=prod".to_string()],
             &settings,
-        );
+        )
+        .expect("inline cluster flag should resolve");
         assert_eq!(cluster_inline.as_deref(), Some("prod"));
     }
 
@@ -5258,7 +5556,8 @@ mod tests {
             clusters: BTreeMap::from([("prod".to_string(), ClusterGatewayDefinition::default())]),
         };
 
-        let cluster = resolve_cluster_name_for_gateway("cluster-pane-retry", &[], &settings);
+        let cluster = resolve_cluster_name_for_gateway("cluster-pane-retry", &[], &settings)
+            .expect("single-cluster default should resolve");
         assert_eq!(cluster.as_deref(), Some("prod"));
     }
 
@@ -5287,8 +5586,68 @@ mod tests {
             "cluster-pane-new",
             &["--host".to_string(), "prod-a".to_string()],
             &settings,
-        );
+        )
+        .expect("unique host should infer cluster");
         assert_eq!(cluster.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn resolve_cluster_name_for_gateway_requires_cluster_for_retry_in_multi_cluster() {
+        let settings = ClusterGatewaySettings {
+            clusters: BTreeMap::from([
+                ("prod".to_string(), ClusterGatewayDefinition::default()),
+                ("staging".to_string(), ClusterGatewayDefinition::default()),
+            ]),
+        };
+
+        let error = resolve_cluster_name_for_gateway("cluster-pane-retry", &[], &settings)
+            .expect_err("retry should require --cluster in multi-cluster mode");
+        assert!(error.to_string().contains("requires --cluster"));
+    }
+
+    #[test]
+    fn resolve_cluster_name_for_gateway_rejects_ambiguous_host_mapping() {
+        let settings = ClusterGatewaySettings {
+            clusters: BTreeMap::from([
+                (
+                    "prod".to_string(),
+                    ClusterGatewayDefinition {
+                        targets: vec!["db-a".to_string()],
+                        ..ClusterGatewayDefinition::default()
+                    },
+                ),
+                (
+                    "staging".to_string(),
+                    ClusterGatewayDefinition {
+                        targets: vec!["db-a".to_string()],
+                        ..ClusterGatewayDefinition::default()
+                    },
+                ),
+            ]),
+        };
+
+        let error = resolve_cluster_name_for_gateway(
+            "cluster-pane-new",
+            &["--host".to_string(), "db-a".to_string()],
+            &settings,
+        )
+        .expect_err("ambiguous host mapping should hard fail");
+        assert!(error.to_string().contains("matches multiple clusters"));
+    }
+
+    #[test]
+    fn ordered_gateway_candidates_prioritizes_recent_success() {
+        clear_gateway_runtime_state_for_tests();
+        record_gateway_success("prod", "db-b");
+        let definition = ClusterGatewayDefinition {
+            targets: vec!["db-a".to_string(), "db-b".to_string()],
+            gateway_mode: ClusterGatewayMode::Auto,
+            ..ClusterGatewayDefinition::default()
+        };
+
+        let ordered = ordered_gateway_candidates_for_cluster("prod", &definition)
+            .expect("ordered candidates should resolve");
+        assert_eq!(ordered, vec!["db-b".to_string(), "db-a".to_string()]);
     }
 
     #[test]

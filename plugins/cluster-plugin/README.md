@@ -23,7 +23,7 @@ Current scope:
 - Connection lifecycle state (`connecting/retrying/degraded/failed`) is tracked in pane metadata
 - Panes transition to `ready` only after post-launch health verification succeeds
 - `cluster pane retry` supports probe retry policy controls (`--retries`, `--on-failure=abort|continue|prompt`)
-- `cluster pane new|move|retry` accept optional `--cluster` hint for deterministic gateway routing in multi-cluster environments
+- `cluster pane new|move|retry` accept `--cluster` for deterministic gateway routing; in multi-cluster layouts, commands hard-fail when cluster inference is ambiguous
 - Cluster service interfaces are implemented for query/command/event-list integrations
 
 ## Failure Semantics
