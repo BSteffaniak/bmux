@@ -32,12 +32,12 @@ fn collect_enabled_plugins(context: &NativeCommandContext) -> Vec<&RegisteredPlu
     let enabled_ids = context
         .enabled_plugins
         .iter()
-        .cloned()
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
     context
         .registered_plugins
         .iter()
-        .filter(|plugin| enabled_ids.contains(&plugin.id))
+        .filter(|plugin| enabled_ids.contains(plugin.id.as_str()))
         .collect::<Vec<_>>()
 }
 
@@ -47,12 +47,13 @@ fn collect_doctor_findings(
     manifest_index: &BTreeMap<String, ManifestRecord>,
 ) -> Vec<DoctorFinding> {
     let mut findings = Vec::new();
+    let registered_ids = context
+        .registered_plugins
+        .iter()
+        .map(|plugin| plugin.id.as_str())
+        .collect::<BTreeSet<_>>();
     for plugin_id in &context.enabled_plugins {
-        if !context
-            .registered_plugins
-            .iter()
-            .any(|registered| registered.id == *plugin_id)
-        {
+        if !registered_ids.contains(plugin_id.as_str()) {
             findings.push(DoctorFinding::error(
                 "enabled_plugin_not_registered",
                 format!("enabled plugin '{plugin_id}' was not found in the registry"),
@@ -64,11 +65,11 @@ fn collect_doctor_findings(
     let available_capabilities = context
         .available_capabilities
         .iter()
-        .cloned()
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
     for plugin in enabled_plugins {
         for required in &plugin.required_capabilities {
-            if !available_capabilities.contains(required) {
+            if !available_capabilities.contains(required.as_str()) {
                 findings.push(DoctorFinding::error(
                     "missing_required_capability",
                     format!(

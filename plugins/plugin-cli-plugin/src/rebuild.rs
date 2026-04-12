@@ -5,7 +5,7 @@ use crate::{
     dir_name_to_crate_name, entry_to_crate_name, plugin_roots,
 };
 use bmux_plugin_sdk::{EXIT_OK, NativeCommandContext};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 
@@ -15,6 +15,7 @@ pub fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String
     let metadata = cargo_metadata()?;
     let workspace_plugin_crates = workspace_plugin_cdylib_crates(&metadata);
     let bundled_plugins = discover_bundled_plugins(context)?;
+    let selector_index = build_selector_index(&bundled_plugins, &workspace_plugin_crates);
 
     if matches!(options.mode, RebuildMode::List) {
         emit_rebuild_selection_report(&options, resolved_base_ref, Vec::new())?;
@@ -22,12 +23,7 @@ pub fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String
         return Ok(EXIT_OK);
     }
 
-    let targets = select_rebuild_targets(
-        &options,
-        resolved_base_ref.as_deref(),
-        &bundled_plugins,
-        &workspace_plugin_crates,
-    )?;
+    let targets = select_rebuild_targets(&options, resolved_base_ref.as_deref(), &selector_index)?;
 
     if targets.is_empty() {
         if matches!(options.mode, RebuildMode::Changed) {
@@ -38,7 +34,7 @@ pub fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String
         );
     }
 
-    validate_selected_targets(&targets, &workspace_plugin_crates)?;
+    validate_selected_targets(&targets, &selector_index.workspace_crates)?;
 
     emit_rebuild_selection_report(&options, resolved_base_ref, targets.clone())?;
 
@@ -60,6 +56,56 @@ pub fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String
     execute_rebuild_build(options.profile, &targets)?;
 
     Ok(EXIT_OK)
+}
+
+struct SelectorIndex {
+    by_plugin_id: BTreeMap<String, String>,
+    by_short_name: BTreeMap<String, String>,
+    workspace_crates: BTreeSet<String>,
+    known_ids: Vec<String>,
+    known_short: Vec<String>,
+    known_crates: Vec<String>,
+    suggestions: Vec<String>,
+}
+
+fn build_selector_index(bundled: &[BundledPlugin], workspace_crates: &[String]) -> SelectorIndex {
+    let mut by_plugin_id = BTreeMap::new();
+    let mut by_short_name = BTreeMap::new();
+    let mut known_ids = Vec::new();
+    let mut known_short = Vec::new();
+
+    for entry in bundled {
+        by_plugin_id
+            .entry(entry.plugin_id.clone())
+            .or_insert_with(|| entry.crate_name.clone());
+        by_short_name
+            .entry(entry.short_name.clone())
+            .or_insert_with(|| entry.crate_name.clone());
+        known_ids.push(entry.plugin_id.clone());
+        known_short.push(entry.short_name.clone());
+    }
+    known_ids.sort();
+    known_ids.dedup();
+    known_short.sort();
+    known_short.dedup();
+
+    let workspace_crates = workspace_crates.iter().cloned().collect::<BTreeSet<_>>();
+    let known_crates = workspace_crates.iter().cloned().collect::<Vec<_>>();
+
+    let mut suggestions = BTreeSet::new();
+    suggestions.extend(known_ids.iter().cloned());
+    suggestions.extend(known_short.iter().cloned());
+    suggestions.extend(known_crates.iter().cloned());
+
+    SelectorIndex {
+        by_plugin_id,
+        by_short_name,
+        workspace_crates,
+        known_ids,
+        known_short,
+        known_crates,
+        suggestions: suggestions.into_iter().collect(),
+    }
 }
 
 fn emit_rebuild_selection_report(
@@ -129,13 +175,10 @@ fn print_rebuild_selection_text(report: &RebuildSelectionReport) {
 
 fn validate_selected_targets(
     targets: &[String],
-    workspace_plugin_crates: &[String],
+    workspace_plugin_crates: &BTreeSet<String>,
 ) -> Result<(), String> {
     for crate_name in targets {
-        if !workspace_plugin_crates
-            .iter()
-            .any(|known| known == crate_name)
-        {
+        if !workspace_plugin_crates.contains(crate_name) {
             return Err(format!(
                 "selected crate '{crate_name}' is not a workspace plugin cdylib crate"
             ));
@@ -188,8 +231,7 @@ fn rebuild_mode_name(options: &RebuildOptions) -> String {
 fn select_rebuild_targets(
     options: &RebuildOptions,
     base_ref: Option<&str>,
-    bundled_plugins: &[BundledPlugin],
-    workspace_plugin_crates: &[String],
+    selector_index: &SelectorIndex,
 ) -> Result<Vec<String>, String> {
     let mut targets = Vec::new();
     let mut seen = BTreeSet::new();
@@ -201,7 +243,7 @@ fn select_rebuild_targets(
 
     if !options.selectors.is_empty() {
         for selector in &options.selectors {
-            let resolved = resolve_selector(selector, bundled_plugins, workspace_plugin_crates)?;
+            let resolved = resolve_selector(selector, selector_index)?;
             add_target(&resolved);
         }
         return Ok(targets);
@@ -209,12 +251,9 @@ fn select_rebuild_targets(
 
     match options.mode {
         RebuildMode::Changed => {
-            for crate_name in changed_workspace_plugin_crates(
-                base_ref,
-                options.diff_range_mode,
-                bundled_plugins,
-                workspace_plugin_crates,
-            )? {
+            for crate_name in
+                changed_workspace_plugin_crates(base_ref, options.diff_range_mode, selector_index)?
+            {
                 add_target(&crate_name);
             }
         }
@@ -222,7 +261,7 @@ fn select_rebuild_targets(
             if matches!(options.workspace_flag, WorkspaceFlag::ExplicitAll) {
                 println!("--all-workspace-plugins is now the default behavior");
             }
-            for crate_name in workspace_plugin_crates {
+            for crate_name in &selector_index.known_crates {
                 add_target(crate_name);
             }
         }
@@ -234,8 +273,7 @@ fn select_rebuild_targets(
 fn changed_workspace_plugin_crates(
     base_ref: Option<&str>,
     diff_range_mode: DiffRangeMode,
-    bundled: &[BundledPlugin],
-    workspace_crates: &[String],
+    selector_index: &SelectorIndex,
 ) -> Result<Vec<String>, String> {
     let changed_paths = collect_changed_paths(base_ref, diff_range_mode)?;
     let mut selected = BTreeSet::new();
@@ -243,7 +281,7 @@ fn changed_workspace_plugin_crates(
     if changed_paths.iter().any(|path| {
         path.starts_with("packages/plugin/") || path.starts_with("packages/plugin-sdk/")
     }) {
-        return Ok(workspace_crates.to_vec());
+        return Ok(selector_index.known_crates.clone());
     }
 
     for path in changed_paths {
@@ -254,16 +292,14 @@ fn changed_workspace_plugin_crates(
         let Some(short_name) = segments.next() else {
             continue;
         };
-        if let Some(entry) = bundled.iter().find(|entry| entry.short_name == short_name)
-            && workspace_crates
-                .iter()
-                .any(|name| name == &entry.crate_name)
+        if let Some(crate_name) = selector_index.by_short_name.get(short_name)
+            && selector_index.workspace_crates.contains(crate_name)
         {
-            selected.insert(entry.crate_name.clone());
+            selected.insert(crate_name.clone());
             continue;
         }
         let derived = dir_name_to_crate_name(short_name);
-        if workspace_crates.iter().any(|name| name == &derived) {
+        if selector_index.workspace_crates.contains(&derived) {
             selected.insert(derived);
         }
     }
@@ -426,42 +462,20 @@ fn print_discovered_plugins(bundled: &[BundledPlugin], workspace_crates: &[Strin
     }
 }
 
-fn resolve_selector(
-    selector: &str,
-    bundled: &[BundledPlugin],
-    workspace_crates: &[String],
-) -> Result<String, String> {
-    if workspace_crates
-        .iter()
-        .any(|crate_name| crate_name == selector)
-    {
+fn resolve_selector(selector: &str, selector_index: &SelectorIndex) -> Result<String, String> {
+    if selector_index.workspace_crates.contains(selector) {
         return Ok(selector.to_string());
     }
-    if let Some(entry) = bundled.iter().find(|entry| entry.plugin_id == selector) {
-        return Ok(entry.crate_name.clone());
+    if let Some(crate_name) = selector_index.by_plugin_id.get(selector) {
+        return Ok(crate_name.clone());
     }
-    if let Some(entry) = bundled.iter().find(|entry| entry.short_name == selector) {
-        return Ok(entry.crate_name.clone());
+    if let Some(crate_name) = selector_index.by_short_name.get(selector) {
+        return Ok(crate_name.clone());
     }
 
-    let known_ids = bundled
-        .iter()
-        .map(|entry| entry.plugin_id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let known_short = bundled
-        .iter()
-        .map(|entry| entry.short_name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let known_crates = workspace_crates.join(", ");
     let suggestions = suggest_top_matches(
         selector,
-        bundled
-            .iter()
-            .map(|entry| entry.plugin_id.as_str())
-            .chain(bundled.iter().map(|entry| entry.short_name.as_str()))
-            .chain(workspace_crates.iter().map(String::as_str)),
+        selector_index.suggestions.iter().map(String::as_str),
         3,
     );
 
@@ -472,7 +486,10 @@ fn resolve_selector(
     };
 
     Err(format!(
-        "Problem: unknown plugin selector '{selector}'.\nWhy: selector did not match a bundled plugin id, short name, or workspace plugin crate.{hint}\nKnown bundled ids: {known_ids}\nKnown bundled short names: {known_short}\nKnown workspace plugin crates: {known_crates}\nNext: run 'bmux plugin rebuild --list' to inspect selectable plugin targets."
+        "Problem: unknown plugin selector '{selector}'.\nWhy: selector did not match a bundled plugin id, short name, or workspace plugin crate.{hint}\nKnown bundled ids: {}\nKnown bundled short names: {}\nKnown workspace plugin crates: {}\nNext: run 'bmux plugin rebuild --list' to inspect selectable plugin targets.",
+        selector_index.known_ids.join(", "),
+        selector_index.known_short.join(", "),
+        selector_index.known_crates.join(", "),
     ))
 }
 
@@ -630,7 +647,10 @@ pub fn parse_rebuild_options(arguments: &[String]) -> Result<RebuildOptions, Str
 
 #[cfg(test)]
 mod tests {
-    use super::{build_rebuild_target_selection, parse_rebuild_options, resolve_selector};
+    use super::{
+        build_rebuild_target_selection, build_selector_index, parse_rebuild_options,
+        resolve_selector,
+    };
     use crate::{BaseSelector, BuildProfile, BundledPlugin, RebuildMode, RebuildOptions};
 
     #[test]
@@ -692,10 +712,36 @@ mod tests {
             crate_name: "bmux_windows_plugin".to_string(),
         }];
         let workspace = vec!["bmux_windows_plugin".to_string()];
-        let error =
-            resolve_selector("windos", &bundled, &workspace).expect_err("selector should fail");
+        let selector_index = build_selector_index(&bundled, &workspace);
+        let error = resolve_selector("windos", &selector_index).expect_err("selector should fail");
         assert!(error.contains("Problem:"));
         assert!(error.contains("Why:"));
         assert!(error.contains("Next: run 'bmux plugin rebuild --list'"));
+    }
+
+    #[test]
+    fn resolve_selector_accepts_plugin_id_short_name_and_crate_name() {
+        let bundled = vec![BundledPlugin {
+            plugin_id: "bmux.windows".to_string(),
+            short_name: "windows-plugin".to_string(),
+            crate_name: "bmux_windows_plugin".to_string(),
+        }];
+        let workspace = vec!["bmux_windows_plugin".to_string()];
+        let selector_index = build_selector_index(&bundled, &workspace);
+
+        assert_eq!(
+            resolve_selector("bmux.windows", &selector_index).expect("id selector should work"),
+            "bmux_windows_plugin"
+        );
+        assert_eq!(
+            resolve_selector("windows-plugin", &selector_index)
+                .expect("short name selector should work"),
+            "bmux_windows_plugin"
+        );
+        assert_eq!(
+            resolve_selector("bmux_windows_plugin", &selector_index)
+                .expect("crate selector should work"),
+            "bmux_windows_plugin"
+        );
     }
 }
