@@ -1,0 +1,31 @@
+{
+  "latency_ms": {
+    "avg": 116.437792,
+    "max": 116.437792,
+    "min": 116.437792,
+    "p50": 116.437792,
+    "p95": 116.437792,
+    "p99": 116.437792
+  },
+  "limits": {
+    "max_avg_ms": null,
+    "max_p95_ms": 24000.0,
+    "max_p99_ms": 34000.0,
+    "max_runtime_respawns": 0,
+    "max_runtime_retries": 0,
+    "max_runtime_timeouts": 0,
+    "max_steady_avg_ms": null,
+    "max_steady_p95_ms": 1100.0,
+    "max_steady_p99_ms": 1600.0
+  },
+  "passed": true,
+  "runtime_faults": {
+    "respawns": 0,
+    "retries": 0,
+    "timeouts": 0
+  },
+  "sample_count": 1,
+  "startup_ms": 116.437792,
+  "steady_state_ms": null,
+  "violations": []
+}
