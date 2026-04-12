@@ -1215,6 +1215,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_mobile_core"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_mobile_ffi"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_mobile_core",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_perf_tools"
 version = "0.0.1-alpha.0"
 dependencies = [

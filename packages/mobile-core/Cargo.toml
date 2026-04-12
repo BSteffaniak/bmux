@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["network-programming", "development-tools"]
+description = "Shared mobile domain core for bmux clients"
+edition     = { workspace = true }
+keywords    = ["bmux", "mobile", "connection", "ffi"]
+license     = { workspace = true }
+name        = "bmux_mobile_core"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde     = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+uuid      = { workspace = true, features = ["serde", "v4"] }
+
+[features]
+default = []
+
+fail-on-warnings = []

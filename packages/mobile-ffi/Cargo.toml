@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["network-programming", "development-tools"]
+description = "FFI facade for bmux mobile core"
+edition     = { workspace = true }
+keywords    = ["bmux", "mobile", "ffi", "android"]
+license     = { workspace = true }
+name        = "bmux_mobile_ffi"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_mobile_core = { workspace = true }
+uuid             = { workspace = true, features = ["v4"] }
+
+[features]
+default = []
+
+fail-on-warnings = ["bmux_mobile_core/fail-on-warnings"]

@@ -30,6 +30,8 @@ members = [
     "packages/terminal/models",
     "packages/terminal_protocol",
     "packages/keyboard",
+    "packages/mobile-core",
+    "packages/mobile-ffi",
     "packages/image",
     "packages/docs-site",
     "packages/docs-site/ui",
@@ -99,6 +101,8 @@ bmux_image             = { version = "0.0.1-alpha.0", default-features = false, 
 bmux_ipc               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
 bmux_keybind           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keybind" }
 bmux_keyboard          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keyboard" }
+bmux_mobile_core       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-core" }
+bmux_mobile_ffi        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-ffi" }
 bmux_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bmux_plugin_sdk        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bmux_sandbox_harness   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/sandbox-harness" }
