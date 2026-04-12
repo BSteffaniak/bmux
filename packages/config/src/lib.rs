@@ -16,7 +16,27 @@ use thiserror::Error;
 
 pub const RECORDINGS_DIR_OVERRIDE_ENV: &str = "BMUX_RECORDINGS_DIR";
 pub const BMUX_CONFIG_ENV: &str = "BMUX_CONFIG";
-pub const BMUX_CONFIG_CLI_OVERRIDE_ENV: &str = "BMUX_CONFIG_CLI";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigLoadOverrides {
+    pub env_config_path: Option<PathBuf>,
+    pub cli_config_path: Option<PathBuf>,
+}
+
+impl ConfigLoadOverrides {
+    #[must_use]
+    pub fn from_env_with_cli(cli_config_path: Option<PathBuf>) -> Self {
+        Self {
+            env_config_path: std::env::var_os(BMUX_CONFIG_ENV).map(PathBuf::from),
+            cli_config_path,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.env_config_path.is_none() && self.cli_config_path.is_none()
+    }
+}
 
 pub mod keybind;
 pub mod paths;
@@ -26,6 +46,42 @@ pub use bmux_config_doc::{ConfigDocSchema, FieldDoc};
 pub use keybind::{KeyBindingConfig, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, ResolvedTimeout};
 pub use paths::{ConfigPaths, ENV_OVERRIDE_DOCS, EnvOverrideDoc};
 pub use theme::ThemeConfig;
+
+fn process_config_overrides() -> &'static std::sync::RwLock<Option<ConfigLoadOverrides>> {
+    static OVERRIDES: std::sync::OnceLock<std::sync::RwLock<Option<ConfigLoadOverrides>>> =
+        std::sync::OnceLock::new();
+    OVERRIDES.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+#[derive(Debug)]
+pub struct ConfigOverrideGuard {
+    previous: Option<ConfigLoadOverrides>,
+}
+
+impl Drop for ConfigOverrideGuard {
+    fn drop(&mut self) {
+        let mut guard = process_config_overrides()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (*guard).clone_from(&self.previous);
+    }
+}
+
+/// Applies process-scoped config load overrides until the returned guard is dropped.
+///
+/// # Panics
+///
+/// Panics only if lock poisoning recovery fails unexpectedly.
+#[must_use]
+pub fn push_process_config_overrides(overrides: ConfigLoadOverrides) -> ConfigOverrideGuard {
+    let mut guard = process_config_overrides()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = guard.clone();
+    *guard = Some(overrides);
+    drop(guard);
+    ConfigOverrideGuard { previous }
+}
 
 /// Configuration error types
 #[derive(Debug, Error)]
@@ -257,7 +313,10 @@ fn load_toml_file(path: &std::path::Path) -> Result<toml::Value> {
     })
 }
 
-fn merged_raw_config_value(base_path: &std::path::Path) -> Result<Option<toml::Value>> {
+fn merged_raw_config_value_with_overrides(
+    base_path: &std::path::Path,
+    explicit_overrides: Option<&ConfigLoadOverrides>,
+) -> Result<Option<toml::Value>> {
     let mut source_paths = Vec::new();
     if base_path.exists() {
         source_paths.push(base_path.to_path_buf());
@@ -275,20 +334,26 @@ fn merged_raw_config_value(base_path: &std::path::Path) -> Result<Option<toml::V
         return Ok(loaded_any.then_some(merged));
     }
 
-    if let Some(value) = std::env::var_os(BMUX_CONFIG_ENV)
-        && !value.is_empty()
-    {
-        let path = resolve_config_override_path(&value);
+    let process_overrides = process_config_overrides()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let resolved_overrides = explicit_overrides
+        .cloned()
+        .filter(|overrides| !overrides.is_empty())
+        .or(process_overrides)
+        .unwrap_or_else(|| ConfigLoadOverrides::from_env_with_cli(None));
+
+    if let Some(value) = resolved_overrides.env_config_path {
+        let path = resolve_config_override_path(value.as_os_str());
         if !path.exists() {
             return Err(ConfigError::FileNotFound { path });
         }
         source_paths.push(path);
     }
 
-    if let Some(value) = std::env::var_os(BMUX_CONFIG_CLI_OVERRIDE_ENV)
-        && !value.is_empty()
-    {
-        let path = resolve_config_override_path(&value);
+    if let Some(value) = resolved_overrides.cli_config_path {
+        let path = resolve_config_override_path(value.as_os_str());
         if !path.exists() {
             return Err(ConfigError::FileNotFound { path });
         }
@@ -2101,6 +2166,28 @@ impl BmuxConfig {
         Self::load_from_path_with_resolution(&paths.config_file(), None)
     }
 
+    /// Load configuration from default location using explicit layered overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_with_overrides(overrides: &ConfigLoadOverrides) -> Result<Self> {
+        let paths = ConfigPaths::default();
+        Self::load_from_path_with_overrides(&paths.config_file(), overrides)
+    }
+
+    /// Load configuration and include composition metadata using explicit overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_with_resolution_and_overrides(
+        overrides: &ConfigLoadOverrides,
+    ) -> Result<(Self, CompositionResolution)> {
+        let paths = ConfigPaths::default();
+        Self::load_from_path_with_resolution_and_overrides(&paths.config_file(), None, overrides)
+    }
+
     /// Load configuration while forcing a specific active composition profile.
     ///
     /// # Errors
@@ -2119,6 +2206,19 @@ impl BmuxConfig {
     pub fn load_with_explain(profile_id: Option<&str>) -> Result<(Self, CompositionExplain)> {
         let paths = ConfigPaths::default();
         Self::load_from_path_with_explain(&paths.config_file(), profile_id)
+    }
+
+    /// Load configuration and explain data using explicit overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_with_explain_and_overrides(
+        profile_id: Option<&str>,
+        overrides: &ConfigLoadOverrides,
+    ) -> Result<(Self, CompositionExplain)> {
+        let paths = ConfigPaths::default();
+        Self::load_from_path_with_explain_and_overrides(&paths.config_file(), profile_id, overrides)
     }
 
     /// Load the configured global theme.
@@ -2169,6 +2269,20 @@ impl BmuxConfig {
         Ok(config)
     }
 
+    /// Load configuration from a specific path using explicit layered overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_from_path_with_overrides(
+        path: &std::path::Path,
+        overrides: &ConfigLoadOverrides,
+    ) -> Result<Self> {
+        let (config, _resolution) =
+            Self::load_from_path_with_resolution_and_overrides(path, None, overrides)?;
+        Ok(config)
+    }
+
     /// Load configuration from a specific path and return composition metadata.
     ///
     /// # Errors
@@ -2178,7 +2292,25 @@ impl BmuxConfig {
         path: &std::path::Path,
         forced_profile: Option<&str>,
     ) -> Result<(Self, CompositionResolution)> {
-        let Some(mut raw_value) = merged_raw_config_value(path)? else {
+        Self::load_from_path_with_resolution_and_overrides(
+            path,
+            forced_profile,
+            &ConfigLoadOverrides::default(),
+        )
+    }
+
+    /// Load configuration from a specific path and return composition metadata with overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_from_path_with_resolution_and_overrides(
+        path: &std::path::Path,
+        forced_profile: Option<&str>,
+        overrides: &ConfigLoadOverrides,
+    ) -> Result<(Self, CompositionResolution)> {
+        let Some(mut raw_value) = merged_raw_config_value_with_overrides(path, Some(overrides))?
+        else {
             return Ok((
                 Self::default(),
                 CompositionResolution {
@@ -2223,7 +2355,25 @@ impl BmuxConfig {
         path: &std::path::Path,
         forced_profile: Option<&str>,
     ) -> Result<(Self, CompositionExplain)> {
-        let Some(mut raw_value) = merged_raw_config_value(path)? else {
+        Self::load_from_path_with_explain_and_overrides(
+            path,
+            forced_profile,
+            &ConfigLoadOverrides::default(),
+        )
+    }
+
+    /// Load configuration from a specific path with layer-by-layer explain data and overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_from_path_with_explain_and_overrides(
+        path: &std::path::Path,
+        forced_profile: Option<&str>,
+        overrides: &ConfigLoadOverrides,
+    ) -> Result<(Self, CompositionExplain)> {
+        let Some(mut raw_value) = merged_raw_config_value_with_overrides(path, Some(overrides))?
+        else {
             let resolution = CompositionResolution {
                 selected_profile: None,
                 selected_profile_source: None,
@@ -2588,8 +2738,9 @@ impl BmuxConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        BMUX_CONFIG_CLI_OVERRIDE_ENV, BMUX_CONFIG_ENV, BmuxConfig, MouseClickPropagation,
+        BMUX_CONFIG_ENV, BmuxConfig, ConfigLoadOverrides, MouseClickPropagation,
         MouseWheelPropagation, ResolvedTimeout, SandboxCleanupSource, StaleBuildAction,
+        push_process_config_overrides,
     };
     use crate::ConfigPaths;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3905,10 +4056,10 @@ timeout_profile = "missing"
         let _config_dir_guard =
             EnvVarGuard::set("BMUX_CONFIG_DIR", dir.to_str().expect("temp dir utf-8"));
         let _env_guard = EnvVarGuard::set(BMUX_CONFIG_ENV, env_path.to_str().expect("env utf-8"));
-        let _cli_guard = EnvVarGuard::set(
-            BMUX_CONFIG_CLI_OVERRIDE_ENV,
-            cli_path.to_str().expect("cli utf-8"),
-        );
+        let _override_guard = push_process_config_overrides(ConfigLoadOverrides {
+            env_config_path: Some(env_path),
+            cli_config_path: Some(cli_path),
+        });
 
         let config = BmuxConfig::load().expect("load merged config");
         assert_eq!(config.general.server_timeout, 300);
@@ -3937,8 +4088,10 @@ timeout_profile = "missing"
 
         let _cwd_guard = CwdGuard::set(&dir);
         let _config_dir_guard = EnvVarGuard::set("BMUX_CONFIG_DIR", ".");
-        let _env_guard = EnvVarGuard::set(BMUX_CONFIG_ENV, "relative-env.toml");
-        let _cli_guard = EnvVarGuard::set(BMUX_CONFIG_CLI_OVERRIDE_ENV, "relative-cli.toml");
+        let _override_guard = push_process_config_overrides(ConfigLoadOverrides {
+            env_config_path: Some(std::path::PathBuf::from("relative-env.toml")),
+            cli_config_path: Some(std::path::PathBuf::from("relative-cli.toml")),
+        });
 
         let config = BmuxConfig::load().expect("load merged config");
         assert_eq!(config.general.server_timeout, 175);
@@ -3950,7 +4103,6 @@ timeout_profile = "missing"
     fn load_fails_when_config_override_path_is_missing() {
         let _guard = env_lock().lock().expect("env lock");
         let _config_dir_guard = EnvVarGuard::unset("BMUX_CONFIG_DIR");
-        let _cli_guard = EnvVarGuard::unset(BMUX_CONFIG_CLI_OVERRIDE_ENV);
         let missing = std::env::temp_dir().join(format!(
             "bmux-missing-config-override-{}-{}.toml",
             std::process::id(),
@@ -3959,7 +4111,11 @@ timeout_profile = "missing"
                 .expect("system time")
                 .as_nanos()
         ));
-        let _env_guard = EnvVarGuard::set(BMUX_CONFIG_ENV, missing.as_os_str());
+        let _env_guard = EnvVarGuard::unset(BMUX_CONFIG_ENV);
+        let _override_guard = push_process_config_overrides(ConfigLoadOverrides {
+            env_config_path: Some(missing),
+            cli_config_path: None,
+        });
 
         let error = BmuxConfig::load().expect_err("missing override should fail");
         assert!(matches!(error, crate::ConfigError::FileNotFound { .. }));

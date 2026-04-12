@@ -14,7 +14,7 @@ use bmux_cli_schema::{
     RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
 };
 use bmux_client::BmuxClient;
-use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_config::{BmuxConfig, ConfigPaths, push_process_config_overrides};
 use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingStatus, RecordingSummary};
 use bmux_server::offline_kill_sessions;
 use crossterm::terminal;
@@ -252,7 +252,9 @@ pub async fn run() -> Result<u8> {
             cli,
             log_level,
             verbose,
+            config_overrides,
         } => {
+            let _config_override_guard = push_process_config_overrides(config_overrides);
             let file_only = command_enters_raw_mode(cli.command.as_ref()) || cli.core_builtins_only;
             init_logging(verbose, Some(log_level), file_only);
             validate_record_bootstrap_flags(&cli)?;
@@ -281,7 +283,9 @@ pub async fn run() -> Result<u8> {
             plugin_id,
             command_name,
             arguments,
+            config_overrides,
         } => {
+            let _config_override_guard = push_process_config_overrides(config_overrides);
             init_logging(false, Some(log_level), false);
             run_plugin_command(&plugin_id, &command_name, &arguments).await
         }

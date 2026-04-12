@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, LogLevel};
-use bmux_config::{
-    BMUX_CONFIG_CLI_OVERRIDE_ENV, BmuxConfig, ConfigPaths, RECORDINGS_DIR_OVERRIDE_ENV,
-};
+use bmux_config::{BmuxConfig, ConfigLoadOverrides, ConfigPaths, RECORDINGS_DIR_OVERRIDE_ENV};
 use bmux_plugin::PluginRegistry;
 use clap::{CommandFactory, FromArgMatches};
 use tracing::Level;
@@ -22,6 +20,7 @@ pub(super) enum ParsedRuntimeCli {
         cli: Cli,
         log_level: LogLevel,
         verbose: bool,
+        config_overrides: ConfigLoadOverrides,
     },
     ImmediateExit {
         code: u8,
@@ -33,19 +32,29 @@ pub(super) enum ParsedRuntimeCli {
         plugin_id: String,
         command_name: String,
         arguments: Vec<String>,
+        config_overrides: ConfigLoadOverrides,
     },
+}
+
+#[derive(Debug, Clone, Default)]
+struct RawRuntimeOverrides {
+    config_path: Option<std::path::PathBuf>,
 }
 
 pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
     let argv = std::env::args_os().collect::<Vec<_>>();
-    apply_runtime_override_from_raw_args(&argv)?;
-    let config = BmuxConfig::load()?;
+    let raw_overrides = apply_runtime_override_from_raw_args(&argv)?;
+    let config_overrides = ConfigLoadOverrides::from_env_with_cli(raw_overrides.config_path);
+    let config = BmuxConfig::load_with_overrides(&config_overrides)?;
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
-    parse_runtime_cli_with_registry(&argv, &config, &registry)
+    parse_runtime_cli_with_registry(&argv, &config, &registry, config_overrides)
 }
 
-fn apply_runtime_override_from_raw_args(argv: &[std::ffi::OsString]) -> Result<()> {
+fn apply_runtime_override_from_raw_args(
+    argv: &[std::ffi::OsString],
+) -> Result<RawRuntimeOverrides> {
+    let mut overrides = RawRuntimeOverrides::default();
     let mut index = 1usize;
     while index < argv.len() {
         let arg = argv[index].to_string_lossy();
@@ -71,8 +80,7 @@ fn apply_runtime_override_from_raw_args(argv: &[std::ffi::OsString]) -> Result<(
         }
         if let Some(value) = arg.strip_prefix("--config=") {
             let path = resolve_cli_path_override(value, "--config")?;
-            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
-            unsafe { std::env::set_var(BMUX_CONFIG_CLI_OVERRIDE_ENV, path) };
+            overrides.config_path = Some(std::path::PathBuf::from(path));
             index += 1;
             continue;
         }
@@ -81,8 +89,7 @@ fn apply_runtime_override_from_raw_args(argv: &[std::ffi::OsString]) -> Result<(
                 anyhow::bail!("--config requires a value")
             };
             let path = resolve_cli_path_override(&value.to_string_lossy(), "--config")?;
-            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
-            unsafe { std::env::set_var(BMUX_CONFIG_CLI_OVERRIDE_ENV, path) };
+            overrides.config_path = Some(std::path::PathBuf::from(path));
             index += 2;
             continue;
         }
@@ -135,7 +142,7 @@ fn apply_runtime_override_from_raw_args(argv: &[std::ffi::OsString]) -> Result<(
         }
         index += 1;
     }
-    Ok(())
+    Ok(overrides)
 }
 
 fn resolve_cli_path_override(value: &str, flag: &str) -> Result<String> {
@@ -175,6 +182,7 @@ pub(super) fn parse_runtime_cli_with_registry(
     argv: &[std::ffi::OsString],
     config: &BmuxConfig,
     registry: &PluginRegistry,
+    config_overrides: ConfigLoadOverrides,
 ) -> Result<ParsedRuntimeCli> {
     let mut command_config = config.clone();
     command_config.plugins.enabled = effective_enabled_plugins(config, registry);
@@ -202,6 +210,7 @@ pub(super) fn parse_runtime_cli_with_registry(
                 plugin_id: resolved.plugin_id,
                 command_name: resolved.command_name,
                 arguments: normalized,
+                config_overrides,
             });
         }
     }
@@ -246,6 +255,7 @@ pub(super) fn parse_runtime_cli_with_registry(
                 plugin_id: resolved.plugin_id,
                 command_name: resolved.command_name,
                 arguments,
+                config_overrides,
             });
         }
     }
@@ -256,6 +266,7 @@ pub(super) fn parse_runtime_cli_with_registry(
         cli,
         log_level,
         verbose,
+        config_overrides,
     })
 }
 
@@ -351,48 +362,15 @@ pub(super) fn validate_record_bootstrap_flags(cli: &Cli) -> Result<()> {
 mod tests {
     use super::*;
 
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn clear(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: test-scoped env mutation guarded by this fixture.
-            unsafe { std::env::remove_var(key) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.as_ref() {
-                // SAFETY: restoring process env during test teardown.
-                unsafe { std::env::set_var(self.key, previous) };
-            } else {
-                // SAFETY: restoring process env during test teardown.
-                unsafe { std::env::remove_var(self.key) };
-            }
-        }
-    }
-
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     #[test]
-    fn raw_arg_config_override_sets_cli_config_env() {
-        let _guard = env_lock().lock().expect("lock poisoned");
-        let _config_cli_guard = EnvGuard::clear(BMUX_CONFIG_CLI_OVERRIDE_ENV);
+    fn raw_arg_config_override_returns_resolved_path() {
         let args = vec![
             std::ffi::OsString::from("bmux"),
             std::ffi::OsString::from("--config"),
             std::ffi::OsString::from("./test.toml"),
         ];
-        apply_runtime_override_from_raw_args(&args).expect("apply overrides");
-        let stored = std::env::var(BMUX_CONFIG_CLI_OVERRIDE_ENV).expect("config override env set");
-        assert!(stored.ends_with("test.toml"));
+        let overrides = apply_runtime_override_from_raw_args(&args).expect("apply overrides");
+        let path = overrides.config_path.expect("config path override set");
+        assert!(path.ends_with("test.toml"));
     }
 }

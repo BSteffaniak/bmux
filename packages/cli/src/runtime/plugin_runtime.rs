@@ -1631,8 +1631,13 @@ mod tests {
             OsString::from("dev"),
         ];
 
-        let parsed = parse_runtime_cli_with_registry(&argv, &config, &registry)
-            .expect("runtime CLI should parse plugin alias under session namespace");
+        let parsed = parse_runtime_cli_with_registry(
+            &argv,
+            &config,
+            &registry,
+            bmux_config::ConfigLoadOverrides::default(),
+        )
+        .expect("runtime CLI should parse plugin alias under session namespace");
         match parsed {
             ParsedRuntimeCli::Plugin {
                 plugin_id,
@@ -1675,8 +1680,13 @@ mod tests {
             OsString::from("list"),
         ];
 
-        let parsed = parse_runtime_cli_with_registry(&argv, &config, &registry)
-            .expect("runtime CLI should parse plugin-owned plugin namespace command");
+        let parsed = parse_runtime_cli_with_registry(
+            &argv,
+            &config,
+            &registry,
+            bmux_config::ConfigLoadOverrides::default(),
+        )
+        .expect("runtime CLI should parse plugin-owned plugin namespace command");
         match parsed {
             ParsedRuntimeCli::Plugin {
                 plugin_id,
@@ -1714,8 +1724,13 @@ mod tests {
 
         let config = BmuxConfig::default();
         let argv = vec![OsString::from("bmux"), OsString::from("new-window")];
-        let parsed = parse_runtime_cli_with_registry(&argv, &config, &registry)
-            .expect("runtime CLI should parse bundled plugin command");
+        let parsed = parse_runtime_cli_with_registry(
+            &argv,
+            &config,
+            &registry,
+            bmux_config::ConfigLoadOverrides::default(),
+        )
+        .expect("runtime CLI should parse bundled plugin command");
         match parsed {
             ParsedRuntimeCli::Plugin { plugin_id, .. } => {
                 assert_eq!(plugin_id, "bmux.windows");
@@ -1734,8 +1749,13 @@ mod tests {
             OsString::from("dev"),
         ];
 
-        let parsed = parse_runtime_cli_with_registry(&argv, &config, &registry)
-            .expect("runtime CLI should parse built-in attach command");
+        let parsed = parse_runtime_cli_with_registry(
+            &argv,
+            &config,
+            &registry,
+            bmux_config::ConfigLoadOverrides::default(),
+        )
+        .expect("runtime CLI should parse built-in attach command");
 
         match parsed {
             ParsedRuntimeCli::BuiltIn { cli, .. } => {
