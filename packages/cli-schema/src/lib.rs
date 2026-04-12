@@ -1122,6 +1122,12 @@ pub enum SandboxCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show a summary of sandbox runtime and index health
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect a sandbox by id or absolute path
     Inspect {
         /// Sandbox id (bmux-sbx-...) or full path
@@ -4067,6 +4073,13 @@ mod tests {
                 json: true,
             }
         ));
+
+        let status = Cli::try_parse_from(["bmux", "sandbox", "status", "--json"])
+            .expect("valid status args");
+        let Some(Command::Sandbox { command }) = status.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(command, SandboxCommand::Status { json: true }));
 
         let inspect =
             Cli::try_parse_from(["bmux", "sandbox", "inspect", "bmux-sbx-abc", "--tail", "25"])

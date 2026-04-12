@@ -117,6 +117,7 @@ pub enum BuiltInHandlerId {
     SandboxDev,
     SandboxRun,
     SandboxList,
+    SandboxStatus,
     SandboxInspect,
     SandboxDoctor,
     SandboxBundle,
@@ -726,6 +727,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::SandboxList,
             &["sandbox", "list"],
             "List known bmux sandbox runs",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxStatus,
+            &["sandbox", "status"],
+            "Show sandbox runtime and index summary",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SandboxInspect,

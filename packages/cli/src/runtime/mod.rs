@@ -126,6 +126,7 @@ use remote_cli::{
 use sandbox_cli::{
     RunSandboxOptions, run_sandbox_bundle, run_sandbox_cleanup, run_sandbox_doctor,
     run_sandbox_inspect, run_sandbox_list, run_sandbox_rebuild_index, run_sandbox_run,
+    run_sandbox_status,
 };
 use server_commands::{
     run_server_bridge, run_server_gateway, run_server_recording_clear, run_server_recording_path,

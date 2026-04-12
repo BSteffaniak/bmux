@@ -78,6 +78,40 @@ struct SandboxListEntry {
     kept: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+struct StatusCounts {
+    total: usize,
+    running: usize,
+    failed: usize,
+    stopped: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SourceStatusCounts {
+    source: String,
+    total: usize,
+    running: usize,
+    failed: usize,
+    stopped: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SandboxStatusHealth {
+    stale_lock_count: usize,
+    missing_manifest_count: usize,
+    index_exists: bool,
+    index_entries: usize,
+    index_missing_roots: usize,
+    index_read_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SandboxStatusSnapshot {
+    totals: StatusCounts,
+    by_source: Vec<SourceStatusCounts>,
+    health: SandboxStatusHealth,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DoctorCheck {
     name: String,
@@ -482,6 +516,156 @@ pub(super) fn run_sandbox_list(
     }
 
     Ok(0)
+}
+
+pub(super) fn run_sandbox_status(json: bool) -> Result<u8> {
+    let snapshot = collect_sandbox_status_snapshot();
+
+    if json {
+        let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+            "totals": snapshot.totals,
+            "by_source": snapshot.by_source,
+            "health": snapshot.health,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_sandbox_status_text(&snapshot);
+        if let Some(error) = snapshot.health.index_read_error.as_deref() {
+            println!("health: index_read_error={error}");
+        }
+    }
+
+    Ok(0)
+}
+
+fn collect_sandbox_status_snapshot() -> SandboxStatusSnapshot {
+    let candidates = collect_sandbox_candidates();
+    let entries = candidates
+        .iter()
+        .map(sandbox_list_entry)
+        .collect::<Vec<_>>();
+    let totals = summarize_status_counts(&entries);
+    let by_source = summarize_source_status_counts(&entries);
+    let health = summarize_sandbox_health(&candidates);
+
+    SandboxStatusSnapshot {
+        totals,
+        by_source,
+        health,
+    }
+}
+
+fn summarize_status_counts(entries: &[SandboxListEntry]) -> StatusCounts {
+    entries.iter().fold(
+        StatusCounts {
+            total: 0,
+            running: 0,
+            failed: 0,
+            stopped: 0,
+        },
+        |mut acc, entry| {
+            acc.total += 1;
+            match entry.status.as_str() {
+                "running" => acc.running += 1,
+                "failed" => acc.failed += 1,
+                _ => acc.stopped += 1,
+            }
+            acc
+        },
+    )
+}
+
+fn summarize_source_status_counts(entries: &[SandboxListEntry]) -> Vec<SourceStatusCounts> {
+    let mut by_source_map = std::collections::BTreeMap::<String, StatusCounts>::new();
+    for entry in entries {
+        let counts = by_source_map
+            .entry(entry.source.clone())
+            .or_insert(StatusCounts {
+                total: 0,
+                running: 0,
+                failed: 0,
+                stopped: 0,
+            });
+        counts.total += 1;
+        match entry.status.as_str() {
+            "running" => counts.running += 1,
+            "failed" => counts.failed += 1,
+            _ => counts.stopped += 1,
+        }
+    }
+
+    by_source_map
+        .into_iter()
+        .map(|(source, counts)| SourceStatusCounts {
+            source,
+            total: counts.total,
+            running: counts.running,
+            failed: counts.failed,
+            stopped: counts.stopped,
+        })
+        .collect::<Vec<_>>()
+}
+
+fn summarize_sandbox_health(candidates: &[SandboxCandidate]) -> SandboxStatusHealth {
+    let stale_lock_count = candidates
+        .iter()
+        .filter(|candidate| sandbox_lock_is_stale(&candidate.root))
+        .count();
+    let missing_manifest_count = candidates
+        .iter()
+        .filter(|candidate| read_manifest(&candidate.root).is_err())
+        .count();
+    let index_exists = sandbox_index_exists_meta();
+    let (index_entries, index_missing_roots, index_read_error) = match read_sandbox_index_entries()
+    {
+        Ok(index) => {
+            let missing_roots = index
+                .iter()
+                .filter(|entry| !Path::new(&entry.root).is_dir())
+                .count();
+            (index.len(), missing_roots, None)
+        }
+        Err(error) => (0, 0, Some(error.to_string())),
+    };
+
+    SandboxStatusHealth {
+        stale_lock_count,
+        missing_manifest_count,
+        index_exists,
+        index_entries,
+        index_missing_roots,
+        index_read_error,
+    }
+}
+
+fn print_sandbox_status_text(snapshot: &SandboxStatusSnapshot) {
+    println!(
+        "sandboxes: total={} running={} failed={} stopped={}",
+        snapshot.totals.total,
+        snapshot.totals.running,
+        snapshot.totals.failed,
+        snapshot.totals.stopped
+    );
+    if snapshot.by_source.is_empty() {
+        println!("by source: (none)");
+    } else {
+        println!("by source:");
+        for source in &snapshot.by_source {
+            println!(
+                "  {:<17} total={} running={} failed={} stopped={}",
+                source.source, source.total, source.running, source.failed, source.stopped
+            );
+        }
+    }
+    println!(
+        "health: stale_locks={} missing_manifest={} index_exists={} index_entries={} index_missing_roots={}",
+        snapshot.health.stale_lock_count,
+        snapshot.health.missing_manifest_count,
+        snapshot.health.index_exists,
+        snapshot.health.index_entries,
+        snapshot.health.index_missing_roots
+    );
 }
 
 pub(super) fn run_sandbox_inspect(
@@ -1272,6 +1456,14 @@ fn sandbox_lock_is_fresh(root_dir: &Path) -> bool {
         return false;
     }
     is_pid_alive(lock.pid)
+}
+
+fn sandbox_lock_is_stale(root_dir: &Path) -> bool {
+    let lock_path = root_dir.join(LOCK_FILE);
+    lock_path.exists()
+        && !sandbox_lock_is_fresh(root_dir)
+        && !sandbox_process_alive(root_dir)
+        && !sandbox_socket_alive(root_dir)
 }
 
 fn format_repro_command(options: &RunSandboxOptions<'_>, command_args: &[String]) -> String {

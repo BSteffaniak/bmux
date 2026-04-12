@@ -152,6 +152,18 @@ fn write_index_entries(path: &Path, entries: serde_json::Value) {
     .expect("write sandbox index payload");
 }
 
+fn write_stale_lock(root: &Path, pid: u32) {
+    let lock = serde_json::json!({
+        "pid": pid,
+        "updated_at_unix_ms": 1,
+    });
+    std::fs::write(
+        root.join("sandbox.lock"),
+        serde_json::to_vec(&lock).expect("serialize lock payload"),
+    )
+    .expect("write stale sandbox lock");
+}
+
 #[test]
 #[serial]
 fn sandbox_dev_prefers_workspace_debug_binary() {
@@ -1213,4 +1225,69 @@ fn sandbox_parallel_runs_and_cleanup_keep_index_and_locks_consistent() {
         rebuild_json["rebuilt_count"].as_u64().unwrap_or(0) >= run_threads as u64,
         "rebuilt index should retain parallel sandbox entries"
     );
+}
+
+#[test]
+#[serial]
+fn sandbox_status_reports_source_counts_and_health() {
+    let sandbox = CommandSandbox::new("status-summary");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-status-running",
+        "sandbox-cli",
+        "running",
+    );
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-status-failed",
+        "recording-verify",
+        "failed",
+    );
+    create_manifest_sandbox(&tmp_root, "bpb-status-stopped", "playbook", "succeeded");
+
+    let stale_lock_root = tmp_root.join("bmux-sbx-status-running");
+    write_stale_lock(&stale_lock_root, 999_999);
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "status", "--json"])
+        .output()
+        .expect("run sandbox status");
+    assert!(
+        output.status.success(),
+        "sandbox status should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["totals"]["total"].as_u64(), Some(3));
+    assert_eq!(json["totals"]["failed"].as_u64(), Some(2));
+    assert_eq!(json["totals"]["stopped"].as_u64(), Some(1));
+
+    let by_source = json["by_source"]
+        .as_array()
+        .expect("status json should include by_source array");
+    assert_eq!(by_source.len(), 3);
+    assert!(
+        by_source
+            .iter()
+            .any(|source| source["source"].as_str() == Some("sandbox-cli")
+                && source["failed"].as_u64() == Some(1))
+    );
+    assert!(by_source.iter().any(
+        |source| source["source"].as_str() == Some("recording-verify")
+            && source["failed"].as_u64() == Some(1)
+    ));
+    assert!(
+        by_source
+            .iter()
+            .any(|source| source["source"].as_str() == Some("playbook")
+                && source["stopped"].as_u64() == Some(1))
+    );
+
+    assert_eq!(json["health"]["stale_lock_count"].as_u64(), Some(1));
+    assert_eq!(json["health"]["index_exists"].as_bool(), Some(true));
 }

@@ -109,6 +109,7 @@ bmux sandbox run -- server status
 bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode inherit -- --version
 bmux sandbox dev -- server status
 bmux sandbox list --limit 10
+bmux sandbox status --json
 bmux sandbox list --source playbook --limit 10
 bmux sandbox inspect --latest
 bmux sandbox inspect --latest --source recording-verify

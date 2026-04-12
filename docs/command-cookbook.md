@@ -63,6 +63,7 @@ bmux sandbox run --print-env -- server status
 
 # Discover recent sandboxes and inspect one
 bmux sandbox list --limit 10
+bmux sandbox status --json
 bmux sandbox list --source playbook --limit 10
 bmux sandbox inspect bmux-sbx-123 --tail 120
 bmux sandbox inspect --latest
