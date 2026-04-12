@@ -91,6 +91,25 @@ struct ClusterGatewayRuntimeState {
     cooldown_until: BTreeMap<String, Instant>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct PersistedClusterGatewayRuntimeState {
+    clusters: BTreeMap<String, PersistedClusterGatewayState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct PersistedClusterGatewayState {
+    last_good: Option<PersistedGatewayLastGood>,
+    cooldown_until_unix_ms: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedGatewayLastGood {
+    target: String,
+    observed_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 struct GatewayLastGood {
     target: String,
@@ -1903,6 +1922,10 @@ fn host_runtime_state_path(paths: &ConfigPaths) -> PathBuf {
     paths.runtime_dir.join("host-state.json")
 }
 
+fn cluster_gateway_runtime_state_path(paths: &ConfigPaths) -> PathBuf {
+    paths.runtime_dir.join("cluster-gateway-state.json")
+}
+
 fn save_host_runtime_state(paths: &ConfigPaths, state: &HostRuntimeState) -> Result<()> {
     std::fs::create_dir_all(&paths.runtime_dir).with_context(|| {
         format!(
@@ -1938,10 +1961,144 @@ fn clear_host_runtime_state(paths: &ConfigPaths) -> Result<()> {
     }
 }
 
+fn save_cluster_gateway_runtime_state(
+    paths: &ConfigPaths,
+    state_map: &BTreeMap<String, ClusterGatewayRuntimeState>,
+) -> Result<()> {
+    std::fs::create_dir_all(&paths.runtime_dir).with_context(|| {
+        format!(
+            "failed creating runtime dir {}",
+            paths.runtime_dir.display()
+        )
+    })?;
+    let now_instant = Instant::now();
+    let now_unix_ms = current_unix_timestamp_ms_u64();
+    let clusters = state_map
+        .iter()
+        .filter_map(|(cluster_name, cluster_state)| {
+            let last_good = cluster_state.last_good.as_ref().map(|last_good| {
+                let observed_age_ms = duration_millis_u64(last_good.observed_at.elapsed());
+                PersistedGatewayLastGood {
+                    target: last_good.target.clone(),
+                    observed_at_unix_ms: now_unix_ms.saturating_sub(observed_age_ms),
+                }
+            });
+            let cooldown_until_unix_ms = cluster_state
+                .cooldown_until
+                .iter()
+                .filter_map(|(candidate, until)| {
+                    if *until <= now_instant {
+                        return None;
+                    }
+                    let remaining_ms = duration_millis_u64(*until - now_instant);
+                    Some((candidate.clone(), now_unix_ms.saturating_add(remaining_ms)))
+                })
+                .collect::<BTreeMap<_, _>>();
+
+            if last_good.is_none() && cooldown_until_unix_ms.is_empty() {
+                return None;
+            }
+
+            Some((
+                cluster_name.clone(),
+                PersistedClusterGatewayState {
+                    last_good,
+                    cooldown_until_unix_ms,
+                },
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let encoded = serde_json::to_string_pretty(&PersistedClusterGatewayRuntimeState { clusters })
+        .context("failed serializing cluster gateway runtime state")?;
+    let path = cluster_gateway_runtime_state_path(paths);
+    std::fs::write(&path, encoded).with_context(|| format!("failed writing {}", path.display()))
+}
+
+fn load_cluster_gateway_runtime_state(
+    paths: &ConfigPaths,
+) -> Result<BTreeMap<String, ClusterGatewayRuntimeState>> {
+    let path = cluster_gateway_runtime_state_path(paths);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeMap::new());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed reading {}", path.display()));
+        }
+    };
+
+    let persisted = serde_json::from_str::<PersistedClusterGatewayRuntimeState>(&content)
+        .with_context(|| {
+            format!(
+                "failed parsing cluster gateway runtime state {}",
+                path.display()
+            )
+        })?;
+    let now_instant = Instant::now();
+    let now_unix_ms = current_unix_timestamp_ms_u64();
+    Ok(persisted
+        .clusters
+        .into_iter()
+        .filter_map(|(cluster_name, persisted_state)| {
+            let last_good = persisted_state.last_good.map(|last_good| {
+                let age_ms = now_unix_ms.saturating_sub(last_good.observed_at_unix_ms);
+                GatewayLastGood {
+                    target: last_good.target,
+                    observed_at: now_instant
+                        .checked_sub(Duration::from_millis(age_ms))
+                        .unwrap_or(now_instant),
+                }
+            });
+
+            let cooldown_until = persisted_state
+                .cooldown_until_unix_ms
+                .into_iter()
+                .filter_map(|(candidate, until_unix_ms)| {
+                    if until_unix_ms <= now_unix_ms {
+                        return None;
+                    }
+                    let remaining_ms = until_unix_ms.saturating_sub(now_unix_ms);
+                    Some((candidate, now_instant + Duration::from_millis(remaining_ms)))
+                })
+                .collect::<BTreeMap<_, _>>();
+
+            if last_good.is_none() && cooldown_until.is_empty() {
+                return None;
+            }
+
+            Some((
+                cluster_name,
+                ClusterGatewayRuntimeState {
+                    last_good,
+                    cooldown_until,
+                },
+            ))
+        })
+        .collect())
+}
+
+#[cfg(test)]
+fn clear_cluster_gateway_runtime_state(paths: &ConfigPaths) -> Result<()> {
+    let path = cluster_gateway_runtime_state_path(paths);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed removing {}", path.display())),
+    }
+}
+
 fn current_unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_secs().cast_signed())
+        .unwrap_or(0)
+}
+
+fn current_unix_timestamp_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(duration_millis_u64)
         .unwrap_or(0)
 }
 
@@ -3394,7 +3551,51 @@ fn cluster_gateway_state_map() -> &'static Mutex<BTreeMap<String, ClusterGateway
     CLUSTER_GATEWAY_RUNTIME_STATE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+fn ensure_gateway_runtime_state_loaded() {
+    let should_load = cluster_gateway_state_map()
+        .lock()
+        .map(|state_map| state_map.is_empty())
+        .unwrap_or(false);
+    if !should_load {
+        return;
+    }
+
+    let loaded = match load_cluster_gateway_runtime_state(&ConfigPaths::default()) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            tracing::warn!(
+                event = "cluster_gateway_state_load_failed",
+                error = %error,
+                "failed loading persisted cluster gateway runtime state"
+            );
+            BTreeMap::new()
+        }
+    };
+    if loaded.is_empty() {
+        return;
+    }
+
+    if let Ok(mut state_map) = cluster_gateway_state_map().lock()
+        && state_map.is_empty()
+    {
+        *state_map = loaded;
+    }
+}
+
+fn persist_gateway_runtime_state_snapshot(
+    state_map: &BTreeMap<String, ClusterGatewayRuntimeState>,
+) {
+    if let Err(error) = save_cluster_gateway_runtime_state(&ConfigPaths::default(), state_map) {
+        tracing::warn!(
+            event = "cluster_gateway_state_save_failed",
+            error = %error,
+            "failed persisting cluster gateway runtime state"
+        );
+    }
+}
+
 fn preferred_gateway_candidate(cluster_name: &str) -> Option<String> {
+    ensure_gateway_runtime_state_loaded();
     let state = {
         let state_map = cluster_gateway_state_map().lock().ok()?;
         state_map.get(cluster_name)?.clone()
@@ -3413,6 +3614,7 @@ fn preferred_gateway_candidate(cluster_name: &str) -> Option<String> {
 }
 
 fn candidate_is_in_cooldown(cluster_name: &str, candidate: &str) -> bool {
+    ensure_gateway_runtime_state_loaded();
     let Ok(mut state_map) = cluster_gateway_state_map().lock() else {
         return false;
     };
@@ -3430,6 +3632,7 @@ fn candidate_is_in_cooldown(cluster_name: &str, candidate: &str) -> bool {
 }
 
 fn record_gateway_success(cluster_name: &str, candidate: &str) {
+    ensure_gateway_runtime_state_loaded();
     if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
         let cluster_state = state_map
             .entry(cluster_name.to_string())
@@ -3442,10 +3645,14 @@ fn record_gateway_success(cluster_name: &str, candidate: &str) {
             observed_at: Instant::now(),
         });
         cluster_state.cooldown_until.remove(candidate);
+        let snapshot = state_map.clone();
+        drop(state_map);
+        persist_gateway_runtime_state_snapshot(&snapshot);
     }
 }
 
 fn record_gateway_failure(cluster_name: &str, candidate: &str) {
+    ensure_gateway_runtime_state_loaded();
     if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
         let cluster_state = state_map
             .entry(cluster_name.to_string())
@@ -3457,6 +3664,9 @@ fn record_gateway_failure(cluster_name: &str, candidate: &str) {
             candidate.to_string(),
             Instant::now() + CLUSTER_GATEWAY_FAILURE_COOLDOWN,
         );
+        let snapshot = state_map.clone();
+        drop(state_map);
+        persist_gateway_runtime_state_snapshot(&snapshot);
     }
 }
 
@@ -3701,6 +3911,7 @@ async fn probe_gateway_candidate(
 }
 
 fn gateway_cooldown_remaining_ms(cluster_name: &str, candidate: &str) -> Option<u128> {
+    ensure_gateway_runtime_state_loaded();
     let until = cluster_gateway_state_map()
         .lock()
         .ok()?
@@ -3717,6 +3928,8 @@ fn gateway_cooldown_remaining_ms(cluster_name: &str, candidate: &str) -> Option<
 
 #[cfg(test)]
 fn clear_gateway_runtime_state_for_tests() {
+    let paths = ConfigPaths::default();
+    let _ = clear_cluster_gateway_runtime_state(&paths);
     if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
         state_map.clear();
     }
@@ -5967,6 +6180,47 @@ mod tests {
         let ordered = ordered_gateway_candidates_for_cluster("prod", &definition)
             .expect("ordered candidates should resolve");
         assert_eq!(ordered, vec!["db-b".to_string(), "db-a".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn gateway_runtime_state_persists_across_process_like_reload() {
+        let runtime_dir = TempDirGuard::new("gateway-state-persistence");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+        let paths = ConfigPaths::default();
+        clear_gateway_runtime_state_for_tests();
+
+        let runtime_state = BTreeMap::from([(
+            "prod".to_string(),
+            ClusterGatewayRuntimeState {
+                last_good: Some(GatewayLastGood {
+                    target: "db-b".to_string(),
+                    observed_at: Instant::now()
+                        .checked_sub(Duration::from_secs(3))
+                        .expect("checked_sub should succeed for small duration"),
+                }),
+                cooldown_until: BTreeMap::from([(
+                    "db-a".to_string(),
+                    Instant::now() + Duration::from_secs(45),
+                )]),
+            },
+        )]);
+        save_cluster_gateway_runtime_state(&paths, &runtime_state)
+            .expect("save gateway runtime state");
+
+        if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+            state_map.clear();
+        }
+
+        let definition = ClusterGatewayDefinition {
+            targets: vec!["db-a".to_string(), "db-b".to_string()],
+            gateway_mode: ClusterGatewayMode::Auto,
+            ..ClusterGatewayDefinition::default()
+        };
+        let ordered = ordered_gateway_candidates_for_cluster("prod", &definition)
+            .expect("ordered candidates should load persisted state");
+        assert_eq!(ordered, vec!["db-b".to_string(), "db-a".to_string()]);
+        assert!(candidate_is_in_cooldown("prod", "db-a"));
     }
 
     #[test]

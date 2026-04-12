@@ -45,7 +45,7 @@ Current scope:
   - `pinned`: require a single configured `gateway_target`.
 - In `auto`, candidates come from `gateway_candidates` when provided; otherwise they fall back to cluster `targets`.
 - If every gateway candidate fails, cluster command execution hard-fails (no silent direct fallback).
-- Auto mode tracks a short-lived last-known-good gateway cache and temporary failure cooldown to reduce flap/retry churn.
+- Auto mode tracks a short-lived last-known-good gateway cache and temporary failure cooldown (persisted in runtime state) to reduce flap/retry churn across invocations.
 
 Example:
 
