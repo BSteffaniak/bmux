@@ -7,7 +7,7 @@
 use bmux_mobile_core::{
     ConnectionManager, ConnectionRequest, ConnectionState, HostKeyPinSuggestion, MobileCoreError,
     ObservedHostKey, TargetInput, TargetRecord, apply_pin_query_fragment_to_target,
-    observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
+    apply_pin_suggestion_to_target, observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
     observe_ssh_host_key_with_pin_suggestion,
 };
 use std::sync::{Arc, Mutex};
@@ -138,6 +138,20 @@ impl MobileApi {
         apply_pin_query_fragment_to_target(target, pin_query_fragment)
     }
 
+    /// Apply a typed host-key pin suggestion to an SSH target URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::InvalidTarget`] for invalid target or
+    /// suggestion data.
+    pub fn apply_pin_suggestion_to_target(
+        &self,
+        target: &str,
+        suggestion: &HostKeyPinSuggestion,
+    ) -> Result<String> {
+        apply_pin_suggestion_to_target(target, suggestion)
+    }
+
     fn lock_manager(&self) -> Result<std::sync::MutexGuard<'_, ConnectionManager>> {
         self.manager.lock().map_err(|_| {
             MobileCoreError::ConnectionNotActive("mobile api manager poisoned".to_string())
@@ -203,6 +217,35 @@ mod tests {
         assert_eq!(
             result,
             "ssh://ops@prod.example.com:22?strict=false&host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        );
+    }
+
+    #[test]
+    fn ffi_apply_pin_suggestion_updates_target() {
+        let api = MobileApi::new();
+        let suggestion = HostKeyPinSuggestion {
+            observed: ObservedHostKey {
+                endpoint: "prod.example.com:22".to_string(),
+                algorithm: "ssh-ed25519".to_string(),
+                fingerprint_sha256:
+                    "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+                        .to_string(),
+            },
+            pin_query_fragment:
+                "host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+                    .to_string(),
+        };
+
+        let result = api
+            .apply_pin_suggestion_to_target(
+                "ssh://ops@prod.example.com:22?strict=true",
+                &suggestion,
+            )
+            .expect("pin suggestion should apply");
+
+        assert_eq!(
+            result,
+            "ssh://ops@prod.example.com:22?strict=true&host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
         );
     }
 }

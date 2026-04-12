@@ -13,9 +13,9 @@ pub use connection::{ConnectionManager, ConnectionRequest, ConnectionState, Conn
 pub use error::{MobileCoreError, Result};
 pub use ssh::{
     EmbeddedSshBackend, HostKeyPinSuggestion, MockSshBackend, ObservedHostKey, SshBackend,
-    SshTarget, apply_pin_query_fragment_to_target, observe_ssh_host_key,
-    observe_ssh_host_key_fingerprint_sha256, observe_ssh_host_key_with_pin_suggestion,
-    parse_ssh_target,
+    SshTarget, apply_pin_query_fragment_to_target, apply_pin_suggestion_to_target,
+    observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
+    observe_ssh_host_key_with_pin_suggestion, parse_ssh_target,
 };
 pub use target::{
     CanonicalTarget, TargetInput, TargetRecord, TargetTransport, TargetUri, canonicalize_target,

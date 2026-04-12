@@ -293,6 +293,19 @@ pub fn apply_pin_query_fragment_to_target(
     Ok(format!("{base}?{}", params.join("&")))
 }
 
+/// Apply a host-key pin suggestion to an SSH target URI.
+///
+/// # Errors
+///
+/// Returns [`MobileCoreError::InvalidTarget`] when the target or suggestion
+/// fragment is invalid.
+pub fn apply_pin_suggestion_to_target(
+    target: &str,
+    suggestion: &HostKeyPinSuggestion,
+) -> Result<String> {
+    apply_pin_query_fragment_to_target(target, &suggestion.pin_query_fragment)
+}
+
 fn is_host_key_pin_param(key: &str) -> bool {
     matches!(
         key,
@@ -774,6 +787,33 @@ mod tests {
         assert_eq!(
             result,
             "ssh://ops@prod.example.com:22?identity=/tmp/id&host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        );
+    }
+
+    #[test]
+    fn apply_pin_suggestion_updates_target() {
+        let suggestion = HostKeyPinSuggestion {
+            observed: ObservedHostKey {
+                endpoint: "prod.example.com:22".to_string(),
+                algorithm: "ssh-ed25519".to_string(),
+                fingerprint_sha256:
+                    "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+                        .to_string(),
+            },
+            pin_query_fragment:
+                "host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+                    .to_string(),
+        };
+
+        let result = apply_pin_suggestion_to_target(
+            "ssh://ops@prod.example.com:22?strict=true",
+            &suggestion,
+        )
+        .expect("pin suggestion should apply");
+
+        assert_eq!(
+            result,
+            "ssh://ops@prod.example.com:22?strict=true&host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
         );
     }
 }
