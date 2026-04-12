@@ -166,6 +166,24 @@ struct RunOutcome<'a> {
     duration_ms: u128,
 }
 
+struct SandboxLockGuard {
+    root_dir: PathBuf,
+}
+
+impl SandboxLockGuard {
+    fn new(root_dir: &Path) -> Self {
+        Self {
+            root_dir: root_dir.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for SandboxLockGuard {
+    fn drop(&mut self) {
+        clear_lock(&self.root_dir);
+    }
+}
+
 pub(super) struct RunSandboxOptions<'a> {
     pub(super) bmux_bin: Option<&'a str>,
     pub(super) env_mode: SandboxEnvModeArg,
@@ -194,6 +212,7 @@ pub(super) async fn run_sandbox_run(
     );
     write_manifest(&sandbox.root_dir, &manifest)?;
     write_lock(&sandbox.root_dir)?;
+    let lock_guard = SandboxLockGuard::new(&sandbox.root_dir);
 
     if options.print_env {
         let env = collect_effective_sandbox_env(&sandbox, options.env_mode);
@@ -211,7 +230,7 @@ pub(super) async fn run_sandbox_run(
     {
         Ok(values) => values,
         Err(error) => {
-            clear_lock(&sandbox.root_dir);
+            let _ = mark_manifest_aborted(&sandbox.root_dir, &mut manifest);
             return Err(error);
         }
     };
@@ -232,7 +251,6 @@ pub(super) async fn run_sandbox_run(
     manifest.exit_code = Some(raw_exit_code);
     manifest.kept = kept;
     write_manifest(&sandbox.root_dir, &manifest)?;
-    clear_lock(&sandbox.root_dir);
 
     emit_run_output(
         &sandbox,
@@ -249,10 +267,19 @@ pub(super) async fn run_sandbox_run(
     )?;
 
     if !kept {
+        drop(lock_guard);
         let _ = std::fs::remove_dir_all(&sandbox.root_dir);
     }
 
     Ok(exit_code_to_u8(raw_exit_code))
+}
+
+fn mark_manifest_aborted(root_dir: &Path, manifest: &mut SandboxManifest) -> Result<()> {
+    manifest.updated_at_unix_ms = unix_millis_now_meta();
+    manifest.status = "aborted".to_string();
+    manifest.exit_code = Some(1);
+    manifest.kept = true;
+    write_manifest(root_dir, manifest)
 }
 
 fn build_manifest(
@@ -790,6 +817,13 @@ fn cleanup_orphaned_sandboxes(
         let removed = if dry_run {
             false
         } else {
+            if sandbox_lock_is_fresh(&root_path)
+                || sandbox_process_alive(&root_path)
+                || sandbox_socket_alive(&root_path)
+            {
+                skipped.running += 1;
+                continue;
+            }
             std::fs::remove_dir_all(&root_path).is_ok()
         };
 
@@ -884,7 +918,10 @@ fn sandbox_status_for_dir(root: &Path) -> &'static str {
     }
 
     if let Ok(manifest) = read_manifest(root) {
-        if matches!(manifest.status.as_str(), "failed" | "timed_out" | "killed") {
+        if matches!(
+            manifest.status.as_str(),
+            "failed" | "timed_out" | "killed" | "aborted" | "running"
+        ) {
             "failed"
         } else {
             "stopped"

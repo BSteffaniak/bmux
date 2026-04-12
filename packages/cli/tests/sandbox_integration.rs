@@ -575,3 +575,107 @@ fn sandbox_cleanup_cli_flags_override_config_defaults() {
     assert_eq!(entries[0]["source"].as_str(), Some("playbook"));
     assert_eq!(entries[0]["status"].as_str(), Some("stopped"));
 }
+
+#[test]
+#[serial]
+fn sandbox_cleanup_failed_only_includes_aborted_running_manifests() {
+    let sandbox = CommandSandbox::new("cleanup-aborted-running");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-aborted-running",
+        "sandbox-cli",
+        "running",
+    );
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-succeeded", "sandbox-cli", "succeeded");
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "cleanup",
+            "--dry-run",
+            "--failed-only",
+            "--older-than",
+            "0",
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox cleanup for aborted-running manifests");
+    assert!(
+        output.status.success(),
+        "sandbox cleanup should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    let entries = json["entries"]
+        .as_array()
+        .expect("sandbox cleanup should include entries array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "failed-only should include aborted-running"
+    );
+    assert_eq!(entries[0]["status"].as_str(), Some("failed"));
+    let path = entries[0]["path"]
+        .as_str()
+        .expect("cleanup entry should include path");
+    assert!(path.contains("bmux-sbx-aborted-running"));
+}
+
+#[test]
+#[serial]
+fn sandbox_run_spawn_failure_marks_manifest_aborted() {
+    let sandbox = CommandSandbox::new("spawn-failure-aborted");
+    let non_exec = sandbox.root.path().join("not-executable-bmux");
+    std::fs::write(&non_exec, "#!/bin/sh\nexit 0\n").expect("write non-executable file");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(&non_exec)
+            .expect("stat non-executable file")
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&non_exec, permissions).expect("set non-executable permissions");
+    }
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--name",
+            "spawn-failure",
+            "--bmux-bin",
+            non_exec.to_string_lossy().as_ref(),
+            "--",
+            "--version",
+        ])
+        .output()
+        .expect("run sandbox with non-executable bmux binary");
+    assert!(
+        !run_output.status.success(),
+        "sandbox run should fail to spawn: {}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let inspect_output = sandbox
+        .command()
+        .args(["sandbox", "inspect", "--latest-failed", "--json"])
+        .output()
+        .expect("inspect latest failed sandbox after spawn error");
+    assert!(
+        inspect_output.status.success(),
+        "inspect latest failed should succeed: {}",
+        String::from_utf8_lossy(&inspect_output.stderr)
+    );
+
+    let inspect_json = parse_json_stdout(&inspect_output);
+    assert_schema_version(&inspect_json);
+    assert_eq!(inspect_json["manifest"]["status"].as_str(), Some("aborted"));
+    assert_eq!(inspect_json["running"].as_bool(), Some(false));
+}
