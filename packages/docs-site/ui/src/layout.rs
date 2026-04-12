@@ -67,7 +67,7 @@ pub fn nav_bar() -> Containers {
                 direction=row
                 align-items=center
                 padding-x=(if_responsive("mobile").then::<i32>(16).or_else(24))
-                column-gap=(if_responsive("mobile").then::<i32>(12).or_else(0))
+                gap=(if_responsive("mobile").then::<i32>(12).or_else(0))
             {
                 // Hamburger button — visible on mobile only
                 div
@@ -104,7 +104,7 @@ pub fn nav_bar() -> Containers {
                 justify-content=end
                 flex=1
                 padding-x=(if_responsive("mobile").then::<i32>(16).or_else(24))
-                column-gap=(if_responsive("mobile").then::<i32>(16).or_else(24))
+                gap=(if_responsive("mobile").then::<i32>(16).or_else(24))
             {
                 anchor
                     color=(text_secondary())

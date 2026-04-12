@@ -23,7 +23,7 @@ pub fn home() -> Containers {
                 #hero-inner
                 align-items=center
                 max-width=800
-                row-gap=(if_responsive("mobile").then::<i32>(24).or_else(32))
+                gap=(if_responsive("mobile").then::<i32>(24).or_else(32))
             {
                 // Terminal prompt branding
                 div
@@ -67,8 +67,7 @@ pub fn home() -> Containers {
                             .then::<LayoutDirection>(LayoutDirection::Column)
                             .or_else(LayoutDirection::Row)
                     )
-                    row-gap=16
-                    column-gap=16
+                    gap=16
                     margin-top=24
                     align-items=center
                 {
@@ -110,8 +109,7 @@ pub fn home() -> Containers {
                         .then::<LayoutDirection>(LayoutDirection::Column)
                         .or_else(LayoutDirection::Row)
                 )
-                row-gap=24
-                column-gap=24
+                gap=24
                 margin-top=(if_responsive("mobile").then::<i32>(48).or_else(80))
                 max-width=900
             {
