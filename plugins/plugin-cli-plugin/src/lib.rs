@@ -231,8 +231,10 @@ fn build_doctor_report(
         .map(|finding| finding.message.clone())
         .collect::<Vec<_>>();
 
+    let healthy = error_count == 0 && (!strict_mode || warning_count == 0);
+
     PluginDoctorReport {
-        healthy: error_count == 0 && (!strict_mode || warning_count == 0),
+        healthy,
         strict_mode,
         enabled_plugins: context.enabled_plugins.clone(),
         inspected_plugins,
@@ -242,6 +244,7 @@ fn build_doctor_report(
         info_count,
         issues,
         warnings,
+        next_steps: doctor_next_steps(healthy, strict_mode, error_count, warning_count),
     }
 }
 
@@ -321,6 +324,28 @@ fn doctor_failure_notes(report: &PluginDoctorReport) -> Vec<String> {
             .to_string(),
     );
     notes
+}
+
+fn doctor_next_steps(
+    healthy: bool,
+    strict_mode: bool,
+    error_count: usize,
+    warning_count: usize,
+) -> Vec<String> {
+    if healthy {
+        return Vec::new();
+    }
+
+    let mut steps = Vec::new();
+    if strict_mode && error_count == 0 && warning_count > 0 {
+        steps.push(
+            "strict mode failed because warnings are treated as failures. Fix warnings above or run without --strict.".to_string(),
+        );
+    }
+    steps.push(
+        "run 'bmux plugin doctor --json --strict' for machine-readable diagnostics".to_string(),
+    );
+    steps
 }
 
 fn print_doctor_findings(
@@ -1398,8 +1423,8 @@ mod tests {
     use super::{
         BaseSelector, BuildProfile, DoctorFinding, DoctorSeverity, PluginDoctorReport, RebuildMode,
         RebuildOptions, build_rebuild_target_selection, core_proxy_command_path,
-        doctor_failure_notes, format_plugin_command_not_found_error, format_plugin_not_found_error,
-        parse_rebuild_options, suggest_top_matches,
+        doctor_failure_notes, doctor_next_steps, format_plugin_command_not_found_error,
+        format_plugin_not_found_error, parse_rebuild_options, suggest_top_matches,
     };
 
     fn test_doctor_report(
@@ -1423,6 +1448,7 @@ mod tests {
             info_count: 0,
             issues: Vec::new(),
             warnings: Vec::new(),
+            next_steps: Vec::new(),
         }
     }
 
@@ -1537,6 +1563,18 @@ mod tests {
         let notes = doctor_failure_notes(&report);
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("bmux plugin doctor --json --strict"));
+    }
+
+    #[test]
+    fn doctor_next_steps_matches_failure_shape() {
+        let strict_warning_only = doctor_next_steps(false, true, 0, 1);
+        assert_eq!(strict_warning_only.len(), 2);
+
+        let hard_errors = doctor_next_steps(false, true, 1, 0);
+        assert_eq!(hard_errors.len(), 1);
+
+        let healthy = doctor_next_steps(true, false, 0, 0);
+        assert!(healthy.is_empty());
     }
 }
 
@@ -1661,6 +1699,7 @@ struct PluginDoctorReport {
     info_count: usize,
     issues: Vec<String>,
     warnings: Vec<String>,
+    next_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
