@@ -2387,7 +2387,13 @@ fn ensure_cluster_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_plugin_sdk::{
+        ApiVersion, HostConnectionInfo, HostMetadata, HostScope, ProviderId, RegisteredService,
+        ServiceRequest,
+    };
+    use std::fs;
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
 
     #[derive(Default)]
@@ -2637,10 +2643,274 @@ mod tests {
         Uuid::from_u128(*counter)
     }
 
+    struct ServiceTestConfigDir {
+        dir: std::path::PathBuf,
+    }
+
+    impl ServiceTestConfigDir {
+        fn create() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            let dir = std::env::temp_dir().join(format!(
+                "bmux-cluster-plugin-service-tests-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("service test config dir should be created");
+            let config = "[connections.targets.db-a]\ntransport='ssh'\nhost='db-a.example.com'\n[connections.targets.db-b]\ntransport='ssh'\nhost='db-b.example.com'\n";
+            fs::write(dir.join("bmux.toml"), config)
+                .expect("service test config should be written");
+            Self { dir }
+        }
+    }
+
+    impl Drop for ServiceTestConfigDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn service_test_context_from_payload(
+        config_dir: &str,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+        settings: Option<toml::Value>,
+    ) -> NativeServiceContext {
+        let kind = if interface_id == "cluster-command/v1" {
+            ServiceKind::Command
+        } else {
+            ServiceKind::Query
+        };
+        let capability = if interface_id == "cluster-command/v1" {
+            "bmux.server_clusters.write"
+        } else {
+            "bmux.server_clusters.read"
+        };
+
+        NativeServiceContext {
+            plugin_id: "bmux.cluster".to_string(),
+            request: ServiceRequest {
+                caller_plugin_id: "test.caller".to_string(),
+                service: RegisteredService {
+                    capability: HostScope::new(capability).expect("capability should parse"),
+                    kind,
+                    interface_id: interface_id.to_string(),
+                    provider: ProviderId::Plugin("bmux.cluster".to_string()),
+                },
+                operation: operation.to_string(),
+                payload,
+            },
+            required_capabilities: vec![
+                "bmux.commands".to_string(),
+                "bmux.panes.write".to_string(),
+                "bmux.sessions.read".to_string(),
+                "bmux.sessions.write".to_string(),
+                "bmux.storage".to_string(),
+            ],
+            provided_capabilities: vec![
+                "bmux.server_clusters.read".to_string(),
+                "bmux.server_clusters.write".to_string(),
+            ],
+            services: Vec::new(),
+            available_capabilities: Vec::new(),
+            enabled_plugins: vec!["bmux.cluster".to_string()],
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: HostConnectionInfo {
+                config_dir: config_dir.to_string(),
+                runtime_dir: config_dir.to_string(),
+                data_dir: config_dir.to_string(),
+                state_dir: config_dir.to_string(),
+            },
+            settings,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: None,
+        }
+    }
+
+    fn service_test_context<T: Serialize>(
+        config_dir: &str,
+        interface_id: &str,
+        operation: &str,
+        request: &T,
+        settings: Option<toml::Value>,
+    ) -> NativeServiceContext {
+        let payload = bmux_plugin_sdk::encode_service_message(request)
+            .expect("service request should encode");
+        service_test_context_from_payload(config_dir, interface_id, operation, payload, settings)
+    }
+
+    fn cluster_settings_value() -> toml::Value {
+        toml::from_str("[clusters.prod]\ntargets=['db-a','db-b']\n")
+            .expect("cluster settings should parse")
+    }
+
     #[test]
     fn target_from_host_ref_accepts_string_variant() {
         let host = ClusterHostRef::Target("prod-a".to_string());
         assert_eq!(target_from_host_ref(&host).as_deref(), Some("prod-a"));
+    }
+
+    #[test]
+    fn invoke_service_list_clusters_returns_inventory_from_settings() {
+        let fixture = ServiceTestConfigDir::create();
+        let mut plugin = ClusterPlugin;
+        let context = service_test_context(
+            fixture.dir.to_str().expect("config path should be utf-8"),
+            "cluster-query/v1",
+            "list_clusters",
+            &ClusterQueryListClustersRequest {},
+            Some(cluster_settings_value()),
+        );
+
+        let response = plugin.invoke_service(context);
+        assert!(response.error.is_none(), "list_clusters should succeed");
+        let decoded: ClusterQueryListClustersResponse =
+            bmux_plugin_sdk::decode_service_message(&response.payload)
+                .expect("list_clusters response should decode");
+        assert_eq!(
+            decoded.clusters.get("prod").cloned(),
+            Some(vec!["db-a".to_string(), "db-b".to_string()])
+        );
+    }
+
+    #[test]
+    fn invoke_service_status_returns_degraded_when_probe_runtime_is_unavailable() {
+        let fixture = ServiceTestConfigDir::create();
+        let mut plugin = ClusterPlugin;
+        let context = service_test_context(
+            fixture.dir.to_str().expect("config path should be utf-8"),
+            "cluster-query/v1",
+            "status",
+            &ClusterQueryStatusRequest {
+                selector: Some("prod".to_string()),
+                doctor: Some(false),
+            },
+            Some(cluster_settings_value()),
+        );
+
+        let response = plugin.invoke_service(context);
+        assert!(response.error.is_none(), "status should succeed");
+        let decoded: ClusterQueryStatusResponse =
+            bmux_plugin_sdk::decode_service_message(&response.payload)
+                .expect("status response should decode");
+        assert_eq!(decoded.statuses.len(), 2);
+        assert!(
+            decoded
+                .statuses
+                .iter()
+                .all(|status| matches!(status.state, ClusterHostState::Degraded))
+        );
+    }
+
+    #[test]
+    fn invoke_service_up_maps_runtime_failures_to_up_failed() {
+        let fixture = ServiceTestConfigDir::create();
+        let mut plugin = ClusterPlugin;
+        let context = service_test_context(
+            fixture.dir.to_str().expect("config path should be utf-8"),
+            "cluster-command/v1",
+            "up",
+            &ClusterCommandUpRequest {
+                cluster: "prod".to_string(),
+                hosts: Vec::new(),
+            },
+            Some(cluster_settings_value()),
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response
+            .error
+            .expect("up should fail without host runtime bridge");
+        assert_eq!(error.code, "up_failed");
+    }
+
+    #[test]
+    fn invoke_service_pane_new_maps_runtime_failures_to_pane_new_failed() {
+        let fixture = ServiceTestConfigDir::create();
+        let mut plugin = ClusterPlugin;
+        let context = service_test_context(
+            fixture.dir.to_str().expect("config path should be utf-8"),
+            "cluster-command/v1",
+            "pane_new",
+            &ClusterCommandPaneNewRequest {
+                host: "db-a".to_string(),
+                name: None,
+            },
+            Some(cluster_settings_value()),
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response
+            .error
+            .expect("pane_new should fail without host runtime bridge");
+        assert_eq!(error.code, "pane_new_failed");
+    }
+
+    #[test]
+    fn invoke_service_pane_retry_maps_runtime_failures_to_pane_retry_failed() {
+        let fixture = ServiceTestConfigDir::create();
+        let mut plugin = ClusterPlugin;
+        let context = service_test_context(
+            fixture.dir.to_str().expect("config path should be utf-8"),
+            "cluster-command/v1",
+            "pane_retry",
+            &ClusterCommandPaneRetryRequest { pane: None },
+            Some(cluster_settings_value()),
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response
+            .error
+            .expect("pane_retry should fail without host runtime bridge");
+        assert_eq!(error.code, "pane_retry_failed");
+    }
+
+    #[test]
+    fn invoke_service_pane_move_maps_runtime_failures_to_pane_move_failed() {
+        let fixture = ServiceTestConfigDir::create();
+        let mut plugin = ClusterPlugin;
+        let context = service_test_context(
+            fixture.dir.to_str().expect("config path should be utf-8"),
+            "cluster-command/v1",
+            "pane_move",
+            &ClusterCommandPaneMoveRequest {
+                pane: None,
+                host: "db-b".to_string(),
+            },
+            Some(cluster_settings_value()),
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response
+            .error
+            .expect("pane_move should fail without host runtime bridge");
+        assert_eq!(error.code, "pane_move_failed");
+    }
+
+    #[test]
+    fn invoke_service_events_list_maps_runtime_failures_to_connection_events_list_failed() {
+        let fixture = ServiceTestConfigDir::create();
+        let mut plugin = ClusterPlugin;
+        let context = service_test_context(
+            fixture.dir.to_str().expect("config path should be utf-8"),
+            "cluster-connection-events/v1",
+            "list",
+            &ClusterConnectionEventsListRequest {},
+            Some(cluster_settings_value()),
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response
+            .error
+            .expect("events list should fail without host runtime bridge");
+        assert_eq!(error.code, "connection_events_list_failed");
     }
 
     #[test]
