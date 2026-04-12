@@ -1153,6 +1153,12 @@ pub enum SandboxCommand {
         /// Optional sandbox id/path for targeted checks
         #[arg(long)]
         id: Option<String>,
+        /// Apply automatic sandbox repair actions
+        #[arg(long)]
+        fix: bool,
+        /// Preview repair actions without mutating state (requires --fix)
+        #[arg(long, requires = "fix")]
+        dry_run: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -4186,6 +4192,8 @@ mod tests {
             "doctor",
             "--id",
             "bmux-sbx-123",
+            "--fix",
+            "--dry-run",
             "--json",
         ])
         .expect("valid doctor args");
@@ -4196,6 +4204,8 @@ mod tests {
             command,
             SandboxCommand::Doctor {
                 id: Some(id),
+                fix: true,
+                dry_run: true,
                 json: true,
             } if id == "bmux-sbx-123"
         ));

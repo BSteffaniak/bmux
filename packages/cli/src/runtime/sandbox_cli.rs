@@ -143,6 +143,20 @@ struct DoctorCheck {
     detail: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DoctorFixReport {
+    applied: bool,
+    dry_run: bool,
+    target: Option<String>,
+    scanned: usize,
+    normalized_running: usize,
+    cleared_stale_locks: usize,
+    index_rebuilt: bool,
+    rebuilt_count: usize,
+    pruned_count: usize,
+    missing_manifest: usize,
+}
+
 #[derive(Debug, Clone)]
 struct SandboxPaths {
     root_dir: PathBuf,
@@ -838,7 +852,12 @@ fn resolve_latest_sandbox(
     anyhow::bail!("no sandboxes found")
 }
 
-pub(super) fn run_sandbox_doctor(id: Option<&str>, json: bool) -> Result<u8> {
+pub(super) fn run_sandbox_doctor(
+    id: Option<&str>,
+    fix: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<u8> {
     let mut checks = Vec::new();
 
     let temp_dir = std::env::temp_dir();
@@ -862,12 +881,19 @@ pub(super) fn run_sandbox_doctor(id: Option<&str>, json: bool) -> Result<u8> {
         append_target_doctor_checks(&mut checks, target);
     }
 
+    let fix_report = if fix {
+        Some(run_sandbox_doctor_fix(id, dry_run)?)
+    } else {
+        None
+    };
+
     let ok = checks.iter().all(|check| check.ok);
     if json {
         let payload = serde_json::json!({
             "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
             "ok": ok,
             "checks": checks,
+            "fix": fix_report,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -880,9 +906,104 @@ pub(super) fn run_sandbox_doctor(id: Option<&str>, json: bool) -> Result<u8> {
                 check.detail
             );
         }
+        if let Some(report) = fix_report {
+            println!(
+                "doctor fix: applied={} dry_run={} scanned={} normalized_running={} cleared_stale_locks={} index_rebuilt={} rebuilt={} pruned={} missing_manifest={}",
+                report.applied,
+                report.dry_run,
+                report.scanned,
+                report.normalized_running,
+                report.cleared_stale_locks,
+                report.index_rebuilt,
+                report.rebuilt_count,
+                report.pruned_count,
+                report.missing_manifest
+            );
+        }
     }
 
     Ok(u8::from(!ok))
+}
+
+fn run_sandbox_doctor_fix(target: Option<&str>, dry_run: bool) -> Result<DoctorFixReport> {
+    let (roots, target_value) = if let Some(target) = target {
+        (
+            vec![resolve_sandbox_target(target)?],
+            Some(target.to_string()),
+        )
+    } else {
+        (collect_sandbox_directories(), None)
+    };
+
+    let candidates = roots
+        .iter()
+        .cloned()
+        .map(|root| SandboxCandidate {
+            root,
+            updated_at_unix_ms: None,
+        })
+        .collect::<Vec<_>>();
+
+    let recovery = if dry_run {
+        preview_candidate_lifecycle_recovery(&candidates)
+    } else {
+        recover_candidate_lifecycle_state(&candidates)
+    };
+
+    let mut report = DoctorFixReport {
+        applied: !dry_run,
+        dry_run,
+        target: target_value,
+        scanned: roots.len(),
+        normalized_running: recovery.normalized_running,
+        cleared_stale_locks: recovery.cleared_stale_locks,
+        index_rebuilt: false,
+        rebuilt_count: 0,
+        pruned_count: 0,
+        missing_manifest: 0,
+    };
+
+    if target.is_none() {
+        let rebuild = if dry_run {
+            preview_rebuild_sandbox_index_from_roots(&roots)
+        } else {
+            rebuild_sandbox_index_from_roots(&roots, !sandbox_index_exists_meta())
+        };
+        report.index_rebuilt = true;
+        report.rebuilt_count = rebuild.rebuilt_count;
+        report.pruned_count = rebuild.pruned_count;
+        report.missing_manifest = rebuild.missing_manifest;
+    } else if !dry_run {
+        for root in &roots {
+            if let Ok(manifest) = read_manifest(root) {
+                let _ = upsert_sandbox_index_entry(&manifest);
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn preview_candidate_lifecycle_recovery(candidates: &[SandboxCandidate]) -> RecoveryReport {
+    let mut report = RecoveryReport::default();
+    for candidate in candidates {
+        let root = &candidate.root;
+        if sandbox_lock_is_fresh(root) || sandbox_process_alive(root) || sandbox_socket_alive(root)
+        {
+            continue;
+        }
+
+        if let Ok(manifest) = read_manifest(root)
+            && manifest.status == "running"
+        {
+            report.normalized_running += 1;
+        }
+
+        if sandbox_lock_is_stale(root) {
+            report.cleared_stale_locks += 1;
+        }
+    }
+    report
 }
 
 pub(super) fn run_sandbox_bundle(target: &str, output: Option<&str>, json: bool) -> Result<u8> {
@@ -1450,6 +1571,39 @@ fn rebuild_sandbox_index_from_roots(
         pruned_count,
         missing_manifest,
         scan_fallback_used,
+    }
+}
+
+fn preview_rebuild_sandbox_index_from_roots(roots: &[PathBuf]) -> IndexRebuildReport {
+    let existing = read_sandbox_index_entries().unwrap_or_default();
+    let previous_roots = existing
+        .iter()
+        .map(|entry| entry.root.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut rebuilt_count = 0usize;
+    let mut missing_manifest = 0usize;
+    let mut seen_roots = std::collections::BTreeSet::new();
+    for root in roots {
+        seen_roots.insert(root.to_string_lossy().to_string());
+        if read_manifest(root).is_ok() {
+            rebuilt_count += 1;
+        } else {
+            missing_manifest += 1;
+        }
+    }
+
+    let pruned_count = previous_roots
+        .iter()
+        .filter(|root| !seen_roots.contains(*root))
+        .count();
+
+    IndexRebuildReport {
+        scanned: roots.len(),
+        rebuilt_count,
+        pruned_count,
+        missing_manifest,
+        scan_fallback_used: !sandbox_index_exists_meta(),
     }
 }
 

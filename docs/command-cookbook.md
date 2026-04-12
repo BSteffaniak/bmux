@@ -72,6 +72,8 @@ bmux sandbox inspect --latest-failed --tail 120
 
 # Health checks for sandbox runtime
 bmux sandbox doctor --json
+bmux sandbox doctor --fix --dry-run --json
+bmux sandbox doctor --fix --json
 
 # Bundle diagnostics and logs for sharing
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts

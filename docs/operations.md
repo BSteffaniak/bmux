@@ -37,6 +37,8 @@ bmux sandbox inspect --latest --source playbook
 bmux sandbox inspect --latest-failed --tail 120
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts --json
 bmux sandbox doctor --json
+bmux sandbox doctor --fix --dry-run --json
+bmux sandbox doctor --fix --json
 bmux sandbox cleanup --dry-run --json
 bmux sandbox clean --dry-run --json
 bmux sandbox cleanup --source playbook --older-than 600 --json

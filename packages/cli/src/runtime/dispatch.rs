@@ -1487,9 +1487,15 @@ pub(super) async fn dispatch_built_in_command(
         (
             BuiltInHandlerId::SandboxDoctor,
             Command::Sandbox {
-                command: SandboxCommand::Doctor { id, json },
+                command:
+                    SandboxCommand::Doctor {
+                        id,
+                        fix,
+                        dry_run,
+                        json,
+                    },
             },
-        ) => run_sandbox_doctor(id.as_deref(), *json),
+        ) => run_sandbox_doctor(id.as_deref(), *fix, *dry_run, *json),
         (
             BuiltInHandlerId::SandboxBundle,
             Command::Sandbox {

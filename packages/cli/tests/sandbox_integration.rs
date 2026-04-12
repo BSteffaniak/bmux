@@ -1437,3 +1437,102 @@ fn sandbox_inspect_reports_reconcile_when_auto_heal_runs() {
         "inspect should surface reconcile heal count"
     );
 }
+
+#[test]
+#[serial]
+fn sandbox_doctor_fix_dry_run_reports_repairs_without_mutation() {
+    let sandbox = CommandSandbox::new("doctor-fix-dry-run");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-doctor-dry", "sandbox-cli", "running");
+    let root = tmp_root.join("bmux-sbx-doctor-dry");
+    write_stale_lock(&root, 999_999);
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "doctor", "--fix", "--dry-run", "--json"])
+        .output()
+        .expect("run sandbox doctor --fix --dry-run");
+    assert!(
+        output.status.success(),
+        "sandbox doctor should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["fix"]["applied"].as_bool(), Some(false));
+    assert_eq!(json["fix"]["dry_run"].as_bool(), Some(true));
+    assert_eq!(json["fix"]["normalized_running"].as_u64(), Some(1));
+    assert_eq!(json["fix"]["cleared_stale_locks"].as_u64(), Some(1));
+
+    let manifest_contents = std::fs::read_to_string(root.join("sandbox.json"))
+        .expect("read manifest after dry-run doctor fix");
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(&manifest_contents).expect("parse manifest json");
+    assert_eq!(manifest_json["status"].as_str(), Some("running"));
+    assert!(
+        root.join("sandbox.lock").exists(),
+        "dry-run fix should not remove stale lock"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_doctor_fix_applies_recovery_and_rebuilds_index() {
+    let sandbox = CommandSandbox::new("doctor-fix-apply");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-doctor-apply", "sandbox-cli", "running");
+    let root = tmp_root.join("bmux-sbx-doctor-apply");
+    write_stale_lock(&root, 999_999);
+
+    let index_path = sandbox.sandbox_index_path();
+    std::fs::create_dir_all(
+        index_path
+            .parent()
+            .expect("sandbox index parent should exist"),
+    )
+    .expect("create sandbox index parent dir");
+    std::fs::write(&index_path, b"{bad-json").expect("write corrupt index");
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "doctor", "--fix", "--json"])
+        .output()
+        .expect("run sandbox doctor --fix");
+    assert!(
+        output.status.success(),
+        "sandbox doctor should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["fix"]["applied"].as_bool(), Some(true));
+    assert_eq!(json["fix"]["dry_run"].as_bool(), Some(false));
+    assert_eq!(json["fix"]["normalized_running"].as_u64(), Some(1));
+    assert_eq!(json["fix"]["cleared_stale_locks"].as_u64(), Some(1));
+    assert_eq!(json["fix"]["index_rebuilt"].as_bool(), Some(true));
+    assert!(
+        json["fix"]["rebuilt_count"].as_u64().unwrap_or(0) >= 1,
+        "doctor fix should rebuild index entries"
+    );
+
+    let manifest_contents =
+        std::fs::read_to_string(root.join("sandbox.json")).expect("read manifest after doctor fix");
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(&manifest_contents).expect("parse manifest json");
+    assert_eq!(manifest_json["status"].as_str(), Some("aborted"));
+    assert!(
+        !root.join("sandbox.lock").exists(),
+        "doctor fix should clear stale lock"
+    );
+
+    let index_contents = std::fs::read_to_string(index_path).expect("read repaired index");
+    let index_json: serde_json::Value =
+        serde_json::from_str(&index_contents).expect("parse repaired index json");
+    let entries = index_json["entries"]
+        .as_array()
+        .expect("index should contain entries array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"].as_str(), Some("bmux-sbx-doctor-apply"));
+}
