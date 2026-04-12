@@ -6,8 +6,9 @@
 
 use bmux_mobile_core::{
     ConnectionManager, ConnectionRequest, ConnectionState, HostKeyPinSuggestion, MobileCoreError,
-    ObservedHostKey, TargetInput, TargetRecord, observe_ssh_host_key,
-    observe_ssh_host_key_fingerprint_sha256, observe_ssh_host_key_with_pin_suggestion,
+    ObservedHostKey, TargetInput, TargetRecord, apply_pin_query_fragment_to_target,
+    observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
+    observe_ssh_host_key_with_pin_suggestion,
 };
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -120,6 +121,23 @@ impl MobileApi {
         observe_ssh_host_key_with_pin_suggestion(target)
     }
 
+    /// Apply a host-key pin fragment to an SSH target URI.
+    ///
+    /// Existing host-key pin query params are removed before applying the new
+    /// fragment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::InvalidTarget`] for invalid target or pin
+    /// fragment input.
+    pub fn apply_pin_query_fragment_to_target(
+        &self,
+        target: &str,
+        pin_query_fragment: &str,
+    ) -> Result<String> {
+        apply_pin_query_fragment_to_target(target, pin_query_fragment)
+    }
+
     fn lock_manager(&self) -> Result<std::sync::MutexGuard<'_, ConnectionManager>> {
         self.manager.lock().map_err(|_| {
             MobileCoreError::ConnectionNotActive("mobile api manager poisoned".to_string())
@@ -170,5 +188,21 @@ mod tests {
         let api = MobileApi::new();
         let result = api.observe_ssh_host_key_with_pin_suggestion("ssh://bad-target:abc");
         assert!(matches!(result, Err(MobileCoreError::InvalidTarget(_))));
+    }
+
+    #[test]
+    fn ffi_apply_pin_fragment_updates_target() {
+        let api = MobileApi::new();
+        let result = api
+            .apply_pin_query_fragment_to_target(
+                "ssh://ops@prod.example.com:22?strict=false&host_key_fp=sha256:abababababababababababababababababababababababababababababababab",
+                "host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            )
+            .expect("pin fragment should apply");
+
+        assert_eq!(
+            result,
+            "ssh://ops@prod.example.com:22?strict=false&host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        );
     }
 }

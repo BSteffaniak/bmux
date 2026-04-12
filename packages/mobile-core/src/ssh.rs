@@ -239,6 +239,67 @@ fn pin_query_fragment_for_fingerprint(fingerprint_sha256: &str) -> String {
     format!("host_key_fp=sha256:{fingerprint_sha256}")
 }
 
+/// Apply a host-key pin query fragment to an SSH target string.
+///
+/// Existing host-key pin query params are removed before applying the new one.
+///
+/// # Errors
+///
+/// Returns [`MobileCoreError::InvalidTarget`] when the target or pin fragment
+/// is invalid.
+pub fn apply_pin_query_fragment_to_target(
+    target: &str,
+    pin_query_fragment: &str,
+) -> Result<String> {
+    let (pin_key, pin_value) = pin_query_fragment.trim().split_once('=').ok_or_else(|| {
+        MobileCoreError::InvalidTarget("pin query fragment must be key=value".to_string())
+    })?;
+    if pin_value.trim().is_empty() {
+        return Err(MobileCoreError::InvalidTarget(
+            "pin query fragment value cannot be empty".to_string(),
+        ));
+    }
+    if !is_host_key_pin_param(pin_key.trim()) {
+        return Err(MobileCoreError::InvalidTarget(format!(
+            "unsupported pin query key '{pin_key}'"
+        )));
+    }
+    let normalized_pin_value =
+        format!("sha256:{}", normalize_sha256_fingerprint(pin_value.trim())?);
+
+    let trimmed_target = target.trim();
+    let (base, existing_query) = match trimmed_target.split_once('?') {
+        Some((left, right)) => (left, Some(right)),
+        None => (trimmed_target, None),
+    };
+    parse_ssh_target(base)?;
+
+    let mut params: Vec<String> = Vec::new();
+    if let Some(query) = existing_query {
+        for part in query.split('&') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let key = part.split_once('=').map_or(part, |(k, _)| k).trim();
+            if is_host_key_pin_param(key) {
+                continue;
+            }
+            params.push(part.to_string());
+        }
+    }
+    params.push(format!("{}={}", pin_key.trim(), normalized_pin_value));
+
+    Ok(format!("{base}?{}", params.join("&")))
+}
+
+fn is_host_key_pin_param(key: &str) -> bool {
+    matches!(
+        key,
+        "host_key_fp" | "host_key_fingerprint" | "host_key_sha256"
+    )
+}
+
 /// Resolve a target string and fetch the observed SSH host-key SHA-256
 /// fingerprint from the server.
 ///
@@ -671,6 +732,48 @@ mod tests {
         assert_eq!(
             suggestion.pin_query_fragment,
             "host_key_fp=sha256:abababababababababababababababababababababababababababababababab"
+        );
+    }
+
+    #[test]
+    fn apply_pin_fragment_adds_query() {
+        let result = apply_pin_query_fragment_to_target(
+            "ssh://ops@prod.example.com:22",
+            "host_key_fp=sha256:abababababababababababababababababababababababababababababababab",
+        )
+        .expect("pin fragment should apply");
+
+        assert_eq!(
+            result,
+            "ssh://ops@prod.example.com:22?host_key_fp=sha256:abababababababababababababababababababababababababababababababab"
+        );
+    }
+
+    #[test]
+    fn apply_pin_fragment_replaces_existing_pin() {
+        let result = apply_pin_query_fragment_to_target(
+            "ssh://ops@prod.example.com:22?strict=false&host_key_fp=sha256:abababababababababababababababababababababababababababababababab",
+            "host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        )
+        .expect("pin fragment should replace previous pin");
+
+        assert_eq!(
+            result,
+            "ssh://ops@prod.example.com:22?strict=false&host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        );
+    }
+
+    #[test]
+    fn apply_pin_fragment_removes_alias_keys() {
+        let result = apply_pin_query_fragment_to_target(
+            "ssh://ops@prod.example.com:22?host_key_sha256=sha256:abababababababababababababababababababababababababababababababab&identity=/tmp/id",
+            "host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        )
+        .expect("pin fragment should replace alias keys");
+
+        assert_eq!(
+            result,
+            "ssh://ops@prod.example.com:22?identity=/tmp/id&host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
         );
     }
 }
