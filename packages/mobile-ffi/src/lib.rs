@@ -6,7 +6,7 @@
 
 use bmux_mobile_core::{
     ConnectionManager, ConnectionRequest, ConnectionState, MobileCoreError, TargetInput,
-    TargetRecord,
+    TargetRecord, observe_ssh_host_key_fingerprint_sha256,
 };
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -86,6 +86,16 @@ impl MobileApi {
         manager.disconnect(connection_id)
     }
 
+    /// Observe and return server SSH host-key SHA-256 fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns parse, DNS/network, handshake, or fingerprint availability
+    /// errors.
+    pub fn observe_ssh_host_key_fingerprint_sha256(&self, target: &str) -> Result<String> {
+        observe_ssh_host_key_fingerprint_sha256(target)
+    }
+
     fn lock_manager(&self) -> Result<std::sync::MutexGuard<'_, ConnectionManager>> {
         self.manager.lock().map_err(|_| {
             MobileCoreError::ConnectionNotActive("mobile api manager poisoned".to_string())
@@ -115,5 +125,12 @@ mod tests {
             .expect("connection transition should work");
 
         assert_eq!(connected.target_id, target.id);
+    }
+
+    #[test]
+    fn ffi_invalid_ssh_target_fingerprint_request_fails() {
+        let api = MobileApi::new();
+        let result = api.observe_ssh_host_key_fingerprint_sha256("ssh://bad-target:abc");
+        assert!(matches!(result, Err(MobileCoreError::InvalidTarget(_))));
     }
 }

@@ -21,6 +21,14 @@ pub trait SshBackend: Send + Sync {
     ///
     /// Returns connection-level errors from the backend implementation.
     fn open(&self, target: &SshTarget) -> Result<()>;
+
+    /// Fetch the server's observed host-key SHA-256 fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns connection or handshake errors, or an error when the server
+    /// does not provide a SHA-256 host key hash.
+    fn observe_host_key_fingerprint_sha256(&self, target: &SshTarget) -> Result<String>;
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +63,48 @@ impl SshBackend for EmbeddedSshBackend {
                 )
             })?;
 
+        let endpoint = format!("{}:{}", target.host, target.port);
+        let session = self.handshaked_session(target)?;
+
+        verify_host_key(&session, target)?;
+
+        authenticate_with_fallback(&session, &username, target)?;
+
+        let mut channel = session.channel_session().map_err(|error| {
+            MobileCoreError::SshConnectionFailed(format!(
+                "failed opening SSH channel for '{endpoint}': {error}"
+            ))
+        })?;
+        channel.exec("true").map_err(|error| {
+            MobileCoreError::SshConnectionFailed(format!(
+                "failed validating SSH exec capability on '{endpoint}': {error}"
+            ))
+        })?;
+        channel.wait_close().map_err(|error| {
+            MobileCoreError::SshConnectionFailed(format!(
+                "failed closing SSH validation channel on '{endpoint}': {error}"
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    fn observe_host_key_fingerprint_sha256(&self, target: &SshTarget) -> Result<String> {
+        let session = self.handshaked_session(target)?;
+        let hash = session
+            .host_key_hash(ssh2::HashType::Sha256)
+            .ok_or_else(|| {
+                MobileCoreError::SshConnectionFailed(format!(
+                    "SSH server did not provide SHA-256 host key hash for '{}:{}'",
+                    target.host, target.port
+                ))
+            })?;
+        Ok(to_hex(hash))
+    }
+}
+
+impl EmbeddedSshBackend {
+    fn handshaked_session(&self, target: &SshTarget) -> Result<ssh2::Session> {
         let endpoint = format!("{}:{}", target.host, target.port);
         let address = endpoint
             .to_socket_addrs()
@@ -100,28 +150,7 @@ impl SshBackend for EmbeddedSshBackend {
                 "SSH handshake failed for '{endpoint}': {error}"
             ))
         })?;
-
-        verify_host_key(&session, target)?;
-
-        authenticate_with_fallback(&session, &username, target)?;
-
-        let mut channel = session.channel_session().map_err(|error| {
-            MobileCoreError::SshConnectionFailed(format!(
-                "failed opening SSH channel for '{endpoint}': {error}"
-            ))
-        })?;
-        channel.exec("true").map_err(|error| {
-            MobileCoreError::SshConnectionFailed(format!(
-                "failed validating SSH exec capability on '{endpoint}': {error}"
-            ))
-        })?;
-        channel.wait_close().map_err(|error| {
-            MobileCoreError::SshConnectionFailed(format!(
-                "failed closing SSH validation channel on '{endpoint}': {error}"
-            ))
-        })?;
-
-        Ok(())
+        Ok(session)
     }
 }
 
@@ -132,6 +161,22 @@ impl SshBackend for MockSshBackend {
     fn open(&self, _target: &SshTarget) -> Result<()> {
         Ok(())
     }
+
+    fn observe_host_key_fingerprint_sha256(&self, _target: &SshTarget) -> Result<String> {
+        Ok("0000000000000000000000000000000000000000000000000000000000000000".to_string())
+    }
+}
+
+/// Resolve a target string and fetch the observed SSH host-key SHA-256
+/// fingerprint from the server.
+///
+/// # Errors
+///
+/// Returns target parse, DNS/network, handshake, or fingerprint availability
+/// errors.
+pub fn observe_ssh_host_key_fingerprint_sha256(target: &str) -> Result<String> {
+    let parsed = parse_ssh_target(target)?;
+    EmbeddedSshBackend::default().observe_host_key_fingerprint_sha256(&parsed)
 }
 
 /// Parse an SSH target from either `ssh://user@host:port` or `user@host:port`.
@@ -500,5 +545,16 @@ mod tests {
         let error = parse_ssh_target("ssh://ops@prod.example.com?host_key_fp=xyz")
             .expect_err("invalid fingerprint should fail");
         assert!(matches!(error, MobileCoreError::InvalidTarget(_)));
+    }
+
+    #[test]
+    fn mock_backend_reports_fingerprint() {
+        let backend = MockSshBackend;
+        let target =
+            parse_ssh_target("ssh://ops@prod.example.com:22").expect("target should parse");
+        let fingerprint = backend
+            .observe_host_key_fingerprint_sha256(&target)
+            .expect("mock backend should provide fingerprint");
+        assert_eq!(fingerprint.len(), 64);
     }
 }
