@@ -39,6 +39,7 @@ bmux sandbox doctor --json
 bmux sandbox cleanup --dry-run --json
 bmux sandbox cleanup --source playbook --older-than 600 --json
 bmux sandbox cleanup --all-status --source playbook --older-than 0 --json
+bmux sandbox rebuild-index --json
 ```
 
 Cleanup output includes per-entry `reason` for observability (`would_remove`,

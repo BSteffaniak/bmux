@@ -81,6 +81,7 @@ bmux sandbox cleanup --dry-run --json
 bmux sandbox cleanup --failed-only --older-than 600
 bmux sandbox cleanup --all-status --source playbook --older-than 0
 bmux sandbox cleanup --source recording-verify --older-than 600
+bmux sandbox rebuild-index --json
 ```
 
 ```bash

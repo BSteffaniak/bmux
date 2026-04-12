@@ -999,3 +999,95 @@ fn sandbox_list_prunes_missing_index_entries_during_reconcile() {
         Some("bmux-sbx-index-existing")
     );
 }
+
+#[test]
+#[serial]
+fn sandbox_rebuild_index_recreates_missing_index() {
+    let sandbox = CommandSandbox::new("rebuild-index-missing");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-rebuild-a", "sandbox-cli", "succeeded");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-rebuild-b", "playbook", "failed");
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "rebuild-index", "--json"])
+        .output()
+        .expect("run sandbox rebuild-index with missing index");
+    assert!(
+        output.status.success(),
+        "sandbox rebuild-index should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["rebuilt_count"].as_u64(), Some(2));
+    assert_eq!(json["missing_manifest"].as_u64(), Some(0));
+
+    let index_contents =
+        std::fs::read_to_string(sandbox.sandbox_index_path()).expect("read rebuilt sandbox index");
+    let index_json: serde_json::Value =
+        serde_json::from_str(&index_contents).expect("parse sandbox index json");
+    let index_entries = index_json["entries"]
+        .as_array()
+        .expect("index should contain entries array");
+    assert_eq!(
+        index_entries.len(),
+        2,
+        "rebuild should write both manifests"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_rebuild_index_recovers_from_corrupt_index() {
+    let sandbox = CommandSandbox::new("rebuild-index-corrupt");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-rebuild-corrupt",
+        "recording-verify",
+        "failed",
+    );
+
+    let index_path = sandbox.sandbox_index_path();
+    std::fs::create_dir_all(
+        index_path
+            .parent()
+            .expect("sandbox index parent should exist"),
+    )
+    .expect("create sandbox index directory");
+    std::fs::write(&index_path, b"{not-json").expect("write corrupt index file");
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "rebuild-index", "--json"])
+        .output()
+        .expect("run sandbox rebuild-index with corrupt index");
+    assert!(
+        output.status.success(),
+        "sandbox rebuild-index should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["rebuilt_count"].as_u64(), Some(1));
+    assert_eq!(json["scan_fallback_used"].as_bool(), Some(true));
+
+    let index_contents = std::fs::read_to_string(index_path).expect("read repaired sandbox index");
+    let index_json: serde_json::Value =
+        serde_json::from_str(&index_contents).expect("parse repaired index json");
+    let index_entries = index_json["entries"]
+        .as_array()
+        .expect("index should contain entries array");
+    assert_eq!(
+        index_entries.len(),
+        1,
+        "rebuild should repair corrupt index"
+    );
+    assert_eq!(
+        index_entries[0]["id"].as_str(),
+        Some("bmux-sbx-rebuild-corrupt")
+    );
+}

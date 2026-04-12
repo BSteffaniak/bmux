@@ -121,6 +121,7 @@ pub enum BuiltInHandlerId {
     SandboxDoctor,
     SandboxBundle,
     SandboxCleanup,
+    SandboxRebuildIndex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -745,6 +746,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::SandboxCleanup,
             &["sandbox", "cleanup"],
             "Clean sandbox run temp directories",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxRebuildIndex,
+            &["sandbox", "rebuild-index"],
+            "Rebuild sandbox index from manifests",
         ),
     ]
 }

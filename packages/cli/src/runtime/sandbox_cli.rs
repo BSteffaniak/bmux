@@ -11,7 +11,9 @@ use crate::sandbox_meta::{
     clear_lock as clear_sandbox_lock, prune_missing_index_entries,
     read_index_entries as read_sandbox_index_entries, read_lock as read_sandbox_lock,
     read_manifest as read_sandbox_manifest, remove_index_entry as remove_sandbox_index_entry,
-    sandbox_id_from_root as sandbox_id_from_root_meta, unix_millis_now as unix_millis_now_meta,
+    replace_index_entries as replace_sandbox_index_entries,
+    sandbox_id_from_root as sandbox_id_from_root_meta,
+    sandbox_index_exists as sandbox_index_exists_meta, unix_millis_now as unix_millis_now_meta,
     upsert_index_entry as upsert_sandbox_index_entry, write_lock as write_sandbox_lock,
     write_manifest as write_sandbox_manifest,
 };
@@ -48,6 +50,15 @@ struct CleanupScan {
     scanned: usize,
     entries: Vec<CleanupEntry>,
     skipped: CleanupSkipped,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct IndexRebuildReport {
+    scanned: usize,
+    rebuilt_count: usize,
+    pruned_count: usize,
+    missing_manifest: usize,
+    scan_fallback_used: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -797,6 +808,34 @@ pub(super) fn run_sandbox_cleanup(
     Ok(0)
 }
 
+pub(super) fn run_sandbox_rebuild_index(json: bool) -> Result<u8> {
+    let roots = collect_sandbox_directories();
+    let report = rebuild_sandbox_index_from_roots(&roots, true);
+
+    if json {
+        let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+            "scanned": report.scanned,
+            "rebuilt_count": report.rebuilt_count,
+            "pruned_count": report.pruned_count,
+            "missing_manifest": report.missing_manifest,
+            "scan_fallback_used": report.scan_fallback_used,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "sandbox index rebuilt: scanned={}, rebuilt={}, pruned={}, missing_manifest={}, fallback={}",
+            report.scanned,
+            report.rebuilt_count,
+            report.pruned_count,
+            report.missing_manifest,
+            report.scan_fallback_used
+        );
+    }
+
+    Ok(0)
+}
+
 fn cleanup_orphaned_sandboxes(
     dry_run: bool,
     failed_only: bool,
@@ -951,6 +990,7 @@ fn collect_sandbox_directories_index_first() -> Vec<PathBuf> {
 }
 
 fn collect_sandbox_candidates() -> Vec<SandboxCandidate> {
+    let index_exists = sandbox_index_exists_meta();
     if read_sandbox_index_entries().is_ok() {
         let _ = prune_missing_index_entries();
         if let Ok(entries) = read_sandbox_index_entries() {
@@ -974,13 +1014,84 @@ fn collect_sandbox_candidates() -> Vec<SandboxCandidate> {
         }
     }
 
-    collect_sandbox_directories()
+    let roots = collect_sandbox_directories();
+    if !roots.is_empty() {
+        let _ = rebuild_sandbox_index_from_roots(&roots, !index_exists);
+        if let Ok(entries) = read_sandbox_index_entries() {
+            let indexed = entries
+                .into_iter()
+                .filter_map(|entry| {
+                    let root = PathBuf::from(entry.root);
+                    if root.is_dir() {
+                        Some(SandboxCandidate {
+                            root,
+                            updated_at_unix_ms: Some(entry.updated_at_unix_ms),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !indexed.is_empty() {
+                return indexed;
+            }
+        }
+    }
+
+    roots
         .into_iter()
         .map(|root| SandboxCandidate {
             root,
             updated_at_unix_ms: None,
         })
         .collect()
+}
+
+fn rebuild_sandbox_index_from_roots(
+    roots: &[PathBuf],
+    scan_fallback_used: bool,
+) -> IndexRebuildReport {
+    let existing = read_sandbox_index_entries().unwrap_or_default();
+    let previous_roots = existing
+        .iter()
+        .map(|entry| entry.root.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut rebuilt_entries = Vec::new();
+    let mut seen_roots = std::collections::BTreeSet::new();
+    let mut missing_manifest = 0usize;
+
+    for root in roots {
+        seen_roots.insert(root.to_string_lossy().to_string());
+        if let Ok(manifest) = read_manifest(root) {
+            rebuilt_entries.push(crate::sandbox_meta::SandboxIndexEntry {
+                id: manifest.id,
+                root: manifest.paths.root,
+                source: manifest.source,
+                status: manifest.status,
+                created_at_unix_ms: manifest.created_at_unix_ms,
+                updated_at_unix_ms: manifest.updated_at_unix_ms,
+                last_seen_unix_ms: unix_millis_now_meta(),
+            });
+        } else {
+            missing_manifest += 1;
+        }
+    }
+
+    let _ = replace_sandbox_index_entries(rebuilt_entries.clone());
+
+    let pruned_count = previous_roots
+        .iter()
+        .filter(|root| !seen_roots.contains(*root))
+        .count();
+
+    IndexRebuildReport {
+        scanned: roots.len(),
+        rebuilt_count: rebuilt_entries.len(),
+        pruned_count,
+        missing_manifest,
+        scan_fallback_used,
+    }
 }
 
 fn candidate_sort_key(candidate: &SandboxCandidate) -> u128 {

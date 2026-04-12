@@ -28,13 +28,13 @@ use super::{
     run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
     run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade,
     run_sandbox_bundle, run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect,
-    run_sandbox_list, run_sandbox_run, run_server_bridge, run_server_gateway,
-    run_server_recording_clear, run_server_recording_path, run_server_recording_start,
-    run_server_recording_status, run_server_recording_stop, run_server_restore, run_server_save,
-    run_server_start, run_server_status, run_server_stop, run_server_whoami_principal,
-    run_session_attach, run_session_detach, run_session_kill, run_session_kill_all,
-    run_session_list, run_session_new, run_setup, run_share, run_terminal_doctor,
-    run_terminal_install_terminfo, run_unfollow, run_unshare,
+    run_sandbox_list, run_sandbox_rebuild_index, run_sandbox_run, run_server_bridge,
+    run_server_gateway, run_server_recording_clear, run_server_recording_path,
+    run_server_recording_start, run_server_recording_status, run_server_recording_stop,
+    run_server_restore, run_server_save, run_server_start, run_server_status, run_server_stop,
+    run_server_whoami_principal, run_session_attach, run_session_detach, run_session_kill,
+    run_session_kill_all, run_session_list, run_session_new, run_setup, run_share,
+    run_terminal_doctor, run_terminal_install_terminfo, run_unfollow, run_unshare,
 };
 
 pub(super) async fn run_command(
@@ -187,6 +187,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             SandboxCommand::Doctor { .. } => BuiltInHandlerId::SandboxDoctor,
             SandboxCommand::Bundle { .. } => BuiltInHandlerId::SandboxBundle,
             SandboxCommand::Cleanup { .. } => BuiltInHandlerId::SandboxCleanup,
+            SandboxCommand::RebuildIndex { .. } => BuiltInHandlerId::SandboxRebuildIndex,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1534,6 +1535,12 @@ pub(super) async fn dispatch_built_in_command(
                 *json,
             )
         }
+        (
+            BuiltInHandlerId::SandboxRebuildIndex,
+            Command::Sandbox {
+                command: SandboxCommand::RebuildIndex { json },
+            },
+        ) => run_sandbox_rebuild_index(*json),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }

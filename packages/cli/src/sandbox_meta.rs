@@ -71,6 +71,10 @@ fn sandbox_index_path() -> PathBuf {
         .join(SANDBOX_INDEX_FILE)
 }
 
+pub fn sandbox_index_exists() -> bool {
+    sandbox_index_path().exists()
+}
+
 pub fn default_source() -> String {
     "sandbox-cli".to_string()
 }
@@ -186,6 +190,10 @@ pub fn prune_missing_index_entries() -> Result<usize> {
         write_index_entries(filtered)?;
     }
     Ok(removed)
+}
+
+pub fn replace_index_entries(entries: Vec<SandboxIndexEntry>) -> Result<()> {
+    write_index_entries(entries)
 }
 
 fn write_index_entries(entries: Vec<SandboxIndexEntry>) -> Result<()> {

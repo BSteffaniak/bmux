@@ -1183,6 +1183,12 @@ pub enum SandboxCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Rebuild sandbox index from discovered sandbox manifests
+    RebuildIndex {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -4217,6 +4223,19 @@ mod tests {
                 source: Some(SandboxSourceArg::RecordingVerify),
                 json: true,
             }
+        ));
+    }
+
+    #[test]
+    fn parses_sandbox_rebuild_index() {
+        let cli = Cli::try_parse_from(["bmux", "sandbox", "rebuild-index", "--json"])
+            .expect("valid CLI args");
+        let Some(Command::Sandbox { command }) = cli.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::RebuildIndex { json: true }
         ));
     }
 
