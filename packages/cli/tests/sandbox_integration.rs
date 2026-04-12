@@ -1357,7 +1357,7 @@ fn sandbox_status_reports_source_counts_and_health() {
                 && source["stopped"].as_u64() == Some(1))
     );
 
-    assert_eq!(json["health"]["stale_lock_count"].as_u64(), Some(1));
+    assert_eq!(json["health"]["stale_lock_count"].as_u64(), Some(0));
     assert_eq!(json["health"]["index_exists"].as_bool(), Some(true));
     assert_eq!(
         json["reconcile"]["scan_fallback_used"].as_bool(),
@@ -1366,6 +1366,27 @@ fn sandbox_status_reports_source_counts_and_health() {
     assert!(
         json["reconcile"]["healed_entries"].as_u64().unwrap_or(0) >= 1,
         "status should surface reconcile heal count"
+    );
+    assert_eq!(
+        json["reconcile"]["normalized_running"].as_u64(),
+        Some(1),
+        "status recovery should normalize stale running manifest"
+    );
+    assert_eq!(
+        json["reconcile"]["cleared_stale_locks"].as_u64(),
+        Some(1),
+        "status recovery should clear stale lock files"
+    );
+
+    let recovered_manifest_path = stale_lock_root.join("sandbox.json");
+    let recovered_manifest =
+        std::fs::read_to_string(&recovered_manifest_path).expect("read recovered manifest");
+    let recovered_json: serde_json::Value =
+        serde_json::from_str(&recovered_manifest).expect("parse recovered manifest json");
+    assert_eq!(recovered_json["status"].as_str(), Some("aborted"));
+    assert!(
+        !stale_lock_root.join("sandbox.lock").exists(),
+        "stale lock should be removed during recovery"
     );
 }
 

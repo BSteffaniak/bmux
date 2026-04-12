@@ -118,8 +118,16 @@ struct ReconcileReport {
     healed_entries: usize,
     pruned_entries: usize,
     rebuilt_entries: usize,
+    normalized_running: usize,
+    cleared_stale_locks: usize,
     scan_fallback_used: bool,
     index_read_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RecoveryReport {
+    normalized_running: usize,
+    cleared_stale_locks: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -534,10 +542,12 @@ pub(super) fn run_sandbox_list(
         }
         if collection.reconcile.healed_entries > 0 {
             println!(
-                "reconcile: healed={} (rebuilt={}, pruned={}, fallback={})",
+                "reconcile: healed={} (rebuilt={}, pruned={}, normalized_running={}, cleared_stale_locks={}, fallback={})",
                 collection.reconcile.healed_entries,
                 collection.reconcile.rebuilt_entries,
                 collection.reconcile.pruned_entries,
+                collection.reconcile.normalized_running,
+                collection.reconcile.cleared_stale_locks,
                 collection.reconcile.scan_fallback_used
             );
         }
@@ -699,10 +709,12 @@ fn print_sandbox_status_text(snapshot: &SandboxStatusSnapshot) {
     );
     if snapshot.reconcile.healed_entries > 0 {
         println!(
-            "reconcile: healed={} (rebuilt={}, pruned={}, fallback={})",
+            "reconcile: healed={} (rebuilt={}, pruned={}, normalized_running={}, cleared_stale_locks={}, fallback={})",
             snapshot.reconcile.healed_entries,
             snapshot.reconcile.rebuilt_entries,
             snapshot.reconcile.pruned_entries,
+            snapshot.reconcile.normalized_running,
+            snapshot.reconcile.cleared_stale_locks,
             snapshot.reconcile.scan_fallback_used
         );
     }
@@ -760,10 +772,12 @@ pub(super) fn run_sandbox_inspect(
         }
         if collection.reconcile.healed_entries > 0 {
             println!(
-                "reconcile: healed={} (rebuilt={}, pruned={}, fallback={})",
+                "reconcile: healed={} (rebuilt={}, pruned={}, normalized_running={}, cleared_stale_locks={}, fallback={})",
                 collection.reconcile.healed_entries,
                 collection.reconcile.rebuilt_entries,
                 collection.reconcile.pruned_entries,
+                collection.reconcile.normalized_running,
+                collection.reconcile.cleared_stale_locks,
                 collection.reconcile.scan_fallback_used
             );
         }
@@ -1048,10 +1062,12 @@ pub(super) fn run_sandbox_cleanup(
         );
         if collection.reconcile.healed_entries > 0 {
             println!(
-                "reconcile: healed={} (rebuilt={}, pruned={}, fallback={})",
+                "reconcile: healed={} (rebuilt={}, pruned={}, normalized_running={}, cleared_stale_locks={}, fallback={})",
                 collection.reconcile.healed_entries,
                 collection.reconcile.rebuilt_entries,
                 collection.reconcile.pruned_entries,
+                collection.reconcile.normalized_running,
+                collection.reconcile.cleared_stale_locks,
                 collection.reconcile.scan_fallback_used
             );
         }
@@ -1068,10 +1084,12 @@ pub(super) fn run_sandbox_cleanup(
         );
         if collection.reconcile.healed_entries > 0 {
             println!(
-                "reconcile: healed={} (rebuilt={}, pruned={}, fallback={})",
+                "reconcile: healed={} (rebuilt={}, pruned={}, normalized_running={}, cleared_stale_locks={}, fallback={})",
                 collection.reconcile.healed_entries,
                 collection.reconcile.rebuilt_entries,
                 collection.reconcile.pruned_entries,
+                collection.reconcile.normalized_running,
+                collection.reconcile.cleared_stale_locks,
                 collection.reconcile.scan_fallback_used
             );
         }
@@ -1272,7 +1290,12 @@ fn collect_sandbox_candidates() -> SandboxCandidateCollection {
             if let Ok(entries) = read_sandbox_index_entries() {
                 let indexed = index_entries_to_candidates(entries);
                 if !indexed.is_empty() {
-                    reconcile.healed_entries = reconcile.pruned_entries;
+                    let recovery = recover_candidate_lifecycle_state(&indexed);
+                    reconcile.normalized_running = recovery.normalized_running;
+                    reconcile.cleared_stale_locks = recovery.cleared_stale_locks;
+                    reconcile.healed_entries = reconcile.pruned_entries
+                        + reconcile.normalized_running
+                        + reconcile.cleared_stale_locks;
                     return SandboxCandidateCollection {
                         candidates: indexed,
                         reconcile,
@@ -1296,7 +1319,13 @@ fn collect_sandbox_candidates() -> SandboxCandidateCollection {
         if let Ok(entries) = read_sandbox_index_entries() {
             let indexed = index_entries_to_candidates(entries);
             if !indexed.is_empty() {
-                reconcile.healed_entries = reconcile.rebuilt_entries + reconcile.pruned_entries;
+                let recovery = recover_candidate_lifecycle_state(&indexed);
+                reconcile.normalized_running = recovery.normalized_running;
+                reconcile.cleared_stale_locks = recovery.cleared_stale_locks;
+                reconcile.healed_entries = reconcile.rebuilt_entries
+                    + reconcile.pruned_entries
+                    + reconcile.normalized_running
+                    + reconcile.cleared_stale_locks;
                 return SandboxCandidateCollection {
                     candidates: indexed,
                     reconcile,
@@ -1311,13 +1340,51 @@ fn collect_sandbox_candidates() -> SandboxCandidateCollection {
             root,
             updated_at_unix_ms: None,
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    reconcile.healed_entries = reconcile.rebuilt_entries + reconcile.pruned_entries;
+    let recovery = recover_candidate_lifecycle_state(&candidates);
+    reconcile.normalized_running = recovery.normalized_running;
+    reconcile.cleared_stale_locks = recovery.cleared_stale_locks;
+    reconcile.healed_entries = reconcile.rebuilt_entries
+        + reconcile.pruned_entries
+        + reconcile.normalized_running
+        + reconcile.cleared_stale_locks;
     SandboxCandidateCollection {
         candidates,
         reconcile,
     }
+}
+
+fn recover_candidate_lifecycle_state(candidates: &[SandboxCandidate]) -> RecoveryReport {
+    let mut report = RecoveryReport::default();
+    for candidate in candidates {
+        let root = &candidate.root;
+        if sandbox_lock_is_fresh(root) || sandbox_process_alive(root) || sandbox_socket_alive(root)
+        {
+            continue;
+        }
+
+        if let Ok(mut manifest) = read_manifest(root)
+            && manifest.status == "running"
+        {
+            manifest.updated_at_unix_ms = unix_millis_now_meta();
+            manifest.status = "aborted".to_string();
+            if manifest.exit_code.is_none() {
+                manifest.exit_code = Some(1);
+            }
+            manifest.kept = true;
+            if write_manifest(root, &manifest).is_ok() {
+                let _ = upsert_sandbox_index_entry(&manifest);
+                report.normalized_running += 1;
+            }
+        }
+
+        if sandbox_lock_is_stale(root) {
+            clear_sandbox_lock(root);
+            report.cleared_stale_locks += 1;
+        }
+    }
+    report
 }
 
 fn index_entries_to_candidates(
