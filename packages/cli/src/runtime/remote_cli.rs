@@ -4954,6 +4954,7 @@ mod tests {
         });
 
         let cli = Cli {
+            config: None,
             record: false,
             no_capture_input: false,
             recording_id_file: None,
@@ -5022,6 +5023,7 @@ mod tests {
         });
 
         let cli = Cli {
+            config: None,
             record: false,
             no_capture_input: false,
             recording_id_file: None,

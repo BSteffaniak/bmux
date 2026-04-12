@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, LogLevel};
-use bmux_config::{BmuxConfig, ConfigPaths, RECORDINGS_DIR_OVERRIDE_ENV};
+use bmux_config::{
+    BMUX_CONFIG_CLI_OVERRIDE_ENV, BmuxConfig, ConfigPaths, RECORDINGS_DIR_OVERRIDE_ENV,
+};
 use bmux_plugin::PluginRegistry;
 use clap::{CommandFactory, FromArgMatches};
 use tracing::Level;
@@ -64,6 +66,23 @@ fn apply_runtime_override_from_raw_args(argv: &[std::ffi::OsString]) -> Result<(
             let runtime = validate_runtime_name(&value.to_string_lossy())?;
             // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
             unsafe { std::env::set_var("BMUX_RUNTIME_NAME", runtime) };
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--config=") {
+            let path = resolve_cli_path_override(value, "--config")?;
+            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
+            unsafe { std::env::set_var(BMUX_CONFIG_CLI_OVERRIDE_ENV, path) };
+            index += 1;
+            continue;
+        }
+        if arg == "--config" {
+            let Some(value) = argv.get(index + 1) else {
+                anyhow::bail!("--config requires a value")
+            };
+            let path = resolve_cli_path_override(&value.to_string_lossy(), "--config")?;
+            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
+            unsafe { std::env::set_var(BMUX_CONFIG_CLI_OVERRIDE_ENV, path) };
             index += 2;
             continue;
         }
@@ -326,4 +345,54 @@ pub(super) fn validate_record_bootstrap_flags(cli: &Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn clear(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: test-scoped env mutation guarded by this fixture.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_ref() {
+                // SAFETY: restoring process env during test teardown.
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                // SAFETY: restoring process env during test teardown.
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn raw_arg_config_override_sets_cli_config_env() {
+        let _guard = env_lock().lock().expect("lock poisoned");
+        let _config_cli_guard = EnvGuard::clear(BMUX_CONFIG_CLI_OVERRIDE_ENV);
+        let args = vec![
+            std::ffi::OsString::from("bmux"),
+            std::ffi::OsString::from("--config"),
+            std::ffi::OsString::from("./test.toml"),
+        ];
+        apply_runtime_override_from_raw_args(&args).expect("apply overrides");
+        let stored = std::env::var(BMUX_CONFIG_CLI_OVERRIDE_ENV).expect("config override env set");
+        assert!(stored.ends_with("test.toml"));
+    }
 }

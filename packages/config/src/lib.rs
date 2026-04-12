@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub const RECORDINGS_DIR_OVERRIDE_ENV: &str = "BMUX_RECORDINGS_DIR";
+pub const BMUX_CONFIG_ENV: &str = "BMUX_CONFIG";
+pub const BMUX_CONFIG_CLI_OVERRIDE_ENV: &str = "BMUX_CONFIG_CLI";
 
 pub mod keybind;
 pub mod paths;
@@ -236,6 +238,96 @@ fn changed_paths(before: &toml::Value, after: &toml::Value) -> Vec<String> {
     let mut out = std::collections::BTreeSet::new();
     collect_changed_paths(Some(before), Some(after), "", &mut out);
     out.into_iter().collect()
+}
+
+fn resolve_config_override_path(value: &std::ffi::OsStr) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir().map_or_else(|_| path.clone(), |cwd| cwd.join(path.clone()))
+}
+
+fn load_toml_file(path: &std::path::Path) -> Result<toml::Value> {
+    let contents = std::fs::read_to_string(path).map_err(|error| ConfigError::ReadError {
+        error: format!("{} ({})", error, path.display()),
+    })?;
+    toml::from_str(&contents).map_err(|error| ConfigError::ParseError {
+        error: format!("{} ({})", error, path.display()),
+    })
+}
+
+fn merged_raw_config_value(base_path: &std::path::Path) -> Result<Option<toml::Value>> {
+    let mut source_paths = Vec::new();
+    if base_path.exists() {
+        source_paths.push(base_path.to_path_buf());
+    }
+
+    let include_override_layers = base_path == ConfigPaths::default().config_file();
+    if !include_override_layers {
+        let mut merged = toml::Value::Table(toml::Table::new());
+        let mut loaded_any = false;
+        for path in source_paths {
+            let value = load_toml_file(&path)?;
+            merge_toml_value(&mut merged, value);
+            loaded_any = true;
+        }
+        return Ok(loaded_any.then_some(merged));
+    }
+
+    if let Some(value) = std::env::var_os(BMUX_CONFIG_ENV)
+        && !value.is_empty()
+    {
+        let path = resolve_config_override_path(&value);
+        if !path.exists() {
+            return Err(ConfigError::FileNotFound { path });
+        }
+        source_paths.push(path);
+    }
+
+    if let Some(value) = std::env::var_os(BMUX_CONFIG_CLI_OVERRIDE_ENV)
+        && !value.is_empty()
+    {
+        let path = resolve_config_override_path(&value);
+        if !path.exists() {
+            return Err(ConfigError::FileNotFound { path });
+        }
+        source_paths.push(path);
+    }
+
+    let mut merged = toml::Value::Table(toml::Table::new());
+    let mut loaded_any = false;
+    for path in source_paths {
+        let value = load_toml_file(&path)?;
+        merge_toml_value(&mut merged, value);
+        loaded_any = true;
+    }
+
+    Ok(loaded_any.then_some(merged))
+}
+
+fn apply_forced_profile(
+    raw_value: &mut toml::Value,
+    forced_profile: Option<&str>,
+) -> std::result::Result<(), ConfigError> {
+    if let Some(profile_id) = forced_profile
+        && let Some(root) = raw_value.as_table_mut()
+    {
+        let composition_value = root
+            .entry("composition".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let composition_table =
+            composition_value
+                .as_table_mut()
+                .ok_or_else(|| ConfigError::ParseError {
+                    error: "[composition] must be a table".to_string(),
+                })?;
+        composition_table.insert(
+            "active_profile".to_string(),
+            toml::Value::String(profile_id.to_string()),
+        );
+    }
+    Ok(())
 }
 
 fn parse_composition_config(
@@ -2086,7 +2178,7 @@ impl BmuxConfig {
         path: &std::path::Path,
         forced_profile: Option<&str>,
     ) -> Result<(Self, CompositionResolution)> {
-        if !path.exists() {
+        let Some(mut raw_value) = merged_raw_config_value(path)? else {
             return Ok((
                 Self::default(),
                 CompositionResolution {
@@ -2097,33 +2189,8 @@ impl BmuxConfig {
                     available_profiles: built_in_composition_profiles().keys().cloned().collect(),
                 },
             ));
-        }
-
-        let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadError {
-            error: e.to_string(),
-        })?;
-
-        let mut raw_value: toml::Value =
-            toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
-                error: e.to_string(),
-            })?;
-        if let Some(profile_id) = forced_profile
-            && let Some(root) = raw_value.as_table_mut()
-        {
-            let composition_value = root
-                .entry("composition".to_string())
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-            let composition_table =
-                composition_value
-                    .as_table_mut()
-                    .ok_or_else(|| ConfigError::ParseError {
-                        error: "[composition] must be a table".to_string(),
-                    })?;
-            composition_table.insert(
-                "active_profile".to_string(),
-                toml::Value::String(profile_id.to_string()),
-            );
-        }
+        };
+        apply_forced_profile(&mut raw_value, forced_profile)?;
         let (resolved_value, resolution) = resolve_composed_config_value(&raw_value)?;
         let mut config: Self = resolved_value
             .try_into()
@@ -2156,7 +2223,7 @@ impl BmuxConfig {
         path: &std::path::Path,
         forced_profile: Option<&str>,
     ) -> Result<(Self, CompositionExplain)> {
-        if !path.exists() {
+        let Some(mut raw_value) = merged_raw_config_value(path)? else {
             let resolution = CompositionResolution {
                 selected_profile: None,
                 selected_profile_source: None,
@@ -2171,33 +2238,8 @@ impl BmuxConfig {
                     applied_layers: Vec::new(),
                 },
             ));
-        }
-
-        let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadError {
-            error: e.to_string(),
-        })?;
-
-        let mut raw_value: toml::Value =
-            toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
-                error: e.to_string(),
-            })?;
-        if let Some(profile_id) = forced_profile
-            && let Some(root) = raw_value.as_table_mut()
-        {
-            let composition_value = root
-                .entry("composition".to_string())
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-            let composition_table =
-                composition_value
-                    .as_table_mut()
-                    .ok_or_else(|| ConfigError::ParseError {
-                        error: "[composition] must be a table".to_string(),
-                    })?;
-            composition_table.insert(
-                "active_profile".to_string(),
-                toml::Value::String(profile_id.to_string()),
-            );
-        }
+        };
+        apply_forced_profile(&mut raw_value, forced_profile)?;
         let (resolved_value, resolution, applied_layers) =
             resolve_composed_config_value_with_explain(&raw_value)?;
         let mut config: Self = resolved_value
@@ -2546,8 +2588,8 @@ impl BmuxConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        BmuxConfig, MouseClickPropagation, MouseWheelPropagation, ResolvedTimeout,
-        SandboxCleanupSource, StaleBuildAction,
+        BMUX_CONFIG_CLI_OVERRIDE_ENV, BMUX_CONFIG_ENV, BmuxConfig, MouseClickPropagation,
+        MouseWheelPropagation, ResolvedTimeout, SandboxCleanupSource, StaleBuildAction,
     };
     use crate::ConfigPaths;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2564,6 +2606,62 @@ mod tests {
         let dir = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&dir).expect("failed to create temp test directory");
         dir.join("bmux.toml")
+    }
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: test-scoped env mutation guarded by env_lock.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: test-scoped env mutation guarded by env_lock.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_ref() {
+                // SAFETY: restoring process env in test teardown.
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                // SAFETY: restoring process env in test teardown.
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    struct CwdGuard {
+        previous: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::current_dir().expect("current dir");
+            std::env::set_current_dir(path).expect("set current dir");
+            Self { previous }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous).expect("restore current dir");
+        }
     }
 
     #[test]
@@ -3783,5 +3881,87 @@ timeout_profile = "missing"
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_merges_discovered_env_and_cli_config_layers_in_precedence_order() {
+        let _guard = env_lock().lock().expect("env lock");
+        let base_path = temp_config_path();
+        let dir = base_path.parent().expect("temp dir").to_path_buf();
+        let env_path = dir.join("env-layer.toml");
+        let cli_path = dir.join("cli-layer.toml");
+        std::fs::write(
+            &base_path,
+            "[general]\nserver_timeout = 100\n[keybindings.global]\n\"alt+1\" = \"focus_left_pane\"\n",
+        )
+        .expect("write base config");
+        std::fs::write(&env_path, "[general]\nserver_timeout = 200\n").expect("write env config");
+        std::fs::write(
+            &cli_path,
+            "[general]\nserver_timeout = 300\n[keybindings.global]\n\"alt+2\" = \"focus_right_pane\"\n",
+        )
+        .expect("write cli config");
+
+        let _config_dir_guard =
+            EnvVarGuard::set("BMUX_CONFIG_DIR", dir.to_str().expect("temp dir utf-8"));
+        let _env_guard = EnvVarGuard::set(BMUX_CONFIG_ENV, env_path.to_str().expect("env utf-8"));
+        let _cli_guard = EnvVarGuard::set(
+            BMUX_CONFIG_CLI_OVERRIDE_ENV,
+            cli_path.to_str().expect("cli utf-8"),
+        );
+
+        let config = BmuxConfig::load().expect("load merged config");
+        assert_eq!(config.general.server_timeout, 300);
+        assert_eq!(
+            config.keybindings.global.get("alt+1"),
+            Some(&"focus_left_pane".to_string())
+        );
+        assert_eq!(
+            config.keybindings.global.get("alt+2"),
+            Some(&"focus_right_pane".to_string())
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn load_resolves_relative_env_and_cli_config_paths_from_cwd() {
+        let _guard = env_lock().lock().expect("env lock");
+        let base_path = temp_config_path();
+        let dir = base_path.parent().expect("temp dir").to_path_buf();
+        let env_path = dir.join("relative-env.toml");
+        let cli_path = dir.join("relative-cli.toml");
+        std::fs::write(&base_path, "[general]\nserver_timeout = 100\n").expect("write base");
+        std::fs::write(&env_path, "[general]\nserver_timeout = 150\n").expect("write env");
+        std::fs::write(&cli_path, "[general]\nserver_timeout = 175\n").expect("write cli");
+
+        let _cwd_guard = CwdGuard::set(&dir);
+        let _config_dir_guard = EnvVarGuard::set("BMUX_CONFIG_DIR", ".");
+        let _env_guard = EnvVarGuard::set(BMUX_CONFIG_ENV, "relative-env.toml");
+        let _cli_guard = EnvVarGuard::set(BMUX_CONFIG_CLI_OVERRIDE_ENV, "relative-cli.toml");
+
+        let config = BmuxConfig::load().expect("load merged config");
+        assert_eq!(config.general.server_timeout, 175);
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn load_fails_when_config_override_path_is_missing() {
+        let _guard = env_lock().lock().expect("env lock");
+        let _config_dir_guard = EnvVarGuard::unset("BMUX_CONFIG_DIR");
+        let _cli_guard = EnvVarGuard::unset(BMUX_CONFIG_CLI_OVERRIDE_ENV);
+        let missing = std::env::temp_dir().join(format!(
+            "bmux-missing-config-override-{}-{}.toml",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let _env_guard = EnvVarGuard::set(BMUX_CONFIG_ENV, missing.as_os_str());
+
+        let error = BmuxConfig::load().expect_err("missing override should fail");
+        assert!(matches!(error, crate::ConfigError::FileNotFound { .. }));
     }
 }

@@ -177,3 +177,10 @@ Keybinding explain command:
 
 - `bmux keymap explain "ctrl+b %"`
 - `bmux keymap explain "h" --mode normal`
+
+Config file layering overrides:
+
+- `BMUX_CONFIG=/path/extra.toml` adds an extra config layer on top of discovered config.
+- `--config /path/extra.toml` adds another layer and takes precedence over `BMUX_CONFIG`.
+- Relative paths in `BMUX_CONFIG` and `--config` resolve against the current working directory.
+- Layers are merged deeply; arrays/lists are replaced by higher-precedence layers.

@@ -215,6 +215,10 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
 #[command(name = "bmux")]
 #[command(about = "Server-backed terminal multiplexer CLI")]
 pub struct Cli {
+    /// Merge an additional config file (highest precedence layer)
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<String>,
+
     /// Start interactive bmux with full-session recording
     #[arg(long)]
     pub record: bool,
@@ -1776,6 +1780,13 @@ mod tests {
             panic!("expected keymap subcommand");
         };
         assert!(matches!(command, KeymapCommand::Doctor { json: false }));
+    }
+
+    #[test]
+    fn parses_global_config_flag() {
+        let cli = Cli::try_parse_from(["bmux", "--config", "./custom.toml", "keymap", "doctor"])
+            .expect("valid CLI args");
+        assert_eq!(cli.config.as_deref(), Some("./custom.toml"));
     }
 
     #[test]

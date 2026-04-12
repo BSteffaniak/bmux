@@ -561,6 +561,7 @@ fn resolve_logging_paths() -> moosicbox_log_runtime::LogRuntimePaths {
 mod tests {
     fn empty_cli() -> bmux_cli_schema::Cli {
         bmux_cli_schema::Cli {
+            config: None,
             record: false,
             no_capture_input: false,
             recording_id_file: None,

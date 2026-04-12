@@ -17,6 +17,11 @@ pub struct EnvOverrideDoc {
 /// Path and runtime environment overrides recognized by bmux.
 pub static ENV_OVERRIDE_DOCS: &[EnvOverrideDoc] = &[
     EnvOverrideDoc {
+        variable: crate::BMUX_CONFIG_ENV,
+        scope: "config",
+        description: "Merges an additional config file after discovered config (lower precedence than --config).",
+    },
+    EnvOverrideDoc {
         variable: "BMUX_CONFIG_DIR",
         scope: "config",
         description: "Overrides the config directory root and disables fallback candidate chaining.",
