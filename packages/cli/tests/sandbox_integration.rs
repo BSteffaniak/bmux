@@ -873,6 +873,14 @@ fn sandbox_list_falls_back_to_scan_when_index_is_corrupt() {
 
     let json = parse_json_stdout(&output);
     assert_schema_version(&json);
+    assert_eq!(
+        json["reconcile"]["scan_fallback_used"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        json["reconcile"]["healed_entries"].as_u64().unwrap_or(0) >= 1,
+        "corrupt index fallback should report healed entries"
+    );
     let sandboxes = json["sandboxes"]
         .as_array()
         .expect("sandbox list should include sandboxes array");
@@ -1351,4 +1359,60 @@ fn sandbox_status_reports_source_counts_and_health() {
 
     assert_eq!(json["health"]["stale_lock_count"].as_u64(), Some(1));
     assert_eq!(json["health"]["index_exists"].as_bool(), Some(true));
+    assert_eq!(
+        json["reconcile"]["scan_fallback_used"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        json["reconcile"]["healed_entries"].as_u64().unwrap_or(0) >= 1,
+        "status should surface reconcile heal count"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_inspect_reports_reconcile_when_auto_heal_runs() {
+    let sandbox = CommandSandbox::new("inspect-reconcile");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-inspect-reconcile",
+        "sandbox-cli",
+        "failed",
+    );
+
+    let index_path = sandbox.sandbox_index_path();
+    std::fs::create_dir_all(
+        index_path
+            .parent()
+            .expect("sandbox index parent should exist"),
+    )
+    .expect("create sandbox index directory");
+    std::fs::write(index_path, b"{broken").expect("write corrupt index");
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "inspect", "--latest-failed", "--json"])
+        .output()
+        .expect("run sandbox inspect latest-failed with reconcile");
+    assert!(
+        output.status.success(),
+        "sandbox inspect should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(
+        json["manifest"]["id"].as_str(),
+        Some("bmux-sbx-inspect-reconcile")
+    );
+    assert_eq!(
+        json["reconcile"]["scan_fallback_used"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        json["reconcile"]["healed_entries"].as_u64().unwrap_or(0) >= 1,
+        "inspect should surface reconcile heal count"
+    );
 }

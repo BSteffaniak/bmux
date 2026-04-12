@@ -110,6 +110,22 @@ struct SandboxStatusSnapshot {
     totals: StatusCounts,
     by_source: Vec<SourceStatusCounts>,
     health: SandboxStatusHealth,
+    reconcile: ReconcileReport,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ReconcileReport {
+    healed_entries: usize,
+    pruned_entries: usize,
+    rebuilt_entries: usize,
+    scan_fallback_used: bool,
+    index_read_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SandboxCandidateCollection {
+    candidates: Vec<SandboxCandidate>,
+    reconcile: ReconcileReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -467,7 +483,9 @@ pub(super) fn run_sandbox_list(
     limit: usize,
     json: bool,
 ) -> Result<u8> {
-    let mut entries = collect_sandbox_candidates()
+    let collection = collect_sandbox_candidates();
+    let mut entries = collection
+        .candidates
         .into_iter()
         .map(|candidate| sandbox_list_entry(&candidate))
         .collect::<Vec<_>>();
@@ -487,6 +505,7 @@ pub(super) fn run_sandbox_list(
     if json {
         let payload = serde_json::json!({
             "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+            "reconcile": collection.reconcile,
             "sandboxes": entries,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -513,6 +532,15 @@ pub(super) fn run_sandbox_list(
                 entry.root,
             );
         }
+        if collection.reconcile.healed_entries > 0 {
+            println!(
+                "reconcile: healed={} (rebuilt={}, pruned={}, fallback={})",
+                collection.reconcile.healed_entries,
+                collection.reconcile.rebuilt_entries,
+                collection.reconcile.pruned_entries,
+                collection.reconcile.scan_fallback_used
+            );
+        }
     }
 
     Ok(0)
@@ -527,6 +555,7 @@ pub(super) fn run_sandbox_status(json: bool) -> Result<u8> {
             "totals": snapshot.totals,
             "by_source": snapshot.by_source,
             "health": snapshot.health,
+            "reconcile": snapshot.reconcile,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -540,19 +569,21 @@ pub(super) fn run_sandbox_status(json: bool) -> Result<u8> {
 }
 
 fn collect_sandbox_status_snapshot() -> SandboxStatusSnapshot {
-    let candidates = collect_sandbox_candidates();
-    let entries = candidates
+    let collection = collect_sandbox_candidates();
+    let entries = collection
+        .candidates
         .iter()
         .map(sandbox_list_entry)
         .collect::<Vec<_>>();
     let totals = summarize_status_counts(&entries);
     let by_source = summarize_source_status_counts(&entries);
-    let health = summarize_sandbox_health(&candidates);
+    let health = summarize_sandbox_health(&collection.candidates);
 
     SandboxStatusSnapshot {
         totals,
         by_source,
         health,
+        reconcile: collection.reconcile,
     }
 }
 
@@ -666,6 +697,15 @@ fn print_sandbox_status_text(snapshot: &SandboxStatusSnapshot) {
         snapshot.health.index_entries,
         snapshot.health.index_missing_roots
     );
+    if snapshot.reconcile.healed_entries > 0 {
+        println!(
+            "reconcile: healed={} (rebuilt={}, pruned={}, fallback={})",
+            snapshot.reconcile.healed_entries,
+            snapshot.reconcile.rebuilt_entries,
+            snapshot.reconcile.pruned_entries,
+            snapshot.reconcile.scan_fallback_used
+        );
+    }
 }
 
 pub(super) fn run_sandbox_inspect(
@@ -676,7 +716,14 @@ pub(super) fn run_sandbox_inspect(
     tail: usize,
     json: bool,
 ) -> Result<u8> {
-    let root = resolve_inspect_target(target, latest, latest_failed, source_filter)?;
+    let collection = collect_sandbox_candidates();
+    let root = resolve_inspect_target(
+        target,
+        latest,
+        latest_failed,
+        source_filter,
+        &collection.candidates,
+    )?;
     let manifest = read_manifest(&root)?;
     let log_tail = read_log_tail(&root, tail);
     let running = sandbox_process_alive(&root) || sandbox_socket_alive(&root);
@@ -684,6 +731,7 @@ pub(super) fn run_sandbox_inspect(
     if json {
         let payload = serde_json::json!({
             "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+            "reconcile": collection.reconcile,
             "manifest": manifest,
             "running": running,
             "log_tail": log_tail,
@@ -710,6 +758,15 @@ pub(super) fn run_sandbox_inspect(
         for line in log_tail {
             println!("  {line}");
         }
+        if collection.reconcile.healed_entries > 0 {
+            println!(
+                "reconcile: healed={} (rebuilt={}, pruned={}, fallback={})",
+                collection.reconcile.healed_entries,
+                collection.reconcile.rebuilt_entries,
+                collection.reconcile.pruned_entries,
+                collection.reconcile.scan_fallback_used
+            );
+        }
     }
 
     Ok(0)
@@ -720,23 +777,28 @@ fn resolve_inspect_target(
     latest: bool,
     latest_failed: bool,
     source_filter: Option<&str>,
+    candidates: &[SandboxCandidate],
 ) -> Result<PathBuf> {
     if let Some(target) = target {
         return resolve_sandbox_target(target);
     }
 
     if latest || latest_failed {
-        return resolve_latest_sandbox(latest_failed, source_filter);
+        return resolve_latest_sandbox(latest_failed, source_filter, candidates);
     }
 
     anyhow::bail!("inspect target required (provide <id|path>, --latest, or --latest-failed)")
 }
 
-fn resolve_latest_sandbox(failed_only: bool, source_filter: Option<&str>) -> Result<PathBuf> {
-    let mut candidates = collect_sandbox_candidates();
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate_sort_key(candidate)));
+fn resolve_latest_sandbox(
+    failed_only: bool,
+    source_filter: Option<&str>,
+    candidates: &[SandboxCandidate],
+) -> Result<PathBuf> {
+    let mut sorted = candidates.to_vec();
+    sorted.sort_by_key(|candidate| std::cmp::Reverse(candidate_sort_key(candidate)));
 
-    for candidate in candidates {
+    for candidate in sorted {
         let path = candidate.root;
         if let Some(source) = source_filter
             && sandbox_source_for_dir(&path) != source
@@ -925,7 +987,14 @@ pub(super) fn run_sandbox_cleanup(
     json: bool,
 ) -> Result<u8> {
     let older_than = older_than_secs.map_or(DEFAULT_CLEANUP_MIN_AGE, Duration::from_secs);
-    let scan = cleanup_orphaned_sandboxes(dry_run, failed_only, older_than, source_filter);
+    let collection = collect_sandbox_candidates();
+    let scan = cleanup_orphaned_sandboxes(
+        collection.candidates,
+        dry_run,
+        failed_only,
+        older_than,
+        source_filter,
+    );
     let orphaned = scan
         .entries
         .iter()
@@ -941,6 +1010,7 @@ pub(super) fn run_sandbox_cleanup(
             "failed_only": failed_only,
             "older_than_secs": older_than.as_secs(),
             "source": source_filter,
+            "reconcile": collection.reconcile,
             "skipped_source_mismatch": scan.skipped.source_mismatch,
             "skipped_running": scan.skipped.running,
             "skipped_recent": scan.skipped.recent,
@@ -976,6 +1046,15 @@ pub(super) fn run_sandbox_cleanup(
             scan.skipped.missing_manifest,
             scan.skipped.delete_failed
         );
+        if collection.reconcile.healed_entries > 0 {
+            println!(
+                "reconcile: healed={} (rebuilt={}, pruned={}, fallback={})",
+                collection.reconcile.healed_entries,
+                collection.reconcile.rebuilt_entries,
+                collection.reconcile.pruned_entries,
+                collection.reconcile.scan_fallback_used
+            );
+        }
     } else {
         println!(
             "no orphaned sandboxes found ({} scanned; reasons source_mismatch={}, running={}, recent={}, not_failed={}, missing_manifest={}, delete_failed={})",
@@ -987,6 +1066,15 @@ pub(super) fn run_sandbox_cleanup(
             scan.skipped.missing_manifest,
             scan.skipped.delete_failed
         );
+        if collection.reconcile.healed_entries > 0 {
+            println!(
+                "reconcile: healed={} (rebuilt={}, pruned={}, fallback={})",
+                collection.reconcile.healed_entries,
+                collection.reconcile.rebuilt_entries,
+                collection.reconcile.pruned_entries,
+                collection.reconcile.scan_fallback_used
+            );
+        }
     }
 
     Ok(0)
@@ -1021,6 +1109,7 @@ pub(super) fn run_sandbox_rebuild_index(json: bool) -> Result<u8> {
 }
 
 fn cleanup_orphaned_sandboxes(
+    candidates: Vec<SandboxCandidate>,
     dry_run: bool,
     failed_only: bool,
     older_than: Duration,
@@ -1038,7 +1127,7 @@ fn cleanup_orphaned_sandboxes(
         delete_failed: 0,
     };
 
-    for candidate in collect_sandbox_candidates() {
+    for candidate in candidates {
         scanned += 1;
         entries.push(evaluate_cleanup_candidate(
             candidate,
@@ -1168,67 +1257,86 @@ fn collect_sandbox_directories() -> Vec<PathBuf> {
 
 fn collect_sandbox_directories_index_first() -> Vec<PathBuf> {
     collect_sandbox_candidates()
+        .candidates
         .into_iter()
         .map(|candidate| candidate.root)
         .collect()
 }
 
-fn collect_sandbox_candidates() -> Vec<SandboxCandidate> {
+fn collect_sandbox_candidates() -> SandboxCandidateCollection {
+    let mut reconcile = ReconcileReport::default();
     let index_exists = sandbox_index_exists_meta();
-    if read_sandbox_index_entries().is_ok() {
-        let _ = prune_missing_index_entries();
-        if let Ok(entries) = read_sandbox_index_entries() {
-            let indexed = entries
-                .into_iter()
-                .filter_map(|entry| {
-                    let root = PathBuf::from(entry.root);
-                    if root.is_dir() {
-                        Some(SandboxCandidate {
-                            root,
-                            updated_at_unix_ms: Some(entry.updated_at_unix_ms),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            if !indexed.is_empty() {
-                return indexed;
+    match read_sandbox_index_entries() {
+        Ok(_) => {
+            reconcile.pruned_entries = prune_missing_index_entries().unwrap_or(0);
+            if let Ok(entries) = read_sandbox_index_entries() {
+                let indexed = index_entries_to_candidates(entries);
+                if !indexed.is_empty() {
+                    reconcile.healed_entries = reconcile.pruned_entries;
+                    return SandboxCandidateCollection {
+                        candidates: indexed,
+                        reconcile,
+                    };
+                }
             }
+        }
+        Err(error) => {
+            reconcile.scan_fallback_used = true;
+            reconcile.index_read_error = Some(error.to_string());
         }
     }
 
     let roots = collect_sandbox_directories();
     if !roots.is_empty() {
-        let _ = rebuild_sandbox_index_from_roots(&roots, !index_exists);
+        let rebuild_report = rebuild_sandbox_index_from_roots(&roots, !index_exists);
+        reconcile.rebuilt_entries = rebuild_report.rebuilt_count;
+        reconcile.pruned_entries = reconcile.pruned_entries.max(rebuild_report.pruned_count);
+        reconcile.scan_fallback_used =
+            reconcile.scan_fallback_used || rebuild_report.scan_fallback_used;
         if let Ok(entries) = read_sandbox_index_entries() {
-            let indexed = entries
-                .into_iter()
-                .filter_map(|entry| {
-                    let root = PathBuf::from(entry.root);
-                    if root.is_dir() {
-                        Some(SandboxCandidate {
-                            root,
-                            updated_at_unix_ms: Some(entry.updated_at_unix_ms),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
+            let indexed = index_entries_to_candidates(entries);
             if !indexed.is_empty() {
-                return indexed;
+                reconcile.healed_entries = reconcile.rebuilt_entries + reconcile.pruned_entries;
+                return SandboxCandidateCollection {
+                    candidates: indexed,
+                    reconcile,
+                };
             }
         }
     }
 
-    roots
+    let candidates = roots
         .into_iter()
         .map(|root| SandboxCandidate {
             root,
             updated_at_unix_ms: None,
         })
-        .collect()
+        .collect();
+
+    reconcile.healed_entries = reconcile.rebuilt_entries + reconcile.pruned_entries;
+    SandboxCandidateCollection {
+        candidates,
+        reconcile,
+    }
+}
+
+fn index_entries_to_candidates(
+    entries: Vec<crate::sandbox_meta::SandboxIndexEntry>,
+) -> Vec<SandboxCandidate> {
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let root = PathBuf::from(entry.root);
+            if root.is_dir() {
+                Some(SandboxCandidate {
+                    root,
+                    updated_at_unix_ms: Some(entry.updated_at_unix_ms),
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
 }
 
 fn rebuild_sandbox_index_from_roots(

@@ -48,6 +48,9 @@ Cleanup output includes per-entry `reason` for observability (`would_remove`,
 `removed`, `running`, `recent`, `not_failed`, `missing_manifest`,
 `source_mismatch`, `delete_failed`) plus top-level reason counters.
 
+Sandbox list/inspect/cleanup/status JSON responses now include a `reconcile`
+object so you can see when auto-heal paths rebuilt or pruned index state.
+
 `bmux sandbox cleanup` uses `[sandbox.cleanup]` defaults from `bmux.toml` when
 flags are omitted. CLI flags always win.
 

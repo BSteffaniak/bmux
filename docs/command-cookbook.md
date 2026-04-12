@@ -89,6 +89,9 @@ bmux sandbox rebuild-index --json
 ```bash
 # Inspect per-entry cleanup reasons quickly
 bmux sandbox cleanup --dry-run --older-than 0 --json | jq '.entries[] | {path, reason, status, source}'
+
+# Inspect auto-heal reconcile stats
+bmux sandbox status --json | jq '.reconcile'
 ```
 
 ## Sandbox Daily Loop
