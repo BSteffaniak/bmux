@@ -14,6 +14,13 @@ pub struct SshTarget {
     pub identity_file: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedHostKey {
+    pub endpoint: String,
+    pub algorithm: String,
+    pub fingerprint_sha256: String,
+}
+
 pub trait SshBackend: Send + Sync {
     /// Open an SSH transport using embedded Rust implementation.
     ///
@@ -22,13 +29,23 @@ pub trait SshBackend: Send + Sync {
     /// Returns connection-level errors from the backend implementation.
     fn open(&self, target: &SshTarget) -> Result<()>;
 
+    /// Fetch structured server host-key details observed during SSH handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns connection or handshake errors, or an error when the server
+    /// does not provide a host key and SHA-256 host key hash.
+    fn observe_host_key(&self, target: &SshTarget) -> Result<ObservedHostKey>;
+
     /// Fetch the server's observed host-key SHA-256 fingerprint.
     ///
     /// # Errors
     ///
     /// Returns connection or handshake errors, or an error when the server
     /// does not provide a SHA-256 host key hash.
-    fn observe_host_key_fingerprint_sha256(&self, target: &SshTarget) -> Result<String>;
+    fn observe_host_key_fingerprint_sha256(&self, target: &SshTarget) -> Result<String> {
+        Ok(self.observe_host_key(target)?.fingerprint_sha256)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,17 +106,26 @@ impl SshBackend for EmbeddedSshBackend {
         Ok(())
     }
 
-    fn observe_host_key_fingerprint_sha256(&self, target: &SshTarget) -> Result<String> {
+    fn observe_host_key(&self, target: &SshTarget) -> Result<ObservedHostKey> {
+        let endpoint = format!("{}:{}", target.host, target.port);
         let session = self.handshaked_session(target)?;
+        let (_, host_key_type) = session.host_key().ok_or_else(|| {
+            MobileCoreError::SshConnectionFailed(format!(
+                "SSH server did not provide a host key for '{endpoint}'"
+            ))
+        })?;
         let hash = session
             .host_key_hash(ssh2::HashType::Sha256)
             .ok_or_else(|| {
                 MobileCoreError::SshConnectionFailed(format!(
-                    "SSH server did not provide SHA-256 host key hash for '{}:{}'",
-                    target.host, target.port
+                    "SSH server did not provide SHA-256 host key hash for '{endpoint}'"
                 ))
             })?;
-        Ok(to_hex(hash))
+        Ok(ObservedHostKey {
+            endpoint,
+            algorithm: host_key_algorithm_name(host_key_type).to_string(),
+            fingerprint_sha256: to_hex(hash),
+        })
     }
 }
 
@@ -162,9 +188,30 @@ impl SshBackend for MockSshBackend {
         Ok(())
     }
 
+    fn observe_host_key(&self, target: &SshTarget) -> Result<ObservedHostKey> {
+        Ok(ObservedHostKey {
+            endpoint: format!("{}:{}", target.host, target.port),
+            algorithm: "ssh-ed25519".to_string(),
+            fingerprint_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        })
+    }
+
     fn observe_host_key_fingerprint_sha256(&self, _target: &SshTarget) -> Result<String> {
         Ok("0000000000000000000000000000000000000000000000000000000000000000".to_string())
     }
+}
+
+/// Resolve a target string and fetch structured observed SSH host-key details
+/// from the server.
+///
+/// # Errors
+///
+/// Returns target parse, DNS/network, handshake, or host key/hash
+/// availability errors.
+pub fn observe_ssh_host_key(target: &str) -> Result<ObservedHostKey> {
+    let parsed = parse_ssh_target(target)?;
+    EmbeddedSshBackend::default().observe_host_key(&parsed)
 }
 
 /// Resolve a target string and fetch the observed SSH host-key SHA-256
@@ -175,8 +222,19 @@ impl SshBackend for MockSshBackend {
 /// Returns target parse, DNS/network, handshake, or fingerprint availability
 /// errors.
 pub fn observe_ssh_host_key_fingerprint_sha256(target: &str) -> Result<String> {
-    let parsed = parse_ssh_target(target)?;
-    EmbeddedSshBackend::default().observe_host_key_fingerprint_sha256(&parsed)
+    Ok(observe_ssh_host_key(target)?.fingerprint_sha256)
+}
+
+const fn host_key_algorithm_name(host_key_type: ssh2::HostKeyType) -> &'static str {
+    match host_key_type {
+        ssh2::HostKeyType::Unknown => "unknown",
+        ssh2::HostKeyType::Rsa => "ssh-rsa",
+        ssh2::HostKeyType::Dss => "ssh-dss",
+        ssh2::HostKeyType::Ecdsa256 => "ecdsa-sha2-nistp256",
+        ssh2::HostKeyType::Ecdsa384 => "ecdsa-sha2-nistp384",
+        ssh2::HostKeyType::Ecdsa521 => "ecdsa-sha2-nistp521",
+        ssh2::HostKeyType::Ed25519 => "ssh-ed25519",
+    }
 }
 
 /// Parse an SSH target from either `ssh://user@host:port` or `user@host:port`.
@@ -556,5 +614,19 @@ mod tests {
             .observe_host_key_fingerprint_sha256(&target)
             .expect("mock backend should provide fingerprint");
         assert_eq!(fingerprint.len(), 64);
+    }
+
+    #[test]
+    fn mock_backend_reports_structured_host_key() {
+        let backend = MockSshBackend;
+        let target =
+            parse_ssh_target("ssh://ops@prod.example.com:2200").expect("target should parse");
+        let observed = backend
+            .observe_host_key(&target)
+            .expect("mock backend should provide host key details");
+
+        assert_eq!(observed.endpoint, "prod.example.com:2200");
+        assert_eq!(observed.algorithm, "ssh-ed25519");
+        assert_eq!(observed.fingerprint_sha256.len(), 64);
     }
 }
