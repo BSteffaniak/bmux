@@ -168,7 +168,7 @@ fn collect_doctor_findings(
             findings.push(DoctorFinding::error(
                 "enabled_plugin_not_registered",
                 format!("enabled plugin '{plugin_id}' was not found in the registry"),
-                Some("Run 'bmux plugin list --json' and verify plugins.enabled in your config."),
+                Some("Run 'bmux plugin list --json' and update plugins.enabled in your config."),
             ));
         }
     }
@@ -187,7 +187,9 @@ fn collect_doctor_findings(
                         "plugin '{}' requires unavailable capability '{}'",
                         plugin.id, required
                     ),
-                    Some("Enable a plugin that provides the capability or disable the requiring plugin."),
+                    Some(
+                        "Run 'bmux plugin list --json' to inspect provided capabilities, then adjust plugins.enabled.",
+                    ),
                 ));
             }
         }
@@ -278,7 +280,9 @@ fn check_manifest_cli_path_conflicts(
                 path_label,
                 path_owners.join(", ")
             ),
-            Some("Disable one owner plugin or adjust command path/aliases to remove overlap."),
+            Some(
+                "Run 'bmux plugin list --json' and remove overlapping CLI paths or disable one owner plugin.",
+            ),
         ));
     }
 }
@@ -299,13 +303,24 @@ fn print_doctor_report(report: &PluginDoctorReport) {
     print_doctor_findings(report, DoctorSeverity::Info, "info", false);
 
     if !report.healthy {
-        if report.strict_mode && report.error_count == 0 && report.warning_count > 0 {
-            println!(
-                "strict mode failed because warnings are treated as failures. Fix warnings above or run without --strict."
-            );
+        for note in doctor_failure_notes(report) {
+            println!("{note}");
         }
-        println!("next: run 'bmux plugin doctor --json --strict' for machine-readable diagnostics");
     }
+}
+
+fn doctor_failure_notes(report: &PluginDoctorReport) -> Vec<String> {
+    let mut notes = Vec::new();
+    if report.strict_mode && report.error_count == 0 && report.warning_count > 0 {
+        notes.push(
+            "strict mode failed because warnings are treated as failures. Fix warnings above or run without --strict.".to_string(),
+        );
+    }
+    notes.push(
+        "next: run 'bmux plugin doctor --json --strict' for machine-readable diagnostics"
+            .to_string(),
+    );
+    notes
 }
 
 fn print_doctor_findings(
@@ -367,7 +382,9 @@ fn check_plugin_manifest_readiness(
                 "plugin '{}' is enabled but no manifest was discovered under configured plugin roots",
                 plugin.id
             ),
-            Some("Verify plugin_search_roots and plugin installation paths."),
+            Some(
+                "Verify plugin_search_roots and plugin installation paths, then run 'bmux plugin doctor --json --strict'.",
+            ),
         ));
         return;
     };
@@ -381,7 +398,7 @@ fn check_plugin_manifest_readiness(
                     "plugin '{}' manifest failed declaration validation: {error}",
                     plugin.id
                 ),
-                Some("Run 'bmux plugin doctor --json' and fix plugin.toml declaration fields."),
+                Some("Fix plugin.toml declaration fields, then run 'bmux plugin doctor --json --strict'."),
             ));
             return;
         }
@@ -397,7 +414,9 @@ fn check_plugin_manifest_readiness(
                 "plugin '{}' plugin_api range '{}' is incompatible with host API version {}",
                 plugin.id, declaration.plugin_api, context.host.plugin_api_version
             ),
-            Some("Upgrade/downgrade the plugin or host so plugin_api ranges overlap."),
+            Some(
+                "Upgrade or downgrade the plugin/host so plugin_api ranges overlap, then rerun 'bmux plugin doctor --json --strict'.",
+            ),
         ));
     }
     if !declaration
@@ -410,7 +429,9 @@ fn check_plugin_manifest_readiness(
                 "plugin '{}' native_abi range '{}' is incompatible with host ABI version {}",
                 plugin.id, declaration.native_abi, context.host.plugin_abi_version
             ),
-            Some("Rebuild or reinstall plugin artifacts targeting this host ABI."),
+            Some(
+                "Run 'bmux plugin rebuild --all-workspace-plugins' or reinstall artifacts targeting this host ABI.",
+            ),
         ));
     }
 
@@ -439,7 +460,9 @@ fn check_plugin_runtime_readiness(
                         "plugin '{}' is missing an entry path for native runtime",
                         plugin.id
                     ),
-                    Some("Set plugin.toml 'entry' to the plugin cdylib path."),
+                    Some(
+                        "Set plugin.toml 'entry' to the plugin cdylib path, then run 'bmux plugin doctor --json --strict'.",
+                    ),
                 ));
                 return;
             };
@@ -469,7 +492,9 @@ fn check_plugin_runtime_readiness(
                         "plugin '{}' process runtime is missing entry command",
                         plugin.id
                     ),
-                    Some("Set plugin.toml 'entry' to an executable command or path."),
+                    Some(
+                        "Set plugin.toml 'entry' to an executable command or path, then run 'bmux plugin doctor --json --strict'.",
+                    ),
                 ));
                 return;
             };
@@ -486,7 +511,9 @@ fn check_plugin_runtime_readiness(
                         plugin.id,
                         path.display()
                     ),
-                    Some("Ensure the command is on PATH or set plugin.toml entry to an absolute path."),
+                    Some(
+                        "Ensure the command is on PATH or set plugin.toml entry to an absolute path, then rerun 'bmux plugin doctor --json --strict'.",
+                    ),
                 )),
                 ProcessCommandStatus::NotExecutable(path) => findings.push(DoctorFinding::error(
                     "process_entry_not_executable",
@@ -495,7 +522,9 @@ fn check_plugin_runtime_readiness(
                         plugin.id,
                         path.display()
                     ),
-                    Some("Mark the process entry executable (for example: chmod +x <entry>)."),
+                    Some(
+                        "Mark the process entry executable (for example: chmod +x <entry>), then rerun 'bmux plugin doctor --json --strict'.",
+                    ),
                 )),
             }
             findings.push(DoctorFinding::warning(
@@ -504,7 +533,9 @@ fn check_plugin_runtime_readiness(
                     "plugin '{}' uses process runtime; ensure stdout emits only framed protocol responses",
                     plugin.id
                 ),
-                Some("Write diagnostics to stderr; keep stdout protocol-framed only."),
+                Some(
+                    "Write diagnostics to stderr and keep stdout protocol-framed only; validate with 'bmux plugin doctor --json --strict'.",
+                ),
             ));
         }
     }
@@ -1365,10 +1396,35 @@ fn levenshtein(left: &str, right: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseSelector, BuildProfile, RebuildMode, RebuildOptions, build_rebuild_target_selection,
-        core_proxy_command_path, format_plugin_command_not_found_error,
-        format_plugin_not_found_error, parse_rebuild_options, suggest_top_matches,
+        BaseSelector, BuildProfile, DoctorFinding, DoctorSeverity, PluginDoctorReport, RebuildMode,
+        RebuildOptions, build_rebuild_target_selection, core_proxy_command_path,
+        doctor_failure_notes, format_plugin_command_not_found_error, format_plugin_not_found_error,
+        parse_rebuild_options, suggest_top_matches,
     };
+
+    fn test_doctor_report(
+        strict_mode: bool,
+        error_count: usize,
+        warning_count: usize,
+    ) -> PluginDoctorReport {
+        PluginDoctorReport {
+            healthy: error_count == 0 && (!strict_mode || warning_count == 0),
+            strict_mode,
+            enabled_plugins: Vec::new(),
+            inspected_plugins: 0,
+            findings: vec![DoctorFinding {
+                code: "test".to_string(),
+                severity: DoctorSeverity::Warning,
+                message: "test warning".to_string(),
+                suggested_fix: Some("test fix".to_string()),
+            }],
+            error_count,
+            warning_count,
+            info_count: 0,
+            issues: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
 
     #[test]
     fn generated_proxy_command_mapping_resolves_known_entries() {
@@ -1457,6 +1513,30 @@ mod tests {
             build_rebuild_target_selection(&options, &["bmux_windows_plugin".to_string()]);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].reason, "selector");
+    }
+
+    #[test]
+    fn doctor_failure_notes_includes_strict_warning_note_when_applicable() {
+        let report = test_doctor_report(true, 0, 1);
+        let notes = doctor_failure_notes(&report);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("warnings are treated as failures"))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("bmux plugin doctor --json --strict"))
+        );
+    }
+
+    #[test]
+    fn doctor_failure_notes_omits_strict_warning_note_when_errors_exist() {
+        let report = test_doctor_report(true, 1, 1);
+        let notes = doctor_failure_notes(&report);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("bmux plugin doctor --json --strict"));
     }
 }
 
