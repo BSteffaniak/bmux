@@ -4,6 +4,23 @@ Android client for connection-first bmux remote workflows.
 
 This app is planned for M4. M0 locks architecture and API contracts.
 
+## UniFFI Kotlin Binding Task
+
+This folder includes a tiny Gradle task for generating Kotlin bindings from
+`bmux_mobile_ffi`.
+
+From `apps/android`:
+
+1. `gradle generateUniffiKotlinBindings`
+
+The task will:
+
+- run `cargo build -p bmux_mobile_ffi`
+- run `uniffi-bindgen generate --language kotlin`
+- write output to `apps/android/generated/uniffi`
+
+Note: this task expects `uniffi-bindgen` to be available on `PATH`.
+
 Product direction for v1:
 
 - quick target import and connection
