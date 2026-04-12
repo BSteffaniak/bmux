@@ -90,6 +90,26 @@ name       = "retries"
 required   = false
 value_name = "COUNT"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
+
 [[commands]]
 aliases       = [["cluster", "status"]]
 expose_in_cli = true
@@ -104,6 +124,26 @@ position   = 0
 required   = false
 value_name = "CLUSTER"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
+
 [[commands]]
 aliases       = [["cluster", "doctor"]]
 expose_in_cli = true
@@ -117,6 +157,26 @@ name       = "target"
 position   = 0
 required   = false
 value_name = "CLUSTER_OR_HOST"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
 
 [[commands]]
 aliases       = [["cluster", "events"]]
@@ -167,6 +227,26 @@ name       = "since"
 required   = false
 value_name = "UNIX_MS"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
+
 [[commands]]
 aliases       = [["cluster", "hosts"]]
 expose_in_cli = true
@@ -180,6 +260,26 @@ name       = "cluster"
 position   = 0
 required   = false
 value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
 
 [[commands]]
 aliases       = [["cluster", "gateway", "status"]]
@@ -195,6 +295,26 @@ name       = "cluster"
 required   = false
 short      = "c"
 value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
 
 [[commands.arguments]]
 kind       = "string"
@@ -237,6 +357,26 @@ name       = "cluster"
 required   = false
 short      = "c"
 value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
 
 [[commands.arguments]]
 kind       = "string"
@@ -293,6 +433,26 @@ name       = "cluster"
 required   = false
 short      = "c"
 value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
 
 [[commands]]
 aliases       = [["cluster", "pane", "move"]]

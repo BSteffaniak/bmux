@@ -27,6 +27,7 @@ Current scope:
 - Gateway overrides are available on cluster commands: `--gateway`, `--gateway-mode=auto|direct|pinned`, and `--gateway-no-failover`
 - `cluster gateway status` reports effective gateway mode, candidate order, preferred gateway cache, and cooldown state
 - `cluster gateway explain` probes candidates and explains why selection would succeed/fail
+- In multi-cluster setups, `cluster gateway status|explain` require explicit cluster selection (`--cluster` or positional cluster name)
 - Cluster service interfaces are implemented for query/command/event-list integrations
 
 ## Failure Semantics

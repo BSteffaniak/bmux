@@ -3242,7 +3242,11 @@ fn resolve_cluster_name_for_gateway(
         "cluster-up" => first_positional_argument(arguments),
         "cluster-events" => cluster_flag,
         "cluster-gateway-status" | "cluster-gateway-explain" => {
-            cluster_flag.or_else(|| first_positional_argument(arguments))
+            let cluster = cluster_flag.or_else(|| first_positional_argument(arguments));
+            if cluster.is_none() && settings.clusters.len() > 1 {
+                anyhow::bail!("{command_name} requires --cluster in multi-cluster setups");
+            }
+            cluster
         }
         "cluster-pane-retry" => {
             if cluster_flag.is_none() && settings.clusters.len() > 1 {
@@ -5913,6 +5917,20 @@ mod tests {
         )
         .expect("gateway status positional cluster should resolve");
         assert_eq!(cluster.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn resolve_cluster_name_for_gateway_status_requires_cluster_in_multi_cluster() {
+        let settings = ClusterGatewaySettings {
+            clusters: BTreeMap::from([
+                ("prod".to_string(), ClusterGatewayDefinition::default()),
+                ("staging".to_string(), ClusterGatewayDefinition::default()),
+            ]),
+        };
+
+        let error = resolve_cluster_name_for_gateway("cluster-gateway-status", &[], &settings)
+            .expect_err("gateway status should require --cluster in multi-cluster mode");
+        assert!(error.to_string().contains("requires --cluster"));
     }
 
     #[test]
