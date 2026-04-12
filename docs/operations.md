@@ -38,6 +38,17 @@ bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts --json
 bmux sandbox doctor --json
 bmux sandbox cleanup --dry-run --json
 bmux sandbox cleanup --source playbook --older-than 600 --json
+bmux sandbox cleanup --all-status --source playbook --older-than 0 --json
+```
+
+`bmux sandbox cleanup` uses `[sandbox.cleanup]` defaults from `bmux.toml` when
+flags are omitted. CLI flags always win.
+
+```toml
+[sandbox.cleanup]
+failed_only = false
+older_than_secs = 300
+source = "all" # sandbox_cli | playbook | recording_verify | all
 ```
 
 ## Runtime Namespaces vs Sandboxes

@@ -65,6 +65,11 @@ impl CommandSandbox {
             .env("TMPDIR", self.root.path().join("tmp-root"));
         command
     }
+
+    fn write_config(&self, toml: &str) {
+        std::fs::write(self.root.path().join("config").join("bmux.toml"), toml)
+            .expect("write sandbox config file");
+    }
 }
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
@@ -475,4 +480,98 @@ fn sandbox_inspect_latest_source_filter_resolves_matching_source() {
         .expect("sandbox inspect should include manifest id");
     assert_eq!(id, "bpb-inspect-playbook");
     assert_eq!(json["manifest"]["source"].as_str(), Some("playbook"));
+}
+
+#[test]
+#[serial]
+fn sandbox_cleanup_uses_config_defaults_when_flags_are_omitted() {
+    let sandbox = CommandSandbox::new("cleanup-config-defaults");
+    sandbox.write_config(
+        "[sandbox.cleanup]\nfailed_only = true\nolder_than_secs = 0\nsource = 'recording_verify'\n",
+    );
+
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "brv-config-failed", "recording-verify", "failed");
+    create_manifest_sandbox(
+        &tmp_root,
+        "brv-config-succeeded",
+        "recording-verify",
+        "succeeded",
+    );
+    create_manifest_sandbox(&tmp_root, "bpb-config-failed", "playbook", "failed");
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "cleanup", "--dry-run", "--json"])
+        .output()
+        .expect("run sandbox cleanup with config defaults");
+    assert!(
+        output.status.success(),
+        "sandbox cleanup should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    let entries = json["entries"]
+        .as_array()
+        .expect("sandbox cleanup should include entries array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "config defaults should narrow to one entry"
+    );
+    assert_eq!(entries[0]["source"].as_str(), Some("recording-verify"));
+    assert_eq!(entries[0]["status"].as_str(), Some("failed"));
+}
+
+#[test]
+#[serial]
+fn sandbox_cleanup_cli_flags_override_config_defaults() {
+    let sandbox = CommandSandbox::new("cleanup-config-overrides");
+    sandbox.write_config(
+        "[sandbox.cleanup]\nfailed_only = true\nolder_than_secs = 86_400\nsource = 'recording_verify'\n",
+    );
+
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bpb-config-override-succeeded",
+        "playbook",
+        "succeeded",
+    );
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "cleanup",
+            "--dry-run",
+            "--all-status",
+            "--older-than",
+            "0",
+            "--source",
+            "playbook",
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox cleanup with explicit overrides");
+    assert!(
+        output.status.success(),
+        "sandbox cleanup should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    let entries = json["entries"]
+        .as_array()
+        .expect("sandbox cleanup should include entries array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "explicit flags should include playbook entry"
+    );
+    assert_eq!(entries[0]["source"].as_str(), Some("playbook"));
+    assert_eq!(entries[0]["status"].as_str(), Some("stopped"));
 }

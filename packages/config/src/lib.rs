@@ -489,6 +489,52 @@ pub struct BmuxConfig {
     /// Performance diagnostics capture controls and telemetry safety limits
     #[config_doc(nested)]
     pub performance: PerformanceConfig,
+    /// Sandbox workflow defaults for cleanup and isolation operations
+    #[config_doc(nested)]
+    pub sandbox: SandboxConfig,
+}
+
+/// Sandbox workflow defaults for cleanup and isolation operations.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[config_doc(section = "sandbox")]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// Cleanup policy defaults used by `bmux sandbox cleanup`.
+    #[config_doc(nested)]
+    pub cleanup: SandboxCleanupConfig,
+}
+
+/// Cleanup policy defaults for sandbox maintenance commands.
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "sandbox.cleanup")]
+#[serde(default)]
+pub struct SandboxCleanupConfig {
+    /// When true, cleanup removes only failed/aborted sandboxes.
+    pub failed_only: bool,
+    /// Minimum age in seconds before sandbox is eligible for cleanup.
+    pub older_than_secs: u64,
+    /// Default cleanup source scope.
+    pub source: SandboxCleanupSource,
+}
+
+impl Default for SandboxCleanupConfig {
+    fn default() -> Self {
+        Self {
+            failed_only: false,
+            older_than_secs: 300,
+            source: SandboxCleanupSource::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxCleanupSource {
+    SandboxCli,
+    Playbook,
+    RecordingVerify,
+    #[default]
+    All,
 }
 
 /// Local and remote connection target profiles used by `bmux connect` and
@@ -2500,7 +2546,8 @@ impl BmuxConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        BmuxConfig, MouseClickPropagation, MouseWheelPropagation, ResolvedTimeout, StaleBuildAction,
+        BmuxConfig, MouseClickPropagation, MouseWheelPropagation, ResolvedTimeout,
+        SandboxCleanupSource, StaleBuildAction,
     };
     use crate::ConfigPaths;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3433,6 +3480,35 @@ timeout_profile = "missing"
         assert_eq!(
             config.recording.auto_export_dir,
             Some(std::path::PathBuf::from("exports/gif"))
+        );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn sandbox_cleanup_defaults_are_stable() {
+        let config = BmuxConfig::default();
+        assert!(!config.sandbox.cleanup.failed_only);
+        assert_eq!(config.sandbox.cleanup.older_than_secs, 300);
+        assert_eq!(config.sandbox.cleanup.source, SandboxCleanupSource::All);
+    }
+
+    #[test]
+    fn load_parses_sandbox_cleanup_defaults() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            "[sandbox.cleanup]\nfailed_only = true\nolder_than_secs = 42\nsource = 'playbook'\n",
+        )
+        .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert!(config.sandbox.cleanup.failed_only);
+        assert_eq!(config.sandbox.cleanup.older_than_secs, 42);
+        assert_eq!(
+            config.sandbox.cleanup.source,
+            SandboxCleanupSource::Playbook
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");

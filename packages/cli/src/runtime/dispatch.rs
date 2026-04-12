@@ -5,6 +5,7 @@ use bmux_cli_schema::{
     RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxSourceArg,
     SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand,
 };
+use bmux_config::{BmuxConfig, SandboxCleanupSource};
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
 
 use super::{
@@ -1498,19 +1499,40 @@ pub(super) async fn dispatch_built_in_command(
                     SandboxCommand::Cleanup {
                         dry_run,
                         failed_only,
+                        all_status,
                         older_than,
                         source,
                         json,
                     },
             },
         ) => {
-            let source_filter = match source {
+            let config = BmuxConfig::load().unwrap_or_default();
+            let defaults = config.sandbox.cleanup;
+
+            let resolved_failed_only =
+                bool_override(*failed_only, *all_status).unwrap_or(defaults.failed_only);
+            let resolved_older_than = older_than.unwrap_or(defaults.older_than_secs);
+
+            let source_arg = source.as_ref().copied().unwrap_or(match defaults.source {
+                SandboxCleanupSource::SandboxCli => SandboxSourceArg::SandboxCli,
+                SandboxCleanupSource::Playbook => SandboxSourceArg::Playbook,
+                SandboxCleanupSource::RecordingVerify => SandboxSourceArg::RecordingVerify,
+                SandboxCleanupSource::All => SandboxSourceArg::All,
+            });
+            let source_filter = match source_arg {
                 SandboxSourceArg::SandboxCli => Some("sandbox-cli"),
                 SandboxSourceArg::Playbook => Some("playbook"),
                 SandboxSourceArg::RecordingVerify => Some("recording-verify"),
                 SandboxSourceArg::All => None,
             };
-            run_sandbox_cleanup(*dry_run, *failed_only, *older_than, source_filter, *json)
+
+            run_sandbox_cleanup(
+                *dry_run,
+                resolved_failed_only,
+                Some(resolved_older_than),
+                source_filter,
+                *json,
+            )
         }
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }

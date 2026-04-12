@@ -1164,14 +1164,17 @@ pub enum SandboxCommand {
         #[arg(long)]
         dry_run: bool,
         /// Remove only failed/aborted sandboxes
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all_status")]
         failed_only: bool,
+        /// Include both failed and non-failed sandboxes
+        #[arg(long, conflicts_with = "failed_only")]
+        all_status: bool,
         /// Minimum age in seconds before sandbox is eligible for cleanup
         #[arg(long)]
         older_than: Option<u64>,
         /// Filter to a sandbox source
-        #[arg(long, value_enum, default_value = "all")]
-        source: SandboxSourceArg,
+        #[arg(long, value_enum)]
+        source: Option<SandboxSourceArg>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -4198,8 +4201,9 @@ mod tests {
             SandboxCommand::Cleanup {
                 dry_run: true,
                 failed_only: true,
+                all_status: false,
                 older_than: Some(600),
-                source: SandboxSourceArg::RecordingVerify,
+                source: Some(SandboxSourceArg::RecordingVerify),
                 json: true,
             }
         ));
