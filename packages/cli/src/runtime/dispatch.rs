@@ -188,6 +188,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             SandboxCommand::Doctor { .. } => BuiltInHandlerId::SandboxDoctor,
             SandboxCommand::Bundle { .. } => BuiltInHandlerId::SandboxBundle,
             SandboxCommand::Cleanup { .. } => BuiltInHandlerId::SandboxCleanup,
+            SandboxCommand::Clean { .. } => BuiltInHandlerId::SandboxClean,
             SandboxCommand::RebuildIndex { .. } => BuiltInHandlerId::SandboxRebuildIndex,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
@@ -1548,6 +1549,36 @@ pub(super) async fn dispatch_built_in_command(
                 command: SandboxCommand::RebuildIndex { json },
             },
         ) => run_sandbox_rebuild_index(*json),
+        (
+            BuiltInHandlerId::SandboxClean,
+            Command::Sandbox {
+                command:
+                    SandboxCommand::Clean {
+                        dry_run,
+                        all_status,
+                        older_than,
+                        source,
+                        json,
+                    },
+            },
+        ) => {
+            let source_filter = match source.as_ref().copied().unwrap_or(SandboxSourceArg::All) {
+                SandboxSourceArg::SandboxCli => Some("sandbox-cli"),
+                SandboxSourceArg::Playbook => Some("playbook"),
+                SandboxSourceArg::RecordingVerify => Some("recording-verify"),
+                SandboxSourceArg::All => None,
+            };
+
+            let resolved_failed_only = !all_status;
+            let resolved_older_than = older_than.unwrap_or(600);
+            run_sandbox_cleanup(
+                *dry_run,
+                resolved_failed_only,
+                Some(resolved_older_than),
+                source_filter,
+                *json,
+            )
+        }
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }

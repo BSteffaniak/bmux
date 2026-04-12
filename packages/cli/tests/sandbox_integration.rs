@@ -625,6 +625,67 @@ fn sandbox_cleanup_cli_flags_override_config_defaults() {
 
 #[test]
 #[serial]
+fn sandbox_clean_uses_failed_only_defaults() {
+    let sandbox = CommandSandbox::new("clean-defaults");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-clean-failed", "sandbox-cli", "failed");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-clean-succeeded",
+        "sandbox-cli",
+        "succeeded",
+    );
+
+    write_index_entries(
+        &sandbox.sandbox_index_path(),
+        serde_json::json!([
+            {
+                "id": "bmux-sbx-clean-failed",
+                "root": tmp_root.join("bmux-sbx-clean-failed").to_string_lossy().to_string(),
+                "source": "sandbox-cli",
+                "status": "failed",
+                "created_at_unix_ms": 1,
+                "updated_at_unix_ms": 1,
+                "last_seen_unix_ms": 1
+            },
+            {
+                "id": "bmux-sbx-clean-succeeded",
+                "root": tmp_root
+                    .join("bmux-sbx-clean-succeeded")
+                    .to_string_lossy()
+                    .to_string(),
+                "source": "sandbox-cli",
+                "status": "succeeded",
+                "created_at_unix_ms": 1,
+                "updated_at_unix_ms": 1,
+                "last_seen_unix_ms": 1
+            }
+        ]),
+    );
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "clean", "--dry-run", "--json"])
+        .output()
+        .expect("run sandbox clean with defaults");
+    assert!(
+        output.status.success(),
+        "sandbox clean should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["orphaned"].as_u64(), Some(1));
+    assert_eq!(json["skipped_not_failed"].as_u64(), Some(1));
+    let entries = json["entries"]
+        .as_array()
+        .expect("sandbox clean should include entries array");
+    assert_eq!(entries.len(), 2);
+}
+
+#[test]
+#[serial]
 fn sandbox_cleanup_failed_only_includes_aborted_running_manifests() {
     let sandbox = CommandSandbox::new("cleanup-aborted-running");
     let tmp_root = sandbox.root.path().join("tmp-root");

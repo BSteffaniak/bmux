@@ -1189,6 +1189,24 @@ pub enum SandboxCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Opinionated cleanup defaults for day-to-day sandbox hygiene
+    Clean {
+        /// Only list orphaned dirs without deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Include both failed and non-failed sandboxes
+        #[arg(long)]
+        all_status: bool,
+        /// Minimum age in seconds before sandbox is eligible for cleanup
+        #[arg(long)]
+        older_than: Option<u64>,
+        /// Filter to a sandbox source
+        #[arg(long, value_enum)]
+        source: Option<SandboxSourceArg>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Rebuild sandbox index from discovered sandbox manifests
     RebuildIndex {
         /// Output as JSON
@@ -4249,6 +4267,36 @@ mod tests {
         assert!(matches!(
             command,
             SandboxCommand::RebuildIndex { json: true }
+        ));
+    }
+
+    #[test]
+    fn parses_sandbox_clean_flags() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "sandbox",
+            "clean",
+            "--dry-run",
+            "--all-status",
+            "--older-than",
+            "300",
+            "--source",
+            "playbook",
+            "--json",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Sandbox { command }) = cli.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Clean {
+                dry_run: true,
+                all_status: true,
+                older_than: Some(300),
+                source: Some(SandboxSourceArg::Playbook),
+                json: true,
+            }
         ));
     }
 

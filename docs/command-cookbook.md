@@ -79,6 +79,7 @@ bmux sandbox bundle bmux-sbx-123 --json
 
 # Clean up orphaned sandbox directories
 bmux sandbox cleanup --dry-run --json
+bmux sandbox clean --dry-run --json
 bmux sandbox cleanup --failed-only --older-than 600
 bmux sandbox cleanup --all-status --source playbook --older-than 0
 bmux sandbox cleanup --source recording-verify --older-than 600

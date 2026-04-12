@@ -117,6 +117,7 @@ bmux sandbox inspect --latest-failed --tail 120
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 bmux sandbox doctor --json
 bmux sandbox cleanup --dry-run --json
+bmux sandbox clean --dry-run --json
 bmux sandbox cleanup --all-status --source playbook --older-than 0
 bmux sandbox cleanup --source recording-verify --older-than 600
 # Optional control-plane mode for account/share links
