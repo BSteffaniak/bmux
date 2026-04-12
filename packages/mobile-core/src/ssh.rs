@@ -21,6 +21,12 @@ pub struct ObservedHostKey {
     pub fingerprint_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyPinSuggestion {
+    pub observed: ObservedHostKey,
+    pub pin_query_fragment: String,
+}
+
 pub trait SshBackend: Send + Sync {
     /// Open an SSH transport using embedded Rust implementation.
     ///
@@ -212,6 +218,25 @@ impl SshBackend for MockSshBackend {
 pub fn observe_ssh_host_key(target: &str) -> Result<ObservedHostKey> {
     let parsed = parse_ssh_target(target)?;
     EmbeddedSshBackend::default().observe_host_key(&parsed)
+}
+
+/// Resolve a target string and return observed host-key details together with
+/// a suggested URI query fragment for pinning.
+///
+/// # Errors
+///
+/// Returns target parse, DNS/network, handshake, or host key/hash
+/// availability errors.
+pub fn observe_ssh_host_key_with_pin_suggestion(target: &str) -> Result<HostKeyPinSuggestion> {
+    let observed = observe_ssh_host_key(target)?;
+    Ok(HostKeyPinSuggestion {
+        pin_query_fragment: pin_query_fragment_for_fingerprint(&observed.fingerprint_sha256),
+        observed,
+    })
+}
+
+fn pin_query_fragment_for_fingerprint(fingerprint_sha256: &str) -> String {
+    format!("host_key_fp=sha256:{fingerprint_sha256}")
 }
 
 /// Resolve a target string and fetch the observed SSH host-key SHA-256
@@ -628,5 +653,24 @@ mod tests {
         assert_eq!(observed.endpoint, "prod.example.com:2200");
         assert_eq!(observed.algorithm, "ssh-ed25519");
         assert_eq!(observed.fingerprint_sha256.len(), 64);
+    }
+
+    #[test]
+    fn build_pin_suggestion_from_mock_observation() {
+        let observed = ObservedHostKey {
+            endpoint: "prod.example.com:22".to_string(),
+            algorithm: "ssh-ed25519".to_string(),
+            fingerprint_sha256: "abababababababababababababababababababababababababababababababab"
+                .to_string(),
+        };
+        let suggestion = HostKeyPinSuggestion {
+            pin_query_fragment: pin_query_fragment_for_fingerprint(&observed.fingerprint_sha256),
+            observed,
+        };
+
+        assert_eq!(
+            suggestion.pin_query_fragment,
+            "host_key_fp=sha256:abababababababababababababababababababababababababababababababab"
+        );
     }
 }

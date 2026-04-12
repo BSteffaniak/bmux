@@ -5,8 +5,9 @@
 //! FFI-facing facade for bmux mobile-core.
 
 use bmux_mobile_core::{
-    ConnectionManager, ConnectionRequest, ConnectionState, MobileCoreError, ObservedHostKey,
-    TargetInput, TargetRecord, observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
+    ConnectionManager, ConnectionRequest, ConnectionState, HostKeyPinSuggestion, MobileCoreError,
+    ObservedHostKey, TargetInput, TargetRecord, observe_ssh_host_key,
+    observe_ssh_host_key_fingerprint_sha256, observe_ssh_host_key_with_pin_suggestion,
 };
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -106,6 +107,19 @@ impl MobileApi {
         observe_ssh_host_key(target)
     }
 
+    /// Observe host-key details and return a prebuilt pin query fragment.
+    ///
+    /// # Errors
+    ///
+    /// Returns parse, DNS/network, handshake, or host-key availability
+    /// errors.
+    pub fn observe_ssh_host_key_with_pin_suggestion(
+        &self,
+        target: &str,
+    ) -> Result<HostKeyPinSuggestion> {
+        observe_ssh_host_key_with_pin_suggestion(target)
+    }
+
     fn lock_manager(&self) -> Result<std::sync::MutexGuard<'_, ConnectionManager>> {
         self.manager.lock().map_err(|_| {
             MobileCoreError::ConnectionNotActive("mobile api manager poisoned".to_string())
@@ -148,6 +162,13 @@ mod tests {
     fn ffi_invalid_ssh_target_host_key_request_fails() {
         let api = MobileApi::new();
         let result = api.observe_ssh_host_key("ssh://bad-target:abc");
+        assert!(matches!(result, Err(MobileCoreError::InvalidTarget(_))));
+    }
+
+    #[test]
+    fn ffi_invalid_ssh_target_pin_suggestion_request_fails() {
+        let api = MobileApi::new();
+        let result = api.observe_ssh_host_key_with_pin_suggestion("ssh://bad-target:abc");
         assert!(matches!(result, Err(MobileCoreError::InvalidTarget(_))));
     }
 }

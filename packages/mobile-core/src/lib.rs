@@ -12,8 +12,9 @@ pub mod target;
 pub use connection::{ConnectionManager, ConnectionRequest, ConnectionState, ConnectionStatus};
 pub use error::{MobileCoreError, Result};
 pub use ssh::{
-    EmbeddedSshBackend, MockSshBackend, ObservedHostKey, SshBackend, SshTarget,
-    observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256, parse_ssh_target,
+    EmbeddedSshBackend, HostKeyPinSuggestion, MockSshBackend, ObservedHostKey, SshBackend,
+    SshTarget, observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
+    observe_ssh_host_key_with_pin_suggestion, parse_ssh_target,
 };
 pub use target::{
     CanonicalTarget, TargetInput, TargetRecord, TargetTransport, TargetUri, canonicalize_target,
