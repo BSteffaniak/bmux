@@ -46,6 +46,12 @@ struct CleanupScan {
     skipped: CleanupSkipped,
 }
 
+#[derive(Debug, Clone)]
+struct SandboxCandidate {
+    root: PathBuf,
+    updated_at_unix_ms: Option<u128>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SandboxListEntry {
     id: String,
@@ -412,9 +418,9 @@ pub(super) fn run_sandbox_list(
     limit: usize,
     json: bool,
 ) -> Result<u8> {
-    let mut entries = collect_sandbox_directories_index_first()
+    let mut entries = collect_sandbox_candidates()
         .into_iter()
-        .map(|root| sandbox_list_entry(&root))
+        .map(|candidate| sandbox_list_entry(&candidate))
         .collect::<Vec<_>>();
 
     entries.sort_by(|left, right| left.age_secs.cmp(&right.age_secs));
@@ -528,21 +534,11 @@ fn resolve_inspect_target(
 }
 
 fn resolve_latest_sandbox(failed_only: bool, source_filter: Option<&str>) -> Result<PathBuf> {
-    let mut candidates = collect_sandbox_directories_index_first()
-        .into_iter()
-        .map(|path| {
-            let age = path
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .unwrap_or_default();
-            (path, age)
-        })
-        .collect::<Vec<_>>();
+    let mut candidates = collect_sandbox_candidates();
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate_sort_key(candidate)));
 
-    candidates.sort_by(|left, right| left.1.cmp(&right.1));
-    for (path, _) in candidates {
+    for candidate in candidates {
+        let path = candidate.root;
         if let Some(source) = source_filter
             && sandbox_source_for_dir(&path) != source
         {
@@ -791,7 +787,9 @@ fn cleanup_orphaned_sandboxes(
         not_failed: 0,
     };
 
-    for root_path in collect_sandbox_directories_index_first() {
+    for candidate in collect_sandbox_candidates() {
+        let age = candidate_age(&candidate, now);
+        let root_path = candidate.root;
         scanned += 1;
         let source = sandbox_source_for_dir(&root_path);
         if let Some(filter) = source_filter
@@ -799,12 +797,6 @@ fn cleanup_orphaned_sandboxes(
         {
             continue;
         }
-        let age = root_path
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| now.duration_since(modified).ok())
-            .unwrap_or_default();
         if age < older_than {
             skipped.recent += 1;
             continue;
@@ -877,29 +869,79 @@ fn collect_sandbox_directories() -> Vec<PathBuf> {
 }
 
 fn collect_sandbox_directories_index_first() -> Vec<PathBuf> {
-    if let Ok(entries) = read_sandbox_index_entries() {
+    collect_sandbox_candidates()
+        .into_iter()
+        .map(|candidate| candidate.root)
+        .collect()
+}
+
+fn collect_sandbox_candidates() -> Vec<SandboxCandidate> {
+    if read_sandbox_index_entries().is_ok() {
         let _ = prune_missing_index_entries();
-        let indexed = entries
-            .into_iter()
-            .map(|entry| PathBuf::from(entry.root))
-            .filter(|root| root.is_dir())
-            .collect::<Vec<_>>();
-        if !indexed.is_empty() {
-            return indexed;
+        if let Ok(entries) = read_sandbox_index_entries() {
+            let indexed = entries
+                .into_iter()
+                .filter_map(|entry| {
+                    let root = PathBuf::from(entry.root);
+                    if root.is_dir() {
+                        Some(SandboxCandidate {
+                            root,
+                            updated_at_unix_ms: Some(entry.updated_at_unix_ms),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !indexed.is_empty() {
+                return indexed;
+            }
         }
     }
 
     collect_sandbox_directories()
+        .into_iter()
+        .map(|root| SandboxCandidate {
+            root,
+            updated_at_unix_ms: None,
+        })
+        .collect()
 }
 
-fn sandbox_list_entry(root: &Path) -> SandboxListEntry {
-    let now = SystemTime::now();
-    let age = root
+fn candidate_sort_key(candidate: &SandboxCandidate) -> u128 {
+    candidate.updated_at_unix_ms.unwrap_or_else(|| {
+        candidate
+            .root
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_millis())
+    })
+}
+
+fn candidate_age(candidate: &SandboxCandidate, now: SystemTime) -> Duration {
+    if let Some(updated_at) = candidate.updated_at_unix_ms {
+        let now_unix_ms = now
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let elapsed_ms = now_unix_ms.saturating_sub(updated_at);
+        let elapsed_ms_u64 = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+        return Duration::from_millis(elapsed_ms_u64);
+    }
+
+    candidate
+        .root
         .metadata()
         .ok()
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| now.duration_since(modified).ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn sandbox_list_entry(candidate: &SandboxCandidate) -> SandboxListEntry {
+    let root = &candidate.root;
+    let age = candidate_age(candidate, SystemTime::now());
 
     let manifest = read_manifest(root).ok();
     SandboxListEntry {

@@ -811,3 +811,133 @@ fn sandbox_cleanup_removes_deleted_index_entry() {
         .expect("index should contain entries array");
     assert!(index_entries.is_empty(), "cleanup should prune index entry");
 }
+
+#[test]
+#[serial]
+fn sandbox_inspect_latest_prefers_index_updated_timestamp_ordering() {
+    let sandbox = CommandSandbox::new("index-latest-ordering");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-index-old", "sandbox-cli", "succeeded");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-index-new", "sandbox-cli", "succeeded");
+
+    write_index_entries(
+        &sandbox.sandbox_index_path(),
+        serde_json::json!([
+            {
+                "id": "bmux-sbx-index-old",
+                "root": tmp_root.join("bmux-sbx-index-old").to_string_lossy().to_string(),
+                "source": "sandbox-cli",
+                "status": "succeeded",
+                "created_at_unix_ms": 1,
+                "updated_at_unix_ms": 10,
+                "last_seen_unix_ms": 10
+            },
+            {
+                "id": "bmux-sbx-index-new",
+                "root": tmp_root.join("bmux-sbx-index-new").to_string_lossy().to_string(),
+                "source": "sandbox-cli",
+                "status": "succeeded",
+                "created_at_unix_ms": 1,
+                "updated_at_unix_ms": 20,
+                "last_seen_unix_ms": 20
+            }
+        ]),
+    );
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "inspect", "--latest", "--json"])
+        .output()
+        .expect("run sandbox inspect latest with indexed order");
+    assert!(
+        output.status.success(),
+        "sandbox inspect should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(
+        json["manifest"]["id"].as_str(),
+        Some("bmux-sbx-index-new"),
+        "latest inspect should pick highest index updated_at"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_list_prunes_missing_index_entries_during_reconcile() {
+    let sandbox = CommandSandbox::new("index-prune-missing-roots");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-index-existing",
+        "sandbox-cli",
+        "succeeded",
+    );
+
+    write_index_entries(
+        &sandbox.sandbox_index_path(),
+        serde_json::json!([
+            {
+                "id": "bmux-sbx-index-missing",
+                "root": tmp_root.join("bmux-sbx-index-missing").to_string_lossy().to_string(),
+                "source": "sandbox-cli",
+                "status": "succeeded",
+                "created_at_unix_ms": 1,
+                "updated_at_unix_ms": 5,
+                "last_seen_unix_ms": 5
+            },
+            {
+                "id": "bmux-sbx-index-existing",
+                "root": tmp_root
+                    .join("bmux-sbx-index-existing")
+                    .to_string_lossy()
+                    .to_string(),
+                "source": "sandbox-cli",
+                "status": "succeeded",
+                "created_at_unix_ms": 1,
+                "updated_at_unix_ms": 10,
+                "last_seen_unix_ms": 10
+            }
+        ]),
+    );
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "list", "--limit", "50", "--json"])
+        .output()
+        .expect("run sandbox list for index reconcile");
+    assert!(
+        output.status.success(),
+        "sandbox list should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    let sandboxes = json["sandboxes"]
+        .as_array()
+        .expect("sandbox list should include sandboxes array");
+    assert_eq!(sandboxes.len(), 1, "only existing sandbox should remain");
+    assert_eq!(sandboxes[0]["id"].as_str(), Some("bmux-sbx-index-existing"));
+
+    let index_contents = std::fs::read_to_string(sandbox.sandbox_index_path())
+        .expect("read sandbox index after list reconcile");
+    let index_json: serde_json::Value =
+        serde_json::from_str(&index_contents).expect("parse sandbox index json");
+    let index_entries = index_json["entries"]
+        .as_array()
+        .expect("index should contain entries array");
+    assert_eq!(
+        index_entries.len(),
+        1,
+        "missing index entry should be pruned"
+    );
+    assert_eq!(
+        index_entries[0]["id"].as_str(),
+        Some("bmux-sbx-index-existing")
+    );
+}
