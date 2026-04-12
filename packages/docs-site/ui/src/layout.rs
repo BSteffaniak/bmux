@@ -235,7 +235,7 @@ fn backdrop() -> Containers {
             left=0
             width=100%
             height=100%
-            background="rgba(0,0,0,0.5)"
+            background=#00000080
             fx-click=(ActionType::Multi(vec![
                 ActionType::no_display_by_id(SIDEBAR_ID),
                 ActionType::no_display_by_id(BACKDROP_ID),
