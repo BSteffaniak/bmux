@@ -1,5 +1,5 @@
 use crate::error::{MobileCoreError, Result};
-use crate::ssh::{SshBackend, parse_ssh_target};
+use crate::ssh::{EmbeddedSshBackend, SshBackend, parse_ssh_target};
 use crate::target::{
     CanonicalTarget, TargetInput, TargetRecord, TargetTransport, canonicalize_target,
 };
@@ -33,11 +33,20 @@ pub struct ConnectionState {
     pub last_error: Option<String>,
 }
 
-#[derive(Default)]
 pub struct ConnectionManager {
     targets: BTreeMap<Uuid, TargetRecord>,
     connections: BTreeMap<Uuid, ConnectionState>,
     ssh_backend: Option<Arc<dyn SshBackend>>,
+}
+
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        Self {
+            targets: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            ssh_backend: Some(Arc::new(EmbeddedSshBackend::default())),
+        }
+    }
 }
 
 impl ConnectionManager {
@@ -52,6 +61,15 @@ impl ConnectionManager {
             targets: BTreeMap::new(),
             connections: BTreeMap::new(),
             ssh_backend: Some(ssh_backend),
+        }
+    }
+
+    #[must_use]
+    pub fn without_ssh_backend() -> Self {
+        Self {
+            targets: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            ssh_backend: None,
         }
     }
 
@@ -208,7 +226,7 @@ mod tests {
 
     #[test]
     fn connect_ssh_requires_backend() {
-        let mut manager = ConnectionManager::new();
+        let mut manager = ConnectionManager::without_ssh_backend();
         let target = manager
             .import_target(&TargetInput {
                 source: "ssh://ops@prod.example.com:22".to_string(),
