@@ -1,14 +1,20 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bmux_config::ConfigPaths;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MANIFEST_FILE: &str = "sandbox.json";
 pub const LOCK_FILE: &str = "sandbox.lock";
 const SANDBOX_INDEX_DIR: &str = "sandbox";
 const SANDBOX_INDEX_FILE: &str = "index.json";
+const SANDBOX_INDEX_LOCK_FILE: &str = "index.lock";
 const SANDBOX_INDEX_SCHEMA_VERSION: u32 = 1;
+const INDEX_LOCK_RETRY_MS: u64 = 5;
+const INDEX_LOCK_MAX_ATTEMPTS: usize = 400;
+const INDEX_LOCK_STALE_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxManifestPaths {
@@ -69,6 +75,13 @@ fn sandbox_index_path() -> PathBuf {
         .state_dir()
         .join(SANDBOX_INDEX_DIR)
         .join(SANDBOX_INDEX_FILE)
+}
+
+fn sandbox_index_lock_path() -> PathBuf {
+    ConfigPaths::default()
+        .state_dir()
+        .join(SANDBOX_INDEX_DIR)
+        .join(SANDBOX_INDEX_LOCK_FILE)
 }
 
 pub fn sandbox_index_exists() -> bool {
@@ -146,54 +159,119 @@ pub fn read_index_entries() -> Result<Vec<SandboxIndexEntry>> {
 }
 
 pub fn upsert_index_entry(manifest: &SandboxManifest) -> Result<()> {
-    let mut entries = read_index_entries().unwrap_or_default();
-    let now = unix_millis_now();
-    let root = manifest.paths.root.clone();
-    let entry = SandboxIndexEntry {
-        id: manifest.id.clone(),
-        root: root.clone(),
-        source: manifest.source.clone(),
-        status: manifest.status.clone(),
-        created_at_unix_ms: manifest.created_at_unix_ms,
-        updated_at_unix_ms: manifest.updated_at_unix_ms,
-        last_seen_unix_ms: now,
-    };
+    with_index_lock(|| {
+        let mut entries = read_index_entries().unwrap_or_default();
+        let now = unix_millis_now();
+        let root = manifest.paths.root.clone();
+        let entry = SandboxIndexEntry {
+            id: manifest.id.clone(),
+            root: root.clone(),
+            source: manifest.source.clone(),
+            status: manifest.status.clone(),
+            created_at_unix_ms: manifest.created_at_unix_ms,
+            updated_at_unix_ms: manifest.updated_at_unix_ms,
+            last_seen_unix_ms: now,
+        };
 
-    if let Some(existing) = entries.iter_mut().find(|existing| existing.root == root) {
-        *existing = entry;
-    } else {
-        entries.push(entry);
-    }
+        if let Some(existing) = entries.iter_mut().find(|existing| existing.root == root) {
+            *existing = entry;
+        } else {
+            entries.push(entry);
+        }
 
-    write_index_entries(entries)
+        write_index_entries(entries)
+    })
 }
 
 pub fn remove_index_entry(root: &Path) -> Result<()> {
-    let root_value = root.to_string_lossy().to_string();
-    let entries = read_index_entries().unwrap_or_default();
-    let filtered = entries
-        .into_iter()
-        .filter(|entry| entry.root != root_value)
-        .collect::<Vec<_>>();
-    write_index_entries(filtered)
+    with_index_lock(|| {
+        let root_value = root.to_string_lossy().to_string();
+        let entries = read_index_entries().unwrap_or_default();
+        let filtered = entries
+            .into_iter()
+            .filter(|entry| entry.root != root_value)
+            .collect::<Vec<_>>();
+        write_index_entries(filtered)
+    })
 }
 
 pub fn prune_missing_index_entries() -> Result<usize> {
-    let entries = read_index_entries().unwrap_or_default();
-    let before = entries.len();
-    let filtered = entries
-        .into_iter()
-        .filter(|entry| Path::new(&entry.root).is_dir())
-        .collect::<Vec<_>>();
-    let removed = before.saturating_sub(filtered.len());
-    if removed > 0 {
-        write_index_entries(filtered)?;
-    }
-    Ok(removed)
+    with_index_lock(|| {
+        let entries = read_index_entries().unwrap_or_default();
+        let before = entries.len();
+        let filtered = entries
+            .into_iter()
+            .filter(|entry| Path::new(&entry.root).is_dir())
+            .collect::<Vec<_>>();
+        let removed = before.saturating_sub(filtered.len());
+        if removed > 0 {
+            write_index_entries(filtered)?;
+        }
+        Ok(removed)
+    })
 }
 
 pub fn replace_index_entries(entries: Vec<SandboxIndexEntry>) -> Result<()> {
-    write_index_entries(entries)
+    with_index_lock(|| write_index_entries(entries))
+}
+
+fn with_index_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock_path = sandbox_index_lock_path();
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating {}", parent.display()))?;
+    }
+
+    for _ in 0..INDEX_LOCK_MAX_ATTEMPTS {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => {
+                let guard = IndexLockGuard { path: lock_path };
+                let result = operation();
+                drop(guard);
+                return result;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if index_lock_is_stale(&lock_path) {
+                    let _ = std::fs::remove_file(&lock_path);
+                }
+                thread::sleep(Duration::from_millis(INDEX_LOCK_RETRY_MS));
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed acquiring sandbox index lock {}: {error}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "timed out acquiring sandbox index lock {}",
+        lock_path.display()
+    ))
+}
+
+fn index_lock_is_stale(lock_path: &Path) -> bool {
+    lock_path
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|elapsed| elapsed >= Duration::from_secs(INDEX_LOCK_STALE_SECS))
+}
+
+struct IndexLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for IndexLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn write_index_entries(entries: Vec<SandboxIndexEntry>) -> Result<()> {

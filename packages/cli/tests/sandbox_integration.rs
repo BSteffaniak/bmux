@@ -1,6 +1,8 @@
 use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 fn bmux_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bmux"))
@@ -53,17 +55,7 @@ impl CommandSandbox {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(bmux_binary());
-        command
-            .current_dir(workspace_root())
-            .env("BMUX_CONFIG_DIR", self.root.path().join("config"))
-            .env("BMUX_RUNTIME_DIR", self.root.path().join("runtime"))
-            .env("BMUX_DATA_DIR", self.root.path().join("data"))
-            .env("BMUX_STATE_DIR", self.root.path().join("state"))
-            .env("BMUX_LOG_DIR", self.root.path().join("logs"))
-            .env("BMUX_TARGET", "")
-            .env("TMPDIR", self.root.path().join("tmp-root"));
-        command
+        sandbox_command_for_root(self.root.path())
     }
 
     fn write_config(&self, toml: &str) {
@@ -78,6 +70,20 @@ impl CommandSandbox {
             .join("sandbox")
             .join("index.json")
     }
+}
+
+fn sandbox_command_for_root(root: &Path) -> Command {
+    let mut command = Command::new(bmux_binary());
+    command
+        .current_dir(workspace_root())
+        .env("BMUX_CONFIG_DIR", root.join("config"))
+        .env("BMUX_RUNTIME_DIR", root.join("runtime"))
+        .env("BMUX_DATA_DIR", root.join("data"))
+        .env("BMUX_STATE_DIR", root.join("state"))
+        .env("BMUX_LOG_DIR", root.join("logs"))
+        .env("BMUX_TARGET", "")
+        .env("TMPDIR", root.join("tmp-root"));
+    command
 }
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
@@ -1089,5 +1095,122 @@ fn sandbox_rebuild_index_recovers_from_corrupt_index() {
     assert_eq!(
         index_entries[0]["id"].as_str(),
         Some("bmux-sbx-rebuild-corrupt")
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_parallel_runs_and_cleanup_keep_index_and_locks_consistent() {
+    let sandbox = CommandSandbox::new("parallel-runs-cleanup");
+    let root = sandbox.root.path().to_path_buf();
+    let run_threads = 4usize;
+
+    let mut handles = Vec::new();
+    for index in 0..run_threads {
+        let root_clone = root.clone();
+        handles.push(thread::spawn(move || {
+            let name = format!("parallel-run-{index}");
+            sandbox_command_for_root(&root_clone)
+                .args([
+                    "sandbox",
+                    "run",
+                    "--keep",
+                    "--name",
+                    &name,
+                    "--",
+                    "--version",
+                ])
+                .output()
+                .expect("run sandbox command in parallel")
+        }));
+    }
+
+    let cleanup_root = root.clone();
+    let cleanup_handle = thread::spawn(move || {
+        for _ in 0..12 {
+            let output = sandbox_command_for_root(&cleanup_root)
+                .args([
+                    "sandbox",
+                    "cleanup",
+                    "--dry-run",
+                    "--older-than",
+                    "0",
+                    "--json",
+                ])
+                .output()
+                .expect("run cleanup while runs are active");
+            assert!(
+                output.status.success(),
+                "cleanup should succeed during parallel runs: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            thread::sleep(Duration::from_millis(15));
+        }
+    });
+
+    for handle in handles {
+        let output = handle.join().expect("join run thread");
+        assert!(
+            output.status.success(),
+            "parallel sandbox run should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    cleanup_handle.join().expect("join cleanup thread");
+
+    let tmp_root = root.join("tmp-root");
+    for entry in std::fs::read_dir(&tmp_root).expect("read tmp-root entries") {
+        let path = entry.expect("read tmp-root entry path").path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        if name.starts_with("bmux-sbx-") || name.starts_with("bpb-") || name.starts_with("brv-") {
+            assert!(
+                !path.join("sandbox.lock").exists(),
+                "completed sandbox should not keep stale lock: {}",
+                path.display()
+            );
+        }
+    }
+
+    let list_output = sandbox
+        .command()
+        .args(["sandbox", "list", "--limit", "100", "--json"])
+        .output()
+        .expect("run sandbox list after parallel operations");
+    assert!(
+        list_output.status.success(),
+        "sandbox list should succeed: {}",
+        String::from_utf8_lossy(&list_output.stderr)
+    );
+    let list_json = parse_json_stdout(&list_output);
+    assert_schema_version(&list_json);
+    let entries = list_json["sandboxes"]
+        .as_array()
+        .expect("sandbox list should include sandboxes array");
+    assert!(
+        entries.len() >= run_threads,
+        "list should include completed parallel sandboxes"
+    );
+
+    let rebuild_output = sandbox
+        .command()
+        .args(["sandbox", "rebuild-index", "--json"])
+        .output()
+        .expect("rebuild index after parallel operations");
+    assert!(
+        rebuild_output.status.success(),
+        "rebuild-index should succeed: {}",
+        String::from_utf8_lossy(&rebuild_output.stderr)
+    );
+    let rebuild_json = parse_json_stdout(&rebuild_output);
+    assert_schema_version(&rebuild_json);
+    assert!(
+        rebuild_json["rebuilt_count"].as_u64().unwrap_or(0) >= run_threads as u64,
+        "rebuilt index should retain parallel sandbox entries"
     );
 }
