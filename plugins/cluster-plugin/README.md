@@ -26,7 +26,7 @@ Current scope:
 - `cluster pane new|move|retry` accept `--cluster` for deterministic gateway routing; in multi-cluster layouts, commands hard-fail when cluster inference is ambiguous
 - Gateway overrides are available on cluster commands: `--gateway`, `--gateway-mode=auto|direct|pinned`, and `--gateway-no-failover`
 - `cluster gateway status` reports effective gateway mode, candidate order, preferred gateway cache, and cooldown state
-- `cluster gateway explain` probes candidates and explains why selection would succeed/fail
+- `cluster gateway explain` probes candidates and explains why selection would succeed/fail without mutating gateway runtime cache/cooldown state
 - In multi-cluster setups, `cluster gateway status|explain` require explicit cluster selection (`--cluster` or positional cluster name)
 - Cluster service interfaces are implemented for query/command/event-list integrations
 

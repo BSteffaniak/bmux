@@ -155,6 +155,13 @@ struct GatewayProbeResult {
     latency_ms: u128,
 }
 
+#[derive(Debug, Clone)]
+struct GatewayExplainCandidateProbe {
+    candidate: String,
+    cooldown_ms: Option<u128>,
+    probe: GatewayProbeResult,
+}
+
 const CLUSTER_GATEWAY_LAST_GOOD_TTL: Duration = Duration::from_secs(90);
 const CLUSTER_GATEWAY_FAILURE_COOLDOWN: Duration = Duration::from_secs(20);
 
@@ -3832,10 +3839,16 @@ async fn run_cluster_gateway_explain(
         definition.gateway_mode, overrides.no_failover
     );
 
+    let mut probes = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
         let cooldown = gateway_cooldown_remaining_ms(cluster_name, candidate);
         let probe = probe_gateway_candidate(config, candidate, cluster_name).await;
         let preferred_marker = preferred.as_ref().is_some_and(|value| value == candidate);
+        probes.push(GatewayExplainCandidateProbe {
+            candidate: candidate.clone(),
+            cooldown_ms: cooldown,
+            probe: probe.clone(),
+        });
         println!(
             "  - candidate={candidate} preferred={} cooldown_ms={} ok={} reason={} latency_ms={} detail={}",
             preferred_marker,
@@ -3847,34 +3860,72 @@ async fn run_cluster_gateway_explain(
         );
     }
 
-    let status_arguments = vec![cluster_name.to_string()];
     let mut failures = Vec::new();
-    let outcome = run_gateway_candidate_batch(
-        GatewayBatchRequest {
-            config,
-            cluster_name,
-            candidates: &candidates,
-            plugin_id: "bmux.cluster",
-            command_name: "cluster-status",
-            arguments: &status_arguments,
-            respect_cooldown: definition.gateway_mode == ClusterGatewayMode::Auto,
-            no_failover: overrides.no_failover,
-        },
+    let (mut selected, attempted) = evaluate_gateway_explain_selection(
+        &probes,
+        definition.gateway_mode == ClusterGatewayMode::Auto,
+        overrides.no_failover,
         &mut failures,
-    )
-    .await?;
+    );
+    if selected.is_none() && !attempted && definition.gateway_mode == ClusterGatewayMode::Auto {
+        println!("selection note: all candidates in cooldown; simulating immediate retry");
+        let (retry_selected, _) = evaluate_gateway_explain_selection(
+            &probes,
+            false,
+            overrides.no_failover,
+            &mut failures,
+        );
+        selected = retry_selected;
+    }
 
-    match outcome {
-        GatewayBatchOutcome::Success(_) => {
-            println!("selection result: at least one candidate is executable");
-            Ok(Some(0))
-        }
-        GatewayBatchOutcome::Exhausted { .. } => {
+    selected.map_or_else(
+        || {
             println!("selection result: no executable gateway candidate");
             println!("failures: {}", format_gateway_failures(&failures));
             Ok(Some(1))
+        },
+        |candidate| {
+            println!(
+                "selection result: candidate '{}' is executable",
+                candidate.candidate
+            );
+            Ok(Some(0))
+        },
+    )
+}
+
+fn evaluate_gateway_explain_selection<'a>(
+    probes: &'a [GatewayExplainCandidateProbe],
+    respect_cooldown: bool,
+    no_failover: bool,
+    failures: &mut Vec<GatewayAttemptFailure>,
+) -> (Option<&'a GatewayExplainCandidateProbe>, bool) {
+    let mut attempted = false;
+    for candidate in probes {
+        if respect_cooldown && candidate.cooldown_ms.is_some() {
+            failures.push(GatewayAttemptFailure {
+                candidate: candidate.candidate.clone(),
+                reason_code: "cooldown",
+                detail: "candidate in cooldown window".to_string(),
+            });
+            continue;
+        }
+
+        attempted = true;
+        if candidate.probe.ok {
+            return (Some(candidate), attempted);
+        }
+
+        failures.push(GatewayAttemptFailure {
+            candidate: candidate.candidate.clone(),
+            reason_code: candidate.probe.reason_code,
+            detail: candidate.probe.detail.clone(),
+        });
+        if no_failover {
+            break;
         }
     }
+    (None, attempted)
 }
 
 async fn probe_gateway_candidate(
@@ -6164,6 +6215,82 @@ mod tests {
         assert_eq!(
             overrides.passthrough_arguments,
             vec!["--cluster".to_string(), "prod".to_string()]
+        );
+    }
+
+    #[test]
+    fn evaluate_gateway_explain_selection_respects_no_failover() {
+        let probes = vec![
+            GatewayExplainCandidateProbe {
+                candidate: "db-a".to_string(),
+                cooldown_ms: None,
+                probe: GatewayProbeResult {
+                    ok: false,
+                    reason_code: "unreachable",
+                    detail: "failed reaching db-a".to_string(),
+                    latency_ms: 11,
+                },
+            },
+            GatewayExplainCandidateProbe {
+                candidate: "db-b".to_string(),
+                cooldown_ms: None,
+                probe: GatewayProbeResult {
+                    ok: true,
+                    reason_code: "ok",
+                    detail: "reachable".to_string(),
+                    latency_ms: 9,
+                },
+            },
+        ];
+        let mut failures = Vec::new();
+        let (selected, attempted) =
+            evaluate_gateway_explain_selection(&probes, false, true, &mut failures);
+
+        assert!(attempted);
+        assert!(selected.is_none());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].candidate, "db-a");
+    }
+
+    #[test]
+    fn evaluate_gateway_explain_selection_skips_cooldown_then_retries() {
+        let probes = vec![
+            GatewayExplainCandidateProbe {
+                candidate: "db-a".to_string(),
+                cooldown_ms: Some(3000),
+                probe: GatewayProbeResult {
+                    ok: false,
+                    reason_code: "timeout",
+                    detail: "timeout".to_string(),
+                    latency_ms: 15,
+                },
+            },
+            GatewayExplainCandidateProbe {
+                candidate: "db-b".to_string(),
+                cooldown_ms: Some(5000),
+                probe: GatewayProbeResult {
+                    ok: true,
+                    reason_code: "ok",
+                    detail: "reachable".to_string(),
+                    latency_ms: 7,
+                },
+            },
+        ];
+
+        let mut failures = Vec::new();
+        let (selected, attempted) =
+            evaluate_gateway_explain_selection(&probes, true, false, &mut failures);
+        assert!(selected.is_none());
+        assert!(!attempted);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].reason_code, "cooldown");
+
+        let (retry_selected, retry_attempted) =
+            evaluate_gateway_explain_selection(&probes, false, false, &mut failures);
+        assert!(retry_attempted);
+        assert_eq!(
+            retry_selected.map(|value| value.candidate.as_str()),
+            Some("db-b")
         );
     }
 
