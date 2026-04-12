@@ -83,6 +83,11 @@ bmux sandbox cleanup --all-status --source playbook --older-than 0
 bmux sandbox cleanup --source recording-verify --older-than 600
 ```
 
+```bash
+# Inspect per-entry cleanup reasons quickly
+bmux sandbox cleanup --dry-run --older-than 0 --json | jq '.entries[] | {path, reason, status, source}'
+```
+
 ## Sandbox Daily Loop
 
 ```bmux-cli

@@ -41,6 +41,10 @@ bmux sandbox cleanup --source playbook --older-than 600 --json
 bmux sandbox cleanup --all-status --source playbook --older-than 0 --json
 ```
 
+Cleanup output includes per-entry `reason` for observability (`would_remove`,
+`removed`, `running`, `recent`, `not_failed`, `missing_manifest`,
+`source_mismatch`, `delete_failed`) plus top-level reason counters.
+
 `bmux sandbox cleanup` uses `[sandbox.cleanup]` defaults from `bmux.toml` when
 flags are omitted. CLI flags always win.
 

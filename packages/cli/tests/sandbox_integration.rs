@@ -458,9 +458,14 @@ fn sandbox_cleanup_source_filter_only_reports_requested_source() {
     let entries = json["entries"]
         .as_array()
         .expect("sandbox cleanup should include entries array");
-    assert_eq!(entries.len(), 1, "only recording-verify should match");
-    assert_eq!(entries[0]["source"].as_str(), Some("recording-verify"));
-    let path = entries[0]["path"]
+    assert_eq!(entries.len(), 2, "cleanup should report filtered decisions");
+    assert_eq!(json["skipped_source_mismatch"].as_u64(), Some(1));
+    let matched = entries
+        .iter()
+        .find(|entry| entry["source"].as_str() == Some("recording-verify"))
+        .expect("cleanup should include recording-verify entry");
+    assert_eq!(matched["reason"].as_str(), Some("would_remove"));
+    let path = matched["path"]
         .as_str()
         .expect("cleanup entry path should be present");
     assert!(
@@ -540,11 +545,12 @@ fn sandbox_cleanup_uses_config_defaults_when_flags_are_omitted() {
         .expect("sandbox cleanup should include entries array");
     assert_eq!(
         entries.len(),
-        1,
-        "config defaults should narrow to one entry"
+        3,
+        "cleanup should report matched and skipped decisions"
     );
-    assert_eq!(entries[0]["source"].as_str(), Some("recording-verify"));
-    assert_eq!(entries[0]["status"].as_str(), Some("failed"));
+    assert_eq!(json["skipped_source_mismatch"].as_u64(), Some(1));
+    assert_eq!(json["skipped_not_failed"].as_u64(), Some(1));
+    assert_eq!(json["orphaned"].as_u64(), Some(1));
 }
 
 #[test]
@@ -596,6 +602,7 @@ fn sandbox_cleanup_cli_flags_override_config_defaults() {
     );
     assert_eq!(entries[0]["source"].as_str(), Some("playbook"));
     assert_eq!(entries[0]["status"].as_str(), Some("stopped"));
+    assert_eq!(entries[0]["reason"].as_str(), Some("would_remove"));
 }
 
 #[test]
@@ -637,14 +644,65 @@ fn sandbox_cleanup_failed_only_includes_aborted_running_manifests() {
         .expect("sandbox cleanup should include entries array");
     assert_eq!(
         entries.len(),
-        1,
-        "failed-only should include aborted-running"
+        2,
+        "cleanup should include failed match and not_failed skip"
     );
-    assert_eq!(entries[0]["status"].as_str(), Some("failed"));
-    let path = entries[0]["path"]
+    let failed_entry = entries
+        .iter()
+        .find(|entry| entry["status"].as_str() == Some("failed"))
+        .expect("cleanup should include failed status entry");
+    assert_eq!(failed_entry["reason"].as_str(), Some("would_remove"));
+    let path = failed_entry["path"]
         .as_str()
         .expect("cleanup entry should include path");
     assert!(path.contains("bmux-sbx-aborted-running"));
+}
+
+#[test]
+#[serial]
+fn sandbox_cleanup_reports_missing_manifest_reason() {
+    let sandbox = CommandSandbox::new("cleanup-missing-manifest-reason");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    let missing_manifest = tmp_root.join("bmux-sbx-missing-manifest");
+    std::fs::create_dir_all(missing_manifest.join("logs")).expect("create logs dir");
+    std::fs::create_dir_all(missing_manifest.join("runtime")).expect("create runtime dir");
+    std::fs::create_dir_all(missing_manifest.join("state")).expect("create state dir");
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "cleanup",
+            "--dry-run",
+            "--failed-only",
+            "--older-than",
+            "0",
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox cleanup for missing-manifest reason");
+    assert!(
+        output.status.success(),
+        "sandbox cleanup should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["skipped_missing_manifest"].as_u64(), Some(1));
+    let entries = json["entries"]
+        .as_array()
+        .expect("sandbox cleanup should include entries array");
+    let missing_manifest_entry = entries
+        .iter()
+        .find(|entry| entry["reason"].as_str() == Some("missing_manifest"))
+        .expect("cleanup should include missing_manifest reason");
+    assert_eq!(
+        missing_manifest_entry["path"]
+            .as_str()
+            .expect("entry path should be present"),
+        missing_manifest.to_string_lossy()
+    );
 }
 
 #[test]

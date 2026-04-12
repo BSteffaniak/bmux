@@ -29,14 +29,18 @@ struct CleanupEntry {
     source: String,
     age_secs: u64,
     status: String,
+    reason: String,
     removed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct CleanupSkipped {
+    source_mismatch: usize,
     running: usize,
     recent: usize,
     not_failed: usize,
+    missing_manifest: usize,
+    delete_failed: usize,
 }
 
 #[derive(Debug)]
@@ -727,7 +731,11 @@ pub(super) fn run_sandbox_cleanup(
 ) -> Result<u8> {
     let older_than = older_than_secs.map_or(DEFAULT_CLEANUP_MIN_AGE, Duration::from_secs);
     let scan = cleanup_orphaned_sandboxes(dry_run, failed_only, older_than, source_filter);
-    let orphaned = scan.entries.len();
+    let orphaned = scan
+        .entries
+        .iter()
+        .filter(|entry| cleanup_reason_is_orphaned(&entry.reason))
+        .count();
 
     if json {
         let report = serde_json::json!({
@@ -738,34 +746,51 @@ pub(super) fn run_sandbox_cleanup(
             "failed_only": failed_only,
             "older_than_secs": older_than.as_secs(),
             "source": source_filter,
+            "skipped_source_mismatch": scan.skipped.source_mismatch,
             "skipped_running": scan.skipped.running,
             "skipped_recent": scan.skipped.recent,
             "skipped_not_failed": scan.skipped.not_failed,
+            "skipped_missing_manifest": scan.skipped.missing_manifest,
+            "delete_failed": scan.skipped.delete_failed,
             "entries": scan.entries,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if orphaned > 0 {
+    } else if !scan.entries.is_empty() {
         for entry in &scan.entries {
-            let status = if entry.removed { "removed" } else { "found" };
+            let status = if entry.removed { "removed" } else { "kept" };
             println!(
-                "  {status}: {} (source: {}, status: {}, age: {}s)",
-                entry.path, entry.source, entry.status, entry.age_secs
+                "  {status}: {} (source: {}, status: {}, age: {}s, reason: {})",
+                entry.path, entry.source, entry.status, entry.age_secs, entry.reason
             );
         }
         if dry_run {
             println!("{orphaned} orphaned sandbox(es) found (dry run, not removed)");
         } else {
             let removed = scan.entries.iter().filter(|entry| entry.removed).count();
-            println!("{removed} orphaned sandbox(es) removed");
+            println!(
+                "{removed} orphaned sandbox(es) removed ({} failed removals)",
+                scan.skipped.delete_failed
+            );
         }
         println!(
-            "skipped: running={}, recent={}, not_failed={}",
-            scan.skipped.running, scan.skipped.recent, scan.skipped.not_failed
+            "reasons: source_mismatch={}, running={}, recent={}, not_failed={}, missing_manifest={}, delete_failed={}",
+            scan.skipped.source_mismatch,
+            scan.skipped.running,
+            scan.skipped.recent,
+            scan.skipped.not_failed,
+            scan.skipped.missing_manifest,
+            scan.skipped.delete_failed
         );
     } else {
         println!(
-            "no orphaned sandboxes found ({} scanned; skipped running={}, recent={}, not_failed={})",
-            scan.scanned, scan.skipped.running, scan.skipped.recent, scan.skipped.not_failed
+            "no orphaned sandboxes found ({} scanned; reasons source_mismatch={}, running={}, recent={}, not_failed={}, missing_manifest={}, delete_failed={})",
+            scan.scanned,
+            scan.skipped.source_mismatch,
+            scan.skipped.running,
+            scan.skipped.recent,
+            scan.skipped.not_failed,
+            scan.skipped.missing_manifest,
+            scan.skipped.delete_failed
         );
     }
 
@@ -782,60 +807,25 @@ fn cleanup_orphaned_sandboxes(
     let mut scanned = 0;
     let mut entries = Vec::new();
     let mut skipped = CleanupSkipped {
+        source_mismatch: 0,
         running: 0,
         recent: 0,
         not_failed: 0,
+        missing_manifest: 0,
+        delete_failed: 0,
     };
 
     for candidate in collect_sandbox_candidates() {
-        let age = candidate_age(&candidate, now);
-        let root_path = candidate.root;
         scanned += 1;
-        let source = sandbox_source_for_dir(&root_path);
-        if let Some(filter) = source_filter
-            && source != filter
-        {
-            continue;
-        }
-        if age < older_than {
-            skipped.recent += 1;
-            continue;
-        }
-
-        let status = sandbox_status_for_dir(&root_path);
-        if status == "running" {
-            skipped.running += 1;
-            continue;
-        }
-        if failed_only && status != "failed" {
-            skipped.not_failed += 1;
-            continue;
-        }
-
-        let removed = if dry_run {
-            false
-        } else {
-            if sandbox_lock_is_fresh(&root_path)
-                || sandbox_process_alive(&root_path)
-                || sandbox_socket_alive(&root_path)
-            {
-                skipped.running += 1;
-                continue;
-            }
-            let removed = std::fs::remove_dir_all(&root_path).is_ok();
-            if removed || !root_path.exists() {
-                let _ = remove_sandbox_index_entry(&root_path);
-            }
-            removed
-        };
-
-        entries.push(CleanupEntry {
-            path: root_path.to_string_lossy().to_string(),
-            source: source.to_string(),
-            age_secs: age.as_secs(),
-            status: status.to_string(),
-            removed,
-        });
+        entries.push(evaluate_cleanup_candidate(
+            candidate,
+            now,
+            dry_run,
+            failed_only,
+            older_than,
+            source_filter,
+            &mut skipped,
+        ));
     }
 
     CleanupScan {
@@ -843,6 +833,91 @@ fn cleanup_orphaned_sandboxes(
         entries,
         skipped,
     }
+}
+
+fn evaluate_cleanup_candidate(
+    candidate: SandboxCandidate,
+    now: SystemTime,
+    dry_run: bool,
+    failed_only: bool,
+    older_than: Duration,
+    source_filter: Option<&str>,
+    skipped: &mut CleanupSkipped,
+) -> CleanupEntry {
+    let age = candidate_age(&candidate, now);
+    let root_path = candidate.root;
+    let source = sandbox_source_for_dir(&root_path);
+    let status = sandbox_status_for_dir(&root_path).to_string();
+
+    if let Some(filter) = source_filter
+        && source != filter
+    {
+        skipped.source_mismatch += 1;
+        return cleanup_entry(&root_path, source, age, status, "source_mismatch", false);
+    }
+
+    if age < older_than {
+        skipped.recent += 1;
+        return cleanup_entry(&root_path, source, age, status, "recent", false);
+    }
+
+    let manifest = read_manifest(&root_path).ok();
+    if status == "running" {
+        skipped.running += 1;
+        return cleanup_entry(&root_path, source, age, status, "running", false);
+    }
+
+    if failed_only && status != "failed" {
+        if manifest.is_some() {
+            skipped.not_failed += 1;
+            return cleanup_entry(&root_path, source, age, status, "not_failed", false);
+        }
+        skipped.missing_manifest += 1;
+        return cleanup_entry(&root_path, source, age, status, "missing_manifest", false);
+    }
+
+    if dry_run {
+        return cleanup_entry(&root_path, source, age, status, "would_remove", false);
+    }
+
+    if sandbox_lock_is_fresh(&root_path)
+        || sandbox_process_alive(&root_path)
+        || sandbox_socket_alive(&root_path)
+    {
+        skipped.running += 1;
+        return cleanup_entry(&root_path, source, age, status, "running", false);
+    }
+
+    let removed = std::fs::remove_dir_all(&root_path).is_ok();
+    if removed || !root_path.exists() {
+        let _ = remove_sandbox_index_entry(&root_path);
+        return cleanup_entry(&root_path, source, age, status, "removed", true);
+    }
+
+    skipped.delete_failed += 1;
+    cleanup_entry(&root_path, source, age, status, "delete_failed", false)
+}
+
+fn cleanup_entry(
+    root_path: &Path,
+    source: &str,
+    age: Duration,
+    status: String,
+    reason: &str,
+    removed: bool,
+) -> CleanupEntry {
+    CleanupEntry {
+        path: root_path.to_string_lossy().to_string(),
+        source: source.to_string(),
+        age_secs: age.as_secs(),
+        status,
+        reason: reason.to_string(),
+        removed,
+    }
+}
+
+fn cleanup_reason_is_orphaned(reason: &str) -> bool {
+    matches!(reason, "removed" | "would_remove" | "delete_failed")
 }
 
 fn collect_sandbox_directories() -> Vec<PathBuf> {
