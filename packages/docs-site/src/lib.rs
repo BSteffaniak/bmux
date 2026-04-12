@@ -15,7 +15,8 @@ use serde_json::json;
 static BACKGROUND_COLOR: LazyLock<Color> = LazyLock::new(|| Color::from_hex("#0d1117"));
 
 /// Default viewport meta tag for responsive design.
-pub static VIEWPORT: LazyLock<String> = LazyLock::new(|| "width=device-width".to_string());
+pub static VIEWPORT: LazyLock<String> =
+    LazyLock::new(|| "width=device-width, initial-scale=1".to_string());
 
 #[cfg(feature = "assets")]
 static CARGO_MANIFEST_DIR: LazyLock<Option<std::path::PathBuf>> =

@@ -63,13 +63,15 @@ pub fn nav_bar() -> Containers {
         {
             // Left: hamburger (mobile only) + logo
             div
+                #nav-left
                 direction=row
                 align-items=center
                 padding-x=(if_responsive("mobile").then::<i32>(16).or_else(24))
-                gap=(if_responsive("mobile").then::<i32>(12).or_else(0))
+                column-gap=(if_responsive("mobile").then::<i32>(12).or_else(0))
             {
                 // Hamburger button — visible on mobile only
                 div
+                    #hamburger-btn
                     hidden=(if_responsive("mobile").then::<bool>(false).or_else(true))
                     fx-click=(ActionType::Multi(vec![
                         ActionType::display_by_id(SIDEBAR_ID),
@@ -96,12 +98,13 @@ pub fn nav_bar() -> Containers {
                 }
             }
             div
+                #nav-right
                 direction=row
                 align-items=center
                 justify-content=end
                 flex=1
                 padding-x=(if_responsive("mobile").then::<i32>(16).or_else(24))
-                gap=(if_responsive("mobile").then::<i32>(16).or_else(24))
+                column-gap=(if_responsive("mobile").then::<i32>(16).or_else(24))
             {
                 anchor
                     color=(text_secondary())
@@ -175,6 +178,7 @@ pub fn sidebar(current_path: &str) -> Containers {
         {
             // Close button at top of mobile drawer
             div
+                #sidebar-close
                 hidden=(if_responsive("mobile").then::<bool>(false).or_else(true))
                 direction=row
                 justify-content=end
@@ -285,6 +289,7 @@ fn sidebar_item(label: &str, href: &str, active: bool) -> Container {
 pub fn docs_layout(current_path: &str, title: Option<&str>, content: &Containers) -> Containers {
     page(&container! {
         div
+            #docs-main
             direction=(
                 if_responsive("mobile")
                     .then::<LayoutDirection>(LayoutDirection::Column)
@@ -303,12 +308,14 @@ pub fn docs_layout(current_path: &str, title: Option<&str>, content: &Containers
                 overflow-y=auto
             {
                 div
+                    #docs-content
                     padding=(if_responsive("tablet").then::<i32>(24).or_else(48))
                     max-width=900
                 {
                     (if let Some(t) = title {
                         container! {
                             h1
+                                #docs-title
                                 color=(text_primary())
                                 font-size=(if_responsive("mobile").then::<i32>(24).or_else(32))
                                 font-family=(MONO_FONT)
@@ -324,6 +331,7 @@ pub fn docs_layout(current_path: &str, title: Option<&str>, content: &Containers
                     })
                     // Content wrapper with overflow-x for wide code blocks / tables
                     div
+                        #docs-body
                         color=(text_secondary())
                         font-family=(MONO_FONT)
                         font-size=(if_responsive("mobile").then::<i32>(13).or_else(14))

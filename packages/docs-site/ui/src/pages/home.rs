@@ -11,6 +11,7 @@ use crate::layout;
 pub fn home() -> Containers {
     layout::page(&container! {
         div
+            #hero-wrap
             flex-grow=1
             justify-content=center
             align-items=center
@@ -19,12 +20,14 @@ pub fn home() -> Containers {
         {
             // Hero section
             div
+                #hero-inner
                 align-items=center
                 max-width=800
-                gap=(if_responsive("mobile").then::<i32>(24).or_else(32))
+                row-gap=(if_responsive("mobile").then::<i32>(24).or_else(32))
             {
                 // Terminal prompt branding
                 div
+                    #hero-brand
                     color=(layout::green())
                     font-size=(if_responsive("tablet").then::<i32>(40).or_else(64))
                     font-family=(layout::MONO_FONT)
@@ -35,6 +38,7 @@ pub fn home() -> Containers {
 
                 // Tagline
                 h1
+                    #hero-tagline
                     color=(layout::text_primary())
                     font-size=(if_responsive("tablet").then::<i32>(22).or_else(32))
                     font-family=(layout::MONO_FONT)
@@ -45,6 +49,7 @@ pub fn home() -> Containers {
                 }
 
                 div
+                    #hero-desc
                     color=(layout::text_muted())
                     font-size=(if_responsive("mobile").then::<i32>(14).or_else(16))
                     font-family=(layout::MONO_FONT)
@@ -56,12 +61,14 @@ pub fn home() -> Containers {
 
                 // CTA buttons
                 div
+                    #hero-cta
                     direction=(
                         if_responsive("mobile")
                             .then::<LayoutDirection>(LayoutDirection::Column)
                             .or_else(LayoutDirection::Row)
                     )
-                    gap=16
+                    row-gap=16
+                    column-gap=16
                     margin-top=24
                     align-items=center
                 {
@@ -97,24 +104,29 @@ pub fn home() -> Containers {
 
             // Feature cards
             div
+                #features-row
                 direction=(
                     if_responsive("tablet")
                         .then::<LayoutDirection>(LayoutDirection::Column)
                         .or_else(LayoutDirection::Row)
                 )
-                gap=24
+                row-gap=24
+                column-gap=24
                 margin-top=(if_responsive("mobile").then::<i32>(48).or_else(80))
                 max-width=900
             {
                 (feature_card(
+                    0,
                     "plugin-driven",
                     "Extensibility is built in, not bolted on. Plugins are first-class architecture."
                 ))
                 (feature_card(
+                    1,
                     "multi-client",
                     "Multiple clients attach to the same session with independent views and roles."
                 ))
                 (feature_card(
+                    2,
                     "modal & fast",
                     "Keyboard-driven with Vim-style navigation. Written in Rust for performance."
                 ))
@@ -123,9 +135,11 @@ pub fn home() -> Containers {
     })
 }
 
-fn feature_card(title: &str, description: &str) -> Containers {
+fn feature_card(index: u8, title: &str, description: &str) -> Containers {
+    let id = format!("feature-card-{index}");
     container! {
         div
+            id=(id)
             background=(layout::surface())
             border-radius=8
             padding=(if_responsive("mobile").then::<i32>(20).or_else(24))
@@ -134,7 +148,7 @@ fn feature_card(title: &str, description: &str) -> Containers {
         {
             h3
                 color=(layout::text_primary())
-                font-size=(if_responsive("mobile").then::<i32>(14).or_else(16))
+                font-size=15
                 font-family=(layout::MONO_FONT)
                 margin-bottom=8
             {
@@ -142,7 +156,7 @@ fn feature_card(title: &str, description: &str) -> Containers {
             }
             div
                 color=(layout::text_muted())
-                font-size=(if_responsive("mobile").then::<i32>(12).or_else(13))
+                font-size=13
                 font-family=(layout::MONO_FONT)
             {
                 (description)
