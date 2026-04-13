@@ -111,3 +111,30 @@ bmux sandbox inspect --latest-failed --tail 200
 # 3) Package logs + repro metadata for teammates
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 ```
+
+## Sandbox Triage (Operator Quickstart)
+
+```bmux-cli
+# Status first: totals + source mix + reconcile auto-heal counters
+bmux sandbox status --json
+
+# Narrow to the failure you care about
+bmux sandbox tail --latest-failed --tail 120 --json
+bmux sandbox open --latest-failed --json
+bmux sandbox tail --latest-failed --source recording-verify --tail 120 --json
+
+# Reproduce from manifest command metadata
+bmux sandbox rerun --latest-failed --bmux-bin ./target/debug/bmux --json
+
+# Repair stale state safely
+bmux sandbox doctor --fix --dry-run --json
+bmux sandbox doctor --fix --json
+```
+
+```bash
+# Quick check: did reconcile auto-heal anything?
+bmux sandbox status --json | jq '.reconcile | {healed_entries, rebuilt_entries, pruned_entries, normalized_running, cleared_stale_locks}'
+
+# Quick check: inspect only failed playbook sandboxes
+bmux sandbox tail --latest-failed --source playbook --tail 200 --json | jq '{id, source, status, latest_log, log_tail}'
+```

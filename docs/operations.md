@@ -49,6 +49,34 @@ bmux sandbox cleanup --all-status --source playbook --older-than 0 --json
 bmux sandbox rebuild-index --json
 ```
 
+## Sandbox Triage Flow
+
+Use this sequence when a sandboxed run fails and you need fast reproduction data.
+
+```bmux-cli
+# 1) Confirm current sandbox health and reconcile activity
+bmux sandbox status --json
+
+# 2) Focus the latest failed run (optionally scoped by source)
+bmux sandbox tail --latest-failed --tail 120 --json
+bmux sandbox open --latest-failed --json
+bmux sandbox tail --latest-failed --source playbook --tail 120 --json
+
+# 3) Re-run with the same command from manifest metadata
+bmux sandbox rerun --latest-failed --bmux-bin ./target/debug/bmux --json
+
+# 4) Preview and apply repair if state drift is detected
+bmux sandbox doctor --fix --dry-run --json
+bmux sandbox doctor --fix --json
+```
+
+Troubleshooting notes:
+
+- `latest_log: null` in JSON means no log file exists yet in that sandbox `logs/` dir.
+- `* target required` errors mean no explicit target or selector was provided; use `<id|path>`, `--latest`, or `--latest-failed`.
+- `sandbox manifest '<id>' has no command to rerun` means the manifest command array is empty; inspect manifest integrity or rerun from a different target.
+- If stale `running`/lock metadata appears, run `bmux sandbox doctor --fix --dry-run --json` first, then apply with `--fix`.
+
 Cleanup output includes per-entry `reason` for observability (`would_remove`,
 `removed`, `running`, `recent`, `not_failed`, `missing_manifest`,
 `source_mismatch`, `delete_failed`) plus top-level reason counters.
