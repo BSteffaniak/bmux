@@ -258,7 +258,50 @@ impl DoctorFinding {
 
 #[cfg(test)]
 mod tests {
-    use super::core_proxy_command_path;
+    use super::{PluginCliPlugin, core_proxy_command_path};
+    use bmux_plugin_sdk::{
+        CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
+        NativeCommandContext, RegisteredPluginInfo, RustPlugin,
+    };
+    use std::collections::BTreeMap;
+
+    fn test_context(command: &str, arguments: Vec<String>) -> NativeCommandContext {
+        NativeCommandContext {
+            plugin_id: "bmux.plugin_cli".to_string(),
+            command: command.to_string(),
+            arguments,
+            required_capabilities: Vec::new(),
+            provided_capabilities: Vec::new(),
+            services: Vec::new(),
+            available_capabilities: vec!["bmux.commands".to_string()],
+            enabled_plugins: vec!["bmux.example".to_string()],
+            plugin_search_roots: Vec::new(),
+            registered_plugins: vec![RegisteredPluginInfo {
+                id: "bmux.example".to_string(),
+                display_name: "Example".to_string(),
+                version: "0.1.0".to_string(),
+                bundled_static: true,
+                required_capabilities: vec!["bmux.commands".to_string()],
+                provided_capabilities: vec!["bmux.example.read".to_string()],
+                commands: vec!["status".to_string(), "run".to_string()],
+            }],
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "test".to_string(),
+                plugin_api_version: CURRENT_PLUGIN_API_VERSION,
+                plugin_abi_version: CURRENT_PLUGIN_ABI_VERSION,
+            },
+            connection: HostConnectionInfo {
+                config_dir: "/tmp".to_string(),
+                runtime_dir: "/tmp".to_string(),
+                data_dir: "/tmp".to_string(),
+                state_dir: "/tmp".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: None,
+        }
+    }
 
     #[test]
     fn generated_proxy_command_mapping_resolves_known_entries() {
@@ -277,6 +320,71 @@ mod tests {
         assert!(core_proxy_command_path("list").is_none());
         assert!(core_proxy_command_path("doctor").is_none());
         assert!(core_proxy_command_path("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn integration_list_command_accepts_new_filter_flags() {
+        let mut plugin = PluginCliPlugin;
+        let context = test_context(
+            "list",
+            vec![
+                "--json".to_string(),
+                "--enabled-only".to_string(),
+                "--capability=bmux.commands".to_string(),
+            ],
+        );
+        let exit = plugin
+            .run_command(context)
+            .expect("list with filter flags should succeed");
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn integration_doctor_command_accepts_summary_and_filters() {
+        let mut plugin = PluginCliPlugin;
+        let context = test_context(
+            "doctor",
+            vec![
+                "--json".to_string(),
+                "--summary-only".to_string(),
+                "--severity=warning".to_string(),
+                "--code=manifest".to_string(),
+            ],
+        );
+        let exit = plugin
+            .run_command(context)
+            .expect("doctor with summary/filter flags should succeed");
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn integration_run_help_succeeds_for_known_plugin() {
+        let mut plugin = PluginCliPlugin;
+        let context = test_context(
+            "run",
+            vec!["bmux.example".to_string(), "--help".to_string()],
+        );
+        let exit = plugin
+            .run_command(context)
+            .expect("run --help should succeed for known plugin");
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn integration_doctor_invalid_severity_is_actionable() {
+        let mut plugin = PluginCliPlugin;
+        let context = test_context(
+            "doctor",
+            vec!["--severity=critical".to_string(), "--json".to_string()],
+        );
+        let error = plugin
+            .run_command(context)
+            .expect_err("invalid severity should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("--severity must be one of: error, warning, info")
+        );
     }
 }
 
