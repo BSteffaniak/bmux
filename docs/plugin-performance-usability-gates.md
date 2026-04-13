@@ -104,3 +104,8 @@ The following workflows must remain functional and keep equivalent UX quality:
 - Any optimization must preserve externally visible behavior.
 - Any cleanup must keep latency flat or better for hot paths.
 - If a cleanup would trade off UX or latency, split it and land only the safe portion.
+
+## References
+
+- Plugin triage playbook: `docs/plugin-triage-playbook.md`
+- Perf troubleshooting and baseline updates: `docs/plugin-perf-troubleshooting.md`

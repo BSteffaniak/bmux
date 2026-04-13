@@ -70,3 +70,8 @@ source = "all" # sandbox_cli | playbook | recording_verify | all
 
 - Use `bmux --runtime <name> ...` for parallel named local runtimes that still use your normal user config/data/state roots.
 - Use `bmux sandbox ...` for fully isolated ephemeral runs intended for local build validation and failure reproduction.
+
+## Plugin Ops References
+
+- Triage and failure playbook: `docs/plugin-triage-playbook.md`
+- Perf gate troubleshooting and baseline guidance: `docs/plugin-perf-troubleshooting.md`
