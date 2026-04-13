@@ -85,6 +85,16 @@ Troubleshooting notes:
 - `sandbox manifest '<id>' has no command to rerun` means the manifest command array is empty; inspect manifest integrity or rerun from a different target.
 - If stale `running`/lock metadata appears, run `bmux sandbox doctor --fix --dry-run --json` first, then apply with `--fix`.
 
+### Bundle Verify Failures
+
+If `bmux sandbox bundle ... --verify` or `bmux sandbox verify-bundle ...` returns drift:
+
+- Re-run verification in JSON mode and inspect `issues[]` for exact `path` + `field` mismatches.
+- `field=exists` usually means a bundled artifact was moved/deleted after creation.
+- `field=bytes` or `field=file_count` usually means files inside the bundle changed post-creation.
+- Regenerate a fresh bundle from the original sandbox when drift is expected (`bmux sandbox bundle <id> --verify --json`).
+- For archived bundles, treat verification drift as a chain-of-custody signal and avoid mutating the directory in place.
+
 Cleanup output includes per-entry `reason` for observability (`would_remove`,
 `removed`, `running`, `recent`, `not_failed`, `missing_manifest`,
 `source_mismatch`, `delete_failed`) plus top-level reason counters.
