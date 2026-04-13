@@ -107,5 +107,6 @@ The following workflows must remain functional and keep equivalent UX quality:
 
 ## References
 
+- Plugin ops index: `docs/plugin-ops.md`
 - Plugin triage playbook: `docs/plugin-triage-playbook.md`
 - Perf troubleshooting and baseline updates: `docs/plugin-perf-troubleshooting.md`

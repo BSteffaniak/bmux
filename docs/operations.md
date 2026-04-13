@@ -104,5 +104,6 @@ source = "all" # sandbox_cli | playbook | recording_verify | all
 
 ## Plugin Ops References
 
+- Plugin operations index: `docs/plugin-ops.md`
 - Triage and failure playbook: `docs/plugin-triage-playbook.md`
 - Perf gate troubleshooting and baseline guidance: `docs/plugin-perf-troubleshooting.md`

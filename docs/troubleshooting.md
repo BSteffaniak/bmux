@@ -33,6 +33,10 @@ bmux logs tail --since 30m --lines 250 --no-follow
 
 ## 5) Plugin-Specific Triage
 
+Plugin operator index:
+
+- `docs/plugin-ops.md`
+
 For plugin discovery/doctor/rebuild/run issues, use:
 
 - `docs/plugin-triage-playbook.md`

@@ -246,3 +246,9 @@ As context substrate work lands:
 ## Status
 
 This document reflects current agreed decisions from architecture discussions and should be updated whenever these decisions change.
+
+Operator workflows and troubleshooting references:
+
+- `docs/plugin-ops.md`
+- `docs/plugin-triage-playbook.md`
+- `docs/plugin-perf-troubleshooting.md`
