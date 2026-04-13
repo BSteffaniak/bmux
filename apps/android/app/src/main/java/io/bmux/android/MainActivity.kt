@@ -1,5 +1,6 @@
 package io.bmux.android
 
+import android.app.Application
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -27,13 +28,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.bmux_mobile_ffi.ConnectionStateFfi
+import uniffi.bmux_mobile_ffi.ConnectionStatusFfi
 import uniffi.bmux_mobile_ffi.HostKeyPinSuggestionFfi
 import uniffi.bmux_mobile_ffi.MobileApiFfi
 import uniffi.bmux_mobile_ffi.TargetRecordFfi
@@ -57,9 +59,20 @@ data class TargetUi(
     val transport: String,
 )
 
+data class DiscoveredTargetUi(
+    val serviceName: String,
+    val host: String,
+    val port: Int,
+) {
+    val targetInput: String get() = "$host:$port"
+}
+
 data class MainUiState(
     val loading: Boolean = false,
     val targets: List<TargetUi> = emptyList(),
+    val discoveredTargets: List<DiscoveredTargetUi> = emptyList(),
+    val discoveryRunning: Boolean = false,
+    val reconnectServiceEnabled: Boolean = false,
     val selectedSession: String = "main",
     val lastConnection: String = "",
     val lastHostKey: String = "",
@@ -67,12 +80,11 @@ data class MainUiState(
     val warning: String? = null,
 )
 
-class MainViewModel : ViewModel() {
-    private val gateway = MobileGateway()
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+    private val gateway = MobileGateway(application)
+    private val discovery = LanDiscoveryManager(application)
 
-    var state by mutableStateOf(
-        MainUiState(info = gateway.startupInfo),
-    )
+    var state by mutableStateOf(MainUiState(info = gateway.startupInfo))
         private set
 
     var newTarget by mutableStateOf("")
@@ -86,7 +98,11 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             state = state.copy(loading = true, warning = null)
             val loaded = withContext(Dispatchers.IO) { gateway.listTargets() }
-            state = state.copy(loading = false, targets = loaded)
+            state = state.copy(
+                loading = false,
+                targets = loaded,
+                info = gateway.startupInfoWithSecurityState(),
+            )
         }
     }
 
@@ -100,10 +116,7 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             state = state.copy(loading = true, warning = null)
             val result = withContext(Dispatchers.IO) {
-                gateway.importTarget(
-                    source = source,
-                    displayName = targetName.trim().ifBlank { null },
-                )
+                gateway.importTarget(source, targetName.trim().ifBlank { null })
             }
             if (result.isFailure) {
                 state = state.copy(
@@ -120,12 +133,19 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    fun importDiscoveredTarget(target: DiscoveredTargetUi) {
+        newTarget = target.targetInput
+        if (targetName.isBlank()) {
+            targetName = target.serviceName
+        }
+        importTarget()
+    }
+
     fun connect(target: TargetUi) {
         viewModelScope.launch {
             state = state.copy(loading = true, warning = null)
-            val result = withContext(Dispatchers.IO) {
-                gateway.connect(target.id, state.selectedSession.ifBlank { null })
-            }
+            val session = state.selectedSession.ifBlank { null }
+            val result = withContext(Dispatchers.IO) { gateway.connect(target.id, session) }
             state = if (result.isSuccess) {
                 val connection = result.getOrThrow()
                 state.copy(
@@ -148,10 +168,7 @@ class MainViewModel : ViewModel() {
                 gateway.observeAndApplyPin(target.canonicalTarget)
             }
             state = if (result.isSuccess) {
-                state.copy(
-                    loading = false,
-                    lastHostKey = result.getOrThrow(),
-                )
+                state.copy(loading = false, lastHostKey = result.getOrThrow())
             } else {
                 state.copy(
                     loading = false,
@@ -161,67 +178,131 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    fun setReconnectService(target: TargetUi, enabled: Boolean) {
+        if (enabled) {
+            gateway.startReconnectService(target.id, state.selectedSession.ifBlank { null })
+        } else {
+            gateway.stopReconnectService()
+        }
+        state = state.copy(reconnectServiceEnabled = enabled)
+    }
+
+    fun setDiscoveryEnabled(enabled: Boolean) {
+        if (!enabled) {
+            discovery.stop()
+            state = state.copy(discoveryRunning = false, discoveredTargets = emptyList())
+            return
+        }
+
+        discovery.start(
+            onUpdate = { discovered ->
+                viewModelScope.launch {
+                    state = state.copy(
+                        discoveryRunning = true,
+                        discoveredTargets = discovered.map {
+                            DiscoveredTargetUi(it.serviceName, it.host, it.port)
+                        },
+                    )
+                }
+            },
+            onError = { message ->
+                viewModelScope.launch {
+                    state = state.copy(discoveryRunning = false, warning = message)
+                }
+            },
+        )
+        state = state.copy(discoveryRunning = true)
+    }
+
     fun updateSession(value: String) {
         state = state.copy(selectedSession = value)
     }
+
+    override fun onCleared() {
+        discovery.stop()
+        super.onCleared()
+    }
 }
 
-private class MobileGateway {
-    val startupInfo: String
-    private val ffi: MobileApiFfi?
-    private val fallbackTargets = mutableListOf<TargetUi>()
+private class MobileGateway(application: Application) {
+    private val context = application.applicationContext
+    private val store = SecureStore(context)
+    private val ffi = runCatching { MobileApiFfi() }.getOrNull()
 
-    init {
-        val client = runCatching { MobileApiFfi() }
-        ffi = client.getOrNull()
-        startupInfo = if (ffi != null) {
-            "FFI connected"
-        } else {
-            "FFI unavailable in this runtime; using in-memory fallback"
-        }
+    val startupInfo: String = if (ffi != null) {
+        "FFI connected with encrypted local store"
+    } else {
+        "FFI unavailable in this runtime; offline encrypted store mode"
+    }
+
+    fun startupInfoWithSecurityState(): String {
+        val pinnedCount = store.pinnedTargets().size
+        val lastTarget = store.lastConnectedTargetId()
+        val suffix = if (lastTarget != null) "last target tracked" else "no prior target"
+        return "$startupInfo | pinned=$pinnedCount | $suffix"
     }
 
     fun listTargets(): List<TargetUi> {
-        val client = ffi ?: return fallbackTargets.toList()
-        return runCatching { client.listTargets() }
-            .getOrDefault(emptyList())
-            .map(::mapTarget)
+        val fromFfi = runCatching { ffi?.listTargets() }
+            .getOrNull()
+            ?.map(::mapTarget)
+            .orEmpty()
+        if (fromFfi.isNotEmpty()) {
+            store.saveTargets(fromFfi.map { it.toStored() })
+            return fromFfi
+        }
+        return store.loadTargets().map {
+            TargetUi(
+                id = it.id,
+                name = it.name,
+                canonicalTarget = it.canonicalTarget,
+                transport = it.transport,
+            )
+        }
     }
 
     fun importTarget(source: String, displayName: String?): Result<TargetUi> {
-        val client = ffi
-        if (client == null) {
-            val id = "local-${System.currentTimeMillis()}"
-            val target = TargetUi(
-                id = id,
+        val imported = if (ffi != null) {
+            val client = ffi
+            runCatching { mapTarget(client!!.importTarget(source, displayName)) }
+        } else {
+            val local = TargetUi(
+                id = "local-${System.currentTimeMillis()}",
                 name = displayName ?: source,
                 canonicalTarget = source,
                 transport = guessTransport(source),
             )
-            fallbackTargets.add(target)
-            return Result.success(target)
+            Result.success(local)
         }
 
-        return runCatching {
-            mapTarget(client.importTarget(source, displayName))
+        if (imported.isSuccess) {
+            val updated = listTargets().toMutableList()
+            val candidate = imported.getOrThrow()
+            if (updated.none { it.id == candidate.id }) {
+                updated.add(candidate)
+            }
+            store.saveTargets(updated.map { it.toStored() })
         }
+        return imported
     }
 
     fun connect(targetId: String, session: String?): Result<ConnectionStateFfi> {
-        val client = ffi
-        if (client == null) {
-            return Result.success(
+        store.saveLastConnectedTarget(targetId)
+        val connected = if (ffi != null) {
+            val client = ffi
+            runCatching { client!!.connect(targetId, session) }
+        } else {
+            Result.success(
                 ConnectionStateFfi(
                     id = "fallback-${System.currentTimeMillis()}",
                     targetId = targetId,
-                    status = uniffi.bmux_mobile_ffi.ConnectionStatusFfi.CONNECTED,
+                    status = ConnectionStatusFfi.CONNECTED,
                     session = session,
                     lastError = null,
                 ),
             )
         }
-
-        return runCatching { client.connect(targetId, session) }
+        return connected
     }
 
     fun observeAndApplyPin(target: String): Result<String> {
@@ -231,8 +312,17 @@ private class MobileGateway {
         return runCatching {
             val suggestion: HostKeyPinSuggestionFfi = client.observeSshHostKeyWithPinSuggestion(target)
             val pinned = client.applyPinSuggestionToTarget(target, suggestion)
-            "Pinned ${suggestion.observed.algorithm} ${suggestion.observed.fingerprintSha256.take(16)}... on $pinned"
+            store.savePinnedTarget(pinned)
+            "Pinned ${suggestion.observed.algorithm} ${suggestion.observed.fingerprintSha256.take(16)}..."
         }
+    }
+
+    fun startReconnectService(targetId: String, session: String?) {
+        ConnectionForegroundService.start(context, targetId, session)
+    }
+
+    fun stopReconnectService() {
+        ConnectionForegroundService.stop(context)
     }
 
     private fun mapTarget(record: TargetRecordFfi): TargetUi = TargetUi(
@@ -250,6 +340,13 @@ private class MobileGateway {
     }
 }
 
+private fun TargetUi.toStored(): StoredTarget = StoredTarget(
+    id = id,
+    name = name,
+    canonicalTarget = canonicalTarget,
+    transport = transport,
+)
+
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 private fun MainScreen(vm: MainViewModel) {
@@ -264,7 +361,7 @@ private fun MainScreen(vm: MainViewModel) {
                 .fillMaxSize()
                 .padding(padding)
                 .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(text = state.info, style = MaterialTheme.typography.bodyMedium)
 
@@ -292,6 +389,9 @@ private fun MainScreen(vm: MainViewModel) {
                 Button(onClick = { vm.refreshTargets() }) {
                     Text("Refresh")
                 }
+                Button(onClick = { vm.setDiscoveryEnabled(!state.discoveryRunning) }) {
+                    Text(if (state.discoveryRunning) "Stop discovery" else "Start discovery")
+                }
             }
 
             OutlinedTextField(
@@ -312,22 +412,52 @@ private fun MainScreen(vm: MainViewModel) {
                 Text(text = state.lastHostKey)
             }
 
+            if (state.discoveredTargets.isNotEmpty()) {
+                Text(text = "Discovered on LAN", fontWeight = FontWeight.SemiBold)
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(bottom = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    items(state.discoveredTargets, key = { "${it.host}:${it.port}" }) { target ->
+                        Card(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column {
+                                    Text(target.serviceName, fontWeight = FontWeight.SemiBold)
+                                    Text("${target.host}:${target.port}")
+                                }
+                                Button(onClick = { vm.importDiscoveredTarget(target) }) {
+                                    Text("Import")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             Text(
-                text = if (state.loading) "Connecting..." else "Targets",
+                text = if (state.loading) "Working..." else "Targets",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
             )
 
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(bottom = 48.dp),
+                contentPadding = PaddingValues(bottom = 40.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(state.targets, key = { it.id }) { target ->
                     TargetCard(
                         target = target,
+                        reconnectEnabled = state.reconnectServiceEnabled,
                         onConnect = { vm.connect(target) },
                         onPin = { vm.observeAndPin(target) },
+                        onToggleReconnect = { vm.setReconnectService(target, !state.reconnectServiceEnabled) },
                     )
                 }
             }
@@ -336,7 +466,13 @@ private fun MainScreen(vm: MainViewModel) {
 }
 
 @Composable
-private fun TargetCard(target: TargetUi, onConnect: () -> Unit, onPin: () -> Unit) {
+private fun TargetCard(
+    target: TargetUi,
+    reconnectEnabled: Boolean,
+    onConnect: () -> Unit,
+    onPin: () -> Unit,
+    onToggleReconnect: () -> Unit,
+) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier
@@ -353,6 +489,9 @@ private fun TargetCard(target: TargetUi, onConnect: () -> Unit, onPin: () -> Uni
                 }
                 Button(onClick = onPin) {
                     Text("Observe + Pin")
+                }
+                Button(onClick = onToggleReconnect) {
+                    Text(if (reconnectEnabled) "Stop Reconnect" else "Reconnect")
                 }
             }
         }
