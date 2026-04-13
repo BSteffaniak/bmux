@@ -59,18 +59,22 @@ class ConnectionForegroundService : Service() {
         val id = targetId ?: return
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
-            var backoffMs = 1_000L
+            val backoff = ReconnectBackoff()
             while (isActive) {
-                val result = runCatching { ffi?.connect(id, session) }
+                val client = ffi
+                val result = if (client != null) {
+                    runCatching { client.connect(id, session) }
+                } else {
+                    Result.failure(IllegalStateException("FFI unavailable for reconnect"))
+                }
                 if (result.isSuccess) {
                     notifyForeground(channelId, "Connected. Keeping session alive")
-                    backoffMs = 1_000L
+                    backoff.reset()
                     delay(30_000)
                 } else {
                     val message = result.exceptionOrNull()?.message ?: "Reconnect failed"
                     notifyForeground(channelId, message)
-                    delay(backoffMs)
-                    backoffMs = (backoffMs * 2).coerceAtMost(60_000L)
+                    delay(backoff.nextDelayMs())
                 }
             }
         }
@@ -96,23 +100,48 @@ class ConnectionForegroundService : Service() {
     }
 
     companion object {
-        private const val ACTION_START = "io.bmux.android.RECONNECT_START"
-        private const val ACTION_STOP = "io.bmux.android.RECONNECT_STOP"
-        private const val EXTRA_TARGET_ID = "target_id"
-        private const val EXTRA_SESSION = "session"
+        const val ACTION_START = "io.bmux.android.RECONNECT_START"
+        const val ACTION_STOP = "io.bmux.android.RECONNECT_STOP"
+        const val EXTRA_TARGET_ID = "target_id"
+        const val EXTRA_SESSION = "session"
 
-        fun start(context: Context, targetId: String, session: String?) {
-            val intent = Intent(context, ConnectionForegroundService::class.java)
+        fun createStartIntent(context: Context, targetId: String, session: String?): Intent {
+            return Intent(context, ConnectionForegroundService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_TARGET_ID, targetId)
                 .putExtra(EXTRA_SESSION, session)
+        }
+
+        fun createStopIntent(context: Context): Intent {
+            return Intent(context, ConnectionForegroundService::class.java)
+                .setAction(ACTION_STOP)
+        }
+
+        fun start(context: Context, targetId: String, session: String?) {
+            val intent = createStartIntent(context, targetId, session)
             context.startForegroundService(intent)
         }
 
         fun stop(context: Context) {
-            val intent = Intent(context, ConnectionForegroundService::class.java)
-                .setAction(ACTION_STOP)
+            val intent = createStopIntent(context)
             context.startService(intent)
         }
+    }
+}
+
+class ReconnectBackoff(
+    private val initialMs: Long = 1_000L,
+    private val maxMs: Long = 60_000L,
+) {
+    private var currentMs = initialMs
+
+    fun nextDelayMs(): Long {
+        val next = currentMs
+        currentMs = (currentMs * 2).coerceAtMost(maxMs)
+        return next
+    }
+
+    fun reset() {
+        currentMs = initialMs
     }
 }

@@ -5,6 +5,15 @@ Android client for connection-first bmux remote workflows.
 M4 status: baseline Compose Android app module is now scaffolded with target
 import/list, connect, and host-key observe/pin flows wired to UniFFI.
 
+M5 status: discovery, reconnect, and security hardening are now wired:
+
+- mDNS LAN discovery using Android NSD
+- reconnect foreground service with exponential backoff loop
+- encrypted local persistence for targets, pin history, discovery history,
+  and target health timestamps
+- runtime permission prompts for discovery and notifications on Android 13+
+- androidTest coverage for reconnect/backoff behavior and secure-store migration
+
 ## UniFFI Kotlin Binding Task
 
 This folder includes a tiny Gradle task for generating Kotlin bindings from
@@ -26,6 +35,7 @@ The task will:
 From `apps/android`:
 
 1. `./gradlew :app:assembleDebug`
+2. `./gradlew :app:assembleDebugAndroidTest`
 
 Main UI file:
 

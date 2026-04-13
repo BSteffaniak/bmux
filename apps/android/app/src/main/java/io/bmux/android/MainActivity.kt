@@ -1,9 +1,15 @@
 package io.bmux.android
 
+import android.Manifest
 import android.app.Application
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -24,10 +30,12 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -71,6 +79,7 @@ data class MainUiState(
     val loading: Boolean = false,
     val targets: List<TargetUi> = emptyList(),
     val discoveredTargets: List<DiscoveredTargetUi> = emptyList(),
+    val discoveryHistory: List<DiscoveredTargetUi> = emptyList(),
     val discoveryRunning: Boolean = false,
     val reconnectServiceEnabled: Boolean = false,
     val selectedSession: String = "main",
@@ -101,6 +110,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             state = state.copy(
                 loading = false,
                 targets = loaded,
+                discoveryHistory = gateway.discoveryHistory(),
                 info = gateway.startupInfoWithSecurityState(),
             )
         }
@@ -196,6 +206,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         discovery.start(
             onUpdate = { discovered ->
+                gateway.recordDiscoverySnapshot(
+                    discovered.map { DiscoveredTargetUi(it.serviceName, it.host, it.port) },
+                )
                 viewModelScope.launch {
                     state = state.copy(
                         discoveryRunning = true,
@@ -235,17 +248,25 @@ private class MobileGateway(application: Application) {
         "FFI unavailable in this runtime; offline encrypted store mode"
     }
 
+    init {
+        store.migrateLegacyIfNeeded()
+    }
+
     fun startupInfoWithSecurityState(): String {
         val pinnedCount = store.pinnedTargets().size
         val lastTarget = store.lastConnectedTargetId()
+        val migrated = if (store.migrateLegacyIfNeeded()) "legacy migrated" else "secure"
         val suffix = if (lastTarget != null) "last target tracked" else "no prior target"
-        return "$startupInfo | pinned=$pinnedCount | $suffix"
+        return "$startupInfo | pinned=$pinnedCount | $suffix | $migrated"
     }
 
     fun listTargets(): List<TargetUi> {
+        val healthMap = store.loadTargetHealth().associateBy { it.targetId }
         val fromFfi = runCatching { ffi?.listTargets() }
             .getOrNull()
             ?.map(::mapTarget)
+            ?.sortedWith(compareByDescending<TargetUi> { healthMap[it.id]?.lastSuccessMs ?: 0L }
+                .thenBy { it.name.lowercase() })
             .orEmpty()
         if (fromFfi.isNotEmpty()) {
             store.saveTargets(fromFfi.map { it.toStored() })
@@ -258,7 +279,8 @@ private class MobileGateway(application: Application) {
                 canonicalTarget = it.canonicalTarget,
                 transport = it.transport,
             )
-        }
+        }.sortedWith(compareByDescending<TargetUi> { healthMap[it.id]?.lastSuccessMs ?: 0L }
+            .thenBy { it.name.lowercase() })
     }
 
     fun importTarget(source: String, displayName: String?): Result<TargetUi> {
@@ -302,6 +324,11 @@ private class MobileGateway(application: Application) {
                 ),
             )
         }
+        store.recordTargetHealth(
+            targetId = targetId,
+            success = connected.isSuccess,
+            timestampMs = System.currentTimeMillis(),
+        )
         return connected
     }
 
@@ -323,6 +350,29 @@ private class MobileGateway(application: Application) {
 
     fun stopReconnectService() {
         ConnectionForegroundService.stop(context)
+    }
+
+    fun recordDiscoverySnapshot(targets: List<DiscoveredTargetUi>) {
+        store.upsertDiscoveryHistory(
+            targets.map {
+                StoredDiscovery(
+                    serviceName = it.serviceName,
+                    host = it.host,
+                    port = it.port,
+                    lastSeenMs = System.currentTimeMillis(),
+                )
+            },
+        )
+    }
+
+    fun discoveryHistory(): List<DiscoveredTargetUi> {
+        return store.loadDiscoveryHistory().map {
+            DiscoveredTargetUi(
+                serviceName = it.serviceName,
+                host = it.host,
+                port = it.port,
+            )
+        }
     }
 
     private fun mapTarget(record: TargetRecordFfi): TargetUi = TargetUi(
@@ -351,6 +401,21 @@ private fun TargetUi.toStored(): StoredTarget = StoredTarget(
 @OptIn(ExperimentalMaterial3Api::class)
 private fun MainScreen(vm: MainViewModel) {
     val state = vm.state
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val discoveryPermissions = remember { discoveryRuntimePermissions() }
+    val notificationPermissions = remember { notificationRuntimePermissions() }
+
+    val discoveryPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { granted ->
+        if (granted.values.all { it }) {
+            vm.setDiscoveryEnabled(!state.discoveryRunning)
+        }
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { _ -> }
+
     Scaffold(
         topBar = {
             TopAppBar(title = { Text("bmux mobile alpha") })
@@ -389,7 +454,13 @@ private fun MainScreen(vm: MainViewModel) {
                 Button(onClick = { vm.refreshTargets() }) {
                     Text("Refresh")
                 }
-                Button(onClick = { vm.setDiscoveryEnabled(!state.discoveryRunning) }) {
+                Button(onClick = {
+                    if (hasAllPermissions(context, discoveryPermissions)) {
+                        vm.setDiscoveryEnabled(!state.discoveryRunning)
+                    } else {
+                        discoveryPermissionLauncher.launch(discoveryPermissions)
+                    }
+                }) {
                     Text(if (state.discoveryRunning) "Stop discovery" else "Start discovery")
                 }
             }
@@ -440,6 +511,34 @@ private fun MainScreen(vm: MainViewModel) {
                 }
             }
 
+            if (!state.discoveryRunning && state.discoveredTargets.isEmpty() && state.discoveryHistory.isNotEmpty()) {
+                Text(text = "Recent LAN targets", fontWeight = FontWeight.SemiBold)
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(bottom = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    items(state.discoveryHistory, key = { "recent-${it.host}:${it.port}" }) { target ->
+                        Card(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column {
+                                    Text(target.serviceName, fontWeight = FontWeight.SemiBold)
+                                    Text("${target.host}:${target.port}")
+                                }
+                                Button(onClick = { vm.importDiscoveredTarget(target) }) {
+                                    Text("Import")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             Text(
                 text = if (state.loading) "Working..." else "Targets",
                 style = MaterialTheme.typography.titleMedium,
@@ -457,11 +556,42 @@ private fun MainScreen(vm: MainViewModel) {
                         reconnectEnabled = state.reconnectServiceEnabled,
                         onConnect = { vm.connect(target) },
                         onPin = { vm.observeAndPin(target) },
-                        onToggleReconnect = { vm.setReconnectService(target, !state.reconnectServiceEnabled) },
+                        onToggleReconnect = {
+                            if (!state.reconnectServiceEnabled && !hasAllPermissions(context, notificationPermissions)) {
+                                notificationPermissionLauncher.launch(notificationPermissions)
+                            } else {
+                                vm.setReconnectService(target, !state.reconnectServiceEnabled)
+                            }
+                        },
                     )
                 }
             }
         }
+    }
+}
+
+private fun discoveryRuntimePermissions(): Array<String> {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
+    } else {
+        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+}
+
+private fun notificationRuntimePermissions(): Array<String> {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        arrayOf(Manifest.permission.POST_NOTIFICATIONS)
+    } else {
+        emptyArray()
+    }
+}
+
+private fun hasAllPermissions(context: Context, permissions: Array<String>): Boolean {
+    if (permissions.isEmpty()) {
+        return true
+    }
+    return permissions.all { permission ->
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
     }
 }
 
