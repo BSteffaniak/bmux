@@ -66,6 +66,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("com.google.android.material:material:1.13.0")
+    implementation("org.connectbot:termlib:0.0.27")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     implementation("net.java.dev.jna:jna:5.17.0@aar")

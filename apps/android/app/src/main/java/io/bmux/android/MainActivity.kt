@@ -39,6 +39,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import io.bmux.android.terminal.TerminalEndpoint
+import io.bmux.android.terminal.TerminalSessionScreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -83,6 +85,7 @@ data class MainUiState(
     val discoveryRunning: Boolean = false,
     val reconnectServiceEnabled: Boolean = false,
     val selectedSession: String = "main",
+    val activeTerminalTarget: TargetUi? = null,
     val lastConnection: String = "",
     val lastHostKey: String = "",
     val info: String = "",
@@ -213,6 +216,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             AlphaTelemetry.log(AlphaEventKind.ReconnectDisabled, "target=${target.id}")
         }
         state = state.copy(reconnectServiceEnabled = enabled)
+    }
+
+    fun openTerminal(target: TargetUi) {
+        state = state.copy(activeTerminalTarget = target, warning = null)
+    }
+
+    fun closeTerminal() {
+        state = state.copy(activeTerminalTarget = null)
+    }
+
+    fun connectForTerminal(targetId: String, session: String?): Result<String> {
+        return gateway.connect(targetId, session).map { connection ->
+            "Connection status: ${connection.status.name}"
+        }
     }
 
     fun setDiscoveryEnabled(enabled: Boolean) {
@@ -450,6 +467,22 @@ private fun MainScreen(vm: MainViewModel) {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            state.activeTerminalTarget?.let { activeTarget ->
+                TerminalSessionScreen(
+                    endpoint = TerminalEndpoint(
+                        id = activeTarget.id,
+                        name = activeTarget.name,
+                        canonicalTarget = activeTarget.canonicalTarget,
+                    ),
+                    session = state.selectedSession.ifBlank { null },
+                    onBack = vm::closeTerminal,
+                    connectAttempt = { targetId, session ->
+                        withContext(Dispatchers.IO) { vm.connectForTerminal(targetId, session) }
+                    },
+                )
+                return@Column
+            }
+
             Text(text = state.info, style = MaterialTheme.typography.bodyMedium)
 
             OutlinedTextField(
@@ -577,6 +610,7 @@ private fun MainScreen(vm: MainViewModel) {
                         target = target,
                         reconnectEnabled = state.reconnectServiceEnabled,
                         onConnect = { vm.connect(target) },
+                        onTerminal = { vm.openTerminal(target) },
                         onPin = { vm.observeAndPin(target) },
                         onToggleReconnect = {
                             if (!state.reconnectServiceEnabled && !hasAllPermissions(context, notificationPermissions)) {
@@ -622,6 +656,7 @@ private fun TargetCard(
     target: TargetUi,
     reconnectEnabled: Boolean,
     onConnect: () -> Unit,
+    onTerminal: () -> Unit,
     onPin: () -> Unit,
     onToggleReconnect: () -> Unit,
 ) {
@@ -638,6 +673,9 @@ private fun TargetCard(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = onConnect) {
                     Text("Connect")
+                }
+                Button(onClick = onTerminal) {
+                    Text("Terminal")
                 }
                 Button(onClick = onPin) {
                     Text("Observe + Pin")
