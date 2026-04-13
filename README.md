@@ -118,8 +118,13 @@ bmux sandbox tail --latest-failed --tail 120 --json
 bmux sandbox open --latest-failed --json
 bmux sandbox rerun --latest-failed --bmux-bin ./target/debug/bmux --json
 bmux sandbox triage --json
+bmux sandbox triage --latest-failed --bundle --bundle-output ./sandbox-artifacts --json
+bmux sandbox triage --latest-failed --bundle --bundle-strict-verify --json
 bmux sandbox triage --latest-failed --rerun --bmux-bin ./target/debug/bmux
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
+bmux sandbox bundle bmux-sbx-123 --include-env --verify --json
+bmux sandbox verify-bundle ./sandbox-artifacts/bmux-sbx-123-1700000000000 --json
+bmux sandbox verify-bundle ./sandbox-artifacts/bmux-sbx-123-1700000000000 --strict --json
 bmux sandbox doctor --json
 bmux sandbox doctor --fix --dry-run --json
 bmux sandbox cleanup --dry-run --json
