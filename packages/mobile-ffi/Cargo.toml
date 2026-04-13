@@ -10,6 +10,9 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 bmux_mobile_core = { workspace = true }
 thiserror        = { workspace = true }

@@ -11,15 +11,14 @@ This folder includes a tiny Gradle task for generating Kotlin bindings from
 
 From `apps/android`:
 
-1. `gradle generateUniffiKotlinBindings`
+1. `./gradlew generateUniffiKotlinBindings`
 
 The task will:
 
 - run `cargo build -p bmux_mobile_ffi`
-- run `uniffi-bindgen generate --language kotlin`
+- run `cargo install --locked --root apps/android/.tools uniffi --version 0.31.0 --features cli` (if missing)
+- run `.tools/bin/uniffi-bindgen generate --language kotlin`
 - write output to `apps/android/generated/uniffi`
-
-Note: this task expects `uniffi-bindgen` to be available on `PATH`.
 
 Product direction for v1:
 

@@ -52,6 +52,7 @@
             nodePackages.markdownlint-cli
             pkg-config
             openssl
+            jdk21_headless
             fish
             codeql
           ];
@@ -65,6 +66,7 @@
             echo "  - cargo-deny ($(cargo deny --version))"
             echo "  - cargo-machete ($(cargo machete --version))"
             echo "  - markdownlint ($(markdownlint --version))"
+            echo "  - java ($(java -version 2>&1 | head -1))"
             echo "  - codeql ($(codeql --version | head -1))"
             echo ""
             echo "Run 'markdownlint *.md **/*.md' to lint all markdown files"

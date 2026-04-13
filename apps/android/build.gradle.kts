@@ -6,6 +6,25 @@ plugins {
 
 val workspaceRoot = layout.projectDirectory.dir("../..").asFile
 val generatedDir = layout.projectDirectory.dir("generated/uniffi").asFile
+val localToolsDir = layout.projectDirectory.dir(".tools").asFile
+
+val installUniffiBindgen = tasks.register<Exec>("installUniffiBindgen") {
+    group = "bmux"
+    description = "Installs uniffi-bindgen locally for wrapper task usage"
+    workingDir = workspaceRoot
+    commandLine(
+        "cargo",
+        "install",
+        "--locked",
+        "--root",
+        localToolsDir.absolutePath,
+        "uniffi",
+        "--version",
+        "0.31.0",
+        "--features",
+        "cli",
+    )
+}
 
 val cargoBuildMobileFfi = tasks.register<Exec>("cargoBuildMobileFfi") {
     group = "bmux"
@@ -14,12 +33,13 @@ val cargoBuildMobileFfi = tasks.register<Exec>("cargoBuildMobileFfi") {
     commandLine("cargo", "build", "-p", "bmux_mobile_ffi")
 }
 
-tasks.register("generateUniffiKotlinBindings") {
+tasks.register<Exec>("generateUniffiKotlinBindings") {
     group = "bmux"
     description = "Generates Kotlin bindings from bmux_mobile_ffi via UniFFI"
+    dependsOn(installUniffiBindgen)
     dependsOn(cargoBuildMobileFfi)
 
-    doLast {
+    doFirst {
         generatedDir.mkdirs()
 
         val os = OperatingSystem.current()
@@ -39,18 +59,26 @@ tasks.register("generateUniffiKotlinBindings") {
             throw GradleException("Expected library not found at $libraryPath")
         }
 
-        exec {
-            workingDir = workspaceRoot
-            commandLine(
-                "uniffi-bindgen",
-                "generate",
-                "--library",
-                libraryPath,
-                "--language",
-                "kotlin",
-                "--out-dir",
-                generatedDir.absolutePath,
-            )
+        val bindgenName = if (os.isWindows) "uniffi-bindgen.exe" else "uniffi-bindgen"
+        val bindgenPath = localToolsDir
+            .resolve("bin")
+            .resolve(bindgenName)
+            .absolutePath
+
+        if (!file(bindgenPath).exists()) {
+            throw GradleException("Expected uniffi-bindgen not found at $bindgenPath")
         }
+
+        workingDir = workspaceRoot
+        commandLine(
+            bindgenPath,
+            "generate",
+            "--library",
+            libraryPath,
+            "--language",
+            "kotlin",
+            "--out-dir",
+            generatedDir.absolutePath,
+        )
     }
 }
