@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use bmux_cli_schema::SandboxEnvModeArg;
 use bmux_config::ConfigPaths;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -380,6 +382,8 @@ struct BundleArtifactMetadata {
     bytes: u64,
     file_count: usize,
     exists: bool,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1914,6 +1918,16 @@ fn verify_bundle_artifacts_metadata(
                 actual: actual.file_count.to_string(),
             });
         }
+        if let Some(expected_hash) = expected_entry.sha256.as_ref()
+            && actual.sha256.as_deref() != Some(expected_hash.as_str())
+        {
+            issues.push(BundleVerifyIssue {
+                path: expected_entry.path.clone(),
+                field: "sha256".to_string(),
+                expected: expected_hash.clone(),
+                actual: actual.sha256.unwrap_or_else(|| "missing".to_string()),
+            });
+        }
     }
 
     issues
@@ -1936,6 +1950,7 @@ fn verify_bundle_artifacts_existence(
             bytes: 0,
             file_count: 0,
             exists: true,
+            sha256: None,
         };
         let actual = bundle_artifact_metadata_for_expected(bundle_root, &expected);
         if !actual.exists {
@@ -1967,22 +1982,34 @@ fn bundle_artifact_metadata_for_expected(
     let path = bundle_root.join(relative);
     if expected.kind == "directory" {
         let (bytes, file_count, exists) = directory_stats(&path);
+        let sha256 = if expected.sha256.is_some() {
+            directory_sha256_hex(&path)
+        } else {
+            None
+        };
         return BundleArtifactMetadata {
             path: expected.path.clone(),
             kind: "directory".to_string(),
             bytes,
             file_count,
             exists,
+            sha256,
         };
     }
 
     let (bytes, exists) = file_bytes(&path);
+    let sha256 = if expected.sha256.is_some() {
+        file_sha256_hex(&path)
+    } else {
+        None
+    };
     BundleArtifactMetadata {
         path: expected.path.clone(),
         kind: "file".to_string(),
         bytes,
         file_count: usize::from(exists),
         exists,
+        sha256,
     }
 }
 
@@ -2069,6 +2096,7 @@ fn bundle_artifact_metadata(
                     bytes,
                     file_count,
                     exists,
+                    sha256: directory_sha256_hex(&path),
                 };
             }
 
@@ -2079,9 +2107,92 @@ fn bundle_artifact_metadata(
                 bytes,
                 file_count: usize::from(exists),
                 exists,
+                sha256: file_sha256_hex(&path),
             }
         })
         .collect()
+}
+
+fn file_sha256_hex(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let bytes_read = file.read(&mut buffer).ok()?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Some(hex_encode_digest(hasher.finalize()))
+}
+
+fn directory_sha256_hex(path: &Path) -> Option<String> {
+    if !path.is_dir() {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    collect_directory_hash_entries(path, path, &mut entries).ok()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hasher = Sha256::new();
+    for (relative, digest) in entries {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(digest.as_bytes());
+        hasher.update([b'\n']);
+    }
+
+    Some(hex_encode_digest(hasher.finalize()))
+}
+
+fn collect_directory_hash_entries(
+    root: &Path,
+    current: &Path,
+    entries: &mut Vec<(String, String)>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(current)
+        .with_context(|| format!("failed reading {}", current.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed reading {}", current.display()))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed reading type for {}", entry_path.display()))?;
+
+        if file_type.is_dir() {
+            collect_directory_hash_entries(root, &entry_path, entries)?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let digest = file_sha256_hex(&entry_path)
+            .ok_or_else(|| anyhow::anyhow!("failed hashing {}", entry_path.display()))?;
+        let relative = entry_path
+            .strip_prefix(root)
+            .map_or_else(|_| entry_path.clone(), PathBuf::from)
+            .to_string_lossy()
+            .replace('\\', "/");
+        entries.push((relative, digest));
+    }
+
+    Ok(())
+}
+
+fn hex_encode_digest(digest: impl AsRef<[u8]>) -> String {
+    let bytes = digest.as_ref();
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
 }
 
 fn file_bytes(path: &Path) -> (u64, bool) {

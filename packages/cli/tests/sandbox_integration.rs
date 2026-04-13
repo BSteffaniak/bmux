@@ -452,6 +452,12 @@ fn sandbox_bundle_includes_optional_artifacts_when_requested() {
         env_entry["bytes"].as_u64().is_some_and(|bytes| bytes > 0),
         "env metadata should include file bytes"
     );
+    assert!(
+        env_entry["sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64),
+        "env metadata should include sha256 hash"
+    );
 
     let logs_entry = artifact_metadata
         .iter()
@@ -464,6 +470,12 @@ fn sandbox_bundle_includes_optional_artifacts_when_requested() {
             .as_u64()
             .is_some_and(|count| count >= 1),
         "logs metadata should include at least one file"
+    );
+    assert!(
+        logs_entry["sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64),
+        "logs metadata should include sha256 hash"
     );
 }
 
@@ -864,6 +876,197 @@ fn sandbox_verify_bundle_fails_for_unsupported_bundle_version() {
             .is_some_and(|reason| reason.contains("bundle_version")),
         "version check reason should mention bundle_version"
     );
+}
+
+#[test]
+#[serial]
+fn sandbox_verify_bundle_detects_sha256_mismatch() {
+    let sandbox = CommandSandbox::new("verify-bundle-sha256-mismatch");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--name",
+            "verify-bundle-sha-source",
+            "--",
+            "no-such-command",
+        ])
+        .output()
+        .expect("run failed sandbox for sha mismatch source");
+    assert!(!run_output.status.success(), "source sandbox should fail");
+    let run_json = parse_json_stdout(&run_output);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let bundle_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "bundle",
+            sandbox_id.as_str(),
+            "--include-env",
+            "--output",
+            sandbox
+                .root
+                .path()
+                .join("bundles")
+                .to_string_lossy()
+                .as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("bundle sandbox artifacts for sha mismatch");
+    assert!(bundle_output.status.success(), "bundle should succeed");
+    let bundle_json = parse_json_stdout(&bundle_output);
+    let bundle_dir = PathBuf::from(
+        bundle_json["bundle_dir"]
+            .as_str()
+            .expect("bundle json should include bundle_dir"),
+    );
+
+    let bundle_manifest_path = bundle_dir.join("bundle_manifest.json");
+    let mut bundle_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&bundle_manifest_path).expect("read bundle manifest json"),
+    )
+    .expect("parse bundle manifest json");
+
+    let artifact_metadata = bundle_manifest["artifact_metadata"]
+        .as_array_mut()
+        .expect("artifact metadata should be an array");
+    let env_entry = artifact_metadata
+        .iter_mut()
+        .find(|entry| entry["path"].as_str() == Some("env.json"))
+        .expect("env artifact metadata entry should exist");
+    env_entry["sha256"] =
+        serde_json::json!("0000000000000000000000000000000000000000000000000000000000000000");
+
+    std::fs::write(
+        &bundle_manifest_path,
+        serde_json::to_vec_pretty(&bundle_manifest).expect("serialize mutated bundle manifest"),
+    )
+    .expect("write mutated bundle manifest");
+
+    let verify_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "verify-bundle",
+            bundle_dir.to_string_lossy().as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("verify bundle with sha mismatch");
+    assert!(
+        !verify_output.status.success(),
+        "verify-bundle should fail for sha mismatch"
+    );
+
+    let verify_json = parse_json_stdout(&verify_output);
+    let issues = verify_json["issues"]
+        .as_array()
+        .expect("issues should be an array");
+    assert!(
+        issues.iter().any(|issue| {
+            issue["path"].as_str() == Some("env.json") && issue["field"].as_str() == Some("sha256")
+        }),
+        "verify output should include sha256 mismatch issue"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_verify_bundle_accepts_manifest_without_sha256_metadata() {
+    let sandbox = CommandSandbox::new("verify-bundle-missing-sha256");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--name",
+            "verify-bundle-legacy-sha-source",
+            "--",
+            "no-such-command",
+        ])
+        .output()
+        .expect("run failed sandbox for legacy sha source");
+    assert!(!run_output.status.success(), "source sandbox should fail");
+    let run_json = parse_json_stdout(&run_output);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let bundle_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "bundle",
+            sandbox_id.as_str(),
+            "--include-env",
+            "--output",
+            sandbox
+                .root
+                .path()
+                .join("bundles")
+                .to_string_lossy()
+                .as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("bundle sandbox artifacts for legacy sha validation");
+    assert!(bundle_output.status.success(), "bundle should succeed");
+    let bundle_json = parse_json_stdout(&bundle_output);
+    let bundle_dir = PathBuf::from(
+        bundle_json["bundle_dir"]
+            .as_str()
+            .expect("bundle json should include bundle_dir"),
+    );
+
+    let bundle_manifest_path = bundle_dir.join("bundle_manifest.json");
+    let mut bundle_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&bundle_manifest_path).expect("read bundle manifest json"),
+    )
+    .expect("parse bundle manifest json");
+
+    let artifact_metadata = bundle_manifest["artifact_metadata"]
+        .as_array_mut()
+        .expect("artifact metadata should be an array");
+    for entry in artifact_metadata.iter_mut() {
+        if let Some(object) = entry.as_object_mut() {
+            object.remove("sha256");
+        }
+    }
+
+    std::fs::write(
+        &bundle_manifest_path,
+        serde_json::to_vec_pretty(&bundle_manifest).expect("serialize mutated bundle manifest"),
+    )
+    .expect("write mutated bundle manifest");
+
+    let verify_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "verify-bundle",
+            bundle_dir.to_string_lossy().as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("verify bundle without sha metadata");
+    assert!(
+        verify_output.status.success(),
+        "verify-bundle should accept manifests without sha256 metadata"
+    );
+
+    let verify_json = parse_json_stdout(&verify_output);
+    assert_eq!(verify_json["ok"].as_bool(), Some(true));
 }
 
 #[test]
@@ -2466,6 +2669,7 @@ fn sandbox_triage_bundle_strict_verify_sets_strict_mode() {
         "failed",
     );
 
+    let bundle_output_root = sandbox.root.path().join("triage-bundles");
     let output = sandbox
         .command()
         .args([
@@ -2473,6 +2677,8 @@ fn sandbox_triage_bundle_strict_verify_sets_strict_mode() {
             "triage",
             "bmux-sbx-triage-bundle-strict",
             "--bundle",
+            "--bundle-output",
+            bundle_output_root.to_string_lossy().as_ref(),
             "--bundle-strict-verify",
             "--json",
         ])
