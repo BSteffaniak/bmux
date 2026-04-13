@@ -114,6 +114,9 @@ bmux sandbox list --source playbook --limit 10
 bmux sandbox inspect --latest
 bmux sandbox inspect --latest --source recording-verify
 bmux sandbox inspect --latest-failed --tail 120
+bmux sandbox tail --latest-failed --tail 120 --json
+bmux sandbox open --latest-failed --json
+bmux sandbox rerun --latest-failed --bmux-bin ./target/debug/bmux --json
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 bmux sandbox doctor --json
 bmux sandbox doctor --fix --dry-run --json

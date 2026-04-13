@@ -119,6 +119,9 @@ pub enum BuiltInHandlerId {
     SandboxList,
     SandboxStatus,
     SandboxInspect,
+    SandboxTail,
+    SandboxOpen,
+    SandboxRerun,
     SandboxDoctor,
     SandboxBundle,
     SandboxCleanup,
@@ -738,6 +741,21 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::SandboxInspect,
             &["sandbox", "inspect"],
             "Inspect bmux sandbox metadata and logs",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxTail,
+            &["sandbox", "tail"],
+            "Tail logs from a sandbox quickly",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxOpen,
+            &["sandbox", "open"],
+            "Show sandbox paths and repro command",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxRerun,
+            &["sandbox", "rerun"],
+            "Rerun command from sandbox manifest",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SandboxDoctor,

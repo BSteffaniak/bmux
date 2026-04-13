@@ -289,6 +289,20 @@ pub(super) struct RunSandboxOptions<'a> {
     pub(super) name: Option<&'a str>,
 }
 
+pub(super) struct RerunSandboxOptions<'a> {
+    pub(super) inspect: InspectTargetOptions<'a>,
+    pub(super) run: RunSandboxOptions<'a>,
+    pub(super) bmux_bin_override: Option<&'a str>,
+    pub(super) env_mode_override: Option<SandboxEnvModeArg>,
+}
+
+pub(super) struct InspectTargetOptions<'a> {
+    pub(super) target: Option<&'a str>,
+    pub(super) latest: bool,
+    pub(super) latest_failed: bool,
+    pub(super) source_filter: Option<&'a str>,
+}
+
 pub(super) async fn run_sandbox_run(
     options: RunSandboxOptions<'_>,
     command_args: &[String],
@@ -798,6 +812,129 @@ pub(super) fn run_sandbox_inspect(
     }
 
     Ok(0)
+}
+
+pub(super) fn run_sandbox_tail(
+    target: Option<&str>,
+    latest: bool,
+    latest_failed: bool,
+    source_filter: Option<&str>,
+    tail: usize,
+    json: bool,
+) -> Result<u8> {
+    let collection = collect_sandbox_candidates();
+    let root = resolve_inspect_target(
+        target,
+        latest,
+        latest_failed,
+        source_filter,
+        &collection.candidates,
+    )?;
+    let log_tail = read_log_tail(&root, tail);
+
+    if json {
+        let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+            "reconcile": collection.reconcile,
+            "root": root.to_string_lossy().to_string(),
+            "log_tail": log_tail,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("logs: {}", root.join("logs").display());
+        for line in log_tail {
+            println!("{line}");
+        }
+    }
+
+    Ok(0)
+}
+
+pub(super) fn run_sandbox_open(
+    target: Option<&str>,
+    latest: bool,
+    latest_failed: bool,
+    source_filter: Option<&str>,
+    json: bool,
+) -> Result<u8> {
+    let collection = collect_sandbox_candidates();
+    let root = resolve_inspect_target(
+        target,
+        latest,
+        latest_failed,
+        source_filter,
+        &collection.candidates,
+    )?;
+    let manifest = read_manifest(&root)?;
+    let log_dir = root.join("logs");
+    let latest_log = newest_regular_file(&log_dir);
+    let repro = format_repro_command_from_manifest(&manifest);
+
+    if json {
+        let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+            "reconcile": collection.reconcile,
+            "root": root.to_string_lossy().to_string(),
+            "log_dir": log_dir.to_string_lossy().to_string(),
+            "latest_log": latest_log.map(|path| path.to_string_lossy().to_string()),
+            "repro": repro,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("root: {}", root.display());
+        println!("logs: {}", log_dir.display());
+        if let Some(path) = latest_log {
+            println!("latest_log: {}", path.display());
+        }
+        println!("repro: {repro}");
+    }
+
+    Ok(0)
+}
+
+pub(super) async fn run_sandbox_rerun(options: RerunSandboxOptions<'_>) -> Result<u8> {
+    let collection = collect_sandbox_candidates();
+    let root = resolve_inspect_target(
+        options.inspect.target,
+        options.inspect.latest,
+        options.inspect.latest_failed,
+        options.inspect.source_filter,
+        &collection.candidates,
+    )?;
+    let manifest = read_manifest(&root)?;
+    anyhow::ensure!(
+        !manifest.command.is_empty(),
+        "sandbox manifest has no command to rerun"
+    );
+
+    let resolved_env_mode = options
+        .env_mode_override
+        .unwrap_or_else(|| manifest_env_mode(&manifest));
+    let bmux_bin_owned = options
+        .bmux_bin_override
+        .map_or_else(|| manifest.bmux_bin.clone(), ToOwned::to_owned);
+
+    run_sandbox_run(
+        RunSandboxOptions {
+            bmux_bin: Some(bmux_bin_owned.as_str()),
+            env_mode: resolved_env_mode,
+            keep: options.run.keep,
+            json: options.run.json,
+            print_env: options.run.print_env,
+            timeout_secs: options.run.timeout_secs,
+            name: options.run.name,
+        },
+        &manifest.command,
+    )
+    .await
+}
+
+fn manifest_env_mode(manifest: &SandboxManifest) -> SandboxEnvModeArg {
+    match manifest.env_mode.as_str() {
+        "clean" => SandboxEnvModeArg::Clean,
+        "hermetic" => SandboxEnvModeArg::Hermetic,
+        _ => SandboxEnvModeArg::Inherit,
+    }
 }
 
 fn resolve_inspect_target(

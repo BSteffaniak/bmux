@@ -1148,6 +1148,78 @@ pub enum SandboxCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Print sandbox log tail without full manifest output
+    Tail {
+        /// Sandbox id (bmux-sbx-...) or full path
+        sandbox: Option<String>,
+        /// Tail the most recent sandbox
+        #[arg(long, conflicts_with_all = ["latest_failed", "sandbox"])]
+        latest: bool,
+        /// Tail the most recent failed sandbox
+        #[arg(long, conflicts_with_all = ["latest", "sandbox"])]
+        latest_failed: bool,
+        /// Filter source when resolving --latest or --latest-failed
+        #[arg(long, value_enum, default_value = "all")]
+        source: SandboxSourceArg,
+        /// Number of log lines to tail from sandbox logs
+        #[arg(long, default_value_t = 80)]
+        tail: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open sandbox paths and repro context quickly
+    Open {
+        /// Sandbox id (bmux-sbx-...) or full path
+        sandbox: Option<String>,
+        /// Open the most recent sandbox
+        #[arg(long, conflicts_with_all = ["latest_failed", "sandbox"])]
+        latest: bool,
+        /// Open the most recent failed sandbox
+        #[arg(long, conflicts_with_all = ["latest", "sandbox"])]
+        latest_failed: bool,
+        /// Filter source when resolving --latest or --latest-failed
+        #[arg(long, value_enum, default_value = "all")]
+        source: SandboxSourceArg,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rerun command from an existing sandbox manifest
+    Rerun {
+        /// Sandbox id (bmux-sbx-...) or full path
+        sandbox: Option<String>,
+        /// Rerun the most recent sandbox
+        #[arg(long, conflicts_with_all = ["latest_failed", "sandbox"])]
+        latest: bool,
+        /// Rerun the most recent failed sandbox
+        #[arg(long, conflicts_with_all = ["latest", "sandbox"])]
+        latest_failed: bool,
+        /// Filter source when resolving --latest or --latest-failed
+        #[arg(long, value_enum, default_value = "all")]
+        source: SandboxSourceArg,
+        /// Override bmux binary path from manifest
+        #[arg(long)]
+        bmux_bin: Option<String>,
+        /// Override sandbox environment mode from manifest
+        #[arg(long, value_enum)]
+        env_mode: Option<SandboxEnvModeArg>,
+        /// Keep rerun sandbox directory after command exits
+        #[arg(long)]
+        keep: bool,
+        /// Output sandbox metadata as JSON
+        #[arg(long)]
+        json: bool,
+        /// Print fully resolved environment map before executing command
+        #[arg(long)]
+        print_env: bool,
+        /// Kill rerun command if it exceeds this timeout in seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Optional human-friendly sandbox label
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Diagnose sandbox readiness and health checks
     Doctor {
         /// Optional sandbox id/path for targeted checks
@@ -4181,6 +4253,89 @@ mod tests {
                 tail: 80,
                 json: true,
             }
+        ));
+
+        let tail = Cli::try_parse_from([
+            "bmux",
+            "sandbox",
+            "tail",
+            "--latest-failed",
+            "--source",
+            "recording-verify",
+            "--tail",
+            "50",
+            "--json",
+        ])
+        .expect("valid tail args");
+        let Some(Command::Sandbox { command }) = tail.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Tail {
+                sandbox: None,
+                latest: false,
+                latest_failed: true,
+                source: SandboxSourceArg::RecordingVerify,
+                tail: 50,
+                json: true,
+            }
+        ));
+
+        let open = Cli::try_parse_from(["bmux", "sandbox", "open", "--latest", "--json"])
+            .expect("valid open args");
+        let Some(Command::Sandbox { command }) = open.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Open {
+                sandbox: None,
+                latest: true,
+                latest_failed: false,
+                source: SandboxSourceArg::All,
+                json: true,
+            }
+        ));
+
+        let rerun = Cli::try_parse_from([
+            "bmux",
+            "sandbox",
+            "rerun",
+            "--latest-failed",
+            "--source",
+            "playbook",
+            "--bmux-bin",
+            "./target/debug/bmux",
+            "--env-mode",
+            "inherit",
+            "--keep",
+            "--print-env",
+            "--timeout",
+            "20",
+            "--name",
+            "rerun-check",
+            "--json",
+        ])
+        .expect("valid rerun args");
+        let Some(Command::Sandbox { command }) = rerun.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Rerun {
+                sandbox: None,
+                latest: false,
+                latest_failed: true,
+                source: SandboxSourceArg::Playbook,
+                bmux_bin: Some(ref bin),
+                env_mode: Some(SandboxEnvModeArg::Inherit),
+                keep: true,
+                json: true,
+                print_env: true,
+                timeout: Some(20),
+                name: Some(ref name),
+            } if bin == "./target/debug/bmux" && name == "rerun-check"
         ));
     }
 

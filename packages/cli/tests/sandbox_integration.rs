@@ -1536,3 +1536,117 @@ fn sandbox_doctor_fix_applies_recovery_and_rebuilds_index() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["id"].as_str(), Some("bmux-sbx-doctor-apply"));
 }
+
+#[test]
+#[serial]
+fn sandbox_tail_returns_log_lines_for_target() {
+    let sandbox = CommandSandbox::new("tail-shortcut");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-tail-target", "sandbox-cli", "failed");
+    let log_path = tmp_root
+        .join("bmux-sbx-tail-target")
+        .join("logs")
+        .join("run.log");
+    std::fs::write(&log_path, "line-a\nline-b\nline-c\n").expect("write sandbox log file");
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "tail",
+            "bmux-sbx-tail-target",
+            "--tail",
+            "2",
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox tail");
+    assert!(
+        output.status.success(),
+        "sandbox tail should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    let log_tail = json["log_tail"]
+        .as_array()
+        .expect("tail output should include log_tail array");
+    assert_eq!(log_tail.len(), 2);
+    assert_eq!(log_tail[0].as_str(), Some("line-b"));
+    assert_eq!(log_tail[1].as_str(), Some("line-c"));
+}
+
+#[test]
+#[serial]
+fn sandbox_open_returns_paths_and_repro() {
+    let sandbox = CommandSandbox::new("open-shortcut");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-open-target", "sandbox-cli", "failed");
+    let log_path = tmp_root
+        .join("bmux-sbx-open-target")
+        .join("logs")
+        .join("run.log");
+    std::fs::write(&log_path, "open-log\n").expect("write sandbox log file");
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "open", "bmux-sbx-open-target", "--json"])
+        .output()
+        .expect("run sandbox open");
+    assert!(
+        output.status.success(),
+        "sandbox open should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    let root = json["root"]
+        .as_str()
+        .expect("open output should include root");
+    assert!(root.contains("bmux-sbx-open-target"));
+    assert_eq!(
+        json["latest_log"].as_str(),
+        Some(log_path.to_string_lossy().as_ref())
+    );
+    assert!(
+        json["repro"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--version"),
+        "open output should include repro command"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_rerun_executes_command_from_manifest() {
+    let sandbox = CommandSandbox::new("rerun-shortcut");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-rerun-target", "sandbox-cli", "failed");
+    let bmux_bin = bmux_binary();
+    let bmux_bin_arg = bmux_bin.to_string_lossy().to_string();
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "rerun",
+            "bmux-sbx-rerun-target",
+            "--bmux-bin",
+            bmux_bin_arg.as_str(),
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox rerun");
+    assert!(
+        output.status.success(),
+        "sandbox rerun should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["status"].as_str(), Some("succeeded"));
+}

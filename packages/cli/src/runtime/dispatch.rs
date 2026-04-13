@@ -2,39 +2,42 @@ use anyhow::Result;
 use bmux_cli_schema::{
     AccessCommand, AuthCommand, Command, ConfigCommand, ConfigProfilesCommand, KeymapCommand,
     LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand, RecordingCommand,
-    RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxSourceArg,
-    SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand,
+    RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg,
+    SandboxSourceArg, SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand,
+    TerminalCommand,
 };
 use bmux_config::{BmuxConfig, SandboxCleanupSource};
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
 
 use super::{
-    BuiltInHandlerId, ConnectionContext, RunSandboxOptions, built_in_command_by_handler, recording,
-    run_access_add, run_access_disable, run_access_enable, run_access_init, run_access_list,
-    run_access_remove, run_access_status, run_auth_login, run_auth_logout, run_auth_status,
-    run_client_list, run_config_get, run_config_path, run_config_profiles_diff,
-    run_config_profiles_evaluate, run_config_profiles_explain, run_config_profiles_lint,
-    run_config_profiles_list, run_config_profiles_resolve, run_config_profiles_show,
-    run_config_profiles_switch, run_config_set, run_config_show, run_connect, run_doctor,
-    run_external_plugin_command, run_follow, run_host, run_hosts, run_join, run_keymap_doctor,
-    run_keymap_explain, run_logs_level, run_logs_path, run_logs_profiles_delete,
-    run_logs_profiles_list, run_logs_profiles_rename, run_logs_profiles_show, run_logs_tail,
-    run_logs_watch, run_perf_off, run_perf_on, run_perf_status, run_playbook_cleanup,
-    run_playbook_diff, run_playbook_dry_run, run_playbook_from_recording, run_playbook_interactive,
-    run_playbook_run, run_playbook_validate, run_recording_analyze, run_recording_cut,
-    run_recording_delete, run_recording_delete_all, run_recording_export, run_recording_inspect,
-    run_recording_list, run_recording_path, run_recording_replay, run_recording_start,
-    run_recording_status, run_recording_stop, run_recording_verify_smoke,
-    run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
-    run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade,
-    run_sandbox_bundle, run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect,
-    run_sandbox_list, run_sandbox_rebuild_index, run_sandbox_run, run_sandbox_status,
-    run_server_bridge, run_server_gateway, run_server_recording_clear, run_server_recording_path,
-    run_server_recording_start, run_server_recording_status, run_server_recording_stop,
-    run_server_restore, run_server_save, run_server_start, run_server_status, run_server_stop,
-    run_server_whoami_principal, run_session_attach, run_session_detach, run_session_kill,
-    run_session_kill_all, run_session_list, run_session_new, run_setup, run_share,
-    run_terminal_doctor, run_terminal_install_terminfo, run_unfollow, run_unshare,
+    BuiltInHandlerId, ConnectionContext, InspectTargetOptions, RerunSandboxOptions,
+    RunSandboxOptions, built_in_command_by_handler, recording, run_access_add, run_access_disable,
+    run_access_enable, run_access_init, run_access_list, run_access_remove, run_access_status,
+    run_auth_login, run_auth_logout, run_auth_status, run_client_list, run_config_get,
+    run_config_path, run_config_profiles_diff, run_config_profiles_evaluate,
+    run_config_profiles_explain, run_config_profiles_lint, run_config_profiles_list,
+    run_config_profiles_resolve, run_config_profiles_show, run_config_profiles_switch,
+    run_config_set, run_config_show, run_connect, run_doctor, run_external_plugin_command,
+    run_follow, run_host, run_hosts, run_join, run_keymap_doctor, run_keymap_explain,
+    run_logs_level, run_logs_path, run_logs_profiles_delete, run_logs_profiles_list,
+    run_logs_profiles_rename, run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off,
+    run_perf_on, run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
+    run_playbook_from_recording, run_playbook_interactive, run_playbook_run, run_playbook_validate,
+    run_recording_analyze, run_recording_cut, run_recording_delete, run_recording_delete_all,
+    run_recording_export, run_recording_inspect, run_recording_list, run_recording_path,
+    run_recording_replay, run_recording_start, run_recording_status, run_recording_stop,
+    run_recording_verify_smoke, run_remote_complete_sessions, run_remote_complete_targets,
+    run_remote_doctor, run_remote_init, run_remote_install_server, run_remote_list,
+    run_remote_test, run_remote_upgrade, run_sandbox_bundle, run_sandbox_cleanup,
+    run_sandbox_doctor, run_sandbox_inspect, run_sandbox_list, run_sandbox_open,
+    run_sandbox_rebuild_index, run_sandbox_rerun, run_sandbox_run, run_sandbox_status,
+    run_sandbox_tail, run_server_bridge, run_server_gateway, run_server_recording_clear,
+    run_server_recording_path, run_server_recording_start, run_server_recording_status,
+    run_server_recording_stop, run_server_restore, run_server_save, run_server_start,
+    run_server_status, run_server_stop, run_server_whoami_principal, run_session_attach,
+    run_session_detach, run_session_kill, run_session_kill_all, run_session_list, run_session_new,
+    run_setup, run_share, run_terminal_doctor, run_terminal_install_terminfo, run_unfollow,
+    run_unshare,
 };
 
 pub(super) async fn run_command(
@@ -185,6 +188,9 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             SandboxCommand::List { .. } => BuiltInHandlerId::SandboxList,
             SandboxCommand::Status { .. } => BuiltInHandlerId::SandboxStatus,
             SandboxCommand::Inspect { .. } => BuiltInHandlerId::SandboxInspect,
+            SandboxCommand::Tail { .. } => BuiltInHandlerId::SandboxTail,
+            SandboxCommand::Open { .. } => BuiltInHandlerId::SandboxOpen,
+            SandboxCommand::Rerun { .. } => BuiltInHandlerId::SandboxRerun,
             SandboxCommand::Doctor { .. } => BuiltInHandlerId::SandboxDoctor,
             SandboxCommand::Bundle { .. } => BuiltInHandlerId::SandboxBundle,
             SandboxCommand::Cleanup { .. } => BuiltInHandlerId::SandboxCleanup,
@@ -1483,6 +1489,108 @@ pub(super) async fn dispatch_built_in_command(
                 *tail,
                 *json,
             )
+        }
+        (
+            BuiltInHandlerId::SandboxTail,
+            Command::Sandbox {
+                command:
+                    SandboxCommand::Tail {
+                        sandbox,
+                        latest,
+                        latest_failed,
+                        source,
+                        tail,
+                        json,
+                    },
+            },
+        ) => {
+            let source_filter = match source {
+                SandboxSourceArg::SandboxCli => Some("sandbox-cli"),
+                SandboxSourceArg::Playbook => Some("playbook"),
+                SandboxSourceArg::RecordingVerify => Some("recording-verify"),
+                SandboxSourceArg::All => None,
+            };
+            run_sandbox_tail(
+                sandbox.as_deref(),
+                *latest,
+                *latest_failed,
+                source_filter,
+                *tail,
+                *json,
+            )
+        }
+        (
+            BuiltInHandlerId::SandboxOpen,
+            Command::Sandbox {
+                command:
+                    SandboxCommand::Open {
+                        sandbox,
+                        latest,
+                        latest_failed,
+                        source,
+                        json,
+                    },
+            },
+        ) => {
+            let source_filter = match source {
+                SandboxSourceArg::SandboxCli => Some("sandbox-cli"),
+                SandboxSourceArg::Playbook => Some("playbook"),
+                SandboxSourceArg::RecordingVerify => Some("recording-verify"),
+                SandboxSourceArg::All => None,
+            };
+            run_sandbox_open(
+                sandbox.as_deref(),
+                *latest,
+                *latest_failed,
+                source_filter,
+                *json,
+            )
+        }
+        (
+            BuiltInHandlerId::SandboxRerun,
+            Command::Sandbox {
+                command:
+                    SandboxCommand::Rerun {
+                        sandbox,
+                        latest,
+                        latest_failed,
+                        source,
+                        bmux_bin,
+                        env_mode,
+                        keep,
+                        json,
+                        print_env,
+                        timeout,
+                        name,
+                    },
+            },
+        ) => {
+            let source_filter = match source {
+                SandboxSourceArg::SandboxCli => Some("sandbox-cli"),
+                SandboxSourceArg::Playbook => Some("playbook"),
+                SandboxSourceArg::RecordingVerify => Some("recording-verify"),
+                SandboxSourceArg::All => None,
+            };
+            run_sandbox_rerun(RerunSandboxOptions {
+                inspect: InspectTargetOptions {
+                    target: sandbox.as_deref(),
+                    latest: *latest,
+                    latest_failed: *latest_failed,
+                    source_filter,
+                },
+                run: RunSandboxOptions {
+                    bmux_bin: None,
+                    env_mode: SandboxEnvModeArg::Inherit,
+                    keep: *keep,
+                    json: *json,
+                    print_env: *print_env,
+                    timeout_secs: *timeout,
+                    name: name.as_deref(),
+                },
+                bmux_bin_override: bmux_bin.as_deref(),
+                env_mode_override: *env_mode,
+            })
+            .await
         }
         (
             BuiltInHandlerId::SandboxDoctor,

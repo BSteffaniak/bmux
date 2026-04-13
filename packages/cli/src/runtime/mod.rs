@@ -124,9 +124,10 @@ use remote_cli::{
     run_target_proxy_from_current_argv, run_unshare, should_proxy_to_target,
 };
 use sandbox_cli::{
-    RunSandboxOptions, run_sandbox_bundle, run_sandbox_cleanup, run_sandbox_doctor,
-    run_sandbox_inspect, run_sandbox_list, run_sandbox_rebuild_index, run_sandbox_run,
-    run_sandbox_status,
+    InspectTargetOptions, RerunSandboxOptions, RunSandboxOptions, run_sandbox_bundle,
+    run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect, run_sandbox_list,
+    run_sandbox_open, run_sandbox_rebuild_index, run_sandbox_rerun, run_sandbox_run,
+    run_sandbox_status, run_sandbox_tail,
 };
 use server_commands::{
     run_server_bridge, run_server_gateway, run_server_recording_clear, run_server_recording_path,

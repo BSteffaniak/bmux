@@ -69,6 +69,9 @@ bmux sandbox inspect bmux-sbx-123 --tail 120
 bmux sandbox inspect --latest
 bmux sandbox inspect --latest --source recording-verify
 bmux sandbox inspect --latest-failed --tail 120
+bmux sandbox tail --latest-failed --tail 120 --json
+bmux sandbox open --latest-failed --json
+bmux sandbox rerun --latest-failed --bmux-bin ./target/debug/bmux --json
 
 # Health checks for sandbox runtime
 bmux sandbox doctor --json
