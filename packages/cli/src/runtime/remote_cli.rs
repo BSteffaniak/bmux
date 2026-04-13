@@ -3733,13 +3733,10 @@ fn print_gateway_dry_run_text(
         cluster_name = request.cluster_name,
         command_name = request.command_name,
     );
+    print_gateway_text_table_header();
     for probe in probes {
-        let skip_detail = probe
-            .skip_reason
-            .map(|value| format!(" would skip due to {value}"))
-            .unwrap_or_default();
         println!(
-            "  - {:<24} preferred={:<5} stability={:<6} breaker={:<9} cooldown_ms={:<8} ok={:<5} reason={} latency_ms={}{}",
+            "  {:<24} {:<9} {:<10} {:<10} {:<12} {:<5} {:<14} {:<10} {:<14} {}",
             probe.candidate,
             gateway_bool_label(preferred.is_some_and(|value| value == &probe.candidate)),
             probe.stability_score,
@@ -3748,7 +3745,8 @@ fn print_gateway_dry_run_text(
             gateway_bool_label(probe.probe.ok),
             probe.probe.reason_code,
             probe.probe.latency_ms,
-            skip_detail
+            probe.skip_reason.unwrap_or("-"),
+            probe.probe.detail
         );
     }
     if let Some(selected) = selected {
@@ -4620,13 +4618,11 @@ fn print_cluster_gateway_status(
         selected_candidate.as_deref().unwrap_or("none")
     );
     println!("candidates:");
-    println!(
-        "  {:<24} {:<9} {:<10} {:<10} {:<12} skip",
-        "candidate", "preferred", "stability", "breaker", "cooldown_ms"
-    );
+    print_gateway_text_table_header();
     for row in candidate_rows {
+        let unavailable = "-";
         println!(
-            "  {:<24} {:<9} {:<10} {:<10} {:<12} {}",
+            "  {:<24} {:<9} {:<10} {:<10} {:<12} {:<5} {:<14} {:<10} {:<14} {}",
             row["candidate"].as_str().unwrap_or("-"),
             gateway_bool_label(row["preferred"].as_bool().unwrap_or(false)),
             row["stability_score"].as_u64().unwrap_or(0),
@@ -4634,7 +4630,13 @@ fn print_cluster_gateway_status(
             row["cooldown_ms"]
                 .as_u64()
                 .map_or_else(|| "-".to_string(), |value| value.to_string()),
-            row["skip_reason"].as_str().unwrap_or("-")
+            unavailable,
+            unavailable,
+            row["historical_latency_ms"]
+                .as_u64()
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
+            row["skip_reason"].as_str().unwrap_or("-"),
+            unavailable
         );
     }
     Ok(())
@@ -4771,7 +4773,7 @@ fn print_gateway_explain_probe_line(
     preferred: Option<&String>,
 ) {
     println!(
-        "  - {:<24} preferred={:<5} stability={:<6} breaker={:<9} cooldown_ms={:<8} ok={:<5} reason={} latency_ms={} detail={}{}",
+        "  {:<24} {:<9} {:<10} {:<10} {:<12} {:<5} {:<14} {:<10} {:<14} {}",
         probe_row.candidate,
         gateway_bool_label(preferred.is_some_and(|value| value == &probe_row.candidate)),
         probe_row.stability_score,
@@ -4780,11 +4782,23 @@ fn print_gateway_explain_probe_line(
         gateway_bool_label(probe_row.probe.ok),
         probe_row.probe.reason_code,
         probe_row.probe.latency_ms,
-        probe_row.probe.detail,
-        probe_row
-            .skip_reason
-            .map(|value| format!(" would skip due to {value}"))
-            .unwrap_or_default()
+        probe_row.skip_reason.unwrap_or("-"),
+        probe_row.probe.detail
+    );
+}
+
+fn print_gateway_text_table_header() {
+    println!(
+        "  {:<24} {:<9} {:<10} {:<10} {:<12} {:<5} {:<14} {:<10} {:<14} detail",
+        "candidate",
+        "preferred",
+        "stability",
+        "breaker",
+        "cooldown_ms",
+        "ok",
+        "reason",
+        "latency_ms",
+        "skip"
     );
 }
 
