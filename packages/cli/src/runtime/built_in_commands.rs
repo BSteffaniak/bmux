@@ -122,6 +122,7 @@ pub enum BuiltInHandlerId {
     SandboxTail,
     SandboxOpen,
     SandboxRerun,
+    SandboxTriage,
     SandboxDoctor,
     SandboxBundle,
     SandboxCleanup,
@@ -756,6 +757,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::SandboxRerun,
             &["sandbox", "rerun"],
             "Rerun command from sandbox manifest",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SandboxTriage,
+            &["sandbox", "triage"],
+            "One-shot summary for sandbox failure triage",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SandboxDoctor,

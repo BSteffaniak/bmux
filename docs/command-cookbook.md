@@ -72,6 +72,9 @@ bmux sandbox inspect --latest-failed --tail 120
 bmux sandbox tail --latest-failed --tail 120 --json
 bmux sandbox open --latest-failed --json
 bmux sandbox rerun --latest-failed --bmux-bin ./target/debug/bmux --json
+bmux sandbox triage --json
+bmux sandbox triage --latest-failed --source playbook --tail 120 --json
+bmux sandbox triage --latest-failed --rerun --bmux-bin ./target/debug/bmux
 
 # Health checks for sandbox runtime
 bmux sandbox doctor --json

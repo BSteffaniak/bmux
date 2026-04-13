@@ -1220,6 +1220,47 @@ pub enum SandboxCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// One-shot sandbox failure triage summary
+    Triage {
+        /// Sandbox id (bmux-sbx-...) or full path
+        sandbox: Option<String>,
+        /// Triage the most recent sandbox
+        #[arg(long, conflicts_with_all = ["latest_failed", "sandbox"])]
+        latest: bool,
+        /// Triage the most recent failed sandbox
+        #[arg(long, conflicts_with_all = ["latest", "sandbox"])]
+        latest_failed: bool,
+        /// Filter source when resolving --latest or --latest-failed
+        #[arg(long, value_enum, default_value = "all")]
+        source: SandboxSourceArg,
+        /// Number of log lines to tail from sandbox logs
+        #[arg(long, default_value_t = 80)]
+        tail: usize,
+        /// Rerun command from selected sandbox manifest
+        #[arg(long)]
+        rerun: bool,
+        /// Override bmux binary path from manifest for rerun
+        #[arg(long)]
+        bmux_bin: Option<String>,
+        /// Override sandbox environment mode from manifest for rerun
+        #[arg(long, value_enum)]
+        env_mode: Option<SandboxEnvModeArg>,
+        /// Keep rerun sandbox directory after command exits
+        #[arg(long)]
+        keep: bool,
+        /// Print fully resolved environment map before rerun command
+        #[arg(long)]
+        print_env: bool,
+        /// Kill rerun command if it exceeds this timeout in seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Optional human-friendly sandbox label for rerun
+        #[arg(long)]
+        name: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Diagnose sandbox readiness and health checks
     Doctor {
         /// Optional sandbox id/path for targeted checks
@@ -4336,6 +4377,50 @@ mod tests {
                 timeout: Some(20),
                 name: Some(ref name),
             } if bin == "./target/debug/bmux" && name == "rerun-check"
+        ));
+
+        let triage = Cli::try_parse_from([
+            "bmux",
+            "sandbox",
+            "triage",
+            "--source",
+            "playbook",
+            "--tail",
+            "30",
+            "--rerun",
+            "--bmux-bin",
+            "./target/debug/bmux",
+            "--env-mode",
+            "clean",
+            "--keep",
+            "--print-env",
+            "--timeout",
+            "15",
+            "--name",
+            "triage-rerun",
+            "--json",
+        ])
+        .expect("valid triage args");
+        let Some(Command::Sandbox { command }) = triage.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::Triage {
+                sandbox: None,
+                latest: false,
+                latest_failed: false,
+                source: SandboxSourceArg::Playbook,
+                tail: 30,
+                rerun: true,
+                bmux_bin: Some(ref bin),
+                env_mode: Some(SandboxEnvModeArg::Clean),
+                keep: true,
+                print_env: true,
+                timeout: Some(15),
+                name: Some(ref name),
+                json: true,
+            } if bin == "./target/debug/bmux" && name == "triage-rerun"
         ));
     }
 

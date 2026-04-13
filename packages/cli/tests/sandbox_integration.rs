@@ -1758,3 +1758,71 @@ fn sandbox_rerun_fails_when_manifest_command_is_empty() {
         "rerun failure should explain missing command: {stderr}"
     );
 }
+
+#[test]
+#[serial]
+fn sandbox_triage_defaults_to_latest_failed_and_reports_target() {
+    let sandbox = CommandSandbox::new("triage-default-latest-failed");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-triage-target", "sandbox-cli", "failed");
+    let log_path = tmp_root
+        .join("bmux-sbx-triage-target")
+        .join("logs")
+        .join("run.log");
+    std::fs::write(&log_path, "triage-line\n").expect("write triage log file");
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "triage", "--tail", "10", "--json"])
+        .output()
+        .expect("run sandbox triage with defaults");
+    assert!(
+        output.status.success(),
+        "sandbox triage should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["selection"]["defaulted_to_latest_failed"], true);
+    assert_eq!(
+        json["target"]["id"].as_str(),
+        Some("bmux-sbx-triage-target")
+    );
+    assert_eq!(json["target"]["source"].as_str(), Some("sandbox-cli"));
+    assert_eq!(json["target"]["status"].as_str(), Some("failed"));
+    assert_eq!(json["rerun"]["requested"], false);
+    assert_eq!(json["rerun"]["executed"], false);
+}
+
+#[test]
+#[serial]
+fn sandbox_triage_rerun_executes_manifest_command() {
+    let sandbox = CommandSandbox::new("triage-rerun");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-triage-rerun", "sandbox-cli", "failed");
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "triage",
+            "bmux-sbx-triage-rerun",
+            "--rerun",
+            "--bmux-bin",
+            bmux_binary().to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run sandbox triage with rerun");
+    assert!(
+        output.status.success(),
+        "sandbox triage rerun should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("rerun_exit_code: 0"),
+        "triage rerun output should include rerun exit code: {stdout}"
+    );
+}

@@ -136,6 +136,36 @@ struct SandboxCandidateCollection {
     reconcile: ReconcileReport,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+struct TriageSelection {
+    defaulted_to_latest_failed: bool,
+    latest: bool,
+    latest_failed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TriageTarget {
+    id: String,
+    source: String,
+    status: String,
+    running: bool,
+    root: String,
+    log_dir: String,
+    latest_log: Option<String>,
+    repro: String,
+    log_tail: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TriageSnapshot {
+    totals: StatusCounts,
+    health: SandboxStatusHealth,
+    reconcile: ReconcileReport,
+    selection: TriageSelection,
+    source_filter: Option<String>,
+    target: TriageTarget,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DoctorCheck {
     name: String,
@@ -301,6 +331,16 @@ pub(super) struct InspectTargetOptions<'a> {
     pub(super) latest: bool,
     pub(super) latest_failed: bool,
     pub(super) source_filter: Option<&'a str>,
+}
+
+pub(super) struct TriageSandboxOptions<'a> {
+    pub(super) inspect: InspectTargetOptions<'a>,
+    pub(super) tail: usize,
+    pub(super) rerun: bool,
+    pub(super) run: RunSandboxOptions<'a>,
+    pub(super) bmux_bin_override: Option<&'a str>,
+    pub(super) env_mode_override: Option<SandboxEnvModeArg>,
+    pub(super) json: bool,
 }
 
 pub(super) async fn run_sandbox_run(
@@ -915,6 +955,165 @@ pub(super) fn run_sandbox_open(
     }
 
     Ok(0)
+}
+
+pub(super) async fn run_sandbox_triage(options: TriageSandboxOptions<'_>) -> Result<u8> {
+    anyhow::ensure!(
+        !(options.json && options.rerun),
+        "sandbox triage --json cannot be combined with --rerun"
+    );
+
+    let collection = collect_sandbox_candidates();
+    let selection = resolve_triage_selector(&options);
+
+    let root = resolve_inspect_target(
+        "triage",
+        options.inspect.target,
+        selection.latest,
+        selection.latest_failed,
+        options.inspect.source_filter,
+        &collection.candidates,
+    )?;
+    let manifest = read_manifest(&root)?;
+    let running = sandbox_process_alive(&root) || sandbox_socket_alive(&root);
+    let log_dir = root.join("logs");
+    let latest_log = newest_regular_file(&log_dir);
+    let log_tail = read_log_tail(&root, options.tail);
+    let repro = format_repro_command_from_manifest(&manifest);
+
+    let entries = collection
+        .candidates
+        .iter()
+        .map(sandbox_list_entry)
+        .collect::<Vec<_>>();
+    let totals = summarize_status_counts(&entries);
+    let health = summarize_sandbox_health(&collection.candidates);
+
+    let snapshot = TriageSnapshot {
+        totals,
+        health,
+        reconcile: collection.reconcile,
+        selection,
+        source_filter: options.inspect.source_filter.map(ToOwned::to_owned),
+        target: TriageTarget {
+            id: manifest.id,
+            source: manifest.source,
+            status: manifest.status,
+            running,
+            root: root.to_string_lossy().to_string(),
+            log_dir: log_dir.to_string_lossy().to_string(),
+            latest_log: latest_log
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            repro,
+            log_tail,
+        },
+    };
+
+    if options.json {
+        let payload = triage_json_payload(&snapshot);
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(0);
+    }
+
+    print_triage_text(&snapshot);
+
+    if options.rerun {
+        println!("rerun: executing manifest command");
+        let target = snapshot.target.root.clone();
+        let rerun_code = run_sandbox_rerun(RerunSandboxOptions {
+            inspect: InspectTargetOptions {
+                target: Some(target.as_str()),
+                latest: false,
+                latest_failed: false,
+                source_filter: None,
+            },
+            run: RunSandboxOptions {
+                bmux_bin: None,
+                env_mode: SandboxEnvModeArg::Inherit,
+                keep: options.run.keep,
+                json: false,
+                print_env: options.run.print_env,
+                timeout_secs: options.run.timeout_secs,
+                name: options.run.name,
+            },
+            bmux_bin_override: options.bmux_bin_override,
+            env_mode_override: options.env_mode_override,
+        })
+        .await?;
+        println!("rerun_exit_code: {rerun_code}");
+        return Ok(rerun_code);
+    }
+
+    Ok(0)
+}
+
+const fn resolve_triage_selector(options: &TriageSandboxOptions<'_>) -> TriageSelection {
+    let defaulted = options.inspect.target.is_none()
+        && !options.inspect.latest
+        && !options.inspect.latest_failed;
+    if defaulted {
+        TriageSelection {
+            defaulted_to_latest_failed: true,
+            latest: false,
+            latest_failed: true,
+        }
+    } else {
+        TriageSelection {
+            defaulted_to_latest_failed: false,
+            latest: options.inspect.latest,
+            latest_failed: options.inspect.latest_failed,
+        }
+    }
+}
+
+fn triage_json_payload(snapshot: &TriageSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+        "totals": snapshot.totals,
+        "health": snapshot.health,
+        "reconcile": snapshot.reconcile,
+        "selection": {
+            "defaulted_to_latest_failed": snapshot.selection.defaulted_to_latest_failed,
+            "latest": snapshot.selection.latest,
+            "latest_failed": snapshot.selection.latest_failed,
+            "source_filter": snapshot.source_filter,
+        },
+        "target": snapshot.target,
+        "rerun": {
+            "requested": false,
+            "executed": false,
+        },
+    })
+}
+
+fn print_triage_text(snapshot: &TriageSnapshot) {
+    println!(
+        "sandboxes: total={} running={} failed={} stopped={}",
+        snapshot.totals.total,
+        snapshot.totals.running,
+        snapshot.totals.failed,
+        snapshot.totals.stopped
+    );
+    println!(
+        "triage_target: {} source={} status={} running={}",
+        snapshot.target.id, snapshot.target.source, snapshot.target.status, snapshot.target.running
+    );
+    if snapshot.selection.defaulted_to_latest_failed {
+        println!("selection: defaulted to --latest-failed");
+    }
+    println!("root: {}", snapshot.target.root);
+    println!("log_dir: {}", snapshot.target.log_dir);
+    println!(
+        "latest_log: {}",
+        snapshot.target.latest_log.as_deref().unwrap_or("(none)")
+    );
+    println!("repro: {}", snapshot.target.repro);
+    println!("logs:");
+    for line in &snapshot.target.log_tail {
+        println!("  {line}");
+    }
+    print_reconcile_report_text(&snapshot.reconcile);
 }
 
 pub(super) async fn run_sandbox_rerun(options: RerunSandboxOptions<'_>) -> Result<u8> {

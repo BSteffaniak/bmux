@@ -92,6 +92,8 @@ bmux sandbox inspect --latest-failed --tail 120
 bmux sandbox tail --latest-failed --tail 120 --json
 bmux sandbox open --latest-failed --json
 bmux sandbox rerun --latest-failed --bmux-bin ./target/debug/bmux --json
+bmux sandbox triage --json
+bmux sandbox triage --latest-failed --rerun --bmux-bin ./target/debug/bmux
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 bmux sandbox doctor --json
 bmux sandbox doctor --fix --dry-run --json
