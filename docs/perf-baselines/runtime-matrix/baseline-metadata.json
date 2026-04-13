@@ -1,0 +1,18 @@
+{
+  "generated_at": "2026-04-13T17:08:18Z",
+  "generated_at_epoch": 1776100098,
+  "generated_by": "scripts/perf-baseline-metadata.sh",
+  "git": {
+    "sha": "cb436bd",
+    "branch": "master"
+  },
+  "environment": {
+    "os": "Darwin",
+    "arch": "arm64"
+  },
+  "sampling": {
+    "profile": "runtime-matrix",
+    "iterations": 2,
+    "warmup": 0
+  }
+}

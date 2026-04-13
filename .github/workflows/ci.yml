@@ -275,6 +275,22 @@ jobs:
             --scale-profile medium \
             --artifact-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-scale"
 
+      - name: Plugin perf baseline metadata check (informational)
+        if: ${{ steps.changes.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          ./scripts/perf-baseline-metadata.sh check --baseline-dir "docs/perf-baselines" --max-age-days 30
+          ./scripts/perf-baseline-metadata.sh check --baseline-dir "docs/perf-baselines/runtime-matrix" --max-age-days 30
+          ./scripts/perf-baseline-metadata.sh check --baseline-dir "docs/perf-baselines/runtime-matrix-scale" --max-age-days 30
+
+      - name: Plugin perf candidate metadata write
+        if: ${{ steps.changes.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          ./scripts/perf-baseline-metadata.sh write --baseline-dir "$RUNNER_TEMP/plugin-perf-artifacts" --profile "command-latency-ci" --iterations 20 --warmup 5
+          ./scripts/perf-baseline-metadata.sh write --baseline-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix" --profile "runtime-matrix-ci" --iterations 20 --warmup 5
+          ./scripts/perf-baseline-metadata.sh write --baseline-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-scale" --profile "runtime-matrix-scale-medium-ci" --iterations 8 --warmup 2
+
       - name: Plugin perf artifact compare (informational)
         if: ${{ steps.changes.outputs.run == 'true' }}
         shell: bash
@@ -299,6 +315,7 @@ jobs:
           name: plugin-perf-artifacts
           path: |
             ${{ runner.temp }}/plugin-perf-artifacts/plugin-command-latency.json
+            ${{ runner.temp }}/plugin-perf-artifacts/baseline-metadata.json
             ${{ runner.temp }}/plugin-perf-artifacts/runtime-matrix
             ${{ runner.temp }}/plugin-perf-artifacts/runtime-matrix-scale
           if-no-files-found: error

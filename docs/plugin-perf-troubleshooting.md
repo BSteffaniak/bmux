@@ -61,6 +61,8 @@ Refresh baselines only when behavior is intentionally changed or improved.
 - Include before/after compare output in PR description.
 
 Baseline refresh commands are documented in `docs/perf-baselines/README.md`.
+After refreshing baseline artifacts, refresh/check metadata with
+`scripts/perf-baseline-metadata.sh` so CI staleness checks stay meaningful.
 
 ## 5) What to Include in Perf PRs
 
