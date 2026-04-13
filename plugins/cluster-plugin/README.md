@@ -24,10 +24,12 @@ Current scope:
 - Panes transition to `ready` only after post-launch health verification succeeds
 - `cluster pane retry` supports probe retry policy controls (`--retries`, `--on-failure=abort|continue|prompt`)
 - `cluster pane new|move|retry` accept `--cluster` for deterministic gateway routing; in multi-cluster layouts, commands hard-fail when cluster inference is ambiguous
-- Gateway overrides are available on cluster commands: `--gateway`, `--gateway-mode=auto|direct|pinned`, and `--gateway-no-failover`
+- Gateway overrides are available on cluster commands: `--gateway`, `--gateway-mode=auto|direct|pinned`, `--gateway-policy=balanced|aggressive|conservative`, and `--gateway-no-failover`
 - Routed cluster commands support `--dry-run` to run real gateway probes/selection without executing the cluster operation itself (`--format text|json`)
+- Routed/special gateway commands support `--why` for concise decision summaries in text and JSON (`decision_summary`)
 - `cluster gateway status` reports effective gateway mode, candidate order, preferred gateway cache, cooldown state, and selected candidate hint (`--format text|json`)
 - `cluster gateway explain` probes candidates and explains why selection would succeed/fail without mutating gateway runtime cache/cooldown state (`--format text|json`)
+- `cluster gateway doctor` inspects gateway candidate health and emits actionable findings (`--format text|json`)
 - `cluster gateway reset` clears persisted gateway runtime state for one cluster (`--cluster`) or all clusters (`--all`)
 - In multi-cluster setups, `cluster gateway status|explain` require explicit cluster selection (`--cluster` or positional cluster name)
 - Cluster service interfaces are implemented for query/command/event-list integrations
@@ -49,7 +51,12 @@ Current scope:
 - If every gateway candidate fails, cluster command execution hard-fails (no silent direct fallback).
 - Auto mode tracks persisted last-known-good/cooldown state, per-candidate stability stats, and breaker state.
 - Breaker behavior defaults: open after 3 consecutive failures, then half-open retry after cooldown.
+- Policy presets tune breaker/cooldown/probe defaults:
+  - `balanced`: current defaults.
+  - `aggressive`: faster failover and shorter cooldown.
+  - `conservative`: slower failover and longer stabilization windows.
 - Candidate ordering in auto mode is stability-first (latency used as tie-break), with explicit skip reasons (`cooldown` / `breaker_open`) visible in status/explain and dry-run output.
+- Text output may truncate long candidate names for alignment only; JSON keeps full candidate values.
 
 ### Gateway Output Examples
 
@@ -140,6 +147,7 @@ gateway_mode = "auto"
 - `cluster pane retry`
 - `cluster gateway status`
 - `cluster gateway explain`
+- `cluster gateway doctor`
 - `cluster gateway reset`
 
 ## Services

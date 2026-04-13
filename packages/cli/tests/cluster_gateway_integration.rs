@@ -409,3 +409,48 @@ fn gateway_text_tables_are_consistent_across_status_explain_and_dry_run() {
     assert_eq!(explain_header, expected);
     assert_eq!(dry_run_header, expected);
 }
+
+#[test]
+fn gateway_status_json_supports_why_and_policy_preset() {
+    let env = CliTestEnv::new("gateway-status-why-policy-json");
+    env.write_cluster_config();
+
+    let output = env.run(&[
+        "cluster",
+        "gateway",
+        "status",
+        "--cluster",
+        "prod",
+        "--format",
+        "json",
+        "--gateway-policy",
+        "aggressive",
+        "--why",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("status json payload");
+    assert_eq!(payload["policy"]["preset"], "aggressive");
+    assert_eq!(payload["policy"]["breaker_open_after_failures"], 2);
+    assert!(payload["decision_summary"].is_object());
+}
+
+#[test]
+fn gateway_doctor_reports_critical_when_all_candidates_fail() {
+    let env = CliTestEnv::new("gateway-doctor-critical");
+    env.write_cluster_config();
+
+    let output = env.run(&[
+        "cluster",
+        "gateway",
+        "doctor",
+        "--cluster",
+        "prod",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("doctor json payload");
+    assert_eq!(payload["cluster"], "prod");
+    assert_eq!(payload["result"], "critical");
+    assert!(payload["findings"].is_array());
+}

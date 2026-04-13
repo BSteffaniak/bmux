@@ -13,6 +13,7 @@ owns_namespaces = [
     "cluster-pane-retry",
     "cluster-gateway-status",
     "cluster-gateway-explain",
+    "cluster-gateway-doctor",
     "cluster-gateway-reset",
 ]
 provided_capabilities = [
@@ -106,6 +107,13 @@ required   = false
 value_name = "MODE"
 
 [[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
@@ -115,6 +123,12 @@ required = false
 kind     = "boolean"
 long     = "dry-run"
 name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
 required = false
 
 [[commands.arguments]]
@@ -153,6 +167,13 @@ required   = false
 value_name = "MODE"
 
 [[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
@@ -162,6 +183,12 @@ required = false
 kind     = "boolean"
 long     = "dry-run"
 name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
 required = false
 
 [[commands.arguments]]
@@ -228,6 +255,13 @@ required   = false
 value_name = "MODE"
 
 [[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
@@ -237,6 +271,12 @@ required = false
 kind     = "boolean"
 long     = "dry-run"
 name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
 required = false
 
 [[commands.arguments]]
@@ -310,6 +350,13 @@ required   = false
 value_name = "MODE"
 
 [[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
@@ -319,6 +366,12 @@ required = false
 kind     = "boolean"
 long     = "dry-run"
 name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
 required = false
 
 [[commands]]
@@ -350,6 +403,13 @@ required   = false
 value_name = "MODE"
 
 [[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
@@ -359,6 +419,12 @@ required = false
 kind     = "boolean"
 long     = "dry-run"
 name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
 required = false
 
 [[commands.arguments]]
@@ -398,6 +464,13 @@ required   = false
 value_name = "MODE"
 
 [[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
@@ -409,6 +482,12 @@ long       = "format"
 name       = "format"
 required   = false
 value_name = "FORMAT"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
+required = false
 
 [[commands.arguments]]
 kind       = "string"
@@ -447,6 +526,13 @@ required   = false
 value_name = "MODE"
 
 [[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
@@ -458,6 +544,74 @@ long       = "format"
 name       = "format"
 required   = false
 value_name = "FORMAT"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster_ref"
+position   = 0
+required   = false
+value_name = "CLUSTER"
+
+[[commands]]
+aliases       = [["cluster", "gateway", "doctor"]]
+expose_in_cli = true
+name          = "cluster-gateway-doctor"
+path          = ["cluster-gateway-doctor"]
+summary       = "Diagnose gateway candidate health and recommendations"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
+required = false
 
 [[commands.arguments]]
 kind       = "string"
@@ -510,6 +664,13 @@ required   = false
 value_name = "MODE"
 
 [[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
@@ -519,6 +680,12 @@ required = false
 kind     = "boolean"
 long     = "dry-run"
 name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
 required = false
 
 [[commands.arguments]]
@@ -585,6 +752,13 @@ required   = false
 value_name = "MODE"
 
 [[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
@@ -594,6 +768,12 @@ required = false
 kind     = "boolean"
 long     = "dry-run"
 name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
 required = false
 
 [[commands.arguments]]
@@ -660,6 +840,13 @@ required   = false
 value_name = "MODE"
 
 [[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
@@ -669,6 +856,12 @@ required = false
 kind     = "boolean"
 long     = "dry-run"
 name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "why"
+name     = "why"
 required = false
 
 [[commands.arguments]]
