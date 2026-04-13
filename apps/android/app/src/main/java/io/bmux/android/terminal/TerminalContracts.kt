@@ -18,6 +18,7 @@ enum class TerminalChunkType {
 data class TerminalChunkFrame(
     val kind: TerminalChunkType,
     val bytes: ByteArray,
+    val statusSeverity: TerminalStatusSeverity? = null,
 )
 
 enum class TerminalStatusSeverity {

@@ -12,7 +12,7 @@ pub mod target;
 pub use connection::{
     ConnectionManager, ConnectionRequest, ConnectionState, ConnectionStatus, TerminalChunk,
     TerminalChunkKind, TerminalOpenRequest, TerminalSessionState, TerminalSessionStatus,
-    TerminalSize,
+    TerminalSize, TerminalStatusSeverity,
 };
 pub use error::{MobileCoreError, Result};
 pub use ssh::{

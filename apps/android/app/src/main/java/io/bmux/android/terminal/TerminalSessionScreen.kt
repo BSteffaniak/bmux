@@ -222,7 +222,7 @@ private class CoreTerminalTransportConnection(
                                     onStatus(
                                         TerminalStatusEvent(
                                             message = message,
-                                            severity = inferStatusSeverity(message),
+                                            severity = chunk.statusSeverity ?: inferStatusSeverity(message),
                                         ),
                                     )
                                 }

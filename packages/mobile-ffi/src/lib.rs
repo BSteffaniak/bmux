@@ -8,8 +8,8 @@ use bmux_mobile_core::{
     ConnectionManager, ConnectionRequest, ConnectionState, ConnectionStatus, HostKeyPinSuggestion,
     MobileCoreError, ObservedHostKey, TargetInput, TargetRecord, TargetTransport, TerminalChunk,
     TerminalChunkKind, TerminalOpenRequest, TerminalSessionState, TerminalSessionStatus,
-    TerminalSize, apply_pin_query_fragment_to_target, apply_pin_suggestion_to_target,
-    observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
+    TerminalSize, TerminalStatusSeverity, apply_pin_query_fragment_to_target,
+    apply_pin_suggestion_to_target, observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
     observe_ssh_host_key_with_pin_suggestion,
 };
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,13 @@ pub enum TerminalChunkKindFfi {
     Status,
 }
 
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum TerminalStatusSeverityFfi {
+    Info,
+    Warn,
+    Error,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TargetRecordFfi {
     pub id: String,
@@ -137,6 +144,7 @@ pub struct TerminalChunkFfi {
     pub sequence: u64,
     pub kind: TerminalChunkKindFfi,
     pub bytes: Vec<u8>,
+    pub status_severity: Option<TerminalStatusSeverityFfi>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -188,6 +196,14 @@ const fn map_terminal_chunk_kind(value: TerminalChunkKind) -> TerminalChunkKindF
     }
 }
 
+const fn map_terminal_status_severity(value: TerminalStatusSeverity) -> TerminalStatusSeverityFfi {
+    match value {
+        TerminalStatusSeverity::Info => TerminalStatusSeverityFfi::Info,
+        TerminalStatusSeverity::Warn => TerminalStatusSeverityFfi::Warn,
+        TerminalStatusSeverity::Error => TerminalStatusSeverityFfi::Error,
+    }
+}
+
 fn map_target_record(value: TargetRecord) -> TargetRecordFfi {
     TargetRecordFfi {
         id: value.id.to_string(),
@@ -228,6 +244,7 @@ fn map_terminal_chunk(value: TerminalChunk) -> TerminalChunkFfi {
         sequence: value.sequence,
         kind: map_terminal_chunk_kind(value.kind),
         bytes: value.bytes,
+        status_severity: value.status_severity.map(map_terminal_status_severity),
     }
 }
 

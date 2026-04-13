@@ -43,6 +43,7 @@ import io.bmux.android.terminal.TerminalEndpoint
 import io.bmux.android.terminal.TerminalChunkFrame
 import io.bmux.android.terminal.TerminalChunkType
 import io.bmux.android.terminal.TerminalSessionScreen
+import io.bmux.android.terminal.TerminalStatusSeverity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -52,6 +53,7 @@ import uniffi.bmux_mobile_ffi.HostKeyPinSuggestionFfi
 import uniffi.bmux_mobile_ffi.MobileApiFfi
 import uniffi.bmux_mobile_ffi.TerminalChunkKindFfi
 import uniffi.bmux_mobile_ffi.TerminalOpenRequestFfi
+import uniffi.bmux_mobile_ffi.TerminalStatusSeverityFfi
 import uniffi.bmux_mobile_ffi.TerminalSizeFfi
 import uniffi.bmux_mobile_ffi.TargetRecordFfi
 
@@ -430,6 +432,12 @@ private class MobileGateway(application: Application) {
                         TerminalChunkKindFfi.STATUS -> TerminalChunkType.STATUS
                     },
                     bytes = chunk.bytes,
+                    statusSeverity = when (chunk.statusSeverity) {
+                        TerminalStatusSeverityFfi.INFO -> TerminalStatusSeverity.INFO
+                        TerminalStatusSeverityFfi.WARN -> TerminalStatusSeverity.WARN
+                        TerminalStatusSeverityFfi.ERROR -> TerminalStatusSeverity.ERROR
+                        null -> null
+                    },
                 )
             }
         }

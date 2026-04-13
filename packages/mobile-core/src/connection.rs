@@ -58,11 +58,20 @@ pub enum TerminalChunkKind {
     Status,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalStatusSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalChunk {
     pub sequence: u64,
     pub kind: TerminalChunkKind,
     pub bytes: Vec<u8>,
+    pub status_severity: Option<TerminalStatusSeverity>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,7 +292,10 @@ impl ConnectionManager {
             next_sequence: 1,
         };
 
-        runtime.push_status_chunk(format!("connected to {target_name} ({canonical_target})"));
+        runtime.push_status_chunk(
+            format!("connected to {target_name} ({canonical_target})"),
+            TerminalStatusSeverity::Info,
+        );
         runtime.state.status = TerminalSessionStatus::Open;
 
         let state = runtime.state.clone();
@@ -349,7 +361,7 @@ impl ConnectionManager {
             ));
         }
         if !bytes.is_empty() {
-            runtime.push_chunk(TerminalChunkKind::Stdout, bytes.to_vec());
+            runtime.push_chunk(TerminalChunkKind::Stdout, bytes.to_vec(), None);
         }
         Ok(())
     }
@@ -373,7 +385,10 @@ impl ConnectionManager {
             ));
         }
         runtime.state.size = size;
-        runtime.push_status_chunk(format!("resize {}x{}", size.rows, size.cols));
+        runtime.push_status_chunk(
+            format!("resize {}x{}", size.rows, size.cols),
+            TerminalStatusSeverity::Info,
+        );
         Ok(())
     }
 
@@ -390,7 +405,8 @@ impl ConnectionManager {
                 .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
             if runtime.state.status != TerminalSessionStatus::Closed {
                 runtime.state.status = TerminalSessionStatus::Closed;
-                runtime.push_status_chunk("session closed".to_string());
+                runtime
+                    .push_status_chunk("session closed".to_string(), TerminalStatusSeverity::Info);
             }
             runtime.state.connection_id
         };
@@ -400,7 +416,12 @@ impl ConnectionManager {
 }
 
 impl TerminalSessionRuntime {
-    fn push_chunk(&mut self, kind: TerminalChunkKind, bytes: Vec<u8>) {
+    fn push_chunk(
+        &mut self,
+        kind: TerminalChunkKind,
+        bytes: Vec<u8>,
+        status_severity: Option<TerminalStatusSeverity>,
+    ) {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.state.last_sequence = sequence;
@@ -408,11 +429,16 @@ impl TerminalSessionRuntime {
             sequence,
             kind,
             bytes,
+            status_severity,
         });
     }
 
-    fn push_status_chunk(&mut self, message: String) {
-        self.push_chunk(TerminalChunkKind::Status, message.into_bytes());
+    fn push_status_chunk(&mut self, message: String, severity: TerminalStatusSeverity) {
+        self.push_chunk(
+            TerminalChunkKind::Status,
+            message.into_bytes(),
+            Some(severity),
+        );
     }
 }
 
