@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     cargoMacheteSrc = {
       url = "github:BSteffaniak/cargo-machete/ignored-dirs";
       flake = false;
@@ -15,6 +19,7 @@
       self,
       nixpkgs,
       flake-utils,
+      rust-overlay,
       cargoMacheteSrc,
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -22,6 +27,7 @@
       let
         pkgs = import nixpkgs {
           inherit system;
+          overlays = [ (import rust-overlay) ];
           config = {
             allowUnfreePredicate =
               pkg:
@@ -39,15 +45,25 @@
           };
           doCheck = false;
         };
+        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+          extensions = [
+            "rustfmt"
+            "clippy"
+            "rust-src"
+          ];
+          targets = [
+            "aarch64-linux-android"
+            "x86_64-linux-android"
+            "armv7-linux-androideabi"
+          ];
+        };
       in
       {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
-            rustc
-            cargo
-            rustfmt
-            clippy
+            rustToolchain
             cargo-deny
+            cargo-ndk
             cargoMachete
             nodePackages.markdownlint-cli
             pkg-config

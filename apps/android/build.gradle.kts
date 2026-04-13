@@ -1,5 +1,6 @@
 import org.gradle.internal.os.OperatingSystem
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 
@@ -9,7 +10,137 @@ plugins {
 
 val workspaceRoot = layout.projectDirectory.dir("../..").asFile
 val generatedDir = layout.projectDirectory.dir("app/src/main/java").asFile
+val generatedJniLibsDir = layout.projectDirectory.dir("generated/jniLibs").asFile
 val localToolsDir = layout.projectDirectory.dir(".tools").asFile
+
+data class AndroidAbi(
+    val abi: String,
+)
+
+fun androidAbisForBuild(): List<AndroidAbi> {
+    val configured = (findProperty("bmux.android.abis") as String?)
+        ?.split(',')
+        ?.map { it.trim() }
+        ?.filter { it.isNotEmpty() }
+        ?.toSet()
+        ?: setOf("arm64-v8a")
+
+    val all = listOf(
+        AndroidAbi(abi = "arm64-v8a"),
+        AndroidAbi(abi = "x86_64"),
+        AndroidAbi(abi = "armeabi-v7a"),
+    )
+
+    return all.filter { it.abi in configured }
+}
+
+fun Project.runChecked(
+    command: List<String>,
+    workingDir: File,
+    environment: Map<String, String> = emptyMap(),
+) {
+    val process = ProcessBuilder(command)
+        .directory(workingDir)
+        .redirectErrorStream(true)
+        .apply {
+            val env = environment()
+            for ((key, value) in environment) {
+                env[key] = value
+            }
+        }
+        .start()
+    val output = process.inputStream.bufferedReader().readText()
+    val exitCode = process.waitFor()
+    if (exitCode != 0) {
+        throw GradleException("Command failed (${command.joinToString(" ")}):\n$output")
+    }
+}
+
+fun resolveAndroidSdkRoot(): File {
+    val fromEnv = listOfNotNull(
+        System.getenv("ANDROID_SDK_ROOT"),
+        System.getenv("ANDROID_HOME"),
+    )
+        .map(::File)
+        .firstOrNull { it.exists() }
+    if (fromEnv != null) {
+        return fromEnv
+    }
+
+    val localProperties = layout.projectDirectory.file("local.properties").asFile
+    if (localProperties.exists()) {
+        val props = java.util.Properties()
+        localProperties.inputStream().use(props::load)
+        val sdkDir = props.getProperty("sdk.dir")
+        if (!sdkDir.isNullOrBlank()) {
+            val sdkRoot = File(sdkDir)
+            if (sdkRoot.exists()) {
+                return sdkRoot
+            }
+        }
+    }
+
+    throw GradleException("Android SDK not found. Set ANDROID_SDK_ROOT/ANDROID_HOME or sdk.dir.")
+}
+
+val buildAndroidFfiLibs = tasks.register("buildAndroidFfiLibs") {
+    group = "bmux"
+    description = "Builds bmux_mobile_ffi Android .so files for configured ABIs"
+
+    doLast {
+        val abis = androidAbisForBuild()
+        if (abis.isEmpty()) {
+            throw GradleException("No Android ABIs selected. Set -Pbmux.android.abis=arm64-v8a,x86_64")
+        }
+
+        if (
+            System.getenv("ANDROID_SDK_ROOT").isNullOrBlank() &&
+            System.getenv("ANDROID_HOME").isNullOrBlank()
+        ) {
+            throw GradleException("ANDROID_SDK_ROOT (or ANDROID_HOME) must be set for cargo-ndk")
+        }
+
+        val hasCargoNdk = runCatching {
+            runChecked(
+                command = listOf("cargo", "ndk", "--version"),
+                workingDir = workspaceRoot,
+            )
+        }.isSuccess
+        if (!hasCargoNdk) {
+            throw GradleException(
+                "cargo-ndk is required for Android FFI builds. Enter this repo via 'nix develop' or install cargo-ndk.",
+            )
+        }
+
+        generatedJniLibsDir.mkdirs()
+
+        for (target in abis) {
+            runChecked(
+                command = listOf(
+                    "cargo",
+                    "ndk",
+                    "-t",
+                    target.abi,
+                    "-o",
+                    generatedJniLibsDir.absolutePath,
+                    "-P",
+                    "29",
+                    "build",
+                    "-p",
+                    "bmux_mobile_ffi",
+                ),
+                workingDir = workspaceRoot,
+            )
+
+            val outputLib = generatedJniLibsDir
+                .resolve(target.abi)
+                .resolve("libbmux_mobile_ffi.so")
+            if (!outputLib.exists()) {
+                throw GradleException("Expected output library not found at ${outputLib.absolutePath}")
+            }
+        }
+    }
+}
 
 val installUniffiBindgen = tasks.register<Exec>("installUniffiBindgen") {
     group = "bmux"
@@ -93,6 +224,12 @@ tasks.register("packageInternalAlpha") {
     dependsOn(":app:assembleAlpha")
 }
 
+project(":app") {
+    tasks.matching { it.name == "preBuild" }.configureEach {
+        dependsOn(buildAndroidFfiLibs)
+    }
+}
+
 tasks.register("collectAlphaLogs") {
     group = "bmux"
     description = "Collects BmuxAlpha adb log lines into a timestamped file"
@@ -104,7 +241,6 @@ tasks.register("collectAlphaLogs") {
         val adbCandidates = listOfNotNull(
             System.getenv("ANDROID_SDK_ROOT")?.let { "$it/platform-tools/adb" },
             System.getenv("ANDROID_HOME")?.let { "$it/platform-tools/adb" },
-            "${System.getProperty("user.home")}/Library/Android/sdk/platform-tools/adb",
             "adb",
         )
         val adbCommand = adbCandidates.firstOrNull { candidate ->

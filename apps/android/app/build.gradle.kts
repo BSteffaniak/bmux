@@ -49,6 +49,10 @@ android {
         buildConfig = true
     }
 
+    sourceSets {
+        getByName("main").jniLibs.srcDirs(file("../generated/jniLibs"))
+    }
+
 }
 
 dependencies {
