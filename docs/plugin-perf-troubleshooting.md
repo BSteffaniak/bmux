@@ -52,6 +52,18 @@ Use scale baseline compare for scale scenarios:
   --warn-regression-ms 30
 ```
 
+For variance-focused comparison (all metrics: startup, p95, p99, avg, steady-state p95/p99/avg), run repeated samples:
+
+```bash
+./scripts/perf-plugin-variance.sh --runs 3 --iterations 8 --warmup 2
+```
+
+The compare output includes per-metric:
+
+- `delta_median`, `delta_mean`, `delta_min`, `delta_max`, `delta_stddev`
+- `status` (`OK`, `IMPROVED`, `SPIKE`, `WARN`)
+- `variance` classification (`stable`, `likely_noise`, `likely_regression`, `likely_regression_with_variance`)
+
 ## 4) Baseline Update Policy
 
 Refresh baselines only when behavior is intentionally changed or improved.

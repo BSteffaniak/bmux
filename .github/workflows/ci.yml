@@ -275,6 +275,16 @@ jobs:
             --scale-profile medium \
             --artifact-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-scale"
 
+      - name: Plugin runtime matrix variance sample (informational)
+        if: ${{ steps.changes.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-variance-2"
+          ./scripts/perf-plugin-runtime-matrix.sh \
+            --iterations 6 \
+            --warmup 1 \
+            --artifact-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-variance-2"
+
       - name: Plugin perf baseline metadata check (informational)
         if: ${{ steps.changes.outputs.run == 'true' }}
         shell: bash
@@ -289,6 +299,7 @@ jobs:
         run: |
           ./scripts/perf-baseline-metadata.sh write --baseline-dir "$RUNNER_TEMP/plugin-perf-artifacts" --profile "command-latency-ci" --iterations 20 --warmup 5
           ./scripts/perf-baseline-metadata.sh write --baseline-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix" --profile "runtime-matrix-ci" --iterations 20 --warmup 5
+          ./scripts/perf-baseline-metadata.sh write --baseline-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-variance-2" --profile "runtime-matrix-variance-2-ci" --iterations 6 --warmup 1
           ./scripts/perf-baseline-metadata.sh write --baseline-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-scale" --profile "runtime-matrix-scale-medium-ci" --iterations 8 --warmup 2
 
       - name: Plugin perf artifact compare (informational)
@@ -302,6 +313,7 @@ jobs:
           ./scripts/perf-plugin-artifact-compare.sh \
             --candidate-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix" \
             --baseline-dir "docs/perf-baselines/runtime-matrix" \
+            --extra-candidate-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-variance-2" \
             --warn-regression-ms 20
           ./scripts/perf-plugin-artifact-compare.sh \
             --candidate-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-scale" \
@@ -317,6 +329,7 @@ jobs:
             ${{ runner.temp }}/plugin-perf-artifacts/plugin-command-latency.json
             ${{ runner.temp }}/plugin-perf-artifacts/baseline-metadata.json
             ${{ runner.temp }}/plugin-perf-artifacts/runtime-matrix
+            ${{ runner.temp }}/plugin-perf-artifacts/runtime-matrix-variance-2
             ${{ runner.temp }}/plugin-perf-artifacts/runtime-matrix-scale
           if-no-files-found: error
 

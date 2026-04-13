@@ -42,7 +42,7 @@ fn usage() -> &'static str {
   report-faults --input PATH [--max-runtime-retries N] [--max-runtime-respawns N] [--max-runtime-timeouts N]
   report-json --input PATH --output PATH [threshold flags]
   prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
-  compare-report --baseline PATH --candidate PATH [--warn-regression-ms N]
+  compare-report --baseline PATH --candidate PATH [--candidate PATH ...] [--warn-regression-ms N]
   discover-run-candidate --bmux-bin PATH"
 }
 
@@ -663,7 +663,7 @@ fn synthetic_plugin_manifest(profile: &str, plugin_id: &str, idx: usize) -> Stri
 
 fn run_compare_report(args: Vec<String>) -> Result<(), String> {
     let mut baseline = None;
-    let mut candidate = None;
+    let mut candidates = Vec::new();
     let mut warn_regression_ms = 10.0_f64;
 
     let mut index = 0;
@@ -680,7 +680,7 @@ fn run_compare_report(args: Vec<String>) -> Result<(), String> {
                 let Some(value) = args.get(index + 1) else {
                     return Err("--candidate requires a value".to_string());
                 };
-                candidate = Some(value.clone());
+                candidates.push(value.clone());
                 index += 2;
             }
             "--warn-regression-ms" => {
@@ -695,38 +695,121 @@ fn run_compare_report(args: Vec<String>) -> Result<(), String> {
     }
 
     let baseline = baseline.ok_or_else(|| "--baseline is required".to_string())?;
-    let candidate = candidate.ok_or_else(|| "--candidate is required".to_string())?;
+    if candidates.is_empty() {
+        return Err("at least one --candidate is required".to_string());
+    }
 
     let baseline_json = read_json_file(&baseline)?;
-    let candidate_json = read_json_file(&candidate)?;
-
     let baseline_latency = parse_report_latency_summary(&baseline_json)?;
-    let candidate_latency = parse_report_latency_summary(&candidate_json)?;
 
-    print_compare_line(
+    let mut candidate_summaries = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        let candidate_json = read_json_file(candidate)?;
+        candidate_summaries.push(parse_report_latency_summary(&candidate_json)?);
+    }
+
+    print_compare_summary(
         "startup_ms",
         baseline_latency.startup_ms,
-        candidate_latency.startup_ms,
+        candidate_summaries
+            .iter()
+            .map(|summary| summary.startup_ms)
+            .collect(),
         warn_regression_ms,
     );
-    print_compare_line(
+    print_compare_summary(
         "p95_ms",
         baseline_latency.p95_ms,
-        candidate_latency.p95_ms,
+        candidate_summaries
+            .iter()
+            .map(|summary| summary.p95_ms)
+            .collect(),
         warn_regression_ms,
     );
-    print_compare_line(
+    print_compare_summary(
         "p99_ms",
         baseline_latency.p99_ms,
-        candidate_latency.p99_ms,
+        candidate_summaries
+            .iter()
+            .map(|summary| summary.p99_ms)
+            .collect(),
         warn_regression_ms,
     );
-    print_compare_line(
+    print_compare_summary(
         "avg_ms",
         baseline_latency.avg_ms,
-        candidate_latency.avg_ms,
+        candidate_summaries
+            .iter()
+            .map(|summary| summary.avg_ms)
+            .collect(),
         warn_regression_ms,
     );
+
+    if let Some(steady_p95) = baseline_latency.steady_p95_ms {
+        if candidate_summaries
+            .iter()
+            .all(|summary| summary.steady_p95_ms.is_some())
+        {
+            let steady_candidates = candidate_summaries
+                .iter()
+                .filter_map(|summary| summary.steady_p95_ms)
+                .collect::<Vec<_>>();
+            print_compare_summary(
+                "steady_p95_ms",
+                steady_p95,
+                steady_candidates,
+                warn_regression_ms,
+            );
+        } else {
+            println!(
+                "compare steady_p95_ms skipped: one or more candidates missing steady_state_ms.p95"
+            );
+        }
+    }
+
+    if let Some(steady_p99) = baseline_latency.steady_p99_ms {
+        if candidate_summaries
+            .iter()
+            .all(|summary| summary.steady_p99_ms.is_some())
+        {
+            let steady_candidates = candidate_summaries
+                .iter()
+                .filter_map(|summary| summary.steady_p99_ms)
+                .collect::<Vec<_>>();
+            print_compare_summary(
+                "steady_p99_ms",
+                steady_p99,
+                steady_candidates,
+                warn_regression_ms,
+            );
+        } else {
+            println!(
+                "compare steady_p99_ms skipped: one or more candidates missing steady_state_ms.p99"
+            );
+        }
+    }
+
+    if let Some(steady_avg) = baseline_latency.steady_avg_ms {
+        if candidate_summaries
+            .iter()
+            .all(|summary| summary.steady_avg_ms.is_some())
+        {
+            let steady_candidates = candidate_summaries
+                .iter()
+                .filter_map(|summary| summary.steady_avg_ms)
+                .collect::<Vec<_>>();
+            print_compare_summary(
+                "steady_avg_ms",
+                steady_avg,
+                steady_candidates,
+                warn_regression_ms,
+            );
+        } else {
+            println!(
+                "compare steady_avg_ms skipped: one or more candidates missing steady_state_ms.avg"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -910,6 +993,9 @@ struct ReportLatencySummary {
     p95_ms: f64,
     p99_ms: f64,
     avg_ms: f64,
+    steady_p95_ms: Option<f64>,
+    steady_p99_ms: Option<f64>,
+    steady_avg_ms: Option<f64>,
 }
 
 fn parse_report_latency_summary(payload: &Value) -> Result<ReportLatencySummary, String> {
@@ -934,26 +1020,112 @@ fn parse_report_latency_summary(payload: &Value) -> Result<ReportLatencySummary,
         .and_then(Value::as_f64)
         .ok_or_else(|| "missing report latency_ms.avg".to_string())?;
 
+    let steady = payload.get("steady_state_ms").and_then(Value::as_object);
+    let steady_p95_ms = steady
+        .and_then(|value| value.get("p95"))
+        .and_then(Value::as_f64);
+    let steady_p99_ms = steady
+        .and_then(|value| value.get("p99"))
+        .and_then(Value::as_f64);
+    let steady_avg_ms = steady
+        .and_then(|value| value.get("avg"))
+        .and_then(Value::as_f64);
+
     Ok(ReportLatencySummary {
         startup_ms,
         p95_ms,
         p99_ms,
         avg_ms,
+        steady_p95_ms,
+        steady_p99_ms,
+        steady_avg_ms,
     })
 }
 
-fn print_compare_line(label: &str, baseline: f64, candidate: f64, warn_regression_ms: f64) {
-    let delta = candidate - baseline;
-    let status = if delta > warn_regression_ms {
+fn print_compare_summary(
+    label: &str,
+    baseline: f64,
+    candidates: Vec<f64>,
+    warn_regression_ms: f64,
+) {
+    let stats = compare_delta_stats(baseline, &candidates);
+    let status = if stats.median > warn_regression_ms {
         "WARN"
-    } else if delta < 0.0 {
+    } else if stats.max > warn_regression_ms {
+        "SPIKE"
+    } else if stats.median < 0.0 {
         "IMPROVED"
     } else {
         "OK"
     };
+    let variance = classify_variance(stats, warn_regression_ms);
     println!(
-        "compare {label} baseline={baseline:.3} candidate={candidate:.3} delta={delta:+.3} status={status}"
+        "compare {label} baseline={baseline:.3} runs={} delta_median={:+.3} delta_mean={:+.3} delta_min={:+.3} delta_max={:+.3} delta_stddev={:.3} status={status} variance={variance}",
+        candidates.len(),
+        stats.median,
+        stats.mean,
+        stats.min,
+        stats.max,
+        stats.stddev,
     );
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeltaStats {
+    min: f64,
+    max: f64,
+    mean: f64,
+    median: f64,
+    stddev: f64,
+}
+
+fn compare_delta_stats(baseline: f64, candidates: &[f64]) -> DeltaStats {
+    let mut deltas = candidates
+        .iter()
+        .map(|candidate| candidate - baseline)
+        .collect::<Vec<_>>();
+    deltas.sort_by(f64::total_cmp);
+
+    let min = *deltas.first().expect("at least one candidate required");
+    let max = *deltas.last().expect("at least one candidate required");
+    let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+    let median = if deltas.len().is_multiple_of(2) {
+        let upper = deltas.len() / 2;
+        (deltas[upper - 1] + deltas[upper]) / 2.0
+    } else {
+        deltas[deltas.len() / 2]
+    };
+    let variance = deltas
+        .iter()
+        .map(|delta| {
+            let distance = delta - mean;
+            distance * distance
+        })
+        .sum::<f64>()
+        / deltas.len() as f64;
+    let stddev = variance.sqrt();
+
+    DeltaStats {
+        min,
+        max,
+        mean,
+        median,
+        stddev,
+    }
+}
+
+fn classify_variance(stats: DeltaStats, warn_regression_ms: f64) -> &'static str {
+    if stats.median > warn_regression_ms {
+        if stats.stddev > warn_regression_ms / 2.0 {
+            "likely_regression_with_variance"
+        } else {
+            "likely_regression"
+        }
+    } else if stats.max > warn_regression_ms {
+        "likely_noise"
+    } else {
+        "stable"
+    }
 }
 
 fn parse_u64(value: &str, flag: &str) -> Result<u64, String> {
@@ -1121,9 +1293,10 @@ fn percentile_nearest_rank(values: &[f64], percentile: f64) -> f64 {
 mod tests {
     use super::{
         LatencyBreakdown, LatencyStats, LatencyThresholds, RuntimeFaultCounts,
-        RuntimeFaultThresholds, count_occurrences, count_runtime_faults, evaluate_fault_thresholds,
-        evaluate_latency_thresholds, parse_report_latency_summary, parse_u64,
-        percentile_nearest_rank, synthetic_plugin_manifest,
+        RuntimeFaultThresholds, classify_variance, compare_delta_stats, count_occurrences,
+        count_runtime_faults, evaluate_fault_thresholds, evaluate_latency_thresholds,
+        parse_report_latency_summary, parse_u64, percentile_nearest_rank,
+        synthetic_plugin_manifest,
     };
     use serde_json::json;
 
@@ -1255,6 +1428,57 @@ mod tests {
         assert_eq!(summary.p95_ms, 20.0);
         assert_eq!(summary.p99_ms, 30.0);
         assert_eq!(summary.avg_ms, 15.0);
+        assert_eq!(summary.steady_p95_ms, None);
+        assert_eq!(summary.steady_p99_ms, None);
+        assert_eq!(summary.steady_avg_ms, None);
+    }
+
+    #[test]
+    fn compare_delta_stats_computes_median_and_stddev() {
+        let stats = compare_delta_stats(100.0, &[110.0, 95.0, 105.0]);
+        assert_eq!(stats.min, -5.0);
+        assert_eq!(stats.max, 10.0);
+        assert_eq!(stats.median, 5.0);
+        assert!(stats.stddev > 0.0);
+    }
+
+    #[test]
+    fn classify_variance_distinguishes_noise_and_regression() {
+        let stable = classify_variance(
+            super::DeltaStats {
+                min: -1.0,
+                max: 2.0,
+                mean: 0.5,
+                median: 0.5,
+                stddev: 0.8,
+            },
+            5.0,
+        );
+        assert_eq!(stable, "stable");
+
+        let noise = classify_variance(
+            super::DeltaStats {
+                min: -1.0,
+                max: 8.0,
+                mean: 2.0,
+                median: 2.0,
+                stddev: 3.0,
+            },
+            5.0,
+        );
+        assert_eq!(noise, "likely_noise");
+
+        let regression = classify_variance(
+            super::DeltaStats {
+                min: 6.0,
+                max: 8.0,
+                mean: 7.0,
+                median: 7.0,
+                stddev: 0.5,
+            },
+            5.0,
+        );
+        assert_eq!(regression, "likely_regression");
     }
 
     #[test]

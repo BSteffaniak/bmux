@@ -68,6 +68,10 @@ For baseline comparisons (informational):
 
 - `./scripts/perf-plugin-artifact-compare.sh --candidate-dir <dir> --baseline-dir docs/perf-baselines/runtime-matrix`
 
+For repeated-run variance analysis (informational):
+
+- `./scripts/perf-plugin-variance.sh --runs 3 --iterations 8 --warmup 2`
+
 ### 5) Plugin runtime command matrix SLO
 
 `scripts/perf-plugin-runtime-matrix.sh` enforces per-scenario p95/p99 SLOs:

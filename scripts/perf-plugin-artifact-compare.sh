@@ -6,6 +6,7 @@ BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
 BASELINE_DIR=""
 CANDIDATE_DIR=""
 WARN_REGRESSION_MS="10"
+EXTRA_CANDIDATE_DIRS=()
 
 usage() {
 	cat <<'USAGE'
@@ -18,6 +19,7 @@ Options:
   --baseline-dir DIR        Baseline JSON directory
   --candidate-dir DIR       Candidate JSON directory
   --warn-regression-ms N    Mark WARN when metric regresses by more than N ms (default: 10)
+  --extra-candidate-dir DIR Additional candidate directory for variance comparisons (repeatable)
   --bmux-perf-tools-bin PATH  Explicit bmux-perf-tools binary
   -h, --help                Show this help message
 USAGE
@@ -45,6 +47,10 @@ parse_args() {
 			;;
 		--warn-regression-ms)
 			WARN_REGRESSION_MS="$2"
+			shift 2
+			;;
+		--extra-candidate-dir)
+			EXTRA_CANDIDATE_DIRS+=("$2")
 			shift 2
 			;;
 		--bmux-perf-tools-bin)
@@ -91,10 +97,16 @@ if [[ ! -x "$BMUX_PERF_TOOLS_BIN" ]]; then
 fi
 
 echo "perf artifact compare: baseline=$BASELINE_DIR candidate=$CANDIDATE_DIR"
+if [[ ${#EXTRA_CANDIDATE_DIRS[@]} -gt 0 ]]; then
+	echo "additional candidate dirs: ${EXTRA_CANDIDATE_DIRS[*]}"
+fi
 
 shopt -s nullglob
 for candidate in "$CANDIDATE_DIR"/*.json; do
 	name="$(basename "$candidate")"
+	if [[ "$name" == "baseline-metadata.json" ]]; then
+		continue
+	fi
 	baseline="$BASELINE_DIR/$name"
 	echo
 	echo "=== compare $name ==="
@@ -102,10 +114,22 @@ for candidate in "$CANDIDATE_DIR"/*.json; do
 		echo "skip: no baseline file at $baseline"
 		continue
 	fi
-	"$BMUX_PERF_TOOLS_BIN" compare-report \
-		--baseline "$baseline" \
-		--candidate "$candidate" \
+	compare_cmd=(
+		"$BMUX_PERF_TOOLS_BIN"
+		compare-report
+		--baseline "$baseline"
+		--candidate "$candidate"
 		--warn-regression-ms "$WARN_REGRESSION_MS"
+	)
+	for extra_dir in "${EXTRA_CANDIDATE_DIRS[@]}"; do
+		extra_candidate="$extra_dir/$name"
+		if [[ -f "$extra_candidate" ]]; then
+			compare_cmd+=(--candidate "$extra_candidate")
+		else
+			echo "note: no extra candidate file at $extra_candidate"
+		fi
+	done
+	"${compare_cmd[@]}"
 done
 
 echo
