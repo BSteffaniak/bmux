@@ -6,3 +6,4 @@ app/build/
 .kotlin/
 local.properties
 logs/alpha/
+build/
