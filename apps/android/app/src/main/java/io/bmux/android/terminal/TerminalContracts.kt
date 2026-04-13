@@ -20,6 +20,17 @@ data class TerminalChunkFrame(
     val bytes: ByteArray,
 )
 
+enum class TerminalStatusSeverity {
+    INFO,
+    WARN,
+    ERROR,
+}
+
+data class TerminalStatusEvent(
+    val message: String,
+    val severity: TerminalStatusSeverity,
+)
+
 interface TerminalTransportConnection {
     fun send(data: ByteArray)
     fun resize(rows: Int, cols: Int)
@@ -31,7 +42,7 @@ interface TerminalTransport {
         endpoint: TerminalEndpoint,
         session: String?,
         sink: (ByteArray) -> Unit,
-        onStatus: (String) -> Unit,
+        onStatus: (TerminalStatusEvent) -> Unit,
     ): TerminalTransportConnection
 }
 

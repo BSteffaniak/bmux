@@ -58,7 +58,7 @@ fun TerminalSessionScreen(
 
     var connection by remember(endpoint.id) { mutableStateOf<TerminalTransportConnection?>(null) }
     var warning by remember(endpoint.id) { mutableStateOf<String?>(null) }
-    var statusLines by remember(endpoint.id) { mutableStateOf(emptyList<String>()) }
+    var statusLines by remember(endpoint.id) { mutableStateOf(emptyList<TerminalStatusEvent>()) }
 
     LaunchedEffect(endpoint.id, session) {
         warning = null
@@ -69,8 +69,8 @@ fun TerminalSessionScreen(
                 endpoint = endpoint,
                 session = session,
                 sink = { bytes -> renderer.appendOutput(bytes) },
-                onStatus = { message ->
-                    statusLines = (statusLines + message).takeLast(MAX_STATUS_LINES)
+                onStatus = { event ->
+                    statusLines = (statusLines + event).takeLast(MAX_STATUS_LINES)
                 },
             )
         }.onSuccess {
@@ -126,8 +126,17 @@ fun TerminalSessionScreen(
                             .heightIn(max = 120.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
-                        itemsIndexed(statusLines, key = { index, line -> "$index-$line" }) { _, line ->
-                            Text(line, style = MaterialTheme.typography.bodySmall)
+                        itemsIndexed(statusLines, key = { index, line -> "$index-${line.message}" }) { _, line ->
+                            val color = when (line.severity) {
+                                TerminalStatusSeverity.INFO -> MaterialTheme.colorScheme.onSurface
+                                TerminalStatusSeverity.WARN -> MaterialTheme.colorScheme.tertiary
+                                TerminalStatusSeverity.ERROR -> MaterialTheme.colorScheme.error
+                            }
+                            Text(
+                                text = line.message,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = color,
+                            )
                         }
                     }
                 }
@@ -153,7 +162,7 @@ private class CoreTerminalTransport(
         endpoint: TerminalEndpoint,
         session: String?,
         sink: (ByteArray) -> Unit,
-        onStatus: (String) -> Unit,
+        onStatus: (TerminalStatusEvent) -> Unit,
     ): TerminalTransportConnection {
         val terminalId = openTerminal(endpoint.id, session, DEFAULT_ROWS, DEFAULT_COLS)
             .getOrElse { error ->
@@ -180,7 +189,7 @@ private class CoreTerminalTransport(
 private class CoreTerminalTransportConnection(
     private val terminalId: String,
     private val sink: (ByteArray) -> Unit,
-    private val onStatus: (String) -> Unit,
+    private val onStatus: (TerminalStatusEvent) -> Unit,
     private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<TerminalChunkFrame>>,
     private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
     private val resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
@@ -210,7 +219,12 @@ private class CoreTerminalTransportConnection(
                             val message = chunk.bytes.toString(StandardCharsets.UTF_8).trim()
                             if (message.isNotEmpty()) {
                                 scope.launch(Dispatchers.Main) {
-                                    onStatus(message)
+                                    onStatus(
+                                        TerminalStatusEvent(
+                                            message = message,
+                                            severity = inferStatusSeverity(message),
+                                        ),
+                                    )
                                 }
                             }
                         }
@@ -258,5 +272,21 @@ private class CoreTerminalTransportConnection(
 
     private companion object {
         private const val POLL_IDLE_DELAY_MS = 25L
+    }
+
+    private fun inferStatusSeverity(message: String): TerminalStatusSeverity {
+        val normalized = message.lowercase()
+        return when {
+            normalized.contains("error") ||
+                normalized.contains("failed") ||
+                normalized.contains("denied") ||
+                normalized.contains("invalid") ||
+                normalized.contains("unavailable") -> TerminalStatusSeverity.ERROR
+            normalized.contains("warn") ||
+                normalized.contains("retry") ||
+                normalized.contains("reconnect") ||
+                normalized.contains("timeout") -> TerminalStatusSeverity.WARN
+            else -> TerminalStatusSeverity.INFO
+        }
     }
 }
