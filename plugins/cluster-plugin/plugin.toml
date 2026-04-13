@@ -13,6 +13,7 @@ owns_namespaces = [
     "cluster-pane-retry",
     "cluster-gateway-status",
     "cluster-gateway-explain",
+    "cluster-gateway-reset",
 ]
 provided_capabilities = [
     "bmux.server_clusters.read",
@@ -142,6 +143,34 @@ value_name = "MODE"
 kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
+required = false
+
+[[commands]]
+aliases       = [["cluster", "gateway", "reset"]]
+expose_in_cli = true
+name          = "cluster-gateway-reset"
+path          = ["cluster-gateway-reset"]
+summary       = "Clear persisted gateway selection cache"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster_ref"
+position   = 0
+required   = false
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "all"
+name     = "all"
 required = false
 
 [[commands]]
@@ -318,30 +347,17 @@ required = false
 
 [[commands.arguments]]
 kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
+
+[[commands.arguments]]
+kind       = "string"
 name       = "cluster_ref"
 position   = 0
 required   = false
 value_name = "CLUSTER"
-
-[[commands.arguments]]
-kind       = "string"
-long       = "gateway"
-name       = "gateway"
-required   = false
-value_name = "TARGET"
-
-[[commands.arguments]]
-kind       = "string"
-long       = "gateway-mode"
-name       = "gateway_mode"
-required   = false
-value_name = "MODE"
-
-[[commands.arguments]]
-kind     = "boolean"
-long     = "gateway-no-failover"
-name     = "gateway_no_failover"
-required = false
 
 [[commands]]
 aliases       = [["cluster", "gateway", "explain"]]
@@ -380,30 +396,17 @@ required = false
 
 [[commands.arguments]]
 kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
+
+[[commands.arguments]]
+kind       = "string"
 name       = "cluster_ref"
 position   = 0
 required   = false
 value_name = "CLUSTER"
-
-[[commands.arguments]]
-kind       = "string"
-long       = "gateway"
-name       = "gateway"
-required   = false
-value_name = "TARGET"
-
-[[commands.arguments]]
-kind       = "string"
-long       = "gateway-mode"
-name       = "gateway_mode"
-required   = false
-value_name = "MODE"
-
-[[commands.arguments]]
-kind     = "boolean"
-long     = "gateway-no-failover"
-name     = "gateway_no_failover"
-required = false
 
 [[commands]]
 aliases       = [["cluster", "pane", "new"]]

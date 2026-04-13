@@ -147,6 +147,18 @@ struct GatewayCommandOverrides {
     passthrough_arguments: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayOutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GatewayResetScope {
+    Cluster(String),
+    All,
+}
+
 #[derive(Debug, Clone)]
 struct GatewayProbeResult {
     ok: bool,
@@ -2085,12 +2097,11 @@ fn load_cluster_gateway_runtime_state(
         .collect())
 }
 
-#[cfg(test)]
-fn clear_cluster_gateway_runtime_state(paths: &ConfigPaths) -> Result<()> {
+fn clear_cluster_gateway_runtime_state(paths: &ConfigPaths) -> Result<bool> {
     let path = cluster_gateway_runtime_state_path(paths);
     match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error).with_context(|| format!("failed removing {}", path.display())),
     }
 }
@@ -3227,6 +3238,12 @@ pub(super) async fn maybe_run_cluster_plugin_command_via_gateway(
     let overrides = parse_gateway_overrides(arguments)?;
     let config = BmuxConfig::load()?;
     let settings = cluster_gateway_settings_from_config(&config)?;
+
+    if command_name == "cluster-gateway-reset" {
+        return run_cluster_gateway_reset_command(&settings, &overrides.passthrough_arguments)
+            .map(Some);
+    }
+
     let Some(cluster_name) = resolve_cluster_name_for_gateway(
         command_name,
         &overrides.passthrough_arguments,
@@ -3242,11 +3259,20 @@ pub(super) async fn maybe_run_cluster_plugin_command_via_gateway(
     let definition = apply_gateway_overrides(base_definition.clone(), &overrides)?;
 
     if command_name == "cluster-gateway-status" {
-        print_cluster_gateway_status(&cluster_name, &definition, &overrides)?;
+        let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
+        print_cluster_gateway_status(&cluster_name, &definition, &overrides, output_format)?;
         return Ok(Some(0));
     }
     if command_name == "cluster-gateway-explain" {
-        return run_cluster_gateway_explain(&config, &cluster_name, &definition, &overrides).await;
+        let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
+        return run_cluster_gateway_explain(
+            &config,
+            &cluster_name,
+            &definition,
+            &overrides,
+            output_format,
+        )
+        .await;
     }
 
     if definition.gateway_mode == ClusterGatewayMode::Direct {
@@ -3707,6 +3733,134 @@ fn format_gateway_failures(failures: &[GatewayAttemptFailure]) -> String {
         .join("; ")
 }
 
+fn parse_gateway_output_format(arguments: &[String]) -> Result<GatewayOutputFormat> {
+    let Some(value) = value_after_flag(arguments, "--format") else {
+        return Ok(GatewayOutputFormat::Text);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "text" => Ok(GatewayOutputFormat::Text),
+        "json" => Ok(GatewayOutputFormat::Json),
+        other => anyhow::bail!("unsupported --format '{other}' (expected text|json)"),
+    }
+}
+
+fn parse_gateway_reset_scope(arguments: &[String]) -> Result<GatewayResetScope> {
+    let all = arguments.iter().any(|value| value == "--all");
+    let cluster_flag =
+        value_after_flag(arguments, "--cluster").or_else(|| value_after_flag(arguments, "-c"));
+    let cluster_positional = first_positional_argument(arguments);
+
+    if all {
+        if cluster_flag.is_some() || cluster_positional.is_some() {
+            anyhow::bail!("cluster gateway reset accepts either --all or --cluster, not both");
+        }
+        return Ok(GatewayResetScope::All);
+    }
+
+    if let (Some(flag_cluster), Some(positional_cluster)) =
+        (cluster_flag.as_ref(), cluster_positional.as_ref())
+        && flag_cluster != positional_cluster
+    {
+        anyhow::bail!(
+            "cluster gateway reset cluster mismatch between --cluster='{flag_cluster}' and positional '{positional_cluster}'"
+        );
+    }
+
+    let cluster = cluster_flag.or(cluster_positional).ok_or_else(|| {
+        anyhow::anyhow!("cluster gateway reset requires --cluster unless --all is passed")
+    })?;
+    Ok(GatewayResetScope::Cluster(cluster))
+}
+
+fn run_cluster_gateway_reset_command(
+    settings: &ClusterGatewaySettings,
+    arguments: &[String],
+) -> Result<u8> {
+    let scope = parse_gateway_reset_scope(arguments)?;
+    match scope {
+        GatewayResetScope::All => {
+            let removed = clear_gateway_runtime_state_all()?;
+            println!("cluster gateway reset: scope=all removed={removed}");
+            Ok(0)
+        }
+        GatewayResetScope::Cluster(cluster_name) => {
+            if !settings.clusters.contains_key(cluster_name.as_str()) {
+                anyhow::bail!("unknown cluster '{cluster_name}'");
+            }
+            let removed = clear_gateway_runtime_state_cluster(cluster_name.as_str())?;
+            println!(
+                "cluster gateway reset: scope=cluster cluster='{cluster_name}' removed={removed}"
+            );
+            Ok(0)
+        }
+    }
+}
+
+fn clear_gateway_runtime_state_all() -> Result<bool> {
+    ensure_gateway_runtime_state_loaded();
+    let had_entries = cluster_gateway_state_map()
+        .lock()
+        .map(|state_map| !state_map.is_empty())
+        .unwrap_or(false);
+    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+        state_map.clear();
+    }
+
+    let paths = ConfigPaths::default();
+    let removed_file = clear_cluster_gateway_runtime_state(&paths)?;
+    Ok(had_entries || removed_file)
+}
+
+fn clear_gateway_runtime_state_cluster(cluster_name: &str) -> Result<bool> {
+    ensure_gateway_runtime_state_loaded();
+    let snapshot = {
+        let mut state_map = cluster_gateway_state_map()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed locking gateway runtime state"))?;
+        let removed = state_map.remove(cluster_name).is_some();
+        (removed, state_map.clone())
+    };
+
+    let paths = ConfigPaths::default();
+    if snapshot.1.is_empty() {
+        let _ = clear_cluster_gateway_runtime_state(&paths)?;
+    } else {
+        save_cluster_gateway_runtime_state(&paths, &snapshot.1)?;
+    }
+    Ok(snapshot.0)
+}
+
+fn status_selected_candidate(
+    cluster_name: &str,
+    definition: &ClusterGatewayDefinition,
+    ordered_candidates: &[String],
+) -> Option<String> {
+    if definition.gateway_mode == ClusterGatewayMode::Direct {
+        return None;
+    }
+    if definition.gateway_mode != ClusterGatewayMode::Auto {
+        return ordered_candidates.first().cloned();
+    }
+
+    ordered_candidates
+        .iter()
+        .find(|candidate| gateway_cooldown_remaining_ms(cluster_name, candidate).is_none())
+        .cloned()
+        .or_else(|| ordered_candidates.first().cloned())
+}
+
+fn u128_to_u64_saturating(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+const fn gateway_mode_label(mode: ClusterGatewayMode) -> &'static str {
+    match mode {
+        ClusterGatewayMode::Auto => "auto",
+        ClusterGatewayMode::Direct => "direct",
+        ClusterGatewayMode::Pinned => "pinned",
+    }
+}
+
 fn parse_gateway_overrides(arguments: &[String]) -> Result<GatewayCommandOverrides> {
     let mut overrides = GatewayCommandOverrides::default();
     let mut index = 0usize;
@@ -3796,9 +3950,43 @@ fn print_cluster_gateway_status(
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     overrides: &GatewayCommandOverrides,
+    output_format: GatewayOutputFormat,
 ) -> Result<()> {
     let candidates = ordered_gateway_candidates_for_cluster(cluster_name, definition)?;
     let preferred = preferred_gateway_candidate(cluster_name);
+    let candidate_rows = candidates
+        .iter()
+        .map(|candidate| {
+            let preferred_marker = preferred.as_ref().is_some_and(|value| value == candidate);
+            let cooldown = gateway_cooldown_remaining_ms(cluster_name, candidate);
+            serde_json::json!({
+                "candidate": candidate,
+                "preferred": preferred_marker,
+                "cooldown_ms": cooldown.map(u128_to_u64_saturating),
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected_candidate = status_selected_candidate(cluster_name, definition, &candidates);
+
+    if output_format == GatewayOutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "cluster": cluster_name,
+                "mode": gateway_mode_label(definition.gateway_mode),
+                "no_failover": overrides.no_failover,
+                "overrides": {
+                    "mode": overrides.gateway_mode.map(gateway_mode_label),
+                    "gateway": overrides.gateway_target,
+                },
+                "selected_candidate": selected_candidate,
+                "candidates": candidate_rows,
+            }))
+            .context("failed encoding gateway status json")?
+        );
+        return Ok(());
+    }
+
     println!(
         "cluster gateway status: cluster='{cluster_name}' mode={:?} no_failover={}",
         definition.gateway_mode, overrides.no_failover
@@ -3809,19 +3997,21 @@ fn print_cluster_gateway_status(
             overrides.gateway_mode, overrides.gateway_target
         );
     }
+    println!(
+        "selected candidate: {}",
+        selected_candidate.as_deref().unwrap_or("none")
+    );
     println!("candidates:");
-    for candidate in candidates {
-        let preferred_marker = preferred.as_ref().is_some_and(|value| value == &candidate);
-        let cooldown = gateway_cooldown_remaining_ms(cluster_name, &candidate);
-        let suffix = if preferred_marker {
-            "preferred"
-        } else {
-            "normal"
-        };
-        match cooldown {
-            Some(ms) => println!("  - {candidate} [{suffix}] cooldown_ms={ms}"),
-            None => println!("  - {candidate} [{suffix}]"),
-        }
+    println!("  candidate\tpreferred\tcooldown_ms");
+    for row in candidate_rows {
+        println!(
+            "  {}\t{}\t{}",
+            row["candidate"].as_str().unwrap_or("-"),
+            row["preferred"].as_bool().unwrap_or(false),
+            row["cooldown_ms"]
+                .as_u64()
+                .map_or_else(|| "-".to_string(), |value| value.to_string())
+        );
     }
     Ok(())
 }
@@ -3831,13 +4021,16 @@ async fn run_cluster_gateway_explain(
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     overrides: &GatewayCommandOverrides,
+    output_format: GatewayOutputFormat,
 ) -> Result<Option<u8>> {
     let candidates = ordered_gateway_candidates_for_cluster(cluster_name, definition)?;
     let preferred = preferred_gateway_candidate(cluster_name);
-    println!(
-        "cluster gateway explain: cluster='{cluster_name}' mode={:?} no_failover={}",
-        definition.gateway_mode, overrides.no_failover
-    );
+    if output_format == GatewayOutputFormat::Text {
+        println!(
+            "cluster gateway explain: cluster='{cluster_name}' mode={:?} no_failover={}",
+            definition.gateway_mode, overrides.no_failover
+        );
+    }
 
     let mut probes = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
@@ -3849,15 +4042,17 @@ async fn run_cluster_gateway_explain(
             cooldown_ms: cooldown,
             probe: probe.clone(),
         });
-        println!(
-            "  - candidate={candidate} preferred={} cooldown_ms={} ok={} reason={} latency_ms={} detail={}",
-            preferred_marker,
-            cooldown.unwrap_or(0),
-            probe.ok,
-            probe.reason_code,
-            probe.latency_ms,
-            probe.detail
-        );
+        if output_format == GatewayOutputFormat::Text {
+            println!(
+                "  - candidate={candidate} preferred={} cooldown_ms={} ok={} reason={} latency_ms={} detail={}",
+                preferred_marker,
+                cooldown.unwrap_or(0),
+                probe.ok,
+                probe.reason_code,
+                probe.latency_ms,
+                probe.detail
+            );
+        }
     }
 
     let mut failures = Vec::new();
@@ -3868,7 +4063,9 @@ async fn run_cluster_gateway_explain(
         &mut failures,
     );
     if selected.is_none() && !attempted && definition.gateway_mode == ClusterGatewayMode::Auto {
-        println!("selection note: all candidates in cooldown; simulating immediate retry");
+        if output_format == GatewayOutputFormat::Text {
+            println!("selection note: all candidates in cooldown; simulating immediate retry");
+        }
         let (retry_selected, _) = evaluate_gateway_explain_selection(
             &probes,
             false,
@@ -3876,6 +4073,25 @@ async fn run_cluster_gateway_explain(
             &mut failures,
         );
         selected = retry_selected;
+    }
+
+    let selected_candidate = selected.map(|value| value.candidate.clone());
+    if output_format == GatewayOutputFormat::Json {
+        let payload = build_gateway_explain_json_payload(
+            cluster_name,
+            definition,
+            overrides,
+            &probes,
+            preferred.as_ref(),
+            &failures,
+            selected_candidate.as_ref(),
+        );
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .context("failed encoding gateway explain json")?
+        );
+        return Ok(Some(u8::from(selected.is_none())));
     }
 
     selected.map_or_else(
@@ -3892,6 +4108,56 @@ async fn run_cluster_gateway_explain(
             Ok(Some(0))
         },
     )
+}
+
+fn build_gateway_explain_json_payload(
+    cluster_name: &str,
+    definition: &ClusterGatewayDefinition,
+    overrides: &GatewayCommandOverrides,
+    probes: &[GatewayExplainCandidateProbe],
+    preferred: Option<&String>,
+    failures: &[GatewayAttemptFailure],
+    selected_candidate: Option<&String>,
+) -> serde_json::Value {
+    let selected_ok = selected_candidate.is_some();
+    let probe_rows = probes
+        .iter()
+        .map(|probe| {
+            serde_json::json!({
+                "candidate": probe.candidate,
+                "preferred": preferred.is_some_and(|value| value == &probe.candidate),
+                "cooldown_ms": probe.cooldown_ms.map(u128_to_u64_saturating),
+                "ok": probe.probe.ok,
+                "reason": probe.probe.reason_code,
+                "latency_ms": u128_to_u64_saturating(probe.probe.latency_ms),
+                "detail": probe.probe.detail,
+            })
+        })
+        .collect::<Vec<_>>();
+    let failure_rows = failures
+        .iter()
+        .map(|failure| {
+            serde_json::json!({
+                "candidate": failure.candidate,
+                "reason": failure.reason_code,
+                "detail": failure.detail,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "cluster": cluster_name,
+        "mode": gateway_mode_label(definition.gateway_mode),
+        "no_failover": overrides.no_failover,
+        "selected_candidate": selected_candidate,
+        "result": if selected_ok {
+            "success"
+        } else {
+            "failure"
+        },
+        "probes": probe_rows,
+        "failures": failure_rows,
+    })
 }
 
 fn evaluate_gateway_explain_selection<'a>(
@@ -6216,6 +6482,48 @@ mod tests {
             overrides.passthrough_arguments,
             vec!["--cluster".to_string(), "prod".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_gateway_output_format_defaults_to_text() {
+        let format = parse_gateway_output_format(&[]).expect("default gateway format should parse");
+        assert_eq!(format, GatewayOutputFormat::Text);
+    }
+
+    #[test]
+    fn parse_gateway_output_format_supports_json() {
+        let format = parse_gateway_output_format(&["--format".to_string(), "json".to_string()])
+            .expect("json gateway format should parse");
+        assert_eq!(format, GatewayOutputFormat::Json);
+    }
+
+    #[test]
+    fn parse_gateway_reset_scope_requires_cluster_without_all() {
+        let error = parse_gateway_reset_scope(&[])
+            .expect_err("reset scope should require --cluster unless --all");
+        assert!(
+            error
+                .to_string()
+                .contains("requires --cluster unless --all is passed")
+        );
+    }
+
+    #[test]
+    fn parse_gateway_reset_scope_accepts_all() {
+        let scope = parse_gateway_reset_scope(&["--all".to_string()])
+            .expect("--all reset scope should parse");
+        assert!(matches!(scope, GatewayResetScope::All));
+    }
+
+    #[test]
+    fn parse_gateway_reset_scope_rejects_mixed_all_and_cluster() {
+        let error = parse_gateway_reset_scope(&[
+            "--all".to_string(),
+            "--cluster".to_string(),
+            "prod".to_string(),
+        ])
+        .expect_err("mixed reset scope should fail");
+        assert!(error.to_string().contains("either --all or --cluster"));
     }
 
     #[test]
