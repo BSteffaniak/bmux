@@ -19,17 +19,35 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import java.nio.charset.StandardCharsets
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 @Composable
 fun TerminalSessionScreen(
     endpoint: TerminalEndpoint,
     session: String?,
     onBack: () -> Unit,
-    connectAttempt: suspend (targetId: String, session: String?) -> Result<String>,
+    openTerminal: suspend (targetId: String, session: String?, rows: Int, cols: Int) -> Result<String>,
+    pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<ByteArray>>,
+    writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
+    resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
+    closeTerminal: suspend (terminalId: String) -> Result<Unit>,
 ) {
     val renderer = remember(endpoint.id) { TermlibTerminalRenderer() }
-    val transport = remember(endpoint.id) { PreviewTerminalTransport(connectAttempt) }
+    val transport = remember(endpoint.id) {
+        CoreTerminalTransport(
+            openTerminal = openTerminal,
+            pollTerminalOutput = pollTerminalOutput,
+            writeTerminalInput = writeTerminalInput,
+            resizeTerminal = resizeTerminal,
+            closeTerminal = closeTerminal,
+        )
+    }
 
     var connection by remember(endpoint.id) { mutableStateOf<TerminalTransportConnection?>(null) }
     var warning by remember(endpoint.id) { mutableStateOf<String?>(null) }
@@ -70,7 +88,7 @@ fun TerminalSessionScreen(
         }
 
         Text(
-            text = "Renderer: termlib (Apache-2.0). Transport: M7 preview adapter.",
+            text = "Renderer: termlib (Apache-2.0). Transport: mobile-core terminal stream.",
             style = MaterialTheme.typography.bodySmall,
         )
 
@@ -86,67 +104,77 @@ fun TerminalSessionScreen(
     }
 }
 
-private class PreviewTerminalTransport(
-    private val connectAttempt: suspend (targetId: String, session: String?) -> Result<String>,
+private class CoreTerminalTransport(
+    private val openTerminal: suspend (targetId: String, session: String?, rows: Int, cols: Int) -> Result<String>,
+    private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<ByteArray>>,
+    private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
+    private val resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
+    private val closeTerminal: suspend (terminalId: String) -> Result<Unit>,
 ) : TerminalTransport {
     override suspend fun open(
         endpoint: TerminalEndpoint,
         session: String?,
         sink: (ByteArray) -> Unit,
     ): TerminalTransportConnection {
-        val status = connectAttempt(endpoint.id, session)
+        val terminalId = openTerminal(endpoint.id, session, DEFAULT_ROWS, DEFAULT_COLS)
             .getOrElse { error ->
-                val line = "Connection failed for ${endpoint.name}: ${error.message ?: "unknown"}\r\n"
-                sink(line.toByteArray(StandardCharsets.UTF_8))
                 throw error
             }
 
-        val banner = buildString {
-            append("Connected to ${endpoint.name} (${endpoint.canonicalTarget})\r\n")
-            append("$status\r\n")
-            append("Preview terminal transport active. Type 'help' for commands.\r\n")
-            append("$ ")
-        }
-        sink(banner.toByteArray(StandardCharsets.UTF_8))
+        return CoreTerminalTransportConnection(
+            terminalId = terminalId,
+            sink = sink,
+            pollTerminalOutput = pollTerminalOutput,
+            writeTerminalInput = writeTerminalInput,
+            resizeTerminal = resizeTerminal,
+            closeTerminal = closeTerminal,
+        )
+    }
 
-        return PreviewTerminalTransportConnection(sink)
+    private companion object {
+        private const val DEFAULT_ROWS = 24
+        private const val DEFAULT_COLS = 80
     }
 }
 
-private class PreviewTerminalTransportConnection(
+private class CoreTerminalTransportConnection(
+    private val terminalId: String,
     private val sink: (ByteArray) -> Unit,
+    private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<ByteArray>>,
+    private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
+    private val resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
+    private val closeTerminal: suspend (terminalId: String) -> Result<Unit>,
 ) : TerminalTransportConnection {
-    private val commandBuffer = StringBuilder()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var closed = false
+
+    init {
+        scope.launch {
+            while (isActive && !closed) {
+                val chunks = pollTerminalOutput(terminalId, 64)
+                    .getOrElse { error ->
+                        sink("\r\n[terminal poll failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
+                        break
+                    }
+                if (chunks.isEmpty()) {
+                    delay(POLL_IDLE_DELAY_MS)
+                    continue
+                }
+                for (chunk in chunks) {
+                    sink(chunk)
+                }
+            }
+        }
+    }
 
     override fun send(data: ByteArray) {
         if (closed) {
             return
         }
 
-        for (byte in data) {
-            when (byte.toInt()) {
-                3 -> {
-                    commandBuffer.clear()
-                    emit("^C\r\n$ ")
-                }
-                8, 127 -> {
-                    if (commandBuffer.isNotEmpty()) {
-                        commandBuffer.deleteAt(commandBuffer.lastIndex)
-                        emit("\b \b")
-                    }
-                }
-                10, 13 -> {
-                    emit("\r\n")
-                    runCommand(commandBuffer.toString().trim())
-                    commandBuffer.clear()
-                    emit("$ ")
-                }
-                else -> {
-                    val asChar = byte.toInt().toChar()
-                    commandBuffer.append(asChar)
-                    sink(byteArrayOf(byte))
-                }
+        scope.launch {
+            writeTerminalInput(terminalId, data).onFailure { error ->
+                sink("\r\n[terminal write failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
             }
         }
     }
@@ -155,31 +183,27 @@ private class PreviewTerminalTransportConnection(
         if (closed) {
             return
         }
-        emit("\r\n[terminal resized to ${rows}x${cols}]\r\n$ ")
+
+        scope.launch {
+            resizeTerminal(terminalId, rows, cols).onFailure { error ->
+                sink("\r\n[terminal resize failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
+            }
+        }
     }
 
     override fun close() {
         if (!closed) {
             closed = true
-            emit("\r\n[terminal closed]\r\n")
-        }
-    }
-
-    private fun runCommand(command: String) {
-        when (command) {
-            "" -> Unit
-            "help" -> emit("Commands: help, clear, status, exit\r\n")
-            "clear" -> emit("\u001b[2J\u001b[H")
-            "status" -> emit("Transport is running in preview mode.\r\n")
-            "exit" -> {
-                emit("Session closed.\r\n")
-                close()
+            scope.launch {
+                closeTerminal(terminalId).onFailure { error ->
+                    sink("\r\n[terminal close failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
+                }
             }
-            else -> emit("Command '${command}' is not wired yet in preview transport.\r\n")
+            scope.coroutineContext.cancel()
         }
     }
 
-    private fun emit(text: String) {
-        sink(text.toByteArray(StandardCharsets.UTF_8))
+    private companion object {
+        private const val POLL_IDLE_DELAY_MS = 25L
     }
 }

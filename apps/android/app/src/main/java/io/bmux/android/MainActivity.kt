@@ -48,6 +48,8 @@ import uniffi.bmux_mobile_ffi.ConnectionStateFfi
 import uniffi.bmux_mobile_ffi.ConnectionStatusFfi
 import uniffi.bmux_mobile_ffi.HostKeyPinSuggestionFfi
 import uniffi.bmux_mobile_ffi.MobileApiFfi
+import uniffi.bmux_mobile_ffi.TerminalOpenRequestFfi
+import uniffi.bmux_mobile_ffi.TerminalSizeFfi
 import uniffi.bmux_mobile_ffi.TargetRecordFfi
 
 class MainActivity : ComponentActivity() {
@@ -226,10 +228,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         state = state.copy(activeTerminalTarget = null)
     }
 
-    fun connectForTerminal(targetId: String, session: String?): Result<String> {
-        return gateway.connect(targetId, session).map { connection ->
-            "Connection status: ${connection.status.name}"
-        }
+    fun openTerminal(targetId: String, session: String?, rows: Int, cols: Int): Result<String> {
+        return gateway.openTerminal(targetId, session, rows, cols)
+    }
+
+    fun pollTerminalOutput(terminalId: String, maxChunks: Int): Result<List<ByteArray>> {
+        return gateway.pollTerminalOutput(terminalId, maxChunks)
+    }
+
+    fun writeTerminalInput(terminalId: String, bytes: ByteArray): Result<Unit> {
+        return gateway.writeTerminalInput(terminalId, bytes)
+    }
+
+    fun resizeTerminal(terminalId: String, rows: Int, cols: Int): Result<Unit> {
+        return gateway.resizeTerminal(terminalId, rows, cols)
+    }
+
+    fun closeTerminalStream(terminalId: String): Result<Unit> {
+        return gateway.closeTerminal(terminalId)
     }
 
     fun setDiscoveryEnabled(enabled: Boolean) {
@@ -383,6 +399,64 @@ private class MobileGateway(application: Application) {
         }
     }
 
+    fun openTerminal(targetId: String, session: String?, rows: Int, cols: Int): Result<String> {
+        val client = ffi ?: return Result.failure(
+            IllegalStateException("FFI terminal stream unavailable"),
+        )
+        return runCatching {
+            val request = TerminalOpenRequestFfi(
+                targetId = targetId,
+                session = session,
+                rows = rows.toTerminalUShort("rows"),
+                cols = cols.toTerminalUShort("cols"),
+            )
+            client.openTerminal(request).id
+        }
+    }
+
+    fun pollTerminalOutput(terminalId: String, maxChunks: Int): Result<List<ByteArray>> {
+        val client = ffi ?: return Result.failure(
+            IllegalStateException("FFI terminal stream unavailable"),
+        )
+        return runCatching {
+            client.pollTerminalOutput(terminalId, maxChunks.toUInt()).map { it.bytes }
+        }
+    }
+
+    fun writeTerminalInput(terminalId: String, bytes: ByteArray): Result<Unit> {
+        val client = ffi ?: return Result.failure(
+            IllegalStateException("FFI terminal stream unavailable"),
+        )
+        return runCatching {
+            client.writeTerminalInput(terminalId, bytes)
+        }
+    }
+
+    fun resizeTerminal(terminalId: String, rows: Int, cols: Int): Result<Unit> {
+        val client = ffi ?: return Result.failure(
+            IllegalStateException("FFI terminal stream unavailable"),
+        )
+        return runCatching {
+            client.resizeTerminal(
+                terminalId,
+                TerminalSizeFfi(
+                    rows = rows.toTerminalUShort("rows"),
+                    cols = cols.toTerminalUShort("cols"),
+                ),
+            )
+        }
+    }
+
+    fun closeTerminal(terminalId: String): Result<Unit> {
+        val client = ffi ?: return Result.failure(
+            IllegalStateException("FFI terminal stream unavailable"),
+        )
+        return runCatching {
+            client.closeTerminal(terminalId)
+            Unit
+        }
+    }
+
     fun startReconnectService(targetId: String, session: String?) {
         ConnectionForegroundService.start(context, targetId, session)
     }
@@ -426,6 +500,11 @@ private class MobileGateway(application: Application) {
         source.startsWith("ssh://") || source.contains('@') -> "ssh"
         source.startsWith("tls://") || source.contains(':') -> "tls"
         else -> "bmux"
+    }
+
+    private fun Int.toTerminalUShort(name: String): UShort {
+        require(this in 1..65_535) { "$name out of range: $this" }
+        return toUShort()
     }
 }
 
@@ -476,8 +555,20 @@ private fun MainScreen(vm: MainViewModel) {
                     ),
                     session = state.selectedSession.ifBlank { null },
                     onBack = vm::closeTerminal,
-                    connectAttempt = { targetId, session ->
-                        withContext(Dispatchers.IO) { vm.connectForTerminal(targetId, session) }
+                    openTerminal = { targetId, session, rows, cols ->
+                        withContext(Dispatchers.IO) { vm.openTerminal(targetId, session, rows, cols) }
+                    },
+                    pollTerminalOutput = { terminalId, maxChunks ->
+                        withContext(Dispatchers.IO) { vm.pollTerminalOutput(terminalId, maxChunks) }
+                    },
+                    writeTerminalInput = { terminalId, bytes ->
+                        withContext(Dispatchers.IO) { vm.writeTerminalInput(terminalId, bytes) }
+                    },
+                    resizeTerminal = { terminalId, rows, cols ->
+                        withContext(Dispatchers.IO) { vm.resizeTerminal(terminalId, rows, cols) }
+                    },
+                    closeTerminal = { terminalId ->
+                        withContext(Dispatchers.IO) { vm.closeTerminalStream(terminalId) }
                     },
                 )
                 return@Column
