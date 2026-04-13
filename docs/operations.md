@@ -76,6 +76,20 @@ bmux sandbox doctor --fix --dry-run --json
 bmux sandbox doctor --fix --json
 ```
 
+### Bundle/Triage Quick Decision Table
+
+| Goal                                     | Command                                          | Default Verify Behavior                                                      | Strict Extras Behavior                                           |
+| ---------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Create a shareable bundle only           | `bmux sandbox bundle <id> --json`                | No verify step                                                               | N/A                                                              |
+| Create + verify in one command           | `bmux sandbox bundle <id> --verify --json`       | Runs metadata verify and fails on required drift                             | Add `--strict` via `verify-bundle` for extra artifact failures   |
+| Verify an existing bundle                | `bmux sandbox verify-bundle <bundle-dir> --json` | Reports unexpected extras but does not fail for them                         | Use `--strict` to fail on unexpected extras                      |
+| Triage and auto-package failure evidence | `bmux sandbox triage <id> --bundle --json`       | Auto-runs verify on created bundle and triage exits non-zero if verify fails | Add `--bundle-strict-verify` to fail triage on unexpected extras |
+
+Strictness rule of thumb:
+
+- Missing/changed expected artifacts (`exists`, `bytes`, `file_count`, `sha256`) fail verification in both strict and non-strict modes.
+- Unexpected extra artifacts are informational in non-strict mode and blocking in strict mode.
+
 Troubleshooting notes:
 
 - `latest_log: null` in JSON means no log file exists yet in that sandbox `logs/` dir.
@@ -92,8 +106,18 @@ If `bmux sandbox bundle ... --verify` or `bmux sandbox verify-bundle ...` return
 - Re-run verification in JSON mode and inspect `issues[]` for exact `path` + `field` mismatches.
 - `field=exists` usually means a bundled artifact was moved/deleted after creation.
 - `field=bytes` or `field=file_count` usually means files inside the bundle changed post-creation.
+- `field=sha256` means content-level drift was detected even if file counts/sizes look unchanged.
+- `unexpected_artifacts[]` lists files present in the bundle dir but not declared in `artifact_metadata`.
+- `version_check.ok=false` means the bundle manifest/schema version is incompatible with this bmux binary.
 - Regenerate a fresh bundle from the original sandbox when drift is expected (`bmux sandbox bundle <id> --verify --json`).
 - For archived bundles, treat verification drift as a chain-of-custody signal and avoid mutating the directory in place.
+
+### Chain-of-Custody Notes
+
+- Bundles record per-artifact hashes in `artifact_metadata[].sha256` for both files and directories.
+- Directory hashes are deterministic over the directory tree contents, so reorder-only filesystem effects do not change the digest.
+- Legacy bundles without `sha256` metadata still verify for existence/size/count checks; rebuild bundles to get full hash guarantees.
+- If you intend to archive or share evidence, run verify immediately before handoff and include the full JSON report.
 
 Cleanup output includes per-entry `reason` for observability (`would_remove`,
 `removed`, `running`, `recent`, `not_failed`, `missing_manifest`,

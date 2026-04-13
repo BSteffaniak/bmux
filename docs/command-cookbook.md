@@ -87,6 +87,13 @@ bmux sandbox bundle bmux-sbx-123 --json
 bmux sandbox bundle bmux-sbx-123 --include-env --include-index-state --include-doctor --json
 bmux sandbox bundle bmux-sbx-123 --include-env --verify --json
 bmux sandbox verify-bundle ./sandbox-artifacts/bmux-sbx-123-1700000000000 --json
+bmux sandbox verify-bundle ./sandbox-artifacts/bmux-sbx-123-1700000000000 --strict --json
+
+# One-shot triage + bundle + verify
+bmux sandbox triage --latest-failed --bundle --bundle-output ./sandbox-artifacts --json
+
+# Strict one-shot triage verify (fails on unexpected extras too)
+bmux sandbox triage --latest-failed --bundle --bundle-strict-verify --json
 
 # Clean up orphaned sandbox directories
 bmux sandbox cleanup --dry-run --json
@@ -103,6 +110,15 @@ bmux sandbox cleanup --dry-run --older-than 0 --json | jq '.entries[] | {path, r
 
 # Inspect auto-heal reconcile stats
 bmux sandbox status --json | jq '.reconcile'
+
+# Inspect verify drift fields quickly
+bmux sandbox verify-bundle ./sandbox-artifacts/bmux-sbx-123-1700000000000 --json | jq '.issues[] | {path, field, expected, actual}'
+
+# Inspect unexpected extras and version compatibility
+bmux sandbox verify-bundle ./sandbox-artifacts/bmux-sbx-123-1700000000000 --json | jq '{ok, strict, unexpected_artifacts, version_check}'
+
+# Check triage bundle verify result and strict mode
+bmux sandbox triage --latest-failed --bundle --json | jq '.bundle.verify | {ok, strict, issue_count, mode}'
 ```
 
 ## Sandbox Daily Loop
