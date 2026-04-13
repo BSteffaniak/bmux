@@ -469,6 +469,71 @@ fn sandbox_bundle_includes_optional_artifacts_when_requested() {
 
 #[test]
 #[serial]
+fn sandbox_bundle_verify_flag_runs_post_bundle_verification() {
+    let sandbox = CommandSandbox::new("bundle-verify-flag");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--name",
+            "bundle-verify-source",
+            "--",
+            "no-such-command",
+        ])
+        .output()
+        .expect("run failed sandbox for bundle verify source");
+    assert!(
+        !run_output.status.success(),
+        "source sandbox should fail and be kept"
+    );
+    let run_json = parse_json_stdout(&run_output);
+    assert_schema_version(&run_json);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let bundle_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "bundle",
+            sandbox_id.as_str(),
+            "--include-env",
+            "--verify",
+            "--output",
+            sandbox
+                .root
+                .path()
+                .join("bundles")
+                .to_string_lossy()
+                .as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("bundle sandbox artifacts with --verify");
+    assert!(
+        bundle_output.status.success(),
+        "bundle --verify should succeed; stderr={}; stdout={}",
+        String::from_utf8_lossy(&bundle_output.stderr),
+        String::from_utf8_lossy(&bundle_output.stdout)
+    );
+
+    let bundle_json = parse_json_stdout(&bundle_output);
+    assert_schema_version(&bundle_json);
+    assert_eq!(bundle_json["verify"]["ok"].as_bool(), Some(true));
+    assert_eq!(bundle_json["verify"]["issue_count"].as_u64(), Some(0));
+    assert_eq!(
+        bundle_json["verify"]["mode"].as_str(),
+        Some("strict_metadata")
+    );
+}
+
+#[test]
+#[serial]
 fn sandbox_verify_bundle_reports_ok_for_fresh_bundle() {
     let sandbox = CommandSandbox::new("verify-bundle-ok");
 

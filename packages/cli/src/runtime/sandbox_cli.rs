@@ -354,6 +354,7 @@ pub(super) struct BundleSandboxOptions<'a> {
     pub(super) target: &'a str,
     pub(super) output: Option<&'a str>,
     pub(super) include: BundleIncludeOptions,
+    pub(super) verify: bool,
     pub(super) json: bool,
 }
 
@@ -380,6 +381,17 @@ struct BundleVerifyIssue {
     field: String,
     expected: String,
     actual: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BundleVerifyReport {
+    ok: bool,
+    mode: String,
+    bundle_dir: String,
+    bundle_manifest: String,
+    checked_artifacts: usize,
+    issue_count: usize,
+    issues: Vec<BundleVerifyIssue>,
 }
 
 pub(super) async fn run_sandbox_run(
@@ -1480,6 +1492,15 @@ pub(super) fn run_sandbox_bundle(options: &BundleSandboxOptions<'_>) -> Result<u
     )
     .with_context(|| format!("failed writing {}", bundle_manifest_path.display()))?;
 
+    let verification_report = if options.verify {
+        Some(load_bundle_verify_report(&bundle_dir)?)
+    } else {
+        None
+    };
+
+    let verify_ok = verification_report.as_ref().is_none_or(|report| report.ok);
+    let exit_code = u8::from(!verify_ok);
+
     if options.json {
         let payload = serde_json::json!({
             "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
@@ -1487,17 +1508,41 @@ pub(super) fn run_sandbox_bundle(options: &BundleSandboxOptions<'_>) -> Result<u
             "sandbox_root": root.to_string_lossy().to_string(),
             "sandbox_id": manifest.id,
             "bundle_manifest": bundle_manifest_path.to_string_lossy().to_string(),
+            "verify": verification_report,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("sandbox bundle created: {}", bundle_dir.display());
+        if let Some(report) = &verification_report {
+            print_bundle_verify_text(report);
+        }
     }
 
-    Ok(0)
+    Ok(exit_code)
 }
 
 pub(super) fn run_sandbox_verify_bundle(bundle_dir: &str, json: bool) -> Result<u8> {
-    let bundle_root = PathBuf::from(bundle_dir);
+    let report = load_bundle_verify_report(Path::new(bundle_dir))?;
+    if json {
+        let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+            "ok": report.ok,
+            "mode": report.mode,
+            "bundle_dir": report.bundle_dir,
+            "bundle_manifest": report.bundle_manifest,
+            "checked_artifacts": report.checked_artifacts,
+            "issue_count": report.issue_count,
+            "issues": report.issues,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_bundle_verify_text(&report);
+    }
+
+    Ok(u8::from(!report.ok))
+}
+
+fn load_bundle_verify_report(bundle_root: &Path) -> Result<BundleVerifyReport> {
     anyhow::ensure!(
         bundle_root.is_dir(),
         "sandbox bundle directory not found: {}",
@@ -1512,50 +1557,47 @@ pub(super) fn run_sandbox_verify_bundle(bundle_dir: &str, json: bool) -> Result<
 
     let (mode, issues, checked_artifacts) = if manifest.artifact_metadata.is_empty() {
         (
-            "existence_only",
-            verify_bundle_artifacts_existence(&bundle_root, &manifest.artifacts),
+            "existence_only".to_string(),
+            verify_bundle_artifacts_existence(bundle_root, &manifest.artifacts),
             manifest.artifacts.len(),
         )
     } else {
         (
-            "strict_metadata",
-            verify_bundle_artifacts_metadata(&bundle_root, &manifest.artifact_metadata),
+            "strict_metadata".to_string(),
+            verify_bundle_artifacts_metadata(bundle_root, &manifest.artifact_metadata),
             manifest.artifact_metadata.len(),
         )
     };
 
-    let ok = issues.is_empty();
-    if json {
-        let payload = serde_json::json!({
-            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
-            "ok": ok,
-            "mode": mode,
-            "bundle_dir": bundle_root.to_string_lossy().to_string(),
-            "bundle_manifest": bundle_manifest_path.to_string_lossy().to_string(),
-            "checked_artifacts": checked_artifacts,
-            "issue_count": issues.len(),
-            "issues": issues,
-        });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        println!(
-            "bundle verify: {}",
-            if ok { "ok" } else { "drift detected" }
-        );
-        println!("mode: {mode}");
-        println!("checked_artifacts: {checked_artifacts}");
-        if !issues.is_empty() {
-            println!("issues:");
-            for issue in &issues {
-                println!(
-                    "  path={} field={} expected={} actual={}",
-                    issue.path, issue.field, issue.expected, issue.actual
-                );
-            }
+    let issue_count = issues.len();
+    let ok = issue_count == 0;
+    Ok(BundleVerifyReport {
+        ok,
+        mode,
+        bundle_dir: bundle_root.to_string_lossy().to_string(),
+        bundle_manifest: bundle_manifest_path.to_string_lossy().to_string(),
+        checked_artifacts,
+        issue_count,
+        issues,
+    })
+}
+
+fn print_bundle_verify_text(report: &BundleVerifyReport) {
+    println!(
+        "bundle verify: {}",
+        if report.ok { "ok" } else { "drift detected" }
+    );
+    println!("mode: {}", report.mode);
+    println!("checked_artifacts: {}", report.checked_artifacts);
+    if !report.issues.is_empty() {
+        println!("issues:");
+        for issue in &report.issues {
+            println!(
+                "  path={} field={} expected={} actual={}",
+                issue.path, issue.field, issue.expected, issue.actual
+            );
         }
     }
-
-    Ok(u8::from(!ok))
 }
 
 fn verify_bundle_artifacts_metadata(

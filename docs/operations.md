@@ -43,6 +43,7 @@ bmux sandbox triage --latest-failed --source playbook --tail 120 --json
 bmux sandbox triage --latest-failed --rerun --bmux-bin ./target/debug/bmux
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts --json
 bmux sandbox bundle bmux-sbx-123 --include-env --include-index-state --include-doctor --json
+bmux sandbox bundle bmux-sbx-123 --include-env --verify --json
 bmux sandbox verify-bundle ./sandbox-artifacts/bmux-sbx-123-1700000000000 --json
 bmux sandbox doctor --json
 bmux sandbox doctor --fix --dry-run --json

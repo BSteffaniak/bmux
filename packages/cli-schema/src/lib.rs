@@ -1292,6 +1292,9 @@ pub enum SandboxCommand {
         /// Include doctor checks snapshot in bundle
         #[arg(long)]
         include_doctor: bool,
+        /// Verify generated bundle against recorded metadata
+        #[arg(long)]
+        verify: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -4480,6 +4483,7 @@ mod tests {
             "--include-env",
             "--include-index-state",
             "--include-doctor",
+            "--verify",
             "--json",
         ])
         .expect("valid bundle args");
@@ -4494,6 +4498,7 @@ mod tests {
                 include_env: true,
                 include_index_state: true,
                 include_doctor: true,
+                verify: true,
                 json: true,
             } if target == "bmux-sbx-123" && output == "./artifacts"
         ));

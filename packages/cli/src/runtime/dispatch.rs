@@ -1643,6 +1643,7 @@ pub(super) async fn dispatch_built_in_command(
                         include_env,
                         include_index_state,
                         include_doctor,
+                        verify,
                         json,
                     },
             },
@@ -1654,6 +1655,7 @@ pub(super) async fn dispatch_built_in_command(
                 index_state: *include_index_state,
                 doctor: *include_doctor,
             },
+            verify: *verify,
             json: *json,
         }),
         (
