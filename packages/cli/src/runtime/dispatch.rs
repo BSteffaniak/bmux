@@ -1698,9 +1698,14 @@ pub(super) async fn dispatch_built_in_command(
         (
             BuiltInHandlerId::SandboxVerifyBundle,
             Command::Sandbox {
-                command: SandboxCommand::VerifyBundle { bundle_dir, json },
+                command:
+                    SandboxCommand::VerifyBundle {
+                        bundle_dir,
+                        strict,
+                        json,
+                    },
             },
-        ) => run_sandbox_verify_bundle(bundle_dir, *json),
+        ) => run_sandbox_verify_bundle(bundle_dir, *strict, *json),
         (
             BuiltInHandlerId::SandboxRebuildIndex,
             Command::Sandbox {

@@ -603,8 +603,267 @@ fn sandbox_verify_bundle_reports_ok_for_fresh_bundle() {
     let verify_json = parse_json_stdout(&verify_output);
     assert_schema_version(&verify_json);
     assert_eq!(verify_json["ok"].as_bool(), Some(true));
+    assert_eq!(verify_json["strict"].as_bool(), Some(false));
     assert_eq!(verify_json["mode"].as_str(), Some("strict_metadata"));
+    assert_eq!(
+        verify_json["unexpected_artifacts"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(verify_json["version_check"]["ok"].as_bool(), Some(true));
     assert_eq!(verify_json["issue_count"].as_u64(), Some(0));
+}
+
+#[test]
+#[serial]
+fn sandbox_verify_bundle_reports_unexpected_artifacts_without_failing_by_default() {
+    let sandbox = CommandSandbox::new("verify-bundle-unexpected-nonstrict");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--name",
+            "verify-bundle-unexpected-source",
+            "--",
+            "no-such-command",
+        ])
+        .output()
+        .expect("run failed sandbox for unexpected artifact source");
+    assert!(!run_output.status.success(), "source sandbox should fail");
+    let run_json = parse_json_stdout(&run_output);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let bundle_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "bundle",
+            sandbox_id.as_str(),
+            "--include-env",
+            "--output",
+            sandbox
+                .root
+                .path()
+                .join("bundles")
+                .to_string_lossy()
+                .as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("bundle sandbox artifacts for unexpected artifact non-strict check");
+    assert!(bundle_output.status.success(), "bundle should succeed");
+    let bundle_json = parse_json_stdout(&bundle_output);
+    let bundle_dir = PathBuf::from(
+        bundle_json["bundle_dir"]
+            .as_str()
+            .expect("bundle json should include bundle_dir"),
+    );
+
+    std::fs::write(bundle_dir.join("extra.txt"), "extra").expect("write extra artifact file");
+
+    let verify_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "verify-bundle",
+            bundle_dir.to_string_lossy().as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("verify bundle with unexpected artifact in non-strict mode");
+    assert!(
+        verify_output.status.success(),
+        "non-strict verify should pass with unexpected artifacts"
+    );
+
+    let verify_json = parse_json_stdout(&verify_output);
+    assert_eq!(verify_json["ok"].as_bool(), Some(true));
+    assert_eq!(verify_json["strict"].as_bool(), Some(false));
+    assert!(
+        verify_json["unexpected_artifacts"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("extra.txt"))),
+        "verify output should report unexpected artifact"
+    );
+    assert_eq!(verify_json["issue_count"].as_u64(), Some(0));
+}
+
+#[test]
+#[serial]
+fn sandbox_verify_bundle_strict_fails_on_unexpected_artifacts() {
+    let sandbox = CommandSandbox::new("verify-bundle-unexpected-strict");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--name",
+            "verify-bundle-unexpected-strict-source",
+            "--",
+            "no-such-command",
+        ])
+        .output()
+        .expect("run failed sandbox for strict unexpected artifact source");
+    assert!(!run_output.status.success(), "source sandbox should fail");
+    let run_json = parse_json_stdout(&run_output);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let bundle_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "bundle",
+            sandbox_id.as_str(),
+            "--include-env",
+            "--output",
+            sandbox
+                .root
+                .path()
+                .join("bundles")
+                .to_string_lossy()
+                .as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("bundle sandbox artifacts for strict unexpected artifact check");
+    assert!(bundle_output.status.success(), "bundle should succeed");
+    let bundle_json = parse_json_stdout(&bundle_output);
+    let bundle_dir = PathBuf::from(
+        bundle_json["bundle_dir"]
+            .as_str()
+            .expect("bundle json should include bundle_dir"),
+    );
+
+    std::fs::write(bundle_dir.join("extra.txt"), "extra").expect("write extra artifact file");
+
+    let verify_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "verify-bundle",
+            bundle_dir.to_string_lossy().as_ref(),
+            "--strict",
+            "--json",
+        ])
+        .output()
+        .expect("verify bundle with unexpected artifact in strict mode");
+    assert!(
+        !verify_output.status.success(),
+        "strict verify should fail with unexpected artifacts"
+    );
+
+    let verify_json = parse_json_stdout(&verify_output);
+    assert_eq!(verify_json["ok"].as_bool(), Some(false));
+    assert_eq!(verify_json["strict"].as_bool(), Some(true));
+    let issues = verify_json["issues"]
+        .as_array()
+        .expect("issues should be an array");
+    assert!(
+        issues.iter().any(|issue| {
+            issue["path"].as_str() == Some("extra.txt")
+                && issue["field"].as_str() == Some("unexpected_artifact")
+        }),
+        "strict verify should include unexpected artifact issue"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_verify_bundle_fails_for_unsupported_bundle_version() {
+    let sandbox = CommandSandbox::new("verify-bundle-version-check");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--name",
+            "verify-bundle-version-source",
+            "--",
+            "no-such-command",
+        ])
+        .output()
+        .expect("run failed sandbox for version-check source");
+    assert!(!run_output.status.success(), "source sandbox should fail");
+    let run_json = parse_json_stdout(&run_output);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let bundle_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "bundle",
+            sandbox_id.as_str(),
+            "--include-env",
+            "--output",
+            sandbox
+                .root
+                .path()
+                .join("bundles")
+                .to_string_lossy()
+                .as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("bundle sandbox artifacts for version-check validation");
+    assert!(bundle_output.status.success(), "bundle should succeed");
+    let bundle_json = parse_json_stdout(&bundle_output);
+    let bundle_dir = PathBuf::from(
+        bundle_json["bundle_dir"]
+            .as_str()
+            .expect("bundle json should include bundle_dir"),
+    );
+
+    let bundle_manifest_path = bundle_dir.join("bundle_manifest.json");
+    let mut bundle_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&bundle_manifest_path).expect("read bundle manifest json"),
+    )
+    .expect("parse bundle manifest json");
+    bundle_manifest["bundle_version"] = serde_json::json!(999);
+    std::fs::write(
+        &bundle_manifest_path,
+        serde_json::to_vec_pretty(&bundle_manifest).expect("serialize mutated bundle manifest"),
+    )
+    .expect("write mutated bundle manifest");
+
+    let verify_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "verify-bundle",
+            bundle_dir.to_string_lossy().as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("verify bundle with unsupported version");
+    assert!(
+        !verify_output.status.success(),
+        "verify-bundle should fail for unsupported bundle version"
+    );
+
+    let verify_json = parse_json_stdout(&verify_output);
+    assert_eq!(verify_json["ok"].as_bool(), Some(false));
+    assert_eq!(verify_json["version_check"]["ok"].as_bool(), Some(false));
+    assert!(
+        verify_json["version_check"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("bundle_version")),
+        "version check reason should mention bundle_version"
+    );
 }
 
 #[test]

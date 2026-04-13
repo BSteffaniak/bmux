@@ -1303,6 +1303,9 @@ pub enum SandboxCommand {
     VerifyBundle {
         /// Bundle directory path
         bundle_dir: String,
+        /// Fail when bundle contains unexpected extra artifacts
+        #[arg(long)]
+        strict: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -4542,6 +4545,7 @@ mod tests {
             "sandbox",
             "verify-bundle",
             "./sandbox-bundles/bmux-sbx-123-456",
+            "--strict",
             "--json",
         ])
         .expect("valid verify-bundle args");
@@ -4550,7 +4554,11 @@ mod tests {
         };
         assert!(matches!(
             command,
-            SandboxCommand::VerifyBundle { bundle_dir, json: true }
+            SandboxCommand::VerifyBundle {
+                bundle_dir,
+                strict: true,
+                json: true
+            }
                 if bundle_dir == "./sandbox-bundles/bmux-sbx-123-456"
         ));
     }

@@ -370,6 +370,10 @@ struct BundleArtifactMetadata {
 #[derive(Debug, Clone, Deserialize)]
 struct BundleVerifyManifest {
     #[serde(default)]
+    bundle_version: Option<u32>,
+    #[serde(default)]
+    schema_version: Option<u32>,
+    #[serde(default)]
     artifact_metadata: Vec<BundleArtifactMetadata>,
     #[serde(default)]
     artifacts: Vec<String>,
@@ -386,12 +390,23 @@ struct BundleVerifyIssue {
 #[derive(Debug, Clone, Serialize)]
 struct BundleVerifyReport {
     ok: bool,
+    strict: bool,
     mode: String,
     bundle_dir: String,
     bundle_manifest: String,
+    unexpected_artifacts: Vec<String>,
+    version_check: BundleVersionCheck,
     checked_artifacts: usize,
     issue_count: usize,
     issues: Vec<BundleVerifyIssue>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BundleVersionCheck {
+    ok: bool,
+    bundle_version: Option<u32>,
+    schema_version: Option<u32>,
+    reason: Option<String>,
 }
 
 pub(super) async fn run_sandbox_run(
@@ -1493,7 +1508,7 @@ pub(super) fn run_sandbox_bundle(options: &BundleSandboxOptions<'_>) -> Result<u
     .with_context(|| format!("failed writing {}", bundle_manifest_path.display()))?;
 
     let verification_report = if options.verify {
-        Some(load_bundle_verify_report(&bundle_dir)?)
+        Some(load_bundle_verify_report(&bundle_dir, false)?)
     } else {
         None
     };
@@ -1521,15 +1536,18 @@ pub(super) fn run_sandbox_bundle(options: &BundleSandboxOptions<'_>) -> Result<u
     Ok(exit_code)
 }
 
-pub(super) fn run_sandbox_verify_bundle(bundle_dir: &str, json: bool) -> Result<u8> {
-    let report = load_bundle_verify_report(Path::new(bundle_dir))?;
+pub(super) fn run_sandbox_verify_bundle(bundle_dir: &str, strict: bool, json: bool) -> Result<u8> {
+    let report = load_bundle_verify_report(Path::new(bundle_dir), strict)?;
     if json {
         let payload = serde_json::json!({
             "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
             "ok": report.ok,
+            "strict": report.strict,
             "mode": report.mode,
             "bundle_dir": report.bundle_dir,
             "bundle_manifest": report.bundle_manifest,
+            "unexpected_artifacts": report.unexpected_artifacts,
+            "version_check": report.version_check,
             "checked_artifacts": report.checked_artifacts,
             "issue_count": report.issue_count,
             "issues": report.issues,
@@ -1542,7 +1560,7 @@ pub(super) fn run_sandbox_verify_bundle(bundle_dir: &str, json: bool) -> Result<
     Ok(u8::from(!report.ok))
 }
 
-fn load_bundle_verify_report(bundle_root: &Path) -> Result<BundleVerifyReport> {
+fn load_bundle_verify_report(bundle_root: &Path, strict: bool) -> Result<BundleVerifyReport> {
     anyhow::ensure!(
         bundle_root.is_dir(),
         "sandbox bundle directory not found: {}",
@@ -1554,6 +1572,8 @@ fn load_bundle_verify_report(bundle_root: &Path) -> Result<BundleVerifyReport> {
         .with_context(|| format!("failed reading {}", bundle_manifest_path.display()))?;
     let manifest: BundleVerifyManifest = serde_json::from_slice(&manifest_bytes)
         .with_context(|| format!("failed parsing {}", bundle_manifest_path.display()))?;
+
+    let version_check = validate_bundle_version(&manifest);
 
     let (mode, issues, checked_artifacts) = if manifest.artifact_metadata.is_empty() {
         (
@@ -1569,17 +1589,131 @@ fn load_bundle_verify_report(bundle_root: &Path) -> Result<BundleVerifyReport> {
         )
     };
 
+    let expected_artifacts = expected_bundle_artifact_paths(&manifest);
+    let unexpected_artifacts = bundle_unexpected_artifacts(bundle_root, &expected_artifacts)?;
+
+    let mut issues = issues;
+    if strict {
+        for artifact in &unexpected_artifacts {
+            issues.push(BundleVerifyIssue {
+                path: artifact.clone(),
+                field: "unexpected_artifact".to_string(),
+                expected: "absent".to_string(),
+                actual: "present".to_string(),
+            });
+        }
+    }
+
+    if !version_check.ok {
+        issues.push(BundleVerifyIssue {
+            path: "bundle_manifest.json".to_string(),
+            field: "version_check".to_string(),
+            expected: "supported".to_string(),
+            actual: version_check
+                .reason
+                .clone()
+                .unwrap_or_else(|| "unsupported version".to_string()),
+        });
+    }
+
     let issue_count = issues.len();
     let ok = issue_count == 0;
     Ok(BundleVerifyReport {
         ok,
+        strict,
         mode,
         bundle_dir: bundle_root.to_string_lossy().to_string(),
         bundle_manifest: bundle_manifest_path.to_string_lossy().to_string(),
+        unexpected_artifacts,
+        version_check,
         checked_artifacts,
         issue_count,
         issues,
     })
+}
+
+fn validate_bundle_version(manifest: &BundleVerifyManifest) -> BundleVersionCheck {
+    let bundle_version = manifest.bundle_version;
+    let schema_version = manifest.schema_version;
+
+    if bundle_version != Some(1) {
+        return BundleVersionCheck {
+            ok: false,
+            bundle_version,
+            schema_version,
+            reason: Some(format!(
+                "unsupported bundle_version={}; expected 1",
+                bundle_version.map_or_else(|| "missing".to_string(), |value| value.to_string())
+            )),
+        };
+    }
+
+    if schema_version != Some(SANDBOX_JSON_SCHEMA_VERSION) {
+        return BundleVersionCheck {
+            ok: false,
+            bundle_version,
+            schema_version,
+            reason: Some(format!(
+                "unsupported schema_version={}; expected {}",
+                schema_version.map_or_else(|| "missing".to_string(), |value| value.to_string()),
+                SANDBOX_JSON_SCHEMA_VERSION
+            )),
+        };
+    }
+
+    BundleVersionCheck {
+        ok: true,
+        bundle_version,
+        schema_version,
+        reason: None,
+    }
+}
+
+fn expected_bundle_artifact_paths(manifest: &BundleVerifyManifest) -> Vec<String> {
+    if manifest.artifact_metadata.is_empty() {
+        return manifest.artifacts.clone();
+    }
+
+    manifest
+        .artifact_metadata
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+fn bundle_unexpected_artifacts(bundle_root: &Path, expected: &[String]) -> Result<Vec<String>> {
+    let mut expected_set = std::collections::BTreeSet::new();
+    expected_set.insert("bundle_manifest.json".to_string());
+    for artifact in expected {
+        expected_set.insert(artifact.clone());
+    }
+
+    let mut unexpected = Vec::new();
+    for entry in std::fs::read_dir(bundle_root)
+        .with_context(|| format!("failed reading {}", bundle_root.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed reading {}", bundle_root.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed reading type for {}", entry.path().display()))?;
+
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+
+        let normalized = if file_type.is_dir() {
+            format!("{name}/")
+        } else {
+            name
+        };
+
+        if !expected_set.contains(&normalized) {
+            unexpected.push(normalized);
+        }
+    }
+
+    unexpected.sort();
+    Ok(unexpected)
 }
 
 fn print_bundle_verify_text(report: &BundleVerifyReport) {
@@ -1588,7 +1722,24 @@ fn print_bundle_verify_text(report: &BundleVerifyReport) {
         if report.ok { "ok" } else { "drift detected" }
     );
     println!("mode: {}", report.mode);
+    println!("strict: {}", report.strict);
     println!("checked_artifacts: {}", report.checked_artifacts);
+    if !report.unexpected_artifacts.is_empty() {
+        println!("unexpected_artifacts:");
+        for artifact in &report.unexpected_artifacts {
+            println!("  {artifact}");
+        }
+    }
+    if !report.version_check.ok {
+        println!(
+            "version_check: unsupported ({})",
+            report
+                .version_check
+                .reason
+                .as_deref()
+                .unwrap_or("unknown reason")
+        );
+    }
     if !report.issues.is_empty() {
         println!("issues:");
         for issue in &report.issues {
