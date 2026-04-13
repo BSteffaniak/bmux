@@ -275,3 +275,82 @@ fn cluster_status_gateway_flags_route_through_gateway_path() {
         combined_output(&output)
     );
 }
+
+#[test]
+fn cluster_status_dry_run_json_is_observational_with_would_mutate_false() {
+    let env = CliTestEnv::new("status-dry-run-json");
+    env.write_cluster_config();
+
+    let output = env.run(&[
+        "cluster",
+        "status",
+        "prod",
+        "--gateway",
+        "missing-prod-a",
+        "--gateway-mode",
+        "pinned",
+        "--gateway-no-failover",
+        "--dry-run",
+        "--format",
+        "json",
+    ]);
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("dry-run json output");
+    assert_eq!(payload["cluster"], "prod");
+    assert_eq!(payload["command"], "cluster-status");
+    assert_eq!(payload["would_mutate"]["enabled"], false);
+    assert_eq!(payload["would_mutate"]["breaker"], false);
+    assert_eq!(payload["would_mutate"]["persistence_write"], false);
+}
+
+#[test]
+fn cluster_status_dry_run_honors_breaker_open_skip_reason() {
+    let env = CliTestEnv::new("status-dry-run-breaker-open");
+    env.write_cluster_config();
+
+    let state = serde_json::json!({
+        "version": 2,
+        "clusters": {
+            "prod": {
+                "last_good": null,
+                "cooldown_until_unix_ms": {},
+                "candidate_health": {
+                    "missing-prod-a": {
+                        "successes": 1,
+                        "failures": 5,
+                        "consecutive_failures": 3,
+                        "last_latency_ms": 250,
+                        "breaker_state": "open",
+                        "breaker_open_until_unix_ms": 4102444800000u64
+                    }
+                }
+            }
+        }
+    });
+    std::fs::write(
+        env.gateway_state_path(),
+        serde_json::to_string_pretty(&state).expect("serialize gateway state"),
+    )
+    .expect("write gateway state");
+    let before = std::fs::read_to_string(env.gateway_state_path()).expect("read state before run");
+
+    let output = env.run(&[
+        "cluster",
+        "status",
+        "prod",
+        "--gateway",
+        "missing-prod-a",
+        "--gateway-mode",
+        "pinned",
+        "--dry-run",
+        "--format",
+        "json",
+    ]);
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("dry-run json output");
+    assert_eq!(payload["result"], "failure");
+    let probes = payload["probes"].as_array().expect("probes array");
+    let first = probes.first().expect("at least one probe");
+    assert_eq!(first["skip_reason"], "breaker_open");
+
+    let after = std::fs::read_to_string(env.gateway_state_path()).expect("read state after run");
+    assert_eq!(before, after, "dry-run should not mutate runtime state");
+}

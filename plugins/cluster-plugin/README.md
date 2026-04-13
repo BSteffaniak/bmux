@@ -25,6 +25,7 @@ Current scope:
 - `cluster pane retry` supports probe retry policy controls (`--retries`, `--on-failure=abort|continue|prompt`)
 - `cluster pane new|move|retry` accept `--cluster` for deterministic gateway routing; in multi-cluster layouts, commands hard-fail when cluster inference is ambiguous
 - Gateway overrides are available on cluster commands: `--gateway`, `--gateway-mode=auto|direct|pinned`, and `--gateway-no-failover`
+- Routed cluster commands support `--dry-run` to run real gateway probes/selection without executing the cluster operation itself (`--format text|json`)
 - `cluster gateway status` reports effective gateway mode, candidate order, preferred gateway cache, cooldown state, and selected candidate hint (`--format text|json`)
 - `cluster gateway explain` probes candidates and explains why selection would succeed/fail without mutating gateway runtime cache/cooldown state (`--format text|json`)
 - `cluster gateway reset` clears persisted gateway runtime state for one cluster (`--cluster`) or all clusters (`--all`)
@@ -46,7 +47,9 @@ Current scope:
   - `pinned`: require a single configured `gateway_target`.
 - In `auto`, candidates come from `gateway_candidates` when provided; otherwise they fall back to cluster `targets`.
 - If every gateway candidate fails, cluster command execution hard-fails (no silent direct fallback).
-- Auto mode tracks a short-lived last-known-good gateway cache and temporary failure cooldown (persisted in runtime state) to reduce flap/retry churn across invocations.
+- Auto mode tracks persisted last-known-good/cooldown state, per-candidate stability stats, and breaker state.
+- Breaker behavior defaults: open after 3 consecutive failures, then half-open retry after cooldown.
+- Candidate ordering in auto mode is stability-first (latency used as tie-break), with explicit skip reasons (`cooldown` / `breaker_open`) visible in status/explain and dry-run output.
 
 Example:
 

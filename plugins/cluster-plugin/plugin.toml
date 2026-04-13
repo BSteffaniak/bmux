@@ -111,6 +111,19 @@ long     = "gateway-no-failover"
 name     = "gateway_no_failover"
 required = false
 
+[[commands.arguments]]
+kind     = "boolean"
+long     = "dry-run"
+name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
+
 [[commands]]
 aliases       = [["cluster", "status"]]
 expose_in_cli = true
@@ -144,6 +157,19 @@ kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
 required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "dry-run"
+name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
 
 [[commands]]
 aliases       = [["cluster", "gateway", "reset"]]
@@ -206,6 +232,19 @@ kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
 required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "dry-run"
+name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
 
 [[commands]]
 aliases       = [["cluster", "events"]]
@@ -276,6 +315,12 @@ long     = "gateway-no-failover"
 name     = "gateway_no_failover"
 required = false
 
+[[commands.arguments]]
+kind     = "boolean"
+long     = "dry-run"
+name     = "dry_run"
+required = false
+
 [[commands]]
 aliases       = [["cluster", "hosts"]]
 expose_in_cli = true
@@ -309,6 +354,19 @@ kind     = "boolean"
 long     = "gateway-no-failover"
 name     = "gateway_no_failover"
 required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "dry-run"
+name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
 
 [[commands]]
 aliases       = [["cluster", "gateway", "status"]]
@@ -457,6 +515,19 @@ long     = "gateway-no-failover"
 name     = "gateway_no_failover"
 required = false
 
+[[commands.arguments]]
+kind     = "boolean"
+long     = "dry-run"
+name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
+
 [[commands]]
 aliases       = [["cluster", "pane", "move"]]
 expose_in_cli = true
@@ -499,6 +570,39 @@ required   = false
 short      = "c"
 value_name = "CLUSTER"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "dry-run"
+name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
+
 [[commands]]
 aliases       = [["cluster", "pane", "retry"]]
 expose_in_cli = true
@@ -540,3 +644,36 @@ name       = "cluster"
 required   = false
 short      = "c"
 value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "dry-run"
+name     = "dry_run"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
