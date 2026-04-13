@@ -216,4 +216,15 @@ mod tests {
         assert!(message.contains("Problem:"));
         assert!(message.contains("Why: boom"));
     }
+
+    #[test]
+    fn format_plugin_command_run_error_adds_policy_hint_when_denied() {
+        let message = super::format_plugin_command_run_error(
+            "bmux.example",
+            "run",
+            &"session policy denied for this operation",
+        );
+        assert!(message.contains("Hint: operation denied by an active policy provider."));
+        assert!(message.contains("Next: verify policy state or run with an authorized principal."));
+    }
 }

@@ -29,6 +29,8 @@ bmux plugin run <plugin-id> <command> --help
   - `docs/plugin-performance-usability-gates.md`
 - Baseline artifacts and refresh commands:
   - `docs/perf-baselines/README.md`
+- Game day scenarios:
+  - `docs/plugin-game-day.md`
 
 ## If-Then Quick Guide
 
