@@ -20,6 +20,15 @@ Variance policy lives at `docs/perf-baselines/variance-policy.json`.
 - CI metadata checks warn when baseline metadata is missing or older than 30 days.
 - CI variance policy checks are warn-only by default (see `variance-policy.json`).
 
+## Variance Promotion + Rollback
+
+- Start in warn-only mode (`mode: warn`) while collecting CI stability data.
+- Promote a scenario to `soft-fail` only after consecutive stable runs with no allowlist dependency.
+- Keep noisy scenarios in warn mode until signal quality improves.
+- Roll back a scenario to warn mode if soft-fail violations spike without clear user-visible regressions.
+
+CI can trial enforcement with repository variable `BMUX_PERF_VARIANCE_ENFORCE=1`.
+
 ## Refresh commands
 
 Run from repository root:

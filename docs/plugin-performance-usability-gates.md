@@ -76,6 +76,14 @@ For variance policy evaluation (warn-only by default):
 
 - `./scripts/perf-variance-policy-check.sh --report-dir <compare-report-dir> --policy-file docs/perf-baselines/variance-policy.json --mode warn`
 
+To trial soft-fail behavior locally:
+
+- `./scripts/perf-variance-policy-check.sh --report-dir <compare-report-dir> --policy-file docs/perf-baselines/variance-policy.json --mode soft-fail`
+
+CI soft-fail trial toggle:
+
+- Set repository variable `BMUX_PERF_VARIANCE_ENFORCE=1`.
+
 ### 5) Plugin runtime command matrix SLO
 
 `scripts/perf-plugin-runtime-matrix.sh` enforces per-scenario p95/p99 SLOs:

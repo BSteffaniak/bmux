@@ -1,17 +1,63 @@
 {
   "mode": "warn",
-  "notes": "Start informational-only. Promote to soft-fail after observing stable signal in CI.",
-  "enforced_metrics": [
-    "steady_p95_ms",
-    "steady_p99_ms",
-    "p95_ms",
-    "p99_ms"
+  "notes": "Default warn-only. Use CI toggle to trial soft-fail mode.",
+  "defaults": {
+    "min_runs": 2,
+    "enforced_metrics": [
+      "steady_p95_ms",
+      "steady_p99_ms",
+      "p95_ms",
+      "p99_ms"
+    ],
+    "regression_statuses": [
+      "WARN"
+    ],
+    "regression_variance": [
+      "likely_regression",
+      "likely_regression_with_variance"
+    ]
+  },
+  "scenarios": {
+    "plugin-list-json": {
+      "mode": "warn",
+      "notes": "Known startup volatility; keep warn-only until baseline drift settles."
+    },
+    "plugin-doctor-json": {
+      "mode": "soft-fail"
+    },
+    "plugin-rebuild-list-json": {
+      "mode": "soft-fail"
+    },
+    "plugin-run-discovered-command": {
+      "mode": "soft-fail"
+    },
+    "plugin-run-missing-plugin": {
+      "mode": "warn",
+      "notes": "Error-path timings are noisy across environments."
+    }
+  },
+  "allowlist": [
+    {
+      "scenario": "plugin-list-json",
+      "metric": "p95_ms",
+      "status": "WARN",
+      "variance": "likely_regression_with_variance",
+      "expires_on": "2026-05-31",
+      "reason": "Cold-start startup volatility under low-load CI runners"
+    },
+    {
+      "scenario": "plugin-list-json",
+      "metric": "p99_ms",
+      "status": "WARN",
+      "variance": "likely_regression_with_variance",
+      "expires_on": "2026-05-31",
+      "reason": "Cold-start startup volatility under low-load CI runners"
+    }
   ],
-  "regression_statuses": [
-    "WARN"
-  ],
-  "regression_variance": [
-    "likely_regression",
-    "likely_regression_with_variance"
-  ]
+  "promotion_criteria": {
+    "requires_consecutive_green_runs": 5,
+    "requires_no_allowlist_matches": true,
+    "requires_min_runs": 2,
+    "rollback_rule": "Return scenario to warn mode if 3 or more soft-fail violations appear in 24h without corresponding user-visible regression evidence"
+  }
 }

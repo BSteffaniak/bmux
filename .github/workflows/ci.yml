@@ -324,14 +324,21 @@ jobs:
             --report-dir "$RUNNER_TEMP/plugin-perf-artifacts/compare/runtime-matrix-scale" \
             --warn-regression-ms 30
 
-      - name: Plugin variance policy check (warn-only)
+      - name: Plugin variance policy check
         if: ${{ steps.changes.outputs.run == 'true' }}
         shell: bash
+        env:
+          BMUX_PERF_VARIANCE_ENFORCE: ${{ vars.BMUX_PERF_VARIANCE_ENFORCE || '0' }}
         run: |
+          mode="warn"
+          if [[ "${BMUX_PERF_VARIANCE_ENFORCE}" == "1" ]]; then
+            mode="soft-fail"
+          fi
+          echo "variance policy default mode: $mode"
           ./scripts/perf-variance-policy-check.sh \
             --report-dir "$RUNNER_TEMP/plugin-perf-artifacts/compare/runtime-matrix" \
             --policy-file "docs/perf-baselines/variance-policy.json" \
-            --mode warn
+            --mode "$mode"
 
       - name: Upload plugin perf artifacts
         if: ${{ steps.changes.outputs.run == 'true' }}

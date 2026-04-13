@@ -14,7 +14,7 @@ Evaluates compare-report JSON files against variance policy.
 Options:
   --report-dir DIR    Directory with compare-report JSON files
   --policy-file PATH  Policy JSON (default: docs/perf-baselines/variance-policy.json)
-  --mode MODE         Override mode: warn or soft-fail
+  --mode MODE         Default mode override: warn or soft-fail
   -h, --help          Show this help message
 USAGE
 }
@@ -55,6 +55,51 @@ parse_args() {
 	done
 }
 
+is_mode_valid() {
+	[[ "$1" == "warn" || "$1" == "soft-fail" ]]
+}
+
+has_active_allowlist_entry() {
+	local scenario="$1"
+	local metric="$2"
+	local status="$3"
+	local variance="$4"
+	local today="$5"
+	local match
+
+	match="$(jq -r \
+		--arg scenario "$scenario" \
+		--arg metric "$metric" \
+		--arg status "$status" \
+		--arg variance "$variance" \
+		--arg today "$today" \
+		'
+      [.allowlist[]?
+       | select(.scenario == $scenario)
+       | select(.metric == $metric)
+       | select((.status // $status) == $status)
+       | select((.variance // $variance) == $variance)
+       | {expires_on: (.expires_on // ""), reason: (.reason // "no reason provided")}]
+      | if length == 0 then empty else .[0] | "\(.expires_on)\t\(.reason)" end
+    ' "$POLICY_FILE")"
+
+	if [[ -z "$match" ]]; then
+		return 1
+	fi
+
+	local expires_on reason
+	expires_on="${match%%$'\t'*}"
+	reason="${match#*$'\t'}"
+
+	if [[ -n "$expires_on" && "$expires_on" < "$today" ]]; then
+		warn "expired allowlist entry for scenario=$scenario metric=$metric (expired $expires_on): $reason"
+		return 1
+	fi
+
+	warn "allowlist suppression for scenario=$scenario metric=$metric: $reason"
+	return 0
+}
+
 parse_args "$@"
 
 if [[ -z "$REPORT_DIR" ]]; then
@@ -74,48 +119,92 @@ if ! command -v jq >/dev/null 2>&1; then
 	exit 2
 fi
 
-policy_mode="$(jq -r '.mode // "warn"' "$POLICY_FILE")"
+default_mode="$(jq -r '.mode // "warn"' "$POLICY_FILE")"
 if [[ -n "$MODE" ]]; then
-	policy_mode="$MODE"
+	default_mode="$MODE"
 fi
-if [[ "$policy_mode" != "warn" && "$policy_mode" != "soft-fail" ]]; then
-	echo "invalid mode: $policy_mode (expected warn or soft-fail)" >&2
+if ! is_mode_valid "$default_mode"; then
+	echo "invalid mode: $default_mode (expected warn or soft-fail)" >&2
 	exit 2
 fi
 
-echo "variance policy check: report_dir=$REPORT_DIR policy=$POLICY_FILE mode=$policy_mode"
+today="$(date -u +%Y-%m-%d)"
+echo "variance policy check: report_dir=$REPORT_DIR policy=$POLICY_FILE default_mode=$default_mode"
 
-violations=0
+# Surface expired allowlist entries even if no matching reports appear.
+jq -r --arg today "$today" '
+  .allowlist[]?
+  | select((.expires_on // "") != "")
+  | select(.expires_on < $today)
+  | "\(.scenario)\t\(.metric)\t\(.expires_on)\t\(.reason // "no reason provided")"
+' "$POLICY_FILE" | while IFS=$'\t' read -r scenario metric expires_on reason; do
+	[[ -z "$scenario" ]] && continue
+	warn "expired allowlist entry scenario=$scenario metric=$metric expired=$expires_on: $reason"
+done
+
+matches=0
+hard_fail_matches=0
 shopt -s nullglob
 for report in "$REPORT_DIR"/*.json; do
 	name="$(basename "$report")"
-	matches="$(jq -r --slurpfile policy "$POLICY_FILE" '
-    .metrics[]?
-    | select(
-        (.label as $label | ($policy[0].enforced_metrics | index($label) != null))
-        and (.status as $status | ($policy[0].regression_statuses | index($status) != null))
-        and (.variance as $variance | ($policy[0].regression_variance | index($variance) != null))
-      )
-    | "\(.label) status=\(.status) variance=\(.variance) delta_median=\(.delta_median) delta_max=\(.delta_max)"
-  ' "$report")"
+	scenario="${name%.json}"
 
-	if [[ -n "$matches" ]]; then
-		while IFS= read -r line; do
-			[[ -z "$line" ]] && continue
-			warn "variance policy match in $name: $line"
-			violations=$((violations + 1))
-		done <<<"$matches"
+	report_matches="$(jq -r \
+		--slurpfile policy "$POLICY_FILE" \
+		--arg scenario "$scenario" \
+		--arg default_mode "$default_mode" \
+		'
+      ($policy[0]) as $p
+      | ($p.defaults // {}) as $defaults
+      | ($p.scenarios[$scenario] // {}) as $scenario_policy
+      | ($scenario_policy.mode // $default_mode) as $mode
+      | ($scenario_policy.min_runs // $defaults.min_runs // 2) as $min_runs
+      | ($scenario_policy.enforced_metrics // $defaults.enforced_metrics // []) as $enforced_metrics
+      | ($scenario_policy.regression_statuses // $defaults.regression_statuses // []) as $regression_statuses
+      | ($scenario_policy.regression_variance // $defaults.regression_variance // []) as $regression_variance
+      | (.metrics // [])[]?
+      | (.label // "") as $label
+      | (.status // "") as $status
+      | (.variance // "") as $variance
+      | (.runs // 0) as $runs
+      | select($runs >= $min_runs)
+      | select(($enforced_metrics | index($label)) != null)
+      | select(($regression_statuses | index($status)) != null)
+      | select(($regression_variance | index($variance)) != null)
+      | "\($label)\t\($status)\t\($variance)\t\($runs)\t\($mode)\t\($min_runs)\t\(.delta_median // 0)\t\(.delta_max // 0)"
+    ' "$report")"
+
+	if [[ -z "$report_matches" ]]; then
+		continue
 	fi
+
+	while IFS=$'\t' read -r metric status variance runs mode min_runs delta_median delta_max; do
+		[[ -z "$metric" ]] && continue
+		if ! is_mode_valid "$mode"; then
+			warn "invalid scenario mode '$mode' for $scenario; falling back to warn"
+			mode="warn"
+		fi
+
+		if has_active_allowlist_entry "$scenario" "$metric" "$status" "$variance" "$today"; then
+			continue
+		fi
+
+		matches=$((matches + 1))
+		warn "variance policy match in $name: metric=$metric status=$status variance=$variance runs=$runs min_runs=$min_runs delta_median=$delta_median delta_max=$delta_max mode=$mode"
+		if [[ "$mode" == "soft-fail" ]]; then
+			hard_fail_matches=$((hard_fail_matches + 1))
+		fi
+	done <<<"$report_matches"
 done
 
-if ((violations == 0)); then
+if ((matches == 0)); then
 	echo "variance policy check: no regression matches"
 	exit 0
 fi
 
-if [[ "$policy_mode" == "soft-fail" ]]; then
-	echo "variance policy check: $violations match(es), failing in soft-fail mode" >&2
+if ((hard_fail_matches > 0)); then
+	echo "variance policy check: $hard_fail_matches soft-fail match(es), failing" >&2
 	exit 1
 fi
 
-echo "variance policy check: $violations match(es), warn-only mode"
+echo "variance policy check: $matches match(es), warn-only outcome"

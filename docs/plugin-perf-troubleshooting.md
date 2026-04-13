@@ -74,6 +74,10 @@ To evaluate compare output against policy (warn-only by default):
 ```
 
 Use `--mode soft-fail` to trial enforcement locally before promoting CI behavior.
+Allowlist suppressions require an `expires_on` date and CI warns when entries expire.
+
+Scenario-level enforcement is controlled in `docs/perf-baselines/variance-policy.json`.
+Keep `plugin-list-json` and other known noisy paths in warn mode until they meet promotion criteria.
 
 ## 4) Baseline Update Policy
 
@@ -93,3 +97,4 @@ After refreshing baseline artifacts, refresh/check metadata with
 - artifact file paths
 - compare output (`OK`/`IMPROVED`/`WARN` lines)
 - whether failures were startup-only or steady-state
+- whether policy matches were allowlisted, warn-only, or soft-fail
