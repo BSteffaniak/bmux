@@ -1569,6 +1569,9 @@ fn sandbox_tail_returns_log_lines_for_target() {
 
     let json = parse_json_stdout(&output);
     assert_schema_version(&json);
+    assert_eq!(json["id"].as_str(), Some("bmux-sbx-tail-target"));
+    assert_eq!(json["source"].as_str(), Some("sandbox-cli"));
+    assert_eq!(json["status"].as_str(), Some("failed"));
     let log_tail = json["log_tail"]
         .as_array()
         .expect("tail output should include log_tail array");
@@ -1602,6 +1605,9 @@ fn sandbox_open_returns_paths_and_repro() {
 
     let json = parse_json_stdout(&output);
     assert_schema_version(&json);
+    assert_eq!(json["id"].as_str(), Some("bmux-sbx-open-target"));
+    assert_eq!(json["source"].as_str(), Some("sandbox-cli"));
+    assert_eq!(json["status"].as_str(), Some("failed"));
     let root = json["root"]
         .as_str()
         .expect("open output should include root");
@@ -1649,4 +1655,106 @@ fn sandbox_rerun_executes_command_from_manifest() {
     let json = parse_json_stdout(&output);
     assert_schema_version(&json);
     assert_eq!(json["status"].as_str(), Some("succeeded"));
+}
+
+#[test]
+#[serial]
+fn sandbox_tail_requires_target_or_selector() {
+    let sandbox = CommandSandbox::new("tail-target-required");
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "tail", "--json"])
+        .output()
+        .expect("run sandbox tail without target");
+
+    assert!(
+        !output.status.success(),
+        "sandbox tail should fail when no target selector is provided"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("tail target required"),
+        "tail failure should provide target selector guidance: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_open_json_reports_missing_latest_log_as_null() {
+    let sandbox = CommandSandbox::new("open-missing-latest-log");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-open-missing-log",
+        "sandbox-cli",
+        "failed",
+    );
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "open", "bmux-sbx-open-missing-log", "--json"])
+        .output()
+        .expect("run sandbox open without log files");
+    assert!(
+        output.status.success(),
+        "sandbox open should succeed without logs: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert!(
+        json["latest_log"].is_null(),
+        "latest_log should be null when no log files are present"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_rerun_fails_when_manifest_command_is_empty() {
+    let sandbox = CommandSandbox::new("rerun-empty-command");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-rerun-empty-command",
+        "sandbox-cli",
+        "failed",
+    );
+
+    let manifest_path = tmp_root
+        .join("bmux-sbx-rerun-empty-command")
+        .join("sandbox.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path).expect("read manifest for empty command test"),
+    )
+    .expect("parse manifest json");
+    manifest["command"] = serde_json::json!([]);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize mutated manifest"),
+    )
+    .expect("write mutated manifest");
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "rerun",
+            "bmux-sbx-rerun-empty-command",
+            "--bmux-bin",
+            bmux_binary().to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run sandbox rerun with empty command manifest");
+
+    assert!(
+        !output.status.success(),
+        "sandbox rerun should fail for empty command manifest"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("has no command to rerun"),
+        "rerun failure should explain missing command: {stderr}"
+    );
 }

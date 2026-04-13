@@ -568,17 +568,7 @@ pub(super) fn run_sandbox_list(
                 entry.root,
             );
         }
-        if collection.reconcile.healed_entries > 0 {
-            println!(
-                "reconcile: healed={} (rebuilt={}, pruned={}, normalized_running={}, cleared_stale_locks={}, fallback={})",
-                collection.reconcile.healed_entries,
-                collection.reconcile.rebuilt_entries,
-                collection.reconcile.pruned_entries,
-                collection.reconcile.normalized_running,
-                collection.reconcile.cleared_stale_locks,
-                collection.reconcile.scan_fallback_used
-            );
-        }
+        print_reconcile_report_text(&collection.reconcile);
     }
 
     Ok(0)
@@ -735,15 +725,19 @@ fn print_sandbox_status_text(snapshot: &SandboxStatusSnapshot) {
         snapshot.health.index_entries,
         snapshot.health.index_missing_roots
     );
-    if snapshot.reconcile.healed_entries > 0 {
+    print_reconcile_report_text(&snapshot.reconcile);
+}
+
+fn print_reconcile_report_text(reconcile: &ReconcileReport) {
+    if reconcile.healed_entries > 0 {
         println!(
             "reconcile: healed={} (rebuilt={}, pruned={}, normalized_running={}, cleared_stale_locks={}, fallback={})",
-            snapshot.reconcile.healed_entries,
-            snapshot.reconcile.rebuilt_entries,
-            snapshot.reconcile.pruned_entries,
-            snapshot.reconcile.normalized_running,
-            snapshot.reconcile.cleared_stale_locks,
-            snapshot.reconcile.scan_fallback_used
+            reconcile.healed_entries,
+            reconcile.rebuilt_entries,
+            reconcile.pruned_entries,
+            reconcile.normalized_running,
+            reconcile.cleared_stale_locks,
+            reconcile.scan_fallback_used
         );
     }
 }
@@ -758,6 +752,7 @@ pub(super) fn run_sandbox_inspect(
 ) -> Result<u8> {
     let collection = collect_sandbox_candidates();
     let root = resolve_inspect_target(
+        "inspect",
         target,
         latest,
         latest_failed,
@@ -765,6 +760,8 @@ pub(super) fn run_sandbox_inspect(
         &collection.candidates,
     )?;
     let manifest = read_manifest(&root)?;
+    let log_dir = root.join("logs");
+    let latest_log = newest_regular_file(&log_dir);
     let log_tail = read_log_tail(&root, tail);
     let running = sandbox_process_alive(&root) || sandbox_socket_alive(&root);
 
@@ -772,6 +769,9 @@ pub(super) fn run_sandbox_inspect(
         let payload = serde_json::json!({
             "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
             "reconcile": collection.reconcile,
+            "root": root.to_string_lossy().to_string(),
+            "log_dir": log_dir.to_string_lossy().to_string(),
+            "latest_log": latest_log.as_ref().map(|path| path.to_string_lossy().to_string()),
             "manifest": manifest,
             "running": running,
             "log_tail": log_tail,
@@ -791,6 +791,13 @@ pub(super) fn run_sandbox_inspect(
         println!("kept: {}", if manifest.kept { "yes" } else { "no" });
         println!("env_mode: {}", manifest.env_mode);
         println!("root: {}", root.display());
+        println!("log_dir: {}", log_dir.display());
+        println!(
+            "latest_log: {}",
+            latest_log
+                .as_ref()
+                .map_or_else(|| "(none)".to_string(), |path| path.display().to_string())
+        );
         println!("bmux_bin: {}", manifest.bmux_bin);
         println!("command: {}", manifest.command.join(" "));
         println!("repro: {}", format_repro_command_from_manifest(&manifest));
@@ -798,17 +805,7 @@ pub(super) fn run_sandbox_inspect(
         for line in log_tail {
             println!("  {line}");
         }
-        if collection.reconcile.healed_entries > 0 {
-            println!(
-                "reconcile: healed={} (rebuilt={}, pruned={}, normalized_running={}, cleared_stale_locks={}, fallback={})",
-                collection.reconcile.healed_entries,
-                collection.reconcile.rebuilt_entries,
-                collection.reconcile.pruned_entries,
-                collection.reconcile.normalized_running,
-                collection.reconcile.cleared_stale_locks,
-                collection.reconcile.scan_fallback_used
-            );
-        }
+        print_reconcile_report_text(&collection.reconcile);
     }
 
     Ok(0)
@@ -824,24 +821,42 @@ pub(super) fn run_sandbox_tail(
 ) -> Result<u8> {
     let collection = collect_sandbox_candidates();
     let root = resolve_inspect_target(
+        "tail",
         target,
         latest,
         latest_failed,
         source_filter,
         &collection.candidates,
     )?;
+    let manifest = read_manifest(&root)?;
+    let log_dir = root.join("logs");
+    let latest_log = newest_regular_file(&log_dir);
     let log_tail = read_log_tail(&root, tail);
 
     if json {
         let payload = serde_json::json!({
             "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
             "reconcile": collection.reconcile,
+            "id": manifest.id,
+            "source": manifest.source,
+            "status": manifest.status,
             "root": root.to_string_lossy().to_string(),
+            "log_dir": log_dir.to_string_lossy().to_string(),
+            "latest_log": latest_log.as_ref().map(|path| path.to_string_lossy().to_string()),
             "log_tail": log_tail,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("logs: {}", root.join("logs").display());
+        println!("id: {}", manifest.id);
+        println!("source: {}", manifest.source);
+        println!("status: {}", manifest.status);
+        println!("logs: {}", log_dir.display());
+        println!(
+            "latest_log: {}",
+            latest_log
+                .as_ref()
+                .map_or_else(|| "(none)".to_string(), |path| path.display().to_string())
+        );
         for line in log_tail {
             println!("{line}");
         }
@@ -859,6 +874,7 @@ pub(super) fn run_sandbox_open(
 ) -> Result<u8> {
     let collection = collect_sandbox_candidates();
     let root = resolve_inspect_target(
+        "open",
         target,
         latest,
         latest_failed,
@@ -874,18 +890,27 @@ pub(super) fn run_sandbox_open(
         let payload = serde_json::json!({
             "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
             "reconcile": collection.reconcile,
+            "id": manifest.id,
+            "source": manifest.source,
+            "status": manifest.status,
             "root": root.to_string_lossy().to_string(),
             "log_dir": log_dir.to_string_lossy().to_string(),
-            "latest_log": latest_log.map(|path| path.to_string_lossy().to_string()),
+            "latest_log": latest_log.as_ref().map(|path| path.to_string_lossy().to_string()),
             "repro": repro,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
+        println!("id: {}", manifest.id);
+        println!("source: {}", manifest.source);
+        println!("status: {}", manifest.status);
         println!("root: {}", root.display());
         println!("logs: {}", log_dir.display());
-        if let Some(path) = latest_log {
-            println!("latest_log: {}", path.display());
-        }
+        println!(
+            "latest_log: {}",
+            latest_log
+                .as_ref()
+                .map_or_else(|| "(none)".to_string(), |path| path.display().to_string())
+        );
         println!("repro: {repro}");
     }
 
@@ -895,6 +920,7 @@ pub(super) fn run_sandbox_open(
 pub(super) async fn run_sandbox_rerun(options: RerunSandboxOptions<'_>) -> Result<u8> {
     let collection = collect_sandbox_candidates();
     let root = resolve_inspect_target(
+        "rerun",
         options.inspect.target,
         options.inspect.latest,
         options.inspect.latest_failed,
@@ -904,7 +930,8 @@ pub(super) async fn run_sandbox_rerun(options: RerunSandboxOptions<'_>) -> Resul
     let manifest = read_manifest(&root)?;
     anyhow::ensure!(
         !manifest.command.is_empty(),
-        "sandbox manifest has no command to rerun"
+        "sandbox manifest '{}' has no command to rerun",
+        manifest.id
     );
 
     let resolved_env_mode = options
@@ -938,6 +965,7 @@ fn manifest_env_mode(manifest: &SandboxManifest) -> SandboxEnvModeArg {
 }
 
 fn resolve_inspect_target(
+    command: &str,
     target: Option<&str>,
     latest: bool,
     latest_failed: bool,
@@ -952,7 +980,7 @@ fn resolve_inspect_target(
         return resolve_latest_sandbox(latest_failed, source_filter, candidates);
     }
 
-    anyhow::bail!("inspect target required (provide <id|path>, --latest, or --latest-failed)")
+    anyhow::bail!("{command} target required (provide <id|path>, --latest, or --latest-failed)")
 }
 
 fn resolve_latest_sandbox(
@@ -1318,17 +1346,7 @@ pub(super) fn run_sandbox_cleanup(
             scan.skipped.missing_manifest,
             scan.skipped.delete_failed
         );
-        if collection.reconcile.healed_entries > 0 {
-            println!(
-                "reconcile: healed={} (rebuilt={}, pruned={}, normalized_running={}, cleared_stale_locks={}, fallback={})",
-                collection.reconcile.healed_entries,
-                collection.reconcile.rebuilt_entries,
-                collection.reconcile.pruned_entries,
-                collection.reconcile.normalized_running,
-                collection.reconcile.cleared_stale_locks,
-                collection.reconcile.scan_fallback_used
-            );
-        }
+        print_reconcile_report_text(&collection.reconcile);
     } else {
         println!(
             "no orphaned sandboxes found ({} scanned; reasons source_mismatch={}, running={}, recent={}, not_failed={}, missing_manifest={}, delete_failed={})",
@@ -1340,17 +1358,7 @@ pub(super) fn run_sandbox_cleanup(
             scan.skipped.missing_manifest,
             scan.skipped.delete_failed
         );
-        if collection.reconcile.healed_entries > 0 {
-            println!(
-                "reconcile: healed={} (rebuilt={}, pruned={}, normalized_running={}, cleared_stale_locks={}, fallback={})",
-                collection.reconcile.healed_entries,
-                collection.reconcile.rebuilt_entries,
-                collection.reconcile.pruned_entries,
-                collection.reconcile.normalized_running,
-                collection.reconcile.cleared_stale_locks,
-                collection.reconcile.scan_fallback_used
-            );
-        }
+        print_reconcile_report_text(&collection.reconcile);
     }
 
     Ok(0)
