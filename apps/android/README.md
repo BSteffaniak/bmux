@@ -14,6 +14,13 @@ M5 status: discovery, reconnect, and security hardening are now wired:
 - runtime permission prompts for discovery and notifications on Android 13+
 - androidTest coverage for reconnect/backoff behavior and secure-store migration
 
+M6 status: internal alpha packaging and dogfood process are now in place:
+
+- `alpha` build type (`io.bmux.android.alpha`) for internal APK distribution
+- `packageInternalAlpha` Gradle task for one-command alpha packaging
+- lightweight alpha telemetry in logcat (`BmuxAlpha`)
+- internal test checklist and failure-capture guide
+
 ## UniFFI Kotlin Binding Task
 
 This folder includes a tiny Gradle task for generating Kotlin bindings from
@@ -22,6 +29,7 @@ This folder includes a tiny Gradle task for generating Kotlin bindings from
 From `apps/android`:
 
 1. `./gradlew generateUniffiKotlinBindings`
+2. `./gradlew packageInternalAlpha`
 
 The task will:
 
@@ -36,6 +44,7 @@ From `apps/android`:
 
 1. `./gradlew :app:assembleDebug`
 2. `./gradlew :app:assembleDebugAndroidTest`
+3. `./gradlew :app:connectedDebugAndroidTest`
 
 Main UI file:
 
@@ -56,3 +65,4 @@ See:
 
 - `docs/mobile-m0-architecture.md`
 - `docs/mobile-ffi-contract.md`
+- `apps/android/docs/internal-alpha-checklist.md`

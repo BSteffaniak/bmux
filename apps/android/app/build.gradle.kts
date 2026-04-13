@@ -17,8 +17,21 @@ android {
     }
 
     buildTypes {
+        debug {
+            buildConfigField("boolean", "ALPHA_TELEMETRY_ENABLED", "true")
+        }
+
+        create("alpha") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".alpha"
+            versionNameSuffix = "-internal"
+            matchingFallbacks += listOf("debug")
+            buildConfigField("boolean", "ALPHA_TELEMETRY_ENABLED", "true")
+        }
+
         release {
             isMinifyEnabled = false
+            buildConfigField("boolean", "ALPHA_TELEMETRY_ENABLED", "false")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -33,6 +46,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
 }

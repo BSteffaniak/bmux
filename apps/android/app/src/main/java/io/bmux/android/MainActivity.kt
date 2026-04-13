@@ -122,6 +122,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             state = state.copy(warning = "Target cannot be empty")
             return
         }
+        AlphaTelemetry.log(AlphaEventKind.ImportTarget, "source=$source")
 
         viewModelScope.launch {
             state = state.copy(loading = true, warning = null)
@@ -155,14 +156,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             state = state.copy(loading = true, warning = null)
             val session = state.selectedSession.ifBlank { null }
+            AlphaTelemetry.log(AlphaEventKind.ConnectAttempt, "target=${target.id}")
             val result = withContext(Dispatchers.IO) { gateway.connect(target.id, session) }
             state = if (result.isSuccess) {
                 val connection = result.getOrThrow()
+                AlphaTelemetry.log(
+                    AlphaEventKind.ConnectSuccess,
+                    "target=${target.id},status=${connection.status}",
+                )
                 state.copy(
                     loading = false,
                     lastConnection = "${target.name}: ${connection.status}",
                 )
             } else {
+                AlphaTelemetry.log(
+                    AlphaEventKind.ConnectFailure,
+                    "target=${target.id},error=${result.exceptionOrNull()?.message ?: "unknown"}",
+                )
                 state.copy(
                     loading = false,
                     warning = result.exceptionOrNull()?.message ?: "Connection failed",
@@ -174,12 +184,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun observeAndPin(target: TargetUi) {
         viewModelScope.launch {
             state = state.copy(loading = true, warning = null)
+            AlphaTelemetry.log(AlphaEventKind.ObservePinAttempt, "target=${target.id}")
             val result = withContext(Dispatchers.IO) {
                 gateway.observeAndApplyPin(target.canonicalTarget)
             }
             state = if (result.isSuccess) {
+                AlphaTelemetry.log(AlphaEventKind.ObservePinSuccess, "target=${target.id}")
                 state.copy(loading = false, lastHostKey = result.getOrThrow())
             } else {
+                AlphaTelemetry.log(
+                    AlphaEventKind.ObservePinFailure,
+                    "target=${target.id},error=${result.exceptionOrNull()?.message ?: "unknown"}",
+                )
                 state.copy(
                     loading = false,
                     warning = result.exceptionOrNull()?.message ?: "Host key check failed",
@@ -191,8 +207,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setReconnectService(target: TargetUi, enabled: Boolean) {
         if (enabled) {
             gateway.startReconnectService(target.id, state.selectedSession.ifBlank { null })
+            AlphaTelemetry.log(AlphaEventKind.ReconnectEnabled, "target=${target.id}")
         } else {
             gateway.stopReconnectService()
+            AlphaTelemetry.log(AlphaEventKind.ReconnectDisabled, "target=${target.id}")
         }
         state = state.copy(reconnectServiceEnabled = enabled)
     }
@@ -200,9 +218,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setDiscoveryEnabled(enabled: Boolean) {
         if (!enabled) {
             discovery.stop()
+            AlphaTelemetry.log(AlphaEventKind.DiscoveryStop, "user_stopped=true")
             state = state.copy(discoveryRunning = false, discoveredTargets = emptyList())
             return
         }
+
+        AlphaTelemetry.log(AlphaEventKind.DiscoveryStart, "user_started=true")
 
         discovery.start(
             onUpdate = { discovered ->
@@ -210,6 +231,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     discovered.map { DiscoveredTargetUi(it.serviceName, it.host, it.port) },
                 )
                 viewModelScope.launch {
+                    AlphaTelemetry.log(AlphaEventKind.DiscoveryUpdate, "count=${discovered.size}")
                     state = state.copy(
                         discoveryRunning = true,
                         discoveredTargets = discovered.map {

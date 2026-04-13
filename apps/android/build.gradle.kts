@@ -82,3 +82,10 @@ tasks.register<Exec>("generateUniffiKotlinBindings") {
         )
     }
 }
+
+tasks.register("packageInternalAlpha") {
+    group = "bmux"
+    description = "Builds internal alpha APK with generated UniFFI bindings"
+    dependsOn("generateUniffiKotlinBindings")
+    dependsOn(":app:assembleAlpha")
+}
