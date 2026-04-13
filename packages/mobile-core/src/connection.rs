@@ -356,6 +356,10 @@ impl ConnectionManager {
             .get_mut(&terminal_id)
             .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
         if runtime.state.status == TerminalSessionStatus::Closed {
+            runtime.push_status_chunk(
+                "write rejected: session is closed".to_string(),
+                TerminalStatusSeverity::Error,
+            );
             return Err(MobileCoreError::TerminalSessionClosed(
                 terminal_id.to_string(),
             ));
@@ -374,15 +378,25 @@ impl ConnectionManager {
     /// [`MobileCoreError::TerminalSessionNotFound`] when unknown, and
     /// [`MobileCoreError::TerminalSessionClosed`] when the stream is closed.
     pub fn resize_terminal(&mut self, terminal_id: Uuid, size: TerminalSize) -> Result<()> {
-        validate_terminal_size(size)?;
         let runtime = self
             .terminals
             .get_mut(&terminal_id)
             .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
         if runtime.state.status == TerminalSessionStatus::Closed {
+            runtime.push_status_chunk(
+                "resize rejected: session is closed".to_string(),
+                TerminalStatusSeverity::Error,
+            );
             return Err(MobileCoreError::TerminalSessionClosed(
                 terminal_id.to_string(),
             ));
+        }
+        if let Err(error) = validate_terminal_size(size) {
+            runtime.push_status_chunk(
+                format!("resize rejected: invalid size {}x{}", size.rows, size.cols),
+                TerminalStatusSeverity::Error,
+            );
+            return Err(error);
         }
         runtime.state.size = size;
         runtime.push_status_chunk(
@@ -403,7 +417,12 @@ impl ConnectionManager {
                 .terminals
                 .get_mut(&terminal_id)
                 .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
-            if runtime.state.status != TerminalSessionStatus::Closed {
+            if runtime.state.status == TerminalSessionStatus::Closed {
+                runtime.push_status_chunk(
+                    "session already closed".to_string(),
+                    TerminalStatusSeverity::Warn,
+                );
+            } else {
                 runtime.state.status = TerminalSessionStatus::Closed;
                 runtime
                     .push_status_chunk("session closed".to_string(), TerminalStatusSeverity::Info);
@@ -577,6 +596,11 @@ mod tests {
         assert!(
             output
                 .iter()
+                .any(|chunk| chunk.status_severity == Some(TerminalStatusSeverity::Info))
+        );
+        assert!(
+            output
+                .iter()
                 .any(|chunk| chunk.kind == TerminalChunkKind::Stdout && chunk.bytes == b"ls\n")
         );
 
@@ -590,6 +614,23 @@ mod tests {
             write_after_close,
             Err(MobileCoreError::TerminalSessionClosed(_))
         ));
+
+        let second_close = manager
+            .close_terminal(terminal.id)
+            .expect("second close should return state");
+        assert_eq!(second_close.status, TerminalSessionStatus::Closed);
+
+        let post_close_output = manager
+            .poll_terminal_output(terminal.id, 16)
+            .expect("post-close poll should work");
+        assert!(post_close_output.iter().any(|chunk| {
+            chunk.status_severity == Some(TerminalStatusSeverity::Error)
+                && chunk.kind == TerminalChunkKind::Status
+        }));
+        assert!(post_close_output.iter().any(|chunk| {
+            chunk.status_severity == Some(TerminalStatusSeverity::Warn)
+                && chunk.kind == TerminalChunkKind::Status
+        }));
     }
 
     #[test]

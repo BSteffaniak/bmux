@@ -893,6 +893,11 @@ mod tests {
             .poll_terminal_output(&terminal.id.to_string(), 8)
             .expect("terminal poll should work");
         assert!(!chunks.is_empty());
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.status_severity == Some(TerminalStatusSeverity::Info))
+        );
 
         api.resize_terminal(
             &terminal.id.to_string(),
