@@ -6,9 +6,11 @@
 
 use bmux_mobile_core::{
     ConnectionManager, ConnectionRequest, ConnectionState, ConnectionStatus, HostKeyPinSuggestion,
-    MobileCoreError, ObservedHostKey, TargetInput, TargetRecord, TargetTransport,
-    apply_pin_query_fragment_to_target, apply_pin_suggestion_to_target, observe_ssh_host_key,
-    observe_ssh_host_key_fingerprint_sha256, observe_ssh_host_key_with_pin_suggestion,
+    MobileCoreError, ObservedHostKey, TargetInput, TargetRecord, TargetTransport, TerminalChunk,
+    TerminalChunkKind, TerminalOpenRequest, TerminalSessionState, TerminalSessionStatus,
+    TerminalSize, apply_pin_query_fragment_to_target, apply_pin_suggestion_to_target,
+    observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
+    observe_ssh_host_key_with_pin_suggestion,
 };
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -28,6 +30,12 @@ pub enum MobileFfiError {
     SshBackendUnavailable,
     #[error("ssh connection failed: {0}")]
     SshConnectionFailed(String),
+    #[error("terminal session {0} not found")]
+    TerminalSessionNotFound(String),
+    #[error("terminal session {0} is closed")]
+    TerminalSessionClosed(String),
+    #[error("invalid terminal size rows={rows}, cols={cols}")]
+    InvalidTerminalSize { rows: u16, cols: u16 },
 }
 
 impl From<MobileCoreError> for MobileFfiError {
@@ -38,6 +46,13 @@ impl From<MobileCoreError> for MobileFfiError {
             MobileCoreError::ConnectionNotActive(message) => Self::ConnectionNotActive(message),
             MobileCoreError::SshBackendUnavailable => Self::SshBackendUnavailable,
             MobileCoreError::SshConnectionFailed(message) => Self::SshConnectionFailed(message),
+            MobileCoreError::TerminalSessionNotFound(message) => {
+                Self::TerminalSessionNotFound(message)
+            }
+            MobileCoreError::TerminalSessionClosed(message) => Self::TerminalSessionClosed(message),
+            MobileCoreError::InvalidTerminalSize { rows, cols } => {
+                Self::InvalidTerminalSize { rows, cols }
+            }
         }
     }
 }
@@ -59,6 +74,21 @@ pub enum ConnectionStatusFfi {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum TerminalSessionStatusFfi {
+    Opening,
+    Open,
+    Closed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum TerminalChunkKindFfi {
+    Stdout,
+    Stderr,
+    Status,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TargetRecordFfi {
     pub id: String,
@@ -75,6 +105,38 @@ pub struct ConnectionStateFfi {
     pub status: ConnectionStatusFfi,
     pub session: Option<String>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalOpenRequestFfi {
+    pub target_id: String,
+    pub session: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalSizeFfi {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalSessionStateFfi {
+    pub id: String,
+    pub target_id: String,
+    pub connection_id: String,
+    pub session: Option<String>,
+    pub status: TerminalSessionStatusFfi,
+    pub size: TerminalSizeFfi,
+    pub last_sequence: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalChunkFfi {
+    pub sequence: u64,
+    pub kind: TerminalChunkKindFfi,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -109,6 +171,23 @@ const fn map_connection_status(value: ConnectionStatus) -> ConnectionStatusFfi {
     }
 }
 
+const fn map_terminal_session_status(value: TerminalSessionStatus) -> TerminalSessionStatusFfi {
+    match value {
+        TerminalSessionStatus::Opening => TerminalSessionStatusFfi::Opening,
+        TerminalSessionStatus::Open => TerminalSessionStatusFfi::Open,
+        TerminalSessionStatus::Closed => TerminalSessionStatusFfi::Closed,
+        TerminalSessionStatus::Failed => TerminalSessionStatusFfi::Failed,
+    }
+}
+
+const fn map_terminal_chunk_kind(value: TerminalChunkKind) -> TerminalChunkKindFfi {
+    match value {
+        TerminalChunkKind::Stdout => TerminalChunkKindFfi::Stdout,
+        TerminalChunkKind::Stderr => TerminalChunkKindFfi::Stderr,
+        TerminalChunkKind::Status => TerminalChunkKindFfi::Status,
+    }
+}
+
 fn map_target_record(value: TargetRecord) -> TargetRecordFfi {
     TargetRecordFfi {
         id: value.id.to_string(),
@@ -126,6 +205,47 @@ fn map_connection_state(value: ConnectionState) -> ConnectionStateFfi {
         status: map_connection_status(value.status),
         session: value.session,
         last_error: value.last_error,
+    }
+}
+
+fn map_terminal_session_state(value: TerminalSessionState) -> TerminalSessionStateFfi {
+    TerminalSessionStateFfi {
+        id: value.id.to_string(),
+        target_id: value.target_id.to_string(),
+        connection_id: value.connection_id.to_string(),
+        session: value.session,
+        status: map_terminal_session_status(value.status),
+        size: TerminalSizeFfi {
+            rows: value.size.rows,
+            cols: value.size.cols,
+        },
+        last_sequence: value.last_sequence,
+    }
+}
+
+fn map_terminal_chunk(value: TerminalChunk) -> TerminalChunkFfi {
+    TerminalChunkFfi {
+        sequence: value.sequence,
+        kind: map_terminal_chunk_kind(value.kind),
+        bytes: value.bytes,
+    }
+}
+
+fn map_terminal_open_request(value: &TerminalOpenRequestFfi) -> Result<TerminalOpenRequest> {
+    let target_id = Uuid::parse_str(&value.target_id)
+        .map_err(|_| MobileCoreError::InvalidTarget(value.target_id.clone()))?;
+    Ok(TerminalOpenRequest {
+        target_id,
+        session: value.session.clone(),
+        rows: value.rows,
+        cols: value.cols,
+    })
+}
+
+const fn map_terminal_size(value: &TerminalSizeFfi) -> TerminalSize {
+    TerminalSize {
+        rows: value.rows,
+        cols: value.cols,
     }
 }
 
@@ -228,6 +348,83 @@ impl MobileApi {
             .map_err(|_| MobileCoreError::ConnectionNotActive(connection_id.to_string()))?;
         let mut manager = self.lock_manager()?;
         manager.disconnect(connection_id)
+    }
+
+    /// Open a terminal stream for a target and optional session.
+    ///
+    /// # Errors
+    ///
+    /// Returns UUID parsing, target lookup, and transport setup errors.
+    pub fn open_terminal(&self, request: &TerminalOpenRequestFfi) -> Result<TerminalSessionState> {
+        let request = map_terminal_open_request(request)?;
+        let mut manager = self.lock_manager()?;
+        manager.open_terminal(request)
+    }
+
+    /// Return current state for a terminal stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns UUID parsing or terminal lookup errors.
+    pub fn terminal_state(&self, terminal_id: &str) -> Result<TerminalSessionState> {
+        let terminal_id = Uuid::parse_str(terminal_id)
+            .map_err(|_| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        let manager = self.lock_manager()?;
+        manager.terminal_state(terminal_id)
+    }
+
+    /// Read pending output chunks from a terminal stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns UUID parsing or terminal lookup errors.
+    pub fn poll_terminal_output(
+        &self,
+        terminal_id: &str,
+        max_chunks: u32,
+    ) -> Result<Vec<TerminalChunk>> {
+        let terminal_id = Uuid::parse_str(terminal_id)
+            .map_err(|_| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        let max_chunks = usize::try_from(max_chunks)
+            .map_err(|_| MobileCoreError::InvalidTarget("max_chunks out of range".to_string()))?;
+        let mut manager = self.lock_manager()?;
+        manager.poll_terminal_output(terminal_id, max_chunks)
+    }
+
+    /// Write input bytes to a terminal stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns UUID parsing, terminal lookup, or closed-session errors.
+    pub fn write_terminal_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<()> {
+        let terminal_id = Uuid::parse_str(terminal_id)
+            .map_err(|_| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        let mut manager = self.lock_manager()?;
+        manager.write_terminal_input(terminal_id, bytes)
+    }
+
+    /// Resize a terminal stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns UUID parsing, size validation, terminal lookup, or closed-session errors.
+    pub fn resize_terminal(&self, terminal_id: &str, size: &TerminalSizeFfi) -> Result<()> {
+        let terminal_id = Uuid::parse_str(terminal_id)
+            .map_err(|_| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        let mut manager = self.lock_manager()?;
+        manager.resize_terminal(terminal_id, map_terminal_size(size))
+    }
+
+    /// Close a terminal stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns UUID parsing or terminal lookup errors.
+    pub fn close_terminal(&self, terminal_id: &str) -> Result<TerminalSessionState> {
+        let terminal_id = Uuid::parse_str(terminal_id)
+            .map_err(|_| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        let mut manager = self.lock_manager()?;
+        manager.close_terminal(terminal_id)
     }
 
     /// Observe and return server SSH host-key SHA-256 fingerprint.
@@ -398,6 +595,98 @@ impl MobileApiFfi {
             .map_err(MobileFfiError::from)
     }
 
+    /// Open terminal stream for a target.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped target, UUID, and transport setup errors.
+    pub fn open_terminal(
+        &self,
+        request: TerminalOpenRequestFfi,
+    ) -> std::result::Result<TerminalSessionStateFfi, MobileFfiError> {
+        self.inner
+            .open_terminal(&request)
+            .map(map_terminal_session_state)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Return terminal stream state.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped UUID parsing and terminal lookup errors.
+    pub fn terminal_state(
+        &self,
+        terminal_id: String,
+    ) -> std::result::Result<TerminalSessionStateFfi, MobileFfiError> {
+        self.inner
+            .terminal_state(&terminal_id)
+            .map(map_terminal_session_state)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Poll pending terminal output chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped UUID parsing and terminal lookup errors.
+    pub fn poll_terminal_output(
+        &self,
+        terminal_id: String,
+        max_chunks: u32,
+    ) -> std::result::Result<Vec<TerminalChunkFfi>, MobileFfiError> {
+        self.inner
+            .poll_terminal_output(&terminal_id, max_chunks)
+            .map(|chunks| chunks.into_iter().map(map_terminal_chunk).collect())
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Write terminal input bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped UUID parsing, terminal lookup, and closed-session errors.
+    pub fn write_terminal_input(
+        &self,
+        terminal_id: String,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), MobileFfiError> {
+        self.inner
+            .write_terminal_input(&terminal_id, &bytes)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Resize terminal stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped UUID parsing, size validation, terminal lookup, and
+    /// closed-session errors.
+    pub fn resize_terminal(
+        &self,
+        terminal_id: String,
+        size: TerminalSizeFfi,
+    ) -> std::result::Result<(), MobileFfiError> {
+        self.inner
+            .resize_terminal(&terminal_id, &size)
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Close terminal stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped UUID parsing and terminal lookup errors.
+    pub fn close_terminal(
+        &self,
+        terminal_id: String,
+    ) -> std::result::Result<TerminalSessionStateFfi, MobileFfiError> {
+        self.inner
+            .close_terminal(&terminal_id)
+            .map(map_terminal_session_state)
+            .map_err(MobileFfiError::from)
+    }
+
     /// Observe only the SSH host-key SHA-256 fingerprint.
     ///
     /// # Errors
@@ -562,5 +851,44 @@ mod tests {
             result,
             "ssh://ops@prod.example.com:22?strict=true&host_key_fp=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
         );
+    }
+
+    #[test]
+    fn ffi_terminal_stream_round_trip() {
+        let api = MobileApi::new();
+        let target = api
+            .import_target("iroh://endpoint-tty", Some("tty".to_string()))
+            .expect("target import should work");
+
+        let terminal = api
+            .open_terminal(&TerminalOpenRequestFfi {
+                target_id: target.id.to_string(),
+                session: Some("main".to_string()),
+                rows: 24,
+                cols: 80,
+            })
+            .expect("terminal open should work");
+
+        api.write_terminal_input(&terminal.id.to_string(), b"pwd\n")
+            .expect("terminal write should work");
+
+        let chunks = api
+            .poll_terminal_output(&terminal.id.to_string(), 8)
+            .expect("terminal poll should work");
+        assert!(!chunks.is_empty());
+
+        api.resize_terminal(
+            &terminal.id.to_string(),
+            &TerminalSizeFfi {
+                rows: 40,
+                cols: 120,
+            },
+        )
+        .expect("terminal resize should work");
+
+        let closed = api
+            .close_terminal(&terminal.id.to_string())
+            .expect("terminal close should work");
+        assert_eq!(closed.status, TerminalSessionStatus::Closed);
     }
 }

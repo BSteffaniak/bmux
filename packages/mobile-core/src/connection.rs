@@ -4,7 +4,7 @@ use crate::target::{
     CanonicalTarget, TargetInput, TargetRecord, TargetTransport, canonicalize_target,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -33,9 +33,66 @@ pub struct ConnectionState {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalOpenRequest {
+    pub target_id: Uuid,
+    pub session: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSessionStatus {
+    Opening,
+    Open,
+    Closed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalChunkKind {
+    Stdout,
+    Stderr,
+    Status,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalChunk {
+    pub sequence: u64,
+    pub kind: TerminalChunkKind,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalSessionState {
+    pub id: Uuid,
+    pub target_id: Uuid,
+    pub connection_id: Uuid,
+    pub session: Option<String>,
+    pub status: TerminalSessionStatus,
+    pub size: TerminalSize,
+    pub last_sequence: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalSessionRuntime {
+    state: TerminalSessionState,
+    chunks: VecDeque<TerminalChunk>,
+    next_sequence: u64,
+}
+
 pub struct ConnectionManager {
     targets: BTreeMap<Uuid, TargetRecord>,
     connections: BTreeMap<Uuid, ConnectionState>,
+    terminals: BTreeMap<Uuid, TerminalSessionRuntime>,
     ssh_backend: Option<Arc<dyn SshBackend>>,
 }
 
@@ -44,6 +101,7 @@ impl Default for ConnectionManager {
         Self {
             targets: BTreeMap::new(),
             connections: BTreeMap::new(),
+            terminals: BTreeMap::new(),
             ssh_backend: Some(Arc::new(EmbeddedSshBackend::default())),
         }
     }
@@ -60,6 +118,7 @@ impl ConnectionManager {
         Self {
             targets: BTreeMap::new(),
             connections: BTreeMap::new(),
+            terminals: BTreeMap::new(),
             ssh_backend: Some(ssh_backend),
         }
     }
@@ -69,6 +128,7 @@ impl ConnectionManager {
         Self {
             targets: BTreeMap::new(),
             connections: BTreeMap::new(),
+            terminals: BTreeMap::new(),
             ssh_backend: None,
         }
     }
@@ -181,6 +241,189 @@ impl ConnectionManager {
         state.status = ConnectionStatus::Disconnected;
         Ok(state.clone())
     }
+
+    /// Open a terminal stream for a target and optional named session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::TargetNotFound`] for unknown targets,
+    /// [`MobileCoreError::InvalidTerminalSize`] for invalid dimensions, and
+    /// connection errors from [`Self::connect`].
+    pub fn open_terminal(&mut self, request: TerminalOpenRequest) -> Result<TerminalSessionState> {
+        let size = TerminalSize {
+            rows: request.rows,
+            cols: request.cols,
+        };
+        validate_terminal_size(size)?;
+
+        let target = self
+            .targets
+            .get(&request.target_id)
+            .ok_or_else(|| MobileCoreError::TargetNotFound(request.target_id.to_string()))?;
+        let target_name = target.name.clone();
+        let canonical_target = target.canonical_target.value.clone();
+
+        let connection = self.connect(ConnectionRequest {
+            target_id: request.target_id,
+            session: request.session.clone(),
+        })?;
+        let connection = self.mark_connected(connection.id)?;
+
+        let mut runtime = TerminalSessionRuntime {
+            state: TerminalSessionState {
+                id: Uuid::new_v4(),
+                target_id: request.target_id,
+                connection_id: connection.id,
+                session: request.session,
+                status: TerminalSessionStatus::Opening,
+                size,
+                last_sequence: 0,
+            },
+            chunks: VecDeque::new(),
+            next_sequence: 1,
+        };
+
+        runtime.push_status_chunk(format!("connected to {target_name} ({canonical_target})"));
+        runtime.state.status = TerminalSessionStatus::Open;
+
+        let state = runtime.state.clone();
+        self.terminals.insert(state.id, runtime);
+        Ok(state)
+    }
+
+    /// Return current terminal session state for a terminal id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::TerminalSessionNotFound`] when unknown.
+    pub fn terminal_state(&self, terminal_id: Uuid) -> Result<TerminalSessionState> {
+        self.terminals
+            .get(&terminal_id)
+            .map(|runtime| runtime.state.clone())
+            .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))
+    }
+
+    /// Read pending output chunks for a terminal stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::TerminalSessionNotFound`] when unknown.
+    pub fn poll_terminal_output(
+        &mut self,
+        terminal_id: Uuid,
+        max_chunks: usize,
+    ) -> Result<Vec<TerminalChunk>> {
+        let runtime = self
+            .terminals
+            .get_mut(&terminal_id)
+            .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+
+        if max_chunks == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut output = Vec::new();
+        for _ in 0..max_chunks {
+            match runtime.chunks.pop_front() {
+                Some(chunk) => output.push(chunk),
+                None => break,
+            }
+        }
+        Ok(output)
+    }
+
+    /// Write input bytes into a terminal stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::TerminalSessionNotFound`] when unknown and
+    /// [`MobileCoreError::TerminalSessionClosed`] when the stream is closed.
+    pub fn write_terminal_input(&mut self, terminal_id: Uuid, bytes: &[u8]) -> Result<()> {
+        let runtime = self
+            .terminals
+            .get_mut(&terminal_id)
+            .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        if runtime.state.status == TerminalSessionStatus::Closed {
+            return Err(MobileCoreError::TerminalSessionClosed(
+                terminal_id.to_string(),
+            ));
+        }
+        if !bytes.is_empty() {
+            runtime.push_chunk(TerminalChunkKind::Stdout, bytes.to_vec());
+        }
+        Ok(())
+    }
+
+    /// Resize a terminal stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::InvalidTerminalSize`] for invalid dimensions,
+    /// [`MobileCoreError::TerminalSessionNotFound`] when unknown, and
+    /// [`MobileCoreError::TerminalSessionClosed`] when the stream is closed.
+    pub fn resize_terminal(&mut self, terminal_id: Uuid, size: TerminalSize) -> Result<()> {
+        validate_terminal_size(size)?;
+        let runtime = self
+            .terminals
+            .get_mut(&terminal_id)
+            .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        if runtime.state.status == TerminalSessionStatus::Closed {
+            return Err(MobileCoreError::TerminalSessionClosed(
+                terminal_id.to_string(),
+            ));
+        }
+        runtime.state.size = size;
+        runtime.push_status_chunk(format!("resize {}x{}", size.rows, size.cols));
+        Ok(())
+    }
+
+    /// Close a terminal stream and mark backing connection disconnected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::TerminalSessionNotFound`] when unknown.
+    pub fn close_terminal(&mut self, terminal_id: Uuid) -> Result<TerminalSessionState> {
+        let connection_id = {
+            let runtime = self
+                .terminals
+                .get_mut(&terminal_id)
+                .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+            if runtime.state.status != TerminalSessionStatus::Closed {
+                runtime.state.status = TerminalSessionStatus::Closed;
+                runtime.push_status_chunk("session closed".to_string());
+            }
+            runtime.state.connection_id
+        };
+        let _ = self.disconnect(connection_id);
+        self.terminal_state(terminal_id)
+    }
+}
+
+impl TerminalSessionRuntime {
+    fn push_chunk(&mut self, kind: TerminalChunkKind, bytes: Vec<u8>) {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.state.last_sequence = sequence;
+        self.chunks.push_back(TerminalChunk {
+            sequence,
+            kind,
+            bytes,
+        });
+    }
+
+    fn push_status_chunk(&mut self, message: String) {
+        self.push_chunk(TerminalChunkKind::Status, message.into_bytes());
+    }
+}
+
+const fn validate_terminal_size(size: TerminalSize) -> Result<()> {
+    if size.rows == 0 || size.cols == 0 {
+        return Err(MobileCoreError::InvalidTerminalSize {
+            rows: size.rows,
+            cols: size.cols,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -262,5 +505,86 @@ mod tests {
             .expect("ssh connection should start");
 
         assert_eq!(connection.status, ConnectionStatus::Connecting);
+    }
+
+    #[test]
+    fn terminal_open_write_poll_resize_close_round_trip() {
+        let mut manager = ConnectionManager::new();
+        let target = manager
+            .import_target(&TargetInput {
+                source: "iroh://endpoint-abc".to_string(),
+                display_name: Some("demo".to_string()),
+            })
+            .expect("target import should work");
+
+        let terminal = manager
+            .open_terminal(TerminalOpenRequest {
+                target_id: target.id,
+                session: Some("main".to_string()),
+                rows: 24,
+                cols: 80,
+            })
+            .expect("terminal should open");
+        assert_eq!(terminal.status, TerminalSessionStatus::Open);
+
+        manager
+            .write_terminal_input(terminal.id, b"ls\n")
+            .expect("terminal write should work");
+        manager
+            .resize_terminal(
+                terminal.id,
+                TerminalSize {
+                    rows: 40,
+                    cols: 120,
+                },
+            )
+            .expect("terminal resize should work");
+
+        let output = manager
+            .poll_terminal_output(terminal.id, 16)
+            .expect("terminal poll should work");
+        assert!(
+            output
+                .iter()
+                .any(|chunk| chunk.kind == TerminalChunkKind::Status)
+        );
+        assert!(
+            output
+                .iter()
+                .any(|chunk| chunk.kind == TerminalChunkKind::Stdout && chunk.bytes == b"ls\n")
+        );
+
+        let closed = manager
+            .close_terminal(terminal.id)
+            .expect("terminal close should work");
+        assert_eq!(closed.status, TerminalSessionStatus::Closed);
+
+        let write_after_close = manager.write_terminal_input(terminal.id, b"pwd\n");
+        assert!(matches!(
+            write_after_close,
+            Err(MobileCoreError::TerminalSessionClosed(_))
+        ));
+    }
+
+    #[test]
+    fn terminal_open_rejects_zero_dimensions() {
+        let mut manager = ConnectionManager::new();
+        let target = manager
+            .import_target(&TargetInput {
+                source: "iroh://endpoint-xyz".to_string(),
+                display_name: None,
+            })
+            .expect("target import should work");
+
+        let result = manager.open_terminal(TerminalOpenRequest {
+            target_id: target.id,
+            session: None,
+            rows: 0,
+            cols: 80,
+        });
+        assert!(matches!(
+            result,
+            Err(MobileCoreError::InvalidTerminalSize { .. })
+        ));
     }
 }

@@ -9,7 +9,11 @@ pub mod error;
 pub mod ssh;
 pub mod target;
 
-pub use connection::{ConnectionManager, ConnectionRequest, ConnectionState, ConnectionStatus};
+pub use connection::{
+    ConnectionManager, ConnectionRequest, ConnectionState, ConnectionStatus, TerminalChunk,
+    TerminalChunkKind, TerminalOpenRequest, TerminalSessionState, TerminalSessionStatus,
+    TerminalSize,
+};
 pub use error::{MobileCoreError, Result};
 pub use ssh::{
     EmbeddedSshBackend, HostKeyPinSuggestion, MockSshBackend, ObservedHostKey, SshBackend,

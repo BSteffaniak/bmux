@@ -5,7 +5,7 @@ UniFFI bridge crate for exposing `mobile-core` APIs to Android and iOS.
 Current status:
 
 - M3 base API is implemented with UniFFI-compatible exported objects and records.
-- The FFI surface includes target import/listing, connection state transitions, and SSH host-key pinning helpers.
+- The FFI surface includes target import/listing, connection state transitions, SSH host-key pinning helpers, and terminal stream APIs.
 
 Primary exported object:
 

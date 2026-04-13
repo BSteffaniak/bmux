@@ -14,4 +14,10 @@ pub enum MobileCoreError {
     SshBackendUnavailable,
     #[error("ssh connection failed: {0}")]
     SshConnectionFailed(String),
+    #[error("terminal session {0} not found")]
+    TerminalSessionNotFound(String),
+    #[error("terminal session {0} is closed")]
+    TerminalSessionClosed(String),
+    #[error("invalid terminal size rows={rows}, cols={cols}")]
+    InvalidTerminalSize { rows: u16, cols: u16 },
 }

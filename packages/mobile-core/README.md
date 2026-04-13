@@ -1,15 +1,16 @@
-# mobile-core (planned)
+# mobile-core
 
 Shared Rust domain core for bmux mobile clients.
 
-This crate is planned in M1. M0 only defines architecture and API contracts.
+This crate provides shared Rust domain primitives for bmux mobile clients.
 
-Expected responsibilities:
+Current responsibilities:
 
 - target parsing and canonicalization
 - transport-agnostic connection state machine
 - iroh/tls/ssh transport adapters
 - session metadata APIs for connection-first mobile flows
+- terminal stream session APIs (`open/poll/write/resize/close`)
 - typed diagnostic and error model for platform UIs
 
 See:
