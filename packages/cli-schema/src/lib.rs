@@ -1257,6 +1257,15 @@ pub enum SandboxCommand {
         /// Optional human-friendly sandbox label for rerun
         #[arg(long)]
         name: Option<String>,
+        /// Bundle selected sandbox diagnostics after triage
+        #[arg(long)]
+        bundle: bool,
+        /// Optional output directory for triage bundle (default: ./sandbox-bundles)
+        #[arg(long, requires = "bundle")]
+        bundle_output: Option<String>,
+        /// Fail triage when bundle verification reports unexpected extra artifacts
+        #[arg(long, requires = "bundle")]
+        bundle_strict_verify: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -4421,6 +4430,10 @@ mod tests {
             "15",
             "--name",
             "triage-rerun",
+            "--bundle",
+            "--bundle-output",
+            "./artifacts",
+            "--bundle-strict-verify",
             "--json",
         ])
         .expect("valid triage args");
@@ -4442,8 +4455,13 @@ mod tests {
                 print_env: true,
                 timeout: Some(15),
                 name: Some(ref name),
+                bundle: true,
+                bundle_output: Some(ref output),
+                bundle_strict_verify: true,
                 json: true,
-            } if bin == "./target/debug/bmux" && name == "triage-rerun"
+            } if bin == "./target/debug/bmux"
+                && name == "triage-rerun"
+                && output == "./artifacts"
         ));
     }
 

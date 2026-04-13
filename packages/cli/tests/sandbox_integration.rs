@@ -2401,8 +2401,94 @@ fn sandbox_triage_defaults_to_latest_failed_and_reports_target() {
     );
     assert_eq!(json["target"]["source"].as_str(), Some("sandbox-cli"));
     assert_eq!(json["target"]["status"].as_str(), Some("failed"));
+    assert_eq!(json["bundle"]["requested"], false);
+    assert_eq!(json["bundle"]["executed"], false);
     assert_eq!(json["rerun"]["requested"], false);
     assert_eq!(json["rerun"]["executed"], false);
+}
+
+#[test]
+#[serial]
+fn sandbox_triage_bundle_generates_verified_bundle_json() {
+    let sandbox = CommandSandbox::new("triage-bundle-json");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-triage-bundle", "sandbox-cli", "failed");
+    let log_path = tmp_root
+        .join("bmux-sbx-triage-bundle")
+        .join("logs")
+        .join("run.log");
+    std::fs::write(&log_path, "triage-bundle\n").expect("write triage bundle log file");
+
+    let bundle_output_root = sandbox.root.path().join("triage-bundles");
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "triage",
+            "bmux-sbx-triage-bundle",
+            "--bundle",
+            "--bundle-output",
+            bundle_output_root.to_string_lossy().as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox triage with bundle");
+    assert!(
+        output.status.success(),
+        "sandbox triage --bundle should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["bundle"]["requested"].as_bool(), Some(true));
+    assert_eq!(json["bundle"]["executed"].as_bool(), Some(true));
+    assert_eq!(json["bundle"]["verify"]["ok"].as_bool(), Some(true));
+    assert_eq!(json["bundle"]["verify"]["strict"].as_bool(), Some(false));
+    let bundle_dir = json["bundle"]["bundle_dir"]
+        .as_str()
+        .expect("triage bundle output should include bundle_dir");
+    assert!(
+        Path::new(bundle_dir).is_dir(),
+        "triage bundle directory should exist"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_triage_bundle_strict_verify_sets_strict_mode() {
+    let sandbox = CommandSandbox::new("triage-bundle-strict");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-triage-bundle-strict",
+        "sandbox-cli",
+        "failed",
+    );
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "triage",
+            "bmux-sbx-triage-bundle-strict",
+            "--bundle",
+            "--bundle-strict-verify",
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox triage with strict bundle verify");
+    assert!(
+        output.status.success(),
+        "sandbox triage --bundle-strict-verify should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_stdout(&output);
+    assert_schema_version(&json);
+    assert_eq!(json["bundle"]["requested"].as_bool(), Some(true));
+    assert_eq!(json["bundle"]["verify"]["strict"].as_bool(), Some(true));
+    assert_eq!(json["bundle"]["verify"]["ok"].as_bool(), Some(true));
 }
 
 #[test]

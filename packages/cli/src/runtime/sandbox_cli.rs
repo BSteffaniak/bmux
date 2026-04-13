@@ -167,6 +167,15 @@ struct TriageSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct TriageBundleSnapshot {
+    requested: bool,
+    executed: bool,
+    bundle_dir: Option<String>,
+    bundle_manifest: Option<String>,
+    verify: Option<BundleVerifyReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct DoctorCheck {
     name: String,
     ok: bool,
@@ -340,7 +349,13 @@ pub(super) struct TriageSandboxOptions<'a> {
     pub(super) run: RunSandboxOptions<'a>,
     pub(super) bmux_bin_override: Option<&'a str>,
     pub(super) env_mode_override: Option<SandboxEnvModeArg>,
+    pub(super) bundle: Option<TriageBundleOptions<'a>>,
     pub(super) json: bool,
+}
+
+pub(super) struct TriageBundleOptions<'a> {
+    pub(super) output: Option<&'a str>,
+    pub(super) strict_verify: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -407,6 +422,15 @@ struct BundleVersionCheck {
     bundle_version: Option<u32>,
     schema_version: Option<u32>,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BundleCreateResult {
+    bundle_dir: String,
+    sandbox_root: String,
+    sandbox_id: String,
+    bundle_manifest: String,
+    verify: Option<BundleVerifyReport>,
 }
 
 pub(super) async fn run_sandbox_run(
@@ -1041,48 +1065,18 @@ pub(super) async fn run_sandbox_triage(options: TriageSandboxOptions<'_>) -> Res
         &collection.candidates,
     )?;
     let manifest = read_manifest(&root)?;
-    let running = sandbox_process_alive(&root) || sandbox_socket_alive(&root);
-    let log_dir = root.join("logs");
-    let latest_log = newest_regular_file(&log_dir);
-    let log_tail = read_log_tail(&root, options.tail);
-    let repro = format_repro_command_from_manifest(&manifest);
-
-    let entries = collection
-        .candidates
-        .iter()
-        .map(sandbox_list_entry)
-        .collect::<Vec<_>>();
-    let totals = summarize_status_counts(&entries);
-    let health = summarize_sandbox_health(&collection.candidates);
-
-    let snapshot = TriageSnapshot {
-        totals,
-        health,
-        reconcile: collection.reconcile,
-        selection,
-        source_filter: options.inspect.source_filter.map(ToOwned::to_owned),
-        target: TriageTarget {
-            id: manifest.id,
-            source: manifest.source,
-            status: manifest.status,
-            running,
-            root: root.to_string_lossy().to_string(),
-            log_dir: log_dir.to_string_lossy().to_string(),
-            latest_log: latest_log
-                .as_ref()
-                .map(|path| path.to_string_lossy().to_string()),
-            repro,
-            log_tail,
-        },
-    };
+    let snapshot = build_triage_snapshot(&options, &collection, selection, &root, &manifest);
+    let (bundle_snapshot, bundle_exit_code) =
+        triage_bundle_snapshot(&options, &root, &manifest, &snapshot)?;
 
     if options.json {
-        let payload = triage_json_payload(&snapshot);
+        let payload = triage_json_payload(&snapshot, &bundle_snapshot);
         println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(0);
+        return Ok(bundle_exit_code);
     }
 
     print_triage_text(&snapshot);
+    print_triage_bundle_text(&bundle_snapshot);
 
     if options.rerun {
         println!("rerun: executing manifest command");
@@ -1108,10 +1102,110 @@ pub(super) async fn run_sandbox_triage(options: TriageSandboxOptions<'_>) -> Res
         })
         .await?;
         println!("rerun_exit_code: {rerun_code}");
-        return Ok(rerun_code);
+        return Ok(std::cmp::max(bundle_exit_code, rerun_code));
     }
 
-    Ok(0)
+    Ok(bundle_exit_code)
+}
+
+fn build_triage_snapshot(
+    options: &TriageSandboxOptions<'_>,
+    collection: &SandboxCandidateCollection,
+    selection: TriageSelection,
+    root: &Path,
+    manifest: &SandboxManifest,
+) -> TriageSnapshot {
+    let running = sandbox_process_alive(root) || sandbox_socket_alive(root);
+    let log_dir = root.join("logs");
+    let latest_log = newest_regular_file(&log_dir);
+    let log_tail = read_log_tail(root, options.tail);
+    let repro = format_repro_command_from_manifest(manifest);
+
+    let entries = collection
+        .candidates
+        .iter()
+        .map(sandbox_list_entry)
+        .collect::<Vec<_>>();
+
+    TriageSnapshot {
+        totals: summarize_status_counts(&entries),
+        health: summarize_sandbox_health(&collection.candidates),
+        reconcile: collection.reconcile.clone(),
+        selection,
+        source_filter: options.inspect.source_filter.map(ToOwned::to_owned),
+        target: TriageTarget {
+            id: manifest.id.clone(),
+            source: manifest.source.clone(),
+            status: manifest.status.clone(),
+            running,
+            root: root.to_string_lossy().to_string(),
+            log_dir: log_dir.to_string_lossy().to_string(),
+            latest_log: latest_log
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            repro,
+            log_tail,
+        },
+    }
+}
+
+fn triage_bundle_snapshot(
+    options: &TriageSandboxOptions<'_>,
+    root: &Path,
+    manifest: &SandboxManifest,
+    snapshot: &TriageSnapshot,
+) -> Result<(TriageBundleSnapshot, u8)> {
+    let mut bundle_snapshot = TriageBundleSnapshot {
+        requested: options.bundle.is_some(),
+        executed: false,
+        bundle_dir: None,
+        bundle_manifest: None,
+        verify: None,
+    };
+
+    let bundle_exit_code = if let Some(bundle_options) = &options.bundle {
+        let created = create_bundle_from_manifest(
+            root,
+            manifest,
+            &snapshot.target.root,
+            bundle_options.output,
+            BundleIncludeOptions {
+                env: false,
+                index_state: false,
+                doctor: false,
+            },
+            true,
+            bundle_options.strict_verify,
+        )?;
+        bundle_snapshot.executed = true;
+        bundle_snapshot.bundle_dir = Some(created.bundle_dir);
+        bundle_snapshot.bundle_manifest = Some(created.bundle_manifest);
+        bundle_snapshot.verify = created.verify;
+        u8::from(
+            bundle_snapshot
+                .verify
+                .as_ref()
+                .is_some_and(|report| !report.ok),
+        )
+    } else {
+        0
+    };
+
+    Ok((bundle_snapshot, bundle_exit_code))
+}
+
+fn print_triage_bundle_text(bundle: &TriageBundleSnapshot) {
+    if !bundle.executed {
+        return;
+    }
+
+    println!(
+        "bundle: {}",
+        bundle.bundle_dir.as_deref().unwrap_or("(none)")
+    );
+    if let Some(verify) = &bundle.verify {
+        print_bundle_verify_text(verify);
+    }
 }
 
 const fn resolve_triage_selector(options: &TriageSandboxOptions<'_>) -> TriageSelection {
@@ -1133,7 +1227,10 @@ const fn resolve_triage_selector(options: &TriageSandboxOptions<'_>) -> TriageSe
     }
 }
 
-fn triage_json_payload(snapshot: &TriageSnapshot) -> serde_json::Value {
+fn triage_json_payload(
+    snapshot: &TriageSnapshot,
+    bundle: &TriageBundleSnapshot,
+) -> serde_json::Value {
     serde_json::json!({
         "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
         "totals": snapshot.totals,
@@ -1146,6 +1243,7 @@ fn triage_json_payload(snapshot: &TriageSnapshot) -> serde_json::Value {
             "source_filter": snapshot.source_filter,
         },
         "target": snapshot.target,
+        "bundle": bundle,
         "rerun": {
             "requested": false,
             "executed": false,
@@ -1454,7 +1552,47 @@ pub(super) fn run_sandbox_bundle(options: &BundleSandboxOptions<'_>) -> Result<u
     let root = resolve_sandbox_target(options.target)?;
     let manifest = read_manifest(&root)?;
 
-    let output_root = options.output.map_or_else(
+    let created = create_bundle_from_manifest(
+        &root,
+        &manifest,
+        options.target,
+        options.output,
+        options.include,
+        options.verify,
+        false,
+    )?;
+    let exit_code = u8::from(created.verify.as_ref().is_some_and(|report| !report.ok));
+
+    if options.json {
+        let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+            "bundle_dir": created.bundle_dir,
+            "sandbox_root": created.sandbox_root,
+            "sandbox_id": created.sandbox_id,
+            "bundle_manifest": created.bundle_manifest,
+            "verify": created.verify,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("sandbox bundle created: {}", created.bundle_dir);
+        if let Some(report) = &created.verify {
+            print_bundle_verify_text(report);
+        }
+    }
+
+    Ok(exit_code)
+}
+
+fn create_bundle_from_manifest(
+    root: &Path,
+    manifest: &SandboxManifest,
+    doctor_target: &str,
+    output: Option<&str>,
+    include: BundleIncludeOptions,
+    verify: bool,
+    verify_strict: bool,
+) -> Result<BundleCreateResult> {
+    let output_root = output.map_or_else(
         || {
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
@@ -1469,12 +1607,12 @@ pub(super) fn run_sandbox_bundle(options: &BundleSandboxOptions<'_>) -> Result<u
     std::fs::create_dir_all(&bundle_dir)
         .with_context(|| format!("failed creating {}", bundle_dir.display()))?;
 
-    let mut artifacts = write_bundle_core_artifacts(&root, &manifest, &bundle_dir)?;
+    let mut artifacts = write_bundle_core_artifacts(root, manifest, &bundle_dir)?;
     let index_status = write_bundle_optional_artifacts(
-        &manifest,
-        options.target,
+        manifest,
+        doctor_target,
         &bundle_dir,
-        options.include,
+        include,
         &mut artifacts,
     )?;
     let artifact_metadata = bundle_artifact_metadata(&bundle_dir, &artifacts);
@@ -1491,9 +1629,9 @@ pub(super) fn run_sandbox_bundle(options: &BundleSandboxOptions<'_>) -> Result<u
             "root": root.to_string_lossy().to_string(),
         },
         "includes": {
-            "env": options.include.env,
-            "index_state": options.include.index_state,
-            "doctor": options.include.doctor,
+            "env": include.env,
+            "index_state": include.index_state,
+            "doctor": include.doctor,
         },
         "index_state": {
             "status": index_status,
@@ -1507,33 +1645,19 @@ pub(super) fn run_sandbox_bundle(options: &BundleSandboxOptions<'_>) -> Result<u
     )
     .with_context(|| format!("failed writing {}", bundle_manifest_path.display()))?;
 
-    let verification_report = if options.verify {
-        Some(load_bundle_verify_report(&bundle_dir, false)?)
+    let verification_report = if verify {
+        Some(load_bundle_verify_report(&bundle_dir, verify_strict)?)
     } else {
         None
     };
 
-    let verify_ok = verification_report.as_ref().is_none_or(|report| report.ok);
-    let exit_code = u8::from(!verify_ok);
-
-    if options.json {
-        let payload = serde_json::json!({
-            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
-            "bundle_dir": bundle_dir.to_string_lossy().to_string(),
-            "sandbox_root": root.to_string_lossy().to_string(),
-            "sandbox_id": manifest.id,
-            "bundle_manifest": bundle_manifest_path.to_string_lossy().to_string(),
-            "verify": verification_report,
-        });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        println!("sandbox bundle created: {}", bundle_dir.display());
-        if let Some(report) = &verification_report {
-            print_bundle_verify_text(report);
-        }
-    }
-
-    Ok(exit_code)
+    Ok(BundleCreateResult {
+        bundle_dir: bundle_dir.to_string_lossy().to_string(),
+        sandbox_root: root.to_string_lossy().to_string(),
+        sandbox_id: manifest.id.clone(),
+        bundle_manifest: bundle_manifest_path.to_string_lossy().to_string(),
+        verify: verification_report,
+    })
 }
 
 pub(super) fn run_sandbox_verify_bundle(bundle_dir: &str, strict: bool, json: bool) -> Result<u8> {
