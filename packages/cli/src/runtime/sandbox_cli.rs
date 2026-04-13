@@ -343,6 +343,29 @@ pub(super) struct TriageSandboxOptions<'a> {
     pub(super) json: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BundleIncludeOptions {
+    pub(super) env: bool,
+    pub(super) index_state: bool,
+    pub(super) doctor: bool,
+}
+
+pub(super) struct BundleSandboxOptions<'a> {
+    pub(super) target: &'a str,
+    pub(super) output: Option<&'a str>,
+    pub(super) include: BundleIncludeOptions,
+    pub(super) json: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BundleArtifactMetadata {
+    path: String,
+    kind: String,
+    bytes: u64,
+    file_count: usize,
+    exists: bool,
+}
+
 pub(super) async fn run_sandbox_run(
     options: RunSandboxOptions<'_>,
     command_args: &[String],
@@ -1384,11 +1407,11 @@ fn preview_candidate_lifecycle_recovery(candidates: &[SandboxCandidate]) -> Reco
     report
 }
 
-pub(super) fn run_sandbox_bundle(target: &str, output: Option<&str>, json: bool) -> Result<u8> {
-    let root = resolve_sandbox_target(target)?;
+pub(super) fn run_sandbox_bundle(options: &BundleSandboxOptions<'_>) -> Result<u8> {
+    let root = resolve_sandbox_target(options.target)?;
     let manifest = read_manifest(&root)?;
 
-    let output_root = output.map_or_else(
+    let output_root = options.output.map_or_else(
         || {
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
@@ -1403,28 +1426,51 @@ pub(super) fn run_sandbox_bundle(target: &str, output: Option<&str>, json: bool)
     std::fs::create_dir_all(&bundle_dir)
         .with_context(|| format!("failed creating {}", bundle_dir.display()))?;
 
-    copy_if_exists(&root.join(MANIFEST_FILE), &bundle_dir.join(MANIFEST_FILE))?;
-    copy_if_exists(
-        &root.join(PID_MARKER_FILE),
-        &bundle_dir.join(PID_MARKER_FILE),
+    let mut artifacts = write_bundle_core_artifacts(&root, &manifest, &bundle_dir)?;
+    let index_status = write_bundle_optional_artifacts(
+        &manifest,
+        options.target,
+        &bundle_dir,
+        options.include,
+        &mut artifacts,
     )?;
-    copy_if_exists(&root.join(LOCK_FILE), &bundle_dir.join(LOCK_FILE))?;
+    let artifact_metadata = bundle_artifact_metadata(&bundle_dir, &artifacts);
 
-    let logs_src = root.join("logs");
-    if logs_src.exists() {
-        copy_directory_recursive(&logs_src, &bundle_dir.join("logs"))?;
-    }
+    let bundle_manifest_path = bundle_dir.join("bundle_manifest.json");
+    let bundle_manifest_payload = serde_json::json!({
+        "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+        "bundle_version": 1,
+        "created_at_unix_ms": unix_millis_now_meta(),
+        "sandbox": {
+            "id": manifest.id,
+            "source": manifest.source,
+            "status": manifest.status,
+            "root": root.to_string_lossy().to_string(),
+        },
+        "includes": {
+            "env": options.include.env,
+            "index_state": options.include.index_state,
+            "doctor": options.include.doctor,
+        },
+        "index_state": {
+            "status": index_status,
+        },
+        "artifacts": artifacts,
+        "artifact_metadata": artifact_metadata,
+    });
+    std::fs::write(
+        &bundle_manifest_path,
+        serde_json::to_vec_pretty(&bundle_manifest_payload)?,
+    )
+    .with_context(|| format!("failed writing {}", bundle_manifest_path.display()))?;
 
-    let repro_path = bundle_dir.join("repro.txt");
-    std::fs::write(&repro_path, format_repro_command_from_manifest(&manifest))
-        .with_context(|| format!("failed writing {}", repro_path.display()))?;
-
-    if json {
+    if options.json {
         let payload = serde_json::json!({
             "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
             "bundle_dir": bundle_dir.to_string_lossy().to_string(),
             "sandbox_root": root.to_string_lossy().to_string(),
             "sandbox_id": manifest.id,
+            "bundle_manifest": bundle_manifest_path.to_string_lossy().to_string(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -1432,6 +1478,233 @@ pub(super) fn run_sandbox_bundle(target: &str, output: Option<&str>, json: bool)
     }
 
     Ok(0)
+}
+
+fn write_bundle_core_artifacts(
+    root: &Path,
+    manifest: &SandboxManifest,
+    bundle_dir: &Path,
+) -> Result<Vec<String>> {
+    copy_if_exists(&root.join(MANIFEST_FILE), &bundle_dir.join(MANIFEST_FILE))?;
+    copy_if_exists(
+        &root.join(PID_MARKER_FILE),
+        &bundle_dir.join(PID_MARKER_FILE),
+    )?;
+    copy_if_exists(&root.join(LOCK_FILE), &bundle_dir.join(LOCK_FILE))?;
+
+    let mut artifacts = vec![
+        MANIFEST_FILE.to_string(),
+        PID_MARKER_FILE.to_string(),
+        LOCK_FILE.to_string(),
+    ];
+
+    let logs_src = root.join("logs");
+    if logs_src.exists() {
+        copy_directory_recursive(&logs_src, &bundle_dir.join("logs"))?;
+        artifacts.push("logs/".to_string());
+    }
+
+    let repro_path = bundle_dir.join("repro.txt");
+    std::fs::write(&repro_path, format_repro_command_from_manifest(manifest))
+        .with_context(|| format!("failed writing {}", repro_path.display()))?;
+    artifacts.push("repro.txt".to_string());
+
+    Ok(artifacts)
+}
+
+fn write_bundle_optional_artifacts(
+    manifest: &SandboxManifest,
+    target: &str,
+    bundle_dir: &Path,
+    include: BundleIncludeOptions,
+    artifacts: &mut Vec<String>,
+) -> Result<String> {
+    let mut index_status = "not_included".to_string();
+
+    if include.env {
+        let env_path = bundle_dir.join("env.json");
+        let payload = bundle_env_payload(manifest);
+        std::fs::write(&env_path, serde_json::to_vec_pretty(&payload)?)
+            .with_context(|| format!("failed writing {}", env_path.display()))?;
+        artifacts.push("env.json".to_string());
+    }
+
+    if include.index_state {
+        index_status = write_bundle_index_state(manifest, bundle_dir, artifacts)?;
+    }
+
+    if include.doctor {
+        let doctor_path = bundle_dir.join("doctor.json");
+        let doctor_payload = bundle_doctor_payload(target);
+        std::fs::write(&doctor_path, serde_json::to_vec_pretty(&doctor_payload)?)
+            .with_context(|| format!("failed writing {}", doctor_path.display()))?;
+        artifacts.push("doctor.json".to_string());
+    }
+
+    Ok(index_status)
+}
+
+fn bundle_artifact_metadata(
+    bundle_dir: &Path,
+    artifacts: &[String],
+) -> Vec<BundleArtifactMetadata> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            let is_dir = artifact.ends_with('/');
+            let relative = artifact.trim_end_matches('/');
+            let path = bundle_dir.join(relative);
+
+            if is_dir {
+                let (bytes, file_count, exists) = directory_stats(&path);
+                return BundleArtifactMetadata {
+                    path: artifact.clone(),
+                    kind: "directory".to_string(),
+                    bytes,
+                    file_count,
+                    exists,
+                };
+            }
+
+            let (bytes, exists) = file_bytes(&path);
+            BundleArtifactMetadata {
+                path: artifact.clone(),
+                kind: "file".to_string(),
+                bytes,
+                file_count: usize::from(exists),
+                exists,
+            }
+        })
+        .collect()
+}
+
+fn file_bytes(path: &Path) -> (u64, bool) {
+    path.metadata().map_or((0, false), |metadata| {
+        if metadata.is_file() {
+            (metadata.len(), true)
+        } else {
+            (0, false)
+        }
+    })
+}
+
+fn directory_stats(path: &Path) -> (u64, usize, bool) {
+    if !path.is_dir() {
+        return (0, 0, false);
+    }
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return (0, 0, false);
+    };
+
+    let mut bytes = 0u64;
+    let mut file_count = 0usize;
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            let (dir_bytes, dir_files, dir_exists) = directory_stats(&entry_path);
+            if dir_exists {
+                bytes = bytes.saturating_add(dir_bytes);
+                file_count += dir_files;
+            }
+            continue;
+        }
+
+        if let Ok(metadata) = entry.metadata()
+            && metadata.is_file()
+        {
+            bytes = bytes.saturating_add(metadata.len());
+            file_count += 1;
+        }
+    }
+
+    (bytes, file_count, true)
+}
+
+fn write_bundle_index_state(
+    manifest: &SandboxManifest,
+    bundle_dir: &Path,
+    artifacts: &mut Vec<String>,
+) -> Result<String> {
+    let index_path = ConfigPaths::default()
+        .state_dir()
+        .join("sandbox")
+        .join("index.json");
+    let index_bundle_path = bundle_dir.join("sandbox-index.json");
+    let status = if index_path.exists() {
+        std::fs::copy(&index_path, &index_bundle_path)
+            .with_context(|| format!("failed copying {}", index_path.display()))?;
+        artifacts.push("sandbox-index.json".to_string());
+        "copied".to_string()
+    } else {
+        "missing".to_string()
+    };
+
+    let index_entry_path = bundle_dir.join("sandbox-index-entry.json");
+    let index_entry_payload = match read_sandbox_index_entries() {
+        Ok(entries) => {
+            let entry = entries.iter().find(|entry| entry.id == manifest.id);
+            serde_json::json!({ "entry": entry })
+        }
+        Err(error) => serde_json::json!({ "index_read_error": error.to_string() }),
+    };
+    std::fs::write(
+        &index_entry_path,
+        serde_json::to_vec_pretty(&index_entry_payload)?,
+    )
+    .with_context(|| format!("failed writing {}", index_entry_path.display()))?;
+    artifacts.push("sandbox-index-entry.json".to_string());
+
+    Ok(status)
+}
+
+fn bundle_env_payload(manifest: &SandboxManifest) -> serde_json::Value {
+    let root = PathBuf::from(&manifest.paths.root);
+    serde_json::json!({
+        "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+        "env_mode": manifest.env_mode,
+        "bmux_bin": manifest.bmux_bin,
+        "command": manifest.command,
+        "paths": {
+            "root": manifest.paths.root,
+            "logs": manifest.paths.logs,
+            "runtime": manifest.paths.runtime,
+            "state": manifest.paths.state,
+            "config_home": root.join("config").to_string_lossy().to_string(),
+            "data_home": root.join("data").to_string_lossy().to_string(),
+            "home": root.join("home").to_string_lossy().to_string(),
+            "tmp": root.join("tmp").to_string_lossy().to_string(),
+        }
+    })
+}
+
+fn bundle_doctor_payload(target: &str) -> serde_json::Value {
+    let mut checks = Vec::new();
+    let temp_dir = std::env::temp_dir();
+    checks.push(DoctorCheck {
+        name: "temp_dir_writable".to_string(),
+        ok: std::fs::create_dir_all(&temp_dir).is_ok(),
+        detail: temp_dir.display().to_string(),
+    });
+
+    let current_exe = std::env::current_exe();
+    checks.push(DoctorCheck {
+        name: "current_bmux_executable".to_string(),
+        ok: current_exe.is_ok(),
+        detail: current_exe.ok().map_or_else(
+            || "unavailable".to_string(),
+            |path| path.display().to_string(),
+        ),
+    });
+
+    append_target_doctor_checks(&mut checks, target);
+    let ok = checks.iter().all(|check| check.ok);
+
+    serde_json::json!({
+        "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+        "ok": ok,
+        "checks": checks,
+    })
 }
 
 fn append_target_doctor_checks(checks: &mut Vec<DoctorCheck>, target: &str) {

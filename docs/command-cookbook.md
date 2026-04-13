@@ -84,6 +84,7 @@ bmux sandbox doctor --fix --json
 # Bundle diagnostics and logs for sharing
 bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
 bmux sandbox bundle bmux-sbx-123 --json
+bmux sandbox bundle bmux-sbx-123 --include-env --include-index-state --include-doctor --json
 
 # Clean up orphaned sandbox directories
 bmux sandbox cleanup --dry-run --json

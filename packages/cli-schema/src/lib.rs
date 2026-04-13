@@ -1283,6 +1283,15 @@ pub enum SandboxCommand {
         /// Optional output directory path (default: ./sandbox-bundles)
         #[arg(long)]
         output: Option<String>,
+        /// Include environment/context snapshot in bundle
+        #[arg(long)]
+        include_env: bool,
+        /// Include current sandbox index state in bundle
+        #[arg(long)]
+        include_index_state: bool,
+        /// Include doctor checks snapshot in bundle
+        #[arg(long)]
+        include_doctor: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -4460,6 +4469,9 @@ mod tests {
             "bmux-sbx-123",
             "--output",
             "./artifacts",
+            "--include-env",
+            "--include-index-state",
+            "--include-doctor",
             "--json",
         ])
         .expect("valid bundle args");
@@ -4471,6 +4483,9 @@ mod tests {
             SandboxCommand::Bundle {
                 sandbox: target,
                 output: Some(output),
+                include_env: true,
+                include_index_state: true,
+                include_doctor: true,
                 json: true,
             } if target == "bmux-sbx-123" && output == "./artifacts"
         ));

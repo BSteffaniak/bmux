@@ -341,12 +341,129 @@ fn sandbox_bundle_writes_manifest_logs_and_repro() {
         bundle_dir.join("repro.txt").exists(),
         "bundle should include repro command"
     );
+    assert!(
+        bundle_dir.join("bundle_manifest.json").exists(),
+        "bundle should include bundle manifest metadata"
+    );
 
     let repro =
         std::fs::read_to_string(bundle_dir.join("repro.txt")).expect("read bundled repro command");
     assert!(
         repro.contains("bmux sandbox run"),
         "repro command should include sandbox run"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_bundle_includes_optional_artifacts_when_requested() {
+    let sandbox = CommandSandbox::new("bundle-optional-artifacts");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--name",
+            "bundle-optional-source",
+            "--",
+            "no-such-command",
+        ])
+        .output()
+        .expect("run failed sandbox for optional bundle source");
+    assert!(
+        !run_output.status.success(),
+        "source sandbox should fail and be kept"
+    );
+    let run_json = parse_json_stdout(&run_output);
+    assert_schema_version(&run_json);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let bundle_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "bundle",
+            sandbox_id.as_str(),
+            "--include-env",
+            "--include-index-state",
+            "--include-doctor",
+            "--output",
+            sandbox
+                .root
+                .path()
+                .join("bundles")
+                .to_string_lossy()
+                .as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("bundle sandbox artifacts with optional files");
+    assert!(
+        bundle_output.status.success(),
+        "bundle should succeed; stderr={}; stdout={}",
+        String::from_utf8_lossy(&bundle_output.stderr),
+        String::from_utf8_lossy(&bundle_output.stdout)
+    );
+
+    let bundle_json = parse_json_stdout(&bundle_output);
+    assert_schema_version(&bundle_json);
+    let bundle_dir = PathBuf::from(
+        bundle_json["bundle_dir"]
+            .as_str()
+            .expect("bundle json should include bundle_dir"),
+    );
+
+    assert!(
+        bundle_dir.join("env.json").exists(),
+        "bundle should include env snapshot"
+    );
+    assert!(
+        bundle_dir.join("sandbox-index-entry.json").exists(),
+        "bundle should include index entry snapshot"
+    );
+    assert!(
+        bundle_dir.join("doctor.json").exists(),
+        "bundle should include doctor snapshot"
+    );
+
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir.join("bundle_manifest.json")).expect("read bundle metadata"),
+    )
+    .expect("parse bundle metadata");
+    assert_eq!(metadata["includes"]["env"].as_bool(), Some(true));
+    assert_eq!(metadata["includes"]["index_state"].as_bool(), Some(true));
+    assert_eq!(metadata["includes"]["doctor"].as_bool(), Some(true));
+
+    let artifact_metadata = metadata["artifact_metadata"]
+        .as_array()
+        .expect("bundle metadata should include artifact metadata");
+    let env_entry = artifact_metadata
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some("env.json"))
+        .expect("env metadata entry should exist");
+    assert_eq!(env_entry["kind"].as_str(), Some("file"));
+    assert_eq!(env_entry["exists"].as_bool(), Some(true));
+    assert!(
+        env_entry["bytes"].as_u64().is_some_and(|bytes| bytes > 0),
+        "env metadata should include file bytes"
+    );
+
+    let logs_entry = artifact_metadata
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some("logs/"))
+        .expect("logs metadata entry should exist");
+    assert_eq!(logs_entry["kind"].as_str(), Some("directory"));
+    assert_eq!(logs_entry["exists"].as_bool(), Some(true));
+    assert!(
+        logs_entry["file_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "logs metadata should include at least one file"
     );
 }
 
