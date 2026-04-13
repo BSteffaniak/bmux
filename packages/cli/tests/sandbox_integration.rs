@@ -469,6 +469,175 @@ fn sandbox_bundle_includes_optional_artifacts_when_requested() {
 
 #[test]
 #[serial]
+fn sandbox_verify_bundle_reports_ok_for_fresh_bundle() {
+    let sandbox = CommandSandbox::new("verify-bundle-ok");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--name",
+            "verify-bundle-source",
+            "--",
+            "no-such-command",
+        ])
+        .output()
+        .expect("run failed sandbox for verify-bundle source");
+    assert!(
+        !run_output.status.success(),
+        "source sandbox should fail and be kept"
+    );
+    let run_json = parse_json_stdout(&run_output);
+    assert_schema_version(&run_json);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let bundle_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "bundle",
+            sandbox_id.as_str(),
+            "--include-env",
+            "--include-index-state",
+            "--include-doctor",
+            "--output",
+            sandbox
+                .root
+                .path()
+                .join("bundles")
+                .to_string_lossy()
+                .as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("bundle sandbox artifacts for verify-bundle");
+    assert!(bundle_output.status.success(), "bundle should succeed");
+    let bundle_json = parse_json_stdout(&bundle_output);
+    assert_schema_version(&bundle_json);
+    let bundle_dir = bundle_json["bundle_dir"]
+        .as_str()
+        .expect("bundle json should include bundle_dir")
+        .to_string();
+
+    let verify_output = sandbox
+        .command()
+        .args(["sandbox", "verify-bundle", bundle_dir.as_str(), "--json"])
+        .output()
+        .expect("verify fresh bundle");
+    assert!(
+        verify_output.status.success(),
+        "verify-bundle should succeed for untouched bundle: {}",
+        String::from_utf8_lossy(&verify_output.stderr)
+    );
+
+    let verify_json = parse_json_stdout(&verify_output);
+    assert_schema_version(&verify_json);
+    assert_eq!(verify_json["ok"].as_bool(), Some(true));
+    assert_eq!(verify_json["mode"].as_str(), Some("strict_metadata"));
+    assert_eq!(verify_json["issue_count"].as_u64(), Some(0));
+}
+
+#[test]
+#[serial]
+fn sandbox_verify_bundle_detects_artifact_drift() {
+    let sandbox = CommandSandbox::new("verify-bundle-drift");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--name",
+            "verify-bundle-drift-source",
+            "--",
+            "no-such-command",
+        ])
+        .output()
+        .expect("run failed sandbox for verify-bundle drift source");
+    assert!(
+        !run_output.status.success(),
+        "source sandbox should fail and be kept"
+    );
+    let run_json = parse_json_stdout(&run_output);
+    assert_schema_version(&run_json);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let bundle_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "bundle",
+            sandbox_id.as_str(),
+            "--include-env",
+            "--output",
+            sandbox
+                .root
+                .path()
+                .join("bundles")
+                .to_string_lossy()
+                .as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("bundle sandbox artifacts for drift verification");
+    assert!(bundle_output.status.success(), "bundle should succeed");
+    let bundle_json = parse_json_stdout(&bundle_output);
+    assert_schema_version(&bundle_json);
+    let bundle_dir = PathBuf::from(
+        bundle_json["bundle_dir"]
+            .as_str()
+            .expect("bundle json should include bundle_dir"),
+    );
+
+    std::fs::remove_file(bundle_dir.join("env.json")).expect("remove env artifact for drift");
+
+    let verify_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "verify-bundle",
+            bundle_dir.to_string_lossy().as_ref(),
+            "--json",
+        ])
+        .output()
+        .expect("verify drifted bundle");
+    assert!(
+        !verify_output.status.success(),
+        "verify-bundle should fail when artifact drift is present"
+    );
+
+    let verify_json = parse_json_stdout(&verify_output);
+    assert_schema_version(&verify_json);
+    assert_eq!(verify_json["ok"].as_bool(), Some(false));
+    assert_eq!(verify_json["mode"].as_str(), Some("strict_metadata"));
+    assert!(
+        verify_json["issue_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "verify-bundle should report at least one issue"
+    );
+    let issues = verify_json["issues"]
+        .as_array()
+        .expect("issues should be an array");
+    assert!(
+        issues.iter().any(|issue| {
+            issue["path"].as_str() == Some("env.json") && issue["field"].as_str() == Some("exists")
+        }),
+        "issues should include missing env.json existence mismatch"
+    );
+}
+
+#[test]
+#[serial]
 fn sandbox_inspect_explicit_id_resolves_target_manifest() {
     let sandbox = CommandSandbox::new("inspect-explicit-id");
 

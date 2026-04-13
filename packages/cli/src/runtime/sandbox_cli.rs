@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bmux_cli_schema::SandboxEnvModeArg;
 use bmux_config::ConfigPaths;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -357,13 +357,29 @@ pub(super) struct BundleSandboxOptions<'a> {
     pub(super) json: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BundleArtifactMetadata {
     path: String,
     kind: String,
     bytes: u64,
     file_count: usize,
     exists: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BundleVerifyManifest {
+    #[serde(default)]
+    artifact_metadata: Vec<BundleArtifactMetadata>,
+    #[serde(default)]
+    artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BundleVerifyIssue {
+    path: String,
+    field: String,
+    expected: String,
+    actual: String,
 }
 
 pub(super) async fn run_sandbox_run(
@@ -1478,6 +1494,179 @@ pub(super) fn run_sandbox_bundle(options: &BundleSandboxOptions<'_>) -> Result<u
     }
 
     Ok(0)
+}
+
+pub(super) fn run_sandbox_verify_bundle(bundle_dir: &str, json: bool) -> Result<u8> {
+    let bundle_root = PathBuf::from(bundle_dir);
+    anyhow::ensure!(
+        bundle_root.is_dir(),
+        "sandbox bundle directory not found: {}",
+        bundle_root.display()
+    );
+
+    let bundle_manifest_path = bundle_root.join("bundle_manifest.json");
+    let manifest_bytes = std::fs::read(&bundle_manifest_path)
+        .with_context(|| format!("failed reading {}", bundle_manifest_path.display()))?;
+    let manifest: BundleVerifyManifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("failed parsing {}", bundle_manifest_path.display()))?;
+
+    let (mode, issues, checked_artifacts) = if manifest.artifact_metadata.is_empty() {
+        (
+            "existence_only",
+            verify_bundle_artifacts_existence(&bundle_root, &manifest.artifacts),
+            manifest.artifacts.len(),
+        )
+    } else {
+        (
+            "strict_metadata",
+            verify_bundle_artifacts_metadata(&bundle_root, &manifest.artifact_metadata),
+            manifest.artifact_metadata.len(),
+        )
+    };
+
+    let ok = issues.is_empty();
+    if json {
+        let payload = serde_json::json!({
+            "schema_version": SANDBOX_JSON_SCHEMA_VERSION,
+            "ok": ok,
+            "mode": mode,
+            "bundle_dir": bundle_root.to_string_lossy().to_string(),
+            "bundle_manifest": bundle_manifest_path.to_string_lossy().to_string(),
+            "checked_artifacts": checked_artifacts,
+            "issue_count": issues.len(),
+            "issues": issues,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "bundle verify: {}",
+            if ok { "ok" } else { "drift detected" }
+        );
+        println!("mode: {mode}");
+        println!("checked_artifacts: {checked_artifacts}");
+        if !issues.is_empty() {
+            println!("issues:");
+            for issue in &issues {
+                println!(
+                    "  path={} field={} expected={} actual={}",
+                    issue.path, issue.field, issue.expected, issue.actual
+                );
+            }
+        }
+    }
+
+    Ok(u8::from(!ok))
+}
+
+fn verify_bundle_artifacts_metadata(
+    bundle_root: &Path,
+    expected: &[BundleArtifactMetadata],
+) -> Vec<BundleVerifyIssue> {
+    let mut issues = Vec::new();
+    for expected_entry in expected {
+        let actual = bundle_artifact_metadata_for_expected(bundle_root, expected_entry);
+        if expected_entry.kind != actual.kind {
+            issues.push(BundleVerifyIssue {
+                path: expected_entry.path.clone(),
+                field: "kind".to_string(),
+                expected: expected_entry.kind.clone(),
+                actual: actual.kind,
+            });
+        }
+        if expected_entry.exists != actual.exists {
+            issues.push(BundleVerifyIssue {
+                path: expected_entry.path.clone(),
+                field: "exists".to_string(),
+                expected: expected_entry.exists.to_string(),
+                actual: actual.exists.to_string(),
+            });
+        }
+        if expected_entry.bytes != actual.bytes {
+            issues.push(BundleVerifyIssue {
+                path: expected_entry.path.clone(),
+                field: "bytes".to_string(),
+                expected: expected_entry.bytes.to_string(),
+                actual: actual.bytes.to_string(),
+            });
+        }
+        if expected_entry.file_count != actual.file_count {
+            issues.push(BundleVerifyIssue {
+                path: expected_entry.path.clone(),
+                field: "file_count".to_string(),
+                expected: expected_entry.file_count.to_string(),
+                actual: actual.file_count.to_string(),
+            });
+        }
+    }
+
+    issues
+}
+
+fn verify_bundle_artifacts_existence(
+    bundle_root: &Path,
+    artifacts: &[String],
+) -> Vec<BundleVerifyIssue> {
+    let mut issues = Vec::new();
+    for artifact in artifacts {
+        let expected_kind = if artifact.ends_with('/') {
+            "directory"
+        } else {
+            "file"
+        };
+        let expected = BundleArtifactMetadata {
+            path: artifact.clone(),
+            kind: expected_kind.to_string(),
+            bytes: 0,
+            file_count: 0,
+            exists: true,
+        };
+        let actual = bundle_artifact_metadata_for_expected(bundle_root, &expected);
+        if !actual.exists {
+            issues.push(BundleVerifyIssue {
+                path: artifact.clone(),
+                field: "exists".to_string(),
+                expected: "true".to_string(),
+                actual: "false".to_string(),
+            });
+        }
+        if actual.kind != expected_kind {
+            issues.push(BundleVerifyIssue {
+                path: artifact.clone(),
+                field: "kind".to_string(),
+                expected: expected_kind.to_string(),
+                actual: actual.kind,
+            });
+        }
+    }
+
+    issues
+}
+
+fn bundle_artifact_metadata_for_expected(
+    bundle_root: &Path,
+    expected: &BundleArtifactMetadata,
+) -> BundleArtifactMetadata {
+    let relative = expected.path.trim_end_matches('/');
+    let path = bundle_root.join(relative);
+    if expected.kind == "directory" {
+        let (bytes, file_count, exists) = directory_stats(&path);
+        return BundleArtifactMetadata {
+            path: expected.path.clone(),
+            kind: "directory".to_string(),
+            bytes,
+            file_count,
+            exists,
+        };
+    }
+
+    let (bytes, exists) = file_bytes(&path);
+    BundleArtifactMetadata {
+        path: expected.path.clone(),
+        kind: "file".to_string(),
+        bytes,
+        file_count: usize::from(exists),
+        exists,
+    }
 }
 
 fn write_bundle_core_artifacts(

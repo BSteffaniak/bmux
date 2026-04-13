@@ -1296,6 +1296,14 @@ pub enum SandboxCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Verify a sandbox bundle against its recorded metadata
+    VerifyBundle {
+        /// Bundle directory path
+        bundle_dir: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Clean up sandbox temp directories from sandbox runs
     Cleanup {
         /// Only list orphaned dirs without deleting
@@ -4519,6 +4527,26 @@ mod tests {
                 source: Some(SandboxSourceArg::RecordingVerify),
                 json: true,
             }
+        ));
+    }
+
+    #[test]
+    fn parses_sandbox_verify_bundle() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "sandbox",
+            "verify-bundle",
+            "./sandbox-bundles/bmux-sbx-123-456",
+            "--json",
+        ])
+        .expect("valid verify-bundle args");
+        let Some(Command::Sandbox { command }) = cli.command else {
+            panic!("expected sandbox command");
+        };
+        assert!(matches!(
+            command,
+            SandboxCommand::VerifyBundle { bundle_dir, json: true }
+                if bundle_dir == "./sandbox-bundles/bmux-sbx-123-456"
         ));
     }
 
