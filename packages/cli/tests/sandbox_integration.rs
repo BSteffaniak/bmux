@@ -1826,3 +1826,128 @@ fn sandbox_triage_rerun_executes_manifest_command() {
         "triage rerun output should include rerun exit code: {stdout}"
     );
 }
+
+#[test]
+#[serial]
+fn sandbox_inspect_rejects_ambiguous_prefix_target() {
+    let sandbox = CommandSandbox::new("inspect-ambiguous-prefix");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-ambiguous-one", "sandbox-cli", "failed");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-ambiguous-two", "sandbox-cli", "failed");
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "inspect", "bmux-sbx-ambiguous", "--json"])
+        .output()
+        .expect("run sandbox inspect with ambiguous prefix");
+    assert!(
+        !output.status.success(),
+        "sandbox inspect should fail for ambiguous prefix"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is ambiguous"),
+        "error should mention ambiguity: {stderr}"
+    );
+    assert!(
+        stderr.contains("bmux-sbx-ambiguous-one") && stderr.contains("bmux-sbx-ambiguous-two"),
+        "error should include matching ids: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_inspect_not_found_suggests_similar_target() {
+    let sandbox = CommandSandbox::new("inspect-similar-suggest");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-suggest-target",
+        "sandbox-cli",
+        "failed",
+    );
+
+    let output = sandbox
+        .command()
+        .args(["sandbox", "inspect", "suggest-target", "--json"])
+        .output()
+        .expect("run sandbox inspect with near-miss target");
+    assert!(
+        !output.status.success(),
+        "sandbox inspect should fail for unknown target"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("did you mean") && stderr.contains("bmux-sbx-suggest-target"),
+        "error should suggest a similar sandbox id: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_latest_source_error_lists_available_sources() {
+    let sandbox = CommandSandbox::new("latest-source-hint");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(&tmp_root, "bmux-sbx-playbook-only", "playbook", "failed");
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "inspect",
+            "--latest",
+            "--source",
+            "recording-verify",
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox inspect latest by missing source");
+    assert!(
+        !output.status.success(),
+        "sandbox inspect should fail for missing source"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("available sources: playbook"),
+        "error should list available sources: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_latest_failed_source_error_suggests_latest() {
+    let sandbox = CommandSandbox::new("latest-failed-source-hint");
+    let tmp_root = sandbox.root.path().join("tmp-root");
+    create_manifest_sandbox(
+        &tmp_root,
+        "bmux-sbx-playbook-stopped",
+        "playbook",
+        "stopped",
+    );
+
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "inspect",
+            "--latest-failed",
+            "--source",
+            "playbook",
+            "--json",
+        ])
+        .output()
+        .expect("run sandbox inspect latest-failed by source without failures");
+    assert!(
+        !output.status.success(),
+        "sandbox inspect should fail when source has no failed sandboxes"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("try --latest --source playbook"),
+        "error should suggest source-scoped latest helper: {stderr}"
+    );
+}

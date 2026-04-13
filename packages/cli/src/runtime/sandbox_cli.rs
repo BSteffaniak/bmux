@@ -1190,12 +1190,15 @@ fn resolve_latest_sandbox(
     let mut sorted = candidates.to_vec();
     sorted.sort_by_key(|candidate| std::cmp::Reverse(candidate_sort_key(candidate)));
 
+    let mut source_total = 0usize;
+
     for candidate in sorted {
         let path = candidate.root;
-        if let Some(source) = source_filter
-            && sandbox_source_for_dir(&path) != source
-        {
-            continue;
+        if let Some(source) = source_filter {
+            if sandbox_source_for_dir(&path) != source {
+                continue;
+            }
+            source_total += 1;
         }
         if !failed_only || matches!(sandbox_status_for_dir(&path), "failed") {
             return Ok(path);
@@ -1203,8 +1206,19 @@ fn resolve_latest_sandbox(
     }
 
     if let Some(source) = source_filter {
+        let known_sources = format_known_sources(candidates);
+        if source_total == 0 {
+            if known_sources.is_empty() {
+                anyhow::bail!("no sandboxes found for source {source}");
+            }
+            anyhow::bail!(
+                "no sandboxes found for source {source}; available sources: {known_sources}"
+            );
+        }
         if failed_only {
-            anyhow::bail!("no failed sandboxes found for source {source}");
+            anyhow::bail!(
+                "no failed sandboxes found for source {source}; try --latest --source {source}"
+            );
         }
         anyhow::bail!("no sandboxes found for source {source}");
     }
@@ -2061,14 +2075,62 @@ fn resolve_sandbox_target(target: &str) -> Result<PathBuf> {
         return Ok(direct);
     }
 
-    if let Some(found) = collect_sandbox_directories_index_first()
+    let directories = collect_sandbox_directories_index_first();
+
+    if let Some(found) = directories
         .iter()
-        .find(|candidate| sandbox_id_from_root_meta(candidate).starts_with(target))
+        .find(|candidate| sandbox_id_from_root_meta(candidate) == target)
     {
         return Ok(found.clone());
     }
 
-    anyhow::bail!("sandbox target not found: {target}")
+    let prefix_matches = directories
+        .iter()
+        .filter_map(|candidate| {
+            let id = sandbox_id_from_root_meta(candidate);
+            id.starts_with(target).then(|| (candidate.clone(), id))
+        })
+        .collect::<Vec<_>>();
+
+    if prefix_matches.len() == 1 {
+        return Ok(prefix_matches[0].0.clone());
+    }
+    if prefix_matches.len() > 1 {
+        let suggestions = prefix_matches
+            .into_iter()
+            .map(|(_, id)| id)
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "sandbox target '{target}' is ambiguous; matches: {suggestions}; use a full id or absolute path"
+        );
+    }
+
+    let suggestions = directories
+        .iter()
+        .map(|candidate| sandbox_id_from_root_meta(candidate))
+        .filter(|id| id.contains(target))
+        .take(5)
+        .collect::<Vec<_>>();
+
+    if suggestions.is_empty() {
+        anyhow::bail!("sandbox target not found: {target}");
+    }
+    anyhow::bail!(
+        "sandbox target not found: {target}; did you mean: {}",
+        suggestions.join(", ")
+    )
+}
+
+fn format_known_sources(candidates: &[SandboxCandidate]) -> String {
+    let mut known = candidates
+        .iter()
+        .map(|candidate| sandbox_source_for_dir(&candidate.root))
+        .collect::<Vec<_>>();
+    known.sort_unstable();
+    known.dedup();
+    known.join(", ")
 }
 
 fn read_log_tail(root: &Path, tail: usize) -> Vec<String> {

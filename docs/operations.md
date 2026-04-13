@@ -77,6 +77,8 @@ Troubleshooting notes:
 
 - `latest_log: null` in JSON means no log file exists yet in that sandbox `logs/` dir.
 - `* target required` errors mean no explicit target or selector was provided; use `<id|path>`, `--latest`, or `--latest-failed`.
+- `sandbox target '<id>' is ambiguous` means your prefix matches multiple runs; use a full id from `bmux sandbox list --limit 20`.
+- `sandbox target not found ... did you mean: ...` gives nearby id hints when the target is close but not exact.
 - `sandbox manifest '<id>' has no command to rerun` means the manifest command array is empty; inspect manifest integrity or rerun from a different target.
 - If stale `running`/lock metadata appears, run `bmux sandbox doctor --fix --dry-run --json` first, then apply with `--fix`.
 
