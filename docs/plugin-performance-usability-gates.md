@@ -72,6 +72,10 @@ For repeated-run variance analysis (informational):
 
 - `./scripts/perf-plugin-variance.sh --runs 3 --iterations 8 --warmup 2`
 
+For variance policy evaluation (warn-only by default):
+
+- `./scripts/perf-variance-policy-check.sh --report-dir <compare-report-dir> --policy-file docs/perf-baselines/variance-policy.json --mode warn`
+
 ### 5) Plugin runtime command matrix SLO
 
 `scripts/perf-plugin-runtime-matrix.sh` enforces per-scenario p95/p99 SLOs:

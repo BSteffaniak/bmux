@@ -1,0 +1,17 @@
+{
+  "mode": "warn",
+  "notes": "Start informational-only. Promote to soft-fail after observing stable signal in CI.",
+  "enforced_metrics": [
+    "steady_p95_ms",
+    "steady_p99_ms",
+    "p95_ms",
+    "p99_ms"
+  ],
+  "regression_statuses": [
+    "WARN"
+  ],
+  "regression_variance": [
+    "likely_regression",
+    "likely_regression_with_variance"
+  ]
+}

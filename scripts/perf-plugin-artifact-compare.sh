@@ -7,6 +7,7 @@ BASELINE_DIR=""
 CANDIDATE_DIR=""
 WARN_REGRESSION_MS="10"
 EXTRA_CANDIDATE_DIRS=()
+REPORT_DIR=""
 
 usage() {
 	cat <<'USAGE'
@@ -20,6 +21,7 @@ Options:
   --candidate-dir DIR       Candidate JSON directory
   --warn-regression-ms N    Mark WARN when metric regresses by more than N ms (default: 10)
   --extra-candidate-dir DIR Additional candidate directory for variance comparisons (repeatable)
+  --report-dir DIR          Write per-scenario compare report JSON files
   --bmux-perf-tools-bin PATH  Explicit bmux-perf-tools binary
   -h, --help                Show this help message
 USAGE
@@ -51,6 +53,10 @@ parse_args() {
 			;;
 		--extra-candidate-dir)
 			EXTRA_CANDIDATE_DIRS+=("$2")
+			shift 2
+			;;
+		--report-dir)
+			REPORT_DIR="$2"
 			shift 2
 			;;
 		--bmux-perf-tools-bin)
@@ -100,6 +106,10 @@ echo "perf artifact compare: baseline=$BASELINE_DIR candidate=$CANDIDATE_DIR"
 if [[ ${#EXTRA_CANDIDATE_DIRS[@]} -gt 0 ]]; then
 	echo "additional candidate dirs: ${EXTRA_CANDIDATE_DIRS[*]}"
 fi
+if [[ -n "$REPORT_DIR" ]]; then
+	mkdir -p "$REPORT_DIR"
+	echo "compare report dir: $REPORT_DIR"
+fi
 
 shopt -s nullglob
 for candidate in "$CANDIDATE_DIR"/*.json; do
@@ -129,6 +139,9 @@ for candidate in "$CANDIDATE_DIR"/*.json; do
 			echo "note: no extra candidate file at $extra_candidate"
 		fi
 	done
+	if [[ -n "$REPORT_DIR" ]]; then
+		compare_cmd+=(--json-output "$REPORT_DIR/$name")
+	fi
 	"${compare_cmd[@]}"
 done
 

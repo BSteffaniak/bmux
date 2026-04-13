@@ -64,6 +64,17 @@ The compare output includes per-metric:
 - `status` (`OK`, `IMPROVED`, `SPIKE`, `WARN`)
 - `variance` classification (`stable`, `likely_noise`, `likely_regression`, `likely_regression_with_variance`)
 
+To evaluate compare output against policy (warn-only by default):
+
+```bash
+./scripts/perf-variance-policy-check.sh \
+  --report-dir /tmp/bmux-compare-reports \
+  --policy-file docs/perf-baselines/variance-policy.json \
+  --mode warn
+```
+
+Use `--mode soft-fail` to trial enforcement locally before promoting CI behavior.
+
 ## 4) Baseline Update Policy
 
 Refresh baselines only when behavior is intentionally changed or improved.

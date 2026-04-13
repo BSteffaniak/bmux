@@ -306,19 +306,32 @@ jobs:
         if: ${{ steps.changes.outputs.run == 'true' }}
         shell: bash
         run: |
+          mkdir -p "$RUNNER_TEMP/plugin-perf-artifacts/compare"
           ./scripts/perf-plugin-artifact-compare.sh \
             --candidate-dir "$RUNNER_TEMP/plugin-perf-artifacts" \
             --baseline-dir "docs/perf-baselines" \
+            --report-dir "$RUNNER_TEMP/plugin-perf-artifacts/compare/top-level" \
             --warn-regression-ms 20
           ./scripts/perf-plugin-artifact-compare.sh \
             --candidate-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix" \
             --baseline-dir "docs/perf-baselines/runtime-matrix" \
             --extra-candidate-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-variance-2" \
+            --report-dir "$RUNNER_TEMP/plugin-perf-artifacts/compare/runtime-matrix" \
             --warn-regression-ms 20
           ./scripts/perf-plugin-artifact-compare.sh \
             --candidate-dir "$RUNNER_TEMP/plugin-perf-artifacts/runtime-matrix-scale" \
             --baseline-dir "docs/perf-baselines/runtime-matrix-scale" \
+            --report-dir "$RUNNER_TEMP/plugin-perf-artifacts/compare/runtime-matrix-scale" \
             --warn-regression-ms 30
+
+      - name: Plugin variance policy check (warn-only)
+        if: ${{ steps.changes.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          ./scripts/perf-variance-policy-check.sh \
+            --report-dir "$RUNNER_TEMP/plugin-perf-artifacts/compare/runtime-matrix" \
+            --policy-file "docs/perf-baselines/variance-policy.json" \
+            --mode warn
 
       - name: Upload plugin perf artifacts
         if: ${{ steps.changes.outputs.run == 'true' }}
@@ -331,6 +344,7 @@ jobs:
             ${{ runner.temp }}/plugin-perf-artifacts/runtime-matrix
             ${{ runner.temp }}/plugin-perf-artifacts/runtime-matrix-variance-2
             ${{ runner.temp }}/plugin-perf-artifacts/runtime-matrix-scale
+            ${{ runner.temp }}/plugin-perf-artifacts/compare
           if-no-files-found: error
 
       - name: Skip message when unchanged

@@ -42,7 +42,7 @@ fn usage() -> &'static str {
   report-faults --input PATH [--max-runtime-retries N] [--max-runtime-respawns N] [--max-runtime-timeouts N]
   report-json --input PATH --output PATH [threshold flags]
   prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
-  compare-report --baseline PATH --candidate PATH [--candidate PATH ...] [--warn-regression-ms N]
+  compare-report --baseline PATH --candidate PATH [--candidate PATH ...] [--warn-regression-ms N] [--json-output PATH]
   discover-run-candidate --bmux-bin PATH"
 }
 
@@ -665,6 +665,7 @@ fn run_compare_report(args: Vec<String>) -> Result<(), String> {
     let mut baseline = None;
     let mut candidates = Vec::new();
     let mut warn_regression_ms = 10.0_f64;
+    let mut json_output = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -690,6 +691,13 @@ fn run_compare_report(args: Vec<String>) -> Result<(), String> {
                 warn_regression_ms = parse_u64(value, "--warn-regression-ms")? as f64;
                 index += 2;
             }
+            "--json-output" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--json-output requires a value".to_string());
+                };
+                json_output = Some(value.clone());
+                index += 2;
+            }
             other => return Err(format!("unknown argument for compare-report: {other}")),
         }
     }
@@ -708,42 +716,44 @@ fn run_compare_report(args: Vec<String>) -> Result<(), String> {
         candidate_summaries.push(parse_report_latency_summary(&candidate_json)?);
     }
 
-    print_compare_summary(
-        "startup_ms",
-        baseline_latency.startup_ms,
-        candidate_summaries
-            .iter()
-            .map(|summary| summary.startup_ms)
-            .collect(),
-        warn_regression_ms,
-    );
-    print_compare_summary(
-        "p95_ms",
-        baseline_latency.p95_ms,
-        candidate_summaries
-            .iter()
-            .map(|summary| summary.p95_ms)
-            .collect(),
-        warn_regression_ms,
-    );
-    print_compare_summary(
-        "p99_ms",
-        baseline_latency.p99_ms,
-        candidate_summaries
-            .iter()
-            .map(|summary| summary.p99_ms)
-            .collect(),
-        warn_regression_ms,
-    );
-    print_compare_summary(
-        "avg_ms",
-        baseline_latency.avg_ms,
-        candidate_summaries
-            .iter()
-            .map(|summary| summary.avg_ms)
-            .collect(),
-        warn_regression_ms,
-    );
+    let mut metric_summaries = vec![
+        print_compare_summary(
+            "startup_ms",
+            baseline_latency.startup_ms,
+            candidate_summaries
+                .iter()
+                .map(|summary| summary.startup_ms)
+                .collect(),
+            warn_regression_ms,
+        ),
+        print_compare_summary(
+            "p95_ms",
+            baseline_latency.p95_ms,
+            candidate_summaries
+                .iter()
+                .map(|summary| summary.p95_ms)
+                .collect(),
+            warn_regression_ms,
+        ),
+        print_compare_summary(
+            "p99_ms",
+            baseline_latency.p99_ms,
+            candidate_summaries
+                .iter()
+                .map(|summary| summary.p99_ms)
+                .collect(),
+            warn_regression_ms,
+        ),
+        print_compare_summary(
+            "avg_ms",
+            baseline_latency.avg_ms,
+            candidate_summaries
+                .iter()
+                .map(|summary| summary.avg_ms)
+                .collect(),
+            warn_regression_ms,
+        ),
+    ];
 
     if let Some(steady_p95) = baseline_latency.steady_p95_ms {
         if candidate_summaries
@@ -754,12 +764,12 @@ fn run_compare_report(args: Vec<String>) -> Result<(), String> {
                 .iter()
                 .filter_map(|summary| summary.steady_p95_ms)
                 .collect::<Vec<_>>();
-            print_compare_summary(
+            metric_summaries.push(print_compare_summary(
                 "steady_p95_ms",
                 steady_p95,
                 steady_candidates,
                 warn_regression_ms,
-            );
+            ));
         } else {
             println!(
                 "compare steady_p95_ms skipped: one or more candidates missing steady_state_ms.p95"
@@ -776,12 +786,12 @@ fn run_compare_report(args: Vec<String>) -> Result<(), String> {
                 .iter()
                 .filter_map(|summary| summary.steady_p99_ms)
                 .collect::<Vec<_>>();
-            print_compare_summary(
+            metric_summaries.push(print_compare_summary(
                 "steady_p99_ms",
                 steady_p99,
                 steady_candidates,
                 warn_regression_ms,
-            );
+            ));
         } else {
             println!(
                 "compare steady_p99_ms skipped: one or more candidates missing steady_state_ms.p99"
@@ -798,17 +808,41 @@ fn run_compare_report(args: Vec<String>) -> Result<(), String> {
                 .iter()
                 .filter_map(|summary| summary.steady_avg_ms)
                 .collect::<Vec<_>>();
-            print_compare_summary(
+            metric_summaries.push(print_compare_summary(
                 "steady_avg_ms",
                 steady_avg,
                 steady_candidates,
                 warn_regression_ms,
-            );
+            ));
         } else {
             println!(
                 "compare steady_avg_ms skipped: one or more candidates missing steady_state_ms.avg"
             );
         }
+    }
+
+    if let Some(output_path) = json_output {
+        let report = json!({
+            "baseline": baseline,
+            "candidate_count": candidates.len(),
+            "warn_regression_ms": warn_regression_ms,
+            "metrics": metric_summaries.iter().map(CompareMetricSummary::to_json).collect::<Vec<_>>(),
+        });
+        if let Some(parent) = Path::new(&output_path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed creating compare report parent {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        let encoded = serde_json::to_string_pretty(&report)
+            .map_err(|error| format!("failed encoding compare report json: {error}"))?;
+        fs::write(&output_path, encoded).map_err(|error| {
+            format!("failed writing compare report json {output_path}: {error}")
+        })?;
     }
 
     Ok(())
@@ -1047,17 +1081,9 @@ fn print_compare_summary(
     baseline: f64,
     candidates: Vec<f64>,
     warn_regression_ms: f64,
-) {
+) -> CompareMetricSummary {
     let stats = compare_delta_stats(baseline, &candidates);
-    let status = if stats.median > warn_regression_ms {
-        "WARN"
-    } else if stats.max > warn_regression_ms {
-        "SPIKE"
-    } else if stats.median < 0.0 {
-        "IMPROVED"
-    } else {
-        "OK"
-    };
+    let status = compare_status(stats, warn_regression_ms);
     let variance = classify_variance(stats, warn_regression_ms);
     println!(
         "compare {label} baseline={baseline:.3} runs={} delta_median={:+.3} delta_mean={:+.3} delta_min={:+.3} delta_max={:+.3} delta_stddev={:.3} status={status} variance={variance}",
@@ -1068,6 +1094,50 @@ fn print_compare_summary(
         stats.max,
         stats.stddev,
     );
+
+    CompareMetricSummary {
+        label: label.to_string(),
+        baseline,
+        runs: candidates.len(),
+        delta_median: stats.median,
+        delta_mean: stats.mean,
+        delta_min: stats.min,
+        delta_max: stats.max,
+        delta_stddev: stats.stddev,
+        status,
+        variance: variance.to_string(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompareMetricSummary {
+    label: String,
+    baseline: f64,
+    runs: usize,
+    delta_median: f64,
+    delta_mean: f64,
+    delta_min: f64,
+    delta_max: f64,
+    delta_stddev: f64,
+    status: &'static str,
+    variance: String,
+}
+
+impl CompareMetricSummary {
+    fn to_json(&self) -> Value {
+        json!({
+            "label": self.label,
+            "baseline": self.baseline,
+            "runs": self.runs,
+            "delta_median": self.delta_median,
+            "delta_mean": self.delta_mean,
+            "delta_min": self.delta_min,
+            "delta_max": self.delta_max,
+            "delta_stddev": self.delta_stddev,
+            "status": self.status,
+            "variance": self.variance,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1125,6 +1195,18 @@ fn classify_variance(stats: DeltaStats, warn_regression_ms: f64) -> &'static str
         "likely_noise"
     } else {
         "stable"
+    }
+}
+
+fn compare_status(stats: DeltaStats, warn_regression_ms: f64) -> &'static str {
+    if stats.median > warn_regression_ms {
+        "WARN"
+    } else if stats.max > warn_regression_ms {
+        "SPIKE"
+    } else if stats.median < 0.0 {
+        "IMPROVED"
+    } else {
+        "OK"
     }
 }
 
