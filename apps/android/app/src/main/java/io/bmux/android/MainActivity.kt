@@ -40,6 +40,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import io.bmux.android.terminal.TerminalEndpoint
+import io.bmux.android.terminal.TerminalChunkFrame
+import io.bmux.android.terminal.TerminalChunkType
 import io.bmux.android.terminal.TerminalSessionScreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -48,6 +50,7 @@ import uniffi.bmux_mobile_ffi.ConnectionStateFfi
 import uniffi.bmux_mobile_ffi.ConnectionStatusFfi
 import uniffi.bmux_mobile_ffi.HostKeyPinSuggestionFfi
 import uniffi.bmux_mobile_ffi.MobileApiFfi
+import uniffi.bmux_mobile_ffi.TerminalChunkKindFfi
 import uniffi.bmux_mobile_ffi.TerminalOpenRequestFfi
 import uniffi.bmux_mobile_ffi.TerminalSizeFfi
 import uniffi.bmux_mobile_ffi.TargetRecordFfi
@@ -232,7 +235,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return gateway.openTerminal(targetId, session, rows, cols)
     }
 
-    fun pollTerminalOutput(terminalId: String, maxChunks: Int): Result<List<ByteArray>> {
+    fun pollTerminalOutput(terminalId: String, maxChunks: Int): Result<List<TerminalChunkFrame>> {
         return gateway.pollTerminalOutput(terminalId, maxChunks)
     }
 
@@ -414,12 +417,21 @@ private class MobileGateway(application: Application) {
         }
     }
 
-    fun pollTerminalOutput(terminalId: String, maxChunks: Int): Result<List<ByteArray>> {
+    fun pollTerminalOutput(terminalId: String, maxChunks: Int): Result<List<TerminalChunkFrame>> {
         val client = ffi ?: return Result.failure(
             IllegalStateException("FFI terminal stream unavailable"),
         )
         return runCatching {
-            client.pollTerminalOutput(terminalId, maxChunks.toUInt()).map { it.bytes }
+            client.pollTerminalOutput(terminalId, maxChunks.toUInt()).map { chunk ->
+                TerminalChunkFrame(
+                    kind = when (chunk.kind) {
+                        TerminalChunkKindFfi.STDOUT -> TerminalChunkType.STDOUT
+                        TerminalChunkKindFfi.STDERR -> TerminalChunkType.STDERR
+                        TerminalChunkKindFfi.STATUS -> TerminalChunkType.STATUS
+                    },
+                    bytes = chunk.bytes,
+                )
+            }
         }
     }
 

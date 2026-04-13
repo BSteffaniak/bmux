@@ -19,6 +19,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -33,7 +34,7 @@ fun TerminalSessionScreen(
     session: String?,
     onBack: () -> Unit,
     openTerminal: suspend (targetId: String, session: String?, rows: Int, cols: Int) -> Result<String>,
-    pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<ByteArray>>,
+    pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<TerminalChunkFrame>>,
     writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
     resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
     closeTerminal: suspend (terminalId: String) -> Result<Unit>,
@@ -51,12 +52,18 @@ fun TerminalSessionScreen(
 
     var connection by remember(endpoint.id) { mutableStateOf<TerminalTransportConnection?>(null) }
     var warning by remember(endpoint.id) { mutableStateOf<String?>(null) }
+    var statusLine by remember(endpoint.id) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(endpoint.id, session) {
         warning = null
         connection = null
         runCatching {
-            transport.open(endpoint, session) { bytes -> renderer.appendOutput(bytes) }
+            transport.open(
+                endpoint = endpoint,
+                session = session,
+                sink = { bytes -> renderer.appendOutput(bytes) },
+                onStatus = { statusLine = it },
+            )
         }.onSuccess {
             connection = it
             renderer.setOnInput(it::send)
@@ -95,6 +102,9 @@ fun TerminalSessionScreen(
         warning?.let {
             Text(it, color = MaterialTheme.colorScheme.error)
         }
+        statusLine?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall)
+        }
 
         renderer.Render(
             modifier = Modifier
@@ -106,7 +116,7 @@ fun TerminalSessionScreen(
 
 private class CoreTerminalTransport(
     private val openTerminal: suspend (targetId: String, session: String?, rows: Int, cols: Int) -> Result<String>,
-    private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<ByteArray>>,
+    private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<TerminalChunkFrame>>,
     private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
     private val resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
     private val closeTerminal: suspend (terminalId: String) -> Result<Unit>,
@@ -115,6 +125,7 @@ private class CoreTerminalTransport(
         endpoint: TerminalEndpoint,
         session: String?,
         sink: (ByteArray) -> Unit,
+        onStatus: (String) -> Unit,
     ): TerminalTransportConnection {
         val terminalId = openTerminal(endpoint.id, session, DEFAULT_ROWS, DEFAULT_COLS)
             .getOrElse { error ->
@@ -124,6 +135,7 @@ private class CoreTerminalTransport(
         return CoreTerminalTransportConnection(
             terminalId = terminalId,
             sink = sink,
+            onStatus = onStatus,
             pollTerminalOutput = pollTerminalOutput,
             writeTerminalInput = writeTerminalInput,
             resizeTerminal = resizeTerminal,
@@ -140,7 +152,8 @@ private class CoreTerminalTransport(
 private class CoreTerminalTransportConnection(
     private val terminalId: String,
     private val sink: (ByteArray) -> Unit,
-    private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<ByteArray>>,
+    private val onStatus: (String) -> Unit,
+    private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<TerminalChunkFrame>>,
     private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
     private val resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
     private val closeTerminal: suspend (terminalId: String) -> Result<Unit>,
@@ -161,7 +174,17 @@ private class CoreTerminalTransportConnection(
                     continue
                 }
                 for (chunk in chunks) {
-                    sink(chunk)
+                    when (chunk.kind) {
+                        TerminalChunkType.STDOUT,
+                        TerminalChunkType.STDERR,
+                        -> sink(chunk.bytes)
+                        TerminalChunkType.STATUS -> {
+                            val message = chunk.bytes.toString(StandardCharsets.UTF_8).trim()
+                            if (message.isNotEmpty()) {
+                                onStatus(message)
+                            }
+                        }
+                    }
                 }
             }
         }

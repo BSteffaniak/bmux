@@ -9,6 +9,17 @@ data class TerminalEndpoint(
     val canonicalTarget: String,
 )
 
+enum class TerminalChunkType {
+    STDOUT,
+    STDERR,
+    STATUS,
+}
+
+data class TerminalChunkFrame(
+    val kind: TerminalChunkType,
+    val bytes: ByteArray,
+)
+
 interface TerminalTransportConnection {
     fun send(data: ByteArray)
     fun resize(rows: Int, cols: Int)
@@ -20,6 +31,7 @@ interface TerminalTransport {
         endpoint: TerminalEndpoint,
         session: String?,
         sink: (ByteArray) -> Unit,
+        onStatus: (String) -> Unit,
     ): TerminalTransportConnection
 }
 
