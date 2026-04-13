@@ -1,4 +1,7 @@
 import org.gradle.internal.os.OperatingSystem
+import java.io.ByteArrayOutputStream
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
 plugins {
     base
@@ -88,4 +91,59 @@ tasks.register("packageInternalAlpha") {
     description = "Builds internal alpha APK with generated UniFFI bindings"
     dependsOn("generateUniffiKotlinBindings")
     dependsOn(":app:assembleAlpha")
+}
+
+tasks.register("collectAlphaLogs") {
+    group = "bmux"
+    description = "Collects BmuxAlpha adb log lines into a timestamped file"
+
+    doLast {
+        val stdout = ByteArrayOutputStream()
+        val stderr = ByteArrayOutputStream()
+
+        val adbCandidates = listOfNotNull(
+            System.getenv("ANDROID_SDK_ROOT")?.let { "$it/platform-tools/adb" },
+            System.getenv("ANDROID_HOME")?.let { "$it/platform-tools/adb" },
+            "${System.getProperty("user.home")}/Library/Android/sdk/platform-tools/adb",
+            "adb",
+        )
+        val adbCommand = adbCandidates.firstOrNull { candidate ->
+            candidate == "adb" || file(candidate).exists()
+        } ?: "adb"
+
+        val process = ProcessBuilder(adbCommand, "logcat", "-d")
+            .directory(workspaceRoot)
+            .start()
+        stdout.write(process.inputStream.readBytes())
+        stderr.write(process.errorStream.readBytes())
+        val exitValue = process.waitFor()
+
+        if (exitValue != 0) {
+            val errorText = stderr.toString().ifBlank { stdout.toString() }
+            throw GradleException(
+                "Failed to read adb logcat output. Is an emulator/device attached?\n$errorText",
+            )
+        }
+
+        val filtered = stdout
+            .toString()
+            .lineSequence()
+            .filter { it.contains("BmuxAlpha") }
+            .joinToString(separator = System.lineSeparator())
+
+        val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
+        val logsDir = layout.projectDirectory.dir("logs/alpha").asFile
+        logsDir.mkdirs()
+        val outputFile = logsDir.resolve("bmux-alpha-$timestamp.log")
+
+        outputFile.writeText(
+            if (filtered.isBlank()) {
+                "No BmuxAlpha lines found in adb logcat output."
+            } else {
+                filtered
+            } + System.lineSeparator(),
+        )
+
+        logger.lifecycle("Wrote alpha logs to ${outputFile.absolutePath}")
+    }
 }

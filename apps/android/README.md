@@ -30,6 +30,7 @@ From `apps/android`:
 
 1. `./gradlew generateUniffiKotlinBindings`
 2. `./gradlew packageInternalAlpha`
+3. `./gradlew collectAlphaLogs`
 
 The task will:
 
@@ -66,3 +67,7 @@ See:
 - `docs/mobile-m0-architecture.md`
 - `docs/mobile-ffi-contract.md`
 - `apps/android/docs/internal-alpha-checklist.md`
+
+`collectAlphaLogs` writes filtered alpha telemetry logs to:
+
+- `apps/android/logs/alpha/bmux-alpha-<timestamp>.log`

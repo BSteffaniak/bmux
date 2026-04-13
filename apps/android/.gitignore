@@ -5,3 +5,4 @@ app/src/main/java/uniffi/
 app/build/
 .kotlin/
 local.properties
+logs/alpha/
