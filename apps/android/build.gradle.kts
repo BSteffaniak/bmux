@@ -5,7 +5,7 @@ plugins {
 }
 
 val workspaceRoot = layout.projectDirectory.dir("../..").asFile
-val generatedDir = layout.projectDirectory.dir("generated/uniffi").asFile
+val generatedDir = layout.projectDirectory.dir("app/src/main/java").asFile
 val localToolsDir = layout.projectDirectory.dir(".tools").asFile
 
 val installUniffiBindgen = tasks.register<Exec>("installUniffiBindgen") {

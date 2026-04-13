@@ -34,14 +34,6 @@ android {
         compose = true
     }
 
-    sourceSets {
-        getByName("main").java.setSrcDirs(
-            listOf(
-                "src/main/java",
-                "../generated/uniffi",
-            ),
-        )
-    }
 }
 
 dependencies {
@@ -55,6 +47,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    implementation("com.google.android.material:material:1.13.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     implementation("net.java.dev.jna:jna:5.17.0@aar")

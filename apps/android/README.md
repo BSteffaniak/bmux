@@ -19,7 +19,7 @@ The task will:
 - run `cargo build -p bmux_mobile_ffi`
 - run `cargo install --locked --root apps/android/.tools uniffi --version 0.31.0 --features cli` (if missing)
 - run `.tools/bin/uniffi-bindgen generate --language kotlin`
-- write output to `apps/android/generated/uniffi`
+- write output under `apps/android/app/src/main/java/uniffi`
 
 ## Run M4 app shell
 

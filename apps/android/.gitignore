@@ -1,3 +1,7 @@
 .gradle/
 .tools/
 generated/
+app/src/main/java/uniffi/
+app/build/
+.kotlin/
+local.properties
