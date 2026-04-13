@@ -12,20 +12,86 @@ use std::path::{Path, PathBuf};
 pub fn run_doctor_command(context: &NativeCommandContext) -> Result<i32, String> {
     let as_json = has_flag(&context.arguments, "json");
     let strict = has_flag(&context.arguments, "strict");
+    let summary_only = has_flag(&context.arguments, "summary-only");
+    let severity_filter = parse_option_value(&context.arguments, "severity")?;
+    let code_filter = parse_option_value(&context.arguments, "code")?;
     let enabled_plugins = collect_enabled_plugins(context);
     let manifest_index = discover_manifest_index(context)?;
     let findings = collect_doctor_findings(context, &enabled_plugins, &manifest_index);
-    let report = build_doctor_report(context, enabled_plugins.len(), strict, findings);
+    let filtered_findings =
+        filter_doctor_findings(findings, severity_filter.as_deref(), code_filter.as_deref())?;
+    let mut report = build_doctor_report(context, enabled_plugins.len(), strict, filtered_findings);
+
+    if summary_only {
+        report.findings.clear();
+    }
 
     if as_json {
         let output = serde_json::to_string_pretty(&report)
             .map_err(|error| format!("failed encoding plugin doctor json: {error}"))?;
         println!("{output}");
+    } else if summary_only {
+        print_doctor_summary(&report);
     } else {
         print_doctor_report(&report);
     }
 
     Ok(if report.healthy { EXIT_OK } else { 1 })
+}
+
+fn parse_option_value(arguments: &[String], option_name: &str) -> Result<Option<String>, String> {
+    let long = format!("--{option_name}");
+    let long_eq = format!("--{option_name}=");
+
+    let mut value = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == &long {
+            let Some(next) = arguments.get(index + 1) else {
+                return Err(format!("{long} requires a value"));
+            };
+            if next.starts_with('-') {
+                return Err(format!("{long} requires a value"));
+            }
+            value = Some(next.clone());
+            index += 2;
+            continue;
+        }
+        if let Some(inline) = argument.strip_prefix(&long_eq) {
+            if inline.is_empty() {
+                return Err(format!("{long} requires a value"));
+            }
+            value = Some(inline.to_string());
+        }
+        index += 1;
+    }
+
+    Ok(value)
+}
+
+fn filter_doctor_findings(
+    findings: Vec<DoctorFinding>,
+    severity_filter: Option<&str>,
+    code_filter: Option<&str>,
+) -> Result<Vec<DoctorFinding>, String> {
+    let severity_filter = match severity_filter {
+        Some("error") => Some(DoctorSeverity::Error),
+        Some("warning") => Some(DoctorSeverity::Warning),
+        Some("info") => Some(DoctorSeverity::Info),
+        Some(other) => {
+            return Err(format!(
+                "--severity must be one of: error, warning, info (received '{other}')"
+            ));
+        }
+        None => None,
+    };
+
+    Ok(findings
+        .into_iter()
+        .filter(|finding| severity_filter.is_none_or(|severity| finding.severity == severity))
+        .filter(|finding| code_filter.is_none_or(|code| finding.code.contains(code)))
+        .collect())
 }
 
 fn collect_enabled_plugins(context: &NativeCommandContext) -> Vec<&RegisteredPluginInfo> {
@@ -194,6 +260,23 @@ fn print_doctor_report(report: &PluginDoctorReport) {
     print_doctor_findings(report, DoctorSeverity::Warning, "warnings", true);
     print_doctor_findings(report, DoctorSeverity::Info, "info", false);
 
+    if !report.healthy {
+        for note in doctor_failure_notes(report) {
+            println!("{note}");
+        }
+    }
+}
+
+fn print_doctor_summary(report: &PluginDoctorReport) {
+    println!(
+        "plugin doctor summary: {} (inspected={} errors={} warnings={} info={} strict={})",
+        if report.healthy { "ok" } else { "issues found" },
+        report.inspected_plugins,
+        report.error_count,
+        report.warning_count,
+        report.info_count,
+        report.strict_mode
+    );
     if !report.healthy {
         for note in doctor_failure_notes(report) {
             println!("{note}");
@@ -516,7 +599,9 @@ fn command_is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{doctor_failure_notes, doctor_next_steps};
+    use super::{
+        doctor_failure_notes, doctor_next_steps, filter_doctor_findings, parse_option_value,
+    };
     use crate::{DoctorFinding, DoctorSeverity, PluginDoctorReport};
 
     fn test_doctor_report(
@@ -589,5 +674,58 @@ mod tests {
 
         let healthy = doctor_next_steps(true, false, 0, 0);
         assert!(healthy.is_empty());
+    }
+
+    #[test]
+    fn parse_option_value_supports_inline_and_separate_forms() {
+        let inline =
+            parse_option_value(&["--severity=warning".to_string()], "severity").expect("inline");
+        assert_eq!(inline.as_deref(), Some("warning"));
+
+        let separate = parse_option_value(&["--code".to_string(), "manifest".to_string()], "code")
+            .expect("separate");
+        assert_eq!(separate.as_deref(), Some("manifest"));
+    }
+
+    #[test]
+    fn filter_doctor_findings_filters_by_severity_and_code() {
+        let findings_for_severity = vec![
+            DoctorFinding {
+                code: "manifest_missing".to_string(),
+                severity: DoctorSeverity::Error,
+                message: "error".to_string(),
+                suggested_fix: None,
+            },
+            DoctorFinding {
+                code: "process_stdout_reserved".to_string(),
+                severity: DoctorSeverity::Warning,
+                message: "warning".to_string(),
+                suggested_fix: None,
+            },
+        ];
+        let findings_for_code = vec![
+            DoctorFinding {
+                code: "manifest_missing".to_string(),
+                severity: DoctorSeverity::Error,
+                message: "error".to_string(),
+                suggested_fix: None,
+            },
+            DoctorFinding {
+                code: "process_stdout_reserved".to_string(),
+                severity: DoctorSeverity::Warning,
+                message: "warning".to_string(),
+                suggested_fix: None,
+            },
+        ];
+
+        let severity_only = filter_doctor_findings(findings_for_severity, Some("warning"), None)
+            .expect("severity filter should pass");
+        assert_eq!(severity_only.len(), 1);
+        assert_eq!(severity_only[0].code, "process_stdout_reserved");
+
+        let code_only = filter_doctor_findings(findings_for_code, None, Some("manifest"))
+            .expect("code filter should pass");
+        assert_eq!(code_only.len(), 1);
+        assert_eq!(code_only[0].code, "manifest_missing");
     }
 }

@@ -150,6 +150,9 @@ fn is_help_flag(value: &str) -> bool {
 fn print_plugin_command_help(plugin_id: &str, commands: &[String]) {
     println!("plugin '{plugin_id}' command usage:");
     println!("  bmux plugin run {plugin_id} <command> [args ...]");
+    println!("examples:");
+    println!("  bmux plugin run {plugin_id} <command> --help");
+    println!("  bmux plugin run {plugin_id} <command> -- <command-args>");
     if commands.is_empty() {
         println!("known commands: (none)");
     } else {

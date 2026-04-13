@@ -4,7 +4,15 @@ use std::collections::BTreeSet;
 
 pub fn run_list_command(context: &NativeCommandContext) -> Result<i32, String> {
     let as_json = has_flag(&context.arguments, "json");
-    let entries = build_list_entries(context);
+    let enabled_only = has_flag(&context.arguments, "enabled-only");
+    let compact = has_flag(&context.arguments, "compact");
+    let capability_filter = parse_option_value(&context.arguments, "capability")?;
+
+    let entries = filter_entries(
+        build_list_entries(context),
+        enabled_only,
+        capability_filter.as_deref(),
+    );
 
     if as_json {
         let output = serde_json::to_string_pretty(&entries)
@@ -13,9 +21,40 @@ pub fn run_list_command(context: &NativeCommandContext) -> Result<i32, String> {
         return Ok(EXIT_OK);
     }
 
-    print!("{}", render_list_text(&entries));
+    print!("{}", render_list_text(&entries, compact));
 
     Ok(EXIT_OK)
+}
+
+fn parse_option_value(arguments: &[String], option_name: &str) -> Result<Option<String>, String> {
+    let long = format!("--{option_name}");
+    let long_eq = format!("--{option_name}=");
+
+    let mut value = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == &long {
+            let Some(next) = arguments.get(index + 1) else {
+                return Err(format!("{long} requires a value"));
+            };
+            if next.starts_with('-') {
+                return Err(format!("{long} requires a value"));
+            }
+            value = Some(next.clone());
+            index += 2;
+            continue;
+        }
+        if let Some(inline) = argument.strip_prefix(&long_eq) {
+            if inline.is_empty() {
+                return Err(format!("{long} requires a value"));
+            }
+            value = Some(inline.to_string());
+        }
+        index += 1;
+    }
+
+    Ok(value)
 }
 
 fn build_list_entries(context: &NativeCommandContext) -> Vec<PluginListEntry> {
@@ -37,13 +76,45 @@ fn build_list_entries(context: &NativeCommandContext) -> Vec<PluginListEntry> {
     entries
 }
 
-fn render_list_text(entries: &[PluginListEntry]) -> String {
+fn filter_entries(
+    entries: Vec<PluginListEntry>,
+    enabled_only: bool,
+    capability_filter: Option<&str>,
+) -> Vec<PluginListEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| !enabled_only || entry.enabled)
+        .filter(|entry| {
+            capability_filter.is_none_or(|capability| {
+                entry
+                    .required_capabilities
+                    .iter()
+                    .any(|cap| cap == capability)
+                    || entry
+                        .provided_capabilities
+                        .iter()
+                        .any(|cap| cap == capability)
+            })
+        })
+        .collect()
+}
+
+fn render_list_text(entries: &[PluginListEntry], compact: bool) -> String {
     if entries.is_empty() {
         return "no plugins discovered\n".to_string();
     }
 
     let mut lines = Vec::new();
     for entry in entries {
+        if compact {
+            lines.push(format!(
+                "{}{}",
+                entry.id,
+                if entry.enabled { " [enabled]" } else { "" }
+            ));
+            continue;
+        }
+
         lines.push(format!(
             "{}{} - {} ({})",
             entry.id,
@@ -72,7 +143,7 @@ fn render_list_text(entries: &[PluginListEntry]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_list_text;
+    use super::{filter_entries, parse_option_value, render_list_text};
     use crate::PluginListEntry;
     use serde_json::Value;
 
@@ -88,7 +159,7 @@ mod tests {
             commands: vec!["doctor".to_string(), "run".to_string()],
         }];
 
-        let rendered = render_list_text(&entries);
+        let rendered = render_list_text(&entries, false);
         assert!(rendered.contains("bmux.example [enabled] - Example (1.2.3)"));
         assert!(rendered.contains("commands: doctor, run"));
         assert!(rendered.contains("required capabilities: cap.read"));
@@ -97,7 +168,23 @@ mod tests {
 
     #[test]
     fn render_list_text_handles_empty_entries() {
-        assert_eq!(render_list_text(&[]), "no plugins discovered\n");
+        assert_eq!(render_list_text(&[], false), "no plugins discovered\n");
+    }
+
+    #[test]
+    fn render_list_text_compact_only_prints_ids() {
+        let entries = vec![PluginListEntry {
+            id: "bmux.example".to_string(),
+            display_name: "Example".to_string(),
+            version: "1.2.3".to_string(),
+            enabled: true,
+            required_capabilities: vec!["cap.read".to_string()],
+            provided_capabilities: vec!["cap.write".to_string()],
+            commands: vec!["doctor".to_string()],
+        }];
+
+        let rendered = render_list_text(&entries, true);
+        assert_eq!(rendered, "bmux.example [enabled]\n");
     }
 
     #[test]
@@ -135,5 +222,67 @@ mod tests {
             .and_then(Value::as_str)
             .expect("id should be a string");
         assert_eq!(id, "bmux.example");
+    }
+
+    #[test]
+    fn filter_entries_supports_enabled_and_capability_filters() {
+        let entries_enabled = vec![
+            PluginListEntry {
+                id: "bmux.enabled".to_string(),
+                display_name: "Enabled".to_string(),
+                version: "1.0.0".to_string(),
+                enabled: true,
+                required_capabilities: vec!["cap.one".to_string()],
+                provided_capabilities: Vec::new(),
+                commands: Vec::new(),
+            },
+            PluginListEntry {
+                id: "bmux.disabled".to_string(),
+                display_name: "Disabled".to_string(),
+                version: "1.0.0".to_string(),
+                enabled: false,
+                required_capabilities: Vec::new(),
+                provided_capabilities: vec!["cap.one".to_string()],
+                commands: Vec::new(),
+            },
+        ];
+        let entries_capability = vec![
+            PluginListEntry {
+                id: "bmux.enabled".to_string(),
+                display_name: "Enabled".to_string(),
+                version: "1.0.0".to_string(),
+                enabled: true,
+                required_capabilities: vec!["cap.one".to_string()],
+                provided_capabilities: Vec::new(),
+                commands: Vec::new(),
+            },
+            PluginListEntry {
+                id: "bmux.disabled".to_string(),
+                display_name: "Disabled".to_string(),
+                version: "1.0.0".to_string(),
+                enabled: false,
+                required_capabilities: Vec::new(),
+                provided_capabilities: vec!["cap.one".to_string()],
+                commands: Vec::new(),
+            },
+        ];
+
+        let enabled_only = filter_entries(entries_enabled, true, None);
+        assert_eq!(enabled_only.len(), 1);
+        assert_eq!(enabled_only[0].id, "bmux.enabled");
+
+        let capability = filter_entries(entries_capability, false, Some("cap.one"));
+        assert_eq!(capability.len(), 2);
+    }
+
+    #[test]
+    fn parse_option_value_supports_inline_and_separate_forms() {
+        let args = vec!["--capability=cap.read".to_string()];
+        let inline = parse_option_value(&args, "capability").expect("inline parse should work");
+        assert_eq!(inline.as_deref(), Some("cap.read"));
+
+        let args = vec!["--capability".to_string(), "cap.write".to_string()];
+        let separate = parse_option_value(&args, "capability").expect("separate parse should work");
+        assert_eq!(separate.as_deref(), Some("cap.write"));
     }
 }
