@@ -2,10 +2,14 @@ package io.bmux.android.terminal
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.material3.Card
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -27,6 +31,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+
+private const val MAX_STATUS_LINES = 24
 
 @Composable
 fun TerminalSessionScreen(
@@ -52,17 +58,20 @@ fun TerminalSessionScreen(
 
     var connection by remember(endpoint.id) { mutableStateOf<TerminalTransportConnection?>(null) }
     var warning by remember(endpoint.id) { mutableStateOf<String?>(null) }
-    var statusLine by remember(endpoint.id) { mutableStateOf<String?>(null) }
+    var statusLines by remember(endpoint.id) { mutableStateOf(emptyList<String>()) }
 
     LaunchedEffect(endpoint.id, session) {
         warning = null
         connection = null
+        statusLines = emptyList()
         runCatching {
             transport.open(
                 endpoint = endpoint,
                 session = session,
                 sink = { bytes -> renderer.appendOutput(bytes) },
-                onStatus = { statusLine = it },
+                onStatus = { message ->
+                    statusLines = (statusLines + message).takeLast(MAX_STATUS_LINES)
+                },
             )
         }.onSuccess {
             connection = it
@@ -102,8 +111,27 @@ fun TerminalSessionScreen(
         warning?.let {
             Text(it, color = MaterialTheme.colorScheme.error)
         }
-        statusLine?.let {
-            Text(it, style = MaterialTheme.typography.bodySmall)
+        if (statusLines.isNotEmpty()) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text("Status", style = MaterialTheme.typography.labelMedium)
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 120.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        itemsIndexed(statusLines, key = { index, line -> "$index-$line" }) { _, line ->
+                            Text(line, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
         }
 
         renderer.Render(
@@ -181,7 +209,9 @@ private class CoreTerminalTransportConnection(
                         TerminalChunkType.STATUS -> {
                             val message = chunk.bytes.toString(StandardCharsets.UTF_8).trim()
                             if (message.isNotEmpty()) {
-                                onStatus(message)
+                                scope.launch(Dispatchers.Main) {
+                                    onStatus(message)
+                                }
                             }
                         }
                     }
