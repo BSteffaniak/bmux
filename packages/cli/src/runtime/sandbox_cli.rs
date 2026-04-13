@@ -3399,7 +3399,8 @@ fn is_pid_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        SandboxEnvModeArg, SandboxPaths, apply_sandbox_env, exit_code_to_u8, sanitize_component,
+        SandboxEnvModeArg, SandboxPaths, apply_sandbox_env, directory_sha256_hex, exit_code_to_u8,
+        file_sha256_hex, sanitize_component,
     };
 
     fn env_value(command: &std::process::Command, key: &str) -> Option<std::ffi::OsString> {
@@ -3482,5 +3483,59 @@ mod tests {
         assert_eq!(exit_code_to_u8(-1), 1);
         assert_eq!(exit_code_to_u8(300), 255);
         assert_eq!(exit_code_to_u8(7), 7);
+    }
+
+    #[test]
+    fn file_sha256_hex_matches_known_digest() {
+        let root = std::env::temp_dir().join(format!(
+            "bmux-file-sha-test-{}-{}",
+            std::process::id(),
+            super::unix_millis_now_meta()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp test root");
+        let file = root.join("sample.txt");
+        std::fs::write(&file, "abc").expect("write sample file");
+
+        let digest = file_sha256_hex(&file).expect("file hash should exist");
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directory_sha256_hex_is_stable_and_detects_changes() {
+        let base = std::env::temp_dir().join(format!(
+            "bmux-dir-sha-test-{}-{}",
+            std::process::id(),
+            super::unix_millis_now_meta()
+        ));
+        let dir_one = base.join("one");
+        let dir_two = base.join("two");
+        std::fs::create_dir_all(dir_one.join("nested")).expect("create dir one");
+        std::fs::create_dir_all(dir_two.join("nested")).expect("create dir two");
+
+        std::fs::write(dir_one.join("b.txt"), "bbb").expect("write one b");
+        std::fs::write(dir_one.join("nested").join("a.txt"), "aaa").expect("write one a");
+
+        std::fs::write(dir_two.join("nested").join("a.txt"), "aaa").expect("write two a");
+        std::fs::write(dir_two.join("b.txt"), "bbb").expect("write two b");
+
+        let hash_one = directory_sha256_hex(&dir_one).expect("dir one hash should exist");
+        let hash_two = directory_sha256_hex(&dir_two).expect("dir two hash should exist");
+        assert_eq!(hash_one, hash_two, "directory hash should be order-stable");
+
+        std::fs::write(dir_two.join("nested").join("a.txt"), "changed")
+            .expect("mutate nested file");
+        let hash_two_changed =
+            directory_sha256_hex(&dir_two).expect("dir two changed hash should exist");
+        assert_ne!(
+            hash_one, hash_two_changed,
+            "directory hash should change on content drift"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }

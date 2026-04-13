@@ -2648,6 +2648,21 @@ fn sandbox_triage_bundle_generates_verified_bundle_json() {
     assert_eq!(json["bundle"]["executed"].as_bool(), Some(true));
     assert_eq!(json["bundle"]["verify"]["ok"].as_bool(), Some(true));
     assert_eq!(json["bundle"]["verify"]["strict"].as_bool(), Some(false));
+    assert_eq!(
+        json["bundle"]["verify"]["mode"].as_str(),
+        Some("strict_metadata")
+    );
+    assert_eq!(json["bundle"]["verify"]["issue_count"].as_u64(), Some(0));
+    assert_eq!(
+        json["bundle"]["verify"]["unexpected_artifacts"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        json["bundle"]["verify"]["version_check"]["ok"].as_bool(),
+        Some(true)
+    );
     let bundle_dir = json["bundle"]["bundle_dir"]
         .as_str()
         .expect("triage bundle output should include bundle_dir");
@@ -2695,6 +2710,11 @@ fn sandbox_triage_bundle_strict_verify_sets_strict_mode() {
     assert_eq!(json["bundle"]["requested"].as_bool(), Some(true));
     assert_eq!(json["bundle"]["verify"]["strict"].as_bool(), Some(true));
     assert_eq!(json["bundle"]["verify"]["ok"].as_bool(), Some(true));
+    assert_eq!(json["bundle"]["verify"]["issue_count"].as_u64(), Some(0));
+    assert_eq!(
+        json["bundle"]["verify"]["version_check"]["ok"].as_bool(),
+        Some(true)
+    );
 }
 
 #[test]
