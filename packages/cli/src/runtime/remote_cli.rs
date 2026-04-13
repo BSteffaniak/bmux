@@ -253,6 +253,7 @@ const DEFAULT_CLUSTER_GATEWAY_FAILURE_COOLDOWN: Duration = Duration::from_secs(2
 const DEFAULT_CLUSTER_GATEWAY_BREAKER_OPEN_AFTER_FAILURES: u32 = 3;
 const DEFAULT_CLUSTER_GATEWAY_BREAKER_HALF_OPEN_AFTER: Duration = Duration::from_secs(30);
 const DEFAULT_CLUSTER_GATEWAY_PROBE_TIMEOUT_MS: u64 = 7000;
+const GATEWAY_TABLE_CANDIDATE_WIDTH: usize = 24;
 
 static CLUSTER_GATEWAY_RUNTIME_STATE: OnceLock<
     Mutex<BTreeMap<String, ClusterGatewayRuntimeState>>,
@@ -3590,6 +3591,8 @@ async fn run_cluster_gateway_routed_command(
         }
     }
 
+    emit_gateway_batch_failure_summary(&cluster_name, command_name, &failures);
+
     anyhow::bail!(
         "all gateway candidates failed for cluster '{cluster_name}': {}",
         format_gateway_failures(&failures)
@@ -3680,6 +3683,14 @@ async fn run_cluster_gateway_dry_run(request: GatewayDryRunRequest<'_>) -> Resul
         request.no_failover,
         &mut failures,
     );
+    emit_gateway_probe_observation(
+        request.cluster_name,
+        request.command_name,
+        "dry_run",
+        &probes,
+        selected,
+        &failures,
+    );
 
     if request.output_format == GatewayOutputFormat::Json {
         print_gateway_dry_run_json(&request, preferred.as_ref(), &probes, &failures, selected)?;
@@ -3737,7 +3748,7 @@ fn print_gateway_dry_run_text(
     for probe in probes {
         println!(
             "  {:<24} {:<9} {:<10} {:<10} {:<12} {:<5} {:<14} {:<10} {:<14} {}",
-            probe.candidate,
+            gateway_table_candidate_label(&probe.candidate),
             gateway_bool_label(preferred.is_some_and(|value| value == &probe.candidate)),
             probe.stability_score,
             gateway_breaker_state_label(probe.breaker_state),
@@ -4623,7 +4634,7 @@ fn print_cluster_gateway_status(
         let unavailable = "-";
         println!(
             "  {:<24} {:<9} {:<10} {:<10} {:<12} {:<5} {:<14} {:<10} {:<14} {}",
-            row["candidate"].as_str().unwrap_or("-"),
+            gateway_table_candidate_label(row["candidate"].as_str().unwrap_or("-")),
             gateway_bool_label(row["preferred"].as_bool().unwrap_or(false)),
             row["stability_score"].as_u64().unwrap_or(0),
             row["breaker_state"].as_str().unwrap_or("closed"),
@@ -4656,6 +4667,7 @@ async fn run_cluster_gateway_explain(
             "cluster gateway explain: cluster='{cluster_name}' mode={:?} no_failover={}",
             definition.gateway_mode, overrides.no_failover
         );
+        print_gateway_text_table_header();
     }
 
     let probes = collect_gateway_explain_probes(
@@ -4687,6 +4699,14 @@ async fn run_cluster_gateway_explain(
         );
         selected = retry_selected;
     }
+    emit_gateway_probe_observation(
+        cluster_name,
+        "cluster-gateway-explain",
+        "explain",
+        &probes,
+        selected,
+        &failures,
+    );
 
     let selected_candidate = selected.map(|value| value.candidate.clone());
     if output_format == GatewayOutputFormat::Json {
@@ -4774,7 +4794,7 @@ fn print_gateway_explain_probe_line(
 ) {
     println!(
         "  {:<24} {:<9} {:<10} {:<10} {:<12} {:<5} {:<14} {:<10} {:<14} {}",
-        probe_row.candidate,
+        gateway_table_candidate_label(&probe_row.candidate),
         gateway_bool_label(preferred.is_some_and(|value| value == &probe_row.candidate)),
         probe_row.stability_score,
         gateway_breaker_state_label(probe_row.breaker_state),
@@ -4784,6 +4804,103 @@ fn print_gateway_explain_probe_line(
         probe_row.probe.latency_ms,
         probe_row.skip_reason.unwrap_or("-"),
         probe_row.probe.detail
+    );
+}
+
+fn emit_gateway_probe_observation(
+    cluster_name: &str,
+    command_name: &str,
+    phase: &str,
+    probes: &[GatewayExplainCandidateProbe],
+    selected: Option<&GatewayExplainCandidateProbe>,
+    failures: &[GatewayAttemptFailure],
+) {
+    let mut probe_ok = 0u64;
+    let mut skip_cooldown = 0u64;
+    let mut skip_breaker_open = 0u64;
+    for probe in probes {
+        if probe.probe.ok {
+            probe_ok = probe_ok.saturating_add(1);
+        }
+        match probe.skip_reason {
+            Some("cooldown") => skip_cooldown = skip_cooldown.saturating_add(1),
+            Some("breaker_open") => skip_breaker_open = skip_breaker_open.saturating_add(1),
+            _ => {}
+        }
+    }
+    let mut failure_connect = 0u64;
+    let mut failure_probe_timeout = 0u64;
+    let mut failure_cooldown = 0u64;
+    let mut failure_breaker_open = 0u64;
+    for failure in failures {
+        match failure.reason_code {
+            "connect" => failure_connect = failure_connect.saturating_add(1),
+            "probe_timeout" => failure_probe_timeout = failure_probe_timeout.saturating_add(1),
+            "cooldown" => failure_cooldown = failure_cooldown.saturating_add(1),
+            "breaker_open" => failure_breaker_open = failure_breaker_open.saturating_add(1),
+            _ => {}
+        }
+    }
+    tracing::info!(
+        event = "cluster_gateway_selection_observation",
+        cluster = %cluster_name,
+        command = %command_name,
+        phase = %phase,
+        candidates_total = probes.len(),
+        probes_ok = probe_ok,
+        skip_cooldown,
+        skip_breaker_open,
+        failure_connect,
+        failure_probe_timeout,
+        failure_cooldown,
+        failure_breaker_open,
+        selected = selected.map_or("none", |value| value.candidate.as_str()),
+        result = if selected.is_some() { "success" } else { "failure" },
+        "observed gateway candidate evaluation"
+    );
+}
+
+fn gateway_table_candidate_label(candidate: &str) -> String {
+    let char_count = candidate.chars().count();
+    if char_count <= GATEWAY_TABLE_CANDIDATE_WIDTH {
+        return candidate.to_string();
+    }
+    let keep = GATEWAY_TABLE_CANDIDATE_WIDTH.saturating_sub(3);
+    let mut shortened = candidate.chars().take(keep).collect::<String>();
+    shortened.push_str("...");
+    shortened
+}
+
+fn emit_gateway_batch_failure_summary(
+    cluster_name: &str,
+    command_name: &str,
+    failures: &[GatewayAttemptFailure],
+) {
+    let mut skipped_cooldown = 0u64;
+    let mut skipped_breaker_open = 0u64;
+    let mut failed_connect = 0u64;
+    let mut failed_probe_timeout = 0u64;
+    let mut failed_other = 0u64;
+    for failure in failures {
+        match failure.reason_code {
+            "cooldown" => skipped_cooldown = skipped_cooldown.saturating_add(1),
+            "breaker_open" => skipped_breaker_open = skipped_breaker_open.saturating_add(1),
+            "connect" => failed_connect = failed_connect.saturating_add(1),
+            "probe_timeout" => failed_probe_timeout = failed_probe_timeout.saturating_add(1),
+            _ => failed_other = failed_other.saturating_add(1),
+        }
+    }
+    tracing::warn!(
+        event = "cluster_gateway_selection_failed",
+        cluster = %cluster_name,
+        command = %command_name,
+        failures_total = failures.len(),
+        skipped_cooldown,
+        skipped_breaker_open,
+        failed_connect,
+        failed_probe_timeout,
+        failed_other,
+        "all gateway candidates exhausted"
     );
 }
 
@@ -7215,6 +7332,19 @@ mod tests {
         let format = parse_gateway_output_format(&["--format".to_string(), "json".to_string()])
             .expect("json gateway format should parse");
         assert_eq!(format, GatewayOutputFormat::Json);
+    }
+
+    #[test]
+    fn gateway_table_candidate_label_keeps_short_names() {
+        let value = gateway_table_candidate_label("db-a");
+        assert_eq!(value, "db-a");
+    }
+
+    #[test]
+    fn gateway_table_candidate_label_truncates_long_names() {
+        let value = gateway_table_candidate_label("very-long-gateway-candidate-name-prod-a");
+        assert_eq!(value.chars().count(), GATEWAY_TABLE_CANDIDATE_WIDTH);
+        assert!(value.ends_with("..."));
     }
 
     #[test]

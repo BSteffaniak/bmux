@@ -103,6 +103,21 @@ fn combined_output(output: &Output) -> String {
     )
 }
 
+fn gateway_table_header_line(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        if line.contains("candidate")
+            && line.contains("preferred")
+            && line.contains("stability")
+            && line.contains("latency_ms")
+            && line.contains("detail")
+        {
+            Some(line.split_whitespace().collect::<Vec<_>>().join(" "))
+        } else {
+            None
+        }
+    })
+}
+
 #[test]
 fn gateway_reset_requires_cluster_unless_all_is_passed() {
     let env = CliTestEnv::new("reset-requires-cluster");
@@ -353,4 +368,44 @@ fn cluster_status_dry_run_honors_breaker_open_skip_reason() {
 
     let after = std::fs::read_to_string(env.gateway_state_path()).expect("read state after run");
     assert_eq!(before, after, "dry-run should not mutate runtime state");
+}
+
+#[test]
+fn gateway_text_tables_are_consistent_across_status_explain_and_dry_run() {
+    let env = CliTestEnv::new("gateway-table-shape-consistency");
+    env.write_cluster_config();
+
+    let status_output = env.run(&["cluster", "gateway", "status", "--cluster", "prod"]);
+    assert_eq!(status_output.status.code(), Some(0));
+    let status_text = String::from_utf8_lossy(&status_output.stdout);
+    let status_header = gateway_table_header_line(&status_text)
+        .expect("status output should include gateway table header");
+
+    let explain_output = env.run(&["cluster", "gateway", "explain", "--cluster", "prod"]);
+    assert_eq!(explain_output.status.code(), Some(1));
+    let explain_text = String::from_utf8_lossy(&explain_output.stdout);
+    let explain_header = gateway_table_header_line(&explain_text)
+        .expect("explain output should include gateway table header");
+
+    let dry_run_output = env.run(&[
+        "cluster",
+        "status",
+        "prod",
+        "--gateway",
+        "missing-prod-a",
+        "--gateway-mode",
+        "pinned",
+        "--gateway-no-failover",
+        "--dry-run",
+    ]);
+    assert_eq!(dry_run_output.status.code(), Some(1));
+    let dry_run_text = String::from_utf8_lossy(&dry_run_output.stdout);
+    let dry_run_header = gateway_table_header_line(&dry_run_text)
+        .expect("dry-run output should include gateway table header");
+
+    let expected =
+        "candidate preferred stability breaker cooldown_ms ok reason latency_ms skip detail";
+    assert_eq!(status_header, expected);
+    assert_eq!(explain_header, expected);
+    assert_eq!(dry_run_header, expected);
 }

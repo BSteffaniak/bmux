@@ -51,6 +51,73 @@ Current scope:
 - Breaker behavior defaults: open after 3 consecutive failures, then half-open retry after cooldown.
 - Candidate ordering in auto mode is stability-first (latency used as tie-break), with explicit skip reasons (`cooldown` / `breaker_open`) visible in status/explain and dry-run output.
 
+### Gateway Output Examples
+
+Text table columns are aligned and consistent across `cluster gateway status`, `cluster gateway explain`, and routed command `--dry-run`:
+
+```text
+candidate                 preferred stability  breaker    cooldown_ms  ok    reason         latency_ms skip           detail
+prod-a                    true      5000       closed     -            true  ok             42         -              gateway command bridge reachable
+prod-b                    false     200000     open       29000        false connect        15         breaker_open   connection refused
+```
+
+JSON example for `cluster gateway explain --format json`:
+
+```json
+{
+  "cluster": "prod",
+  "command": "cluster-gateway-explain",
+  "mode": "auto",
+  "no_failover": false,
+  "selected_candidate": "prod-a",
+  "result": "success",
+  "would_mutate": {
+    "enabled": false,
+    "last_good": false,
+    "cooldown": false,
+    "breaker": false,
+    "persistence_write": false
+  },
+  "probes": [
+    {
+      "candidate": "prod-a",
+      "preferred": true,
+      "stability_score": 5000,
+      "breaker_state": "closed",
+      "cooldown_ms": null,
+      "skip_reason": null,
+      "historical_latency_ms": 42,
+      "ok": true,
+      "reason": "ok",
+      "latency_ms": 42,
+      "detail": "gateway command bridge reachable"
+    }
+  ],
+  "failures": []
+}
+```
+
+JSON example for routed command dry-run (`cluster status prod --dry-run --format json`):
+
+```json
+{
+  "cluster": "prod",
+  "command": "cluster-status",
+  "mode": "auto",
+  "result": "failure",
+  "selected_candidate": null,
+  "would_mutate": {
+    "enabled": false,
+    "last_good": false,
+    "cooldown": false,
+    "breaker": false,
+    "persistence_write": false
+  },
+  "probes": [],
+  "failures": []
+}
+```
+
 Example:
 
 ```toml
