@@ -1,12 +1,14 @@
+use crate::connection::{TerminalMouseButton, TerminalMouseEvent, TerminalMouseEventKind};
 use crate::error::{MobileCoreError, Result};
 use crate::target::{TargetRecord, TargetTransport};
+use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::render::visible_scene_pane_ids;
 use bmux_attach_pipeline::{AttachChunkApplyOutcome, AttachScenePipeline, AttachViewport};
 use bmux_client::{BmuxClient, ClientError, ServerEvent, StreamingBmuxClient};
 use bmux_ipc::compressed_stream::CompressedStream;
 use bmux_ipc::transport::{ErasedIpcStream, IpcTransportError};
 use bmux_ipc::{
-    AttachPaneChunk, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ErrorCode,
+    AttachPaneChunk, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ErrorCode, PaneSelector,
     SessionSelector,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
@@ -187,6 +189,14 @@ pub trait TerminalBackend: Send + Sync {
     /// call fails.
     fn write_input(&self, handle_id: Uuid, bytes: &[u8]) -> Result<()>;
 
+    /// Sends a terminal mouse event for an open session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session handle is unknown or the remote mouse
+    /// routing call fails.
+    fn mouse_event(&self, handle_id: Uuid, event: &TerminalMouseEvent) -> Result<()>;
+
     /// Updates the terminal viewport size for an open session.
     ///
     /// # Errors
@@ -220,6 +230,10 @@ enum SessionCommand {
     },
     WriteInput {
         bytes: Vec<u8>,
+        response: oneshot::Sender<Result<()>>,
+    },
+    MouseEvent {
+        event: TerminalMouseEvent,
         response: oneshot::Sender<Result<()>>,
     },
     Resize {
@@ -1051,6 +1065,13 @@ impl TerminalBackend for RemoteTerminalBackend {
         })
     }
 
+    fn mouse_event(&self, handle_id: Uuid, event: &TerminalMouseEvent) -> Result<()> {
+        self.call_session(handle_id, |response| SessionCommand::MouseEvent {
+            event: *event,
+            response,
+        })
+    }
+
     fn resize(&self, handle_id: Uuid, rows: u16, cols: u16) -> Result<()> {
         self.call_session(handle_id, |response| SessionCommand::Resize {
             rows,
@@ -1181,6 +1202,12 @@ async fn handle_session_command(
                 ))));
                 return true;
             }
+            SessionCommand::MouseEvent { response, .. } => {
+                let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(format!(
+                    "{reason}; mouse event rejected"
+                ))));
+                return true;
+            }
             SessionCommand::Resize { response, .. } => {
                 let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(format!(
                     "{reason}; resize rejected"
@@ -1211,6 +1238,14 @@ async fn handle_session_command(
                 .attach_input(session_id, bytes)
                 .await
                 .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
+            if let Err(error) = &result {
+                set_session_terminated_reason(actor_state, error.to_string());
+            }
+            let _ = response.send(result);
+            true
+        }
+        SessionCommand::MouseEvent { event, response } => {
+            let result = handle_session_mouse_event(client, state, session_id, event).await;
             if let Err(error) = &result {
                 set_session_terminated_reason(actor_state, error.to_string());
             }
@@ -1249,6 +1284,95 @@ async fn handle_session_command(
             false
         }
     }
+}
+
+async fn handle_session_mouse_event(
+    client: &mut StreamingBmuxClient,
+    state: &mut StreamOutputState,
+    session_id: Uuid,
+    event: TerminalMouseEvent,
+) -> Result<()> {
+    let Some(target_pane) = state.target_pane_at(event.col, event.row) else {
+        return Ok(());
+    };
+
+    let in_focused_pane = state
+        .focused_pane_id()
+        .is_some_and(|focused_pane| focused_pane == target_pane);
+    let focus_before_forward = matches!(
+        event.kind,
+        TerminalMouseEventKind::Down | TerminalMouseEventKind::Up | TerminalMouseEventKind::Drag
+    ) && matches!(event.button, Some(TerminalMouseButton::Left));
+
+    if focus_before_forward && !in_focused_pane {
+        client
+            .focus_pane_target(
+                Some(SessionSelector::ById(session_id)),
+                PaneSelector::ById(target_pane),
+            )
+            .await
+            .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
+        if let Ok(layout) = client.attach_layout(session_id).await {
+            let _ = state.apply_layout_state(layout);
+        }
+    } else if !in_focused_pane {
+        return Ok(());
+    }
+
+    let Some(protocol) = state.pane_protocol(target_pane) else {
+        return Ok(());
+    };
+    let Some(mouse_event) = terminal_mouse_event_to_attach_mouse_event(event) else {
+        return Ok(());
+    };
+    let Some(bytes) = attach_mouse::encode_for_protocol(mouse_event, protocol) else {
+        return Ok(());
+    };
+
+    client
+        .attach_input(session_id, bytes)
+        .await
+        .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))
+}
+
+const fn terminal_mouse_button_to_attach(button: TerminalMouseButton) -> attach_mouse::Button {
+    match button {
+        TerminalMouseButton::Left => attach_mouse::Button::Left,
+        TerminalMouseButton::Middle => attach_mouse::Button::Middle,
+        TerminalMouseButton::Right => attach_mouse::Button::Right,
+    }
+}
+
+fn terminal_mouse_event_to_attach_mouse_event(
+    event: TerminalMouseEvent,
+) -> Option<attach_mouse::Event> {
+    let kind = match event.kind {
+        TerminalMouseEventKind::Down => {
+            attach_mouse::EventKind::Down(terminal_mouse_button_to_attach(event.button?))
+        }
+        TerminalMouseEventKind::Up => {
+            attach_mouse::EventKind::Up(terminal_mouse_button_to_attach(event.button?))
+        }
+        TerminalMouseEventKind::Drag => {
+            attach_mouse::EventKind::Drag(terminal_mouse_button_to_attach(event.button?))
+        }
+        TerminalMouseEventKind::Move => attach_mouse::EventKind::Moved,
+        TerminalMouseEventKind::ScrollUp => attach_mouse::EventKind::ScrollUp,
+        TerminalMouseEventKind::ScrollDown => attach_mouse::EventKind::ScrollDown,
+        TerminalMouseEventKind::ScrollLeft => attach_mouse::EventKind::ScrollLeft,
+        TerminalMouseEventKind::ScrollRight => attach_mouse::EventKind::ScrollRight,
+    };
+
+    Some(attach_mouse::Event {
+        kind,
+        column: event.col,
+        row: event.row,
+        modifiers: attach_mouse::Modifiers {
+            shift: event.shift,
+            alt: event.alt,
+            control: event.control,
+        },
+    })
 }
 
 async fn handle_session_event(
@@ -1396,6 +1520,26 @@ impl StreamOutputState {
             .map_or_else(Vec::new, |layout_state| {
                 visible_scene_pane_ids(&layout_state.scene)
             })
+    }
+
+    fn focused_pane_id(&self) -> Option<Uuid> {
+        self.pipeline
+            .layout_state
+            .as_ref()
+            .map(|layout_state| layout_state.focused_pane_id)
+    }
+
+    fn target_pane_at(&self, column: u16, row: u16) -> Option<Uuid> {
+        let layout_state = self.pipeline.layout_state.as_ref()?;
+        attach_mouse::pane_at(&layout_state.scene, column, row)
+    }
+
+    fn pane_protocol(&self, pane_id: Uuid) -> Option<attach_mouse::PaneProtocol> {
+        attach_mouse::pane_protocol(
+            &self.pipeline.pane_buffers,
+            self.pipeline.pane_mouse_protocol_hints(),
+            pane_id,
+        )
     }
 
     fn render_if_dirty(&mut self) -> Result<()> {

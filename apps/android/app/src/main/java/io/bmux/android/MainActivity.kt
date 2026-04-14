@@ -43,6 +43,9 @@ import io.bmux.android.terminal.TerminalEndpoint
 import io.bmux.android.terminal.TerminalChunkFrame
 import io.bmux.android.terminal.TerminalChunkType
 import io.bmux.android.terminal.TerminalDiagnosticFrame
+import io.bmux.android.terminal.TerminalMouseButton
+import io.bmux.android.terminal.TerminalMouseEvent
+import io.bmux.android.terminal.TerminalMouseEventKind
 import io.bmux.android.terminal.TerminalSessionScreen
 import io.bmux.android.terminal.TerminalStatusSeverity
 import kotlinx.coroutines.Dispatchers
@@ -55,6 +58,9 @@ import uniffi.bmux_mobile_ffi.MobileApiFfi
 import uniffi.bmux_mobile_ffi.MobileFfiException
 import uniffi.bmux_mobile_ffi.TerminalChunkKindFfi
 import uniffi.bmux_mobile_ffi.TerminalDiagnosticFfi
+import uniffi.bmux_mobile_ffi.TerminalMouseButtonFfi
+import uniffi.bmux_mobile_ffi.TerminalMouseEventFfi
+import uniffi.bmux_mobile_ffi.TerminalMouseEventKindFfi
 import uniffi.bmux_mobile_ffi.TerminalOpenRequestFfi
 import uniffi.bmux_mobile_ffi.TerminalStatusSeverityFfi
 import uniffi.bmux_mobile_ffi.TerminalSizeFfi
@@ -246,6 +252,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun writeTerminalInput(terminalId: String, bytes: ByteArray): Result<Unit> {
         return gateway.writeTerminalInput(terminalId, bytes)
+    }
+
+    fun sendTerminalMouseEvent(terminalId: String, event: TerminalMouseEvent): Result<Unit> {
+        return gateway.sendTerminalMouseEvent(terminalId, event)
     }
 
     fun resizeTerminal(terminalId: String, rows: Int, cols: Int): Result<Unit> {
@@ -467,6 +477,40 @@ private class MobileGateway(application: Application) {
         }
     }
 
+    fun sendTerminalMouseEvent(terminalId: String, event: TerminalMouseEvent): Result<Unit> {
+        val client = ffi ?: return Result.failure(
+            IllegalStateException("FFI terminal stream unavailable"),
+        )
+        return runGatewayCall {
+            client.sendTerminalMouseEvent(
+                terminalId,
+                TerminalMouseEventFfi(
+                    kind = when (event.kind) {
+                        TerminalMouseEventKind.DOWN -> TerminalMouseEventKindFfi.DOWN
+                        TerminalMouseEventKind.UP -> TerminalMouseEventKindFfi.UP
+                        TerminalMouseEventKind.DRAG -> TerminalMouseEventKindFfi.DRAG
+                        TerminalMouseEventKind.MOVE -> TerminalMouseEventKindFfi.MOVE
+                        TerminalMouseEventKind.SCROLL_UP -> TerminalMouseEventKindFfi.SCROLL_UP
+                        TerminalMouseEventKind.SCROLL_DOWN -> TerminalMouseEventKindFfi.SCROLL_DOWN
+                        TerminalMouseEventKind.SCROLL_LEFT -> TerminalMouseEventKindFfi.SCROLL_LEFT
+                        TerminalMouseEventKind.SCROLL_RIGHT -> TerminalMouseEventKindFfi.SCROLL_RIGHT
+                    },
+                    button = when (event.button) {
+                        TerminalMouseButton.LEFT -> TerminalMouseButtonFfi.LEFT
+                        TerminalMouseButton.MIDDLE -> TerminalMouseButtonFfi.MIDDLE
+                        TerminalMouseButton.RIGHT -> TerminalMouseButtonFfi.RIGHT
+                        null -> null
+                    },
+                    row = event.row.toTerminalCellUShort("row"),
+                    col = event.col.toTerminalCellUShort("col"),
+                    shift = event.shift,
+                    alt = event.alt,
+                    control = event.control,
+                ),
+            )
+        }
+    }
+
     fun resizeTerminal(terminalId: String, rows: Int, cols: Int): Result<Unit> {
         val client = ffi ?: return Result.failure(
             IllegalStateException("FFI terminal stream unavailable"),
@@ -610,6 +654,11 @@ private class MobileGateway(application: Application) {
         require(this in 1..65_535) { "$name out of range: $this" }
         return toUShort()
     }
+
+    private fun Int.toTerminalCellUShort(name: String): UShort {
+        require(this in 0..65_535) { "$name out of range: $this" }
+        return toUShort()
+    }
 }
 
 private fun TargetUi.toStored(): StoredTarget = StoredTarget(
@@ -667,6 +716,9 @@ private fun MainScreen(vm: MainViewModel) {
                     },
                     writeTerminalInput = { terminalId, bytes ->
                         withContext(Dispatchers.IO) { vm.writeTerminalInput(terminalId, bytes) }
+                    },
+                    sendTerminalMouseEvent = { terminalId, event ->
+                        withContext(Dispatchers.IO) { vm.sendTerminalMouseEvent(terminalId, event) }
                     },
                     resizeTerminal = { terminalId, rows, cols ->
                         withContext(Dispatchers.IO) { vm.resizeTerminal(terminalId, rows, cols) }

@@ -6,13 +6,16 @@ use crate::reconcile::{
 };
 use crate::render::{append_pane_output, render_attach_scene, visible_scene_pane_ids};
 use crate::types::{AttachCursorState, PaneRenderBuffer};
+use crate::{mouse_protocol_encoding_to_ipc, mouse_protocol_mode_to_ipc};
 use anyhow::Result;
 use bmux_attach_pipeline_models::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, AttachPipelineDiagnosticCode,
     AttachPipelineDiagnosticEvent, AttachViewport,
 };
 use bmux_client::{AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState};
-use bmux_ipc::{AttachPaneChunk, AttachViewComponent};
+use bmux_ipc::{
+    AttachInputModeState, AttachMouseProtocolState, AttachPaneChunk, AttachViewComponent,
+};
 use crossterm::cursor::{Hide, SavePosition};
 use crossterm::queue;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
@@ -24,6 +27,8 @@ pub struct AttachScenePipeline {
     viewport: AttachViewport,
     pub layout_state: Option<AttachLayoutState>,
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+    pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
+    pane_input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
     dirty_pane_ids: BTreeSet<Uuid>,
     full_pane_redraw: bool,
     last_cursor_state: Option<AttachCursorState>,
@@ -40,6 +45,8 @@ impl AttachScenePipeline {
             viewport,
             layout_state: None,
             pane_buffers: BTreeMap::new(),
+            pane_mouse_protocol_hints: BTreeMap::new(),
+            pane_input_mode_hints: BTreeMap::new(),
             dirty_pane_ids: BTreeSet::new(),
             full_pane_redraw: true,
             last_cursor_state: None,
@@ -77,6 +84,8 @@ impl AttachScenePipeline {
         } = snapshot;
 
         self.pane_buffers.clear();
+        self.pane_mouse_protocol_hints.clear();
+        self.pane_input_mode_hints.clear();
         self.layout_state = Some(AttachLayoutState {
             context_id,
             session_id,
@@ -102,6 +111,12 @@ impl AttachScenePipeline {
             let _ = append_pane_output(buffer, &chunk.data);
             buffer.sync_update_in_progress = chunk.sync_update_active;
             buffer.expected_stream_start = Some(chunk.stream_end);
+            update_parser_mode_hints(
+                &mut self.pane_mouse_protocol_hints,
+                &mut self.pane_input_mode_hints,
+                pane_id,
+                buffer,
+            );
         }
 
         if let Some(layout_state) = self.layout_state.as_ref() {
@@ -141,6 +156,12 @@ impl AttachScenePipeline {
             let _ = append_pane_output(buffer, &chunk.data);
             buffer.sync_update_in_progress = chunk.sync_update_active;
             buffer.expected_stream_start = Some(chunk.stream_end);
+            update_parser_mode_hints(
+                &mut self.pane_mouse_protocol_hints,
+                &mut self.pane_input_mode_hints,
+                chunk.pane_id,
+                buffer,
+            );
             self.dirty_pane_ids.insert(chunk.pane_id);
         }
 
@@ -174,6 +195,10 @@ impl AttachScenePipeline {
 
         let active_pane_ids = attach_layout_pane_id_set(&next_layout);
         self.pane_buffers
+            .retain(|pane_id, _| active_pane_ids.contains(pane_id));
+        self.pane_mouse_protocol_hints
+            .retain(|pane_id, _| active_pane_ids.contains(pane_id));
+        self.pane_input_mode_hints
             .retain(|pane_id, _| active_pane_ids.contains(pane_id));
         self.layout_state = Some(next_layout);
 
@@ -229,6 +254,12 @@ impl AttachScenePipeline {
             },
             |buffer, bytes| {
                 let toggled_alternate = append_pane_output(buffer, bytes);
+                update_parser_mode_hints(
+                    &mut self.pane_mouse_protocol_hints,
+                    &mut self.pane_input_mode_hints,
+                    pane_id,
+                    buffer,
+                );
                 if toggled_alternate {
                     self.full_pane_redraw = true;
                 }
@@ -312,6 +343,16 @@ impl AttachScenePipeline {
     }
 
     #[must_use]
+    pub const fn pane_mouse_protocol_hints(&self) -> &BTreeMap<Uuid, AttachMouseProtocolState> {
+        &self.pane_mouse_protocol_hints
+    }
+
+    #[must_use]
+    pub const fn pane_input_mode_hints(&self) -> &BTreeMap<Uuid, AttachInputModeState> {
+        &self.pane_input_mode_hints
+    }
+
+    #[must_use]
     pub fn drain_diagnostics(
         &mut self,
         since_sequence: Option<u64>,
@@ -344,6 +385,29 @@ impl AttachScenePipeline {
             let _ = self.diagnostics.pop_front();
         }
     }
+}
+
+fn update_parser_mode_hints(
+    pane_mouse_protocol_hints: &mut BTreeMap<Uuid, AttachMouseProtocolState>,
+    pane_input_mode_hints: &mut BTreeMap<Uuid, AttachInputModeState>,
+    pane_id: Uuid,
+    buffer: &PaneRenderBuffer,
+) {
+    let screen = buffer.parser.screen();
+    pane_mouse_protocol_hints.insert(
+        pane_id,
+        AttachMouseProtocolState {
+            mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
+            encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
+        },
+    );
+    pane_input_mode_hints.insert(
+        pane_id,
+        AttachInputModeState {
+            application_cursor: screen.application_cursor(),
+            application_keypad: screen.application_keypad(),
+        },
+    );
 }
 
 fn now_epoch_ms() -> u64 {

@@ -7,10 +7,11 @@
 use bmux_mobile_core::{
     ConnectionManager, ConnectionRequest, ConnectionState, ConnectionStatus, HostKeyPinSuggestion,
     MobileCoreError, ObservedHostKey, TargetInput, TargetRecord, TargetTransport, TerminalChunk,
-    TerminalChunkKind, TerminalDiagnostic, TerminalOpenRequest, TerminalSessionState,
-    TerminalSessionStatus, TerminalSize, TerminalStatusSeverity,
-    apply_pin_query_fragment_to_target, apply_pin_suggestion_to_target, observe_ssh_host_key,
-    observe_ssh_host_key_fingerprint_sha256, observe_ssh_host_key_with_pin_suggestion,
+    TerminalChunkKind, TerminalDiagnostic, TerminalMouseButton, TerminalMouseEvent,
+    TerminalMouseEventKind, TerminalOpenRequest, TerminalSessionState, TerminalSessionStatus,
+    TerminalSize, TerminalStatusSeverity, apply_pin_query_fragment_to_target,
+    apply_pin_suggestion_to_target, observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
+    observe_ssh_host_key_with_pin_suggestion,
 };
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -104,6 +105,36 @@ pub enum TerminalStatusSeverityFfi {
     Info,
     Warn,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum TerminalMouseButtonFfi {
+    Left,
+    Middle,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum TerminalMouseEventKindFfi {
+    Down,
+    Up,
+    Drag,
+    Move,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalMouseEventFfi {
+    pub kind: TerminalMouseEventKindFfi,
+    pub button: Option<TerminalMouseButtonFfi>,
+    pub row: u16,
+    pub col: u16,
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -222,6 +253,50 @@ const fn map_terminal_status_severity(value: TerminalStatusSeverity) -> Terminal
         TerminalStatusSeverity::Warn => TerminalStatusSeverityFfi::Warn,
         TerminalStatusSeverity::Error => TerminalStatusSeverityFfi::Error,
     }
+}
+
+const fn map_terminal_mouse_button(value: TerminalMouseButtonFfi) -> TerminalMouseButton {
+    match value {
+        TerminalMouseButtonFfi::Left => TerminalMouseButton::Left,
+        TerminalMouseButtonFfi::Middle => TerminalMouseButton::Middle,
+        TerminalMouseButtonFfi::Right => TerminalMouseButton::Right,
+    }
+}
+
+const fn map_terminal_mouse_event_kind(value: TerminalMouseEventKindFfi) -> TerminalMouseEventKind {
+    match value {
+        TerminalMouseEventKindFfi::Down => TerminalMouseEventKind::Down,
+        TerminalMouseEventKindFfi::Up => TerminalMouseEventKind::Up,
+        TerminalMouseEventKindFfi::Drag => TerminalMouseEventKind::Drag,
+        TerminalMouseEventKindFfi::Move => TerminalMouseEventKind::Move,
+        TerminalMouseEventKindFfi::ScrollUp => TerminalMouseEventKind::ScrollUp,
+        TerminalMouseEventKindFfi::ScrollDown => TerminalMouseEventKind::ScrollDown,
+        TerminalMouseEventKindFfi::ScrollLeft => TerminalMouseEventKind::ScrollLeft,
+        TerminalMouseEventKindFfi::ScrollRight => TerminalMouseEventKind::ScrollRight,
+    }
+}
+
+fn map_terminal_mouse_event(value: &TerminalMouseEventFfi) -> Result<TerminalMouseEvent> {
+    let kind = map_terminal_mouse_event_kind(value.kind);
+    if matches!(
+        kind,
+        TerminalMouseEventKind::Down | TerminalMouseEventKind::Up | TerminalMouseEventKind::Drag
+    ) && value.button.is_none()
+    {
+        return Err(MobileCoreError::InvalidTarget(
+            "mouse event kind requires button".to_string(),
+        ));
+    }
+
+    Ok(TerminalMouseEvent {
+        kind,
+        button: value.button.map(map_terminal_mouse_button),
+        row: value.row,
+        col: value.col,
+        shift: value.shift,
+        alt: value.alt,
+        control: value.control,
+    })
 }
 
 fn map_target_record(value: TargetRecord) -> TargetRecordFfi {
@@ -487,6 +562,23 @@ impl MobileApi {
             .map_err(|_| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
         let mut manager = self.lock_manager()?;
         manager.write_terminal_input(terminal_id, bytes)
+    }
+
+    /// Send a terminal mouse event.
+    ///
+    /// # Errors
+    ///
+    /// Returns UUID parsing, terminal lookup, or closed-session errors.
+    pub fn send_terminal_mouse_event(
+        &self,
+        terminal_id: &str,
+        event: &TerminalMouseEventFfi,
+    ) -> Result<()> {
+        let terminal_id = Uuid::parse_str(terminal_id)
+            .map_err(|_| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        let event = map_terminal_mouse_event(event)?;
+        let mut manager = self.lock_manager()?;
+        manager.send_terminal_mouse_event(terminal_id, event)
     }
 
     /// Resize a terminal stream.
@@ -773,6 +865,21 @@ impl MobileApiFfi {
             .map_err(MobileFfiError::from)
     }
 
+    /// Send a terminal mouse event.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped UUID parsing, terminal lookup, and closed-session errors.
+    pub fn send_terminal_mouse_event(
+        &self,
+        terminal_id: String,
+        event: TerminalMouseEventFfi,
+    ) -> std::result::Result<(), MobileFfiError> {
+        self.inner
+            .send_terminal_mouse_event(&terminal_id, &event)
+            .map_err(MobileFfiError::from)
+    }
+
     /// Resize terminal stream.
     ///
     /// # Errors
@@ -936,6 +1043,21 @@ mod tests {
             Ok(())
         }
 
+        fn mouse_event(&self, handle_id: Uuid, _event: &TerminalMouseEvent) -> Result<()> {
+            if self
+                .sessions
+                .lock()
+                .expect("mock terminal sessions lock")
+                .contains_key(&handle_id)
+            {
+                Ok(())
+            } else {
+                Err(MobileCoreError::TerminalSessionNotFound(
+                    handle_id.to_string(),
+                ))
+            }
+        }
+
         fn resize(&self, handle_id: Uuid, _rows: u16, _cols: u16) -> Result<()> {
             if self
                 .sessions
@@ -1072,6 +1194,20 @@ mod tests {
 
         api.write_terminal_input(&terminal.id.to_string(), b"pwd\n")
             .expect("terminal write should work");
+
+        api.send_terminal_mouse_event(
+            &terminal.id.to_string(),
+            &TerminalMouseEventFfi {
+                kind: TerminalMouseEventKindFfi::Down,
+                button: Some(TerminalMouseButtonFfi::Left),
+                row: 0,
+                col: 0,
+                shift: false,
+                alt: false,
+                control: false,
+            },
+        )
+        .expect("terminal mouse event should work");
 
         let chunks = api
             .poll_terminal_output(&terminal.id.to_string(), 8)

@@ -3,6 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod cursor;
+pub mod mouse;
 pub mod reconcile;
 pub mod render;
 pub mod scene_pipeline;
@@ -16,6 +17,10 @@ pub use bmux_attach_pipeline_models::{
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+pub use mouse::{
+    Button as AttachMouseButton, Event as AttachMouseEvent, EventKind as AttachMouseEventKind,
+    Modifiers as AttachMouseModifiers, PaneProtocol as AttachPaneMouseProtocol,
+};
 pub use scene_pipeline::AttachScenePipeline;
 pub use types::{
     AttachCursorState, AttachPaneMouseProtocolHints, AttachScrollbackCursor,

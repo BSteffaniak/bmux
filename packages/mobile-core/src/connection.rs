@@ -96,6 +96,38 @@ pub struct TerminalSize {
     pub cols: u16,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMouseEventKind {
+    Down,
+    Up,
+    Drag,
+    Move,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalMouseEvent {
+    pub kind: TerminalMouseEventKind,
+    pub button: Option<TerminalMouseButton>,
+    pub row: u16,
+    pub col: u16,
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalSessionState {
     pub id: Uuid,
@@ -578,6 +610,49 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Send a terminal mouse event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MobileCoreError::TerminalSessionNotFound`] when unknown and
+    /// [`MobileCoreError::TerminalSessionClosed`] when the stream is closed.
+    pub fn send_terminal_mouse_event(
+        &mut self,
+        terminal_id: Uuid,
+        event: TerminalMouseEvent,
+    ) -> Result<()> {
+        let runtime = self
+            .terminals
+            .get_mut(&terminal_id)
+            .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        if runtime.state.status == TerminalSessionStatus::Closed {
+            runtime.push_status_chunk(
+                "mouse rejected: session is closed".to_string(),
+                TerminalStatusSeverity::Error,
+            );
+            return Err(MobileCoreError::TerminalSessionClosed(
+                terminal_id.to_string(),
+            ));
+        }
+
+        self.terminal_backend
+            .mouse_event(runtime.backend.id, &event)
+            .map_err(|error| {
+                runtime.state.status = TerminalSessionStatus::Failed;
+                runtime.push_diagnostic(
+                    "mouse",
+                    TerminalStatusSeverity::Error,
+                    Some("backend_mouse_failed"),
+                    error.to_string(),
+                );
+                runtime.push_status_chunk(
+                    format!("mouse event failed: {error}"),
+                    TerminalStatusSeverity::Error,
+                );
+                error
+            })
+    }
+
     /// Resize a terminal stream.
     ///
     /// # Errors
@@ -974,6 +1049,17 @@ mod tests {
             Ok(())
         }
 
+        fn mouse_event(&self, handle_id: Uuid, _event: &TerminalMouseEvent) -> Result<()> {
+            let sessions = self.sessions.lock().expect("mock terminal sessions lock");
+            if sessions.contains_key(&handle_id) {
+                Ok(())
+            } else {
+                Err(MobileCoreError::TerminalSessionNotFound(
+                    handle_id.to_string(),
+                ))
+            }
+        }
+
         fn resize(&self, handle_id: Uuid, _rows: u16, _cols: u16) -> Result<()> {
             let sessions = self.sessions.lock().expect("mock terminal sessions lock");
             if sessions.contains_key(&handle_id) {
@@ -1051,6 +1137,20 @@ mod tests {
                     .extend_from_slice(bytes);
             }
             Ok(())
+        }
+
+        fn mouse_event(&self, handle_id: Uuid, _event: &TerminalMouseEvent) -> Result<()> {
+            let sessions = self
+                .sessions
+                .lock()
+                .expect("recovering terminal sessions lock");
+            if sessions.contains_key(&handle_id) {
+                Ok(())
+            } else {
+                Err(MobileCoreError::TerminalSessionNotFound(
+                    handle_id.to_string(),
+                ))
+            }
         }
 
         fn resize(&self, handle_id: Uuid, _rows: u16, _cols: u16) -> Result<()> {
@@ -1182,6 +1282,20 @@ mod tests {
         manager
             .write_terminal_input(terminal.id, b"ls\n")
             .expect("terminal write should work");
+        manager
+            .send_terminal_mouse_event(
+                terminal.id,
+                TerminalMouseEvent {
+                    kind: TerminalMouseEventKind::Down,
+                    button: Some(TerminalMouseButton::Left),
+                    row: 0,
+                    col: 0,
+                    shift: false,
+                    alt: false,
+                    control: false,
+                },
+            )
+            .expect("terminal mouse event should work");
         manager
             .resize_terminal(
                 terminal.id,

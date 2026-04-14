@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::apply_attach_output_chunk_with;
 use bmux_attach_pipeline::{AttachChunkApplyOutcome, AttachOutputChunkMeta};
 use bmux_client::{
@@ -7,7 +8,7 @@ use bmux_client::{
 };
 use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
 use bmux_ipc::{
-    AttachRect, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ContextSelector,
+    AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ContextSelector,
     ContextSessionBindingSummary, ContextSummary, ControlCatalogSnapshot, InvokeServiceKind,
     PaneFocusDirection, PaneSelector, PaneSplitDirection, SessionSelector, SessionSummary,
 };
@@ -5230,59 +5231,19 @@ pub const fn mouse_protocol_encoding_to_ipc(
     }
 }
 
-pub const fn mouse_protocol_mode_from_ipc(
-    mode: bmux_ipc::AttachMouseProtocolMode,
-) -> vt100::MouseProtocolMode {
-    match mode {
-        bmux_ipc::AttachMouseProtocolMode::None => vt100::MouseProtocolMode::None,
-        bmux_ipc::AttachMouseProtocolMode::Press => vt100::MouseProtocolMode::Press,
-        bmux_ipc::AttachMouseProtocolMode::PressRelease => vt100::MouseProtocolMode::PressRelease,
-        bmux_ipc::AttachMouseProtocolMode::ButtonMotion => vt100::MouseProtocolMode::ButtonMotion,
-        bmux_ipc::AttachMouseProtocolMode::AnyMotion => vt100::MouseProtocolMode::AnyMotion,
-    }
-}
-
-pub const fn mouse_protocol_encoding_from_ipc(
-    encoding: bmux_ipc::AttachMouseProtocolEncoding,
-) -> vt100::MouseProtocolEncoding {
-    match encoding {
-        bmux_ipc::AttachMouseProtocolEncoding::Default => vt100::MouseProtocolEncoding::Default,
-        bmux_ipc::AttachMouseProtocolEncoding::Utf8 => vt100::MouseProtocolEncoding::Utf8,
-        bmux_ipc::AttachMouseProtocolEncoding::Sgr => vt100::MouseProtocolEncoding::Sgr,
-    }
-}
-
 pub fn attach_pane_mouse_protocol(
     view_state: &AttachViewState,
     pane_id: Uuid,
 ) -> Option<AttachPaneMouseProtocol> {
-    let parser_protocol = view_state.pane_buffers.get(&pane_id).map(|buffer| {
-        let screen = buffer.parser.screen();
-        AttachPaneMouseProtocol {
-            mode: screen.mouse_protocol_mode(),
-            encoding: screen.mouse_protocol_encoding(),
-        }
-    });
-
-    let hint_protocol = view_state
-        .pane_mouse_protocol_hints
-        .get(&pane_id)
-        .map(|hint| AttachPaneMouseProtocol {
-            mode: mouse_protocol_mode_from_ipc(hint.mode),
-            encoding: mouse_protocol_encoding_from_ipc(hint.encoding),
-        });
-
-    match (parser_protocol, hint_protocol) {
-        (Some(protocol), Some(hint))
-            if protocol.mode == vt100::MouseProtocolMode::None
-                && hint.mode != vt100::MouseProtocolMode::None =>
-        {
-            Some(hint)
-        }
-        (Some(protocol), _) => Some(protocol),
-        (None, Some(hint)) => Some(hint),
-        (None, None) => None,
-    }
+    let protocol = attach_mouse::pane_protocol(
+        &view_state.pane_buffers,
+        &view_state.pane_mouse_protocol_hints,
+        pane_id,
+    )?;
+    Some(AttachPaneMouseProtocol {
+        mode: protocol.mode,
+        encoding: protocol.encoding,
+    })
 }
 
 pub fn attach_pane_input_mode(
@@ -5323,66 +5284,25 @@ pub fn focused_attach_pane_input_mode(view_state: &AttachViewState) -> AttachPan
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 pub const fn mouse_protocol_mode_reports_event(
     mode: vt100::MouseProtocolMode,
     kind: MouseEventKind,
 ) -> bool {
-    match mode {
-        vt100::MouseProtocolMode::None => false,
-        vt100::MouseProtocolMode::Press => matches!(
-            kind,
-            MouseEventKind::Down(_)
-                | MouseEventKind::ScrollUp
-                | MouseEventKind::ScrollDown
-                | MouseEventKind::ScrollLeft
-                | MouseEventKind::ScrollRight
-        ),
-        vt100::MouseProtocolMode::PressRelease => matches!(
-            kind,
-            MouseEventKind::Down(_)
-                | MouseEventKind::Up(_)
-                | MouseEventKind::ScrollUp
-                | MouseEventKind::ScrollDown
-                | MouseEventKind::ScrollLeft
-                | MouseEventKind::ScrollRight
-        ),
-        vt100::MouseProtocolMode::ButtonMotion => matches!(
-            kind,
-            MouseEventKind::Down(_)
-                | MouseEventKind::Up(_)
-                | MouseEventKind::Drag(_)
-                | MouseEventKind::ScrollUp
-                | MouseEventKind::ScrollDown
-                | MouseEventKind::ScrollLeft
-                | MouseEventKind::ScrollRight
-        ),
-        vt100::MouseProtocolMode::AnyMotion => matches!(
-            kind,
-            MouseEventKind::Down(_)
-                | MouseEventKind::Up(_)
-                | MouseEventKind::Drag(_)
-                | MouseEventKind::Moved
-                | MouseEventKind::ScrollUp
-                | MouseEventKind::ScrollDown
-                | MouseEventKind::ScrollLeft
-                | MouseEventKind::ScrollRight
-        ),
-    }
+    attach_mouse::mode_reports_event(mode, mouse_event_kind_to_shared(kind))
 }
 
 pub fn encode_attach_mouse_for_protocol(
     mouse_event: MouseEvent,
     protocol: AttachPaneMouseProtocol,
 ) -> Option<Vec<u8>> {
-    if !mouse_protocol_mode_reports_event(protocol.mode, mouse_event.kind) {
-        return None;
-    }
-
-    match protocol.encoding {
-        vt100::MouseProtocolEncoding::Sgr => encode_attach_mouse_sgr(mouse_event),
-        vt100::MouseProtocolEncoding::Default => encode_attach_mouse_x10(mouse_event, false),
-        vt100::MouseProtocolEncoding::Utf8 => encode_attach_mouse_x10(mouse_event, true),
-    }
+    attach_mouse::encode_for_protocol(
+        mouse_event_to_shared(mouse_event),
+        attach_mouse::PaneProtocol {
+            mode: protocol.mode,
+            encoding: protocol.encoding,
+        },
+    )
 }
 
 pub async fn maybe_forward_attach_mouse_event(
@@ -5430,105 +5350,50 @@ pub fn attach_mouse_forward_bytes_for_target(
     encode_attach_mouse_for_protocol(mouse_event, protocol)
 }
 
+#[cfg(test)]
 pub fn encode_attach_mouse_sgr(mouse_event: MouseEvent) -> Option<Vec<u8>> {
-    let (cb, suffix) = encode_attach_mouse_sgr_cb(mouse_event.kind, mouse_event.modifiers)?;
-    let x = mouse_event.column.saturating_add(1);
-    let y = mouse_event.row.saturating_add(1);
-    Some(format!("\x1b[<{cb};{x};{y}{suffix}").into_bytes())
+    attach_mouse::encode_sgr(mouse_event_to_shared(mouse_event))
 }
 
-pub fn encode_attach_mouse_x10(mouse_event: MouseEvent, utf8_coordinates: bool) -> Option<Vec<u8>> {
-    let cb = encode_attach_mouse_x10_cb(mouse_event.kind, mouse_event.modifiers)?;
-    let x = mouse_event.column.saturating_add(1);
-    let y = mouse_event.row.saturating_add(1);
-
-    let mut bytes = Vec::with_capacity(if utf8_coordinates { 12 } else { 6 });
-    bytes.extend_from_slice(b"\x1b[M");
-
-    if utf8_coordinates {
-        encode_utf8_mouse_component(&mut bytes, cb.saturating_add(32))?;
-        encode_utf8_mouse_component(&mut bytes, x.saturating_add(32))?;
-        encode_utf8_mouse_component(&mut bytes, y.saturating_add(32))?;
-    } else {
-        if x > 223 || y > 223 {
-            return None;
-        }
-        bytes.push(u8::try_from(cb.saturating_add(32)).ok()?);
-        bytes.push(u8::try_from(x.saturating_add(32)).ok()?);
-        bytes.push(u8::try_from(y.saturating_add(32)).ok()?);
+const fn mouse_button_to_shared(button: MouseButton) -> attach_mouse::Button {
+    match button {
+        MouseButton::Left => attach_mouse::Button::Left,
+        MouseButton::Middle => attach_mouse::Button::Middle,
+        MouseButton::Right => attach_mouse::Button::Right,
     }
-
-    Some(bytes)
 }
 
-pub fn encode_utf8_mouse_component(bytes: &mut Vec<u8>, value: u16) -> Option<()> {
-    let codepoint = char::from_u32(u32::from(value))?;
-    let mut buffer = [0_u8; 4];
-    let encoded = codepoint.encode_utf8(&mut buffer);
-    bytes.extend_from_slice(encoded.as_bytes());
-    Some(())
-}
-
-pub const fn encode_attach_mouse_modifier_bits(modifiers: KeyModifiers) -> u16 {
-    let mut cb: u16 = if modifiers.contains(KeyModifiers::SHIFT) {
-        4
-    } else {
-        0
-    };
-    if modifiers.contains(KeyModifiers::ALT) {
-        cb += 8;
-    }
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        cb += 16;
-    }
-    cb
-}
-
-#[allow(clippy::unnecessary_wraps)] // Returns None for unrecognized mouse events in future
-pub const fn encode_attach_mouse_x10_cb(
-    kind: MouseEventKind,
-    modifiers: KeyModifiers,
-) -> Option<u16> {
-    let modifier_bits = encode_attach_mouse_modifier_bits(modifiers);
-    let button_bits = match kind {
-        MouseEventKind::Down(MouseButton::Left) => 0,
-        MouseEventKind::Down(MouseButton::Middle) => 1,
-        MouseEventKind::Down(MouseButton::Right) => 2,
-        MouseEventKind::Up(MouseButton::Left | MouseButton::Middle | MouseButton::Right) => 3,
-        MouseEventKind::Drag(MouseButton::Left) => 32,
-        MouseEventKind::Drag(MouseButton::Middle) => 33,
-        MouseEventKind::Drag(MouseButton::Right) => 34,
-        MouseEventKind::Moved => 35,
-        MouseEventKind::ScrollUp => 64,
-        MouseEventKind::ScrollDown => 65,
-        MouseEventKind::ScrollLeft => 66,
-        MouseEventKind::ScrollRight => 67,
-    };
-    Some(modifier_bits + button_bits)
-}
-
-#[allow(clippy::unnecessary_wraps)] // Returns None for unrecognized mouse events in future
-pub const fn encode_attach_mouse_sgr_cb(
-    kind: MouseEventKind,
-    modifiers: KeyModifiers,
-) -> Option<(u16, char)> {
-    let cb = encode_attach_mouse_modifier_bits(modifiers);
-
+const fn mouse_event_kind_to_shared(kind: MouseEventKind) -> attach_mouse::EventKind {
     match kind {
-        MouseEventKind::Down(MouseButton::Left) => Some((cb, 'M')),
-        MouseEventKind::Down(MouseButton::Middle) => Some((cb + 1, 'M')),
-        MouseEventKind::Down(MouseButton::Right) => Some((cb + 2, 'M')),
-        MouseEventKind::Up(MouseButton::Left) => Some((cb, 'm')),
-        MouseEventKind::Up(MouseButton::Middle) => Some((cb + 1, 'm')),
-        MouseEventKind::Up(MouseButton::Right) => Some((cb + 2, 'm')),
-        MouseEventKind::Drag(MouseButton::Left) => Some((cb + 32, 'M')),
-        MouseEventKind::Drag(MouseButton::Middle) => Some((cb + 33, 'M')),
-        MouseEventKind::Drag(MouseButton::Right) => Some((cb + 34, 'M')),
-        MouseEventKind::Moved => Some((cb + 35, 'M')),
-        MouseEventKind::ScrollUp => Some((cb + 64, 'M')),
-        MouseEventKind::ScrollDown => Some((cb + 65, 'M')),
-        MouseEventKind::ScrollLeft => Some((cb + 66, 'M')),
-        MouseEventKind::ScrollRight => Some((cb + 67, 'M')),
+        MouseEventKind::Down(button) => {
+            attach_mouse::EventKind::Down(mouse_button_to_shared(button))
+        }
+        MouseEventKind::Up(button) => attach_mouse::EventKind::Up(mouse_button_to_shared(button)),
+        MouseEventKind::Drag(button) => {
+            attach_mouse::EventKind::Drag(mouse_button_to_shared(button))
+        }
+        MouseEventKind::Moved => attach_mouse::EventKind::Moved,
+        MouseEventKind::ScrollUp => attach_mouse::EventKind::ScrollUp,
+        MouseEventKind::ScrollDown => attach_mouse::EventKind::ScrollDown,
+        MouseEventKind::ScrollLeft => attach_mouse::EventKind::ScrollLeft,
+        MouseEventKind::ScrollRight => attach_mouse::EventKind::ScrollRight,
+    }
+}
+
+const fn key_modifiers_to_shared(modifiers: KeyModifiers) -> attach_mouse::Modifiers {
+    attach_mouse::Modifiers {
+        shift: modifiers.contains(KeyModifiers::SHIFT),
+        alt: modifiers.contains(KeyModifiers::ALT),
+        control: modifiers.contains(KeyModifiers::CONTROL),
+    }
+}
+
+const fn mouse_event_to_shared(mouse_event: MouseEvent) -> attach_mouse::Event {
+    attach_mouse::Event {
+        kind: mouse_event_kind_to_shared(mouse_event.kind),
+        column: mouse_event.column,
+        row: mouse_event.row,
+        modifiers: key_modifiers_to_shared(mouse_event.modifiers),
     }
 }
 
@@ -5744,32 +5609,7 @@ pub async fn focus_attach_pane(
 
 pub fn attach_scene_pane_at(view_state: &AttachViewState, column: u16, row: u16) -> Option<Uuid> {
     let layout_state = view_state.cached_layout_state.as_ref()?;
-    let mut best: Option<(bmux_ipc::AttachLayer, i32, usize, Uuid)> = None;
-    for (index, surface) in layout_state.scene.surfaces.iter().enumerate() {
-        let Some(pane_id) = surface.pane_id else {
-            continue;
-        };
-        if !surface.visible || !surface.accepts_input {
-            continue;
-        }
-        if !attach_rect_contains_point(surface.rect, column, row) {
-            continue;
-        }
-        let candidate = (surface.layer, surface.z, index, pane_id);
-        if best.as_ref().is_none_or(|current| candidate > *current) {
-            best = Some(candidate);
-        }
-    }
-    best.map(|(_, _, _, pane_id)| pane_id)
-}
-
-pub const fn attach_rect_contains_point(rect: AttachRect, column: u16, row: u16) -> bool {
-    if rect.w == 0 || rect.h == 0 {
-        return false;
-    }
-    let max_x = rect.x.saturating_add(rect.w.saturating_sub(1));
-    let max_y = rect.y.saturating_add(rect.h.saturating_sub(1));
-    column >= rect.x && column <= max_x && row >= rect.y && row <= max_y
+    attach_mouse::pane_at(&layout_state.scene, column, row)
 }
 
 pub fn restore_terminal_after_attach_ui() -> Result<()> {

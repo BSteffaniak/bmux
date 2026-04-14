@@ -56,6 +56,7 @@ fun TerminalSessionScreen(
     openTerminal: suspend (targetId: String, session: String?, rows: Int, cols: Int) -> Result<String>,
     pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<TerminalChunkFrame>>,
     writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
+    sendTerminalMouseEvent: suspend (terminalId: String, event: TerminalMouseEvent) -> Result<Unit>,
     resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
     closeTerminal: suspend (terminalId: String) -> Result<Unit>,
     fetchTerminalDiagnostics: suspend (terminalId: String, sinceSequence: Long?, limit: Int) -> Result<List<TerminalDiagnosticFrame>>,
@@ -68,6 +69,7 @@ fun TerminalSessionScreen(
             openTerminal = openTerminal,
             pollTerminalOutput = pollTerminalOutput,
             writeTerminalInput = writeTerminalInput,
+            sendTerminalMouseEvent = sendTerminalMouseEvent,
             resizeTerminal = resizeTerminal,
             closeTerminal = closeTerminal,
             fetchTerminalDiagnostics = fetchTerminalDiagnostics,
@@ -122,6 +124,7 @@ fun TerminalSessionScreen(
         }.onSuccess {
             connection = it
             renderer.setOnInput(it::send)
+            renderer.setOnMouseEvent(it::mouse)
             renderer.setOnResize(it::resize)
         }.onFailure {
             warning = it.message ?: "Failed to open terminal"
@@ -281,6 +284,7 @@ private class CoreTerminalTransport(
     private val openTerminal: suspend (targetId: String, session: String?, rows: Int, cols: Int) -> Result<String>,
     private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<TerminalChunkFrame>>,
     private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
+    private val sendTerminalMouseEvent: suspend (terminalId: String, event: TerminalMouseEvent) -> Result<Unit>,
     private val resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
     private val closeTerminal: suspend (terminalId: String) -> Result<Unit>,
     private val fetchTerminalDiagnostics: suspend (terminalId: String, sinceSequence: Long?, limit: Int) -> Result<List<TerminalDiagnosticFrame>>,
@@ -324,6 +328,7 @@ private class CoreTerminalTransport(
             onStatus = onStatus,
             pollTerminalOutput = pollTerminalOutput,
             writeTerminalInput = writeTerminalInput,
+            sendTerminalMouseEvent = sendTerminalMouseEvent,
             resizeTerminal = resizeTerminal,
             closeTerminal = closeTerminal,
             fetchTerminalDiagnostics = fetchTerminalDiagnostics,
@@ -346,6 +351,7 @@ private class CoreTerminalTransportConnection(
     private val onStatus: (TerminalStatusEvent) -> Unit,
     private val pollTerminalOutput: suspend (terminalId: String, maxChunks: Int) -> Result<List<TerminalChunkFrame>>,
     private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
+    private val sendTerminalMouseEvent: suspend (terminalId: String, event: TerminalMouseEvent) -> Result<Unit>,
     private val resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
     private val closeTerminal: suspend (terminalId: String) -> Result<Unit>,
     private val fetchTerminalDiagnostics: suspend (terminalId: String, sinceSequence: Long?, limit: Int) -> Result<List<TerminalDiagnosticFrame>>,
@@ -458,6 +464,18 @@ private class CoreTerminalTransportConnection(
         }
     }
 
+    override fun mouse(event: TerminalMouseEvent) {
+        if (closed) {
+            return
+        }
+
+        val queueResult = outboundCommands.trySend(OutboundCommand.Mouse(event))
+        if (queueResult.isFailure && !closed) {
+            val message = queueResult.exceptionOrNull()?.message ?: "unknown"
+            sink("\r\n[terminal mouse queue failed: $message]\r\n".encodeToByteArray())
+        }
+    }
+
     override fun resize(rows: Int, cols: Int) {
         if (closed) {
             return
@@ -527,6 +545,11 @@ private class CoreTerminalTransportConnection(
                         sink("\r\n[terminal write failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
                     }
                 }
+                is OutboundCommand.Mouse -> {
+                    sendTerminalMouseEvent(terminalId, command.event).onFailure { error ->
+                        sink("\r\n[terminal mouse failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
+                    }
+                }
                 is OutboundCommand.Resize -> {
                     val requested = command.rows to command.cols
                     val pending = pendingResize?.let { resize -> resize.rows to resize.cols }
@@ -559,6 +582,7 @@ private class CoreTerminalTransportConnection(
 
     private sealed interface OutboundCommand {
         data class Input(val bytes: ByteArray) : OutboundCommand
+        data class Mouse(val event: TerminalMouseEvent) : OutboundCommand
         data class Resize(val rows: Int, val cols: Int) : OutboundCommand
         object Close : OutboundCommand
     }

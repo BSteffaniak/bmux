@@ -41,8 +41,36 @@ data class TerminalStatusEvent(
     val severity: TerminalStatusSeverity,
 )
 
+enum class TerminalMouseButton {
+    LEFT,
+    MIDDLE,
+    RIGHT,
+}
+
+enum class TerminalMouseEventKind {
+    DOWN,
+    UP,
+    DRAG,
+    MOVE,
+    SCROLL_UP,
+    SCROLL_DOWN,
+    SCROLL_LEFT,
+    SCROLL_RIGHT,
+}
+
+data class TerminalMouseEvent(
+    val kind: TerminalMouseEventKind,
+    val button: TerminalMouseButton? = null,
+    val row: Int,
+    val col: Int,
+    val shift: Boolean = false,
+    val alt: Boolean = false,
+    val control: Boolean = false,
+)
+
 interface TerminalTransportConnection {
     fun send(data: ByteArray)
+    fun mouse(event: TerminalMouseEvent)
     fun resize(rows: Int, cols: Int)
     fun close()
 }
@@ -62,6 +90,7 @@ interface TerminalRenderer {
     fun appendOutput(data: ByteArray)
     fun setOnInput(handler: (ByteArray) -> Unit)
     fun setOnResize(handler: (rows: Int, cols: Int) -> Unit)
+    fun setOnMouseEvent(handler: (TerminalMouseEvent) -> Unit)
 
     @Composable
     fun Render(modifier: Modifier)
