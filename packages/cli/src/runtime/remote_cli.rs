@@ -1099,7 +1099,7 @@ pub(super) async fn run_setup(check: bool, mode: Option<HostedModeArg>) -> Resul
     ) {
         println!("{line}");
     }
-    println!("Setup complete.");
+    println!("Status: ready");
     Ok(0)
 }
 
@@ -1667,6 +1667,9 @@ pub(super) fn run_hosts(verbose: bool) -> Result<u8> {
         .is_some_and(|state| is_process_alive(state.pid));
     if auth_ready && host_running {
         println!("Status: ready");
+        if let Some(next) = hosts_next_action(&config, host_state.as_ref()) {
+            println!("Next: {next}");
+        }
     } else {
         let reason = hosts_status_reason(auth_ready, host_running, host_state.as_ref());
         println!("Status: not ready ({reason})");
@@ -1704,6 +1707,25 @@ pub(super) fn run_hosts(verbose: bool) -> Result<u8> {
         println!("Advanced: bmux host --daemon");
     }
     Ok(0)
+}
+
+fn hosts_next_action(config: &BmuxConfig, host_state: Option<&HostRuntimeState>) -> Option<String> {
+    if let Some(state) = host_state {
+        if let Some(link) = state.share_link.as_deref() {
+            return Some(format!("bmux join {link}"));
+        }
+        return Some(format!("bmux join {}", state.target));
+    }
+    if let Some((name, _)) = config.connections.share_links.iter().next() {
+        return Some(format!("bmux join bmux://{name}"));
+    }
+    if let Some(target) = config.connections.recent_targets.first() {
+        return Some(format!("bmux join {target}"));
+    }
+    if let Some((name, _)) = config.connections.targets.iter().next() {
+        return Some(format!("bmux connect {name}"));
+    }
+    None
 }
 
 fn hosts_status_reason(
@@ -1961,11 +1983,12 @@ pub(super) async fn run_share(
     config.save()?;
     let link_name = created.name.clone().unwrap_or(created_name);
     let invite_url = created.url;
+    println!("Status: ready");
     println!("Share link: bmux://{link_name}");
     if let Some(url) = invite_url.as_deref() {
         println!("Invite URL: {url}");
     }
-    println!("Join from another machine: bmux join bmux://{link_name}");
+    println!("Next: bmux join bmux://{link_name}");
     println!("Target: {resolved_target}");
     println!("Role: {role}");
     if let Some(value) = ttl {
@@ -2004,7 +2027,9 @@ pub(super) async fn run_unshare(name: &str) -> Result<u8> {
 
     if config.connections.share_links.remove(name).is_some() {
         config.save()?;
+        println!("Status: ready");
         println!("Revoked share link: bmux://{name}");
+        println!("Next: bmux hosts");
         return Ok(0);
     }
     Err(actionable_error(
@@ -2584,7 +2609,8 @@ fn render_text_qr(payload: &str) -> Result<Vec<String>> {
 fn run_host_status() -> Result<u8> {
     let paths = ConfigPaths::default();
     let Some(state) = load_host_runtime_state(&paths)? else {
-        println!("host runtime: not running");
+        println!("Status: not ready");
+        println!("Reason: host runtime is not running");
         println!("runtime: {}", active_runtime_name());
         println!("local ipc endpoint: {}", local_ipc_endpoint_label(&paths));
         println!("Fix: bmux setup");
@@ -2593,10 +2619,10 @@ fn run_host_status() -> Result<u8> {
     };
     if !is_process_alive(state.pid) {
         clear_host_runtime_state(&paths)?;
-        println!("host runtime: not running");
+        println!("Status: not ready");
+        println!("Reason: stale runtime state was cleared");
         println!("runtime: {}", active_runtime_name());
         println!("local ipc endpoint: {}", local_ipc_endpoint_label(&paths));
-        println!("Reason: stale runtime state was cleared");
         println!("Fix: bmux setup");
         println!("Advanced: bmux host --restart");
         return Ok(1);
@@ -2608,7 +2634,10 @@ fn run_host_status() -> Result<u8> {
 }
 
 fn format_host_status_lines(state: &HostRuntimeState) -> Vec<String> {
-    let mut lines = vec!["host runtime: running".to_string()];
+    let mut lines = vec![
+        "Status: ready".to_string(),
+        "host runtime: running".to_string(),
+    ];
     lines.push(format!("runtime: {}", active_runtime_name()));
     lines.push(format!(
         "local ipc endpoint: {}",
@@ -2629,18 +2658,14 @@ fn format_host_status_lines(state: &HostRuntimeState) -> Vec<String> {
 fn run_host_stop() -> Result<u8> {
     let paths = ConfigPaths::default();
     let Some(state) = load_host_runtime_state(&paths)? else {
-        println!("host runtime: not running");
-        println!("Fix: bmux setup");
-        println!("Advanced: bmux host --daemon");
+        println!("Status: ready (already stopped)");
         return Ok(0);
     };
 
     if !is_process_alive(state.pid) {
         clear_host_runtime_state(&paths)?;
-        println!("host runtime: not running");
+        println!("Status: ready (already stopped)");
         println!("Reason: stale runtime state was cleared");
-        println!("Fix: bmux setup");
-        println!("Advanced: bmux host --restart");
         return Ok(0);
     }
 
@@ -2668,7 +2693,8 @@ fn run_host_stop() -> Result<u8> {
     }
 
     clear_host_runtime_state(&paths)?;
-    println!("stopped host runtime (pid {})", state.pid);
+    println!("Status: ready");
+    println!("host runtime stopped (pid {})", state.pid);
     Ok(0)
 }
 
@@ -7828,9 +7854,10 @@ mod tests {
             .expect("load host runtime state")
             .expect("state present");
         let lines = format_host_status_lines(&loaded);
-        assert_eq!(lines[0], "host runtime: running");
-        assert_eq!(lines[1], "runtime: default");
-        assert!(lines[2].starts_with("local ipc endpoint: "));
+        assert_eq!(lines[0], "Status: ready");
+        assert_eq!(lines[1], "host runtime: running");
+        assert_eq!(lines[2], "runtime: default");
+        assert!(lines[3].starts_with("local ipc endpoint: "));
         assert!(lines.contains(&"name: demo-host".to_string()));
         assert!(lines.contains(&"pid: 9001".to_string()));
         assert!(lines.contains(&"target: iroh://endpoint-123".to_string()));

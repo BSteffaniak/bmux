@@ -116,6 +116,7 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
             println!("Fix: bmux setup");
         } else {
             println!("Status: ready");
+            println!("Next: bmux hosts");
         }
         for (name, ok, hint, detail) in &lines {
             if *ok {
