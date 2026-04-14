@@ -1,13 +1,13 @@
 use crate::error::{MobileCoreError, Result};
 use crate::target::{TargetRecord, TargetTransport};
-use bmux_client::{BmuxClient, ClientError};
+use bmux_client::{BmuxClient, ClientError, ServerEvent, StreamingBmuxClient};
 use bmux_ipc::compressed_stream::CompressedStream;
 use bmux_ipc::transport::{ErasedIpcStream, IpcTransportError};
-use bmux_ipc::{ErrorCode, SessionSelector};
+use bmux_ipc::{AttachPaneChunk, ErrorCode, SessionSelector};
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::io;
@@ -22,6 +22,8 @@ const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
 const SESSION_COMMAND_BUFFER: usize = 64;
 const DEFAULT_IROH_CONNECT_TIMEOUT_MS: u64 = 30_000;
 const IROH_COMPRESSED_RETRY_COUNT: usize = 2;
+const OUTPUT_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const EVENT_TRIGGER_FETCH_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IrohCompressionMode {
@@ -604,39 +606,59 @@ impl TerminalBackend for RemoteTerminalBackend {
             .clone()
             .or_else(|| Self::normalize_session_value(target.default_session.as_deref()));
 
-        let (handle_id, session_id, can_write) = self.runtime.block_on(async {
-            let attach_info = if let Some(preferred) = preferred_session {
-                let selector = Self::session_selector_from_value(&preferred);
-                match Self::attach_with_selector(&mut client, selector).await {
-                    Ok(info) => Ok(info),
-                    Err(error)
-                        if explicit_session.is_none() && Self::is_session_not_found(&error) =>
-                    {
-                        Self::attach_auto_session(&mut client).await
+        let (handle_id, session_id, can_write, focused_pane_id, streaming_client) =
+            self.runtime.block_on(async {
+                let attach_info = if let Some(preferred) = preferred_session {
+                    let selector = Self::session_selector_from_value(&preferred);
+                    match Self::attach_with_selector(&mut client, selector).await {
+                        Ok(info) => Ok(info),
+                        Err(error)
+                            if explicit_session.is_none() && Self::is_session_not_found(&error) =>
+                        {
+                            Self::attach_auto_session(&mut client).await
+                        }
+                        Err(error) => {
+                            Err(MobileCoreError::TerminalBackendFailure(error.to_string()))
+                        }
                     }
-                    Err(error) => Err(MobileCoreError::TerminalBackendFailure(error.to_string())),
-                }
-            } else {
-                Self::attach_auto_session(&mut client).await
-            }?;
+                } else {
+                    Self::attach_auto_session(&mut client).await
+                }?;
 
-            let _ = client
-                .attach_set_viewport(attach_info.0, cols, rows)
-                .await
-                .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
+                let _ = client
+                    .attach_set_viewport(attach_info.0, cols, rows)
+                    .await
+                    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
 
-            Ok::<(Uuid, Uuid, bool), MobileCoreError>((
-                Uuid::new_v4(),
-                attach_info.0,
-                attach_info.1,
-            ))
-        })?;
+                let focused_pane_id = client
+                    .attach_layout(attach_info.0)
+                    .await
+                    .ok()
+                    .map(|layout| layout.focused_pane_id);
+
+                let mut streaming_client = StreamingBmuxClient::from_client(client)
+                    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
+                streaming_client
+                    .enable_event_push()
+                    .await
+                    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
+
+                Ok::<(Uuid, Uuid, bool, Option<Uuid>, StreamingBmuxClient), MobileCoreError>((
+                    Uuid::new_v4(),
+                    attach_info.0,
+                    attach_info.1,
+                    focused_pane_id,
+                    streaming_client,
+                ))
+            })?;
 
         let (command_tx, command_rx) = mpsc::channel(SESSION_COMMAND_BUFFER);
-        drop(
-            self.runtime
-                .spawn(run_remote_terminal_session(client, session_id, command_rx)),
-        );
+        drop(self.runtime.spawn(run_remote_terminal_session(
+            streaming_client,
+            session_id,
+            focused_pane_id,
+            command_rx,
+        )));
         self.lock_sessions()?
             .insert(handle_id, RemoteTerminalSession { command_tx });
 
@@ -693,54 +715,237 @@ impl TerminalBackend for RemoteTerminalBackend {
 }
 
 async fn run_remote_terminal_session(
-    mut client: BmuxClient,
+    mut client: StreamingBmuxClient,
     session_id: Uuid,
+    focused_pane_id: Option<Uuid>,
     mut command_rx: mpsc::Receiver<SessionCommand>,
 ) {
-    while let Some(command) = command_rx.recv().await {
-        match command {
-            SessionCommand::PollOutput {
-                max_bytes,
-                response,
-            } => {
-                let result = client
-                    .attach_output(session_id, max_bytes)
-                    .await
-                    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
-                let _ = response.send(result);
+    let mut state = StreamOutputState::new(focused_pane_id);
+
+    loop {
+        tokio::select! {
+            maybe_command = command_rx.recv() => {
+                let Some(command) = maybe_command else {
+                    break;
+                };
+                if !handle_session_command(&mut client, &mut state, session_id, command).await {
+                    return;
+                }
             }
-            SessionCommand::WriteInput { bytes, response } => {
-                let result = client
-                    .attach_input(session_id, bytes)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
-                let _ = response.send(result);
-            }
-            SessionCommand::Resize {
-                rows,
-                cols,
-                response,
-            } => {
-                let result = client
-                    .attach_set_viewport(session_id, cols, rows)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
-                let _ = response.send(result);
-            }
-            SessionCommand::Close { response } => {
-                let result = client
-                    .detach()
-                    .await
-                    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
-                let _ = response.send(result);
-                return;
+            maybe_event = client.event_receiver().recv() => {
+                let Some(event) = maybe_event else {
+                    break;
+                };
+                handle_session_event(&mut client, &mut state, session_id, event).await;
             }
         }
     }
 
     let _ = client.detach().await;
+}
+
+async fn handle_session_command(
+    client: &mut StreamingBmuxClient,
+    state: &mut StreamOutputState,
+    session_id: Uuid,
+    command: SessionCommand,
+) -> bool {
+    match command {
+        SessionCommand::PollOutput {
+            max_bytes,
+            response,
+        } => {
+            let _ = response.send(Ok(state.output_queue.drain(max_bytes)));
+            true
+        }
+        SessionCommand::WriteInput { bytes, response } => {
+            let result = client
+                .attach_input(session_id, bytes)
+                .await
+                .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
+            let _ = response.send(result);
+            true
+        }
+        SessionCommand::Resize {
+            rows,
+            cols,
+            response,
+        } => {
+            let result = client
+                .attach_set_viewport_with_insets(session_id, cols, rows, 0, 0)
+                .await
+                .map(|(_cols, _rows)| ())
+                .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
+            let _ = response.send(result);
+            true
+        }
+        SessionCommand::Close { response } => {
+            let result = client
+                .detach()
+                .await
+                .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
+            let _ = response.send(result);
+            false
+        }
+    }
+}
+
+async fn handle_session_event(
+    client: &mut StreamingBmuxClient,
+    state: &mut StreamOutputState,
+    session_id: Uuid,
+    event: ServerEvent,
+) {
+    match event {
+        ServerEvent::PaneOutput {
+            session_id: event_session_id,
+            pane_id,
+            data,
+            stream_start,
+            stream_end,
+            stream_gap,
+            sync_update_active,
+        } if event_session_id == session_id && state.accepts_pane(pane_id) => {
+            state.apply_chunk(AttachPaneChunk {
+                pane_id,
+                data,
+                stream_start,
+                stream_end,
+                stream_gap,
+                sync_update_active,
+            });
+        }
+        ServerEvent::PaneOutputAvailable {
+            session_id: event_session_id,
+            pane_id,
+        } if event_session_id == session_id && state.accepts_pane(pane_id) => {
+            if let Ok(batch) = client
+                .attach_pane_output_batch(session_id, vec![pane_id], EVENT_TRIGGER_FETCH_MAX_BYTES)
+                .await
+            {
+                for chunk in batch.chunks {
+                    state.apply_chunk(chunk);
+                }
+            }
+        }
+        ServerEvent::AttachViewChanged {
+            session_id: event_session_id,
+            ..
+        } if event_session_id == session_id => {
+            if let Ok(layout) = client.attach_layout(session_id).await {
+                state.focused_pane_id = Some(layout.focused_pane_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[derive(Debug)]
+struct StreamOutputState {
+    output_queue: OutputQueue,
+    expected_stream_start: Option<u64>,
+    sync_update_in_progress: bool,
+    sync_staging: Vec<u8>,
+    focused_pane_id: Option<Uuid>,
+}
+
+impl StreamOutputState {
+    const fn new(focused_pane_id: Option<Uuid>) -> Self {
+        Self {
+            output_queue: OutputQueue::new(OUTPUT_QUEUE_MAX_BYTES),
+            expected_stream_start: None,
+            sync_update_in_progress: false,
+            sync_staging: Vec::new(),
+            focused_pane_id,
+        }
+    }
+
+    fn accepts_pane(&self, pane_id: Uuid) -> bool {
+        self.focused_pane_id
+            .is_none_or(|focused| focused == pane_id)
+    }
+
+    fn apply_chunk(&mut self, chunk: AttachPaneChunk) {
+        apply_pane_chunk(
+            &mut self.output_queue,
+            &mut self.expected_stream_start,
+            &mut self.sync_update_in_progress,
+            &mut self.sync_staging,
+            chunk,
+        );
+    }
+}
+
+#[derive(Debug)]
+struct OutputQueue {
+    bytes: VecDeque<u8>,
+    max_bytes: usize,
+}
+
+impl OutputQueue {
+    const fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: VecDeque::new(),
+            max_bytes,
+        }
+    }
+
+    fn push_bytes(&mut self, data: Vec<u8>) {
+        self.bytes.extend(data);
+        while self.bytes.len() > self.max_bytes {
+            let _ = self.bytes.pop_front();
+        }
+    }
+
+    fn drain(&mut self, max_bytes: usize) -> Vec<u8> {
+        let to_read = self.bytes.len().min(max_bytes.max(1));
+        self.bytes.drain(..to_read).collect()
+    }
+}
+
+fn apply_pane_chunk(
+    output_queue: &mut OutputQueue,
+    expected_stream_start: &mut Option<u64>,
+    sync_update_in_progress: &mut bool,
+    sync_staging: &mut Vec<u8>,
+    chunk: AttachPaneChunk,
+) {
+    if chunk.stream_end < chunk.stream_start {
+        sync_staging.clear();
+        *sync_update_in_progress = false;
+        return;
+    }
+
+    if let Some(expected) = *expected_stream_start
+        && chunk.stream_end <= expected
+        && !chunk.stream_gap
+    {
+        return;
+    }
+
+    let continuity_ok = !chunk.stream_gap
+        && expected_stream_start.is_none_or(|expected| expected == chunk.stream_start);
+
+    *expected_stream_start = Some(chunk.stream_end);
+
+    if !continuity_ok {
+        sync_staging.clear();
+        *sync_update_in_progress = false;
+    }
+
+    if !chunk.data.is_empty() {
+        if *sync_update_in_progress || chunk.sync_update_active {
+            sync_staging.extend_from_slice(&chunk.data);
+        } else {
+            output_queue.push_bytes(chunk.data);
+        }
+    }
+
+    *sync_update_in_progress = chunk.sync_update_active;
+    if !*sync_update_in_progress && !sync_staging.is_empty() {
+        let flushed = std::mem::take(sync_staging);
+        output_queue.push_bytes(flushed);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -898,5 +1103,105 @@ mod tests {
         );
         assert!(target.require_ssh_auth);
         assert!(matches!(target.compression_mode, IrohCompressionMode::Zstd));
+    }
+
+    #[test]
+    fn apply_pane_chunk_flushes_when_sync_update_ends() {
+        let pane_id = Uuid::new_v4();
+        let mut queue = OutputQueue::new(1024);
+        let mut expected = None;
+        let mut sync_in_progress = false;
+        let mut sync_staging = Vec::new();
+
+        apply_pane_chunk(
+            &mut queue,
+            &mut expected,
+            &mut sync_in_progress,
+            &mut sync_staging,
+            AttachPaneChunk {
+                pane_id,
+                data: b"first".to_vec(),
+                stream_start: 0,
+                stream_end: 5,
+                stream_gap: false,
+                sync_update_active: true,
+            },
+        );
+        assert_eq!(queue.drain(1024), Vec::<u8>::new());
+
+        apply_pane_chunk(
+            &mut queue,
+            &mut expected,
+            &mut sync_in_progress,
+            &mut sync_staging,
+            AttachPaneChunk {
+                pane_id,
+                data: b"second".to_vec(),
+                stream_start: 5,
+                stream_end: 11,
+                stream_gap: false,
+                sync_update_active: false,
+            },
+        );
+
+        assert_eq!(queue.drain(1024), b"firstsecond".to_vec());
+    }
+
+    #[test]
+    fn apply_pane_chunk_resets_sync_buffer_when_gap_reported() {
+        let pane_id = Uuid::new_v4();
+        let mut queue = OutputQueue::new(1024);
+        let mut expected = Some(20);
+        let mut sync_in_progress = true;
+        let mut sync_staging = b"stale".to_vec();
+
+        apply_pane_chunk(
+            &mut queue,
+            &mut expected,
+            &mut sync_in_progress,
+            &mut sync_staging,
+            AttachPaneChunk {
+                pane_id,
+                data: b"fresh".to_vec(),
+                stream_start: 100,
+                stream_end: 105,
+                stream_gap: true,
+                sync_update_active: false,
+            },
+        );
+
+        assert_eq!(queue.drain(1024), b"fresh".to_vec());
+        assert_eq!(expected, Some(105));
+        assert!(!sync_in_progress);
+        assert!(sync_staging.is_empty());
+    }
+
+    #[test]
+    fn apply_pane_chunk_ignores_stale_chunks() {
+        let pane_id = Uuid::new_v4();
+        let mut queue = OutputQueue::new(1024);
+        let mut expected = Some(20);
+        let mut sync_in_progress = false;
+        let mut sync_staging = Vec::new();
+
+        apply_pane_chunk(
+            &mut queue,
+            &mut expected,
+            &mut sync_in_progress,
+            &mut sync_staging,
+            AttachPaneChunk {
+                pane_id,
+                data: b"stale".to_vec(),
+                stream_start: 10,
+                stream_end: 15,
+                stream_gap: false,
+                sync_update_active: false,
+            },
+        );
+
+        assert_eq!(queue.drain(1024), Vec::<u8>::new());
+        assert_eq!(expected, Some(20));
+        assert!(!sync_in_progress);
+        assert!(sync_staging.is_empty());
     }
 }

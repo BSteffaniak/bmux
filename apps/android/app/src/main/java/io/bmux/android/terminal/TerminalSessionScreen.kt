@@ -1,6 +1,7 @@
 package io.bmux.android.terminal
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.Row
@@ -21,17 +22,23 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.onTimeout
+import kotlinx.coroutines.selects.select
+import kotlin.coroutines.coroutineContext
 
 private const val MAX_STATUS_LINES = 12
 
@@ -60,14 +67,15 @@ fun TerminalSessionScreen(
     var connection by remember(endpoint.id) { mutableStateOf<TerminalTransportConnection?>(null) }
     var warning by remember(endpoint.id) { mutableStateOf<String?>(null) }
     var statusLines by remember(endpoint.id) { mutableStateOf(emptyList<TerminalStatusEvent>()) }
-    var statusPanelVisible by remember(endpoint.id) { mutableStateOf(true) }
+    var statusPanelVisible by remember(endpoint.id) { mutableStateOf(false) }
     var statusPanelExpanded by remember(endpoint.id) { mutableStateOf(false) }
 
     LaunchedEffect(endpoint.id, session) {
+        connection?.close()
         warning = null
         connection = null
         statusLines = emptyList()
-        statusPanelVisible = true
+        statusPanelVisible = false
         statusPanelExpanded = false
         runCatching {
             transport.open(
@@ -122,38 +130,50 @@ fun TerminalSessionScreen(
         warning?.let {
             Text(it, color = MaterialTheme.colorScheme.error)
         }
-        if (statusLines.isNotEmpty()) {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(
+
+        Box(modifier = Modifier.fillMaxSize()) {
+            renderer.Render(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = 8.dp),
+            )
+
+            if (statusLines.isNotEmpty() && statusPanelVisible) {
+                Card(
                     modifier = Modifier
+                        .align(Alignment.TopCenter)
                         .fillMaxWidth()
                         .padding(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        Text("Status (${statusLines.size})", style = MaterialTheme.typography.labelMedium)
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            TextButton(onClick = { statusPanelExpanded = !statusPanelExpanded }) {
-                                Text(if (statusPanelExpanded) "Collapse" else "Expand")
-                            }
-                            TextButton(onClick = { statusPanelVisible = !statusPanelVisible }) {
-                                Text(if (statusPanelVisible) "Dismiss" else "Show")
-                            }
-                            TextButton(
-                                onClick = {
-                                    statusLines = emptyList()
-                                    statusPanelVisible = false
-                                },
-                            ) {
-                                Text("Clear")
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text("Status (${statusLines.size})", style = MaterialTheme.typography.labelMedium)
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                TextButton(onClick = { statusPanelExpanded = !statusPanelExpanded }) {
+                                    Text(if (statusPanelExpanded) "Collapse" else "Expand")
+                                }
+                                TextButton(onClick = { statusPanelVisible = false }) {
+                                    Text("Dismiss")
+                                }
+                                TextButton(
+                                    onClick = {
+                                        statusLines = emptyList()
+                                        statusPanelVisible = false
+                                    },
+                                ) {
+                                    Text("Clear")
+                                }
                             }
                         }
-                    }
 
-                    if (statusPanelVisible) {
                         val visibleLines = if (statusPanelExpanded) {
                             statusLines
                         } else {
@@ -162,7 +182,7 @@ fun TerminalSessionScreen(
                         LazyColumn(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = if (statusPanelExpanded) 100.dp else 28.dp),
+                                .heightIn(max = if (statusPanelExpanded) 96.dp else 28.dp),
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
                             itemsIndexed(visibleLines, key = { index, line -> "$index-${line.message}" }) { _, line ->
@@ -178,22 +198,19 @@ fun TerminalSessionScreen(
                                 )
                             }
                         }
-                    } else {
-                        Text(
-                            text = statusLines.last().message,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
                     }
+                }
+            } else if (statusLines.isNotEmpty()) {
+                TextButton(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(8.dp),
+                    onClick = { statusPanelVisible = true },
+                ) {
+                    Text("Show status (${statusLines.size})")
                 }
             }
         }
-
-        renderer.Render(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(bottom = 8.dp),
-        )
     }
 }
 
@@ -257,6 +274,7 @@ private class CoreTerminalTransport(
         private const val DEFAULT_ROWS = 24
         private const val DEFAULT_COLS = 80
     }
+
 }
 
 private class CoreTerminalTransportConnection(
@@ -269,9 +287,13 @@ private class CoreTerminalTransportConnection(
     private val closeTerminal: suspend (terminalId: String) -> Result<Unit>,
 ) : TerminalTransportConnection {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val outboundCommands = Channel<OutboundCommand>(capacity = Channel.BUFFERED)
     private var closed = false
 
     init {
+        scope.launch {
+            runOutboundLoop()
+        }
         scope.launch {
             while (isActive && !closed) {
                 val chunks = pollTerminalOutput(terminalId, 64)
@@ -312,10 +334,10 @@ private class CoreTerminalTransportConnection(
             return
         }
 
-        scope.launch {
-            writeTerminalInput(terminalId, data).onFailure { error ->
-                sink("\r\n[terminal write failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
-            }
+        val queueResult = outboundCommands.trySend(OutboundCommand.Input(data.copyOf()))
+        if (queueResult.isFailure && !closed) {
+            val message = queueResult.exceptionOrNull()?.message ?: "unknown"
+            sink("\r\n[terminal write queue failed: $message]\r\n".encodeToByteArray())
         }
     }
 
@@ -324,28 +346,101 @@ private class CoreTerminalTransportConnection(
             return
         }
 
-        scope.launch {
-            resizeTerminal(terminalId, rows, cols).onFailure { error ->
-                sink("\r\n[terminal resize failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
-            }
+        val queueResult = outboundCommands.trySend(OutboundCommand.Resize(rows = rows, cols = cols))
+        if (queueResult.isFailure && !closed) {
+            val message = queueResult.exceptionOrNull()?.message ?: "unknown"
+            sink("\r\n[terminal resize queue failed: $message]\r\n".encodeToByteArray())
         }
     }
 
     override fun close() {
         if (!closed) {
             closed = true
+            outboundCommands.trySend(OutboundCommand.Close)
+            outboundCommands.close()
             scope.launch {
-                closeTerminal(terminalId).onFailure { error ->
-                    sink("\r\n[terminal close failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
+                delay(CLOSE_DRAIN_DELAY_MS)
+                scope.coroutineContext.cancel()
+            }
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private suspend fun runOutboundLoop() {
+        var pendingResize: PendingResize? = null
+        var lastAppliedResize: Pair<Int, Int>? = null
+
+        while (coroutineContext.isActive) {
+            val timeoutMillis = pendingResize
+                ?.let { pending -> (pending.deadlineMillis - System.currentTimeMillis()).coerceAtLeast(0L) }
+            val command = if (timeoutMillis == null) {
+                outboundCommands.receiveCatching().getOrNull() ?: break
+            } else {
+                select<OutboundCommand?> {
+                    outboundCommands.onReceiveCatching { result -> result.getOrNull() }
+                    onTimeout(timeoutMillis) { null }
                 }
             }
-            scope.coroutineContext.cancel()
+
+            if (command == null) {
+                val resize = pendingResize ?: continue
+                pendingResize = null
+                val requested = resize.rows to resize.cols
+                if (requested == lastAppliedResize) {
+                    continue
+                }
+                resizeTerminal(terminalId, resize.rows, resize.cols).onFailure { error ->
+                    sink("\r\n[terminal resize failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
+                }
+                lastAppliedResize = requested
+                continue
+            }
+
+            when (command) {
+                is OutboundCommand.Input -> {
+                    writeTerminalInput(terminalId, command.bytes).onFailure { error ->
+                        sink("\r\n[terminal write failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
+                    }
+                }
+                is OutboundCommand.Resize -> {
+                    val requested = command.rows to command.cols
+                    val pending = pendingResize?.let { resize -> resize.rows to resize.cols }
+                    if (requested == lastAppliedResize || requested == pending) {
+                        continue
+                    }
+                    pendingResize = PendingResize(
+                        rows = command.rows,
+                        cols = command.cols,
+                        deadlineMillis = System.currentTimeMillis() + RESIZE_DEBOUNCE_MS,
+                    )
+                }
+                OutboundCommand.Close -> {
+                    closeTerminal(terminalId).onFailure { error ->
+                        sink("\r\n[terminal close failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
+                    }
+                    return
+                }
+            }
         }
     }
 
     private companion object {
         private const val POLL_IDLE_DELAY_MS = 25L
+        private const val RESIZE_DEBOUNCE_MS = 80L
+        private const val CLOSE_DRAIN_DELAY_MS = 250L
     }
+
+    private sealed interface OutboundCommand {
+        data class Input(val bytes: ByteArray) : OutboundCommand
+        data class Resize(val rows: Int, val cols: Int) : OutboundCommand
+        object Close : OutboundCommand
+    }
+
+    private data class PendingResize(
+        val rows: Int,
+        val cols: Int,
+        val deadlineMillis: Long,
+    )
 
     private fun inferStatusSeverity(message: String): TerminalStatusSeverity {
         val normalized = message.lowercase()
