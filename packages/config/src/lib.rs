@@ -646,9 +646,112 @@ pub struct BmuxConfig {
     /// Performance diagnostics capture controls and telemetry safety limits
     #[config_doc(nested)]
     pub performance: PerformanceConfig,
+    /// Kiosk profiles and SSH/bootstrap settings for locked-down access flows
+    #[config_doc(nested)]
+    pub kiosk: KioskConfig,
     /// Sandbox workflow defaults for cleanup and isolation operations
     #[config_doc(nested)]
     pub sandbox: SandboxConfig,
+}
+
+/// Kiosk profile configuration for SSH-first locked sessions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[config_doc(section = "kiosk")]
+#[serde(default)]
+pub struct KioskConfig {
+    /// Shared defaults inherited by all kiosk profiles.
+    #[config_doc(nested)]
+    pub defaults: KioskDefaultsConfig,
+    /// Named kiosk profile overrides.
+    #[config_doc(nested, map_key = "<name>")]
+    pub profiles: BTreeMap<String, KioskProfileConfig>,
+    /// Optional file output locations used by `bmux kiosk init`.
+    #[config_doc(nested)]
+    pub files: KioskFilesConfig,
+}
+
+/// Shared kiosk defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[serde(default)]
+pub struct KioskDefaultsConfig {
+    /// Enable kiosk features and commands.
+    pub enabled: bool,
+    /// Default SSH user when profiles do not override it.
+    pub ssh_user: String,
+    /// Default role assigned to issued kiosk tokens.
+    pub role: KioskRole,
+    /// Allow detach in kiosk attach mode.
+    pub allow_detach: bool,
+    /// Default issued token TTL in seconds.
+    pub token_ttl_secs: u64,
+    /// Require one-time token usage by default.
+    pub one_shot: bool,
+    /// Sandbox mode preference.
+    pub sandbox: KioskSandboxMode,
+}
+
+impl Default for KioskDefaultsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ssh_user: "bmux-kiosk".to_string(),
+            role: KioskRole::Observer,
+            allow_detach: false,
+            token_ttl_secs: 15 * 60,
+            one_shot: true,
+            sandbox: KioskSandboxMode::Auto,
+        }
+    }
+}
+
+/// Per-profile kiosk overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[serde(default)]
+pub struct KioskProfileConfig {
+    /// Optional session name to attach when token omits a session override.
+    pub session: Option<String>,
+    /// Optional target name for attach routing.
+    pub target: Option<String>,
+    /// Override role for this profile.
+    pub role: Option<KioskRole>,
+    /// Override SSH user for this profile.
+    pub ssh_user: Option<String>,
+    /// Override detach policy for this profile.
+    pub allow_detach: Option<bool>,
+    /// Override token TTL in seconds for this profile.
+    pub token_ttl_secs: Option<u64>,
+    /// Override one-shot token behavior for this profile.
+    pub one_shot: Option<bool>,
+    /// Override sandbox mode for this profile.
+    pub sandbox: Option<KioskSandboxMode>,
+}
+
+/// File output locations for generated kiosk assets.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[serde(default)]
+pub struct KioskFilesConfig {
+    /// Destination path for generated sshd include content.
+    pub sshd_include_path: Option<PathBuf>,
+    /// Destination directory for generated wrapper scripts.
+    pub wrapper_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum KioskRole {
+    #[default]
+    Observer,
+    Writer,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum KioskSandboxMode {
+    #[default]
+    Auto,
+    None,
+    Container,
+    Native,
 }
 
 /// Sandbox workflow defaults for cleanup and isolation operations.

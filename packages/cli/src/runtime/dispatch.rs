@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bmux_cli_schema::{
     AccessCommand, AuthCommand, Command, ConfigCommand, ConfigProfilesCommand, KeymapCommand,
-    LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand, RecordingCommand,
+    KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand, RecordingCommand,
     RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg,
     SandboxSourceArg, SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand,
     TerminalCommand,
@@ -20,9 +20,11 @@ use super::{
     run_config_profiles_resolve, run_config_profiles_show, run_config_profiles_switch,
     run_config_set, run_config_show, run_connect, run_doctor, run_external_plugin_command,
     run_follow, run_host, run_hosts, run_join, run_keymap_doctor, run_keymap_explain,
-    run_logs_level, run_logs_path, run_logs_profiles_delete, run_logs_profiles_list,
-    run_logs_profiles_rename, run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off,
-    run_perf_on, run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
+    run_kiosk_attach, run_kiosk_init, run_kiosk_issue_token, run_kiosk_revoke_token,
+    run_kiosk_ssh_print_config, run_kiosk_status, run_logs_level, run_logs_path,
+    run_logs_profiles_delete, run_logs_profiles_list, run_logs_profiles_rename,
+    run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off, run_perf_on,
+    run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
     run_playbook_from_recording, run_playbook_interactive, run_playbook_run, run_playbook_validate,
     run_recording_analyze, run_recording_cut, run_recording_delete, run_recording_delete_all,
     run_recording_export, run_recording_inspect, run_recording_list, run_recording_path,
@@ -64,6 +66,14 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             AuthCommand::Logout => BuiltInHandlerId::AuthLogout,
         },
         Command::Access { .. } => BuiltInHandlerId::Access,
+        Command::Kiosk { command } => match command {
+            KioskCommand::Status { .. } => BuiltInHandlerId::KioskStatus,
+            KioskCommand::Init { .. } => BuiltInHandlerId::KioskInit,
+            KioskCommand::IssueToken { .. } => BuiltInHandlerId::KioskIssueToken,
+            KioskCommand::RevokeToken { .. } => BuiltInHandlerId::KioskRevokeToken,
+            KioskCommand::Attach { .. } => BuiltInHandlerId::KioskAttach,
+            KioskCommand::SshPrintConfig { .. } => BuiltInHandlerId::KioskSshPrintConfig,
+        },
         Command::Share { .. } => BuiltInHandlerId::Share,
         Command::Unshare { .. } => BuiltInHandlerId::Unshare,
         Command::Connect { .. } => BuiltInHandlerId::Connect,
@@ -320,6 +330,65 @@ pub(super) async fn dispatch_built_in_command(
                 command: AccessCommand::Disable,
             },
         ) => run_access_disable(),
+        (
+            BuiltInHandlerId::KioskStatus,
+            Command::Kiosk {
+                command: KioskCommand::Status { json },
+            },
+        ) => run_kiosk_status(*json),
+        (
+            BuiltInHandlerId::KioskInit,
+            Command::Kiosk {
+                command:
+                    KioskCommand::Init {
+                        profile,
+                        all_profiles,
+                        dry_run,
+                        yes,
+                    },
+            },
+        ) => run_kiosk_init(profile, *all_profiles, *dry_run, *yes),
+        (
+            BuiltInHandlerId::KioskIssueToken,
+            Command::Kiosk {
+                command:
+                    KioskCommand::IssueToken {
+                        profile,
+                        session,
+                        ttl_secs,
+                        one_shot,
+                        multi_use,
+                    },
+            },
+        ) => run_kiosk_issue_token(
+            profile,
+            session.as_deref(),
+            *ttl_secs,
+            *one_shot,
+            *multi_use,
+        ),
+        (
+            BuiltInHandlerId::KioskRevokeToken,
+            Command::Kiosk {
+                command: KioskCommand::RevokeToken { token_id },
+            },
+        ) => run_kiosk_revoke_token(token_id),
+        (
+            BuiltInHandlerId::KioskAttach,
+            Command::Kiosk {
+                command: KioskCommand::Attach { profile, token },
+            },
+        ) => run_kiosk_attach(profile, token, connection_context).await,
+        (
+            BuiltInHandlerId::KioskSshPrintConfig,
+            Command::Kiosk {
+                command:
+                    KioskCommand::SshPrintConfig {
+                        profile,
+                        all_profiles,
+                    },
+            },
+        ) => run_kiosk_ssh_print_config(profile, *all_profiles),
         (
             BuiltInHandlerId::Share,
             Command::Share {

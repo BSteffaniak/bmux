@@ -35,6 +35,7 @@ mod config_cli;
 mod dispatch;
 mod doctor_cli;
 mod hosted_output;
+mod kiosk_cli;
 mod logs_cli;
 mod logs_watch;
 mod perf_cli;
@@ -84,6 +85,10 @@ use config_cli::{
 };
 use dispatch::run_command;
 use doctor_cli::run_doctor;
+use kiosk_cli::{
+    run_kiosk_attach, run_kiosk_init, run_kiosk_issue_token, run_kiosk_revoke_token,
+    run_kiosk_ssh_print_config, run_kiosk_status,
+};
 use logs_cli::{run_logs_level, run_logs_path, run_logs_tail};
 use perf_cli::{run_perf_off, run_perf_on, run_perf_status};
 use playbook_cli::{

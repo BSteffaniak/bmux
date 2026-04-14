@@ -348,6 +348,11 @@ pub enum Command {
         #[command(subcommand)]
         command: AccessCommand,
     },
+    /// SSH kiosk profiles and token management
+    Kiosk {
+        #[command(subcommand)]
+        command: KioskCommand,
+    },
     /// Share helpers for hosted links
     Share {
         /// Target/link to share
@@ -585,6 +590,70 @@ pub enum AccessCommand {
     Enable,
     /// Disable iroh SSH access enforcement
     Disable,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KioskCommand {
+    /// Show kiosk profile status and effective defaults
+    Status {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Initialize/update kiosk bootstrap files from config
+    Init {
+        /// Kiosk profile to reconcile (repeatable)
+        #[arg(long, value_name = "PROFILE", conflicts_with = "all_profiles")]
+        profile: Vec<String>,
+        /// Reconcile all configured profiles
+        #[arg(long, conflicts_with = "profile")]
+        all_profiles: bool,
+        /// Preview actions without writing files
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip confirmation prompts
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Issue a kiosk token scoped to a profile
+    IssueToken {
+        /// Kiosk profile name
+        profile: String,
+        /// Optional session override stored in token
+        #[arg(long)]
+        session: Option<String>,
+        /// Optional token TTL in seconds (defaults to profile/default TTL)
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+        /// Mark token as one-shot (defaults to profile/default one_shot)
+        #[arg(long, conflicts_with = "multi_use")]
+        one_shot: bool,
+        /// Mark token as reusable until expiry
+        #[arg(long, conflicts_with = "one_shot")]
+        multi_use: bool,
+    },
+    /// Revoke one issued kiosk token by id
+    RevokeToken {
+        /// Token id to revoke
+        token_id: String,
+    },
+    /// Attach using a kiosk token (intended for forced SSH command)
+    Attach {
+        /// Kiosk profile name
+        profile: String,
+        /// Raw kiosk token
+        #[arg(long)]
+        token: String,
+    },
+    /// Print generated sshd include text without writing files
+    SshPrintConfig {
+        /// Kiosk profile to print (repeatable)
+        #[arg(long, value_name = "PROFILE", conflicts_with = "all_profiles")]
+        profile: Vec<String>,
+        /// Print all configured profiles
+        #[arg(long, conflicts_with = "profile")]
+        all_profiles: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1942,15 +2011,15 @@ pub enum TerminalCommand {
 mod tests {
     use super::{
         AccessCommand, AuthCommand, Cli, Command, ConfigCommand, ConfigProfilesCommand,
-        GatewayHostMode, HostedModeArg, KeymapCommand, LogsCommand, LogsProfilesCommand,
-        PerfCommand, PerfProfileArg, PlaybookCommand, RecordingCommand, RecordingCursorBlinkMode,
-        RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile,
-        RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
-        RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
-        RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-        RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg,
-        SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand,
-        TraceFamily,
+        GatewayHostMode, HostedModeArg, KeymapCommand, KioskCommand, LogsCommand,
+        LogsProfilesCommand, PerfCommand, PerfProfileArg, PlaybookCommand, RecordingCommand,
+        RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
+        RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
+        RecordingEventKindArg, RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg,
+        RecordingListStatusArg, RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode,
+        RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, SandboxCommand,
+        SandboxEnvModeArg, SandboxSourceArg, SandboxStatusArg, ServerCommand,
+        ServerRecordingCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -2312,6 +2381,45 @@ mod tests {
                 fingerprint,
                 yes: true
             } if fingerprint == "abc123"
+        ));
+    }
+
+    #[test]
+    fn parses_kiosk_status_json_command() {
+        let cli =
+            Cli::try_parse_from(["bmux", "kiosk", "status", "--json"]).expect("valid CLI args");
+        let Some(Command::Kiosk { command }) = cli.command else {
+            panic!("expected kiosk command");
+        };
+        assert!(matches!(command, KioskCommand::Status { json: true }));
+    }
+
+    #[test]
+    fn parses_kiosk_issue_token_flags() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "kiosk",
+            "issue-token",
+            "demo",
+            "--session",
+            "main",
+            "--ttl-secs",
+            "900",
+            "--multi-use",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Kiosk { command }) = cli.command else {
+            panic!("expected kiosk command");
+        };
+        assert!(matches!(
+            command,
+            KioskCommand::IssueToken {
+                profile,
+                session,
+                ttl_secs,
+                one_shot: false,
+                multi_use: true,
+            } if profile == "demo" && session.as_deref() == Some("main") && ttl_secs == Some(900)
         ));
     }
 
