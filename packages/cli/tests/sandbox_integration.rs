@@ -75,7 +75,7 @@ impl CommandSandbox {
 fn sandbox_command_for_root(root: &Path) -> Command {
     let mut command = Command::new(bmux_binary());
     command
-        .current_dir(workspace_root())
+        .current_dir(root)
         .env("BMUX_CONFIG_DIR", root.join("config"))
         .env("BMUX_RUNTIME_DIR", root.join("runtime"))
         .env("BMUX_DATA_DIR", root.join("data"))
@@ -168,8 +168,9 @@ fn write_stale_lock(root: &Path, pid: u32) {
 #[serial]
 fn sandbox_dev_prefers_workspace_debug_binary() {
     let sandbox = CommandSandbox::new("dev-prefers-debug-binary");
-    let output = sandbox
-        .command()
+    let mut command = sandbox.command();
+    let output = command
+        .current_dir(workspace_root())
         .args(["sandbox", "dev", "--json", "--", "--version"])
         .output()
         .expect("run bmux sandbox dev");
@@ -351,6 +352,73 @@ fn sandbox_bundle_writes_manifest_logs_and_repro() {
     assert!(
         repro.contains("bmux sandbox run"),
         "repro command should include sandbox run"
+    );
+}
+
+#[test]
+#[serial]
+fn sandbox_bundle_without_output_uses_test_temp_root() {
+    let sandbox = CommandSandbox::new("bundle-default-output-root");
+
+    let run_output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "run",
+            "--json",
+            "--name",
+            "bundle-default-output-source",
+            "--",
+            "no-such-command",
+        ])
+        .output()
+        .expect("run failed sandbox for default output source");
+    assert!(
+        !run_output.status.success(),
+        "source sandbox should fail and be kept"
+    );
+    let run_json = parse_json_stdout(&run_output);
+    assert_schema_version(&run_json);
+    let sandbox_id = run_json["sandbox_id"]
+        .as_str()
+        .expect("sandbox run json should include sandbox_id")
+        .to_string();
+
+    let bundle_output = sandbox
+        .command()
+        .args(["sandbox", "bundle", sandbox_id.as_str(), "--json"])
+        .output()
+        .expect("bundle sandbox artifacts with default output directory");
+    assert!(
+        bundle_output.status.success(),
+        "bundle should succeed; stderr={}; stdout={}",
+        String::from_utf8_lossy(&bundle_output.stderr),
+        String::from_utf8_lossy(&bundle_output.stdout)
+    );
+
+    let bundle_json = parse_json_stdout(&bundle_output);
+    assert_schema_version(&bundle_json);
+    let bundle_dir = PathBuf::from(
+        bundle_json["bundle_dir"]
+            .as_str()
+            .expect("bundle json should include bundle_dir"),
+    );
+    assert!(bundle_dir.is_dir(), "bundle output should be a directory");
+
+    let expected_root = sandbox
+        .root
+        .path()
+        .join("sandbox-bundles")
+        .canonicalize()
+        .expect("expected bundle root should exist");
+    let canonical_bundle_dir = bundle_dir
+        .canonicalize()
+        .expect("bundle directory should canonicalize");
+    assert!(
+        canonical_bundle_dir.starts_with(&expected_root),
+        "default bundle output should live under test temp root; expected prefix={}, actual={}",
+        expected_root.display(),
+        canonical_bundle_dir.display()
     );
 }
 
