@@ -21,6 +21,15 @@ data class TerminalChunkFrame(
     val statusSeverity: TerminalStatusSeverity? = null,
 )
 
+data class TerminalDiagnosticFrame(
+    val sequence: Long,
+    val timestampMs: Long,
+    val severity: TerminalStatusSeverity,
+    val stage: String,
+    val code: String?,
+    val message: String,
+)
+
 enum class TerminalStatusSeverity {
     INFO,
     WARN,
@@ -44,6 +53,8 @@ interface TerminalTransport {
         session: String?,
         sink: (ByteArray) -> Unit,
         onStatus: (TerminalStatusEvent) -> Unit,
+        onDiagnostics: (List<TerminalDiagnosticFrame>) -> Unit,
+        onTerminalFailure: (String) -> Unit,
     ): TerminalTransportConnection
 }
 

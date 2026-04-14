@@ -42,6 +42,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import io.bmux.android.terminal.TerminalEndpoint
 import io.bmux.android.terminal.TerminalChunkFrame
 import io.bmux.android.terminal.TerminalChunkType
+import io.bmux.android.terminal.TerminalDiagnosticFrame
 import io.bmux.android.terminal.TerminalSessionScreen
 import io.bmux.android.terminal.TerminalStatusSeverity
 import kotlinx.coroutines.Dispatchers
@@ -51,7 +52,9 @@ import uniffi.bmux_mobile_ffi.ConnectionStateFfi
 import uniffi.bmux_mobile_ffi.ConnectionStatusFfi
 import uniffi.bmux_mobile_ffi.HostKeyPinSuggestionFfi
 import uniffi.bmux_mobile_ffi.MobileApiFfi
+import uniffi.bmux_mobile_ffi.MobileFfiException
 import uniffi.bmux_mobile_ffi.TerminalChunkKindFfi
+import uniffi.bmux_mobile_ffi.TerminalDiagnosticFfi
 import uniffi.bmux_mobile_ffi.TerminalOpenRequestFfi
 import uniffi.bmux_mobile_ffi.TerminalStatusSeverityFfi
 import uniffi.bmux_mobile_ffi.TerminalSizeFfi
@@ -253,6 +256,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return gateway.closeTerminal(terminalId)
     }
 
+    fun terminalDiagnostics(
+        terminalId: String,
+        sinceSequence: Long?,
+        limit: Int,
+    ): Result<List<TerminalDiagnosticFrame>> {
+        return gateway.terminalDiagnostics(terminalId, sinceSequence, limit)
+    }
+
+    fun latestTerminalFailure(terminalId: String): Result<String?> {
+        return gateway.latestTerminalFailure(terminalId)
+    }
+
     fun setDiscoveryEnabled(enabled: Boolean) {
         if (!enabled) {
             discovery.stop()
@@ -408,7 +423,7 @@ private class MobileGateway(application: Application) {
         val client = ffi ?: return Result.failure(
             IllegalStateException("FFI terminal stream unavailable"),
         )
-        return runCatching {
+        return runGatewayCall {
             val request = TerminalOpenRequestFfi(
                 targetId = targetId,
                 session = session,
@@ -423,7 +438,7 @@ private class MobileGateway(application: Application) {
         val client = ffi ?: return Result.failure(
             IllegalStateException("FFI terminal stream unavailable"),
         )
-        return runCatching {
+        return runGatewayCall {
             client.pollTerminalOutput(terminalId, maxChunks.toUInt()).map { chunk ->
                 TerminalChunkFrame(
                     kind = when (chunk.kind) {
@@ -447,7 +462,7 @@ private class MobileGateway(application: Application) {
         val client = ffi ?: return Result.failure(
             IllegalStateException("FFI terminal stream unavailable"),
         )
-        return runCatching {
+        return runGatewayCall {
             client.writeTerminalInput(terminalId, bytes)
         }
     }
@@ -456,7 +471,7 @@ private class MobileGateway(application: Application) {
         val client = ffi ?: return Result.failure(
             IllegalStateException("FFI terminal stream unavailable"),
         )
-        return runCatching {
+        return runGatewayCall {
             client.resizeTerminal(
                 terminalId,
                 TerminalSizeFfi(
@@ -471,9 +486,36 @@ private class MobileGateway(application: Application) {
         val client = ffi ?: return Result.failure(
             IllegalStateException("FFI terminal stream unavailable"),
         )
-        return runCatching {
+        return runGatewayCall {
             client.closeTerminal(terminalId)
             Unit
+        }
+    }
+
+    fun terminalDiagnostics(
+        terminalId: String,
+        sinceSequence: Long?,
+        limit: Int,
+    ): Result<List<TerminalDiagnosticFrame>> {
+        val client = ffi ?: return Result.failure(
+            IllegalStateException("FFI terminal stream unavailable"),
+        )
+        val safeLimit = limit.coerceIn(1, 512)
+        return runGatewayCall {
+            client.terminalDiagnostics(
+                terminalId,
+                sinceSequence?.toULong(),
+                safeLimit.toUInt(),
+            ).map(::mapTerminalDiagnostic)
+        }
+    }
+
+    fun latestTerminalFailure(terminalId: String): Result<String?> {
+        val client = ffi ?: return Result.failure(
+            IllegalStateException("FFI terminal stream unavailable"),
+        )
+        return runGatewayCall {
+            client.latestTerminalFailure(terminalId)
         }
     }
 
@@ -514,6 +556,48 @@ private class MobileGateway(application: Application) {
         canonicalTarget = record.canonicalTarget,
         transport = record.transport.name.lowercase(),
     )
+
+    private fun <T> runGatewayCall(block: () -> T): Result<T> {
+        return try {
+            Result.success(block())
+        } catch (error: Throwable) {
+            Result.failure(IllegalStateException(userFacingGatewayMessage(error), error))
+        }
+    }
+
+    private fun userFacingGatewayMessage(error: Throwable): String {
+        val resolved = when (error) {
+            is MobileFfiException.InvalidTarget -> "invalid target: ${error.v1}"
+            is MobileFfiException.TargetNotFound -> "target not found: ${error.v1}"
+            is MobileFfiException.ConnectionNotActive -> "connection not active: ${error.v1}"
+            is MobileFfiException.SshBackendUnavailable -> "ssh backend unavailable"
+            is MobileFfiException.SshConnectionFailed -> "ssh connection failed: ${error.v1}"
+            is MobileFfiException.TerminalSessionNotFound -> "terminal session ended"
+            is MobileFfiException.TerminalSessionClosed -> "terminal session is closed"
+            is MobileFfiException.InvalidTerminalSize -> "invalid terminal size"
+            is MobileFfiException.UnsupportedTerminalTransport -> {
+                "unsupported terminal transport: ${error.v1}"
+            }
+            is MobileFfiException.TerminalBackendFailure -> error.v1
+            else -> error.message
+        }
+        return resolved?.takeIf { it.isNotBlank() } ?: "unknown error"
+    }
+
+    private fun mapTerminalDiagnostic(record: TerminalDiagnosticFfi): TerminalDiagnosticFrame {
+        return TerminalDiagnosticFrame(
+            sequence = record.sequence.toLong(),
+            timestampMs = record.timestampMs.toLong(),
+            severity = when (record.severity) {
+                TerminalStatusSeverityFfi.INFO -> TerminalStatusSeverity.INFO
+                TerminalStatusSeverityFfi.WARN -> TerminalStatusSeverity.WARN
+                TerminalStatusSeverityFfi.ERROR -> TerminalStatusSeverity.ERROR
+            },
+            stage = record.stage,
+            code = record.code,
+            message = record.message,
+        )
+    }
 
     private fun guessTransport(source: String): String = when {
         source.startsWith("iroh://") -> "iroh"
@@ -589,6 +673,14 @@ private fun MainScreen(vm: MainViewModel) {
                     },
                     closeTerminal = { terminalId ->
                         withContext(Dispatchers.IO) { vm.closeTerminalStream(terminalId) }
+                    },
+                    fetchTerminalDiagnostics = { terminalId, sinceSequence, limit ->
+                        withContext(Dispatchers.IO) {
+                            vm.terminalDiagnostics(terminalId, sinceSequence, limit)
+                        }
+                    },
+                    latestTerminalFailure = { terminalId ->
+                        withContext(Dispatchers.IO) { vm.latestTerminalFailure(terminalId) }
                     },
                 )
                 return@Column

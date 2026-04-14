@@ -22,7 +22,7 @@ use bmux_ipc::{
     decode, default_supported_capabilities, encode,
 };
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -1730,6 +1730,35 @@ impl BmuxClient {
 type PendingMap =
     Arc<tokio::sync::Mutex<BTreeMap<u64, tokio::sync::oneshot::Sender<Result<Response>>>>>;
 
+fn store_stream_disconnect_reason(reason_slot: &Arc<StdMutex<Option<String>>>, reason: String) {
+    if let Ok(mut slot) = reason_slot.lock()
+        && slot.is_none()
+    {
+        *slot = Some(reason);
+    }
+}
+
+fn format_stream_disconnect_reason(error: &IpcTransportError) -> String {
+    match error {
+        IpcTransportError::Io(io_error) if io_error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            format!("stream closed with unexpected EOF: {io_error}")
+        }
+        IpcTransportError::Io(io_error)
+            if io_error.kind() == std::io::ErrorKind::ConnectionReset =>
+        {
+            format!("stream connection reset by peer: {io_error}")
+        }
+        IpcTransportError::Io(io_error) => format!("stream I/O failure: {io_error}"),
+        IpcTransportError::FrameDecode(decode_error) => {
+            format!("stream frame decode failure: {decode_error}")
+        }
+        IpcTransportError::FrameEncode(encode_error) => {
+            format!("stream frame encode failure: {encode_error}")
+        }
+        IpcTransportError::UnsupportedEndpoint => "stream failed: unsupported endpoint".to_string(),
+    }
+}
+
 /// Event-driven client that receives server-pushed events without polling.
 ///
 /// After the initial handshake (performed as a regular [`BmuxClient`]), the
@@ -1748,6 +1777,7 @@ pub struct StreamingBmuxClient {
     negotiated_protocol: Option<NegotiatedProtocol>,
     pending: PendingMap,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+    disconnect_reason: Arc<StdMutex<Option<String>>>,
     _reader_task: tokio::task::JoinHandle<()>,
 }
 
@@ -1845,10 +1875,12 @@ impl StreamingBmuxClient {
 
         let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let disconnect_reason = Arc::new(StdMutex::new(None));
 
         let reader_pending = Arc::clone(&pending);
+        let reader_disconnect_reason = Arc::clone(&disconnect_reason);
         let reader_task = tokio::spawn(async move {
-            Self::reader_loop(reader, reader_pending, event_tx).await;
+            Self::reader_loop(reader, reader_pending, event_tx, reader_disconnect_reason).await;
         });
 
         Ok(Self {
@@ -1859,6 +1891,7 @@ impl StreamingBmuxClient {
             negotiated_protocol,
             pending,
             event_rx,
+            disconnect_reason,
             _reader_task: reader_task,
         })
     }
@@ -1883,20 +1916,27 @@ impl StreamingBmuxClient {
         mut reader: StreamingClientReader,
         pending: PendingMap,
         event_tx: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
+        disconnect_reason: Arc<StdMutex<Option<String>>>,
     ) {
         loop {
-            let Ok(envelope) = reader.recv_envelope().await else {
-                // Connection closed or error — wake all pending requests.
-                let pending_requests = std::mem::take(&mut *pending.lock().await);
-                for (_, tx) in pending_requests {
-                    let _ = tx.send(Err(ClientError::Transport(IpcTransportError::Io(
-                        std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "server connection closed",
-                        ),
-                    ))));
+            let envelope = match reader.recv_envelope().await {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    let reason = format_stream_disconnect_reason(&error);
+                    store_stream_disconnect_reason(&disconnect_reason, reason.clone());
+                    // Connection closed or error — wake all pending requests.
+                    let pending_requests = std::mem::take(&mut *pending.lock().await);
+                    for (_, tx) in pending_requests {
+                        let io_error_kind = match &error {
+                            IpcTransportError::Io(io_error) => io_error.kind(),
+                            _ => std::io::ErrorKind::BrokenPipe,
+                        };
+                        let io_error = std::io::Error::new(io_error_kind, reason.clone());
+                        let _ =
+                            tx.send(Err(ClientError::Transport(IpcTransportError::Io(io_error))));
+                    }
+                    return;
                 }
-                return;
             };
 
             match envelope.kind {
@@ -1941,6 +1981,14 @@ impl StreamingBmuxClient {
         &mut self,
     ) -> &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent> {
         &mut self.event_rx
+    }
+
+    #[must_use]
+    pub fn disconnect_reason(&self) -> Option<String> {
+        self.disconnect_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone())
     }
 
     /// Return this connection's principal identity.

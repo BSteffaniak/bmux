@@ -7,10 +7,10 @@
 use bmux_mobile_core::{
     ConnectionManager, ConnectionRequest, ConnectionState, ConnectionStatus, HostKeyPinSuggestion,
     MobileCoreError, ObservedHostKey, TargetInput, TargetRecord, TargetTransport, TerminalChunk,
-    TerminalChunkKind, TerminalOpenRequest, TerminalSessionState, TerminalSessionStatus,
-    TerminalSize, TerminalStatusSeverity, apply_pin_query_fragment_to_target,
-    apply_pin_suggestion_to_target, observe_ssh_host_key, observe_ssh_host_key_fingerprint_sha256,
-    observe_ssh_host_key_with_pin_suggestion,
+    TerminalChunkKind, TerminalDiagnostic, TerminalOpenRequest, TerminalSessionState,
+    TerminalSessionStatus, TerminalSize, TerminalStatusSeverity,
+    apply_pin_query_fragment_to_target, apply_pin_suggestion_to_target, observe_ssh_host_key,
+    observe_ssh_host_key_fingerprint_sha256, observe_ssh_host_key_with_pin_suggestion,
 };
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -158,6 +158,16 @@ pub struct TerminalChunkFfi {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalDiagnosticFfi {
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub severity: TerminalStatusSeverityFfi,
+    pub stage: String,
+    pub code: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct ObservedHostKeyFfi {
     pub endpoint: String,
     pub algorithm: String,
@@ -255,6 +265,17 @@ fn map_terminal_chunk(value: TerminalChunk) -> TerminalChunkFfi {
         kind: map_terminal_chunk_kind(value.kind),
         bytes: value.bytes,
         status_severity: value.status_severity.map(map_terminal_status_severity),
+    }
+}
+
+fn map_terminal_diagnostic(value: TerminalDiagnostic) -> TerminalDiagnosticFfi {
+    TerminalDiagnosticFfi {
+        sequence: value.sequence,
+        timestamp_ms: value.timestamp_ms,
+        severity: map_terminal_status_severity(value.severity),
+        stage: value.stage,
+        code: value.code,
+        message: value.message,
     }
 }
 
@@ -423,6 +444,37 @@ impl MobileApi {
             .map_err(|_| MobileCoreError::InvalidTarget("max_chunks out of range".to_string()))?;
         let mut manager = self.lock_manager()?;
         manager.poll_terminal_output(terminal_id, max_chunks)
+    }
+
+    /// Read terminal diagnostics since a sequence marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns UUID parsing or terminal lookup errors.
+    pub fn terminal_diagnostics(
+        &self,
+        terminal_id: &str,
+        since_sequence: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<TerminalDiagnostic>> {
+        let terminal_id = Uuid::parse_str(terminal_id)
+            .map_err(|_| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        let limit = usize::try_from(limit)
+            .map_err(|_| MobileCoreError::InvalidTarget("limit out of range".to_string()))?;
+        let manager = self.lock_manager()?;
+        manager.terminal_diagnostics(terminal_id, since_sequence, limit)
+    }
+
+    /// Return latest terminal failure message if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns UUID parsing or terminal lookup errors.
+    pub fn latest_terminal_failure(&self, terminal_id: &str) -> Result<Option<String>> {
+        let terminal_id = Uuid::parse_str(terminal_id)
+            .map_err(|_| MobileCoreError::TerminalSessionNotFound(terminal_id.to_string()))?;
+        let manager = self.lock_manager()?;
+        manager.latest_terminal_failure(terminal_id)
     }
 
     /// Write input bytes to a terminal stream.
@@ -672,6 +724,37 @@ impl MobileApiFfi {
         self.inner
             .poll_terminal_output(&terminal_id, max_chunks)
             .map(|chunks| chunks.into_iter().map(map_terminal_chunk).collect())
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Read terminal diagnostics since a sequence marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped UUID parsing and terminal lookup errors.
+    pub fn terminal_diagnostics(
+        &self,
+        terminal_id: String,
+        since_sequence: Option<u64>,
+        limit: u32,
+    ) -> std::result::Result<Vec<TerminalDiagnosticFfi>, MobileFfiError> {
+        self.inner
+            .terminal_diagnostics(&terminal_id, since_sequence, limit)
+            .map(|events| events.into_iter().map(map_terminal_diagnostic).collect())
+            .map_err(MobileFfiError::from)
+    }
+
+    /// Return latest terminal failure message if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns mapped UUID parsing and terminal lookup errors.
+    pub fn latest_terminal_failure(
+        &self,
+        terminal_id: String,
+    ) -> std::result::Result<Option<String>, MobileFfiError> {
+        self.inner
+            .latest_terminal_failure(&terminal_id)
             .map_err(MobileFfiError::from)
     }
 

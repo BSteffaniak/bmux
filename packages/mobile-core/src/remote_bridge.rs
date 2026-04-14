@@ -9,7 +9,7 @@ use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -20,10 +20,12 @@ use uuid::Uuid;
 
 const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
 const SESSION_COMMAND_BUFFER: usize = 64;
-const DEFAULT_IROH_CONNECT_TIMEOUT_MS: u64 = 30_000;
-const IROH_COMPRESSED_RETRY_COUNT: usize = 2;
+const DEFAULT_IROH_CONNECT_TIMEOUT_MS: u64 = 7_500;
+const DEFAULT_IROH_HELLO_PROBE_TIMEOUT_MS: u64 = 2_500;
+const IROH_COMPRESSED_RETRY_COUNT: usize = 0;
 const OUTPUT_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const EVENT_TRIGGER_FETCH_MAX_BYTES: usize = 256 * 1024;
+const SESSION_KEEPALIVE_INTERVAL_MS: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IrohCompressionMode {
@@ -55,30 +57,65 @@ enum IrohConnectAttemptErrorKind {
     Other,
 }
 
+impl IrohConnectAttemptErrorKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Protocol => "protocol",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IrohConnectStage {
+    Connect,
+    OpenBi,
+    HelloV2,
+}
+
+impl IrohConnectStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::OpenBi => "open_bi",
+            Self::HelloV2 => "hello_v2",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct IrohConnectAttemptError {
     kind: IrohConnectAttemptErrorKind,
+    stage: IrohConnectStage,
+    elapsed_ms: u64,
     message: String,
 }
 
 impl IrohConnectAttemptError {
-    const fn timeout(message: String) -> Self {
+    const fn timeout(stage: IrohConnectStage, elapsed_ms: u64, message: String) -> Self {
         Self {
             kind: IrohConnectAttemptErrorKind::Timeout,
+            stage,
+            elapsed_ms,
             message,
         }
     }
 
-    const fn protocol(message: String) -> Self {
+    const fn protocol(stage: IrohConnectStage, elapsed_ms: u64, message: String) -> Self {
         Self {
             kind: IrohConnectAttemptErrorKind::Protocol,
+            stage,
+            elapsed_ms,
             message,
         }
     }
 
-    const fn other(message: String) -> Self {
+    const fn other(stage: IrohConnectStage, elapsed_ms: u64, message: String) -> Self {
         Self {
             kind: IrohConnectAttemptErrorKind::Other,
+            stage,
+            elapsed_ms,
             message,
         }
     }
@@ -86,6 +123,25 @@ impl IrohConnectAttemptError {
     const fn is_timeout(&self) -> bool {
         matches!(self.kind, IrohConnectAttemptErrorKind::Timeout)
     }
+
+    fn report_fragment(&self, mode_label: &str, attempt_number: usize) -> String {
+        format!(
+            "{} attempt {}: phase={} kind={} elapsed={}ms detail={}",
+            mode_label,
+            attempt_number,
+            self.stage.as_str(),
+            self.kind.as_str(),
+            self.elapsed_ms,
+            self.message
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IrohAttemptFailure {
+    use_compression: bool,
+    attempt_number: usize,
+    error: IrohConnectAttemptError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +200,12 @@ pub trait TerminalBackend: Send + Sync {
 
 struct RemoteTerminalSession {
     command_tx: mpsc::Sender<SessionCommand>,
+    actor_state: Arc<Mutex<SessionActorState>>,
+}
+
+#[derive(Debug, Default)]
+struct SessionActorState {
+    terminated_reason: Option<String>,
 }
 
 enum SessionCommand {
@@ -168,6 +230,7 @@ enum SessionCommand {
 pub struct RemoteTerminalBackend {
     runtime: tokio::runtime::Runtime,
     sessions: Mutex<BTreeMap<Uuid, RemoteTerminalSession>>,
+    iroh_mode_cache: Mutex<BTreeMap<String, bool>>,
 }
 
 impl Default for RemoteTerminalBackend {
@@ -191,6 +254,40 @@ impl RemoteTerminalBackend {
         Self {
             runtime,
             sessions: Mutex::new(BTreeMap::new()),
+            iroh_mode_cache: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn iroh_mode_cache_key(target: &IrohTarget) -> String {
+        format!(
+            "{}|{}",
+            target.endpoint_id,
+            target.relay_url.as_deref().unwrap_or_default()
+        )
+    }
+
+    fn cached_iroh_mode(&self, target: &IrohTarget) -> Option<bool> {
+        let key = Self::iroh_mode_cache_key(target);
+        self.iroh_mode_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&key).copied())
+    }
+
+    fn remember_iroh_mode_success(&self, target: &IrohTarget, use_compression: bool) {
+        if let Ok(mut cache) = self.iroh_mode_cache.lock() {
+            let key = Self::iroh_mode_cache_key(target);
+            cache.insert(key, use_compression);
+        }
+    }
+
+    fn iroh_mode_order(&self, target: &IrohTarget) -> Vec<bool> {
+        match target.compression_mode {
+            IrohCompressionMode::None => vec![false],
+            IrohCompressionMode::Zstd => vec![true],
+            IrohCompressionMode::Auto => self
+                .cached_iroh_mode(target)
+                .map_or_else(|| vec![true, false], |cached| vec![cached, !cached]),
         }
     }
 
@@ -228,6 +325,13 @@ impl RemoteTerminalBackend {
             .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(handle_id.to_string()))
     }
 
+    fn session_actor_state(&self, handle_id: Uuid) -> Result<Arc<Mutex<SessionActorState>>> {
+        self.lock_sessions()?
+            .get(&handle_id)
+            .map(|session| Arc::clone(&session.actor_state))
+            .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(handle_id.to_string()))
+    }
+
     fn remove_session_if_present(&self, handle_id: Uuid) {
         if let Ok(mut sessions) = self.lock_sessions() {
             sessions.remove(&handle_id);
@@ -240,6 +344,12 @@ impl RemoteTerminalBackend {
         command_builder: impl FnOnce(oneshot::Sender<Result<T>>) -> SessionCommand,
     ) -> Result<T> {
         let command_tx = self.session_command_tx(handle_id)?;
+        let actor_state = self.session_actor_state(handle_id)?;
+        if let Some(reason) = session_terminated_reason(&actor_state) {
+            self.remove_session_if_present(handle_id);
+            return Err(MobileCoreError::TerminalBackendFailure(reason));
+        }
+
         let response = self.runtime.block_on(async {
             let (response_tx, response_rx) = oneshot::channel();
             command_tx
@@ -247,12 +357,16 @@ impl RemoteTerminalBackend {
                 .await
                 .map_err(|_| {
                     MobileCoreError::TerminalBackendFailure(
-                        "terminal backend session actor unavailable".to_string(),
+                        session_terminated_reason(&actor_state).unwrap_or_else(|| {
+                            "terminal backend session actor unavailable".to_string()
+                        }),
                     )
                 })?;
             response_rx.await.map_err(|_| {
                 MobileCoreError::TerminalBackendFailure(
-                    "terminal backend session actor dropped response".to_string(),
+                    session_terminated_reason(&actor_state).unwrap_or_else(|| {
+                        "terminal backend session actor dropped response".to_string()
+                    }),
                 )
             })
         });
@@ -355,19 +469,43 @@ impl RemoteTerminalBackend {
             ));
         }
 
-        let timeout = Duration::from_millis(target.connect_timeout_ms.max(1));
-        self.runtime.block_on(async {
-            let mut compressed_errors = Vec::new();
-            if !matches!(target.compression_mode, IrohCompressionMode::None) {
-                for attempt in 0..=IROH_COMPRESSED_RETRY_COUNT {
-                    match Self::connect_iroh_client_once(target, timeout, true).await {
-                        Ok(client) => return Ok(client),
+        let connect_timeout = Duration::from_millis(target.connect_timeout_ms.max(1));
+        let hello_timeout = Duration::from_millis(
+            target
+                .connect_timeout_ms
+                .clamp(1, DEFAULT_IROH_HELLO_PROBE_TIMEOUT_MS),
+        );
+        let mode_order = self.iroh_mode_order(target);
+
+        let result = self.runtime.block_on(async {
+            let mut failures = Vec::new();
+            for use_compression in mode_order {
+                let max_attempts = if use_compression {
+                    IROH_COMPRESSED_RETRY_COUNT.saturating_add(1)
+                } else {
+                    1
+                };
+
+                for attempt_index in 0..max_attempts {
+                    match Self::connect_iroh_client_once(
+                        target,
+                        connect_timeout,
+                        hello_timeout,
+                        use_compression,
+                    )
+                    .await
+                    {
+                        Ok(client) => return Ok((client, use_compression)),
                         Err(error) => {
-                            compressed_errors
-                                .push(format!("attempt {}: {}", attempt + 1, error.message));
-                            if matches!(target.compression_mode, IrohCompressionMode::Zstd)
-                                && !error.is_timeout()
-                            {
+                            let should_break = use_compression
+                                && matches!(target.compression_mode, IrohCompressionMode::Zstd)
+                                && !error.is_timeout();
+                            failures.push(IrohAttemptFailure {
+                                use_compression,
+                                attempt_number: attempt_index.saturating_add(1),
+                                error,
+                            });
+                            if should_break {
                                 break;
                             }
                         }
@@ -375,85 +513,92 @@ impl RemoteTerminalBackend {
                 }
             }
 
-            if matches!(target.compression_mode, IrohCompressionMode::Zstd) {
-                let errors = compressed_errors.join("; ");
-                return Err(MobileCoreError::TerminalBackendFailure(format!(
-                    "failed connecting iroh target '{}': compressed mode: {errors}",
-                    target.label
-                )));
-            }
+            Err(Self::format_iroh_connect_failures(target, &failures))
+        });
 
-            match Self::connect_iroh_client_once(target, timeout, false).await {
-                Ok(client) => Ok(client),
-                Err(raw_error) => {
-                    if compressed_errors.is_empty() {
-                        Err(MobileCoreError::TerminalBackendFailure(format!(
-                            "failed connecting iroh target '{}': raw mode: {}",
-                            target.label, raw_error.message
-                        )))
-                    } else {
-                        let compressed_summary = compressed_errors.join("; ");
-                        Err(MobileCoreError::TerminalBackendFailure(format!(
-                            "failed connecting iroh target '{}': compressed mode: {compressed_summary}; raw mode: {}",
-                            target.label, raw_error.message
-                        )))
-                    }
-                }
+        match result {
+            Ok((client, use_compression)) => {
+                self.remember_iroh_mode_success(target, use_compression);
+                Ok(client)
             }
-        })
+            Err(error_message) => Err(MobileCoreError::TerminalBackendFailure(error_message)),
+        }
     }
 
     async fn connect_iroh_client_once(
         target: &IrohTarget,
-        timeout: Duration,
+        connect_timeout: Duration,
+        hello_timeout: Duration,
         use_compression: bool,
     ) -> std::result::Result<BmuxClient, IrohConnectAttemptError> {
+        let started = Instant::now();
         let endpoint = Endpoint::builder(presets::N0)
             .alpns(vec![BMUX_IROH_ALPN.to_vec()])
             .bind()
             .await
             .map_err(|error| {
-                IrohConnectAttemptError::other(format!("failed binding iroh endpoint: {error}"))
+                IrohConnectAttemptError::other(
+                    IrohConnectStage::Connect,
+                    Self::elapsed_ms(started),
+                    format!("failed binding iroh endpoint: {error}"),
+                )
             })?;
 
         let endpoint_id: EndpointId = target.endpoint_id.parse().map_err(|error| {
-            IrohConnectAttemptError::other(format!(
-                "invalid iroh endpoint '{}': {error}",
-                target.endpoint_id
-            ))
+            IrohConnectAttemptError::other(
+                IrohConnectStage::Connect,
+                Self::elapsed_ms(started),
+                format!("invalid iroh endpoint '{}': {error}", target.endpoint_id),
+            )
         })?;
         let remote_addr = if let Some(relay_url) = target.relay_url.as_deref() {
             let relay = relay_url.parse().map_err(|error| {
-                IrohConnectAttemptError::other(format!(
-                    "invalid iroh relay url '{relay_url}': {error}"
-                ))
+                IrohConnectAttemptError::other(
+                    IrohConnectStage::Connect,
+                    Self::elapsed_ms(started),
+                    format!("invalid iroh relay url '{relay_url}': {error}"),
+                )
             })?;
             EndpointAddr::new(endpoint_id).with_relay_url(relay)
         } else {
             EndpointAddr::new(endpoint_id)
         };
 
-        let connection =
-            tokio::time::timeout(timeout, endpoint.connect(remote_addr, BMUX_IROH_ALPN))
-                .await
-                .map_err(|_| {
-                    IrohConnectAttemptError::timeout(format!(
-                        "timed out connecting iroh target '{}'",
-                        target.label
-                    ))
-                })?
-                .map_err(|error| {
-                    IrohConnectAttemptError::other(format!(
-                        "failed connecting iroh target '{}': {error}",
-                        target.label
-                    ))
-                })?;
-        let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
-            IrohConnectAttemptError::other(format!(
-                "failed opening iroh stream for '{}': {error}",
-                target.label
-            ))
+        let connection = tokio::time::timeout(
+            connect_timeout,
+            endpoint.connect(remote_addr, BMUX_IROH_ALPN),
+        )
+        .await
+        .map_err(|_| {
+            IrohConnectAttemptError::timeout(
+                IrohConnectStage::Connect,
+                Self::elapsed_ms(started),
+                format!("timed out connecting iroh target '{}'", target.label),
+            )
+        })?
+        .map_err(|error| {
+            IrohConnectAttemptError::other(
+                IrohConnectStage::Connect,
+                Self::elapsed_ms(started),
+                format!("failed connecting iroh target '{}': {error}", target.label),
+            )
         })?;
+        let (mut send, mut recv) = tokio::time::timeout(hello_timeout, connection.open_bi())
+            .await
+            .map_err(|_| {
+                IrohConnectAttemptError::timeout(
+                    IrohConnectStage::OpenBi,
+                    Self::elapsed_ms(started),
+                    format!("timed out opening iroh stream for '{}'", target.label),
+                )
+            })?
+            .map_err(|error| {
+                IrohConnectAttemptError::other(
+                    IrohConnectStage::OpenBi,
+                    Self::elapsed_ms(started),
+                    format!("failed opening iroh stream for '{}': {error}", target.label),
+                )
+            })?;
 
         let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
         let (mut bridge_read, mut bridge_write) = io::split(bridge_stream);
@@ -476,62 +621,188 @@ impl RemoteTerminalBackend {
 
         BmuxClient::connect_with_bridge_stream(
             erased,
-            timeout,
+            hello_timeout,
             "bmux-mobile-terminal-iroh".to_string(),
             Uuid::new_v4(),
         )
         .await
-        .map_err(Self::classify_iroh_connect_error)
+        .map_err(|error| {
+            Self::classify_iroh_connect_error(
+                error,
+                IrohConnectStage::HelloV2,
+                Self::elapsed_ms(started),
+            )
+        })
     }
 
-    fn classify_iroh_connect_error(error: ClientError) -> IrohConnectAttemptError {
+    fn classify_iroh_connect_error(
+        error: ClientError,
+        stage: IrohConnectStage,
+        elapsed_ms: u64,
+    ) -> IrohConnectAttemptError {
         match error {
-            ClientError::Timeout(timeout) => {
-                IrohConnectAttemptError::timeout(format!("request timed out after {timeout:?}"))
-            }
+            ClientError::Timeout(timeout) => IrohConnectAttemptError::timeout(
+                stage,
+                elapsed_ms,
+                format!("request timed out after {timeout:?}"),
+            ),
             ClientError::ProtocolIncompatible { reason } => IrohConnectAttemptError::protocol(
+                stage,
+                elapsed_ms,
                 format!("protocol negotiation failed: {reason:?}"),
             ),
             ClientError::UnexpectedEnvelopeKind { expected, actual } => {
-                IrohConnectAttemptError::protocol(format!(
-                    "unexpected envelope kind: expected {expected:?}, got {actual:?}"
-                ))
+                IrohConnectAttemptError::protocol(
+                    stage,
+                    elapsed_ms,
+                    format!("unexpected envelope kind: expected {expected:?}, got {actual:?}"),
+                )
             }
-            ClientError::UnexpectedResponse(kind) => {
-                IrohConnectAttemptError::protocol(format!("unexpected response payload: {kind}"))
-            }
+            ClientError::UnexpectedResponse(kind) => IrohConnectAttemptError::protocol(
+                stage,
+                elapsed_ms,
+                format!("unexpected response payload: {kind}"),
+            ),
             ClientError::RequestIdMismatch { expected, actual } => {
-                IrohConnectAttemptError::protocol(format!(
-                    "request id mismatch (expected {expected}, got {actual})"
-                ))
+                IrohConnectAttemptError::protocol(
+                    stage,
+                    elapsed_ms,
+                    format!("request id mismatch (expected {expected}, got {actual})"),
+                )
             }
             ClientError::Transport(transport_error) => {
-                Self::classify_iroh_transport_error(transport_error)
+                Self::classify_iroh_transport_error(transport_error, stage, elapsed_ms)
             }
-            other => IrohConnectAttemptError::other(other.to_string()),
+            other => IrohConnectAttemptError::other(stage, elapsed_ms, other.to_string()),
         }
     }
 
-    fn classify_iroh_transport_error(error: IpcTransportError) -> IrohConnectAttemptError {
+    fn classify_iroh_transport_error(
+        error: IpcTransportError,
+        stage: IrohConnectStage,
+        elapsed_ms: u64,
+    ) -> IrohConnectAttemptError {
         match error {
             IpcTransportError::Io(io_error)
                 if io_error.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
-                IrohConnectAttemptError::protocol(format!("transport error: I/O error: {io_error}"))
+                IrohConnectAttemptError::protocol(
+                    stage,
+                    elapsed_ms,
+                    format!("transport error: I/O error: {io_error}"),
+                )
             }
             IpcTransportError::FrameDecode(decode_error) => IrohConnectAttemptError::protocol(
+                stage,
+                elapsed_ms,
                 format!("transport error: frame decoding failed: {decode_error}"),
             ),
             IpcTransportError::FrameEncode(encode_error) => IrohConnectAttemptError::protocol(
+                stage,
+                elapsed_ms,
                 format!("transport error: frame encoding failed: {encode_error}"),
             ),
             IpcTransportError::UnsupportedEndpoint => IrohConnectAttemptError::other(
+                stage,
+                elapsed_ms,
                 "transport error: unsupported endpoint for this platform".to_string(),
             ),
-            IpcTransportError::Io(io_error) => {
-                IrohConnectAttemptError::other(format!("transport error: I/O error: {io_error}"))
-            }
+            IpcTransportError::Io(io_error) => IrohConnectAttemptError::other(
+                stage,
+                elapsed_ms,
+                format!("transport error: I/O error: {io_error}"),
+            ),
         }
+    }
+
+    fn format_iroh_connect_failures(
+        target: &IrohTarget,
+        failures: &[IrohAttemptFailure],
+    ) -> String {
+        if failures.is_empty() {
+            return format!(
+                "failed connecting iroh target '{}': no attempts were executed",
+                target.label
+            );
+        }
+
+        let compressed = failures
+            .iter()
+            .filter(|failure| failure.use_compression)
+            .map(|failure| {
+                failure
+                    .error
+                    .report_fragment("compressed", failure.attempt_number)
+            })
+            .collect::<Vec<_>>();
+        let raw = failures
+            .iter()
+            .filter(|failure| !failure.use_compression)
+            .map(|failure| failure.error.report_fragment("raw", failure.attempt_number))
+            .collect::<Vec<_>>();
+        let compressed_summary = if compressed.is_empty() {
+            "not attempted".to_string()
+        } else {
+            compressed.join("; ")
+        };
+        let raw_summary = if raw.is_empty() {
+            "not attempted".to_string()
+        } else {
+            raw.join("; ")
+        };
+
+        let classification = Self::classify_iroh_open_failure(failures);
+        let timeline = failures
+            .iter()
+            .map(|failure| {
+                failure.error.report_fragment(
+                    if failure.use_compression {
+                        "compressed"
+                    } else {
+                        "raw"
+                    },
+                    failure.attempt_number,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        format!(
+            "failed connecting iroh target '{}': {classification}; compressed mode: {compressed_summary}; raw mode: {raw_summary}; open timeline: {timeline}",
+            target.label
+        )
+    }
+
+    fn classify_iroh_open_failure(failures: &[IrohAttemptFailure]) -> &'static str {
+        let reached_stream = failures
+            .iter()
+            .any(|failure| !matches!(failure.error.stage, IrohConnectStage::Connect));
+        let has_connect_timeout = failures.iter().any(|failure| {
+            failure.error.stage == IrohConnectStage::Connect && failure.error.is_timeout()
+        });
+        let has_hello_timeout = failures.iter().any(|failure| {
+            failure.error.stage == IrohConnectStage::HelloV2 && failure.error.is_timeout()
+        });
+        let has_hello_eof = failures.iter().any(|failure| {
+            failure.error.stage == IrohConnectStage::HelloV2
+                && failure.error.message.to_ascii_lowercase().contains("eof")
+        });
+
+        if reached_stream && has_hello_timeout && has_hello_eof {
+            "endpoint reachable, but bmux handshake failed (timeout + early EOF)"
+        } else if reached_stream && has_hello_eof {
+            "endpoint reachable, but remote closed bmux handshake stream early"
+        } else if reached_stream && has_hello_timeout {
+            "endpoint reachable, but bmux handshake timed out"
+        } else if has_connect_timeout {
+            "unable to establish relay route before timeout"
+        } else {
+            "iroh connect/open handshake failed"
+        }
+    }
+
+    fn elapsed_ms(started: Instant) -> u64 {
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     fn session_selector_from_value(value: &str) -> SessionSelector {
@@ -606,7 +877,7 @@ impl TerminalBackend for RemoteTerminalBackend {
             .clone()
             .or_else(|| Self::normalize_session_value(target.default_session.as_deref()));
 
-        let (handle_id, session_id, can_write, focused_pane_id, streaming_client) =
+        let (handle_id, session_id, can_write, focused_pane_id, initial_chunks, streaming_client) =
             self.runtime.block_on(async {
                 let attach_info = if let Some(preferred) = preferred_session {
                     let selector = Self::session_selector_from_value(&preferred);
@@ -643,24 +914,54 @@ impl TerminalBackend for RemoteTerminalBackend {
                     .await
                     .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
 
-                Ok::<(Uuid, Uuid, bool, Option<Uuid>, StreamingBmuxClient), MobileCoreError>((
+                let initial_snapshot = streaming_client
+                    .attach_snapshot(attach_info.0, EVENT_TRIGGER_FETCH_MAX_BYTES)
+                    .await
+                    .ok();
+                let initial_chunks = initial_snapshot
+                    .as_ref()
+                    .map_or_else(Vec::new, |snapshot| snapshot.chunks.clone());
+                let focused_pane_id = initial_snapshot
+                    .as_ref()
+                    .map_or(focused_pane_id, |snapshot| Some(snapshot.focused_pane_id));
+
+                Ok::<
+                    (
+                        Uuid,
+                        Uuid,
+                        bool,
+                        Option<Uuid>,
+                        Vec<AttachPaneChunk>,
+                        StreamingBmuxClient,
+                    ),
+                    MobileCoreError,
+                >((
                     Uuid::new_v4(),
                     attach_info.0,
                     attach_info.1,
                     focused_pane_id,
+                    initial_chunks,
                     streaming_client,
                 ))
             })?;
 
         let (command_tx, command_rx) = mpsc::channel(SESSION_COMMAND_BUFFER);
+        let actor_state = Arc::new(Mutex::new(SessionActorState::default()));
         drop(self.runtime.spawn(run_remote_terminal_session(
             streaming_client,
             session_id,
             focused_pane_id,
+            initial_chunks,
             command_rx,
+            Arc::clone(&actor_state),
         )));
-        self.lock_sessions()?
-            .insert(handle_id, RemoteTerminalSession { command_tx });
+        self.lock_sessions()?.insert(
+            handle_id,
+            RemoteTerminalSession {
+                command_tx,
+                actor_state,
+            },
+        );
 
         Ok(BackendSessionHandle {
             id: handle_id,
@@ -714,13 +1015,42 @@ impl TerminalBackend for RemoteTerminalBackend {
     }
 }
 
+fn set_session_terminated_reason(actor_state: &Arc<Mutex<SessionActorState>>, reason: String) {
+    if let Ok(mut state) = actor_state.lock()
+        && state.terminated_reason.is_none()
+    {
+        state.terminated_reason = Some(reason);
+    }
+}
+
+fn session_terminated_reason(actor_state: &Arc<Mutex<SessionActorState>>) -> Option<String> {
+    actor_state.lock().ok().and_then(|state| {
+        state
+            .terminated_reason
+            .as_ref()
+            .map(|reason| format!("terminal session terminated: {reason}"))
+    })
+}
+
 async fn run_remote_terminal_session(
     mut client: StreamingBmuxClient,
     session_id: Uuid,
     focused_pane_id: Option<Uuid>,
+    initial_chunks: Vec<AttachPaneChunk>,
     mut command_rx: mpsc::Receiver<SessionCommand>,
+    actor_state: Arc<Mutex<SessionActorState>>,
 ) {
     let mut state = StreamOutputState::new(focused_pane_id);
+    for chunk in initial_chunks {
+        if state.accepts_pane(chunk.pane_id) {
+            state.apply_chunk(chunk);
+        }
+    }
+
+    let mut event_stream_open = true;
+    let mut keepalive = tokio::time::interval(Duration::from_millis(SESSION_KEEPALIVE_INTERVAL_MS));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let _ = keepalive.tick().await;
 
     loop {
         tokio::select! {
@@ -728,15 +1058,38 @@ async fn run_remote_terminal_session(
                 let Some(command) = maybe_command else {
                     break;
                 };
-                if !handle_session_command(&mut client, &mut state, session_id, command).await {
+                if !handle_session_command(
+                    &mut client,
+                    &mut state,
+                    session_id,
+                    command,
+                    &actor_state,
+                ).await {
                     return;
                 }
             }
-            maybe_event = client.event_receiver().recv() => {
+            maybe_event = client.event_receiver().recv(), if event_stream_open => {
                 let Some(event) = maybe_event else {
-                    break;
+                    event_stream_open = false;
+                    let reason = client.disconnect_reason().unwrap_or_else(|| {
+                        "terminal session stream closed by remote peer".to_string()
+                    });
+                    set_session_terminated_reason(
+                        &actor_state,
+                        reason,
+                    );
+                    continue;
                 };
                 handle_session_event(&mut client, &mut state, session_id, event).await;
+            }
+            _ = keepalive.tick(), if event_stream_open => {
+                if let Err(error) = client.ping().await {
+                    event_stream_open = false;
+                    set_session_terminated_reason(
+                        &actor_state,
+                        format!("keepalive ping failed: {error}"),
+                    );
+                }
             }
         }
     }
@@ -749,7 +1102,33 @@ async fn handle_session_command(
     state: &mut StreamOutputState,
     session_id: Uuid,
     command: SessionCommand,
+    actor_state: &Arc<Mutex<SessionActorState>>,
 ) -> bool {
+    if let Some(reason) = session_terminated_reason(actor_state) {
+        match command {
+            SessionCommand::PollOutput { response, .. } => {
+                let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(reason)));
+                return true;
+            }
+            SessionCommand::WriteInput { response, .. } => {
+                let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(format!(
+                    "{reason}; input rejected"
+                ))));
+                return true;
+            }
+            SessionCommand::Resize { response, .. } => {
+                let _ = response.send(Err(MobileCoreError::TerminalBackendFailure(format!(
+                    "{reason}; resize rejected"
+                ))));
+                return true;
+            }
+            SessionCommand::Close { response } => {
+                let _ = response.send(Ok(()));
+                return false;
+            }
+        }
+    }
+
     match command {
         SessionCommand::PollOutput {
             max_bytes,
@@ -763,6 +1142,9 @@ async fn handle_session_command(
                 .attach_input(session_id, bytes)
                 .await
                 .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
+            if let Err(error) = &result {
+                set_session_terminated_reason(actor_state, error.to_string());
+            }
             let _ = response.send(result);
             true
         }
@@ -776,6 +1158,9 @@ async fn handle_session_command(
                 .await
                 .map(|(_cols, _rows)| ())
                 .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
+            if let Err(error) = &result {
+                set_session_terminated_reason(actor_state, error.to_string());
+            }
             let _ = response.send(result);
             true
         }

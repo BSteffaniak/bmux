@@ -24,9 +24,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -41,6 +46,7 @@ import kotlinx.coroutines.selects.select
 import kotlin.coroutines.coroutineContext
 
 private const val MAX_STATUS_LINES = 12
+private const val MAX_DIAGNOSTIC_LINES = 160
 
 @Composable
 fun TerminalSessionScreen(
@@ -52,7 +58,10 @@ fun TerminalSessionScreen(
     writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
     resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
     closeTerminal: suspend (terminalId: String) -> Result<Unit>,
+    fetchTerminalDiagnostics: suspend (terminalId: String, sinceSequence: Long?, limit: Int) -> Result<List<TerminalDiagnosticFrame>>,
+    latestTerminalFailure: suspend (terminalId: String) -> Result<String?>,
 ) {
+    val clipboard = LocalClipboardManager.current
     val renderer = remember(endpoint.id) { TermlibTerminalRenderer() }
     val transport = remember(endpoint.id) {
         CoreTerminalTransport(
@@ -61,12 +70,15 @@ fun TerminalSessionScreen(
             writeTerminalInput = writeTerminalInput,
             resizeTerminal = resizeTerminal,
             closeTerminal = closeTerminal,
+            fetchTerminalDiagnostics = fetchTerminalDiagnostics,
+            latestTerminalFailure = latestTerminalFailure,
         )
     }
 
     var connection by remember(endpoint.id) { mutableStateOf<TerminalTransportConnection?>(null) }
     var warning by remember(endpoint.id) { mutableStateOf<String?>(null) }
     var statusLines by remember(endpoint.id) { mutableStateOf(emptyList<TerminalStatusEvent>()) }
+    var diagnosticLines by remember(endpoint.id) { mutableStateOf(emptyList<TerminalDiagnosticFrame>()) }
     var statusPanelVisible by remember(endpoint.id) { mutableStateOf(false) }
     var statusPanelExpanded by remember(endpoint.id) { mutableStateOf(false) }
 
@@ -75,6 +87,7 @@ fun TerminalSessionScreen(
         warning = null
         connection = null
         statusLines = emptyList()
+        diagnosticLines = emptyList()
         statusPanelVisible = false
         statusPanelExpanded = false
         runCatching {
@@ -90,6 +103,20 @@ fun TerminalSessionScreen(
                             statusPanelExpanded = true
                         }
                     }
+                },
+                onDiagnostics = { events ->
+                    if (events.isNotEmpty()) {
+                        diagnosticLines = (diagnosticLines + events).takeLast(MAX_DIAGNOSTIC_LINES)
+                        if (events.any { it.severity != TerminalStatusSeverity.INFO }) {
+                            statusPanelVisible = true
+                            statusPanelExpanded = true
+                        }
+                    }
+                },
+                onTerminalFailure = { message ->
+                    warning = message
+                    statusPanelVisible = true
+                    statusPanelExpanded = true
                 },
             )
         }.onSuccess {
@@ -138,7 +165,16 @@ fun TerminalSessionScreen(
                     .padding(bottom = 8.dp),
             )
 
-            if (statusLines.isNotEmpty() && statusPanelVisible) {
+            if ((statusLines.isNotEmpty() || diagnosticLines.isNotEmpty()) && statusPanelVisible) {
+                val displayLines = (statusLines.map {
+                    DisplayLine(message = "[status] ${it.message}", severity = it.severity)
+                } + diagnosticLines.map {
+                    DisplayLine(
+                        message = "[diag ${formatDiagnosticTimestamp(it.timestampMs)}][${it.stage}] ${it.message}",
+                        severity = it.severity,
+                    )
+                }).takeLast(MAX_DIAGNOSTIC_LINES)
+
                 Card(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -155,8 +191,26 @@ fun TerminalSessionScreen(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
-                            Text("Status (${statusLines.size})", style = MaterialTheme.typography.labelMedium)
+                            Text(
+                                "Status ${statusLines.size} | Diagnostics ${diagnosticLines.size}",
+                                style = MaterialTheme.typography.labelMedium,
+                            )
                             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                TextButton(
+                                    onClick = {
+                                        clipboard.setText(
+                                            AnnotatedString(
+                                                buildDiagnosticsReport(
+                                                    endpoint = endpoint,
+                                                    statusLines = statusLines,
+                                                    diagnostics = diagnosticLines,
+                                                ),
+                                            ),
+                                        )
+                                    },
+                                ) {
+                                    Text("Copy")
+                                }
                                 TextButton(onClick = { statusPanelExpanded = !statusPanelExpanded }) {
                                     Text(if (statusPanelExpanded) "Collapse" else "Expand")
                                 }
@@ -166,6 +220,7 @@ fun TerminalSessionScreen(
                                 TextButton(
                                     onClick = {
                                         statusLines = emptyList()
+                                        diagnosticLines = emptyList()
                                         statusPanelVisible = false
                                     },
                                 ) {
@@ -175,14 +230,14 @@ fun TerminalSessionScreen(
                         }
 
                         val visibleLines = if (statusPanelExpanded) {
-                            statusLines
+                            displayLines
                         } else {
-                            listOf(statusLines.last())
+                            displayLines.takeLast(1)
                         }
                         LazyColumn(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = if (statusPanelExpanded) 96.dp else 28.dp),
+                                .heightIn(max = if (statusPanelExpanded) 160.dp else 28.dp),
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
                             itemsIndexed(visibleLines, key = { index, line -> "$index-${line.message}" }) { _, line ->
@@ -200,14 +255,14 @@ fun TerminalSessionScreen(
                         }
                     }
                 }
-            } else if (statusLines.isNotEmpty()) {
+            } else if (statusLines.isNotEmpty() || diagnosticLines.isNotEmpty()) {
                 TextButton(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(8.dp),
                     onClick = { statusPanelVisible = true },
                 ) {
-                    Text("Show status (${statusLines.size})")
+                    Text("Show diagnostics")
                 }
             }
         }
@@ -228,12 +283,16 @@ private class CoreTerminalTransport(
     private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
     private val resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
     private val closeTerminal: suspend (terminalId: String) -> Result<Unit>,
+    private val fetchTerminalDiagnostics: suspend (terminalId: String, sinceSequence: Long?, limit: Int) -> Result<List<TerminalDiagnosticFrame>>,
+    private val latestTerminalFailure: suspend (terminalId: String) -> Result<String?>,
 ) : TerminalTransport {
     override suspend fun open(
         endpoint: TerminalEndpoint,
         session: String?,
         sink: (ByteArray) -> Unit,
         onStatus: (TerminalStatusEvent) -> Unit,
+        onDiagnostics: (List<TerminalDiagnosticFrame>) -> Unit,
+        onTerminalFailure: (String) -> Unit,
     ): TerminalTransportConnection {
         onStatus(
             TerminalStatusEvent(
@@ -267,6 +326,10 @@ private class CoreTerminalTransport(
             writeTerminalInput = writeTerminalInput,
             resizeTerminal = resizeTerminal,
             closeTerminal = closeTerminal,
+            fetchTerminalDiagnostics = fetchTerminalDiagnostics,
+            latestTerminalFailure = latestTerminalFailure,
+            onDiagnostics = onDiagnostics,
+            onTerminalFailure = onTerminalFailure,
         )
     }
 
@@ -285,9 +348,15 @@ private class CoreTerminalTransportConnection(
     private val writeTerminalInput: suspend (terminalId: String, bytes: ByteArray) -> Result<Unit>,
     private val resizeTerminal: suspend (terminalId: String, rows: Int, cols: Int) -> Result<Unit>,
     private val closeTerminal: suspend (terminalId: String) -> Result<Unit>,
+    private val fetchTerminalDiagnostics: suspend (terminalId: String, sinceSequence: Long?, limit: Int) -> Result<List<TerminalDiagnosticFrame>>,
+    private val latestTerminalFailure: suspend (terminalId: String) -> Result<String?>,
+    private val onDiagnostics: (List<TerminalDiagnosticFrame>) -> Unit,
+    private val onTerminalFailure: (String) -> Unit,
 ) : TerminalTransportConnection {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val outboundCommands = Channel<OutboundCommand>(capacity = Channel.BUFFERED)
+    @Volatile
+    private var terminalFailed = false
     private var closed = false
 
     init {
@@ -295,10 +364,58 @@ private class CoreTerminalTransportConnection(
             runOutboundLoop()
         }
         scope.launch {
+            var diagnosticsSequence: Long? = null
+            var nextDiagnosticsFetchAtMs = 0L
             while (isActive && !closed) {
+                val now = System.currentTimeMillis()
+                if (now >= nextDiagnosticsFetchAtMs) {
+                    nextDiagnosticsFetchAtMs = now + DIAGNOSTICS_POLL_INTERVAL_MS
+                    fetchTerminalDiagnostics(terminalId, diagnosticsSequence, DIAGNOSTICS_FETCH_LIMIT)
+                        .onSuccess { diagnostics ->
+                            if (diagnostics.isNotEmpty()) {
+                                diagnosticsSequence = diagnostics.last().sequence
+                                scope.launch(Dispatchers.Main) {
+                                    onDiagnostics(diagnostics)
+                                }
+                            }
+                        }
+                }
+
                 val chunks = pollTerminalOutput(terminalId, 64)
                     .getOrElse { error ->
-                        sink("\r\n[terminal poll failed: ${error.message ?: "unknown"}]\r\n".encodeToByteArray())
+                        val flushedDiagnostics = fetchTerminalDiagnostics(
+                            terminalId,
+                            diagnosticsSequence,
+                            DIAGNOSTICS_FETCH_LIMIT,
+                        ).getOrDefault(emptyList())
+                        if (flushedDiagnostics.isNotEmpty()) {
+                            diagnosticsSequence = flushedDiagnostics.last().sequence
+                            scope.launch(Dispatchers.Main) {
+                                onDiagnostics(flushedDiagnostics)
+                            }
+                        }
+
+                        val failureMessage = latestTerminalFailure(terminalId)
+                            .getOrNull()
+                            ?.takeIf { it.isNotBlank() }
+                        val latestDiagnosticFailure = flushedDiagnostics
+                            .asReversed()
+                            .firstOrNull { it.severity == TerminalStatusSeverity.ERROR }
+                            ?.let { "${it.stage}: ${it.message}" }
+                        val detail = failureMessage
+                            ?: latestDiagnosticFailure
+                            ?: (error.message ?: "unknown")
+                        sink("\r\n[terminal poll failed: $detail]\r\n".encodeToByteArray())
+                        scope.launch(Dispatchers.Main) {
+                            onStatus(
+                                TerminalStatusEvent(
+                                    message = "terminal poll failed: $detail",
+                                    severity = TerminalStatusSeverity.ERROR,
+                                ),
+                            )
+                            onTerminalFailure(detail)
+                        }
+                        markTerminalFailed()
                         break
                     }
                 if (chunks.isEmpty()) {
@@ -371,6 +488,10 @@ private class CoreTerminalTransportConnection(
         var lastAppliedResize: Pair<Int, Int>? = null
 
         while (coroutineContext.isActive) {
+            if (terminalFailed) {
+                return
+            }
+
             val timeoutMillis = pendingResize
                 ?.let { pending -> (pending.deadlineMillis - System.currentTimeMillis()).coerceAtLeast(0L) }
             val command = if (timeoutMillis == null) {
@@ -380,6 +501,10 @@ private class CoreTerminalTransportConnection(
                     outboundCommands.onReceiveCatching { result -> result.getOrNull() }
                     onTimeout(timeoutMillis) { null }
                 }
+            }
+
+            if (terminalFailed) {
+                return
             }
 
             if (command == null) {
@@ -428,6 +553,8 @@ private class CoreTerminalTransportConnection(
         private const val POLL_IDLE_DELAY_MS = 25L
         private const val RESIZE_DEBOUNCE_MS = 80L
         private const val CLOSE_DRAIN_DELAY_MS = 250L
+        private const val DIAGNOSTICS_POLL_INTERVAL_MS = 250L
+        private const val DIAGNOSTICS_FETCH_LIMIT = 48
     }
 
     private sealed interface OutboundCommand {
@@ -441,6 +568,15 @@ private class CoreTerminalTransportConnection(
         val cols: Int,
         val deadlineMillis: Long,
     )
+
+    private fun markTerminalFailed() {
+        if (terminalFailed) {
+            return
+        }
+        terminalFailed = true
+        closed = true
+        outboundCommands.close()
+    }
 
     private fun inferStatusSeverity(message: String): TerminalStatusSeverity {
         val normalized = message.lowercase()
@@ -457,4 +593,72 @@ private class CoreTerminalTransportConnection(
             else -> TerminalStatusSeverity.INFO
         }
     }
+}
+
+private data class DisplayLine(
+    val message: String,
+    val severity: TerminalStatusSeverity,
+)
+
+private fun formatDiagnosticTimestamp(timestampMs: Long): String {
+    val formatter = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    return formatter.format(Date(timestampMs))
+}
+
+private fun buildDiagnosticsReport(
+    endpoint: TerminalEndpoint,
+    statusLines: List<TerminalStatusEvent>,
+    diagnostics: List<TerminalDiagnosticFrame>,
+): String {
+    val report = StringBuilder()
+    report.append("bmux mobile terminal diagnostics\n")
+    report.append("endpoint=").append(endpoint.name)
+        .append(" target=").append(endpoint.canonicalTarget)
+        .append('\n')
+
+    val primaryCause = diagnostics.asReversed()
+        .firstOrNull { it.severity == TerminalStatusSeverity.ERROR }
+        ?.let { "${it.stage}: ${it.message}" }
+        ?: statusLines.asReversed()
+            .firstOrNull { it.severity == TerminalStatusSeverity.ERROR }
+            ?.message
+    primaryCause?.let { cause ->
+        report.append("primary_cause=").append(cause).append('\n')
+    }
+
+    if (statusLines.isNotEmpty()) {
+        report.append("\nstatus events\n")
+        statusLines.forEach { line ->
+            report.append('[')
+                .append(line.severity.name)
+                .append("] ")
+                .append(line.message)
+                .append('\n')
+        }
+    }
+
+    if (diagnostics.isNotEmpty()) {
+        report.append("\ndiagnostic timeline\n")
+        diagnostics.forEach { line ->
+            report.append('#')
+                .append(line.sequence)
+                .append(' ')
+                .append(formatDiagnosticTimestamp(line.timestampMs))
+                .append(' ')
+                .append('[')
+                .append(line.severity.name)
+                .append(']')
+                .append('[')
+                .append(line.stage)
+                .append(']')
+            line.code?.let { code ->
+                report.append('[').append(code).append(']')
+            }
+            report.append(' ')
+                .append(line.message)
+                .append('\n')
+        }
+    }
+
+    return report.toString()
 }
