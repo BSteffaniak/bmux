@@ -475,11 +475,12 @@ impl RemoteTerminalBackend {
         }
 
         let connect_timeout = Duration::from_millis(target.connect_timeout_ms.max(1));
-        let hello_timeout = Duration::from_millis(
+        let hello_probe_timeout = Duration::from_millis(
             target
                 .connect_timeout_ms
                 .clamp(1, DEFAULT_IROH_HELLO_PROBE_TIMEOUT_MS),
         );
+        let hello_retry_timeout = connect_timeout;
         let mode_order = self.iroh_mode_order(target);
 
         let result = self.runtime.block_on(async {
@@ -491,11 +492,13 @@ impl RemoteTerminalBackend {
                     1
                 };
 
-                for attempt_index in 0..max_attempts {
+                let mut mode_attempt_number: usize = 0;
+                for _ in 0..max_attempts {
+                    mode_attempt_number += 1;
                     match Self::connect_iroh_client_once(
                         target,
                         connect_timeout,
-                        hello_timeout,
+                        hello_probe_timeout,
                         use_compression,
                     )
                     .await
@@ -505,12 +508,47 @@ impl RemoteTerminalBackend {
                             let should_break = use_compression
                                 && matches!(target.compression_mode, IrohCompressionMode::Zstd)
                                 && !error.is_timeout();
+                            let should_retry_with_extended_hello =
+                                Self::should_retry_with_extended_hello_timeout(
+                                    &error,
+                                    hello_probe_timeout,
+                                    hello_retry_timeout,
+                                );
                             failures.push(IrohAttemptFailure {
                                 use_compression,
-                                attempt_number: attempt_index.saturating_add(1),
+                                attempt_number: mode_attempt_number,
                                 error,
                             });
-                            if should_break {
+
+                            if should_retry_with_extended_hello {
+                                mode_attempt_number += 1;
+                                match Self::connect_iroh_client_once(
+                                    target,
+                                    connect_timeout,
+                                    hello_retry_timeout,
+                                    use_compression,
+                                )
+                                .await
+                                {
+                                    Ok(client) => return Ok((client, use_compression)),
+                                    Err(retry_error) => {
+                                        let retry_should_break = use_compression
+                                            && matches!(
+                                                target.compression_mode,
+                                                IrohCompressionMode::Zstd
+                                            )
+                                            && !retry_error.is_timeout();
+                                        failures.push(IrohAttemptFailure {
+                                            use_compression,
+                                            attempt_number: mode_attempt_number,
+                                            error: retry_error,
+                                        });
+                                        if retry_should_break {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else if should_break {
                                 break;
                             }
                         }
@@ -804,6 +842,19 @@ impl RemoteTerminalBackend {
         } else {
             "iroh connect/open handshake failed"
         }
+    }
+
+    fn should_retry_with_extended_hello_timeout(
+        error: &IrohConnectAttemptError,
+        hello_probe_timeout: Duration,
+        hello_retry_timeout: Duration,
+    ) -> bool {
+        hello_retry_timeout > hello_probe_timeout
+            && error.is_timeout()
+            && matches!(
+                error.stage,
+                IrohConnectStage::OpenBi | IrohConnectStage::HelloV2
+            )
     }
 
     fn elapsed_ms(started: Instant) -> u64 {
@@ -1545,5 +1596,56 @@ mod tests {
         );
         assert!(target.require_ssh_auth);
         assert!(matches!(target.compression_mode, IrohCompressionMode::Zstd));
+    }
+
+    #[test]
+    fn retry_with_extended_hello_timeout_for_hello_probe_timeout() {
+        let error = IrohConnectAttemptError::timeout(
+            IrohConnectStage::HelloV2,
+            2_500,
+            "request timed out after 2.5s".to_string(),
+        );
+
+        assert!(
+            RemoteTerminalBackend::should_retry_with_extended_hello_timeout(
+                &error,
+                std::time::Duration::from_millis(2_500),
+                std::time::Duration::from_millis(7_500),
+            )
+        );
+    }
+
+    #[test]
+    fn no_retry_with_extended_hello_timeout_for_connect_stage_timeout() {
+        let error = IrohConnectAttemptError::timeout(
+            IrohConnectStage::Connect,
+            2_500,
+            "timed out connecting iroh target".to_string(),
+        );
+
+        assert!(
+            !RemoteTerminalBackend::should_retry_with_extended_hello_timeout(
+                &error,
+                std::time::Duration::from_millis(2_500),
+                std::time::Duration::from_millis(7_500),
+            )
+        );
+    }
+
+    #[test]
+    fn no_retry_with_extended_hello_timeout_when_retry_not_longer_than_probe() {
+        let error = IrohConnectAttemptError::timeout(
+            IrohConnectStage::OpenBi,
+            2_500,
+            "timed out opening iroh stream".to_string(),
+        );
+
+        assert!(
+            !RemoteTerminalBackend::should_retry_with_extended_hello_timeout(
+                &error,
+                std::time::Duration::from_millis(2_500),
+                std::time::Duration::from_millis(2_500),
+            )
+        );
     }
 }
