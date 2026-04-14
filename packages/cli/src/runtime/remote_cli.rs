@@ -1628,6 +1628,7 @@ const fn resolve_hosted_mode(config: &BmuxConfig, mode: Option<HostedModeArg>) -
 
 pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Result<u8> {
     let config = BmuxConfig::load()?;
+    let non_interactive_default = link.is_none() && !io::stdin().is_terminal();
     let target = if let Some(link) = link {
         let normalized = normalize_join_target_input(link)?;
         if normalized != link.trim() {
@@ -1637,6 +1638,9 @@ pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Resul
     } else {
         choose_default_target_interactively(&config)?
     };
+    if non_interactive_default {
+        println!("Using default target: {target}");
+    }
     let resumed_session = session.or_else(|| {
         config
             .connections
@@ -3146,6 +3150,13 @@ fn normalize_join_target_input(link: &str) -> Result<String> {
     if value.contains("://") {
         return Ok(value.to_string());
     }
+    if let Some(suggestion) = suggest_invite_typo_fix(value) {
+        return Err(actionable_error(
+            "invite looks malformed",
+            "bmux join <invite>",
+            Some(&format!("Did you mean: {suggestion}")),
+        ));
+    }
     if value.contains(char::is_whitespace) {
         return Err(actionable_error(
             "could not find a valid invite link in input",
@@ -3154,6 +3165,24 @@ fn normalize_join_target_input(link: &str) -> Result<String> {
         ));
     }
     Ok(format!("bmux://{value}"))
+}
+
+fn suggest_invite_typo_fix(value: &str) -> Option<String> {
+    if let Some(rest) = value.strip_prefix("bmux:/")
+        && !value.starts_with("bmux://")
+    {
+        return Some(format!("bmux://{}", rest.trim_start_matches('/')));
+    }
+    if let Some(rest) = value.strip_prefix("bmux//") {
+        return Some(format!("bmux://{}", rest.trim_start_matches('/')));
+    }
+    if value.starts_with("http:/") && !value.starts_with("http://") {
+        return Some(value.replacen("http:/", "http://", 1));
+    }
+    if value.starts_with("https:/") && !value.starts_with("https://") {
+        return Some(value.replacen("https:/", "https://", 1));
+    }
+    None
 }
 
 fn extract_target_from_text(value: &str) -> Option<String> {
@@ -8026,6 +8055,14 @@ mod tests {
                 .contains("could not find a valid invite link in input")
         );
         assert!(error.to_string().contains("Fix: bmux join <invite>"));
+    }
+
+    #[test]
+    fn normalize_join_target_input_malformed_scheme_offers_did_you_mean_hint() {
+        let error = normalize_join_target_input("bmux:/demo").expect_err("should fail");
+        assert!(error.to_string().contains("invite looks malformed"));
+        assert!(error.to_string().contains("Fix: bmux join <invite>"));
+        assert!(error.to_string().contains("Did you mean: bmux://demo"));
     }
 
     #[test]

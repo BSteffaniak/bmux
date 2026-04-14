@@ -75,6 +75,13 @@ impl CliTestEnv {
     }
 }
 
+fn stdout_lines(output: &std::process::Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(ToString::to_string)
+        .collect()
+}
+
 #[test]
 fn host_status_prints_runtime_state_from_file() {
     let root = TempDirGuard::new("status-output");
@@ -258,4 +265,56 @@ relay_url = "https://relay.example.com"
     assert!(stdout.contains("  endpoint id: endpoint-123"));
     assert!(stdout.contains("  relay: https://relay.example.com"));
     assert!(stdout.contains("  join: bmux join dev"));
+}
+
+#[test]
+fn setup_check_not_ready_output_contract_is_stable() {
+    let env = CliTestEnv::new("setup-check-not-ready");
+    std::fs::write(
+        env.config_dir.join("bmux.toml"),
+        r#"[connections]
+hosted_mode = "control_plane"
+"#,
+    )
+    .expect("write bmux config");
+
+    let output = env.run(&["setup", "--check"]);
+    assert_eq!(output.status.code(), Some(1));
+    let lines = stdout_lines(&output);
+    assert_eq!(lines.first().map(String::as_str), Some("Status: not ready"));
+    assert!(lines.iter().any(|line| line.starts_with("Reason: ")));
+    assert!(lines.iter().any(|line| line == "Fix: bmux setup"));
+    assert!(lines.iter().any(|line| line.starts_with("Advanced: ")));
+}
+
+#[test]
+fn doctor_hosted_not_ready_output_contract_is_stable() {
+    let env = CliTestEnv::new("doctor-hosted-not-ready");
+
+    let output = env.run(&["doctor", "--hosted"]);
+    assert_eq!(output.status.code(), Some(1));
+    let lines = stdout_lines(&output);
+    assert_eq!(lines.first().map(String::as_str), Some("Status: not ready"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("Reason: failed checks:"))
+    );
+    assert!(lines.iter().any(|line| line == "Fix: bmux setup"));
+    assert!(lines.iter().any(|line| line.starts_with("auth: fail (")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("control-plane: fail ("))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("host-runtime: fail ("))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("share-lookup: fail ("))
+    );
 }

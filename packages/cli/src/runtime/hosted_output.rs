@@ -52,3 +52,43 @@ pub(super) fn hosted_not_ready_reason(
         reasons.join("; ")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HostedHostState, hosted_not_ready_reason, status_not_ready_lines, status_ready_lines,
+    };
+
+    #[test]
+    fn status_ready_lines_include_next_when_provided() {
+        let lines = status_ready_lines(Some("bmux hosts"));
+        assert_eq!(
+            lines,
+            vec!["Status: ready".to_string(), "Next: bmux hosts".to_string()]
+        );
+    }
+
+    #[test]
+    fn status_not_ready_lines_include_reason_fix_and_advanced() {
+        let lines = status_not_ready_lines(
+            Some("host is offline"),
+            "bmux setup",
+            Some("bmux host --daemon"),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Status: not ready".to_string(),
+                "Reason: host is offline".to_string(),
+                "Fix: bmux setup".to_string(),
+                "Advanced: bmux host --daemon".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn hosted_not_ready_reason_combines_auth_host_and_share() {
+        let reason = hosted_not_ready_reason(true, HostedHostState::Stale(42), true);
+        assert_eq!(reason, "not signed in; host state is stale (pid 42)");
+    }
+}
