@@ -337,6 +337,23 @@ jobs:
         if: ${{ steps.changes.outputs.run != 'true' }}
         run: echo "Skipping plugin runtime perf gates (no plugin/runtime touching changes)."
 
+  sandbox-bundle-regression:
+    name: Sandbox Bundle Regression
+    runs-on: ubuntu-latest
+    needs: [determine-affected-packages]
+    if: ${{ needs.determine-affected-packages.outputs.has-changes == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run sandbox bundle/verify regression checks
+        shell: bash
+        run: |
+          ./scripts/sandbox-bundle-regression.sh
+
   build:
     name: ${{ matrix.package.name }}${{ matrix.package.hasMultipleOs && format(' {0}', matrix.package.osEmoji) || '' }}${{ matrix.package.osCount > 1 && format(' {0}', matrix.package.osIndex) || '' }}
     runs-on: ${{ matrix.package.os }}
