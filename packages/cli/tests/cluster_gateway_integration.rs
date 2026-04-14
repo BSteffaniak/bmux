@@ -520,3 +520,175 @@ fn gateway_history_json_supports_since_and_limit_filters() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["candidate"], "missing-prod-b");
 }
+
+#[test]
+fn gateway_history_clear_requires_confirm_for_broad_non_interactive_clear() {
+    let env = CliTestEnv::new("gateway-history-clear-confirm");
+    env.write_cluster_config();
+
+    let now_ms: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("unix millis should fit into u64");
+    let state = serde_json::json!({
+        "version": 3,
+        "clusters": {
+            "prod": {
+                "last_good": null,
+                "cooldown_until_unix_ms": {},
+                "candidate_health": {},
+                "history": [
+                    {
+                        "observed_at_unix_ms": now_ms,
+                        "command": "cluster-status",
+                        "candidate": "missing-prod-a",
+                        "result": "failure",
+                        "reason_code": "timeout",
+                        "selected": false
+                    }
+                ]
+            }
+        }
+    });
+    std::fs::write(
+        env.gateway_state_path(),
+        serde_json::to_string_pretty(&state).expect("serialize gateway history state"),
+    )
+    .expect("write gateway state");
+
+    let fail_output = env.run(&["cluster", "gateway", "history-clear", "--cluster", "prod"]);
+    assert_eq!(fail_output.status.code(), Some(1));
+    assert!(
+        combined_output(&fail_output).contains("requires --confirm"),
+        "unexpected output: {}",
+        combined_output(&fail_output)
+    );
+
+    let ok_output = env.run(&[
+        "cluster",
+        "gateway",
+        "history-clear",
+        "--cluster",
+        "prod",
+        "--confirm",
+    ]);
+    assert_eq!(ok_output.status.code(), Some(0));
+
+    let history_output = env.run(&[
+        "cluster",
+        "gateway",
+        "history",
+        "--cluster",
+        "prod",
+        "--format",
+        "json",
+    ]);
+    let payload: Value = serde_json::from_slice(&history_output.stdout).expect("history payload");
+    assert_eq!(payload["count"], 0);
+}
+
+#[test]
+fn gateway_history_export_ndjson_emits_filtered_entries() {
+    let env = CliTestEnv::new("gateway-history-export-ndjson");
+    env.write_cluster_config();
+
+    let now_ms: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("unix millis should fit into u64");
+    let state = serde_json::json!({
+        "version": 3,
+        "clusters": {
+            "prod": {
+                "last_good": null,
+                "cooldown_until_unix_ms": {},
+                "candidate_health": {},
+                "history": [
+                    {
+                        "observed_at_unix_ms": now_ms,
+                        "command": "cluster-status",
+                        "candidate": "missing-prod-a",
+                        "result": "failure",
+                        "reason_code": "timeout",
+                        "selected": false
+                    },
+                    {
+                        "observed_at_unix_ms": now_ms,
+                        "command": "cluster-status",
+                        "candidate": "missing-prod-b",
+                        "result": "success",
+                        "reason_code": null,
+                        "selected": true
+                    }
+                ]
+            }
+        }
+    });
+    std::fs::write(
+        env.gateway_state_path(),
+        serde_json::to_string_pretty(&state).expect("serialize gateway history state"),
+    )
+    .expect("write gateway state");
+
+    let output = env.run(&[
+        "cluster",
+        "gateway",
+        "history-export",
+        "--cluster",
+        "prod",
+        "--format",
+        "ndjson",
+        "--result",
+        "failure",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 1);
+    let row: Value = serde_json::from_str(lines[0]).expect("ndjson row");
+    assert_eq!(row["candidate"], "missing-prod-a");
+    assert_eq!(row["result"], "failure");
+}
+
+#[test]
+fn gateway_why_and_doctor_json_include_actions_and_slo() {
+    let env = CliTestEnv::new("gateway-why-doctor-slo");
+    env.write_cluster_config();
+
+    let why_output = env.run(&[
+        "cluster",
+        "gateway",
+        "why",
+        "--cluster",
+        "prod",
+        "--format",
+        "json",
+    ]);
+    let why_payload: Value = serde_json::from_slice(&why_output.stdout).expect("why json");
+    assert!(why_payload["decision_summary"].is_object());
+    assert!(why_payload["slo"].is_object());
+
+    let doctor_output = env.run(&[
+        "cluster",
+        "gateway",
+        "doctor",
+        "--cluster",
+        "prod",
+        "--format",
+        "json",
+    ]);
+    let doctor_payload: Value =
+        serde_json::from_slice(&doctor_output.stdout).expect("doctor json payload");
+    assert!(doctor_payload["slo"].is_object());
+    let findings = doctor_payload["findings"]
+        .as_array()
+        .expect("findings array");
+    if let Some(first) = findings.first() {
+        assert!(first["next_command"].is_string());
+        assert!(first["priority"].is_number());
+    }
+}

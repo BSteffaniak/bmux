@@ -86,7 +86,10 @@ struct ClusterGatewayDefinition {
     probe_timeout_ms: Option<u64>,
     cooldown_ms: Option<u64>,
     cooldown_max_ms: Option<u64>,
+    cooldown_jitter_pct: Option<u32>,
     success_ttl_ms: Option<u64>,
+    history_max_entries: Option<usize>,
+    history_retention_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,15 +152,21 @@ struct PersistedGatewayCandidateHealth {
     breaker_open_until_unix_ms: Option<u64>,
     adaptive_cooldown_level: u32,
     half_open_success_streak: u32,
+    last_failure_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 struct PersistedGatewayHistoryEntry {
     observed_at_unix_ms: u64,
     command: String,
     candidate: Option<String>,
+    execution_mode: Option<GatewayExecutionMode>,
+    latency_ms: Option<u64>,
     result: String,
-    reason: Option<String>,
+    #[serde(alias = "reason")]
+    reason_code: Option<String>,
+    selected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +191,7 @@ struct GatewayCandidateHealth {
     breaker_open_until: Option<Instant>,
     adaptive_cooldown_level: u32,
     half_open_success_streak: u32,
+    last_failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,8 +199,11 @@ struct GatewayHistoryEntry {
     observed_at: Instant,
     command: String,
     candidate: Option<String>,
+    execution_mode: GatewayExecutionMode,
+    latency_ms: Option<u64>,
     result: String,
-    reason: Option<String>,
+    reason_code: Option<String>,
+    selected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -251,7 +264,10 @@ struct GatewayPolicyValues {
     probe_timeout_ms: u64,
     cooldown_ms: u64,
     cooldown_max_ms: u64,
+    cooldown_jitter_pct: u32,
     success_ttl_ms: u64,
+    history_max_entries: usize,
+    history_retention_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -269,12 +285,61 @@ struct GatewayDoctorFinding {
     reason_code: &'static str,
     detail: String,
     recommended_action: String,
+    priority: u8,
+    confidence: f32,
+    next_command: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize)]
+struct GatewayDoctorSloSnapshot {
+    #[serde(rename = "success_rate_5m")]
+    success_rate: f64,
+    #[serde(rename = "failover_rate_5m")]
+    failover_rate: f64,
+    #[serde(rename = "p95_probe_latency_ms_5m")]
+    p95_probe_latency_ms: u64,
+    #[serde(rename = "breaker_open_ratio_5m")]
+    breaker_open_ratio: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum GatewayExecutionMode {
     Mutating,
     Observational,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GatewayHistoryQuery {
+    since: Option<Duration>,
+    limit: Option<usize>,
+    result: Option<String>,
+    reason: Option<String>,
+    candidate: Option<String>,
+    command: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GatewayHistoryRecordInput<'a> {
+    command_name: &'a str,
+    candidate: Option<&'a str>,
+    execution_mode: GatewayExecutionMode,
+    latency_ms: Option<u64>,
+    result: &'a str,
+    reason_code: Option<&'a str>,
+    selected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayHistoryClearScope {
+    Cluster,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayExportFormat {
+    Json,
+    Ndjson,
 }
 
 #[derive(Debug, Default)]
@@ -319,7 +384,7 @@ struct GatewayExplainCandidateProbe {
     probe: GatewayProbeResult,
 }
 
-const CLUSTER_GATEWAY_STATE_SCHEMA_VERSION: u32 = 2;
+const CLUSTER_GATEWAY_STATE_SCHEMA_VERSION: u32 = 3;
 const DEFAULT_CLUSTER_GATEWAY_LAST_GOOD_TTL: Duration = Duration::from_secs(90);
 const DEFAULT_CLUSTER_GATEWAY_FAILURE_COOLDOWN: Duration = Duration::from_secs(20);
 const DEFAULT_CLUSTER_GATEWAY_BREAKER_OPEN_AFTER_FAILURES: u32 = 3;
@@ -327,6 +392,8 @@ const DEFAULT_CLUSTER_GATEWAY_BREAKER_HALF_OPEN_AFTER: Duration = Duration::from
 const DEFAULT_CLUSTER_GATEWAY_BREAKER_HALF_OPEN_REQUIRED_SUCCESSES: u32 = 2;
 const DEFAULT_CLUSTER_GATEWAY_PROBE_TIMEOUT_MS: u64 = 7000;
 const DEFAULT_CLUSTER_GATEWAY_COOLDOWN_MAX: Duration = Duration::from_secs(90);
+const DEFAULT_CLUSTER_GATEWAY_COOLDOWN_JITTER_PCT: u32 = 10;
+const DEFAULT_CLUSTER_GATEWAY_HISTORY_RETENTION_MS: u64 = 86_400_000;
 const MAX_CLUSTER_GATEWAY_HISTORY_ENTRIES: usize = 200;
 const GATEWAY_TABLE_CANDIDATE_WIDTH: usize = 24;
 
@@ -341,7 +408,10 @@ fn default_gateway_policy_values() -> GatewayPolicyValues {
         probe_timeout_ms: DEFAULT_CLUSTER_GATEWAY_PROBE_TIMEOUT_MS,
         cooldown_ms: duration_millis_u64(DEFAULT_CLUSTER_GATEWAY_FAILURE_COOLDOWN),
         cooldown_max_ms: duration_millis_u64(DEFAULT_CLUSTER_GATEWAY_COOLDOWN_MAX),
+        cooldown_jitter_pct: DEFAULT_CLUSTER_GATEWAY_COOLDOWN_JITTER_PCT,
         success_ttl_ms: duration_millis_u64(DEFAULT_CLUSTER_GATEWAY_LAST_GOOD_TTL),
+        history_max_entries: MAX_CLUSTER_GATEWAY_HISTORY_ENTRIES,
+        history_retention_ms: DEFAULT_CLUSTER_GATEWAY_HISTORY_RETENTION_MS,
     }
 }
 
@@ -355,7 +425,10 @@ fn gateway_policy_values_for_preset(preset: GatewayPolicyPreset) -> GatewayPolic
             probe_timeout_ms: 4_000,
             cooldown_ms: 8_000,
             cooldown_max_ms: 30_000,
+            cooldown_jitter_pct: 5,
             success_ttl_ms: 45_000,
+            history_max_entries: 300,
+            history_retention_ms: 21_600_000,
         },
         GatewayPolicyPreset::Conservative => GatewayPolicyValues {
             breaker_open_after_failures: 4,
@@ -364,7 +437,10 @@ fn gateway_policy_values_for_preset(preset: GatewayPolicyPreset) -> GatewayPolic
             probe_timeout_ms: 10_000,
             cooldown_ms: 30_000,
             cooldown_max_ms: 180_000,
+            cooldown_jitter_pct: 15,
             success_ttl_ms: 180_000,
+            history_max_entries: 500,
+            history_retention_ms: 259_200_000,
         },
     }
 }
@@ -392,8 +468,17 @@ fn gateway_effective_policy_values(definition: &ClusterGatewayDefinition) -> Gat
     if let Some(value) = definition.cooldown_max_ms {
         values.cooldown_max_ms = value.max(values.cooldown_ms);
     }
+    if let Some(value) = definition.cooldown_jitter_pct {
+        values.cooldown_jitter_pct = value.min(100);
+    }
     if let Some(value) = definition.success_ttl_ms {
         values.success_ttl_ms = value.max(1);
+    }
+    if let Some(value) = definition.history_max_entries {
+        values.history_max_entries = value.max(1);
+    }
+    if let Some(value) = definition.history_retention_ms {
+        values.history_retention_ms = value.max(1);
     }
     values
 }
@@ -417,7 +502,10 @@ impl Default for ClusterGatewayDefinition {
             probe_timeout_ms: None,
             cooldown_ms: None,
             cooldown_max_ms: None,
+            cooldown_jitter_pct: None,
             success_ttl_ms: None,
+            history_max_entries: None,
+            history_retention_ms: None,
         }
     }
 }
@@ -433,6 +521,7 @@ impl Default for GatewayCandidateHealth {
             breaker_open_until: None,
             adaptive_cooldown_level: 0,
             half_open_success_streak: 0,
+            last_failure_reason: None,
         }
     }
 }
@@ -2344,6 +2433,14 @@ fn load_cluster_gateway_runtime_state(
                 path.display()
             )
         })?;
+    if persisted.version > CLUSTER_GATEWAY_STATE_SCHEMA_VERSION {
+        tracing::warn!(
+            event = "cluster_gateway_state_version_newer_than_runtime",
+            file_version = persisted.version,
+            supported_version = CLUSTER_GATEWAY_STATE_SCHEMA_VERSION,
+            "cluster gateway state file version is newer than runtime schema"
+        );
+    }
     let now_instant = Instant::now();
     let now_unix_ms = current_unix_timestamp_ms_u64();
     Ok(persisted
@@ -2424,6 +2521,7 @@ fn persist_gateway_candidate_health(
         && health.last_latency_ms.is_none()
         && health.adaptive_cooldown_level == 0
         && health.half_open_success_streak == 0
+        && health.last_failure_reason.is_none()
         && breaker_open_until_unix_ms.is_none()
         && health.breaker_state == GatewayBreakerState::Closed
     {
@@ -2440,6 +2538,7 @@ fn persist_gateway_candidate_health(
             breaker_open_until_unix_ms,
             adaptive_cooldown_level: health.adaptive_cooldown_level,
             half_open_success_streak: health.half_open_success_streak,
+            last_failure_reason: health.last_failure_reason.clone(),
         },
     ))
 }
@@ -2460,8 +2559,11 @@ fn persist_gateway_history_entries(
                 .saturating_sub(duration_millis_u64(entry.observed_at.elapsed())),
             command: entry.command.clone(),
             candidate: entry.candidate.clone(),
+            execution_mode: Some(entry.execution_mode),
+            latency_ms: entry.latency_ms,
             result: entry.result.clone(),
-            reason: entry.reason.clone(),
+            reason_code: entry.reason_code.clone(),
+            selected: entry.selected,
         })
         .collect()
 }
@@ -2503,8 +2605,13 @@ fn hydrate_gateway_cluster_state(
             observed_at: instant_from_unix_ms(now_instant, now_unix_ms, entry.observed_at_unix_ms),
             command: entry.command,
             candidate: entry.candidate,
+            execution_mode: entry
+                .execution_mode
+                .unwrap_or(GatewayExecutionMode::Mutating),
+            latency_ms: entry.latency_ms,
             result: entry.result,
-            reason: entry.reason,
+            reason_code: entry.reason_code,
+            selected: entry.selected,
         })
         .collect::<Vec<_>>();
     if last_good.is_none()
@@ -2550,6 +2657,7 @@ fn hydrate_gateway_candidate_health(
         breaker_open_until,
         adaptive_cooldown_level: persisted_health.adaptive_cooldown_level,
         half_open_success_streak: persisted_health.half_open_success_streak,
+        last_failure_reason: persisted_health.last_failure_reason.clone(),
     }
 }
 
@@ -3761,6 +3869,13 @@ async fn maybe_run_cluster_gateway_special_command(
         return run_cluster_gateway_reset_command(settings, &overrides.passthrough_arguments)
             .map(Some);
     }
+    if command_name == "cluster-gateway-history-clear" {
+        return run_cluster_gateway_history_clear_command(
+            settings,
+            &overrides.passthrough_arguments,
+        )
+        .map(Some);
+    }
 
     if !matches!(
         command_name,
@@ -3768,6 +3883,8 @@ async fn maybe_run_cluster_gateway_special_command(
             | "cluster-gateway-explain"
             | "cluster-gateway-doctor"
             | "cluster-gateway-history"
+            | "cluster-gateway-history-export"
+            | "cluster-gateway-why"
     ) {
         return Ok(None);
     }
@@ -3782,12 +3899,13 @@ async fn maybe_run_cluster_gateway_special_command(
         .get(cluster_name.as_str())
         .ok_or_else(|| anyhow::anyhow!("unknown cluster '{cluster_name}'"))?;
     let definition = apply_gateway_overrides(base_definition.clone(), overrides)?;
-    let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
     if command_name == "cluster-gateway-status" {
+        let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
         print_cluster_gateway_status(&cluster_name, &definition, overrides, output_format)?;
         return Ok(Some(0));
     }
     if command_name == "cluster-gateway-doctor" {
+        let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
         return run_cluster_gateway_doctor(
             config,
             &cluster_name,
@@ -3799,14 +3917,37 @@ async fn maybe_run_cluster_gateway_special_command(
         .map(Some);
     }
     if command_name == "cluster-gateway-history" {
+        let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
         return run_cluster_gateway_history_command(
             &cluster_name,
+            &definition,
             &overrides.passthrough_arguments,
             output_format,
         )
         .map(Some);
     }
+    if command_name == "cluster-gateway-history-export" {
+        return run_cluster_gateway_history_export_command(
+            &cluster_name,
+            &definition,
+            &overrides.passthrough_arguments,
+        )
+        .map(Some);
+    }
+    if command_name == "cluster-gateway-why" {
+        let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
+        return run_cluster_gateway_why_command(
+            config,
+            &cluster_name,
+            &definition,
+            overrides,
+            output_format,
+        )
+        .await
+        .map(Some);
+    }
 
+    let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
     run_cluster_gateway_explain(config, &cluster_name, &definition, overrides, output_format).await
 }
 
@@ -3970,7 +4111,10 @@ fn print_direct_gateway_dry_run(
                 "probe_timeout_ms": policy.probe_timeout_ms,
                 "cooldown_ms": policy.cooldown_ms,
                 "cooldown_max_ms": policy.cooldown_max_ms,
+                "cooldown_jitter_pct": policy.cooldown_jitter_pct,
                 "success_ttl_ms": policy.success_ttl_ms,
+                "history_max_entries": policy.history_max_entries,
+                "history_retention_ms": policy.history_retention_ms,
             },
             "result": "success",
             "selected_candidate": serde_json::Value::Null,
@@ -3997,7 +4141,7 @@ fn print_direct_gateway_dry_run(
             "cluster gateway dry-run: mode=direct for cluster='{cluster_name}' command='{command_name}' (gateway bypass)"
         );
         println!(
-            "policy: preset={} breaker_open_after_failures={} breaker_half_open_after_ms={} breaker_half_open_required_successes={} probe_timeout_ms={} cooldown_ms={} cooldown_max_ms={} success_ttl_ms={}",
+            "policy: preset={} breaker_open_after_failures={} breaker_half_open_after_ms={} breaker_half_open_required_successes={} probe_timeout_ms={} cooldown_ms={} cooldown_max_ms={} cooldown_jitter_pct={} success_ttl_ms={} history_max_entries={} history_retention_ms={}",
             definition
                 .gateway_policy
                 .map_or("custom", gateway_policy_label),
@@ -4007,7 +4151,10 @@ fn print_direct_gateway_dry_run(
             policy.probe_timeout_ms,
             policy.cooldown_ms,
             policy.cooldown_max_ms,
-            policy.success_ttl_ms
+            policy.cooldown_jitter_pct,
+            policy.success_ttl_ms,
+            policy.history_max_entries,
+            policy.history_retention_ms
         );
         println!(
             "would mutate: last_good=false cooldown=false breaker=false persistence_write=false"
@@ -4129,7 +4276,7 @@ fn print_gateway_dry_run_text(
         command_name = request.command_name,
     );
     println!(
-        "policy: preset={} breaker_open_after_failures={} breaker_half_open_after_ms={} breaker_half_open_required_successes={} probe_timeout_ms={} cooldown_ms={} cooldown_max_ms={} success_ttl_ms={}",
+        "policy: preset={} breaker_open_after_failures={} breaker_half_open_after_ms={} breaker_half_open_required_successes={} probe_timeout_ms={} cooldown_ms={} cooldown_max_ms={} cooldown_jitter_pct={} success_ttl_ms={} history_max_entries={} history_retention_ms={}",
         request
             .definition
             .gateway_policy
@@ -4140,7 +4287,10 @@ fn print_gateway_dry_run_text(
         policy.probe_timeout_ms,
         policy.cooldown_ms,
         policy.cooldown_max_ms,
-        policy.success_ttl_ms
+        policy.cooldown_jitter_pct,
+        policy.success_ttl_ms,
+        policy.history_max_entries,
+        policy.history_retention_ms
     );
     print_gateway_text_table_header();
     for probe in probes {
@@ -4176,6 +4326,7 @@ fn print_gateway_dry_run_text(
     }
 }
 
+#[allow(clippy::too_many_lines)] // Control flow is clearer as one selection loop.
 async fn run_gateway_candidate_batch(
     request: GatewayBatchRequest<'_>,
     failures: &mut Vec<GatewayAttemptFailure>,
@@ -4225,10 +4376,16 @@ async fn run_gateway_candidate_batch(
                     );
                     record_gateway_history_entry(
                         request.cluster_name,
-                        request.command_name,
-                        Some(candidate),
-                        "success",
-                        None,
+                        request.definition,
+                        &GatewayHistoryRecordInput {
+                            command_name: request.command_name,
+                            candidate: Some(candidate),
+                            execution_mode: GatewayExecutionMode::Mutating,
+                            latency_ms: Some(u128_to_u64_saturating(started.elapsed().as_millis())),
+                            result: "success",
+                            reason_code: None,
+                            selected: true,
+                        },
                     );
                 }
                 tracing::info!(
@@ -4248,13 +4405,20 @@ async fn run_gateway_candidate_batch(
                         candidate,
                         request.definition,
                         started.elapsed().as_millis(),
+                        classified.0,
                     );
                     record_gateway_history_entry(
                         request.cluster_name,
-                        request.command_name,
-                        Some(candidate),
-                        "failure",
-                        Some(classified.0),
+                        request.definition,
+                        &GatewayHistoryRecordInput {
+                            command_name: request.command_name,
+                            candidate: Some(candidate),
+                            execution_mode: GatewayExecutionMode::Mutating,
+                            latency_ms: Some(u128_to_u64_saturating(started.elapsed().as_millis())),
+                            result: "failure",
+                            reason_code: Some(classified.0),
+                            selected: false,
+                        },
                     );
                 }
                 tracing::warn!(
@@ -4305,7 +4469,9 @@ fn resolve_cluster_name_for_gateway(
         "cluster-gateway-status"
         | "cluster-gateway-explain"
         | "cluster-gateway-doctor"
-        | "cluster-gateway-history" => {
+        | "cluster-gateway-history"
+        | "cluster-gateway-history-export"
+        | "cluster-gateway-why" => {
             let cluster = cluster_flag.or_else(|| first_positional_argument(arguments));
             if cluster.is_none() && settings.clusters.len() > 1 {
                 anyhow::bail!("{command_name} requires --cluster in multi-cluster setups");
@@ -4442,13 +4608,62 @@ fn gateway_success_ttl(definition: &ClusterGatewayDefinition) -> Duration {
 
 fn gateway_failure_cooldown_for_level(
     definition: &ClusterGatewayDefinition,
+    candidate: &str,
     adaptive_level: u32,
+    reason_code: &str,
 ) -> Duration {
     let policy = gateway_effective_policy_values(definition);
     let exponent = adaptive_level.saturating_sub(1).min(16);
     let multiplier = 1_u64 << exponent;
-    let scaled = policy.cooldown_ms.saturating_mul(multiplier);
-    Duration::from_millis(scaled.min(policy.cooldown_max_ms))
+    let class_multiplier = gateway_reason_class_cooldown_multiplier(reason_code);
+    let scaled = policy
+        .cooldown_ms
+        .saturating_mul(multiplier)
+        .saturating_mul(class_multiplier);
+    let bounded = scaled.min(policy.cooldown_max_ms);
+    let jittered = apply_gateway_jitter_ms(bounded, policy.cooldown_jitter_pct, candidate);
+    Duration::from_millis(jittered)
+}
+
+fn gateway_reason_class_cooldown_multiplier(reason_code: &str) -> u64 {
+    match reason_code {
+        "auth_failed" | "service_denied" => 3,
+        "dns_failed" | "protocol_mismatch" => 2,
+        _ => 1,
+    }
+}
+
+fn gateway_reason_breaker_threshold(
+    definition: &ClusterGatewayDefinition,
+    reason_code: &str,
+) -> u32 {
+    match reason_code {
+        "auth_failed" | "service_denied" => 1,
+        _ => gateway_breaker_open_after_failures(definition),
+    }
+}
+
+fn apply_gateway_jitter_ms(base_ms: u64, jitter_pct: u32, seed_hint: &str) -> u64 {
+    if base_ms == 0 || jitter_pct == 0 {
+        return base_ms;
+    }
+    let spread = base_ms
+        .saturating_mul(u64::from(jitter_pct))
+        .saturating_div(100);
+    if spread == 0 {
+        return base_ms;
+    }
+    let mut seed = current_unix_timestamp_ms_u64();
+    for byte in seed_hint.as_bytes() {
+        seed = seed.wrapping_mul(109).wrapping_add(u64::from(*byte));
+    }
+    let bucket = spread.saturating_mul(2).saturating_add(1);
+    let delta = seed % bucket;
+    if delta <= spread {
+        base_ms.saturating_sub(spread - delta)
+    } else {
+        base_ms.saturating_add(delta - spread)
+    }
 }
 
 fn gateway_breaker_half_open_after(definition: &ClusterGatewayDefinition) -> Duration {
@@ -4692,6 +4907,7 @@ fn record_gateway_success(
         health.successes = health.successes.saturating_add(1);
         health.consecutive_failures = 0;
         health.adaptive_cooldown_level = 0;
+        health.last_failure_reason = None;
         health.last_latency_ms = Some(u128_to_u64_saturating(latency_ms));
         let snapshot = state_map.clone();
         drop(state_map);
@@ -4704,6 +4920,7 @@ fn record_gateway_failure(
     candidate: &str,
     definition: &ClusterGatewayDefinition,
     latency_ms: u128,
+    reason_code: &str,
 ) {
     ensure_gateway_runtime_state_loaded();
     if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
@@ -4717,11 +4934,16 @@ fn record_gateway_failure(
         let failed_from_half_open = health.breaker_state == GatewayBreakerState::HalfOpen;
         health.failures = health.failures.saturating_add(1);
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
-        health.adaptive_cooldown_level = health.adaptive_cooldown_level.saturating_add(1);
+        let level_increment = gateway_reason_class_cooldown_multiplier(reason_code);
+        health.adaptive_cooldown_level = health
+            .adaptive_cooldown_level
+            .saturating_add(u32::try_from(level_increment).unwrap_or(u32::MAX));
         health.half_open_success_streak = 0;
+        health.last_failure_reason = Some(reason_code.to_string());
         health.last_latency_ms = Some(u128_to_u64_saturating(latency_ms));
         if failed_from_half_open
-            || health.consecutive_failures >= gateway_breaker_open_after_failures(definition)
+            || health.consecutive_failures
+                >= gateway_reason_breaker_threshold(definition, reason_code)
         {
             health.breaker_state = GatewayBreakerState::Open;
             health.breaker_open_until =
@@ -4730,7 +4952,12 @@ fn record_gateway_failure(
         cluster_state.cooldown_until.insert(
             candidate.to_string(),
             Instant::now()
-                + gateway_failure_cooldown_for_level(definition, health.adaptive_cooldown_level),
+                + gateway_failure_cooldown_for_level(
+                    definition,
+                    candidate,
+                    health.adaptive_cooldown_level,
+                    reason_code,
+                ),
         );
         let snapshot = state_map.clone();
         drop(state_map);
@@ -4740,10 +4967,8 @@ fn record_gateway_failure(
 
 fn record_gateway_history_entry(
     cluster_name: &str,
-    command_name: &str,
-    candidate: Option<&str>,
-    result: &str,
-    reason: Option<&str>,
+    definition: &ClusterGatewayDefinition,
+    input: &GatewayHistoryRecordInput<'_>,
 ) {
     ensure_gateway_runtime_state_loaded();
     if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
@@ -4752,18 +4977,15 @@ fn record_gateway_history_entry(
             .or_insert_with(ClusterGatewayRuntimeState::default);
         cluster_state.history.push(GatewayHistoryEntry {
             observed_at: Instant::now(),
-            command: command_name.to_string(),
-            candidate: candidate.map(str::to_string),
-            result: result.to_string(),
-            reason: reason.map(str::to_string),
+            command: input.command_name.to_string(),
+            candidate: input.candidate.map(str::to_string),
+            execution_mode: input.execution_mode,
+            latency_ms: input.latency_ms,
+            result: input.result.to_string(),
+            reason_code: input.reason_code.map(str::to_string),
+            selected: input.selected,
         });
-        if cluster_state.history.len() > MAX_CLUSTER_GATEWAY_HISTORY_ENTRIES {
-            let drain_count = cluster_state
-                .history
-                .len()
-                .saturating_sub(MAX_CLUSTER_GATEWAY_HISTORY_ENTRIES);
-            cluster_state.history.drain(..drain_count);
-        }
+        trim_gateway_history_entries(cluster_state, definition);
         let snapshot = state_map.clone();
         drop(state_map);
         persist_gateway_runtime_state_snapshot(&snapshot);
@@ -4772,8 +4994,8 @@ fn record_gateway_history_entry(
 
 fn gateway_history_entries(
     cluster_name: &str,
-    since: Option<Duration>,
-    limit: Option<usize>,
+    definition: &ClusterGatewayDefinition,
+    query: &GatewayHistoryQuery,
 ) -> Vec<GatewayHistoryEntry> {
     ensure_gateway_runtime_state_loaded();
     let mut entries = cluster_gateway_state_map()
@@ -4785,14 +5007,54 @@ fn gateway_history_entries(
                 .map(|state| state.history.clone())
         })
         .unwrap_or_default();
-    if let Some(since_window) = since {
-        entries.retain(|entry| entry.observed_at.elapsed() <= since_window);
-    }
+    trim_gateway_history_entries_vec(&mut entries, definition);
+    apply_gateway_history_query(&mut entries, query);
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.observed_at));
-    if let Some(limit) = limit {
+    if let Some(limit) = query.limit {
         entries.truncate(limit);
     }
     entries
+}
+
+fn trim_gateway_history_entries(
+    cluster_state: &mut ClusterGatewayRuntimeState,
+    definition: &ClusterGatewayDefinition,
+) {
+    trim_gateway_history_entries_vec(&mut cluster_state.history, definition);
+}
+
+fn trim_gateway_history_entries_vec(
+    entries: &mut Vec<GatewayHistoryEntry>,
+    definition: &ClusterGatewayDefinition,
+) {
+    let policy = gateway_effective_policy_values(definition);
+    let retention = Duration::from_millis(policy.history_retention_ms);
+    entries.retain(|entry| entry.observed_at.elapsed() <= retention);
+    if entries.len() > policy.history_max_entries {
+        let drain_count = entries.len().saturating_sub(policy.history_max_entries);
+        entries.drain(..drain_count);
+    }
+}
+
+fn apply_gateway_history_query(
+    entries: &mut Vec<GatewayHistoryEntry>,
+    query: &GatewayHistoryQuery,
+) {
+    if let Some(since_window) = query.since {
+        entries.retain(|entry| entry.observed_at.elapsed() <= since_window);
+    }
+    if let Some(result) = query.result.as_ref() {
+        entries.retain(|entry| entry.result == *result);
+    }
+    if let Some(reason) = query.reason.as_ref() {
+        entries.retain(|entry| entry.reason_code.as_deref() == Some(reason.as_str()));
+    }
+    if let Some(candidate) = query.candidate.as_ref() {
+        entries.retain(|entry| entry.candidate.as_deref() == Some(candidate.as_str()));
+    }
+    if let Some(command) = query.command.as_ref() {
+        entries.retain(|entry| entry.command == *command);
+    }
 }
 
 fn gateway_history_entry_observed_unix_ms(entry: &GatewayHistoryEntry) -> u64 {
@@ -4817,6 +5079,51 @@ fn parse_gateway_history_since(arguments: &[String]) -> Result<Option<Duration>>
         return Ok(None);
     };
     parse_duration_literal(raw.as_str()).map(Some)
+}
+
+fn parse_gateway_history_query(arguments: &[String]) -> Result<GatewayHistoryQuery> {
+    let result = value_after_flag(arguments, "--result").map(|value| value.trim().to_string());
+    let reason = value_after_flag(arguments, "--reason").map(|value| value.trim().to_string());
+    let candidate =
+        value_after_flag(arguments, "--candidate").map(|value| value.trim().to_string());
+    let command = value_after_flag(arguments, "--command").map(|value| value.trim().to_string());
+    if let Some(value) = result.as_ref()
+        && !matches!(
+            value.as_str(),
+            "success" | "failure" | "observed_success" | "observed_failure"
+        )
+    {
+        anyhow::bail!(
+            "unsupported --result '{value}' (expected success|failure|observed_success|observed_failure)"
+        );
+    }
+    Ok(GatewayHistoryQuery {
+        since: parse_gateway_history_since(arguments)?,
+        limit: parse_gateway_history_limit(arguments)?,
+        result,
+        reason,
+        candidate,
+        command,
+    })
+}
+
+fn parse_gateway_confirm_flag(arguments: &[String]) -> bool {
+    arguments.iter().any(|value| value == "--confirm")
+}
+
+fn parse_gateway_all_flag(arguments: &[String]) -> bool {
+    arguments.iter().any(|value| value == "--all")
+}
+
+fn parse_gateway_export_format(arguments: &[String]) -> Result<GatewayExportFormat> {
+    let Some(value) = value_after_flag(arguments, "--format") else {
+        return Ok(GatewayExportFormat::Json);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "json" => Ok(GatewayExportFormat::Json),
+        "ndjson" => Ok(GatewayExportFormat::Ndjson),
+        other => anyhow::bail!("unsupported --format '{other}' (expected json|ndjson)"),
+    }
 }
 
 fn parse_duration_literal(value: &str) -> Result<Duration> {
@@ -4963,12 +5270,12 @@ fn run_cluster_gateway_reset_command(
 
 fn run_cluster_gateway_history_command(
     cluster_name: &str,
+    definition: &ClusterGatewayDefinition,
     arguments: &[String],
     output_format: GatewayOutputFormat,
 ) -> Result<u8> {
-    let since = parse_gateway_history_since(arguments)?;
-    let limit = parse_gateway_history_limit(arguments)?;
-    let entries = gateway_history_entries(cluster_name, since, limit);
+    let query = parse_gateway_history_query(arguments)?;
+    let entries = gateway_history_entries(cluster_name, definition, &query);
 
     if output_format == GatewayOutputFormat::Json {
         let payload_entries = entries
@@ -4978,8 +5285,11 @@ fn run_cluster_gateway_history_command(
                     "observed_at_unix_ms": gateway_history_entry_observed_unix_ms(entry),
                     "command": entry.command,
                     "candidate": entry.candidate,
+                    "execution_mode": entry.execution_mode,
+                    "latency_ms": entry.latency_ms,
                     "result": entry.result,
-                    "reason": entry.reason,
+                    "reason_code": entry.reason_code,
+                    "selected": entry.selected,
                 })
             })
             .collect::<Vec<_>>();
@@ -4987,8 +5297,14 @@ fn run_cluster_gateway_history_command(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "cluster": cluster_name,
-                "since": value_after_flag(arguments, "--since"),
-                "limit": limit,
+                "filters": {
+                    "since": value_after_flag(arguments, "--since"),
+                    "limit": query.limit,
+                    "result": query.result,
+                    "reason": query.reason,
+                    "candidate": query.candidate,
+                    "command": query.command,
+                },
                 "count": payload_entries.len(),
                 "entries": payload_entries,
             }))
@@ -5016,10 +5332,178 @@ fn run_cluster_gateway_history_command(
             entry.command,
             entry.result,
             entry.candidate.unwrap_or_else(|| "-".to_string()),
-            entry.reason.unwrap_or_else(|| "-".to_string())
+            entry.reason_code.unwrap_or_else(|| "-".to_string())
         );
     }
     Ok(0)
+}
+
+fn run_cluster_gateway_history_export_command(
+    cluster_name: &str,
+    definition: &ClusterGatewayDefinition,
+    arguments: &[String],
+) -> Result<u8> {
+    let query = parse_gateway_history_query(arguments)?;
+    let entries = gateway_history_entries(cluster_name, definition, &query);
+    let export_format = parse_gateway_export_format(arguments)?;
+    match export_format {
+        GatewayExportFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "cluster": cluster_name,
+                    "entries": entries.iter().map(|entry| serde_json::json!({
+                        "observed_at_unix_ms": gateway_history_entry_observed_unix_ms(entry),
+                        "command": entry.command,
+                        "candidate": entry.candidate,
+                        "execution_mode": entry.execution_mode,
+                        "latency_ms": entry.latency_ms,
+                        "result": entry.result,
+                        "reason_code": entry.reason_code,
+                        "selected": entry.selected,
+                    })).collect::<Vec<_>>()
+                }))
+                .context("failed encoding gateway history export json")?
+            );
+        }
+        GatewayExportFormat::Ndjson => {
+            for entry in entries {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "cluster": cluster_name,
+                        "observed_at_unix_ms": gateway_history_entry_observed_unix_ms(&entry),
+                        "command": entry.command,
+                        "candidate": entry.candidate,
+                        "execution_mode": entry.execution_mode,
+                        "latency_ms": entry.latency_ms,
+                        "result": entry.result,
+                        "reason_code": entry.reason_code,
+                        "selected": entry.selected,
+                    }))
+                    .context("failed encoding gateway history export ndjson")?
+                );
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn run_cluster_gateway_history_clear_command(
+    settings: &ClusterGatewaySettings,
+    arguments: &[String],
+) -> Result<u8> {
+    let all = parse_gateway_all_flag(arguments);
+    let confirm = parse_gateway_confirm_flag(arguments);
+    if all
+        && (value_after_flag(arguments, "--cluster").is_some()
+            || value_after_flag(arguments, "-c").is_some()
+            || first_positional_argument(arguments).is_some())
+    {
+        anyhow::bail!("cluster gateway history clear accepts either --all or --cluster, not both");
+    }
+    let scope = if all {
+        GatewayHistoryClearScope::All
+    } else {
+        GatewayHistoryClearScope::Cluster
+    };
+    let query = parse_gateway_history_query(arguments)?;
+    let broad_clear = query.since.is_none()
+        && query.result.is_none()
+        && query.reason.is_none()
+        && query.candidate.is_none()
+        && query.command.is_none();
+    if broad_clear && !confirm && !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "cluster gateway history clear requires --confirm for non-interactive broad clear"
+        );
+    }
+
+    ensure_gateway_runtime_state_loaded();
+    let mut removed = 0usize;
+    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+        match scope {
+            GatewayHistoryClearScope::All => {
+                for (cluster_name, state) in state_map.iter_mut() {
+                    let definition = settings
+                        .clusters
+                        .get(cluster_name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let before = state.history.len();
+                    removed = removed.saturating_add(clear_gateway_history_for_cluster(
+                        state,
+                        &definition,
+                        &query,
+                    ));
+                    if before != state.history.len() {
+                        trim_gateway_history_entries(state, &definition);
+                    }
+                }
+            }
+            GatewayHistoryClearScope::Cluster => {
+                let Some(cluster_name) = resolve_cluster_name_for_history(arguments, settings)?
+                else {
+                    anyhow::bail!(
+                        "cluster gateway history clear requires --cluster unless --all is passed"
+                    );
+                };
+                let definition = settings
+                    .clusters
+                    .get(cluster_name.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                let state = state_map
+                    .entry(cluster_name)
+                    .or_insert_with(ClusterGatewayRuntimeState::default);
+                removed = clear_gateway_history_for_cluster(state, &definition, &query);
+                trim_gateway_history_entries(state, &definition);
+            }
+        }
+        let snapshot = state_map.clone();
+        drop(state_map);
+        persist_gateway_runtime_state_snapshot(&snapshot);
+    }
+
+    println!("cluster gateway history clear: removed={removed}");
+    Ok(0)
+}
+
+fn clear_gateway_history_for_cluster(
+    state: &mut ClusterGatewayRuntimeState,
+    definition: &ClusterGatewayDefinition,
+    query: &GatewayHistoryQuery,
+) -> usize {
+    let mut filtered = state.history.clone();
+    trim_gateway_history_entries_vec(&mut filtered, definition);
+    apply_gateway_history_query(&mut filtered, query);
+    if filtered.is_empty() {
+        return 0;
+    }
+    let before = state.history.len();
+    state.history.retain(|entry| {
+        !filtered.iter().any(|matched| {
+            matched.command == entry.command
+                && matched.candidate == entry.candidate
+                && matched.result == entry.result
+                && matched.reason_code == entry.reason_code
+                && matched.observed_at == entry.observed_at
+        })
+    });
+    before.saturating_sub(state.history.len())
+}
+
+fn resolve_cluster_name_for_history(
+    arguments: &[String],
+    settings: &ClusterGatewaySettings,
+) -> Result<Option<String>> {
+    let cluster_flag =
+        value_after_flag(arguments, "--cluster").or_else(|| value_after_flag(arguments, "-c"));
+    let explicit = cluster_flag.or_else(|| first_positional_argument(arguments));
+    if explicit.is_none() && settings.clusters.len() > 1 {
+        anyhow::bail!("cluster gateway history clear requires --cluster in multi-cluster setups");
+    }
+    Ok(explicit.or_else(|| settings.clusters.keys().next().cloned()))
 }
 
 fn clear_gateway_runtime_state_all() -> Result<bool> {
@@ -5112,7 +5596,7 @@ fn print_gateway_policy_header(
         definition.gateway_mode
     );
     println!(
-        "policy: preset={} breaker_open_after_failures={} breaker_half_open_after_ms={} breaker_half_open_required_successes={} probe_timeout_ms={} cooldown_ms={} cooldown_max_ms={} success_ttl_ms={}",
+        "policy: preset={} breaker_open_after_failures={} breaker_half_open_after_ms={} breaker_half_open_required_successes={} probe_timeout_ms={} cooldown_ms={} cooldown_max_ms={} cooldown_jitter_pct={} success_ttl_ms={} history_max_entries={} history_retention_ms={}",
         definition
             .gateway_policy
             .map_or("custom", gateway_policy_label),
@@ -5122,7 +5606,10 @@ fn print_gateway_policy_header(
         policy.probe_timeout_ms,
         policy.cooldown_ms,
         policy.cooldown_max_ms,
-        policy.success_ttl_ms
+        policy.cooldown_jitter_pct,
+        policy.success_ttl_ms,
+        policy.history_max_entries,
+        policy.history_retention_ms
     );
 }
 
@@ -5360,7 +5847,10 @@ fn print_cluster_gateway_status_json(
             "probe_timeout_ms": policy.probe_timeout_ms,
             "cooldown_ms": policy.cooldown_ms,
             "cooldown_max_ms": policy.cooldown_max_ms,
+            "cooldown_jitter_pct": policy.cooldown_jitter_pct,
             "success_ttl_ms": policy.success_ttl_ms,
+            "history_max_entries": policy.history_max_entries,
+            "history_retention_ms": policy.history_retention_ms,
         },
         "selected_candidate": selected_candidate,
         "would_mutate": {
@@ -5397,7 +5887,7 @@ fn print_cluster_gateway_status_text(
         definition.gateway_mode, overrides.no_failover
     );
     println!(
-        "policy: preset={} breaker_open_after_failures={} breaker_half_open_after_ms={} breaker_half_open_required_successes={} probe_timeout_ms={} cooldown_ms={} cooldown_max_ms={} success_ttl_ms={}",
+        "policy: preset={} breaker_open_after_failures={} breaker_half_open_after_ms={} breaker_half_open_required_successes={} probe_timeout_ms={} cooldown_ms={} cooldown_max_ms={} cooldown_jitter_pct={} success_ttl_ms={} history_max_entries={} history_retention_ms={}",
         definition
             .gateway_policy
             .map_or("custom", gateway_policy_label),
@@ -5407,7 +5897,10 @@ fn print_cluster_gateway_status_text(
         policy.probe_timeout_ms,
         policy.cooldown_ms,
         policy.cooldown_max_ms,
-        policy.success_ttl_ms
+        policy.cooldown_jitter_pct,
+        policy.success_ttl_ms,
+        policy.history_max_entries,
+        policy.history_retention_ms
     );
     if overrides.gateway_mode.is_some() || overrides.gateway_target.is_some() {
         println!(
@@ -5579,7 +6072,9 @@ async fn run_cluster_gateway_doctor(
         GatewayOutputFormat::Json,
     )
     .await;
-    let findings = build_gateway_doctor_findings(cluster_name, &probes);
+    let mut findings = build_gateway_doctor_findings(cluster_name, &probes);
+    findings.sort_by_key(|finding| finding.priority);
+    let slo = gateway_doctor_slo_snapshot(cluster_name, definition);
     let has_critical = findings
         .iter()
         .any(|finding| matches!(finding.severity, GatewayDoctorSeverity::Critical));
@@ -5593,6 +6088,7 @@ async fn run_cluster_gateway_doctor(
                     "preset": definition.gateway_policy.map(gateway_policy_label),
                     "effective": gateway_effective_policy_values(definition),
                 },
+                "slo": slo,
                 "findings": findings,
                 "checked_candidates": probes.len(),
                 "no_failover": overrides.no_failover,
@@ -5603,7 +6099,7 @@ async fn run_cluster_gateway_doctor(
         let policy = gateway_effective_policy_values(definition);
         println!("cluster gateway doctor: cluster='{cluster_name}'");
         println!(
-            "policy: preset={} breaker_open_after_failures={} breaker_half_open_after_ms={} breaker_half_open_required_successes={} probe_timeout_ms={} cooldown_ms={} cooldown_max_ms={} success_ttl_ms={}",
+            "policy: preset={} breaker_open_after_failures={} breaker_half_open_after_ms={} breaker_half_open_required_successes={} probe_timeout_ms={} cooldown_ms={} cooldown_max_ms={} cooldown_jitter_pct={} success_ttl_ms={} history_max_entries={} history_retention_ms={}",
             definition
                 .gateway_policy
                 .map_or("custom", gateway_policy_label),
@@ -5613,7 +6109,14 @@ async fn run_cluster_gateway_doctor(
             policy.probe_timeout_ms,
             policy.cooldown_ms,
             policy.cooldown_max_ms,
-            policy.success_ttl_ms
+            policy.cooldown_jitter_pct,
+            policy.success_ttl_ms,
+            policy.history_max_entries,
+            policy.history_retention_ms
+        );
+        println!(
+            "slo(5m): success_rate={:.2}% failover_rate={:.2}% p95_probe_latency_ms={} breaker_open_ratio={:.2}%",
+            slo.success_rate, slo.failover_rate, slo.p95_probe_latency_ms, slo.breaker_open_ratio
         );
         if findings.is_empty() {
             println!("doctor result: healthy");
@@ -5626,11 +6129,14 @@ async fn run_cluster_gateway_doctor(
             );
             for finding in &findings {
                 println!(
-                    "  - severity={} candidate={} reason={} action={} detail={}",
+                    "  - priority={} severity={} candidate={} reason={} action={} next={} confidence={:.2} detail={}",
+                    finding.priority,
                     gateway_doctor_severity_label(&finding.severity),
                     finding.candidate.as_deref().unwrap_or("-"),
                     finding.reason_code,
                     finding.recommended_action,
+                    finding.next_command,
+                    finding.confidence,
                     finding.detail
                 );
             }
@@ -5638,6 +6144,114 @@ async fn run_cluster_gateway_doctor(
     }
 
     Ok(u8::from(has_critical))
+}
+
+async fn run_cluster_gateway_why_command(
+    config: &BmuxConfig,
+    cluster_name: &str,
+    definition: &ClusterGatewayDefinition,
+    overrides: &GatewayCommandOverrides,
+    output_format: GatewayOutputFormat,
+) -> Result<u8> {
+    let candidates = ordered_gateway_candidates_for_cluster(cluster_name, definition)?;
+    let preferred = preferred_gateway_candidate(cluster_name, gateway_success_ttl(definition));
+    let probes = collect_gateway_explain_probes(
+        config,
+        cluster_name,
+        definition,
+        &candidates,
+        preferred.as_ref(),
+        GatewayOutputFormat::Json,
+    )
+    .await;
+    let mut failures = Vec::new();
+    let (selected, _) = evaluate_gateway_explain_selection(
+        &probes,
+        definition.gateway_mode == ClusterGatewayMode::Auto,
+        overrides.no_failover,
+        &mut failures,
+    );
+    let mut findings = build_gateway_doctor_findings(cluster_name, &probes);
+    findings.sort_by_key(|finding| finding.priority);
+    let policy = gateway_effective_policy_values(definition);
+    let query = GatewayHistoryQuery {
+        limit: Some(parse_gateway_history_limit(&overrides.passthrough_arguments)?.unwrap_or(5)),
+        ..GatewayHistoryQuery::default()
+    };
+    let history = gateway_history_entries(cluster_name, definition, &query);
+    let slo = gateway_doctor_slo_snapshot(cluster_name, definition);
+
+    if output_format == GatewayOutputFormat::Json {
+        let payload = serde_json::json!({
+            "cluster": cluster_name,
+            "mode": gateway_mode_label(definition.gateway_mode),
+            "selected_candidate": selected.map(|value| value.candidate.clone()),
+            "decision_summary": build_gateway_decision_summary(selected.map(|value| value.candidate.as_str()), &failures),
+            "policy": {
+                "preset": definition.gateway_policy.map(gateway_policy_label),
+                "effective": policy,
+            },
+            "slo": slo,
+            "findings": findings,
+            "recent_history": history.iter().map(|entry| serde_json::json!({
+                "observed_at_unix_ms": gateway_history_entry_observed_unix_ms(entry),
+                "command": entry.command,
+                "candidate": entry.candidate,
+                "result": entry.result,
+                "reason_code": entry.reason_code,
+            })).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).context("failed encoding gateway why json")?
+        );
+    } else {
+        println!(
+            "cluster gateway why: cluster='{cluster_name}' mode={}",
+            gateway_mode_label(definition.gateway_mode)
+        );
+        println!(
+            "selected: {}",
+            selected.map_or_else(|| "none".to_string(), |value| value.candidate.clone())
+        );
+        print_gateway_decision_summary_text(
+            selected.map(|value| value.candidate.as_str()),
+            &failures,
+        );
+        println!(
+            "slo(5m): success_rate={:.2}% failover_rate={:.2}% p95_probe_latency_ms={} breaker_open_ratio={:.2}%",
+            slo.success_rate, slo.failover_rate, slo.p95_probe_latency_ms, slo.breaker_open_ratio
+        );
+        if findings.is_empty() {
+            println!("actions: none (healthy)");
+        } else {
+            println!("top actions:");
+            for finding in findings.iter().take(3) {
+                println!(
+                    "  - [{}] {} (next: {})",
+                    gateway_doctor_severity_label(&finding.severity),
+                    finding.recommended_action,
+                    finding.next_command
+                );
+            }
+        }
+        if history.is_empty() {
+            println!("recent history: none");
+        } else {
+            println!("recent history:");
+            for entry in history {
+                println!(
+                    "  - command={} result={} candidate={} reason={}",
+                    entry.command,
+                    entry.result,
+                    entry.candidate.as_deref().unwrap_or("-"),
+                    entry.reason_code.as_deref().unwrap_or("-")
+                );
+            }
+        }
+    }
+
+    Ok(u8::from(selected.is_none()))
 }
 
 fn build_gateway_doctor_findings(
@@ -5656,6 +6270,9 @@ fn build_gateway_doctor_findings(
             recommended_action:
                 "run `cluster gateway reset --cluster <name>` or wait for cooldown/half-open"
                     .to_string(),
+            priority: 1,
+            confidence: 0.95,
+            next_command: format!("cluster gateway why --cluster {cluster_name}"),
         });
     }
     if all_unhealthy {
@@ -5667,6 +6284,9 @@ fn build_gateway_doctor_findings(
             recommended_action:
                 "verify network reachability and credentials for at least one gateway target"
                     .to_string(),
+            priority: 2,
+            confidence: 0.95,
+            next_command: format!("cluster gateway explain --cluster {cluster_name} --format json"),
         });
     }
 
@@ -5680,6 +6300,12 @@ fn build_gateway_doctor_findings(
                 recommended_action:
                     "wait for half-open window or inspect recurring failures for this target"
                         .to_string(),
+                priority: 4,
+                confidence: 0.80,
+                next_command: format!(
+                    "cluster gateway history --cluster {cluster_name} --candidate {} --limit 10",
+                    probe.candidate
+                ),
             });
         }
         if probe.skip_reason == Some("cooldown") {
@@ -5690,6 +6316,9 @@ fn build_gateway_doctor_findings(
                 detail: "candidate is cooling down after a recent failure".to_string(),
                 recommended_action:
                     "retry after cooldown or use --gateway to force a specific target".to_string(),
+                priority: 6,
+                confidence: 0.70,
+                next_command: format!("cluster gateway status --cluster {cluster_name}"),
             });
         }
         if !probe.probe.ok
@@ -5742,7 +6371,130 @@ fn gateway_doctor_finding_from_reason(
         reason_code: probe.probe.reason_code,
         detail: probe.probe.detail.clone(),
         recommended_action: action.to_string(),
+        priority: gateway_reason_priority(probe.probe.reason_code),
+        confidence: gateway_reason_confidence(probe.probe.reason_code),
+        next_command: gateway_reason_next_command(probe.probe.reason_code, &probe.candidate),
     })
+}
+
+fn gateway_reason_priority(reason_code: &str) -> u8 {
+    match reason_code {
+        "auth_failed" | "service_denied" => 1,
+        "protocol_mismatch" | "dns_failed" => 2,
+        "connection_refused" | "connect" | "unreachable" => 3,
+        "timeout" => 4,
+        _ => 5,
+    }
+}
+
+fn gateway_reason_confidence(reason_code: &str) -> f32 {
+    match reason_code {
+        "auth_failed" | "service_denied" => 0.95,
+        "protocol_mismatch" | "dns_failed" => 0.9,
+        "connection_refused" | "connect" | "unreachable" => 0.8,
+        "timeout" => 0.75,
+        _ => 0.6,
+    }
+}
+
+fn gateway_reason_next_command(reason_code: &str, candidate: &str) -> String {
+    match reason_code {
+        "auth_failed" | "service_denied" => {
+            format!(
+                "cluster gateway history --candidate {candidate} --reason {reason_code} --limit 10"
+            )
+        }
+        "protocol_mismatch" => "cluster gateway doctor --format json".to_string(),
+        "dns_failed" => "cluster gateway explain --format json".to_string(),
+        "connection_refused" | "connect" | "unreachable" => {
+            format!("cluster gateway status --gateway {candidate}")
+        }
+        "timeout" => "cluster gateway explain --format json --why".to_string(),
+        _ => "cluster gateway why".to_string(),
+    }
+}
+
+fn gateway_doctor_slo_snapshot(
+    cluster_name: &str,
+    definition: &ClusterGatewayDefinition,
+) -> GatewayDoctorSloSnapshot {
+    let entries = gateway_history_entries(
+        cluster_name,
+        definition,
+        &GatewayHistoryQuery {
+            since: Some(Duration::from_secs(300)),
+            ..GatewayHistoryQuery::default()
+        },
+    );
+    let mut success = 0usize;
+    let mut failure = 0usize;
+    let mut failover = 0usize;
+    let mut latencies = Vec::new();
+    for entry in &entries {
+        if entry.result == "success" {
+            success = success.saturating_add(1);
+        } else if entry.result == "failure" {
+            failure = failure.saturating_add(1);
+            if entry
+                .reason_code
+                .as_deref()
+                .is_some_and(|code| code != "auth_failed")
+            {
+                failover = failover.saturating_add(1);
+            }
+        }
+        if let Some(latency_ms) = entry.latency_ms {
+            latencies.push(latency_ms);
+        }
+    }
+    latencies.sort_unstable();
+    let p95 = if latencies.is_empty() {
+        0
+    } else {
+        let idx = (latencies.len().saturating_sub(1) * 95) / 100;
+        latencies[idx]
+    };
+    let total = success.saturating_add(failure);
+    let success_rate = if total == 0 {
+        100.0
+    } else {
+        (count_to_f64(success) * 100.0) / count_to_f64(total)
+    };
+    let failover_rate = if total == 0 {
+        0.0
+    } else {
+        (count_to_f64(failover) * 100.0) / count_to_f64(total)
+    };
+    let ordered =
+        ordered_gateway_candidates_for_cluster(cluster_name, definition).unwrap_or_default();
+    let mut open = 0usize;
+    for candidate in &ordered {
+        let health = gateway_effective_candidate_health(
+            cluster_name,
+            candidate,
+            definition,
+            GatewayExecutionMode::Observational,
+        );
+        if health.breaker_state == GatewayBreakerState::Open {
+            open = open.saturating_add(1);
+        }
+    }
+    let breaker_open_ratio = if ordered.is_empty() {
+        0.0
+    } else {
+        (count_to_f64(open) * 100.0) / count_to_f64(ordered.len())
+    };
+
+    GatewayDoctorSloSnapshot {
+        success_rate,
+        failover_rate,
+        p95_probe_latency_ms: p95,
+        breaker_open_ratio,
+    }
+}
+
+fn count_to_f64(value: usize) -> f64 {
+    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 const fn gateway_doctor_severity_label(severity: &GatewayDoctorSeverity) -> &'static str {
@@ -6081,7 +6833,10 @@ fn build_gateway_explain_json_payload(
             "probe_timeout_ms": policy.probe_timeout_ms,
             "cooldown_ms": policy.cooldown_ms,
             "cooldown_max_ms": policy.cooldown_max_ms,
+            "cooldown_jitter_pct": policy.cooldown_jitter_pct,
             "success_ttl_ms": policy.success_ttl_ms,
+            "history_max_entries": policy.history_max_entries,
+            "history_retention_ms": policy.history_retention_ms,
         },
         "no_failover": input.overrides.no_failover,
         "overrides": {
@@ -8694,9 +9449,9 @@ mod tests {
             gateway_mode: ClusterGatewayMode::Auto,
             ..ClusterGatewayDefinition::default()
         };
-        record_gateway_failure("prod", "db-a", &definition, 30);
-        record_gateway_failure("prod", "db-a", &definition, 40);
-        record_gateway_failure("prod", "db-a", &definition, 50);
+        record_gateway_failure("prod", "db-a", &definition, 30, "timeout");
+        record_gateway_failure("prod", "db-a", &definition, 40, "timeout");
+        record_gateway_failure("prod", "db-a", &definition, 50, "timeout");
 
         let health = gateway_effective_candidate_health(
             "prod",
@@ -8721,7 +9476,7 @@ mod tests {
             ..ClusterGatewayDefinition::default()
         };
 
-        record_gateway_failure("prod", "db-a", &definition, 30);
+        record_gateway_failure("prod", "db-a", &definition, 30, "timeout");
         std::thread::sleep(Duration::from_millis(3));
         let half_open = gateway_effective_candidate_health(
             "prod",
@@ -8766,8 +9521,8 @@ mod tests {
             ..ClusterGatewayDefinition::default()
         };
 
-        record_gateway_failure("prod", "db-a", &definition, 10);
-        record_gateway_failure("prod", "db-a", &definition, 11);
+        record_gateway_failure("prod", "db-a", &definition, 10, "timeout");
+        record_gateway_failure("prod", "db-a", &definition, 11, "timeout");
         let after_failures = gateway_effective_candidate_health(
             "prod",
             "db-a",
@@ -8791,18 +9546,19 @@ mod tests {
         let definition = ClusterGatewayDefinition {
             cooldown_ms: Some(1_000),
             cooldown_max_ms: Some(4_000),
+            cooldown_jitter_pct: Some(0),
             ..ClusterGatewayDefinition::default()
         };
         assert_eq!(
-            gateway_failure_cooldown_for_level(&definition, 1).as_millis(),
+            gateway_failure_cooldown_for_level(&definition, "db-a", 1, "timeout").as_millis(),
             1_000
         );
         assert_eq!(
-            gateway_failure_cooldown_for_level(&definition, 2).as_millis(),
+            gateway_failure_cooldown_for_level(&definition, "db-a", 2, "timeout").as_millis(),
             2_000
         );
         assert_eq!(
-            gateway_failure_cooldown_for_level(&definition, 4).as_millis(),
+            gateway_failure_cooldown_for_level(&definition, "db-a", 4, "timeout").as_millis(),
             4_000
         );
     }
@@ -8813,17 +9569,29 @@ mod tests {
         clear_gateway_runtime_state_for_tests();
         record_gateway_history_entry(
             "prod",
-            "cluster-status",
-            Some("db-a"),
-            "observed_failure",
-            Some("timeout"),
+            &ClusterGatewayDefinition::default(),
+            &GatewayHistoryRecordInput {
+                command_name: "cluster-status",
+                candidate: Some("db-a"),
+                execution_mode: GatewayExecutionMode::Observational,
+                latency_ms: Some(10),
+                result: "observed_failure",
+                reason_code: Some("timeout"),
+                selected: false,
+            },
         );
         record_gateway_history_entry(
             "prod",
-            "cluster-status",
-            Some("db-b"),
-            "observed_success",
-            None,
+            &ClusterGatewayDefinition::default(),
+            &GatewayHistoryRecordInput {
+                command_name: "cluster-status",
+                candidate: Some("db-b"),
+                execution_mode: GatewayExecutionMode::Observational,
+                latency_ms: Some(5),
+                result: "observed_success",
+                reason_code: None,
+                selected: true,
+            },
         );
         if let Ok(mut state_map) = cluster_gateway_state_map().lock()
             && let Some(cluster_state) = state_map.get_mut("prod")
@@ -8834,11 +9602,25 @@ mod tests {
                 .expect("checked_sub should support one hour");
         }
 
-        let recent = gateway_history_entries("prod", Some(Duration::from_secs(60)), None);
+        let recent = gateway_history_entries(
+            "prod",
+            &ClusterGatewayDefinition::default(),
+            &GatewayHistoryQuery {
+                since: Some(Duration::from_secs(60)),
+                ..GatewayHistoryQuery::default()
+            },
+        );
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].candidate.as_deref(), Some("db-b"));
 
-        let limited = gateway_history_entries("prod", None, Some(1));
+        let limited = gateway_history_entries(
+            "prod",
+            &ClusterGatewayDefinition::default(),
+            &GatewayHistoryQuery {
+                limit: Some(1),
+                ..GatewayHistoryQuery::default()
+            },
+        );
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].candidate.as_deref(), Some("db-b"));
     }
@@ -8855,7 +9637,7 @@ mod tests {
 
         record_gateway_success("prod", "db-a", &definition, 120);
         record_gateway_success("prod", "db-b", &definition, 10);
-        record_gateway_failure("prod", "db-b", &definition, 15);
+        record_gateway_failure("prod", "db-b", &definition, 15, "timeout");
 
         let ordered = ordered_gateway_candidates_for_cluster("prod", &definition)
             .expect("ordered candidates should resolve");

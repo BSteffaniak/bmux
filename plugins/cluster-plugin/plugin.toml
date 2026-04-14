@@ -15,6 +15,9 @@ owns_namespaces = [
     "cluster-gateway-explain",
     "cluster-gateway-doctor",
     "cluster-gateway-history",
+    "cluster-gateway-history-export",
+    "cluster-gateway-history-clear",
+    "cluster-gateway-why",
     "cluster-gateway-reset",
 ]
 provided_capabilities = [
@@ -649,6 +652,237 @@ long       = "since"
 name       = "since"
 required   = false
 value_name = "DURATION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "limit"
+name       = "limit"
+required   = false
+value_name = "COUNT"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "result"
+name       = "result"
+required   = false
+value_name = "RESULT"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "reason"
+name       = "reason"
+required   = false
+value_name = "REASON"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "candidate"
+name       = "candidate"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "command"
+name       = "command_filter"
+required   = false
+value_name = "COMMAND"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster_ref"
+position   = 0
+required   = false
+value_name = "CLUSTER"
+
+[[commands]]
+aliases       = [["cluster", "gateway", "history-export"]]
+expose_in_cli = true
+name          = "cluster-gateway-history-export"
+path          = ["cluster-gateway-history-export"]
+summary       = "Export gateway selection history"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "since"
+name       = "since"
+required   = false
+value_name = "DURATION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "limit"
+name       = "limit"
+required   = false
+value_name = "COUNT"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "result"
+name       = "result"
+required   = false
+value_name = "RESULT"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "reason"
+name       = "reason"
+required   = false
+value_name = "REASON"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "candidate"
+name       = "candidate"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "command"
+name       = "command_filter"
+required   = false
+value_name = "COMMAND"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster_ref"
+position   = 0
+required   = false
+value_name = "CLUSTER"
+
+[[commands]]
+aliases       = [["cluster", "gateway", "history-clear"]]
+expose_in_cli = true
+name          = "cluster-gateway-history-clear"
+path          = ["cluster-gateway-history-clear"]
+summary       = "Clear gateway selection history"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "all"
+name     = "all"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+long       = "since"
+name       = "since"
+required   = false
+value_name = "DURATION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "result"
+name       = "result"
+required   = false
+value_name = "RESULT"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "reason"
+name       = "reason"
+required   = false
+value_name = "REASON"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "candidate"
+name       = "candidate"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "command"
+name       = "command_filter"
+required   = false
+value_name = "COMMAND"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "confirm"
+name     = "confirm"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster_ref"
+position   = 0
+required   = false
+value_name = "CLUSTER"
+
+[[commands]]
+aliases       = [["cluster", "gateway", "why"]]
+expose_in_cli = true
+name          = "cluster-gateway-why"
+path          = ["cluster-gateway-why"]
+summary       = "Explain current gateway choice and next actions"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway"
+name       = "gateway"
+required   = false
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-mode"
+name       = "gateway_mode"
+required   = false
+value_name = "MODE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "gateway-policy"
+name       = "gateway_policy"
+required   = false
+value_name = "PRESET"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "gateway-no-failover"
+name     = "gateway_no_failover"
+required = false
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
 
 [[commands.arguments]]
 kind       = "string"
