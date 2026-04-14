@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Attach pipeline models for bmux"
+edition     = { workspace = true }
+keywords    = ["attach", "bmux", "models", "pipeline", "terminal"]
+license     = { workspace = true }
+name        = "bmux_attach_pipeline_models"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive"], optional = true }
+uuid  = { workspace = true, features = ["std"] }
+
+[features]
+default = ["serde"]
+
+fail-on-warnings = []
+
+serde = ["dep:serde", "uuid/serde"]

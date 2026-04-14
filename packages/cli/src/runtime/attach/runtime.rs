@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use bmux_attach_pipeline::reconcile::apply_attach_output_chunk_with;
+use bmux_attach_pipeline::{AttachChunkApplyOutcome, AttachOutputChunkMeta};
 use bmux_client::{
     AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, ClientError,
     StreamingBmuxClient,
@@ -216,21 +218,6 @@ fn apply_attach_output_bytes(
     true
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AttachOutputChunkMeta {
-    stream_start: u64,
-    stream_end: u64,
-    stream_gap: bool,
-    sync_update_active: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttachChunkApplyOutcome {
-    Applied { had_data: bool },
-    Stale,
-    Desync,
-}
-
 fn apply_attach_output_chunk(
     view_state: &mut AttachViewState,
     pane_id: Uuid,
@@ -238,34 +225,50 @@ fn apply_attach_output_chunk(
     meta: AttachOutputChunkMeta,
     frame_needs_render: &mut bool,
 ) -> AttachChunkApplyOutcome {
-    {
-        let buffer = view_state.pane_buffers.entry(pane_id).or_default();
-
-        if meta.stream_end < meta.stream_start {
-            return AttachChunkApplyOutcome::Desync;
-        }
-
-        if meta.stream_gap {
-            return AttachChunkApplyOutcome::Desync;
-        }
-
-        if let Some(expected) = buffer.expected_stream_start {
-            if meta.stream_end <= expected {
-                return AttachChunkApplyOutcome::Stale;
+    let pane_mouse_protocol_hints = &mut view_state.pane_mouse_protocol_hints;
+    let pane_input_mode_hints = &mut view_state.pane_input_mode_hints;
+    let mut toggled_alternate = false;
+    let outcome = apply_attach_output_chunk_with(
+        &mut view_state.pane_buffers,
+        pane_id,
+        bytes,
+        meta,
+        |buffer, data| {
+            if data.is_empty() {
+                return false;
             }
-            if meta.stream_start != expected {
-                return AttachChunkApplyOutcome::Desync;
-            }
-        }
+
+            toggled_alternate = append_pane_output(buffer, data) || toggled_alternate;
+            let screen = buffer.parser.screen();
+            pane_mouse_protocol_hints.insert(
+                pane_id,
+                bmux_ipc::AttachMouseProtocolState {
+                    mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
+                    encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
+                },
+            );
+            pane_input_mode_hints.insert(
+                pane_id,
+                bmux_ipc::AttachInputModeState {
+                    application_cursor: screen.application_cursor(),
+                    application_keypad: screen.application_keypad(),
+                },
+            );
+            true
+        },
+    );
+
+    if outcome == (AttachChunkApplyOutcome::Applied { had_data: true }) {
+        view_state.dirty.pane_dirty_ids.insert(pane_id);
+        *frame_needs_render = true;
     }
 
-    let had_data = apply_attach_output_bytes(view_state, pane_id, bytes, frame_needs_render);
-    if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
-        buffer.sync_update_in_progress = meta.sync_update_active;
-        buffer.expected_stream_start = Some(meta.stream_end);
+    if toggled_alternate {
+        view_state.dirty.full_pane_redraw = true;
+        view_state.force_cursor_move_next_frame = true;
     }
 
-    AttachChunkApplyOutcome::Applied { had_data }
+    outcome
 }
 
 async fn recover_attach_output_desync_for_pane(
@@ -4243,37 +4246,27 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn attach_scene_visible_pane_id_set(scene: &bmux_ipc::AttachScene) -> BTreeSet<Uuid> {
-    visible_scene_pane_ids(scene).into_iter().collect()
+    bmux_attach_pipeline::reconcile::attach_scene_visible_pane_id_set(scene)
 }
 
 pub fn attach_scene_revealed_pane_ids(
     previous: &bmux_ipc::AttachScene,
     next: &bmux_ipc::AttachScene,
 ) -> BTreeSet<Uuid> {
-    let previous_visible = attach_scene_visible_pane_id_set(previous);
-    let next_visible = attach_scene_visible_pane_id_set(next);
-    next_visible
-        .difference(&previous_visible)
-        .copied()
-        .collect()
+    bmux_attach_pipeline::reconcile::attach_scene_revealed_pane_ids(previous, next)
 }
 
 pub fn attach_layout_pane_id_set(layout_state: &AttachLayoutState) -> BTreeSet<Uuid> {
-    layout_state.panes.iter().map(|pane| pane.id).collect()
+    bmux_attach_pipeline::reconcile::attach_layout_pane_id_set(layout_state)
 }
 
 pub fn attach_layout_requires_snapshot_hydration(
     previous: &AttachLayoutState,
     next: &AttachLayoutState,
 ) -> bool {
-    if previous.session_id != next.session_id {
-        return true;
-    }
-    if previous.layout_root != next.layout_root {
-        return true;
-    }
-    attach_layout_pane_id_set(previous) != attach_layout_pane_id_set(next)
+    bmux_attach_pipeline::reconcile::attach_layout_requires_snapshot_hydration(previous, next)
 }
 
 pub fn resize_attach_parsers_for_scene(
@@ -4290,34 +4283,12 @@ pub fn resize_attach_parsers_for_scene_with_size(
     cols: u16,
     rows: u16,
 ) {
-    if cols == 0 || rows <= 1 {
-        return;
-    }
-
-    for surface in &scene.surfaces {
-        let Some(pane_id) = surface.pane_id else {
-            continue;
-        };
-        if !surface.visible {
-            continue;
-        }
-        let rect = PaneRect {
-            x: surface.rect.x.min(cols.saturating_sub(1)),
-            y: surface.rect.y.min(rows.saturating_sub(1)),
-            w: surface.rect.w.min(cols),
-            h: surface
-                .rect
-                .h
-                .min(rows.saturating_sub(surface.rect.y.min(rows.saturating_sub(1)))),
-        };
-        if rect.w < 2 || rect.h < 2 {
-            continue;
-        }
-        let inner_w = rect.w.saturating_sub(2).max(1);
-        let inner_h = rect.h.saturating_sub(2).max(1);
-        let buffer = pane_buffers.entry(pane_id).or_default();
-        buffer.parser.screen_mut().set_size(inner_h, inner_w);
-    }
+    bmux_attach_pipeline::reconcile::resize_attach_parsers_for_scene_with_size(
+        pane_buffers,
+        scene,
+        cols,
+        rows,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

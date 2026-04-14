@@ -1,0 +1,31 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shared attach pipeline runtime for bmux"
+edition     = { workspace = true }
+keywords    = ["attach", "bmux", "pipeline", "render", "terminal"]
+license     = { workspace = true }
+name        = "bmux_attach_pipeline"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_attach_pipeline_models = { workspace = true }
+bmux_client                 = { workspace = true }
+bmux_ipc                    = { workspace = true }
+
+anyhow        = { workspace = true, features = ["std"] }
+crossterm     = { workspace = true }
+unicode-width = { workspace = true }
+uuid          = { workspace = true, features = ["std"] }
+vt100         = { workspace = true }
+
+[features]
+default = []
+
+fail-on-warnings = [
+    "bmux_attach_pipeline_models/fail-on-warnings",
+    "bmux_client/fail-on-warnings",
+    "bmux_ipc/fail-on-warnings",
+]

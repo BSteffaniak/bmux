@@ -981,11 +981,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_attach_pipeline"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "bmux_attach_pipeline_models",
+ "bmux_client",
+ "bmux_ipc",
+ "crossterm",
+ "unicode-width",
+ "uuid",
+ "vt100",
+]
+
+[[package]]
+name = "bmux_attach_pipeline_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
+ "bmux_attach_pipeline",
  "bmux_cli_output",
  "bmux_cli_schema",
  "bmux_client",
@@ -1261,6 +1284,7 @@ dependencies = [
 name = "bmux_mobile_core"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_attach_pipeline",
  "bmux_client",
  "bmux_ipc",
  "iroh",

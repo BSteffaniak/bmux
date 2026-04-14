@@ -4,6 +4,8 @@ members = [
     "examples/native-plugin",
     "examples/prompt-showcase",
     "examples/prompt-plugin-showcase",
+    "packages/attach_pipeline",
+    "packages/attach_pipeline/models",
     "packages/bmux",
     "packages/codec",
     "packages/fonts",
@@ -84,34 +86,36 @@ version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
 # Internal bmux packages
-bmux                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux" }
-bmux_cli               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
-bmux_cli_output        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli_output" }
-bmux_cli_schema        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli-schema" }
-bmux_client            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
-bmux_clipboard         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/clipboard" }
-bmux_codec             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/codec" }
-bmux_config            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
-bmux_config_doc        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config-doc" }
-bmux_config_doc_derive = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config-doc-derive" }
-bmux_event             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event" }
-bmux_event_models      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
-bmux_fonts             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/fonts" }
-bmux_image             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/image" }
-bmux_ipc               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
-bmux_keybind           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keybind" }
-bmux_keyboard          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keyboard" }
-bmux_mobile_core       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-core" }
-bmux_mobile_ffi        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-ffi" }
-bmux_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
-bmux_plugin_sdk        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
-bmux_sandbox_harness   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/sandbox-harness" }
-bmux_server            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
-bmux_session           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
-bmux_session_models    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
-bmux_terminal          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal" }
-bmux_terminal_models   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal/models" }
-bmux_terminal_protocol = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }
+bmux                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux" }
+bmux_attach_pipeline        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/attach_pipeline" }
+bmux_attach_pipeline_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/attach_pipeline/models" }
+bmux_cli                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
+bmux_cli_output             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli_output" }
+bmux_cli_schema             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli-schema" }
+bmux_client                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
+bmux_clipboard              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/clipboard" }
+bmux_codec                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/codec" }
+bmux_config                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
+bmux_config_doc             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config-doc" }
+bmux_config_doc_derive      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config-doc-derive" }
+bmux_event                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event" }
+bmux_event_models           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
+bmux_fonts                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/fonts" }
+bmux_image                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/image" }
+bmux_ipc                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
+bmux_keybind                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keybind" }
+bmux_keyboard               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keyboard" }
+bmux_mobile_core            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-core" }
+bmux_mobile_ffi             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-ffi" }
+bmux_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
+bmux_plugin_sdk             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
+bmux_sandbox_harness        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/sandbox-harness" }
+bmux_server                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
+bmux_session                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
+bmux_session_models         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
+bmux_terminal               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal" }
+bmux_terminal_models        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal/models" }
+bmux_terminal_protocol      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }
 
 # Bundled plugin crates (used as optional rlib deps in bmux_cli)
 bmux_clipboard_plugin        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/clipboard-plugin" }

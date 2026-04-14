@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_attach_pipeline = { workspace = true }
 bmux_client = { workspace = true }
 bmux_ipc = { workspace = true, features = ["compression-zstd"] }
 iroh = { workspace = true }
