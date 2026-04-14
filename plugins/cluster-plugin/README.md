@@ -30,6 +30,7 @@ Current scope:
 - `cluster gateway status` reports effective gateway mode, candidate order, preferred gateway cache, cooldown state, and selected candidate hint (`--format text|json`)
 - `cluster gateway explain` probes candidates and explains why selection would succeed/fail without mutating gateway runtime cache/cooldown state (`--format text|json`)
 - `cluster gateway doctor` inspects gateway candidate health and emits actionable findings (`--format text|json`)
+- `cluster gateway history` shows recent gateway routing decisions and observations (`--format text|json`, `--since <duration>`, `--limit <count>`)
 - `cluster gateway reset` clears persisted gateway runtime state for one cluster (`--cluster`) or all clusters (`--all`)
 - In multi-cluster setups, `cluster gateway status|explain` require explicit cluster selection (`--cluster` or positional cluster name)
 - Cluster service interfaces are implemented for query/command/event-list integrations
@@ -51,6 +52,8 @@ Current scope:
 - If every gateway candidate fails, cluster command execution hard-fails (no silent direct fallback).
 - Auto mode tracks persisted last-known-good/cooldown state, per-candidate stability stats, and breaker state.
 - Breaker behavior defaults: open after 3 consecutive failures, then half-open retry after cooldown.
+- Cooldown is adaptive per candidate (failure streak increases delay up to `cooldown_max_ms`) and resets on successful execution.
+- Half-open probation requires consecutive successes (`breaker_half_open_required_successes`) before closing breaker again.
 - Policy presets tune breaker/cooldown/probe defaults:
   - `balanced`: current defaults.
   - `aggressive`: faster failover and shorter cooldown.
@@ -148,6 +151,7 @@ gateway_mode = "auto"
 - `cluster gateway status`
 - `cluster gateway explain`
 - `cluster gateway doctor`
+- `cluster gateway history`
 - `cluster gateway reset`
 
 ## Services

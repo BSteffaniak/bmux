@@ -14,6 +14,7 @@ owns_namespaces = [
     "cluster-gateway-status",
     "cluster-gateway-explain",
     "cluster-gateway-doctor",
+    "cluster-gateway-history",
     "cluster-gateway-reset",
 ]
 provided_capabilities = [
@@ -612,6 +613,49 @@ kind     = "boolean"
 long     = "why"
 name     = "why"
 required = false
+
+[[commands.arguments]]
+kind       = "string"
+name       = "cluster_ref"
+position   = 0
+required   = false
+value_name = "CLUSTER"
+
+[[commands]]
+aliases       = [["cluster", "gateway", "history"]]
+expose_in_cli = true
+name          = "cluster-gateway-history"
+path          = ["cluster-gateway-history"]
+summary       = "Show gateway selection history"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cluster"
+name       = "cluster"
+required   = false
+short      = "c"
+value_name = "CLUSTER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "format"
+name       = "format"
+required   = false
+value_name = "FORMAT"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "since"
+name       = "since"
+required   = false
+value_name = "DURATION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "limit"
+name       = "limit"
+required   = false
+value_name = "COUNT"
 
 [[commands.arguments]]
 kind       = "string"

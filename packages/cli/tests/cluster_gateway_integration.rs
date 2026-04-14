@@ -1,6 +1,7 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn bmux_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bmux"))
@@ -453,4 +454,69 @@ fn gateway_doctor_reports_critical_when_all_candidates_fail() {
     assert_eq!(payload["cluster"], "prod");
     assert_eq!(payload["result"], "critical");
     assert!(payload["findings"].is_array());
+}
+
+#[test]
+fn gateway_history_json_supports_since_and_limit_filters() {
+    let env = CliTestEnv::new("gateway-history-json");
+    env.write_cluster_config();
+
+    let now_ms: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("unix millis should fit into u64");
+    let state = serde_json::json!({
+        "version": 2,
+        "clusters": {
+            "prod": {
+                "last_good": null,
+                "cooldown_until_unix_ms": {},
+                "candidate_health": {},
+                "history": [
+                    {
+                        "observed_at_unix_ms": now_ms.saturating_sub(7_200_000),
+                        "command": "cluster-status",
+                        "candidate": "missing-prod-a",
+                        "result": "observed_failure",
+                        "reason": "timeout"
+                    },
+                    {
+                        "observed_at_unix_ms": now_ms.saturating_sub(60_000),
+                        "command": "cluster-status",
+                        "candidate": "missing-prod-b",
+                        "result": "observed_success",
+                        "reason": null
+                    }
+                ]
+            }
+        }
+    });
+    std::fs::write(
+        env.gateway_state_path(),
+        serde_json::to_string_pretty(&state).expect("serialize gateway history state"),
+    )
+    .expect("write gateway state");
+
+    let output = env.run(&[
+        "cluster",
+        "gateway",
+        "history",
+        "--cluster",
+        "prod",
+        "--format",
+        "json",
+        "--since",
+        "5m",
+        "--limit",
+        "5",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("history json payload");
+    assert_eq!(payload["cluster"], "prod");
+    assert_eq!(payload["count"], 1);
+    let entries = payload["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["candidate"], "missing-prod-b");
 }
