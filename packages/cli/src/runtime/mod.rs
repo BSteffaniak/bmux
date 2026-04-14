@@ -34,6 +34,7 @@ mod cli_parse;
 mod config_cli;
 mod dispatch;
 mod doctor_cli;
+mod hosted_output;
 mod logs_cli;
 mod logs_watch;
 mod perf_cli;

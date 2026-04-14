@@ -19,8 +19,12 @@ use uuid::Uuid;
 use super::{
     AttachExitReason, ConnectionContext, ConnectionPolicyScope, KernelClientFactory,
     active_runtime_name, append_runtime_arg, connect, connect_with_context,
-    expand_bmux_target_if_needed, map_cli_client_error, recording, run_server_start,
-    run_session_attach, run_session_attach_with_client,
+    expand_bmux_target_if_needed,
+    hosted_output::{
+        HostedHostState, hosted_not_ready_reason, status_not_ready_lines, status_ready_lines,
+    },
+    map_cli_client_error, recording, run_server_start, run_session_attach,
+    run_session_attach_with_client,
 };
 use bmux_cli_schema::HostedModeArg;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, HostedMode, RemoteServerStartMode};
@@ -1099,7 +1103,9 @@ pub(super) async fn run_setup(check: bool, mode: Option<HostedModeArg>) -> Resul
     ) {
         println!("{line}");
     }
-    println!("Status: ready");
+    for line in status_ready_lines(None) {
+        println!("{line}");
+    }
     Ok(0)
 }
 
@@ -1135,7 +1141,9 @@ fn run_setup_check(mode: HostedMode) -> Result<u8> {
         ) {
             println!("{line}");
         }
-        println!("Status: ready");
+        for line in status_ready_lines(None) {
+            println!("{line}");
+        }
         return Ok(0);
     }
 
@@ -1199,30 +1207,18 @@ fn format_setup_check_not_ready_lines(
     host_check: SetupHostCheck,
     share_check: SetupShareCheck,
 ) -> Vec<String> {
-    let mut reasons = Vec::new();
-    if auth_check == SetupAuthCheck::RequiredMissing {
-        reasons.push("not signed in".to_string());
-    }
-    match host_check {
-        SetupHostCheck::Offline => reasons.push("host is offline".to_string()),
-        SetupHostCheck::Stale(pid) => reasons.push(format!("host state is stale (pid {pid})")),
-        SetupHostCheck::Running => {}
-    }
-    if share_check == SetupShareCheck::RequiredMissing && host_check == SetupHostCheck::Running {
-        reasons.push("share link unavailable".to_string());
-    }
-
-    let reason_text = if reasons.is_empty() {
-        "not ready".to_string()
-    } else {
-        reasons.join("; ")
+    let host_state = match host_check {
+        SetupHostCheck::Running => HostedHostState::Running,
+        SetupHostCheck::Offline => HostedHostState::Offline,
+        SetupHostCheck::Stale(pid) => HostedHostState::Stale(pid),
     };
+    let reason_text = hosted_not_ready_reason(
+        auth_check == SetupAuthCheck::RequiredMissing,
+        host_state,
+        share_check == SetupShareCheck::RequiredMissing,
+    );
 
-    let mut lines = vec![
-        "Status: not ready".to_string(),
-        format!("Reason: {reason_text}"),
-        "Fix: bmux setup".to_string(),
-    ];
+    let mut lines = status_not_ready_lines(Some(&reason_text), "bmux setup", None);
     if auth_check == SetupAuthCheck::RequiredMissing {
         lines.push("Advanced: bmux auth login".to_string());
     } else if share_check == SetupShareCheck::RequiredMissing
@@ -1240,11 +1236,10 @@ fn format_setup_check_not_ready_lines(
 }
 
 fn format_actionable_error_lines(reason: &str, fix: &str, advanced: Option<&str>) -> Vec<String> {
-    let mut lines = vec![format!("Reason: {reason}"), format!("Fix: {fix}")];
-    if let Some(value) = advanced {
-        lines.push(format!("Advanced: {value}"));
-    }
-    lines
+    status_not_ready_lines(Some(reason), fix, advanced)
+        .into_iter()
+        .skip(1)
+        .collect()
 }
 
 fn actionable_error(reason: &str, fix: &str, advanced: Option<&str>) -> anyhow::Error {
@@ -1666,14 +1661,14 @@ pub(super) fn run_hosts(verbose: bool) -> Result<u8> {
         .as_ref()
         .is_some_and(|state| is_process_alive(state.pid));
     if auth_ready && host_running {
-        println!("Status: ready");
-        if let Some(next) = hosts_next_action(&config, host_state.as_ref()) {
-            println!("Next: {next}");
+        for line in status_ready_lines(hosts_next_action(&config, host_state.as_ref()).as_deref()) {
+            println!("{line}");
         }
     } else {
-        let reason = hosts_status_reason(auth_ready, host_running, host_state.as_ref());
-        println!("Status: not ready ({reason})");
-        println!("Fix: bmux setup");
+        let reason = hosts_not_ready_reason(auth_ready, host_running, host_state.as_ref());
+        for line in status_not_ready_lines(Some(&reason), "bmux setup", None) {
+            println!("{line}");
+        }
     }
     if verbose {
         println!("runtime:");
@@ -1728,21 +1723,19 @@ fn hosts_next_action(config: &BmuxConfig, host_state: Option<&HostRuntimeState>)
     None
 }
 
-fn hosts_status_reason(
+fn hosts_not_ready_reason(
     auth_ready: bool,
     host_running: bool,
     host_state: Option<&HostRuntimeState>,
 ) -> String {
-    match (auth_ready, host_running, host_state) {
-        (false, false, Some(state)) => {
-            format!("not signed in; host state is stale (pid {})", state.pid)
-        }
-        (false, false, None) => "not signed in; host is offline".to_string(),
-        (false, true, _) => "not signed in".to_string(),
-        (true, false, Some(state)) => format!("host state is stale (pid {})", state.pid),
-        (true, false, None) => "host is offline".to_string(),
-        (true, true, _) => "not ready".to_string(),
-    }
+    let host_state = if host_running {
+        HostedHostState::Running
+    } else if let Some(state) = host_state {
+        HostedHostState::Stale(state.pid)
+    } else {
+        HostedHostState::Offline
+    };
+    hosted_not_ready_reason(!auth_ready, host_state, false)
 }
 
 fn print_share_links<'a>(links: impl Iterator<Item = (&'a String, &'a String)>, verbose: bool) {
@@ -1983,12 +1976,13 @@ pub(super) async fn run_share(
     config.save()?;
     let link_name = created.name.clone().unwrap_or(created_name);
     let invite_url = created.url;
-    println!("Status: ready");
+    for line in status_ready_lines(Some(&format!("bmux join bmux://{link_name}"))) {
+        println!("{line}");
+    }
     println!("Share link: bmux://{link_name}");
     if let Some(url) = invite_url.as_deref() {
         println!("Invite URL: {url}");
     }
-    println!("Next: bmux join bmux://{link_name}");
     println!("Target: {resolved_target}");
     println!("Role: {role}");
     if let Some(value) = ttl {
@@ -2027,9 +2021,10 @@ pub(super) async fn run_unshare(name: &str) -> Result<u8> {
 
     if config.connections.share_links.remove(name).is_some() {
         config.save()?;
-        println!("Status: ready");
+        for line in status_ready_lines(Some("bmux hosts")) {
+            println!("{line}");
+        }
         println!("Revoked share link: bmux://{name}");
-        println!("Next: bmux hosts");
         return Ok(0);
     }
     Err(actionable_error(
@@ -2609,22 +2604,28 @@ fn render_text_qr(payload: &str) -> Result<Vec<String>> {
 fn run_host_status() -> Result<u8> {
     let paths = ConfigPaths::default();
     let Some(state) = load_host_runtime_state(&paths)? else {
-        println!("Status: not ready");
-        println!("Reason: host runtime is not running");
+        for line in status_not_ready_lines(
+            Some("host runtime is not running"),
+            "bmux setup",
+            Some("bmux host --daemon"),
+        ) {
+            println!("{line}");
+        }
         println!("runtime: {}", active_runtime_name());
         println!("local ipc endpoint: {}", local_ipc_endpoint_label(&paths));
-        println!("Fix: bmux setup");
-        println!("Advanced: bmux host --daemon");
         return Ok(1);
     };
     if !is_process_alive(state.pid) {
         clear_host_runtime_state(&paths)?;
-        println!("Status: not ready");
-        println!("Reason: stale runtime state was cleared");
+        for line in status_not_ready_lines(
+            Some("stale runtime state was cleared"),
+            "bmux setup",
+            Some("bmux host --restart"),
+        ) {
+            println!("{line}");
+        }
         println!("runtime: {}", active_runtime_name());
         println!("local ipc endpoint: {}", local_ipc_endpoint_label(&paths));
-        println!("Fix: bmux setup");
-        println!("Advanced: bmux host --restart");
         return Ok(1);
     }
     for line in format_host_status_lines(&state) {
@@ -2634,10 +2635,8 @@ fn run_host_status() -> Result<u8> {
 }
 
 fn format_host_status_lines(state: &HostRuntimeState) -> Vec<String> {
-    let mut lines = vec![
-        "Status: ready".to_string(),
-        "host runtime: running".to_string(),
-    ];
+    let mut lines = status_ready_lines(None);
+    lines.push("host runtime: running".to_string());
     lines.push(format!("runtime: {}", active_runtime_name()));
     lines.push(format!(
         "local ipc endpoint: {}",
@@ -2658,13 +2657,19 @@ fn format_host_status_lines(state: &HostRuntimeState) -> Vec<String> {
 fn run_host_stop() -> Result<u8> {
     let paths = ConfigPaths::default();
     let Some(state) = load_host_runtime_state(&paths)? else {
-        println!("Status: ready (already stopped)");
+        for line in status_ready_lines(None) {
+            println!("{line}");
+        }
+        println!("Reason: host runtime is already stopped");
         return Ok(0);
     };
 
     if !is_process_alive(state.pid) {
         clear_host_runtime_state(&paths)?;
-        println!("Status: ready (already stopped)");
+        for line in status_ready_lines(None) {
+            println!("{line}");
+        }
+        println!("Reason: host runtime is already stopped");
         println!("Reason: stale runtime state was cleared");
         return Ok(0);
     }
@@ -2693,7 +2698,9 @@ fn run_host_stop() -> Result<u8> {
     }
 
     clear_host_runtime_state(&paths)?;
-    println!("Status: ready");
+    for line in status_ready_lines(None) {
+        println!("{line}");
+    }
     println!("host runtime stopped (pid {})", state.pid);
     Ok(0)
 }

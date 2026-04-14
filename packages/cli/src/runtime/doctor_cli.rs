@@ -5,8 +5,10 @@ use std::path::PathBuf;
 
 use super::{
     ConnectionContext, check_terminfo_available, current_cli_build_id, effective_enabled_plugins,
-    fetch_server_status, plugin_host_metadata, read_server_runtime_metadata, resolve_pane_term,
-    scan_available_plugins, terminal_profile_name,
+    fetch_server_status,
+    hosted_output::{status_not_ready_lines, status_ready_lines},
+    plugin_host_metadata, read_server_runtime_metadata, resolve_pane_term, scan_available_plugins,
+    terminal_profile_name,
 };
 
 pub(super) async fn run_doctor(as_json: bool, hosted: bool) -> Result<u8> {
@@ -111,12 +113,19 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
                 .context("failed to encode hosted doctor json")?
         );
     } else {
+        let failed_checks = lines
+            .iter()
+            .filter_map(|(name, ok, _, _)| (!*ok).then_some(*name))
+            .collect::<Vec<_>>();
         if has_failures {
-            println!("Status: not ready");
-            println!("Fix: bmux setup");
+            let reason = format!("failed checks: {}", failed_checks.join(", "));
+            for line in status_not_ready_lines(Some(&reason), "bmux setup", None) {
+                println!("{line}");
+            }
         } else {
-            println!("Status: ready");
-            println!("Next: bmux hosts");
+            for line in status_ready_lines(Some("bmux hosts")) {
+                println!("{line}");
+            }
         }
         for (name, ok, hint, detail) in &lines {
             if *ok {
