@@ -1,5 +1,6 @@
 use crate::ssh_access::{
-    authenticate_client_connection, parse_iroh_target as parse_iroh_target_parts,
+    IrohTargetCompression, authenticate_client_connection,
+    parse_iroh_target as parse_iroh_target_parts,
 };
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
@@ -7,6 +8,7 @@ use bmux_config::{
     BmuxConfig, ConfigPaths, ConnectionTargetConfig, ConnectionTransport, StaleBuildAction,
 };
 use bmux_ipc::IncompatibilityReason;
+use bmux_ipc::compressed_stream::CompressedStream;
 use bmux_ipc::transport::ErasedIpcStream;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
@@ -124,6 +126,7 @@ struct IrohTarget {
     endpoint_id: String,
     relay_url: Option<String>,
     require_ssh_auth: bool,
+    transport_compression: IrohTargetCompression,
     connect_timeout_ms: u64,
 }
 
@@ -220,8 +223,14 @@ async fn connect_iroh_target(target: &IrohTarget, client_name: &'static str) -> 
         let _ = send.finish();
     });
     let principal_id = load_or_create_local_principal_id()?;
+    let use_transport_compression = iroh_target_uses_compression(target);
+    let erased = if use_transport_compression {
+        ErasedIpcStream::new(Box::new(CompressedStream::new(client_stream, 1)))
+    } else {
+        ErasedIpcStream::new(Box::new(client_stream))
+    };
     BmuxClient::connect_with_bridge_stream(
-        ErasedIpcStream::new(Box::new(client_stream)),
+        erased,
         std::time::Duration::from_millis(target.connect_timeout_ms.max(1)),
         client_name.to_string(),
         principal_id,
@@ -396,8 +405,24 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<A
                 endpoint_id,
                 relay_url: target.relay_url.clone(),
                 require_ssh_auth: target.iroh_ssh_auth,
+                transport_compression: IrohTargetCompression::Auto,
                 connect_timeout_ms: target.connect_timeout_ms.max(1),
             }))
+        }
+    }
+}
+
+fn iroh_target_uses_compression(target: &IrohTarget) -> bool {
+    match target.transport_compression {
+        IrohTargetCompression::Zstd => true,
+        IrohTargetCompression::None => false,
+        IrohTargetCompression::Auto => {
+            let config = BmuxConfig::load().unwrap_or_default();
+            config.behavior.compression.enabled
+                && matches!(
+                    config.behavior.compression.remote,
+                    bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
+                )
         }
     }
 }
@@ -468,6 +493,7 @@ fn parse_iroh_target(target: &str) -> Result<ActiveTarget> {
         endpoint_id: parsed.endpoint_id,
         relay_url: parsed.relay_url,
         require_ssh_auth: parsed.require_ssh_auth,
+        transport_compression: parsed.transport_compression,
         connect_timeout_ms: 8_000,
     }))
 }

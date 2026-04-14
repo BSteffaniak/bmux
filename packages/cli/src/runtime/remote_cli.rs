@@ -1,6 +1,7 @@
 use crate::ssh_access::{
-    authenticate_client_connection, authenticate_host_connection, ensure_iroh_ssh_access_ready,
-    iroh_ssh_access_enabled, iroh_target_url, parse_iroh_target as parse_iroh_target_parts,
+    IrohTargetCompression, authenticate_client_connection, authenticate_host_connection,
+    ensure_iroh_ssh_access_ready, iroh_ssh_access_enabled, iroh_target_compression_from_config,
+    iroh_target_url, parse_iroh_target as parse_iroh_target_parts,
 };
 use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
@@ -358,7 +359,22 @@ struct IrohTarget {
     endpoint_id: String,
     relay_url: Option<String>,
     require_ssh_auth: bool,
+    transport_compression: IrohTargetCompression,
     connect_timeout_ms: u64,
+}
+
+const fn iroh_target_uses_compression(target: &IrohTarget, config: &BmuxConfig) -> bool {
+    match target.transport_compression {
+        IrohTargetCompression::Zstd => true,
+        IrohTargetCompression::None => false,
+        IrohTargetCompression::Auto => {
+            config.behavior.compression.enabled
+                && matches!(
+                    config.behavior.compression.remote,
+                    bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
+                )
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -1171,7 +1187,13 @@ pub(super) async fn run_host(
         .relay_urls()
         .next()
         .map(|value| normalize_relay_url_for_display(&value.to_string()));
-    let target = iroh_target_url(&endpoint_id.to_string(), relay.as_deref(), require_ssh_auth);
+    let transport_compression = iroh_target_compression_from_config(&config);
+    let target = iroh_target_url(
+        &endpoint_id.to_string(),
+        relay.as_deref(),
+        require_ssh_auth,
+        transport_compression,
+    );
 
     let resolved_share = if hosted_mode == HostedMode::ControlPlane {
         let auth_state = auth_state
@@ -5763,11 +5785,7 @@ fn build_iroh_kernel_client_factory(
     let principal_id = load_or_create_local_principal_id(&ConfigPaths::default())
         .unwrap_or_else(|_| Uuid::new_v4());
     let config = BmuxConfig::load().unwrap_or_default();
-    let use_compression = config.behavior.compression.enabled
-        && matches!(
-            config.behavior.compression.remote,
-            bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
-        );
+    let use_compression = iroh_target_uses_compression(target, &config);
 
     Arc::new(move || {
         let conn = connection.clone();
@@ -6421,6 +6439,7 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<R
                 endpoint_id,
                 relay_url: target.relay_url.clone(),
                 require_ssh_auth: target.iroh_ssh_auth,
+                transport_compression: IrohTargetCompression::Auto,
                 connect_timeout_ms: target.connect_timeout_ms.max(1),
             }))
         }
@@ -6524,6 +6543,7 @@ fn parse_iroh_target(target: &str) -> Result<ResolvedTarget> {
         endpoint_id: parsed.endpoint_id,
         relay_url: parsed.relay_url,
         require_ssh_auth: parsed.require_ssh_auth,
+        transport_compression: parsed.transport_compression,
         connect_timeout_ms: 8_000,
     }))
 }

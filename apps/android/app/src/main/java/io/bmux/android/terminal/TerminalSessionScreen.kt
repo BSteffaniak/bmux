@@ -13,6 +13,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -32,7 +33,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-private const val MAX_STATUS_LINES = 24
+private const val MAX_STATUS_LINES = 12
 
 @Composable
 fun TerminalSessionScreen(
@@ -59,18 +60,28 @@ fun TerminalSessionScreen(
     var connection by remember(endpoint.id) { mutableStateOf<TerminalTransportConnection?>(null) }
     var warning by remember(endpoint.id) { mutableStateOf<String?>(null) }
     var statusLines by remember(endpoint.id) { mutableStateOf(emptyList<TerminalStatusEvent>()) }
+    var statusPanelVisible by remember(endpoint.id) { mutableStateOf(true) }
+    var statusPanelExpanded by remember(endpoint.id) { mutableStateOf(false) }
 
     LaunchedEffect(endpoint.id, session) {
         warning = null
         connection = null
         statusLines = emptyList()
+        statusPanelVisible = true
+        statusPanelExpanded = false
         runCatching {
             transport.open(
                 endpoint = endpoint,
                 session = session,
                 sink = { bytes -> renderer.appendOutput(bytes) },
                 onStatus = { event ->
-                    statusLines = (statusLines + event).takeLast(MAX_STATUS_LINES)
+                    if (shouldKeepStatusEvent(event)) {
+                        statusLines = (statusLines + event).takeLast(MAX_STATUS_LINES)
+                        if (event.severity != TerminalStatusSeverity.INFO) {
+                            statusPanelVisible = true
+                            statusPanelExpanded = true
+                        }
+                    }
                 },
             )
         }.onSuccess {
@@ -119,25 +130,60 @@ fun TerminalSessionScreen(
                         .padding(8.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    Text("Status", style = MaterialTheme.typography.labelMedium)
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 120.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        itemsIndexed(statusLines, key = { index, line -> "$index-${line.message}" }) { _, line ->
-                            val color = when (line.severity) {
-                                TerminalStatusSeverity.INFO -> MaterialTheme.colorScheme.onSurface
-                                TerminalStatusSeverity.WARN -> MaterialTheme.colorScheme.tertiary
-                                TerminalStatusSeverity.ERROR -> MaterialTheme.colorScheme.error
+                        Text("Status (${statusLines.size})", style = MaterialTheme.typography.labelMedium)
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            TextButton(onClick = { statusPanelExpanded = !statusPanelExpanded }) {
+                                Text(if (statusPanelExpanded) "Collapse" else "Expand")
                             }
-                            Text(
-                                text = line.message,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = color,
-                            )
+                            TextButton(onClick = { statusPanelVisible = !statusPanelVisible }) {
+                                Text(if (statusPanelVisible) "Dismiss" else "Show")
+                            }
+                            TextButton(
+                                onClick = {
+                                    statusLines = emptyList()
+                                    statusPanelVisible = false
+                                },
+                            ) {
+                                Text("Clear")
+                            }
                         }
+                    }
+
+                    if (statusPanelVisible) {
+                        val visibleLines = if (statusPanelExpanded) {
+                            statusLines
+                        } else {
+                            listOf(statusLines.last())
+                        }
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = if (statusPanelExpanded) 100.dp else 28.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            itemsIndexed(visibleLines, key = { index, line -> "$index-${line.message}" }) { _, line ->
+                                val color = when (line.severity) {
+                                    TerminalStatusSeverity.INFO -> MaterialTheme.colorScheme.onSurface
+                                    TerminalStatusSeverity.WARN -> MaterialTheme.colorScheme.tertiary
+                                    TerminalStatusSeverity.ERROR -> MaterialTheme.colorScheme.error
+                                }
+                                Text(
+                                    text = line.message,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = color,
+                                )
+                            }
+                        }
+                    } else {
+                        Text(
+                            text = statusLines.last().message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
             }
@@ -149,6 +195,14 @@ fun TerminalSessionScreen(
                 .padding(bottom = 8.dp),
         )
     }
+}
+
+private fun shouldKeepStatusEvent(event: TerminalStatusEvent): Boolean {
+    if (event.severity != TerminalStatusSeverity.INFO) {
+        return true
+    }
+    val message = event.message.lowercase()
+    return !message.startsWith("resize ")
 }
 
 private class CoreTerminalTransport(
@@ -164,10 +218,29 @@ private class CoreTerminalTransport(
         sink: (ByteArray) -> Unit,
         onStatus: (TerminalStatusEvent) -> Unit,
     ): TerminalTransportConnection {
-        val terminalId = openTerminal(endpoint.id, session, DEFAULT_ROWS, DEFAULT_COLS)
-            .getOrElse { error ->
-                throw error
-            }
+        onStatus(
+            TerminalStatusEvent(
+                message = "opening terminal to ${endpoint.name}...",
+                severity = TerminalStatusSeverity.INFO,
+            ),
+        )
+
+        val terminalId = openTerminal(endpoint.id, session, DEFAULT_ROWS, DEFAULT_COLS).getOrElse { error ->
+            onStatus(
+                TerminalStatusEvent(
+                    message = "terminal open failed: ${error.message ?: "unknown"}",
+                    severity = TerminalStatusSeverity.ERROR,
+                ),
+            )
+            throw error
+        }
+
+        onStatus(
+            TerminalStatusEvent(
+                message = "connected to ${endpoint.canonicalTarget}",
+                severity = TerminalStatusSeverity.INFO,
+            ),
+        )
 
         return CoreTerminalTransportConnection(
             terminalId = terminalId,

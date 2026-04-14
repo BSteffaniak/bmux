@@ -11,10 +11,23 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-serde     = { workspace = true, features = ["derive"] }
-ssh2      = { workspace = true, features = ["vendored-openssl"] }
+bmux_client = { workspace = true }
+bmux_ipc = { workspace = true, features = ["compression-zstd"] }
+iroh = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+ssh2 = { workspace = true, features = ["vendored-openssl"] }
 thiserror = { workspace = true }
-uuid      = { workspace = true, features = ["serde", "v4"] }
+tokio = { workspace = true, features = [
+    "io-util",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-rustls = { workspace = true }
+url = { version = "2.5.8", default-features = false }
+uuid = { workspace = true, features = ["serde", "v4"] }
 
 [features]
 default = []

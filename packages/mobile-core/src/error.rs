@@ -20,4 +20,8 @@ pub enum MobileCoreError {
     TerminalSessionClosed(String),
     #[error("invalid terminal size rows={rows}, cols={cols}")]
     InvalidTerminalSize { rows: u16, cols: u16 },
+    #[error("unsupported terminal transport target: {0}")]
+    UnsupportedTerminalTransport(String),
+    #[error("terminal backend failure: {0}")]
+    TerminalBackendFailure(String),
 }

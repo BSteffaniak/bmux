@@ -1,4 +1,5 @@
 use crate::error::{MobileCoreError, Result};
+use crate::remote_bridge::{BackendSessionHandle, RemoteTerminalBackend, TerminalBackend};
 use crate::ssh::{EmbeddedSshBackend, SshBackend, parse_ssh_target};
 use crate::target::{
     CanonicalTarget, TargetInput, TargetRecord, TargetTransport, canonicalize_target,
@@ -94,6 +95,7 @@ pub struct TerminalSessionState {
 #[derive(Debug, Clone)]
 struct TerminalSessionRuntime {
     state: TerminalSessionState,
+    backend: BackendSessionHandle,
     chunks: VecDeque<TerminalChunk>,
     next_sequence: u64,
 }
@@ -103,6 +105,7 @@ pub struct ConnectionManager {
     connections: BTreeMap<Uuid, ConnectionState>,
     terminals: BTreeMap<Uuid, TerminalSessionRuntime>,
     ssh_backend: Option<Arc<dyn SshBackend>>,
+    terminal_backend: Arc<dyn TerminalBackend>,
 }
 
 impl Default for ConnectionManager {
@@ -112,6 +115,7 @@ impl Default for ConnectionManager {
             connections: BTreeMap::new(),
             terminals: BTreeMap::new(),
             ssh_backend: Some(Arc::new(EmbeddedSshBackend::default())),
+            terminal_backend: Arc::new(RemoteTerminalBackend::new()),
         }
     }
 }
@@ -129,6 +133,18 @@ impl ConnectionManager {
             connections: BTreeMap::new(),
             terminals: BTreeMap::new(),
             ssh_backend: Some(ssh_backend),
+            terminal_backend: Arc::new(RemoteTerminalBackend::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_terminal_backend(terminal_backend: Arc<dyn TerminalBackend>) -> Self {
+        Self {
+            targets: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            terminals: BTreeMap::new(),
+            ssh_backend: Some(Arc::new(EmbeddedSshBackend::default())),
+            terminal_backend,
         }
     }
 
@@ -139,6 +155,7 @@ impl ConnectionManager {
             connections: BTreeMap::new(),
             terminals: BTreeMap::new(),
             ssh_backend: None,
+            terminal_backend: Arc::new(RemoteTerminalBackend::new()),
         }
     }
 
@@ -259,35 +276,65 @@ impl ConnectionManager {
     /// [`MobileCoreError::InvalidTerminalSize`] for invalid dimensions, and
     /// connection errors from [`Self::connect`].
     pub fn open_terminal(&mut self, request: TerminalOpenRequest) -> Result<TerminalSessionState> {
-        let size = TerminalSize {
-            rows: request.rows,
-            cols: request.cols,
-        };
+        let TerminalOpenRequest {
+            target_id,
+            session,
+            rows,
+            cols,
+        } = request;
+        let size = TerminalSize { rows, cols };
         validate_terminal_size(size)?;
+
+        let requested_session = session
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
 
         let target = self
             .targets
-            .get(&request.target_id)
-            .ok_or_else(|| MobileCoreError::TargetNotFound(request.target_id.to_string()))?;
+            .get(&target_id)
+            .ok_or_else(|| MobileCoreError::TargetNotFound(target_id.to_string()))?
+            .clone();
         let target_name = target.name.clone();
         let canonical_target = target.canonical_target.value.clone();
 
         let connection = self.connect(ConnectionRequest {
-            target_id: request.target_id,
-            session: request.session.clone(),
+            target_id,
+            session: requested_session.clone(),
         })?;
         let connection = self.mark_connected(connection.id)?;
+        let backend =
+            match self
+                .terminal_backend
+                .open(&target, requested_session, size.rows, size.cols)
+            {
+                Ok(backend) => backend,
+                Err(error) => {
+                    let _ = self.mark_failed(connection.id, &error.to_string());
+                    return Err(error);
+                }
+            };
+
+        let attached_session = Some(backend.session_id.to_string());
+        if let Some(connection_state) = self.connections.get_mut(&connection.id) {
+            connection_state.session.clone_from(&attached_session);
+        }
+        if let Some(target_state) = self.targets.get_mut(&target_id) {
+            target_state.default_session.clone_from(&attached_session);
+        }
 
         let mut runtime = TerminalSessionRuntime {
             state: TerminalSessionState {
                 id: Uuid::new_v4(),
-                target_id: request.target_id,
+                target_id,
                 connection_id: connection.id,
-                session: request.session,
+                session: attached_session,
                 status: TerminalSessionStatus::Opening,
                 size,
                 last_sequence: 0,
             },
+            backend,
             chunks: VecDeque::new(),
             next_sequence: 1,
         };
@@ -341,6 +388,37 @@ impl ConnectionManager {
                 None => break,
             }
         }
+        if output.len() >= max_chunks || runtime.state.status == TerminalSessionStatus::Closed {
+            return Ok(output);
+        }
+
+        let max_bytes = max_chunks.saturating_mul(4096).max(1);
+        let data = match self
+            .terminal_backend
+            .poll_output(runtime.backend.id, max_bytes)
+        {
+            Ok(data) => data,
+            Err(error) => {
+                runtime.state.status = TerminalSessionStatus::Failed;
+                runtime.push_status_chunk(
+                    format!("poll failed: {error}"),
+                    TerminalStatusSeverity::Error,
+                );
+                if !output.is_empty() {
+                    return Ok(output);
+                }
+                return Err(error);
+            }
+        };
+        if !data.is_empty() {
+            runtime.push_chunk(TerminalChunkKind::Stdout, data, None);
+            while output.len() < max_chunks {
+                match runtime.chunks.pop_front() {
+                    Some(chunk) => output.push(chunk),
+                    None => break,
+                }
+            }
+        }
         Ok(output)
     }
 
@@ -365,7 +443,16 @@ impl ConnectionManager {
             ));
         }
         if !bytes.is_empty() {
-            runtime.push_chunk(TerminalChunkKind::Stdout, bytes.to_vec(), None);
+            self.terminal_backend
+                .write_input(runtime.backend.id, bytes)
+                .map_err(|error| {
+                    runtime.state.status = TerminalSessionStatus::Failed;
+                    runtime.push_status_chunk(
+                        format!("write failed: {error}"),
+                        TerminalStatusSeverity::Error,
+                    );
+                    error
+                })?;
         }
         Ok(())
     }
@@ -398,6 +485,16 @@ impl ConnectionManager {
             );
             return Err(error);
         }
+        self.terminal_backend
+            .resize(runtime.backend.id, size.rows, size.cols)
+            .map_err(|error| {
+                runtime.state.status = TerminalSessionStatus::Failed;
+                runtime.push_status_chunk(
+                    format!("resize failed: {error}"),
+                    TerminalStatusSeverity::Error,
+                );
+                error
+            })?;
         runtime.state.size = size;
         runtime.push_status_chunk(
             format!("resize {}x{}", size.rows, size.cols),
@@ -423,6 +520,16 @@ impl ConnectionManager {
                     TerminalStatusSeverity::Warn,
                 );
             } else {
+                let _ = self
+                    .terminal_backend
+                    .close(runtime.backend.id)
+                    .map_err(|error| {
+                        runtime.push_status_chunk(
+                            format!("close failed: {error}"),
+                            TerminalStatusSeverity::Error,
+                        );
+                        error
+                    });
                 runtime.state.status = TerminalSessionStatus::Closed;
                 runtime
                     .push_status_chunk("session closed".to_string(), TerminalStatusSeverity::Info);
@@ -474,7 +581,78 @@ const fn validate_terminal_size(size: TerminalSize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_bridge::{BackendSessionHandle, TerminalBackend};
     use crate::ssh::MockSshBackend;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockTerminalBackend {
+        sessions: Mutex<BTreeMap<Uuid, Vec<u8>>>,
+    }
+
+    impl TerminalBackend for MockTerminalBackend {
+        fn open(
+            &self,
+            _target: &TargetRecord,
+            _session: Option<String>,
+            _rows: u16,
+            _cols: u16,
+        ) -> Result<BackendSessionHandle> {
+            let id = Uuid::new_v4();
+            self.sessions
+                .lock()
+                .expect("mock terminal sessions lock")
+                .insert(id, Vec::new());
+            Ok(BackendSessionHandle {
+                id,
+                session_id: Uuid::new_v4(),
+                can_write: true,
+            })
+        }
+
+        fn poll_output(&self, handle_id: Uuid, _max_bytes: usize) -> Result<Vec<u8>> {
+            let mut sessions = self.sessions.lock().expect("mock terminal sessions lock");
+            let output =
+                std::mem::take(sessions.get_mut(&handle_id).ok_or_else(|| {
+                    MobileCoreError::TerminalSessionNotFound(handle_id.to_string())
+                })?);
+            drop(sessions);
+            Ok(output)
+        }
+
+        fn write_input(&self, handle_id: Uuid, bytes: &[u8]) -> Result<()> {
+            let mut sessions = self.sessions.lock().expect("mock terminal sessions lock");
+            sessions
+                .get_mut(&handle_id)
+                .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(handle_id.to_string()))?
+                .extend_from_slice(bytes);
+            drop(sessions);
+            Ok(())
+        }
+
+        fn resize(&self, handle_id: Uuid, _rows: u16, _cols: u16) -> Result<()> {
+            let sessions = self.sessions.lock().expect("mock terminal sessions lock");
+            if sessions.contains_key(&handle_id) {
+                Ok(())
+            } else {
+                Err(MobileCoreError::TerminalSessionNotFound(
+                    handle_id.to_string(),
+                ))
+            }
+        }
+
+        fn close(&self, handle_id: Uuid) -> Result<()> {
+            let mut sessions = self.sessions.lock().expect("mock terminal sessions lock");
+            if sessions.remove(&handle_id).is_some() {
+                Ok(())
+            } else {
+                Err(MobileCoreError::TerminalSessionNotFound(
+                    handle_id.to_string(),
+                ))
+            }
+        }
+    }
 
     #[test]
     fn import_and_connect_round_trip() {
@@ -554,7 +732,8 @@ mod tests {
 
     #[test]
     fn terminal_open_write_poll_resize_close_round_trip() {
-        let mut manager = ConnectionManager::new();
+        let mut manager =
+            ConnectionManager::with_terminal_backend(Arc::new(MockTerminalBackend::default()));
         let target = manager
             .import_target(&TargetInput {
                 source: "iroh://endpoint-abc".to_string(),
@@ -620,14 +799,10 @@ mod tests {
             .expect("second close should return state");
         assert_eq!(second_close.status, TerminalSessionStatus::Closed);
 
-        let post_close_output = manager
+        let second_close_output = manager
             .poll_terminal_output(terminal.id, 16)
-            .expect("post-close poll should work");
-        assert!(post_close_output.iter().any(|chunk| {
-            chunk.status_severity == Some(TerminalStatusSeverity::Error)
-                && chunk.kind == TerminalChunkKind::Status
-        }));
-        assert!(post_close_output.iter().any(|chunk| {
+            .expect("post-second-close poll should work");
+        assert!(second_close_output.iter().any(|chunk| {
             chunk.status_severity == Some(TerminalStatusSeverity::Warn)
                 && chunk.kind == TerminalChunkKind::Status
         }));
@@ -635,7 +810,8 @@ mod tests {
 
     #[test]
     fn terminal_open_rejects_zero_dimensions() {
-        let mut manager = ConnectionManager::new();
+        let mut manager =
+            ConnectionManager::with_terminal_backend(Arc::new(MockTerminalBackend::default()));
         let target = manager
             .import_target(&TargetInput {
                 source: "iroh://endpoint-xyz".to_string(),

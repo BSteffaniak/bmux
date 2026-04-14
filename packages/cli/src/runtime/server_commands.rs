@@ -1,6 +1,6 @@
 use crate::ssh_access::{
     authenticate_host_connection, ensure_iroh_ssh_access_ready, iroh_ssh_access_enabled,
-    iroh_target_url,
+    iroh_target_compression_from_config, iroh_target_url,
 };
 use anyhow::{Context, Result};
 use bmux_cli_schema::GatewayHostMode;
@@ -710,7 +710,13 @@ async fn run_server_gateway_iroh() -> Result<u8> {
         .relay_urls()
         .next()
         .map(std::string::ToString::to_string);
-    let url = iroh_target_url(&endpoint_id.to_string(), relay.as_deref(), require_ssh_auth);
+    let transport_compression = iroh_target_compression_from_config(&config);
+    let url = iroh_target_url(
+        &endpoint_id.to_string(),
+        relay.as_deref(),
+        require_ssh_auth,
+        transport_compression,
+    );
     println!("bmux iroh gateway online");
     println!("connect URL: {url}");
     if require_ssh_auth {

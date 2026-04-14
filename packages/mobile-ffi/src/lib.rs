@@ -36,6 +36,10 @@ pub enum MobileFfiError {
     TerminalSessionClosed(String),
     #[error("invalid terminal size rows={rows}, cols={cols}")]
     InvalidTerminalSize { rows: u16, cols: u16 },
+    #[error("unsupported terminal transport target: {0}")]
+    UnsupportedTerminalTransport(String),
+    #[error("terminal backend failure: {0}")]
+    TerminalBackendFailure(String),
 }
 
 impl From<MobileCoreError> for MobileFfiError {
@@ -52,6 +56,12 @@ impl From<MobileCoreError> for MobileFfiError {
             MobileCoreError::TerminalSessionClosed(message) => Self::TerminalSessionClosed(message),
             MobileCoreError::InvalidTerminalSize { rows, cols } => {
                 Self::InvalidTerminalSize { rows, cols }
+            }
+            MobileCoreError::UnsupportedTerminalTransport(message) => {
+                Self::UnsupportedTerminalTransport(message)
+            }
+            MobileCoreError::TerminalBackendFailure(message) => {
+                Self::TerminalBackendFailure(message)
             }
         }
     }
@@ -301,6 +311,13 @@ impl MobileApi {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_manager(manager: ConnectionManager) -> Self {
+        Self {
+            manager: Arc::new(Mutex::new(manager)),
+        }
     }
 
     /// Import a target into the shared connection manager.
@@ -785,6 +802,88 @@ pub type Result<T> = std::result::Result<T, MobileCoreError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_mobile_core::ConnectionManager;
+    use bmux_mobile_core::remote_bridge::{BackendSessionHandle, TerminalBackend};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct MockTerminalBackend {
+        sessions: Mutex<BTreeMap<Uuid, Vec<u8>>>,
+    }
+
+    impl TerminalBackend for MockTerminalBackend {
+        fn open(
+            &self,
+            _target: &TargetRecord,
+            _session: Option<String>,
+            _rows: u16,
+            _cols: u16,
+        ) -> Result<BackendSessionHandle> {
+            let id = Uuid::new_v4();
+            self.sessions
+                .lock()
+                .expect("mock terminal sessions lock")
+                .insert(id, Vec::new());
+            Ok(BackendSessionHandle {
+                id,
+                session_id: Uuid::new_v4(),
+                can_write: true,
+            })
+        }
+
+        fn poll_output(&self, handle_id: Uuid, _max_bytes: usize) -> Result<Vec<u8>> {
+            let mut sessions = self.sessions.lock().expect("mock terminal sessions lock");
+            let output =
+                std::mem::take(sessions.get_mut(&handle_id).ok_or_else(|| {
+                    MobileCoreError::TerminalSessionNotFound(handle_id.to_string())
+                })?);
+            drop(sessions);
+            Ok(output)
+        }
+
+        fn write_input(&self, handle_id: Uuid, bytes: &[u8]) -> Result<()> {
+            let mut sessions = self.sessions.lock().expect("mock terminal sessions lock");
+            sessions
+                .get_mut(&handle_id)
+                .ok_or_else(|| MobileCoreError::TerminalSessionNotFound(handle_id.to_string()))?
+                .extend_from_slice(bytes);
+            drop(sessions);
+            Ok(())
+        }
+
+        fn resize(&self, handle_id: Uuid, _rows: u16, _cols: u16) -> Result<()> {
+            if self
+                .sessions
+                .lock()
+                .expect("mock terminal sessions lock")
+                .contains_key(&handle_id)
+            {
+                Ok(())
+            } else {
+                Err(MobileCoreError::TerminalSessionNotFound(
+                    handle_id.to_string(),
+                ))
+            }
+        }
+
+        fn close(&self, handle_id: Uuid) -> Result<()> {
+            if self
+                .sessions
+                .lock()
+                .expect("mock terminal sessions lock")
+                .remove(&handle_id)
+                .is_some()
+            {
+                Ok(())
+            } else {
+                Err(MobileCoreError::TerminalSessionNotFound(
+                    handle_id.to_string(),
+                ))
+            }
+        }
+    }
 
     #[test]
     fn ffi_facade_import_and_connect() {
@@ -872,7 +971,9 @@ mod tests {
 
     #[test]
     fn ffi_terminal_stream_round_trip() {
-        let api = MobileApi::new();
+        let api = MobileApi::with_manager(ConnectionManager::with_terminal_backend(Arc::new(
+            MockTerminalBackend::default(),
+        )));
         let target = api
             .import_target("iroh://endpoint-tty", Some("tty".to_string()))
             .expect("target import should work");

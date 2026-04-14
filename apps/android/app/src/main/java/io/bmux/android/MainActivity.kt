@@ -91,7 +91,7 @@ data class MainUiState(
     val discoveryHistory: List<DiscoveredTargetUi> = emptyList(),
     val discoveryRunning: Boolean = false,
     val reconnectServiceEnabled: Boolean = false,
-    val selectedSession: String = "main",
+    val selectedSession: String = "",
     val activeTerminalTarget: TargetUi? = null,
     val lastConnection: String = "",
     val lastHostKey: String = "",
@@ -635,7 +635,7 @@ private fun MainScreen(vm: MainViewModel) {
                 value = state.selectedSession,
                 onValueChange = { vm.updateSession(it) },
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("Session") },
+                label = { Text("Session (optional)") },
                 singleLine = true,
             )
 

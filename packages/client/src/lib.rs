@@ -3241,6 +3241,8 @@ fn cell_pixel_size_from_ioctl() -> (u16, u16) {
     const TIOCGWINSZ: u64 = 0x4008_7468;
     #[cfg(target_os = "linux")]
     const TIOCGWINSZ: u64 = 0x5413;
+    #[cfg(target_os = "android")]
+    const TIOCGWINSZ: u64 = 0x5413;
 
     let fd = std::io::stdout().as_raw_fd();
     let mut ws = std::mem::MaybeUninit::<Winsize>::uninit();

@@ -1,5 +1,7 @@
 package io.bmux.android.terminal
 
+import android.os.Handler
+import android.os.Looper
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import org.connectbot.terminal.Terminal
@@ -8,6 +10,7 @@ import org.connectbot.terminal.TerminalEmulatorFactory
 class TermlibTerminalRenderer : TerminalRenderer {
     private var onInput: ((ByteArray) -> Unit)? = null
     private var onResize: ((Int, Int) -> Unit)? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val emulator = TerminalEmulatorFactory.create(
         onKeyboardInput = { data -> onInput?.invoke(data) },
@@ -15,7 +18,11 @@ class TermlibTerminalRenderer : TerminalRenderer {
     )
 
     override fun appendOutput(data: ByteArray) {
-        emulator.writeInput(data)
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            emulator.writeInput(data)
+        } else {
+            mainHandler.post { emulator.writeInput(data) }
+        }
     }
 
     override fun setOnInput(handler: (ByteArray) -> Unit) {

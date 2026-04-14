@@ -1261,9 +1261,17 @@ dependencies = [
 name = "bmux_mobile_core"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_client",
+ "bmux_ipc",
+ "iroh",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "ssh2",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "url 2.5.8",
  "uuid",
 ]
 
