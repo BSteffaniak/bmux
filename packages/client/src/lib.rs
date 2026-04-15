@@ -1366,6 +1366,25 @@ impl BmuxClient {
         }
     }
 
+    /// Configure attach policy for this connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn set_attach_policy(&mut self, allow_detach: bool) -> Result<()> {
+        match self
+            .request(Request::SetClientAttachPolicy { allow_detach })
+            .await?
+        {
+            ResponsePayload::ClientAttachPolicySet {
+                allow_detach: applied,
+            } if applied == allow_detach => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected client attach policy set response",
+            )),
+        }
+    }
+
     /// Send bytes to an attached session runtime.
     ///
     /// # Errors
@@ -2803,6 +2822,25 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Configure attach policy for this connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn set_attach_policy(&mut self, allow_detach: bool) -> Result<()> {
+        match self
+            .request(Request::SetClientAttachPolicy { allow_detach })
+            .await?
+        {
+            ResponsePayload::ClientAttachPolicySet {
+                allow_detach: applied,
+            } if applied == allow_detach => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected client attach policy set",
+            )),
+        }
+    }
+
     /// Invoke a generic service request over IPC.
     ///
     /// # Errors
@@ -3109,6 +3147,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingRollingClear { .. } => "recording_rolling_clear",
         Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
+        Request::SetClientAttachPolicy { .. } => "set_client_attach_policy",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
@@ -3177,6 +3216,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::PerformanceUpdated { .. } => "performance_updated",
             ResponsePayload::RecordingRollingCleared { .. } => "recording_rolling_cleared",
             ResponsePayload::RecordingPruned { .. } => "recording_pruned",
+            ResponsePayload::ClientAttachPolicySet { .. } => "client_attach_policy_set",
             ResponsePayload::Detached => "detached",
             ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
             ResponsePayload::EventsSubscribed => "events_subscribed",

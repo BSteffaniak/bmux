@@ -1366,7 +1366,9 @@ pub async fn run_session_attach_with_client(
     drop(raw_mode_guard);
     restore_terminal_after_attach_ui()?;
 
-    let _ = client.detach().await;
+    if exit_reason != AttachExitReason::Detached {
+        let _ = client.detach().await;
+    }
     if follow_target_id.is_some() {
         let _ = client.unfollow().await;
     }
@@ -4631,7 +4633,7 @@ pub async fn handle_attach_terminal_event(
     {
         match attach_action {
             AttachEventAction::Detach => {
-                return Ok(AttachLoopControl::Break(AttachExitReason::Detached));
+                return try_detach_or_continue(client, view_state).await;
             }
             AttachEventAction::Send(bytes) => {
                 if view_state.help_overlay_open || view_state.prompt.is_active() {
@@ -4882,7 +4884,7 @@ async fn handle_attach_action_dispatch(
 
     match event_action {
         AttachEventAction::Detach => {
-            return Ok(AttachLoopControl::Break(AttachExitReason::Detached));
+            return try_detach_or_continue(client, view_state).await;
         }
         AttachEventAction::Send(bytes) => {
             if view_state.can_write
@@ -4964,6 +4966,23 @@ async fn handle_attach_action_dispatch(
     }
 
     Ok(AttachLoopControl::Continue)
+}
+
+async fn try_detach_or_continue(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+) -> Result<AttachLoopControl> {
+    match client.detach().await {
+        Ok(()) => Ok(AttachLoopControl::Break(AttachExitReason::Detached)),
+        Err(error) => {
+            view_state.set_transient_status(
+                format!("detach blocked: {}", map_attach_client_error(error)),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            Ok(AttachLoopControl::Continue)
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]

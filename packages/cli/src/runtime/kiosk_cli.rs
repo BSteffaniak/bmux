@@ -1,4 +1,7 @@
-use super::{ConnectionContext, run_connect, run_session_attach};
+use super::{
+    ConnectionContext, connect_with_context, map_cli_client_error, run_session_attach_with_client,
+};
+use crate::connection::ConnectionPolicyScope;
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths, KioskProfileConfig, KioskRole, KioskSandboxMode};
 use sha2::{Digest, Sha256};
@@ -199,11 +202,25 @@ pub(super) async fn run_kiosk_attach(
     let session = record.session.clone();
     save_token_store(&store)?;
 
-    if let Some(target) = resolved.target.as_deref() {
-        return run_connect(Some(target), session.as_deref(), None, false, false).await;
+    if resolved.target.is_some() {
+        anyhow::bail!(
+            "kiosk attach profile '{profile}' sets a non-local target; detached-lock enforcement currently requires a local target"
+        );
     }
 
-    run_session_attach(session.as_deref(), None, false, connection_context).await
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-kiosk-attach",
+        connection_context,
+    )
+    .await?;
+    client
+        .set_attach_policy(resolved.allow_detach)
+        .await
+        .map_err(map_cli_client_error)?;
+    run_session_attach_with_client(client, session.as_deref(), None, false, None)
+        .await
+        .map(|outcome| outcome.status_code)
 }
 
 pub(super) fn run_kiosk_init(

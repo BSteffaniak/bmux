@@ -652,6 +652,9 @@ pub enum Request {
         /// Override retention period in days. If `None`, uses the server config.
         older_than_days: Option<u64>,
     },
+    SetClientAttachPolicy {
+        allow_detach: bool,
+    },
     Detach,
     /// Write input bytes directly to a specific pane by ID, bypassing focus routing.
     PaneDirectInput {
@@ -1350,6 +1353,9 @@ pub enum ResponsePayload {
     },
     RecordingPruned {
         deleted_count: usize,
+    },
+    ClientAttachPolicySet {
+        allow_detach: bool,
     },
     Detached,
     PaneDirectInputAccepted {

@@ -380,6 +380,7 @@ impl ServiceInvokeContext {
         let mut selection = self.selection.lock().await;
         let mut selected_session = selection.0;
         let mut attached_stream_session = selection.1;
+        let mut attach_policy = ConnectionAttachPolicy::default();
         let response = handle_request(
             &self.state,
             &self.shutdown_tx,
@@ -387,6 +388,7 @@ impl ServiceInvokeContext {
             self.client_principal_id,
             &mut selected_session,
             &mut attached_stream_session,
+            &mut attach_policy,
             request,
         )
         .await?;
@@ -5267,6 +5269,17 @@ impl BmuxServer {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ConnectionAttachPolicy {
+    allow_detach: bool,
+}
+
+impl Default for ConnectionAttachPolicy {
+    fn default() -> Self {
+        Self { allow_detach: true }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_connection(
     state: Arc<ServerState>,
@@ -5277,6 +5290,7 @@ async fn handle_connection(
     let client_principal_id: Uuid;
     let mut selected_session: Option<SessionId> = None;
     let mut attached_stream_session: Option<SessionId> = None;
+    let mut attach_policy = ConnectionAttachPolicy::default();
     let negotiated_frame_codec: Option<
         std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>,
     >;
@@ -5443,6 +5457,7 @@ async fn handle_connection(
             client_principal_id,
             &mut selected_session,
             &mut attached_stream_session,
+            &mut attach_policy,
             request,
         )
         .await?;
@@ -7227,6 +7242,9 @@ async fn ensure_attach_session_exists(
 }
 
 #[allow(clippy::too_many_lines)]
+// Central request dispatcher needs explicit per-connection state parameters.
+// Bundling these into an ad-hoc struct would hide ownership/mutation flow.
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
@@ -7234,6 +7252,7 @@ async fn handle_request(
     client_principal_id: Uuid,
     selected_session: &mut Option<SessionId>,
     attached_stream_session: &mut Option<SessionId>,
+    attach_policy: &mut ConnectionAttachPolicy,
     request: Request,
 ) -> Result<Response> {
     let _operation_guard = if request_requires_exclusive(&request) {
@@ -8900,7 +8919,17 @@ async fn handle_request(
             };
             Response::Ok(ResponsePayload::AttachPaneImages { deltas })
         }
+        Request::SetClientAttachPolicy { allow_detach } => {
+            attach_policy.allow_detach = allow_detach;
+            Response::Ok(ResponsePayload::ClientAttachPolicySet { allow_detach })
+        }
         Request::Detach => {
+            if !attach_policy.allow_detach {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "detach is disabled for this connection".to_string(),
+                }));
+            }
             let mut manager = state
                 .session_manager
                 .lock()
@@ -9762,6 +9791,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingRollingClear { .. } => "recording_rolling_clear",
         Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
+        Request::SetClientAttachPolicy { .. } => "set_client_attach_policy",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
@@ -10044,6 +10074,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::PerformanceUpdated { .. } => "performance_updated",
         ResponsePayload::RecordingRollingCleared { .. } => "recording_rolling_cleared",
         ResponsePayload::RecordingPruned { .. } => "recording_pruned",
+        ResponsePayload::ClientAttachPolicySet { .. } => "client_attach_policy_set",
         ResponsePayload::Detached => "detached",
         ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
         ResponsePayload::EventsSubscribed => "events_subscribed",
@@ -11095,6 +11126,7 @@ mod tests {
         attached_stream_session: &mut Option<SessionId>,
         request: Request,
     ) -> Response {
+        let mut attach_policy = ConnectionAttachPolicy::default();
         handle_request(
             &server.state,
             &server.shutdown_tx,
@@ -11102,6 +11134,7 @@ mod tests {
             principal_id,
             selected_session,
             attached_stream_session,
+            &mut attach_policy,
             request,
         )
         .await
@@ -11752,6 +11785,90 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn attach_policy_blocks_detach_until_reenabled() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+        let mut attach_policy = ConnectionAttachPolicy::default();
+
+        let policy_disabled = handle_request(
+            &server.state,
+            &server.shutdown_tx,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            &mut attach_policy,
+            Request::SetClientAttachPolicy {
+                allow_detach: false,
+            },
+        )
+        .await
+        .expect("set attach policy should complete");
+        assert_eq!(
+            policy_disabled,
+            Response::Ok(ResponsePayload::ClientAttachPolicySet {
+                allow_detach: false,
+            })
+        );
+
+        let blocked_detach = handle_request(
+            &server.state,
+            &server.shutdown_tx,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            &mut attach_policy,
+            Request::Detach,
+        )
+        .await
+        .expect("detach request should complete");
+        match blocked_detach {
+            Response::Err(ErrorResponse { code, message }) => {
+                assert_eq!(code, ErrorCode::InvalidRequest);
+                assert_eq!(message, "detach is disabled for this connection");
+            }
+            response @ Response::Ok(_) => {
+                panic!("expected detach to be blocked, got {response:?}")
+            }
+        }
+
+        let policy_enabled = handle_request(
+            &server.state,
+            &server.shutdown_tx,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            &mut attach_policy,
+            Request::SetClientAttachPolicy { allow_detach: true },
+        )
+        .await
+        .expect("set attach policy should complete");
+        assert_eq!(
+            policy_enabled,
+            Response::Ok(ResponsePayload::ClientAttachPolicySet { allow_detach: true })
+        );
+
+        let detached = handle_request(
+            &server.state,
+            &server.shutdown_tx,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            &mut attach_policy,
+            Request::Detach,
+        )
+        .await
+        .expect("detach request should complete");
+        assert_eq!(detached, Response::Ok(ResponsePayload::Detached));
     }
 
     #[tokio::test]
