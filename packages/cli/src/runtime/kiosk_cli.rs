@@ -9,8 +9,10 @@ use bmux_config::{BmuxConfig, ConfigPaths, KioskProfileConfig, KioskRole, KioskS
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -251,21 +253,110 @@ fn resolve_kiosk_attach_target(
 }
 
 async fn run_kiosk_attach_with_reconnect(
-    mut client: bmux_client::BmuxClient,
-    mut kernel_client_factory: Option<KernelClientFactory>,
+    client: bmux_client::BmuxClient,
+    kernel_client_factory: Option<KernelClientFactory>,
+    reconnect_target: Option<&str>,
+    allow_detach: bool,
+    session: Option<&str>,
+) -> Result<u8> {
+    let mut runner = LiveKioskAttachRunner {
+        client: Some(client),
+        kernel_client_factory,
+    };
+    run_kiosk_attach_with_reconnect_loop(&mut runner, reconnect_target, allow_detach, session).await
+}
+
+trait KioskAttachLoopDriver {
+    fn set_attach_policy(
+        &mut self,
+        allow_detach: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    fn run_attach<'a>(
+        &'a mut self,
+        session: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<super::AttachRunOutcome>> + Send + 'a>>;
+
+    fn reconnect<'a>(
+        &'a mut self,
+        target: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+    fn sleep_backoff(&mut self, backoff: Duration)
+    -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+struct LiveKioskAttachRunner {
+    client: Option<bmux_client::BmuxClient>,
+    kernel_client_factory: Option<KernelClientFactory>,
+}
+
+impl KioskAttachLoopDriver for LiveKioskAttachRunner {
+    fn set_attach_policy(
+        &mut self,
+        allow_detach: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("kiosk attach client unavailable"))?;
+            client
+                .set_attach_policy(allow_detach)
+                .await
+                .map_err(map_cli_client_error)
+        })
+    }
+
+    fn run_attach<'a>(
+        &'a mut self,
+        session: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<super::AttachRunOutcome>> + Send + 'a>> {
+        Box::pin(async move {
+            let client = self
+                .client
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("kiosk attach client unavailable"))?;
+            let kernel_client_factory = self.kernel_client_factory.take();
+            run_session_attach_with_client(client, session, None, false, kernel_client_factory)
+                .await
+        })
+    }
+
+    fn reconnect<'a>(
+        &'a mut self,
+        target: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let (new_client, new_kernel_factory) =
+                connect_attach_target_with_kernel(target, "bmux-cli-kiosk-attach-reconnect")
+                    .await?;
+            self.client = Some(new_client);
+            self.kernel_client_factory = new_kernel_factory;
+            Ok(())
+        })
+    }
+
+    fn sleep_backoff(
+        &mut self,
+        backoff: Duration,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            tokio::time::sleep(backoff).await;
+        })
+    }
+}
+
+async fn run_kiosk_attach_with_reconnect_loop(
+    runner: &mut impl KioskAttachLoopDriver,
     reconnect_target: Option<&str>,
     allow_detach: bool,
     session: Option<&str>,
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
-        client
-            .set_attach_policy(allow_detach)
-            .await
-            .map_err(map_cli_client_error)?;
-        let outcome =
-            run_session_attach_with_client(client, session, None, false, kernel_client_factory)
-                .await?;
+        runner.set_attach_policy(allow_detach).await?;
+        let outcome = runner.run_attach(session).await?;
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
@@ -287,12 +378,8 @@ async fn run_kiosk_attach_with_reconnect(
             SSH_RECONNECT_MAX_ATTEMPTS,
             backoff.as_millis()
         );
-        tokio::time::sleep(backoff).await;
-
-        let (new_client, new_kernel_factory) =
-            connect_attach_target_with_kernel(target, "bmux-cli-kiosk-attach-reconnect").await?;
-        client = new_client;
-        kernel_client_factory = new_kernel_factory;
+        runner.sleep_backoff(backoff).await;
+        runner.reconnect(target).await?;
     }
 }
 
@@ -589,8 +676,71 @@ fn current_unix_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_kiosk_attach_target;
+    use super::{
+        KioskAttachLoopDriver, resolve_kiosk_attach_target, run_kiosk_attach_with_reconnect_loop,
+    };
     use crate::connection::ConnectionContext;
+    use crate::runtime::{AttachExitReason, AttachRunOutcome};
+    use anyhow::Result;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    struct MockKioskAttachRunner {
+        outcomes: VecDeque<AttachRunOutcome>,
+        set_policy_calls: usize,
+        reconnect_calls: usize,
+        sleep_calls: usize,
+    }
+
+    impl MockKioskAttachRunner {
+        fn with_outcomes(outcomes: Vec<AttachRunOutcome>) -> Self {
+            Self {
+                outcomes: outcomes.into(),
+                set_policy_calls: 0,
+                reconnect_calls: 0,
+                sleep_calls: 0,
+            }
+        }
+    }
+
+    impl KioskAttachLoopDriver for MockKioskAttachRunner {
+        fn set_attach_policy(
+            &mut self,
+            _allow_detach: bool,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.set_policy_calls = self.set_policy_calls.saturating_add(1);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn run_attach<'a>(
+            &'a mut self,
+            _session: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Result<AttachRunOutcome>> + Send + 'a>> {
+            let outcome = self
+                .outcomes
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("test runner has no attach outcomes remaining"));
+            Box::pin(async move { outcome })
+        }
+
+        fn reconnect<'a>(
+            &'a mut self,
+            _target: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            self.reconnect_calls = self.reconnect_calls.saturating_add(1);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn sleep_backoff(
+            &mut self,
+            _backoff: Duration,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.sleep_calls = self.sleep_calls.saturating_add(1);
+            Box::pin(async {})
+        }
+    }
 
     #[test]
     fn kiosk_attach_target_uses_profile_pin_when_present() {
@@ -624,5 +774,50 @@ mod tests {
         )
         .expect("target resolution should succeed");
         assert_eq!(resolved.as_deref(), Some("tls://demo.example.com"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_loop_reapplies_policy_after_stream_closed() {
+        let mut runner = MockKioskAttachRunner::with_outcomes(vec![
+            AttachRunOutcome {
+                status_code: 1,
+                exit_reason: AttachExitReason::StreamClosed,
+            },
+            AttachRunOutcome {
+                status_code: 0,
+                exit_reason: AttachExitReason::Detached,
+            },
+        ]);
+
+        let status = run_kiosk_attach_with_reconnect_loop(
+            &mut runner,
+            Some("ssh://demo@host"),
+            false,
+            Some("session-a"),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(status, 0);
+        assert_eq!(runner.set_policy_calls, 2);
+        assert_eq!(runner.reconnect_calls, 1);
+        assert_eq!(runner.sleep_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_loop_does_not_retry_without_target() {
+        let mut runner = MockKioskAttachRunner::with_outcomes(vec![AttachRunOutcome {
+            status_code: 7,
+            exit_reason: AttachExitReason::StreamClosed,
+        }]);
+
+        let status = run_kiosk_attach_with_reconnect_loop(&mut runner, None, true, None)
+            .await
+            .expect("loop should succeed");
+
+        assert_eq!(status, 7);
+        assert_eq!(runner.set_policy_calls, 1);
+        assert_eq!(runner.reconnect_calls, 0);
+        assert_eq!(runner.sleep_calls, 0);
     }
 }
