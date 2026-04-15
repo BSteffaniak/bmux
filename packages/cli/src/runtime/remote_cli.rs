@@ -1141,6 +1141,44 @@ fn map_connect_target_resolution_error(target: &str, error: anyhow::Error) -> an
     error
 }
 
+pub(super) async fn connect_attach_target_with_kernel(
+    target: &str,
+    client_name: &'static str,
+) -> Result<(BmuxClient, Option<KernelClientFactory>)> {
+    let config = BmuxConfig::load()?;
+    let resolved = resolve_target_reference(&config, target)
+        .await
+        .map_err(|error| map_connect_target_resolution_error(target, error))?;
+    match resolved {
+        ResolvedTarget::Local => {
+            let client = connect_with_context(
+                ConnectionPolicyScope::Normal,
+                client_name,
+                ConnectionContext::new(Some("local")),
+            )
+            .await?;
+            Ok((client, None))
+        }
+        ResolvedTarget::Ssh(ssh_target) => {
+            let ssh_control_path = ssh_control_path_for_session();
+            let client =
+                connect_remote_bridge(&ssh_target, client_name, Some(&ssh_control_path)).await?;
+            let kernel_factory = build_ssh_kernel_client_factory(&ssh_target, ssh_control_path);
+            Ok((client, Some(kernel_factory)))
+        }
+        ResolvedTarget::Tls(tls_target) => {
+            let client = connect_tls_bridge(&tls_target, client_name).await?;
+            let kernel_factory = build_tls_kernel_client_factory(&tls_target);
+            Ok((client, Some(kernel_factory)))
+        }
+        ResolvedTarget::Iroh(iroh_target) => {
+            let (client, connection) = connect_iroh_bridge(&iroh_target, client_name, None).await?;
+            let kernel_factory = build_iroh_kernel_client_factory(connection, &iroh_target);
+            Ok((client, Some(kernel_factory)))
+        }
+    }
+}
+
 pub(super) async fn run_setup(check: bool, mode: Option<HostedModeArg>) -> Result<u8> {
     let mut config = BmuxConfig::load()?;
     let hosted_mode = resolve_hosted_mode(&config, mode);

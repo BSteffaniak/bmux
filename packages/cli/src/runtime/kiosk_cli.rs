@@ -1,5 +1,6 @@
 use super::{
-    ConnectionContext, connect_with_context, map_cli_client_error, run_session_attach_with_client,
+    ConnectionContext, connect_attach_target_with_kernel, connect_with_context,
+    map_cli_client_error, run_session_attach_with_client,
 };
 use crate::connection::ConnectionPolicyScope;
 use anyhow::{Context, Result};
@@ -202,25 +203,54 @@ pub(super) async fn run_kiosk_attach(
     let session = record.session.clone();
     save_token_store(&store)?;
 
-    if resolved.target.is_some() {
-        anyhow::bail!(
-            "kiosk attach profile '{profile}' sets a non-local target; detached-lock enforcement currently requires a local target"
-        );
-    }
-
-    let mut client = connect_with_context(
-        ConnectionPolicyScope::Normal,
-        "bmux-cli-kiosk-attach",
-        connection_context,
-    )
-    .await?;
+    let effective_target =
+        resolve_kiosk_attach_target(profile, resolved.target.as_deref(), connection_context)?;
+    let (mut client, kernel_client_factory) = if let Some(target) = effective_target.as_deref() {
+        connect_attach_target_with_kernel(target, "bmux-cli-kiosk-attach").await?
+    } else {
+        let client = connect_with_context(
+            ConnectionPolicyScope::Normal,
+            "bmux-cli-kiosk-attach",
+            connection_context,
+        )
+        .await?;
+        (client, None)
+    };
     client
         .set_attach_policy(resolved.allow_detach)
         .await
         .map_err(map_cli_client_error)?;
-    run_session_attach_with_client(client, session.as_deref(), None, false, None)
-        .await
-        .map(|outcome| outcome.status_code)
+    run_session_attach_with_client(
+        client,
+        session.as_deref(),
+        None,
+        false,
+        kernel_client_factory,
+    )
+    .await
+    .map(|outcome| outcome.status_code)
+}
+
+fn resolve_kiosk_attach_target(
+    profile: &str,
+    profile_target: Option<&str>,
+    connection_context: ConnectionContext<'_>,
+) -> Result<Option<String>> {
+    let target_override = connection_context
+        .target_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(pinned_target) = profile_target {
+        if let Some(override_target) = target_override
+            && override_target != pinned_target
+        {
+            anyhow::bail!(
+                "kiosk profile '{profile}' pins target '{pinned_target}' and cannot be overridden by --target '{override_target}'"
+            );
+        }
+        return Ok(Some(pinned_target.to_string()));
+    }
+    Ok(target_override.map(ToString::to_string))
 }
 
 pub(super) fn run_kiosk_init(
@@ -512,4 +542,44 @@ fn current_unix_timestamp() -> i64 {
         .map_or(0, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_kiosk_attach_target;
+    use crate::connection::ConnectionContext;
+
+    #[test]
+    fn kiosk_attach_target_uses_profile_pin_when_present() {
+        let resolved =
+            resolve_kiosk_attach_target("demo", Some("prod-ssh"), ConnectionContext::new(None))
+                .expect("target resolution should succeed");
+        assert_eq!(resolved.as_deref(), Some("prod-ssh"));
+    }
+
+    #[test]
+    fn kiosk_attach_target_rejects_conflicting_cli_override() {
+        let error = resolve_kiosk_attach_target(
+            "demo",
+            Some("prod-ssh"),
+            ConnectionContext::new(Some("staging-ssh")),
+        )
+        .expect_err("conflicting override should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be overridden by --target 'staging-ssh'")
+        );
+    }
+
+    #[test]
+    fn kiosk_attach_target_uses_cli_override_without_profile_pin() {
+        let resolved = resolve_kiosk_attach_target(
+            "demo",
+            None,
+            ConnectionContext::new(Some("tls://demo.example.com")),
+        )
+        .expect("target resolution should succeed");
+        assert_eq!(resolved.as_deref(), Some("tls://demo.example.com"));
+    }
 }
