@@ -123,8 +123,9 @@ use recording_cli::{
     run_recording_verify_smoke, verify_recording_report,
 };
 use remote_cli::{
-    connect_attach_target_with_kernel, maybe_run_cluster_plugin_command_via_gateway,
-    run_auth_login, run_auth_logout, run_auth_status, run_connect, run_host, run_hosts, run_join,
+    SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel,
+    maybe_run_cluster_plugin_command_via_gateway, reconnect_backoff_ms, run_auth_login,
+    run_auth_logout, run_auth_status, run_connect, run_host, run_hosts, run_join,
     run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
     run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade, run_setup,
     run_share, run_target_proxy_from_current_argv, run_unshare, should_proxy_to_target,

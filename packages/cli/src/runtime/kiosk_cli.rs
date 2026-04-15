@@ -1,6 +1,7 @@
 use super::{
-    ConnectionContext, connect_attach_target_with_kernel, connect_with_context,
-    map_cli_client_error, run_session_attach_with_client,
+    AttachExitReason, ConnectionContext, KernelClientFactory, SSH_RECONNECT_MAX_ATTEMPTS,
+    connect_attach_target_with_kernel, connect_with_context, map_cli_client_error,
+    reconnect_backoff_ms, run_session_attach_with_client,
 };
 use crate::connection::ConnectionPolicyScope;
 use anyhow::{Context, Result};
@@ -10,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -205,7 +207,7 @@ pub(super) async fn run_kiosk_attach(
 
     let effective_target =
         resolve_kiosk_attach_target(profile, resolved.target.as_deref(), connection_context)?;
-    let (mut client, kernel_client_factory) = if let Some(target) = effective_target.as_deref() {
+    let (client, kernel_client_factory) = if let Some(target) = effective_target.as_deref() {
         connect_attach_target_with_kernel(target, "bmux-cli-kiosk-attach").await?
     } else {
         let client = connect_with_context(
@@ -216,19 +218,14 @@ pub(super) async fn run_kiosk_attach(
         .await?;
         (client, None)
     };
-    client
-        .set_attach_policy(resolved.allow_detach)
-        .await
-        .map_err(map_cli_client_error)?;
-    run_session_attach_with_client(
+    run_kiosk_attach_with_reconnect(
         client,
-        session.as_deref(),
-        None,
-        false,
         kernel_client_factory,
+        effective_target.as_deref(),
+        resolved.allow_detach,
+        session.as_deref(),
     )
     .await
-    .map(|outcome| outcome.status_code)
 }
 
 fn resolve_kiosk_attach_target(
@@ -251,6 +248,52 @@ fn resolve_kiosk_attach_target(
         return Ok(Some(pinned_target.to_string()));
     }
     Ok(target_override.map(ToString::to_string))
+}
+
+async fn run_kiosk_attach_with_reconnect(
+    mut client: bmux_client::BmuxClient,
+    mut kernel_client_factory: Option<KernelClientFactory>,
+    reconnect_target: Option<&str>,
+    allow_detach: bool,
+    session: Option<&str>,
+) -> Result<u8> {
+    let mut attempt = 0usize;
+    loop {
+        client
+            .set_attach_policy(allow_detach)
+            .await
+            .map_err(map_cli_client_error)?;
+        let outcome =
+            run_session_attach_with_client(client, session, None, false, kernel_client_factory)
+                .await?;
+        if outcome.exit_reason != AttachExitReason::StreamClosed {
+            return Ok(outcome.status_code);
+        }
+
+        let Some(target) = reconnect_target else {
+            return Ok(outcome.status_code);
+        };
+        if attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
+            println!(
+                "kiosk remote connection closed; giving up after {SSH_RECONNECT_MAX_ATTEMPTS} reconnect attempts"
+            );
+            return Ok(1);
+        }
+
+        attempt = attempt.saturating_add(1);
+        let backoff = Duration::from_millis(reconnect_backoff_ms(attempt));
+        println!(
+            "kiosk remote connection closed; reconnecting to '{target}' (attempt {attempt}/{}) in {}ms...",
+            SSH_RECONNECT_MAX_ATTEMPTS,
+            backoff.as_millis()
+        );
+        tokio::time::sleep(backoff).await;
+
+        let (new_client, new_kernel_factory) =
+            connect_attach_target_with_kernel(target, "bmux-cli-kiosk-attach-reconnect").await?;
+        client = new_client;
+        kernel_client_factory = new_kernel_factory;
+    }
 }
 
 pub(super) fn run_kiosk_init(

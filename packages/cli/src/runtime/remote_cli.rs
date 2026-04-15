@@ -806,7 +806,7 @@ async fn emit_iroh_reconnect_outage_perf_event(
         .await
 }
 
-const SSH_RECONNECT_MAX_ATTEMPTS: usize = 4;
+pub(super) const SSH_RECONNECT_MAX_ATTEMPTS: usize = 4;
 const SSH_RECONNECT_BASE_BACKOFF_MS: u64 = 300;
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
 const RECENT_CACHE_MAX: usize = 10;
@@ -8226,7 +8226,7 @@ fn command_needs_tty(command: Option<&Command>) -> bool {
 }
 
 #[allow(clippy::cast_possible_truncation)] // Attempt count bounded to small values
-fn reconnect_backoff_ms(attempt: usize) -> u64 {
+pub(super) fn reconnect_backoff_ms(attempt: usize) -> u64 {
     let exponent = attempt.saturating_sub(1).min(10) as u32;
     SSH_RECONNECT_BASE_BACKOFF_MS.saturating_mul(2u64.saturating_pow(exponent))
 }
