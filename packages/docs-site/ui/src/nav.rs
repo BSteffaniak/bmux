@@ -47,6 +47,10 @@ pub static SECTIONS: &[NavSection] = &[
                 href: "/docs/command-cookbook",
             },
             NavItem {
+                label: "Kiosk Access",
+                href: "/docs/kiosk",
+            },
+            NavItem {
                 label: "Playbooks",
                 href: "/docs/playbooks",
             },

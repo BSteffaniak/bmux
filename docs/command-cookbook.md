@@ -26,6 +26,18 @@ bmux host --status
 bmux hosts
 ```
 
+## Kiosk Access Flow
+
+```bmux-cli
+bmux kiosk status
+bmux kiosk init --all-profiles --dry-run
+bmux kiosk init --all-profiles
+bmux kiosk issue-token demo
+bmux kiosk revoke-token <token-id>
+```
+
+For profile design, SSH forced-command examples, and security semantics, see [Kiosk Access](/docs/kiosk).
+
 ## Logging and Diagnostics
 
 ```bmux-cli

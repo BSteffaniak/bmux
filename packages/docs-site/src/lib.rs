@@ -58,6 +58,9 @@ pub static ROUTER: LazyLock<Router> = LazyLock::new(|| {
         .with_static_route(&["/docs/command-cookbook"], |_| async {
             bmux_docs_site_ui::pages::docs::command_cookbook()
         })
+        .with_static_route(&["/docs/kiosk"], |_| async {
+            bmux_docs_site_ui::pages::docs::kiosk()
+        })
         .with_static_route(&["/docs/setup-guide"], |_| async {
             bmux_docs_site_ui::pages::docs::setup_guide()
         })

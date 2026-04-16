@@ -17,6 +17,7 @@ reference pages.
 - `/docs/concepts` -- core bmux concepts and architecture mental model
 - `/docs/cli` -- auto-generated CLI reference
 - `/docs/command-cookbook` -- task-oriented command recipes
+- `/docs/kiosk` -- kiosk SSH access and token workflow guide
 - `/docs/config` -- auto-generated configuration reference
 - `/docs/setup-guide` -- practical setup flows for local/remote/hosted
 - `/docs/playbooks` -- headless scripted execution

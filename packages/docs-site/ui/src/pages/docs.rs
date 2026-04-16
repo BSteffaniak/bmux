@@ -96,6 +96,15 @@ pub fn command_cookbook() -> Containers {
 }
 
 #[must_use]
+pub fn kiosk() -> Containers {
+    layout::docs_layout(
+        "/docs/kiosk",
+        Some("Kiosk Access"),
+        &md(include_str!("../../../../../docs/kiosk.md")),
+    )
+}
+
+#[must_use]
 pub fn setup_guide() -> Containers {
     layout::docs_layout(
         "/docs/setup-guide",
