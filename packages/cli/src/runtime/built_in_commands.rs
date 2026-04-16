@@ -136,6 +136,11 @@ pub enum BuiltInHandlerId {
     SandboxCleanup,
     SandboxClean,
     SandboxRebuildIndex,
+    SlotList,
+    SlotShow,
+    SlotPaths,
+    SlotDoctor,
+    SlotInstall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -835,6 +840,31 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::SandboxRebuildIndex,
             &["sandbox", "rebuild-index"],
             "Rebuild sandbox index from manifests",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SlotList,
+            &["slot", "list"],
+            "List declared bmux slots",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SlotShow,
+            &["slot", "show"],
+            "Show a single slot's resolved detail",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SlotPaths,
+            &["slot", "paths"],
+            "Print a slot's resolved config/runtime/data/state/log paths",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SlotDoctor,
+            &["slot", "doctor"],
+            "Validate the slot manifest",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SlotInstall,
+            &["slot", "install"],
+            "Emit a TOML/JSON/Nix block for installing a new slot (read-only)",
         ),
     ]
 }

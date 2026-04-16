@@ -168,7 +168,7 @@ pub(super) fn try_kill_pid(pid: u32) -> Result<bool> {
     }
 }
 
-pub(super) fn is_pid_running(pid: u32) -> Result<bool> {
+pub fn is_pid_running(pid: u32) -> Result<bool> {
     if pid == 0 {
         return Ok(false);
     }

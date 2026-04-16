@@ -517,6 +517,11 @@ pub enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    /// Manage bmux slots (multi-version installs).
+    Slot {
+        #[command(subcommand)]
+        command: SlotCommand,
+    },
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -533,6 +538,60 @@ pub enum AuthCommand {
     Status,
     /// Clear locally stored authentication state
     Logout,
+}
+
+/// Slot-management commands.
+#[derive(Debug, Subcommand)]
+pub enum SlotCommand {
+    /// List all declared slots and the presentational default.
+    List {
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = SlotOutputFormat::Toml)]
+        format: SlotOutputFormat,
+    },
+    /// Show one slot's full resolved detail.
+    Show {
+        /// Slot name. Defaults to the active slot.
+        name: Option<String>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = SlotOutputFormat::Toml)]
+        format: SlotOutputFormat,
+    },
+    /// Print this slot's resolved paths (config/runtime/data/state/log).
+    Paths {
+        /// Slot name. Defaults to the active slot.
+        name: Option<String>,
+    },
+    /// Validate the slot manifest: names, duplicate runtime dirs, binaries,
+    /// per-slot configs.
+    Doctor,
+    /// Emit a TOML/JSON/Nix block that would register a new slot.
+    ///
+    /// This is a read-only / dry-run operation in this pass of the CLI —
+    /// it prints the block to stdout. A companion xtask (`cargo xtask
+    /// install-slot`) lands in a follow-up.
+    Install {
+        /// Slot name (validates as `[A-Za-z0-9._-]+`, not reserved).
+        #[arg(long)]
+        name: String,
+        /// Absolute path to the `bmux-<name>` binary.
+        #[arg(long)]
+        binary: String,
+        /// Disable base-config inheritance for this slot.
+        #[arg(long)]
+        no_inherit_base: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = SlotOutputFormat::Toml)]
+        format: SlotOutputFormat,
+    },
+}
+
+/// Output format for slot subcommands that support structured output.
+#[derive(Debug, Copy, Clone, clap::ValueEnum)]
+pub enum SlotOutputFormat {
+    Toml,
+    Json,
+    Nix,
 }
 
 #[derive(Debug, Subcommand)]

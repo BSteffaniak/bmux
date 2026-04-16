@@ -44,9 +44,37 @@ struct RawRuntimeOverrides {
 pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
     let argv = std::env::args_os().collect::<Vec<_>>();
     let raw_overrides = apply_runtime_override_from_raw_args(&argv)?;
-    let config_overrides = ConfigLoadOverrides::from_env_with_cli(raw_overrides.config_path);
-    let config = BmuxConfig::load_with_overrides(&config_overrides)?;
-    let paths = ConfigPaths::default();
+    // Resolve the active slot (if any) before loading config, so that
+    // slot-aware paths / env propagation apply to the rest of bootstrap.
+    let slot_state = super::slot::active_slot().clone();
+    if let super::slot::ActiveSlotState::Resolved { slot, .. } = &slot_state {
+        // Propagate BMUX_SLOT_NAME so child processes (daemon, sandboxed
+        // re-execs, etc.) inherit the active slot name.
+        // SAFETY: CLI bootstrap, before threads spawn.
+        unsafe { std::env::set_var(bmux_slots::SLOT_NAME_ENV, &slot.name) };
+    }
+    if let super::slot::ActiveSlotState::Unknown { name, known, .. } = &slot_state {
+        anyhow::bail!(
+            "active slot {name:?} is not declared in the slot manifest (known: {known:?}). \
+             Add it to slots.toml or unset BMUX_SLOT_NAME."
+        );
+    }
+    let mut config_overrides = ConfigLoadOverrides::from_env_with_cli(raw_overrides.config_path);
+    // When a slot is active and `inherit_base = true`, layer the shared
+    // `<config_root>/base.toml` underneath the slot's config.
+    if let super::slot::ActiveSlotState::Resolved { slot, .. } = &slot_state
+        && slot.inherit_base
+    {
+        config_overrides.base_config_path = Some(bmux_slots::default_base_config_path());
+    }
+    let (config, paths) = if let super::slot::ActiveSlotState::Resolved { slot, .. } = &slot_state {
+        let paths = ConfigPaths::for_slot(slot);
+        let cfg = BmuxConfig::load_with_paths_and_overrides(&paths, &config_overrides)?;
+        (cfg, paths)
+    } else {
+        let cfg = BmuxConfig::load_with_overrides(&config_overrides)?;
+        (cfg, ConfigPaths::default())
+    };
     let registry = scan_available_plugins(&config, &paths)?;
     parse_runtime_cli_with_registry(&argv, &config, &registry, config_overrides)
 }

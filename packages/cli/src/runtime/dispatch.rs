@@ -4,7 +4,7 @@ use bmux_cli_schema::{
     KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand, PlaybookCommand, RecordingCommand,
     RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg,
     SandboxSourceArg, SandboxStatusArg, ServerCommand, ServerRecordingCommand, SessionCommand,
-    TerminalCommand,
+    SlotCommand, TerminalCommand,
 };
 use bmux_config::{BmuxConfig, SandboxCleanupSource};
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
@@ -209,6 +209,13 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             SandboxCommand::Cleanup { .. } => BuiltInHandlerId::SandboxCleanup,
             SandboxCommand::Clean { .. } => BuiltInHandlerId::SandboxClean,
             SandboxCommand::RebuildIndex { .. } => BuiltInHandlerId::SandboxRebuildIndex,
+        },
+        Command::Slot { command } => match command {
+            SlotCommand::List { .. } => BuiltInHandlerId::SlotList,
+            SlotCommand::Show { .. } => BuiltInHandlerId::SlotShow,
+            SlotCommand::Paths { .. } => BuiltInHandlerId::SlotPaths,
+            SlotCommand::Doctor => BuiltInHandlerId::SlotDoctor,
+            SlotCommand::Install { .. } => BuiltInHandlerId::SlotInstall,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1814,6 +1821,42 @@ pub(super) async fn dispatch_built_in_command(
                 *json,
             )
         }
+        (
+            BuiltInHandlerId::SlotList,
+            Command::Slot {
+                command: SlotCommand::List { format },
+            },
+        ) => super::slot_cli::run_slot_list(*format),
+        (
+            BuiltInHandlerId::SlotShow,
+            Command::Slot {
+                command: SlotCommand::Show { name, format },
+            },
+        ) => super::slot_cli::run_slot_show(name.as_deref(), *format),
+        (
+            BuiltInHandlerId::SlotPaths,
+            Command::Slot {
+                command: SlotCommand::Paths { name },
+            },
+        ) => super::slot_cli::run_slot_paths(name.as_deref()),
+        (
+            BuiltInHandlerId::SlotDoctor,
+            Command::Slot {
+                command: SlotCommand::Doctor,
+            },
+        ) => super::slot_cli::run_slot_doctor(),
+        (
+            BuiltInHandlerId::SlotInstall,
+            Command::Slot {
+                command:
+                    SlotCommand::Install {
+                        name,
+                        binary,
+                        no_inherit_base,
+                        format,
+                    },
+            },
+        ) => super::slot_cli::run_slot_install(name, binary, !*no_inherit_base, *format),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }

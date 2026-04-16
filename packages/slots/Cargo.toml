@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities"]
+description = "Slot manifest + declarative multi-version install model for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "slots", "versioning", "install"]
+license     = { workspace = true }
+name        = "bmux_slots"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+dirs      = { workspace = true }
+serde     = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+toml      = { workspace = true, features = ["parse"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+fail-on-warnings = []

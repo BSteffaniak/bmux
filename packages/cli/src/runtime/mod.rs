@@ -53,6 +53,8 @@ mod server_commands;
 mod server_runtime;
 mod session_cli;
 mod session_follow;
+pub mod slot;
+mod slot_cli;
 mod terminal_doctor;
 mod terminal_protocol;
 
@@ -149,6 +151,12 @@ use server_runtime::{
     wait_for_process_exit, wait_for_server_running, wait_until_server_stopped,
     write_server_pid_file,
 };
+
+/// Re-export of [`server_runtime::is_pid_running`] for cross-module callers
+/// (e.g. `crate::connection`).
+pub fn is_pid_running_crate(pid: u32) -> anyhow::Result<bool> {
+    server_runtime::is_pid_running(pid)
+}
 use session_cli::{
     attach_quit_failure_status, run_client_list, run_session_kill, run_session_kill_all,
     run_session_list, run_session_new,
@@ -257,6 +265,37 @@ const fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> 
     )
 }
 
+/// Print a startup banner on stderr when:
+/// - a slot is active,
+/// - the slot differs from the manifest's presentational default,
+/// - the command enters raw-mode (interactive attach-like flows),
+/// - `BMUX_SLOT_BANNER` is not "off",
+/// - stderr is a TTY.
+fn maybe_print_slot_startup_banner(command: Option<&bmux_cli_schema::Command>) {
+    use std::io::IsTerminal as _;
+    if std::env::var("BMUX_SLOT_BANNER")
+        .ok()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"))
+    {
+        return;
+    }
+    if !command_enters_raw_mode(command) {
+        return;
+    }
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    let state = slot::active_slot();
+    let slot::ActiveSlotState::Resolved { slot, manifest, .. } = state else {
+        return;
+    };
+    let default_name = manifest.resolved_default().map_or("", |s| s.name.as_str());
+    if slot.name == default_name {
+        return;
+    }
+    eprintln!("[bmux slot={} @ {}]", slot.name, env!("CARGO_PKG_VERSION"));
+}
+
 pub async fn run() -> Result<u8> {
     match parse_runtime_cli()? {
         ParsedRuntimeCli::BuiltIn {
@@ -269,6 +308,7 @@ pub async fn run() -> Result<u8> {
             let file_only = command_enters_raw_mode(cli.command.as_ref()) || cli.core_builtins_only;
             init_logging(verbose, Some(log_level), file_only);
             validate_record_bootstrap_flags(&cli)?;
+            maybe_print_slot_startup_banner(cli.command.as_ref());
             let connection_context = ConnectionContext::new(cli.target.as_deref());
             if should_proxy_to_target(&cli).await? {
                 return run_target_proxy_from_current_argv(&cli).await;

@@ -31,6 +31,10 @@ pub struct ServerRuntimeMetadata {
     pub build_id: String,
     pub executable_path: String,
     pub started_at_epoch_ms: u64,
+    /// Active slot name, when the server was started under a slot-aware CLI.
+    /// Optional for backwards compatibility with pre-slots server-meta files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -613,16 +617,57 @@ fn format_protocol_incompatibility(reason: &IncompatibilityReason) -> String {
 
 pub fn apply_stale_build_policy(scope: ConnectionPolicyScope) -> Result<()> {
     let config = BmuxConfig::load().context("failed loading bmux config")?;
+    let metadata = read_server_runtime_metadata().ok().flatten();
+    if scope != ConnectionPolicyScope::RecoveryInspection {
+        check_cross_slot_mismatch(active_slot_name().as_deref(), metadata.as_ref())?;
+    }
     match evaluate_stale_build_policy(
         scope,
         config.behavior.stale_build_action,
-        read_server_runtime_metadata().ok().flatten(),
+        metadata,
         current_cli_build_id().ok(),
     )? {
         Some(ServerBuildPolicyEffect::Warn(message)) => eprintln!("{message}"),
         None => {}
     }
     Ok(())
+}
+
+/// Refuse to attach when the client's active slot does not match the server's
+/// recorded slot. Returns Ok(()) when either side is slot-unaware (legacy
+/// compatibility) or when both sides agree.
+fn check_cross_slot_mismatch(
+    client_slot: Option<&str>,
+    metadata: Option<&ServerRuntimeMetadata>,
+) -> Result<()> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    let server_slot = metadata.slot_name.as_deref();
+    match (client_slot, server_slot) {
+        (Some(client), Some(server)) if client != server => {
+            anyhow::bail!(
+                "cross-slot attach refused: this CLI is running under slot {client:?} \
+                 but the server in this runtime dir was started under slot {server:?}.\n\
+                 Run `bmux-{server}` to talk to that server, or stop it first \
+                 (`bmux-{server} server stop`) and start a fresh server under slot \
+                 {client:?}."
+            );
+        }
+        (Some(client), None) => {
+            // Server was started by a slot-unaware (legacy) CLI; when the
+            // client is slot-aware this is almost certainly a configuration
+            // error (two installs pointing at the same runtime_dir). Hard-
+            // refuse with a clear remediation hint.
+            anyhow::bail!(
+                "cross-slot attach refused: this CLI is running under slot {client:?} \
+                 but the existing server in this runtime dir has no slot recorded \
+                 (legacy / pre-slots install).\n\
+                 Stop the existing server, then run the slot-aware CLI fresh."
+            );
+        }
+        _ => Ok(()),
+    }
 }
 
 pub fn evaluate_stale_build_policy(
@@ -702,11 +747,40 @@ fn current_server_runtime_metadata(pid: u32) -> Result<ServerRuntimeMetadata> {
         started_at_epoch_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis() as u64),
+        slot_name: active_slot_name(),
     })
+}
+
+/// Return the active slot name if one has been resolved at bootstrap.
+fn active_slot_name() -> Option<String> {
+    match crate::runtime::slot::active_slot() {
+        crate::runtime::slot::ActiveSlotState::Resolved { slot, .. } => Some(slot.name.clone()),
+        _ => None,
+    }
 }
 
 pub fn write_server_runtime_metadata(pid: u32) -> Result<()> {
     let path = server_runtime_metadata_file_path();
+    // Before claiming the runtime dir for this slot, verify no live server
+    // under a different slot already owns it. This mirrors the client-side
+    // cross-slot check (see `check_cross_slot_mismatch`) but protects
+    // against the server-startup direction.
+    if let Ok(Some(existing)) = read_server_runtime_metadata() {
+        let pid_alive = crate::runtime::is_pid_running_crate(existing.pid).unwrap_or(false);
+        let client_slot = active_slot_name();
+        if let (Some(client), Some(server)) =
+            (client_slot.as_deref(), existing.slot_name.as_deref())
+            && client != server
+            && pid_alive
+        {
+            anyhow::bail!(
+                "refusing to start server under slot {client:?}: another live server \
+                 (pid={}) is already running here under slot {server:?}. \
+                 Stop it first with `bmux-{server} server stop`.",
+                existing.pid,
+            );
+        }
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating runtime dir {}", parent.display()))?;
@@ -752,7 +826,7 @@ pub fn remove_server_runtime_metadata_file() -> Result<()> {
 mod tests {
     use super::{
         ConnectionPolicyScope, ServerBuildPolicyEffect, ServerRuntimeMetadata,
-        evaluate_stale_build_policy, expand_bmux_target_if_needed,
+        check_cross_slot_mismatch, evaluate_stale_build_policy, expand_bmux_target_if_needed,
         is_server_unavailable_client_error, map_client_connect_error,
     };
     use bmux_client::ClientError;
@@ -825,6 +899,7 @@ mod tests {
                 build_id: "server-build".to_string(),
                 executable_path: "/tmp/bmux-server".to_string(),
                 started_at_epoch_ms: 0,
+                slot_name: None,
             }),
             Some("cli-build".to_string()),
         )
@@ -844,6 +919,7 @@ mod tests {
                 build_id: "server-build".to_string(),
                 executable_path: "/tmp/bmux-server".to_string(),
                 started_at_epoch_ms: 0,
+                slot_name: None,
             }),
             Some("cli-build".to_string()),
         )
@@ -865,6 +941,7 @@ mod tests {
                 build_id: "server-build".to_string(),
                 executable_path: "/tmp/bmux-server".to_string(),
                 started_at_epoch_ms: 0,
+                slot_name: None,
             }),
             Some("cli-build".to_string()),
         )
@@ -888,6 +965,7 @@ mod tests {
                 build_id: "server-build".to_string(),
                 executable_path: "/tmp/bmux-server".to_string(),
                 started_at_epoch_ms: 0,
+                slot_name: None,
             }),
             Some("cli-build".to_string()),
         )
@@ -908,6 +986,61 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("client/server protocol mismatch"));
         assert!(message.contains("bmux server stop"));
+    }
+
+    fn metadata_with_slot(slot: Option<&str>) -> ServerRuntimeMetadata {
+        ServerRuntimeMetadata {
+            pid: 42,
+            version: "0.0.1-alpha.0".to_string(),
+            build_id: "b".to_string(),
+            executable_path: "/tmp/bmux".to_string(),
+            started_at_epoch_ms: 0,
+            slot_name: slot.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn cross_slot_check_accepts_matching_slots() {
+        let md = metadata_with_slot(Some("stable"));
+        check_cross_slot_mismatch(Some("stable"), Some(&md)).unwrap();
+    }
+
+    #[test]
+    fn cross_slot_check_refuses_mismatched_slots() {
+        let md = metadata_with_slot(Some("stable"));
+        let err = check_cross_slot_mismatch(Some("dev"), Some(&md))
+            .expect_err("expected cross-slot refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("cross-slot attach refused"));
+        assert!(msg.contains("\"dev\""));
+        assert!(msg.contains("\"stable\""));
+    }
+
+    #[test]
+    fn cross_slot_check_refuses_slot_client_against_legacy_server() {
+        let md = metadata_with_slot(None);
+        let err = check_cross_slot_mismatch(Some("dev"), Some(&md)).expect_err("expected refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("cross-slot attach refused"));
+        assert!(msg.contains("legacy"));
+    }
+
+    #[test]
+    fn cross_slot_check_allows_legacy_client_and_server() {
+        check_cross_slot_mismatch(None, None).unwrap();
+    }
+
+    #[test]
+    fn cross_slot_check_allows_legacy_client_against_slotted_server() {
+        // A legacy (slot-unaware) CLI talking to a slot-aware server is
+        // intentionally tolerated; otherwise upgrade ordering would break.
+        let md = metadata_with_slot(Some("stable"));
+        check_cross_slot_mismatch(None, Some(&md)).unwrap();
+    }
+
+    #[test]
+    fn cross_slot_check_noop_without_metadata() {
+        check_cross_slot_mismatch(Some("dev"), None).unwrap();
     }
 
     #[test]

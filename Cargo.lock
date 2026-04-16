@@ -1028,6 +1028,7 @@ dependencies = [
  "bmux_prompted_actions_plugin",
  "bmux_server",
  "bmux_session",
+ "bmux_slots",
  "bmux_terminal",
  "bmux_terminal_protocol",
  "bmux_windows_plugin",
@@ -1144,6 +1145,7 @@ dependencies = [
  "bmux_config_doc_derive",
  "bmux_event",
  "bmux_keybind",
+ "bmux_slots",
  "dirs",
  "serde",
  "thiserror 2.0.18",
@@ -1193,6 +1195,16 @@ dependencies = [
  "serde",
  "serde_json",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "bmux_env"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "bmux_slots",
+ "clap",
+ "serde_json",
 ]
 
 [[package]]
@@ -1449,6 +1461,17 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "bmux_slots"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
 ]
 
 [[package]]

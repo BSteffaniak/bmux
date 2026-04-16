@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities"]
+description = "Pure-printer PATH + env helper for bmux slot-based installs"
+edition     = { workspace = true }
+keywords    = ["bmux", "env", "shell", "path", "slots"]
+license     = { workspace = true }
+name        = "bmux_env"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[[bin]]
+name = "bmux-env"
+path = "src/main.rs"
+
+[dependencies]
+anyhow     = { workspace = true }
+bmux_slots = { workspace = true }
+clap       = { workspace = true, features = ["derive", "help", "std", "usage"] }
+serde_json = { workspace = true }
+
+[features]
+fail-on-warnings = []

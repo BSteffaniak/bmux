@@ -56,6 +56,36 @@ pub static ENV_OVERRIDE_DOCS: &[EnvOverrideDoc] = &[
         scope: "recordings",
         description: "Overrides recording storage root for recording CLI/runtime resolution.",
     },
+    EnvOverrideDoc {
+        variable: bmux_slots::SLOT_NAME_ENV,
+        scope: "slot",
+        description: "Forces the active bmux slot. Overrides argv[0] parsing. When unset, the binary's basename (bmux-<slot>) is used.",
+    },
+    EnvOverrideDoc {
+        variable: bmux_slots::SLOTS_MANIFEST_ENV,
+        scope: "slot",
+        description: "Path to the slot manifest (slots.toml). `-` means read from stdin. Defaults to <config_dir>/slots.toml.",
+    },
+    EnvOverrideDoc {
+        variable: bmux_slots::SLOTS_ROOT_ENV,
+        scope: "slot",
+        description: "Root directory under which per-slot default dirs are materialized. Defaults to the platform data dir.",
+    },
+    EnvOverrideDoc {
+        variable: bmux_slots::SLOTS_BIN_DIR_ENV,
+        scope: "slot",
+        description: "Directory containing the bmux-<slot> binaries. Defaults to ~/.local/bin.",
+    },
+    EnvOverrideDoc {
+        variable: bmux_slots::NO_BASE_CONFIG_ENV,
+        scope: "config",
+        description: "When set to a truthy value, disables merging the shared ~/.config/bmux/base.toml layer for this invocation.",
+    },
+    EnvOverrideDoc {
+        variable: bmux_slots::MANIFEST_READ_ONLY_PREFIXES_ENV,
+        scope: "slot",
+        description: "Colon-separated path prefixes that, when a manifest file lives under one of them, make write-side helpers refuse to modify the file.",
+    },
 ];
 
 /// Configuration paths for bmux
@@ -459,6 +489,48 @@ impl ConfigPaths {
 
         let mut paths = Self::new(config_dir, runtime_dir, data_dir, default_state_dir());
         paths.config_dir_candidates = config_dir_candidates;
+        paths
+    }
+
+    /// Build `ConfigPaths` bound to a specific bmux slot.
+    ///
+    /// This is the slot-aware equivalent of [`ConfigPaths::default`]. When a
+    /// slot is active (resolved via argv[0] parsing or `BMUX_SLOT_NAME`), call
+    /// this to produce paths scoped to that slot.
+    ///
+    /// Per-directory `BMUX_*_DIR` env vars still take precedence as an escape
+    /// hatch, so `BMUX_RUNTIME_DIR=/tmp/x` works from within a slot too.
+    ///
+    /// Legacy `BMUX_RUNTIME_NAME` is honored as a *sub-namespace* inside the
+    /// slot's `runtime_dir` (preserving the pre-slots behavior where
+    /// `--runtime foo` nested under `runtime_dir/runtimes/foo`).
+    #[must_use]
+    pub fn for_slot(slot: &bmux_slots::Slot) -> Self {
+        // Env-level per-directory overrides still win.
+        let runtime_root = std::env::var_os("BMUX_RUNTIME_DIR")
+            .map_or_else(|| slot.runtime_dir.clone(), PathBuf::from);
+        let runtime_name = std::env::var("BMUX_RUNTIME_NAME")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        let runtime_dir = if runtime_name == "default" {
+            runtime_root
+        } else {
+            runtime_root.join("runtimes").join(&runtime_name)
+        };
+
+        let config_dir = std::env::var_os("BMUX_CONFIG_DIR")
+            .map_or_else(|| slot.config_dir.clone(), PathBuf::from);
+
+        let data_dir =
+            std::env::var_os("BMUX_DATA_DIR").map_or_else(|| slot.data_dir.clone(), PathBuf::from);
+
+        let state_dir = std::env::var_os("BMUX_STATE_DIR")
+            .map_or_else(|| slot.state_dir.clone(), PathBuf::from);
+
+        let mut paths = Self::new(config_dir.clone(), runtime_dir, data_dir, state_dir);
+        paths.config_dir_candidates = vec![config_dir];
         paths
     }
 }
@@ -911,6 +983,84 @@ mod tests {
         assert!(
             candidates.contains(&xdg),
             "candidates should include XDG path {xdg:?}, got {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn for_slot_uses_slot_paths_when_no_env_overrides() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
+        let _c = EnvVarGuard::unset("BMUX_CONFIG_DIR");
+        let _r = EnvVarGuard::unset("BMUX_RUNTIME_DIR");
+        let _n = EnvVarGuard::unset("BMUX_RUNTIME_NAME");
+        let _d = EnvVarGuard::unset("BMUX_DATA_DIR");
+        let _s = EnvVarGuard::unset("BMUX_STATE_DIR");
+
+        let slot = bmux_slots::Slot {
+            name: "dev".into(),
+            binary: PathBuf::from("/bin/bmux-dev"),
+            inherit_base: true,
+            config_dir: PathBuf::from("/cfg/dev"),
+            runtime_dir: PathBuf::from("/rt/dev"),
+            data_dir: PathBuf::from("/data/dev"),
+            state_dir: PathBuf::from("/state/dev"),
+            log_dir: PathBuf::from("/state/dev/logs"),
+        };
+        let paths = ConfigPaths::for_slot(&slot);
+        assert_eq!(paths.config_dir, PathBuf::from("/cfg/dev"));
+        assert_eq!(paths.runtime_dir, PathBuf::from("/rt/dev"));
+        assert_eq!(paths.data_dir, PathBuf::from("/data/dev"));
+        assert_eq!(paths.state_dir, PathBuf::from("/state/dev"));
+    }
+
+    #[test]
+    fn for_slot_honors_env_dir_overrides() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
+        let _c = EnvVarGuard::set("BMUX_CONFIG_DIR", "/override/cfg");
+        let _r = EnvVarGuard::set("BMUX_RUNTIME_DIR", "/override/rt");
+        let _d = EnvVarGuard::set("BMUX_DATA_DIR", "/override/data");
+        let _s = EnvVarGuard::set("BMUX_STATE_DIR", "/override/state");
+        let _n = EnvVarGuard::unset("BMUX_RUNTIME_NAME");
+
+        let slot = bmux_slots::Slot {
+            name: "dev".into(),
+            binary: PathBuf::from("/bin/bmux-dev"),
+            inherit_base: true,
+            config_dir: PathBuf::from("/cfg/dev"),
+            runtime_dir: PathBuf::from("/rt/dev"),
+            data_dir: PathBuf::from("/data/dev"),
+            state_dir: PathBuf::from("/state/dev"),
+            log_dir: PathBuf::from("/state/dev/logs"),
+        };
+        let paths = ConfigPaths::for_slot(&slot);
+        assert_eq!(paths.config_dir, PathBuf::from("/override/cfg"));
+        assert_eq!(paths.runtime_dir, PathBuf::from("/override/rt"));
+        assert_eq!(paths.data_dir, PathBuf::from("/override/data"));
+        assert_eq!(paths.state_dir, PathBuf::from("/override/state"));
+    }
+
+    #[test]
+    fn for_slot_namespaces_under_runtime_name() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
+        let _c = EnvVarGuard::unset("BMUX_CONFIG_DIR");
+        let _r = EnvVarGuard::unset("BMUX_RUNTIME_DIR");
+        let _n = EnvVarGuard::set("BMUX_RUNTIME_NAME", "alt");
+        let _d = EnvVarGuard::unset("BMUX_DATA_DIR");
+        let _s = EnvVarGuard::unset("BMUX_STATE_DIR");
+
+        let slot = bmux_slots::Slot {
+            name: "dev".into(),
+            binary: PathBuf::from("/bin/bmux-dev"),
+            inherit_base: true,
+            config_dir: PathBuf::from("/cfg/dev"),
+            runtime_dir: PathBuf::from("/rt/dev"),
+            data_dir: PathBuf::from("/data/dev"),
+            state_dir: PathBuf::from("/state/dev"),
+            log_dir: PathBuf::from("/state/dev/logs"),
+        };
+        let paths = ConfigPaths::for_slot(&slot);
+        assert_eq!(
+            paths.runtime_dir,
+            PathBuf::from("/rt/dev").join("runtimes").join("alt")
         );
     }
 }

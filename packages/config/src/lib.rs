@@ -19,7 +19,13 @@ pub const BMUX_CONFIG_ENV: &str = "BMUX_CONFIG";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigLoadOverrides {
+    /// Optional base layer merged BELOW the primary config (lowest precedence
+    /// of all layers). Typically populated by the CLI bootstrap when a slot
+    /// has `inherit_base = true` and points at `<config_dir>/base.toml`.
+    pub base_config_path: Option<PathBuf>,
+    /// Overlay from the `BMUX_CONFIG` env var. Merged between primary and CLI.
     pub env_config_path: Option<PathBuf>,
+    /// Overlay from the `--config` CLI flag. Highest precedence.
     pub cli_config_path: Option<PathBuf>,
 }
 
@@ -27,6 +33,7 @@ impl ConfigLoadOverrides {
     #[must_use]
     pub fn from_env_with_cli(cli_config_path: Option<PathBuf>) -> Self {
         Self {
+            base_config_path: None,
             env_config_path: std::env::var_os(BMUX_CONFIG_ENV).map(PathBuf::from),
             cli_config_path,
         }
@@ -34,7 +41,16 @@ impl ConfigLoadOverrides {
 
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.env_config_path.is_none() && self.cli_config_path.is_none()
+        self.base_config_path.is_none()
+            && self.env_config_path.is_none()
+            && self.cli_config_path.is_none()
+    }
+
+    /// Fluent setter for [`Self::base_config_path`].
+    #[must_use]
+    pub fn with_base_config_path(mut self, path: Option<PathBuf>) -> Self {
+        self.base_config_path = path;
+        self
     }
 }
 
@@ -322,7 +338,20 @@ fn merged_raw_config_value_with_overrides(
         source_paths.push(base_path.to_path_buf());
     }
 
-    let include_override_layers = base_path == ConfigPaths::default().config_file();
+    // Apply override layers (base / env / cli) only when:
+    //   - the caller provided explicit non-empty overrides, OR
+    //   - a process-scoped overrides guard is active, OR
+    //   - the base_path points at the *current* default config file
+    //     (preserves legacy behavior for callers that do not pass overrides).
+    let process_overrides = process_config_overrides()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let has_explicit_overrides = explicit_overrides.is_some_and(|overrides| !overrides.is_empty());
+    let matches_default_config_file = base_path == ConfigPaths::default().config_file();
+    let include_override_layers =
+        has_explicit_overrides || process_overrides.is_some() || matches_default_config_file;
+
     if !include_override_layers {
         let mut merged = toml::Value::Table(toml::Table::new());
         let mut loaded_any = false;
@@ -334,15 +363,22 @@ fn merged_raw_config_value_with_overrides(
         return Ok(loaded_any.then_some(merged));
     }
 
-    let process_overrides = process_config_overrides()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
     let resolved_overrides = explicit_overrides
         .cloned()
         .filter(|overrides| !overrides.is_empty())
         .or(process_overrides)
         .unwrap_or_else(|| ConfigLoadOverrides::from_env_with_cli(None));
+
+    // Precedence (low → high):
+    //   base_config_path → primary config → BMUX_CONFIG env → --config flag
+    // Prepend the base layer so it sits below everything else. Skip the
+    // base layer entirely when `BMUX_NO_BASE_CONFIG` is truthy.
+    if !base_config_disabled()
+        && let Some(base) = resolved_overrides.base_config_path.as_ref()
+        && base.exists()
+    {
+        source_paths.insert(0, base.clone());
+    }
 
     if let Some(value) = resolved_overrides.env_config_path {
         let path = resolve_config_override_path(value.as_os_str());
@@ -369,6 +405,15 @@ fn merged_raw_config_value_with_overrides(
     }
 
     Ok(loaded_any.then_some(merged))
+}
+
+fn base_config_disabled() -> bool {
+    std::env::var(bmux_slots::NO_BASE_CONFIG_ENV)
+        .ok()
+        .is_some_and(|v| {
+            let t = v.trim().to_ascii_lowercase();
+            matches!(t.as_str(), "1" | "true" | "yes" | "on")
+        })
 }
 
 fn apply_forced_profile(
@@ -2279,6 +2324,21 @@ impl BmuxConfig {
         Self::load_from_path_with_overrides(&paths.config_file(), overrides)
     }
 
+    /// Load configuration from explicitly-provided paths with layered overrides.
+    ///
+    /// Prefer this entry point from slot-aware callers so that the slot's
+    /// `config_file()` is used as the primary layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub fn load_with_paths_and_overrides(
+        paths: &ConfigPaths,
+        overrides: &ConfigLoadOverrides,
+    ) -> Result<Self> {
+        Self::load_from_path_with_overrides(&paths.config_file(), overrides)
+    }
+
     /// Load configuration and include composition metadata using explicit overrides.
     ///
     /// # Errors
@@ -4160,6 +4220,7 @@ timeout_profile = "missing"
             EnvVarGuard::set("BMUX_CONFIG_DIR", dir.to_str().expect("temp dir utf-8"));
         let _env_guard = EnvVarGuard::set(BMUX_CONFIG_ENV, env_path.to_str().expect("env utf-8"));
         let _override_guard = push_process_config_overrides(ConfigLoadOverrides {
+            base_config_path: None,
             env_config_path: Some(env_path),
             cli_config_path: Some(cli_path),
         });
@@ -4192,6 +4253,7 @@ timeout_profile = "missing"
         let _cwd_guard = CwdGuard::set(&dir);
         let _config_dir_guard = EnvVarGuard::set("BMUX_CONFIG_DIR", ".");
         let _override_guard = push_process_config_overrides(ConfigLoadOverrides {
+            base_config_path: None,
             env_config_path: Some(std::path::PathBuf::from("relative-env.toml")),
             cli_config_path: Some(std::path::PathBuf::from("relative-cli.toml")),
         });
@@ -4216,11 +4278,65 @@ timeout_profile = "missing"
         ));
         let _env_guard = EnvVarGuard::unset(BMUX_CONFIG_ENV);
         let _override_guard = push_process_config_overrides(ConfigLoadOverrides {
+            base_config_path: None,
             env_config_path: Some(missing),
             cli_config_path: None,
         });
 
         let error = BmuxConfig::load().expect_err("missing override should fail");
         assert!(matches!(error, crate::ConfigError::FileNotFound { .. }));
+    }
+
+    #[test]
+    fn base_config_is_merged_below_primary() {
+        let _guard = env_lock().lock().expect("env lock");
+        let _config_dir_guard = EnvVarGuard::unset("BMUX_CONFIG_DIR");
+        let _env_guard = EnvVarGuard::unset(BMUX_CONFIG_ENV);
+        let _no_base_guard = EnvVarGuard::unset("BMUX_NO_BASE_CONFIG");
+
+        let dir = std::env::temp_dir().join(format!(
+            "bmux-base-layer-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let base_path = dir.join("base.toml");
+        std::fs::write(
+            &base_path,
+            "[general]\nserver_timeout = 999\nscrollback_limit = 555\n",
+        )
+        .expect("write base");
+
+        let primary_path = dir.join("bmux.toml");
+        std::fs::write(&primary_path, "[general]\nscrollback_limit = 1234\n")
+            .expect("write primary");
+
+        // Use the "explicit overrides" path: pass a non-empty overrides set
+        // with base + primary, and verify primary wins for shared keys while
+        // base provides keys the primary does not set.
+        let overrides = ConfigLoadOverrides {
+            base_config_path: Some(base_path),
+            env_config_path: None,
+            cli_config_path: None,
+        };
+        let config = BmuxConfig::load_from_path_with_overrides(&primary_path, &overrides)
+            .expect("load with base");
+        // Base-only key survives.
+        assert_eq!(config.general.server_timeout, 999);
+        // Primary-set key wins.
+        assert_eq!(config.general.scrollback_limit, 1234);
+
+        // With BMUX_NO_BASE_CONFIG, base is dropped entirely → server_timeout
+        // returns to its default.
+        let _no_base = EnvVarGuard::set("BMUX_NO_BASE_CONFIG", "1");
+        let config_no_base = BmuxConfig::load_from_path_with_overrides(&primary_path, &overrides)
+            .expect("load without base");
+        assert_ne!(config_no_base.general.server_timeout, 999);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

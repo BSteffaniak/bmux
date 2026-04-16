@@ -30,6 +30,7 @@ bmux_plugin            = { workspace = true }
 bmux_plugin_sdk        = { workspace = true }
 bmux_server            = { workspace = true }
 bmux_session           = { workspace = true }
+bmux_slots             = { workspace = true }
 bmux_terminal          = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
 
