@@ -1,13 +1,13 @@
 # Kiosk Access
 
-Use kiosk mode to grant SSH users controlled, token-based access into bmux sessions without dropping them into a normal remote shell.
+Use kiosk mode to grant SSH users controlled, token-based access to bmux sessions without exposing a general remote shell.
 
 ## What Kiosk Mode Does
 
-- Enforces a forced-command entrypoint (`bmux kiosk attach ...`) for SSH access flows.
-- Supports multiple named profiles with separate defaults for session, target, SSH user mapping, and token policy.
-- Uses short-lived tokens (one-shot by default) that can be revoked.
-- Applies attach policy on every connect/reconnect attempt, including remote targets.
+- Enforces a forced-command entrypoint (`bmux kiosk attach ...`) for SSH entry.
+- Supports multiple named profiles with independent defaults for session, target, SSH user, and token policy.
+- Uses short-lived tokens (one-shot by default) that can be revoked at any time.
+- Re-applies attach policy after reconnects, including remote targets.
 
 ## Quick Start
 
@@ -15,7 +15,7 @@ Use kiosk mode to grant SSH users controlled, token-based access into bmux sessi
 2. Generate SSH include/wrapper assets.
 3. Include generated SSH config in your `sshd_config`.
 4. Issue a kiosk token for the profile.
-5. Use the printed `authorized_keys` forced-command entry.
+5. Add the printed `authorized_keys` forced-command entry.
 
 ```bmux-config
 [kiosk.defaults]
@@ -36,6 +36,7 @@ bmux kiosk status
 bmux kiosk init --all-profiles --dry-run
 bmux kiosk init --all-profiles
 bmux kiosk issue-token demo
+bmux kiosk ssh-print-config --all-profiles
 ```
 
 ## Profile Model
@@ -46,7 +47,7 @@ Kiosk config lives under `[kiosk]`:
 - `[kiosk.profiles.<name>]` applies per-profile overrides.
 - `[kiosk.files]` customizes output locations used by `bmux kiosk init`.
 
-Default/single SSH user is the normal path via `kiosk.defaults.ssh_user`. Override per profile only when you need separate Unix users:
+Use one default SSH user via `kiosk.defaults.ssh_user` unless you need per-profile Unix users:
 
 ```bmux-config
 [kiosk.defaults]
@@ -64,7 +65,7 @@ role = "observer"
 
 `bmux kiosk init` generates two artifact types:
 
-- sshd include content (with `Match User` blocks + `ForceCommand`)
+- sshd include content (`Match User` blocks + `ForceCommand`)
 - shell wrappers (one script per selected profile)
 
 Useful commands:
@@ -80,7 +81,7 @@ Notes:
 
 - Interactive mode prompts before writing unless `--yes` is provided.
 - Non-interactive execution requires `--yes`.
-- Wrapper scripts require `BMUX_KIOSK_TOKEN` and execute `bmux kiosk attach <profile> --token ...`.
+- Wrapper scripts require `BMUX_KIOSK_TOKEN` and run `bmux kiosk attach <profile> --token ...`.
 
 ## Token Lifecycle
 
@@ -96,7 +97,7 @@ Token behavior:
 
 - Format is `k1.<token_id>.<secret>`.
 - Secret is hashed at rest in local token store.
-- Expired/revoked/consumed one-shot tokens are rejected.
+- Expired, revoked, or consumed one-shot tokens are rejected.
 
 ## SSH Integration
 
@@ -114,6 +115,17 @@ Pair this with the generated sshd include file from `bmux kiosk init`.
 - Kiosk attach sets policy before attach and re-applies it after reconnect.
 - If a profile pins `target`, conflicting `--target` overrides are rejected.
 - Remote-target kiosk attaches reconnect with bounded retry/backoff behavior.
+
+## Security Hardening Checklist
+
+> Use these defaults for production-style kiosk access.
+>
+> - Keep `allow_detach = false` unless users explicitly need detach.
+> - Keep `one_shot = true` and use short `token_ttl_secs` values.
+> - Pin `target` (and optionally `session`) in each production profile.
+> - Use dedicated SSH users for sensitive environments.
+> - Prefer generated sshd settings that disable forwarding/tunneling features.
+> - Revoke tokens immediately after support or demo windows close.
 
 ## Troubleshooting
 
