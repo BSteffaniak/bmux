@@ -5311,6 +5311,7 @@ pub const fn mouse_protocol_mode_reports_event(
     attach_mouse::mode_reports_event(mode, mouse_event_kind_to_shared(kind))
 }
 
+#[cfg(test)]
 pub fn encode_attach_mouse_for_protocol(
     mouse_event: MouseEvent,
     protocol: AttachPaneMouseProtocol,
@@ -5366,7 +5367,44 @@ pub fn attach_mouse_forward_bytes_for_target(
     }
     let target_pane = target_pane?;
     let protocol = attach_pane_mouse_protocol(view_state, target_pane)?;
-    encode_attach_mouse_for_protocol(mouse_event, protocol)
+    // Programs running inside a pane (nvim, tmux, etc.) expect mouse
+    // coordinates relative to the pane's own virtual terminal, not the
+    // whole attach UI. Without this translation the encoder emits absolute
+    // terminal coordinates — well past the pane width — which causes
+    // applications to clamp the cursor to end-of-line on every click.
+    let pane_rect = attach_scene_pane_rect(view_state, target_pane)?;
+    let shared_event = mouse_event_to_shared(mouse_event);
+    let local_event = attach_mouse::translate_event_to_pane_local(shared_event, pane_rect)?;
+    attach_mouse::encode_for_protocol(
+        local_event,
+        attach_mouse::PaneProtocol {
+            mode: protocol.mode,
+            encoding: protocol.encoding,
+        },
+    )
+}
+
+fn attach_scene_pane_rect(
+    view_state: &AttachViewState,
+    pane_id: Uuid,
+) -> Option<bmux_ipc::AttachRect> {
+    let layout_state = view_state.cached_layout_state.as_ref()?;
+    let mut best: Option<(bmux_ipc::AttachLayer, i32, usize, bmux_ipc::AttachRect)> = None;
+    for (index, surface) in layout_state.scene.surfaces.iter().enumerate() {
+        if surface.pane_id != Some(pane_id) {
+            continue;
+        }
+        if !surface.visible || !surface.accepts_input {
+            continue;
+        }
+        let candidate = (surface.layer, surface.z, index, surface.rect);
+        if best.as_ref().is_none_or(|current| {
+            (candidate.0, candidate.1, candidate.2) > (current.0, current.1, current.2)
+        }) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, _, _, rect)| rect)
 }
 
 #[cfg(test)]
@@ -6532,6 +6570,111 @@ mod tests {
         )
         .expect("mouse move should forward once pane enables any-motion mode");
         assert_eq!(forwarded, b"\x1b[<35;3;3M".to_vec());
+    }
+
+    #[test]
+    fn attach_mouse_forward_translates_coordinates_to_pane_local() {
+        // Regression for "clicks land at end of line": a pane rendered in
+        // the top-right of the attach UI has a non-zero origin. Clicks
+        // must be translated into that pane's own coordinate space before
+        // being forwarded; otherwise the program inside the pane receives
+        // a column far past its own width and clamps the cursor to EOL.
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        let rect = AttachRect {
+            x: 91,
+            y: 1,
+            w: 90,
+            h: 40,
+        };
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: vec![PaneSummary {
+                id: pane_id,
+                index: 1,
+                name: None,
+                focused: true,
+                state: PaneState::Running,
+                state_reason: None,
+            }],
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![AttachSurface {
+                    id: Uuid::new_v4(),
+                    kind: AttachSurfaceKind::Pane,
+                    layer: bmux_ipc::AttachLayer::Pane,
+                    z: 0,
+                    pane_id: Some(pane_id),
+                    rect,
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                }],
+            },
+            zoomed: false,
+        });
+        let buffer = view_state
+            .pane_buffers
+            .entry(pane_id)
+            .or_insert_with(|| PaneRenderBuffer {
+                parser: vt100::Parser::new(40, 90, 4_096),
+                last_alternate_screen: false,
+                prev_rows: Vec::new(),
+                sync_update_in_progress: false,
+                expected_stream_start: None,
+            });
+        // Enable SGR + press/release so the pane protocol reports clicks.
+        append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
+
+        // Click at the pane's first visible cell (absolute 91, 1) should
+        // emit pane-local (1, 1), not absolute (92, 2).
+        let first_cell = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 91,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let forwarded =
+            attach_mouse_forward_bytes_for_target(&view_state, first_cell, Some(pane_id), true)
+                .expect("forward click at pane origin");
+        assert_eq!(forwarded, b"\x1b[<0;1;1M".to_vec());
+
+        // Click further into the pane: (100, 5) → local (9, 4) → encoded (10, 5).
+        let middle = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 100,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let forwarded =
+            attach_mouse_forward_bytes_for_target(&view_state, middle, Some(pane_id), true)
+                .expect("forward click inside pane");
+        assert_eq!(forwarded, b"\x1b[<0;10;5M".to_vec());
+
+        // Click outside the pane rect should not forward (belt-and-suspenders;
+        // upstream callers are already expected to filter by pane_at).
+        let outside = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let forwarded =
+            attach_mouse_forward_bytes_for_target(&view_state, outside, Some(pane_id), true);
+        assert!(
+            forwarded.is_none(),
+            "clicks outside the pane rect must not be forwarded"
+        );
     }
 
     #[test]

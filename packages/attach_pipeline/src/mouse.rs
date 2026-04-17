@@ -47,7 +47,17 @@ pub struct PaneProtocol {
 
 #[must_use]
 pub fn pane_at(scene: &AttachScene, column: u16, row: u16) -> Option<Uuid> {
-    let mut best: Option<(AttachLayer, i32, usize, Uuid)> = None;
+    pane_and_rect_at(scene, column, row).map(|(pane_id, _)| pane_id)
+}
+
+/// Like [`pane_at`], but also returns the matched surface's rect.
+///
+/// Callers use the rect to translate absolute terminal coordinates into
+/// pane-local coordinates before forwarding mouse events to the pane's
+/// program.
+#[must_use]
+pub fn pane_and_rect_at(scene: &AttachScene, column: u16, row: u16) -> Option<(Uuid, AttachRect)> {
+    let mut best: Option<(AttachLayer, i32, usize, Uuid, AttachRect)> = None;
     for (index, surface) in scene.surfaces.iter().enumerate() {
         let Some(pane_id) = surface.pane_id else {
             continue;
@@ -58,12 +68,32 @@ pub fn pane_at(scene: &AttachScene, column: u16, row: u16) -> Option<Uuid> {
         if !rect_contains_point(surface.rect, column, row) {
             continue;
         }
-        let candidate = (surface.layer, surface.z, index, pane_id);
-        if best.as_ref().is_none_or(|current| candidate > *current) {
+        let candidate = (surface.layer, surface.z, index, pane_id, surface.rect);
+        if best.as_ref().is_none_or(|current| {
+            (candidate.0, candidate.1, candidate.2) > (current.0, current.1, current.2)
+        }) {
             best = Some(candidate);
         }
     }
-    best.map(|(_, _, _, pane_id)| pane_id)
+    best.map(|(_, _, _, pane_id, rect)| (pane_id, rect))
+}
+
+/// Translate `event` from absolute terminal coordinates into `rect`'s local space.
+///
+/// Returns `None` when the event position falls outside the rect, which
+/// callers should treat as a signal to drop the event rather than forward
+/// a clamped coordinate that didn't match where the user actually clicked.
+#[must_use]
+pub const fn translate_event_to_pane_local(event: Event, rect: AttachRect) -> Option<Event> {
+    if !rect_contains_point(rect, event.column, event.row) {
+        return None;
+    }
+    Some(Event {
+        kind: event.kind,
+        column: event.column.saturating_sub(rect.x),
+        row: event.row.saturating_sub(rect.y),
+        modifiers: event.modifiers,
+    })
 }
 
 #[must_use]
@@ -292,5 +322,194 @@ pub const fn encode_sgr_cb(kind: EventKind, modifiers: Modifiers) -> Option<(u16
         EventKind::ScrollDown => Some((cb + 65, 'M')),
         EventKind::ScrollLeft => Some((cb + 66, 'M')),
         EventKind::ScrollRight => Some((cb + 67, 'M')),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_ipc::{AttachFocusTarget, AttachSurface, AttachSurfaceKind};
+
+    fn surface(
+        pane_id: Uuid,
+        layer: AttachLayer,
+        z: i32,
+        rect: AttachRect,
+        accepts_input: bool,
+        visible: bool,
+    ) -> AttachSurface {
+        AttachSurface {
+            id: Uuid::new_v4(),
+            kind: AttachSurfaceKind::Pane,
+            layer,
+            z,
+            rect,
+            opaque: true,
+            visible,
+            accepts_input,
+            cursor_owner: false,
+            pane_id: Some(pane_id),
+        }
+    }
+
+    fn scene(surfaces: Vec<AttachSurface>) -> AttachScene {
+        AttachScene {
+            session_id: Uuid::new_v4(),
+            focus: AttachFocusTarget::None,
+            surfaces,
+        }
+    }
+
+    #[test]
+    fn pane_and_rect_at_returns_matched_surface_rect() {
+        let pane = Uuid::new_v4();
+        let rect = AttachRect {
+            x: 10,
+            y: 2,
+            w: 20,
+            h: 8,
+        };
+        let scene = scene(vec![surface(pane, AttachLayer::Pane, 0, rect, true, true)]);
+
+        let hit = pane_and_rect_at(&scene, 15, 5).expect("hit");
+        assert_eq!(hit, (pane, rect));
+    }
+
+    #[test]
+    fn pane_and_rect_at_prefers_topmost_surface() {
+        let background = Uuid::new_v4();
+        let floating = Uuid::new_v4();
+        let background_rect = AttachRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 20,
+        };
+        let floating_rect = AttachRect {
+            x: 5,
+            y: 5,
+            w: 10,
+            h: 5,
+        };
+        let scene = scene(vec![
+            surface(
+                background,
+                AttachLayer::Pane,
+                0,
+                background_rect,
+                true,
+                true,
+            ),
+            surface(
+                floating,
+                AttachLayer::FloatingPane,
+                10,
+                floating_rect,
+                true,
+                true,
+            ),
+        ]);
+
+        let over_both = pane_and_rect_at(&scene, 7, 6).expect("over floating");
+        assert_eq!(over_both, (floating, floating_rect));
+
+        let outside_floating = pane_and_rect_at(&scene, 20, 15).expect("over background");
+        assert_eq!(outside_floating, (background, background_rect));
+    }
+
+    #[test]
+    fn translate_event_to_pane_local_subtracts_rect_origin() {
+        let rect = AttachRect {
+            x: 91,
+            y: 1,
+            w: 90,
+            h: 40,
+        };
+        let event = Event {
+            kind: EventKind::Down(Button::Left),
+            column: 120,
+            row: 5,
+            modifiers: Modifiers::default(),
+        };
+
+        let local = translate_event_to_pane_local(event, rect).expect("inside rect");
+        assert_eq!(local.column, 29);
+        assert_eq!(local.row, 4);
+        assert_eq!(local.kind, event.kind);
+        assert_eq!(local.modifiers, event.modifiers);
+    }
+
+    #[test]
+    fn translate_event_to_pane_local_drops_events_outside_rect() {
+        let rect = AttachRect {
+            x: 10,
+            y: 2,
+            w: 20,
+            h: 8,
+        };
+
+        let outside_left = Event {
+            kind: EventKind::Down(Button::Left),
+            column: 5,
+            row: 3,
+            modifiers: Modifiers::default(),
+        };
+        assert!(translate_event_to_pane_local(outside_left, rect).is_none());
+
+        let outside_right = Event {
+            kind: EventKind::Down(Button::Left),
+            column: 40,
+            row: 3,
+            modifiers: Modifiers::default(),
+        };
+        assert!(translate_event_to_pane_local(outside_right, rect).is_none());
+
+        let outside_above = Event {
+            kind: EventKind::Down(Button::Left),
+            column: 15,
+            row: 1,
+            modifiers: Modifiers::default(),
+        };
+        assert!(translate_event_to_pane_local(outside_above, rect).is_none());
+    }
+
+    #[test]
+    fn translate_then_encode_produces_pane_local_sgr_coordinates() {
+        // Regression test for the "clicks land at end of line" bug: the
+        // top-right pane starts at rect.x=91, rect.y=1. A click at the
+        // pane's first visible cell (absolute 91, 1) must produce SGR
+        // coordinates (1, 1) — not (92, 2) — so the program inside the
+        // pane receives a click on its own column 1.
+        let rect = AttachRect {
+            x: 91,
+            y: 1,
+            w: 90,
+            h: 40,
+        };
+        let protocol = PaneProtocol {
+            mode: vt100::MouseProtocolMode::PressRelease,
+            encoding: vt100::MouseProtocolEncoding::Sgr,
+        };
+
+        let first_cell = Event {
+            kind: EventKind::Down(Button::Left),
+            column: 91,
+            row: 1,
+            modifiers: Modifiers::default(),
+        };
+        let local = translate_event_to_pane_local(first_cell, rect).expect("inside rect");
+        let encoded = encode_for_protocol(local, protocol).expect("encoded");
+        assert_eq!(encoded, b"\x1b[<0;1;1M".to_vec());
+
+        let middle = Event {
+            kind: EventKind::Down(Button::Left),
+            column: 100,
+            row: 5,
+            modifiers: Modifiers::default(),
+        };
+        let local = translate_event_to_pane_local(middle, rect).expect("inside rect");
+        let encoded = encode_for_protocol(local, protocol).expect("encoded");
+        // column 100 - 91 = 9, +1 = 10 ; row 5 - 1 = 4, +1 = 5
+        assert_eq!(encoded, b"\x1b[<0;10;5M".to_vec());
     }
 }

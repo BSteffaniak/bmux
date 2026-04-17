@@ -1292,7 +1292,7 @@ async fn handle_session_mouse_event(
     session_id: Uuid,
     event: TerminalMouseEvent,
 ) -> Result<()> {
-    let Some(target_pane) = state.target_pane_at(event.col, event.row) else {
+    let Some((target_pane, pane_rect)) = state.target_pane_and_rect_at(event.col, event.row) else {
         return Ok(());
     };
 
@@ -1325,7 +1325,14 @@ async fn handle_session_mouse_event(
     let Some(mouse_event) = terminal_mouse_event_to_attach_mouse_event(event) else {
         return Ok(());
     };
-    let Some(bytes) = attach_mouse::encode_for_protocol(mouse_event, protocol) else {
+    // Programs inside the pane expect pane-local coordinates. See the
+    // matching translation in `attach_mouse_forward_bytes_for_target` for
+    // the attach CLI path.
+    let Some(local_event) = attach_mouse::translate_event_to_pane_local(mouse_event, pane_rect)
+    else {
+        return Ok(());
+    };
+    let Some(bytes) = attach_mouse::encode_for_protocol(local_event, protocol) else {
         return Ok(());
     };
 
@@ -1529,9 +1536,13 @@ impl StreamOutputState {
             .map(|layout_state| layout_state.focused_pane_id)
     }
 
-    fn target_pane_at(&self, column: u16, row: u16) -> Option<Uuid> {
+    fn target_pane_and_rect_at(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<(Uuid, bmux_ipc::AttachRect)> {
         let layout_state = self.pipeline.layout_state.as_ref()?;
-        attach_mouse::pane_at(&layout_state.scene, column, row)
+        attach_mouse::pane_and_rect_at(&layout_state.scene, column, row)
     }
 
     fn pane_protocol(&self, pane_id: Uuid) -> Option<attach_mouse::PaneProtocol> {
