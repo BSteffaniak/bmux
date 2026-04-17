@@ -10,6 +10,10 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
+[lib]
+name = "bmux_env"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bmux-env"
 path = "src/main.rs"
@@ -19,6 +23,9 @@ anyhow     = { workspace = true }
 bmux_slots = { workspace = true }
 clap       = { workspace = true, features = ["derive", "help", "std", "usage"] }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 fail-on-warnings = []

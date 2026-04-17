@@ -141,6 +141,10 @@ pub enum BuiltInHandlerId {
     SlotPaths,
     SlotDoctor,
     SlotInstall,
+    SlotUninstall,
+    SlotShell,
+    SlotExec,
+    SlotPrint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +163,13 @@ impl BuiltInExecutionCommand {
             aliases: Vec::new(),
             summary,
         }
+    }
+
+    /// Attach an alias path that dispatches to the same handler.
+    fn with_alias(mut self, path: &[&str]) -> Self {
+        self.aliases
+            .push(path.iter().map(|s| (*s).to_string()).collect());
+        self
     }
 }
 
@@ -845,27 +856,56 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::SlotList,
             &["slot", "list"],
             "List declared bmux slots",
-        ),
+        )
+        .with_alias(&["env", "list"]),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SlotShow,
             &["slot", "show"],
             "Show a single slot's resolved detail",
-        ),
+        )
+        .with_alias(&["env", "show"]),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SlotPaths,
             &["slot", "paths"],
             "Print a slot's resolved config/runtime/data/state/log paths",
-        ),
+        )
+        .with_alias(&["env", "paths"]),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SlotDoctor,
             &["slot", "doctor"],
             "Validate the slot manifest",
-        ),
+        )
+        .with_alias(&["env", "doctor"]),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::SlotInstall,
             &["slot", "install"],
-            "Emit a TOML/JSON/Nix block for installing a new slot (read-only)",
-        ),
+            "Register a new bmux slot (writes manifest; refuses read-only manifests)",
+        )
+        .with_alias(&["env", "install"]),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SlotUninstall,
+            &["slot", "uninstall"],
+            "Remove a bmux slot from the manifest and delete its binary link",
+        )
+        .with_alias(&["env", "uninstall"]),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SlotShell,
+            &["slot", "shell"],
+            "Print shell code to prepend $BMUX_SLOTS_BIN_DIR to PATH",
+        )
+        .with_alias(&["env", "shell"]),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SlotExec,
+            &["slot", "exec"],
+            "Run a command with a slot's env applied",
+        )
+        .with_alias(&["env", "exec"]),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::SlotPrint,
+            &["slot", "print"],
+            "Print the resolved env-var set as structured data",
+        )
+        .with_alias(&["env", "print"]),
     ]
 }
 

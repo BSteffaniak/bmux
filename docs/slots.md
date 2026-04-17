@@ -80,27 +80,60 @@ When neither is set, bmux falls back to legacy single-install behavior.
 
 ## Commands
 
+The slot-management surface is reachable through three identical namespaces:
+
 ```
-bmux slot list                      # show all declared slots
-bmux slot list --format json|nix    # machine-readable
-bmux slot show [name]               # one slot's resolved paths
-bmux slot paths [name]              # just the path grid
-bmux slot doctor                    # validate manifest
-bmux slot install --name dev \      # emit TOML/JSON/Nix block for a new slot
-  --binary /path/to/bmux \          #   (does not mutate the manifest)
-  [--no-inherit-base] \
-  [--format toml|json|nix]
+bmux slot <subcommand>        # primary
+bmux env  <subcommand>        # alias for the above
+bmux-env  <subcommand>        # standalone binary, same subcommands
+
+# Read-only:
+bmux slot list                       # all slots
+bmux slot list --format json|nix     # machine-readable
+bmux slot show [name]                # one slot's resolved detail
+bmux slot paths [name]               # just the path grid
+bmux slot doctor                     # validate manifest
+
+# Write:
+bmux slot install <name> <binary>    # register a slot
+  [--no-inherit-base]                # do not layer ~/.config/bmux/base.toml
+  [--mode symlink|copy]              # default symlink
+  [--bin-dir <dir>]                  # default ~/.local/bin (or $BMUX_SLOTS_BIN_DIR)
+  [--format toml|json|nix]           # for the printed block
+  [--dry-run]                        # do not touch disk
+bmux slot uninstall <name>           # remove slot
+  [--purge]                          # also remove config/data/state/log dirs
+  [--bin-dir <dir>]
+
+# PATH / env bootstrapping:
+bmux slot shell [--shell auto|bash|zsh|fish|nushell|powershell|posix]
+bmux slot exec <name> -- <cmd> [args...]
+bmux slot print [--format shell|json|nix|fish]
 ```
 
-`bmux slot install` is read-only by design: it prints the block for you to
-paste into your `slots.toml` (or your Home Manager / nix-darwin config). A
-matching `cargo xtask install-slot` command will land in a follow-up pass to
-mutate the manifest in place (subject to the read-only guard).
+Every subcommand above works identically as `bmux env <same>` and as
+`bmux-env <same>`. The `bmux-env` binary exists so that users can bootstrap
+their `PATH` before any slot binary is reachable.
+
+### Read-only manifest protection
+
+`bmux slot install` and `bmux slot uninstall` refuse to mutate manifests
+that are detected as "declaratively-managed" (e.g. under `/nix/store` or
+`/etc`, or any prefix in `$BMUX_MANIFEST_READ_ONLY_PREFIXES`, or any file
+with the read-only bit set). In that case:
+
+- The would-be block is printed to stdout (`install`).
+- A `note:` line explains the refusal.
+- Exit code is `77`.
+
+This makes the tool safe to run inside Nix / Home Manager workflows — users
+can copy the printed block into their declarative config without any risk of
+imperative drift.
 
 ## `bmux-env` helper
 
-`bmux-env` is a separate binary that is _not_ slot-scoped. Its job is to help
-bootstrap `PATH` and provide a per-invocation slot override.
+`bmux-env` is a standalone binary that exposes every subcommand above; it is
+what you use in your shell rc to prepend the slot bin dir to `PATH`:
 
 ```
 bmux-env shell [--shell auto|bash|zsh|fish|nushell|powershell|posix]
@@ -121,7 +154,10 @@ bmux-env exec dev -- cargo test
 bmux-env print --format nix
 ```
 
-`bmux-env` never writes to disk; it only emits stdout and `execvp`s.
+`bmux-env shell`, `bmux-env exec`, and `bmux-env print` are pure — they only
+emit to stdout (and `execvp` for `exec`). The install/uninstall subcommands
+write, but they respect the same read-only-manifest refusal as the
+`bmux slot` variants.
 
 ## Server isolation
 
@@ -182,7 +218,31 @@ highest precedence — useful for sandbox/test flows.
 - No cutover: `bmux` (bare) still works as legacy single-install. A future
   pass renames to `bmux-<slot>` across apt/rpm/curl/npm and ships a `default`
   symlink.
-- No `cargo xtask install-slot` (coming next).
 - No first-class Nix flake / Home Manager module (design is ready; external
   authors can build one against the public surface today).
 - No config schema-version field / migrations.
+
+## Quickstart: "spin up a dev slot for my current checkout"
+
+```
+# One-time: put ~/.local/bin on PATH (many distros already do).
+eval "$(bmux-env shell)"
+
+# From anywhere:
+bmux slot install cursor /home/you/GitHub/bmux/target/release/bmux \
+    --no-inherit-base
+
+# Verify:
+bmux slot doctor
+bmux slot paths cursor      # distinct runtime_dir from any other install
+
+# Run an isolated bmux:
+bmux-cursor                 # opens a fresh server under the 'cursor' slot
+
+# Iterate: cargo build --release in the repo, the symlink keeps pointing
+# at target/release/bmux so the next `bmux-cursor` invocation picks up the
+# new binary automatically.
+
+# Remove:
+bmux slot uninstall cursor [--purge]
+```

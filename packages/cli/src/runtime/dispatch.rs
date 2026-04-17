@@ -210,12 +210,16 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             SandboxCommand::Clean { .. } => BuiltInHandlerId::SandboxClean,
             SandboxCommand::RebuildIndex { .. } => BuiltInHandlerId::SandboxRebuildIndex,
         },
-        Command::Slot { command } => match command {
+        Command::Slot { command } | Command::Env { command } => match command {
             SlotCommand::List { .. } => BuiltInHandlerId::SlotList,
             SlotCommand::Show { .. } => BuiltInHandlerId::SlotShow,
             SlotCommand::Paths { .. } => BuiltInHandlerId::SlotPaths,
             SlotCommand::Doctor => BuiltInHandlerId::SlotDoctor,
             SlotCommand::Install { .. } => BuiltInHandlerId::SlotInstall,
+            SlotCommand::Uninstall { .. } => BuiltInHandlerId::SlotUninstall,
+            SlotCommand::Shell { .. } => BuiltInHandlerId::SlotShell,
+            SlotCommand::Exec { .. } => BuiltInHandlerId::SlotExec,
+            SlotCommand::Print { .. } => BuiltInHandlerId::SlotPrint,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1825,11 +1829,17 @@ pub(super) async fn dispatch_built_in_command(
             BuiltInHandlerId::SlotList,
             Command::Slot {
                 command: SlotCommand::List { format },
+            }
+            | Command::Env {
+                command: SlotCommand::List { format },
             },
         ) => super::slot_cli::run_slot_list(*format),
         (
             BuiltInHandlerId::SlotShow,
             Command::Slot {
+                command: SlotCommand::Show { name, format },
+            }
+            | Command::Env {
                 command: SlotCommand::Show { name, format },
             },
         ) => super::slot_cli::run_slot_show(name.as_deref(), *format),
@@ -1837,11 +1847,17 @@ pub(super) async fn dispatch_built_in_command(
             BuiltInHandlerId::SlotPaths,
             Command::Slot {
                 command: SlotCommand::Paths { name },
+            }
+            | Command::Env {
+                command: SlotCommand::Paths { name },
             },
         ) => super::slot_cli::run_slot_paths(name.as_deref()),
         (
             BuiltInHandlerId::SlotDoctor,
             Command::Slot {
+                command: SlotCommand::Doctor,
+            }
+            | Command::Env {
                 command: SlotCommand::Doctor,
             },
         ) => super::slot_cli::run_slot_doctor(),
@@ -1853,10 +1869,79 @@ pub(super) async fn dispatch_built_in_command(
                         name,
                         binary,
                         no_inherit_base,
+                        mode,
+                        bin_dir,
                         format,
+                        dry_run,
+                    },
+            }
+            | Command::Env {
+                command:
+                    SlotCommand::Install {
+                        name,
+                        binary,
+                        no_inherit_base,
+                        mode,
+                        bin_dir,
+                        format,
+                        dry_run,
                     },
             },
-        ) => super::slot_cli::run_slot_install(name, binary, !*no_inherit_base, *format),
+        ) => super::slot_cli::run_slot_install(
+            name,
+            binary,
+            !*no_inherit_base,
+            *mode,
+            bin_dir.as_deref(),
+            *format,
+            *dry_run,
+        ),
+        (
+            BuiltInHandlerId::SlotUninstall,
+            Command::Slot {
+                command:
+                    SlotCommand::Uninstall {
+                        name,
+                        purge,
+                        bin_dir,
+                    },
+            }
+            | Command::Env {
+                command:
+                    SlotCommand::Uninstall {
+                        name,
+                        purge,
+                        bin_dir,
+                    },
+            },
+        ) => super::slot_cli::run_slot_uninstall(name, *purge, bin_dir.as_deref()),
+        (
+            BuiltInHandlerId::SlotShell,
+            Command::Slot {
+                command: SlotCommand::Shell { shell },
+            }
+            | Command::Env {
+                command: SlotCommand::Shell { shell },
+            },
+        ) => super::slot_cli::run_slot_shell(*shell),
+        (
+            BuiltInHandlerId::SlotExec,
+            Command::Slot {
+                command: SlotCommand::Exec { slot, argv },
+            }
+            | Command::Env {
+                command: SlotCommand::Exec { slot, argv },
+            },
+        ) => super::slot_cli::run_slot_exec(slot, argv),
+        (
+            BuiltInHandlerId::SlotPrint,
+            Command::Slot {
+                command: SlotCommand::Print { format },
+            }
+            | Command::Env {
+                command: SlotCommand::Print { format },
+            },
+        ) => super::slot_cli::run_slot_print(*format),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }

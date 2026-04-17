@@ -668,6 +668,200 @@ pub fn is_read_only_manifest(path: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Manifest-write helpers
+// ---------------------------------------------------------------------------
+
+/// Parameters for adding a new slot via [`write_slot_block`].
+#[derive(Debug, Clone)]
+pub struct NewSlotBlock {
+    /// Slot name (validated against [`validate_slot_name`]).
+    pub name: String,
+    /// Absolute path to the `bmux-<name>` binary.
+    pub binary: PathBuf,
+    /// Whether to inherit the shared base config.
+    pub inherit_base: bool,
+}
+
+/// Render a `[slots.<name>]` TOML block for [`NewSlotBlock`].
+///
+/// This is the canonical on-disk representation used by write operations and
+/// by read-only manifest refusal printouts.
+#[must_use]
+pub fn render_slot_block_toml(block: &NewSlotBlock) -> String {
+    format!(
+        "[slots.{name}]\nbinary = {binary}\ninherit_base = {inherit_base}\n",
+        name = block.name,
+        binary = toml_string_literal(&block.binary.to_string_lossy()),
+        inherit_base = block.inherit_base,
+    )
+}
+
+/// Append a new slot block to the manifest file at `path`, creating the file
+/// if missing.
+///
+/// Behavior:
+/// - Validates the slot name.
+/// - Refuses when the target file is read-only (see [`is_read_only_manifest`]).
+/// - Refuses when a slot with the same name already exists in the file (the
+///   caller should uninstall first or pick a different name).
+///
+/// # Errors
+///
+/// - [`SlotError::InvalidName`] for invalid slot names.
+/// - [`SlotError::ReadOnlyManifest`] for read-only manifest paths.
+/// - [`SlotError::Io`] for file I/O failures.
+/// - Returns a [`SlotError::InvalidName`] with a `"duplicate"` reason when the
+///   slot name already appears in the manifest contents.
+pub fn write_slot_block(manifest_path: &Path, block: &NewSlotBlock) -> Result<(), SlotError> {
+    validate_slot_name(&block.name)?;
+    if manifest_path.exists() && is_read_only_manifest(manifest_path) {
+        return Err(SlotError::ReadOnlyManifest {
+            path: manifest_path.to_path_buf(),
+        });
+    }
+    // Parent dir must exist (or we create it).
+    if let Some(parent) = manifest_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| SlotError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
+    // If the file exists, detect pre-existing slot with this name via the
+    // existing loader (ignoring extend files — we're editing *this* file only).
+    let mut current = match std::fs::read_to_string(manifest_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(SlotError::Io {
+                path: manifest_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let header = format!("[slots.{}]", block.name);
+    if current.contains(&header) {
+        return Err(SlotError::InvalidName {
+            name: block.name.clone(),
+            reason: "duplicate (slot with this name already exists in manifest)",
+        });
+    }
+
+    if !current.is_empty() && !current.ends_with('\n') {
+        current.push('\n');
+    }
+    if !current.is_empty() && !current.ends_with("\n\n") {
+        current.push('\n');
+    }
+    current.push_str(&render_slot_block_toml(block));
+
+    std::fs::write(manifest_path, current).map_err(|source| SlotError::Io {
+        path: manifest_path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Remove a `[slots.<name>]` block from the manifest file.
+///
+/// Uses a simple line-based scan: the `[slots.<name>]` header line plus all
+/// subsequent non-header lines are removed. Preserves the rest of the file
+/// verbatim.
+///
+/// # Errors
+///
+/// - [`SlotError::ReadOnlyManifest`] for read-only manifests.
+/// - [`SlotError::Io`] for file I/O failures.
+/// - [`SlotError::UnknownSlot`] when the block is not present.
+pub fn remove_slot_block(manifest_path: &Path, name: &str) -> Result<(), SlotError> {
+    validate_slot_name(name)?;
+    if !manifest_path.exists() {
+        return Err(SlotError::UnknownSlot {
+            name: name.to_string(),
+            known: Vec::new(),
+        });
+    }
+    if is_read_only_manifest(manifest_path) {
+        return Err(SlotError::ReadOnlyManifest {
+            path: manifest_path.to_path_buf(),
+        });
+    }
+    let current = std::fs::read_to_string(manifest_path).map_err(|source| SlotError::Io {
+        path: manifest_path.to_path_buf(),
+        source,
+    })?;
+
+    let header = format!("[slots.{name}]");
+    let mut found = false;
+    let mut out_lines: Vec<&str> = Vec::with_capacity(current.lines().count());
+    let mut skipping = false;
+    for line in current.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            found = true;
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            // A new top-level TOML header ends the block we are skipping.
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                skipping = false;
+                out_lines.push(line);
+                continue;
+            }
+            // Drop lines within the block.
+            continue;
+        }
+        out_lines.push(line);
+    }
+
+    if !found {
+        return Err(SlotError::UnknownSlot {
+            name: name.to_string(),
+            known: Vec::new(),
+        });
+    }
+
+    // Trim trailing blank lines; ensure single trailing newline.
+    let mut new_content = out_lines.join("\n");
+    while new_content.ends_with("\n\n") {
+        new_content.pop();
+    }
+    if !new_content.is_empty() && !new_content.ends_with('\n') {
+        new_content.push('\n');
+    }
+
+    std::fs::write(manifest_path, new_content).map_err(|source| SlotError::Io {
+        path: manifest_path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Quote a string for TOML output.
+#[must_use]
+pub fn toml_string_literal(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str(r#"\""#),
+            '\\' => out.push_str(r"\\"),
+            '\n' => out.push_str(r"\n"),
+            '\r' => out.push_str(r"\r"),
+            '\t' => out.push_str(r"\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Path / env interpolation
 // ---------------------------------------------------------------------------
 
@@ -999,5 +1193,106 @@ runtime_dir = "/tmp/main"
         // (canonicalize will fail and we fall through to the raw path match.)
         let p = PathBuf::from("/nix/store/abc-123/slots.toml");
         assert!(is_read_only_manifest(&p));
+    }
+
+    #[test]
+    fn render_slot_block_toml_is_deterministic() {
+        let block = NewSlotBlock {
+            name: "dev".into(),
+            binary: PathBuf::from("/tmp/bmux"),
+            inherit_base: false,
+        };
+        let rendered = render_slot_block_toml(&block);
+        assert_eq!(
+            rendered,
+            "[slots.dev]\nbinary = \"/tmp/bmux\"\ninherit_base = false\n"
+        );
+    }
+
+    #[test]
+    fn write_slot_block_creates_file_when_absent() {
+        let _g = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("slots.toml");
+        let block = NewSlotBlock {
+            name: "cursor".into(),
+            binary: PathBuf::from("/home/u/target/release/bmux"),
+            inherit_base: true,
+        };
+        write_slot_block(&path, &block).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("[slots.cursor]"));
+        assert!(contents.contains("inherit_base = true"));
+        // Reloading the manifest should produce the slot.
+        let manifest = SlotManifest::load_from_path(&path).unwrap();
+        assert!(manifest.slots.contains_key("cursor"));
+    }
+
+    #[test]
+    fn write_slot_block_appends_to_existing_file() {
+        let _g = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("slots.toml");
+        std::fs::write(
+            &path,
+            "default = \"stable\"\n\n[slots.stable]\nbinary = \"/usr/bin/bmux\"\n",
+        )
+        .unwrap();
+        let block = NewSlotBlock {
+            name: "dev".into(),
+            binary: PathBuf::from("/tmp/bmux"),
+            inherit_base: false,
+        };
+        write_slot_block(&path, &block).unwrap();
+        let manifest = SlotManifest::load_from_path(&path).unwrap();
+        assert_eq!(manifest.slots.len(), 2);
+    }
+
+    #[test]
+    fn write_slot_block_refuses_duplicate() {
+        let _g = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("slots.toml");
+        let block = NewSlotBlock {
+            name: "dev".into(),
+            binary: PathBuf::from("/tmp/bmux"),
+            inherit_base: false,
+        };
+        write_slot_block(&path, &block).unwrap();
+        let err = write_slot_block(&path, &block).unwrap_err();
+        assert!(matches!(err, SlotError::InvalidName { .. }));
+    }
+
+    #[test]
+    fn remove_slot_block_drops_named_block() {
+        let _g = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("slots.toml");
+        std::fs::write(
+            &path,
+            "default = \"stable\"\n\n[slots.stable]\nbinary = \"/usr/bin/bmux\"\n\n[slots.dev]\nbinary = \"/tmp/bmux\"\ninherit_base = false\n",
+        )
+        .unwrap();
+        remove_slot_block(&path, "dev").unwrap();
+        let manifest = SlotManifest::load_from_path(&path).unwrap();
+        assert!(!manifest.slots.contains_key("dev"));
+        assert!(manifest.slots.contains_key("stable"));
+    }
+
+    #[test]
+    fn remove_slot_block_unknown_slot_errors() {
+        let _g = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("slots.toml");
+        std::fs::write(&path, "[slots.only]\nbinary = \"/tmp/bmux\"\n").unwrap();
+        let err = remove_slot_block(&path, "absent").unwrap_err();
+        assert!(matches!(err, SlotError::UnknownSlot { .. }));
+    }
+
+    #[test]
+    fn toml_string_literal_escapes_metas() {
+        assert_eq!(toml_string_literal("a"), "\"a\"");
+        assert_eq!(toml_string_literal(r#"say "hi""#), "\"say \\\"hi\\\"\"");
+        assert_eq!(toml_string_literal("a\\b"), "\"a\\\\b\"");
     }
 }

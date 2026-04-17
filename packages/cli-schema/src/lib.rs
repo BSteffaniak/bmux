@@ -522,6 +522,12 @@ pub enum Command {
         #[command(subcommand)]
         command: SlotCommand,
     },
+    /// Alias for `bmux slot ...` (same subcommand tree; useful alongside the
+    /// standalone `bmux-env` binary for symmetry).
+    Env {
+        #[command(subcommand)]
+        command: SlotCommand,
+    },
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -541,6 +547,9 @@ pub enum AuthCommand {
 }
 
 /// Slot-management commands.
+///
+/// Both `bmux slot ...` and `bmux env ...` map to this enum; they are
+/// aliases for the same implementation.
 #[derive(Debug, Subcommand)]
 pub enum SlotCommand {
     /// List all declared slots and the presentational default.
@@ -565,24 +574,61 @@ pub enum SlotCommand {
     /// Validate the slot manifest: names, duplicate runtime dirs, binaries,
     /// per-slot configs.
     Doctor,
-    /// Emit a TOML/JSON/Nix block that would register a new slot.
+    /// Register a new slot.
     ///
-    /// This is a read-only / dry-run operation in this pass of the CLI —
-    /// it prints the block to stdout. A companion xtask (`cargo xtask
-    /// install-slot`) lands in a follow-up.
+    /// Writes to `~/.config/bmux/slots.toml` and places `bmux-<name>` into
+    /// the bin dir. When the manifest is read-only (e.g. under /nix/store)
+    /// prints the block and exits with code 77 without touching disk.
     Install {
         /// Slot name (validates as `[A-Za-z0-9._-]+`, not reserved).
-        #[arg(long)]
         name: String,
-        /// Absolute path to the `bmux-<name>` binary.
-        #[arg(long)]
+        /// Path to the source `bmux` binary.
         binary: String,
         /// Disable base-config inheritance for this slot.
         #[arg(long)]
         no_inherit_base: bool,
-        /// Output format.
+        /// Symlink (default) or copy the binary into bin_dir.
+        #[arg(long, value_enum, default_value_t = SlotInstallMode::Symlink)]
+        mode: SlotInstallMode,
+        /// Destination bin dir for `bmux-<name>`. Defaults to ~/.local/bin
+        /// (or `$BMUX_SLOTS_BIN_DIR`).
+        #[arg(long)]
+        bin_dir: Option<std::path::PathBuf>,
+        /// Output format for the printed block.
         #[arg(long, value_enum, default_value_t = SlotOutputFormat::Toml)]
         format: SlotOutputFormat,
+        /// Do not modify disk; only print what would happen.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a slot from the manifest and delete its `bmux-<name>` binary.
+    Uninstall {
+        /// Slot name.
+        name: String,
+        /// Also remove the slot's config/data/state/log dirs.
+        #[arg(long)]
+        purge: bool,
+        /// Destination bin dir the slot binary lives in.
+        #[arg(long)]
+        bin_dir: Option<std::path::PathBuf>,
+    },
+    /// Print shell code that prepends `$BMUX_SLOTS_BIN_DIR` to `PATH`.
+    Shell {
+        #[arg(long, value_enum, default_value_t = SlotShellKind::Auto)]
+        shell: SlotShellKind,
+    },
+    /// Run a command with a slot's env applied (re-execs via execvp).
+    Exec {
+        /// Slot name to activate.
+        slot: String,
+        /// Command and arguments.
+        #[arg(trailing_var_arg = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Print the resolved env-var set as structured data.
+    Print {
+        #[arg(long, value_enum, default_value_t = SlotPrintFormat::Shell)]
+        format: SlotPrintFormat,
     },
 }
 
@@ -592,6 +638,36 @@ pub enum SlotOutputFormat {
     Toml,
     Json,
     Nix,
+}
+
+/// Shell dialect for `bmux slot shell` / `bmux env shell`.
+#[derive(Debug, Copy, Clone, clap::ValueEnum)]
+pub enum SlotShellKind {
+    Auto,
+    Bash,
+    Zsh,
+    Fish,
+    Nushell,
+    Powershell,
+    Posix,
+}
+
+/// Output format for `bmux slot print` / `bmux env print`.
+#[derive(Debug, Copy, Clone, clap::ValueEnum)]
+pub enum SlotPrintFormat {
+    Shell,
+    Json,
+    Nix,
+    Fish,
+}
+
+/// Placement mode for the per-slot binary during install.
+#[derive(Debug, Copy, Clone, clap::ValueEnum)]
+pub enum SlotInstallMode {
+    /// Symlink into the bin dir (default).
+    Symlink,
+    /// Copy into the bin dir.
+    Copy,
 }
 
 #[derive(Debug, Subcommand)]
