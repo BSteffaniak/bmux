@@ -108,6 +108,8 @@ pub struct PluginManifest {
     pub dependencies: Vec<PluginManifestDependency>,
     #[serde(default)]
     pub keybindings: PluginManifestKeybindings,
+    #[serde(default)]
+    pub ready_signals: Vec<bmux_plugin_sdk::ReadySignalDecl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -202,6 +204,7 @@ impl PluginManifest {
                 })
                 .collect::<Result<Vec<_>>>()?,
             lifecycle: crate::PluginLifecycle::default(),
+            ready_signals: self.ready_signals.clone(),
         };
         declaration.validate()?;
         Ok(declaration)

@@ -181,7 +181,7 @@ fn bundled_windows_manifest_exposes_window_command_service_interface() {
     let windows = bundled_manifest("bmux.windows");
 
     assert!(windows.services.iter().any(|service| {
-        service.interface_id == "window-command/v1"
+        service.interface_id == "windows-commands"
             && service.kind == bmux_plugin_sdk::ServiceKind::Command
     }));
 }

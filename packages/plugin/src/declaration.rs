@@ -141,6 +141,8 @@ pub struct PluginDeclaration {
     pub dependencies: Vec<PluginDependency>,
     #[serde(default)]
     pub lifecycle: PluginLifecycle,
+    #[serde(default)]
+    pub ready_signals: Vec<bmux_plugin_sdk::ReadySignalDecl>,
 }
 
 impl PluginDeclaration {
@@ -369,6 +371,7 @@ mod tests {
             event_subscriptions: Vec::new(),
             dependencies: Vec::new(),
             lifecycle: super::PluginLifecycle::default(),
+            ready_signals: Vec::new(),
         };
 
         assert!(declaration.validate().is_err());
@@ -412,6 +415,7 @@ mod tests {
             event_subscriptions: Vec::new(),
             dependencies: Vec::new(),
             lifecycle: super::PluginLifecycle::default(),
+            ready_signals: Vec::new(),
         };
 
         assert!(declaration.validate().is_ok());
@@ -453,6 +457,7 @@ mod tests {
                 },
             ],
             lifecycle: super::PluginLifecycle::default(),
+            ready_signals: Vec::new(),
         };
 
         assert!(declaration.validate().is_err());

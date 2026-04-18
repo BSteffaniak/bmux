@@ -8,6 +8,8 @@ use bmux_plugin_sdk::{
     ContextCloseRequest, ContextCreateRequest, ContextSelector, StorageGetRequest,
     StorageSetRequest,
 };
+use bmux_windows_plugin_api::windows_commands::{self, WindowAck};
+use bmux_windows_plugin_api::windows_state::{self, WindowEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
@@ -29,26 +31,26 @@ impl RustPlugin for WindowsPlugin {
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
-            "window-query/v1", "list" => |req: ListWindowsRequest, ctx| {
+            "windows-state", "list-windows" => |req: ListWindowsArgs, ctx| {
                 let windows = list_windows(ctx, req.session.as_deref())
                     .map_err(|e| ServiceResponse::error("list_failed", e))?;
-                Ok(ListWindowsResponse { windows })
+                Ok(windows)
             },
-            "window-command/v1", "new" => |req: NewWindowRequest, ctx| {
+            "windows-commands", "new-window" => |req: NewWindowArgs, ctx| {
                 create_window(ctx, req.name)
                     .map_err(|e| ServiceResponse::error("new_failed", e))
             },
-            "window-command/v1", "kill" => |req: KillWindowRequest, ctx| {
+            "windows-commands", "kill-window" => |req: KillWindowArgs, ctx| {
                 let selector = parse_selector(&req.target)
                     .map_err(|e| ServiceResponse::error("invalid_request", e))?;
                 kill_window(ctx, selector, req.force_local)
                     .map_err(|e| ServiceResponse::error("kill_failed", e))
             },
-            "window-command/v1", "kill_all" => |req: KillAllWindowsRequest, ctx| {
+            "windows-commands", "kill-all-windows" => |req: KillAllWindowsArgs, ctx| {
                 kill_all_windows(ctx, req.force_local)
                     .map_err(|e| ServiceResponse::error("kill_failed", e))
             },
-            "window-command/v1", "switch" => |req: SwitchWindowRequest, ctx| {
+            "windows-commands", "switch-window" => |req: SwitchWindowArgs, ctx| {
                 let selector = parse_selector(&req.target)
                     .map_err(|e| ServiceResponse::error("invalid_request", e))?;
                 switch_window(ctx, selector, &mut self.last_selected_by_client)
@@ -77,8 +79,9 @@ fn handle_command(
             let as_json = has_flag(&context.arguments, "json");
             let windows = list_windows(context, session_filter.as_deref())?;
             if as_json {
-                let output = serde_json::to_string_pretty(&ListWindowsResponse { windows })
-                    .map_err(|error| error.to_string())?;
+                let output =
+                    serde_json::to_string_pretty(&serde_json::json!({ "windows": windows }))
+                        .map_err(|error| error.to_string())?;
                 println!("{output}");
             } else if windows.is_empty() {
                 println!("no windows");
@@ -241,10 +244,7 @@ fn list_windows(
         .collect())
 }
 
-fn create_window(
-    caller: &impl HostRuntimeApi,
-    name: Option<String>,
-) -> Result<WindowCommandAck, String> {
+fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<WindowAck, String> {
     let resolved_name = name.or_else(|| {
         caller
             .context_list()
@@ -265,7 +265,7 @@ fn create_window(
         let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
     }
     let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
-    Ok(WindowCommandAck {
+    Ok(WindowAck {
         ok: true,
         id: Some(context_id.to_string()),
     })
@@ -289,23 +289,20 @@ fn kill_window(
     caller: &impl HostRuntimeApi,
     selector: ContextSelector,
     force_local: bool,
-) -> Result<WindowCommandAck, String> {
+) -> Result<WindowAck, String> {
     let response = caller
         .context_close(&ContextCloseRequest {
             selector,
             force: force_local,
         })
         .map_err(|error| error.to_string())?;
-    Ok(WindowCommandAck {
+    Ok(WindowAck {
         ok: true,
         id: Some(response.id.to_string()),
     })
 }
 
-fn kill_all_windows(
-    caller: &impl HostRuntimeApi,
-    force_local: bool,
-) -> Result<WindowCommandAck, String> {
+fn kill_all_windows(caller: &impl HostRuntimeApi, force_local: bool) -> Result<WindowAck, String> {
     let contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
@@ -318,7 +315,7 @@ fn kill_all_windows(
             })
             .map_err(|error| error.to_string())?;
     }
-    Ok(WindowCommandAck { ok: true, id: None })
+    Ok(WindowAck { ok: true, id: None })
 }
 
 #[allow(clippy::needless_pass_by_value)] // Plugin command dispatch passes owned selector from deserialized request
@@ -326,7 +323,7 @@ fn switch_window(
     caller: &impl HostRuntimeApi,
     selector: ContextSelector,
     last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
-) -> Result<WindowCommandAck, String> {
+) -> Result<WindowAck, String> {
     let contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
@@ -350,7 +347,7 @@ fn switch_window(
         let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
     }
     let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
-    Ok(WindowCommandAck {
+    Ok(WindowAck {
         ok: true,
         id: Some(context_id.to_string()),
     })
@@ -361,7 +358,7 @@ fn cycle_window(
     caller: &impl HostRuntimeApi,
     direction: WindowCycleDirection,
     last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
-) -> Result<WindowCommandAck, String> {
+) -> Result<WindowAck, String> {
     let contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
@@ -413,7 +410,7 @@ fn goto_window_by_index(
     caller: &impl HostRuntimeApi,
     index: usize,
     last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
-) -> Result<WindowCommandAck, String> {
+) -> Result<WindowAck, String> {
     if index == 0 {
         return Err("window index must be 1 or greater".to_string());
     }
@@ -444,7 +441,7 @@ fn goto_window_by_index(
 fn close_current_window(
     caller: &impl HostRuntimeApi,
     last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
-) -> Result<WindowCommandAck, String> {
+) -> Result<WindowAck, String> {
     let contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
@@ -480,7 +477,7 @@ fn close_current_window(
         })
         .map_err(|error| error.to_string())?;
 
-    Ok(WindowCommandAck {
+    Ok(WindowAck {
         ok: true,
         id: Some(current_id.to_string()),
     })
@@ -697,51 +694,49 @@ fn positional_value(arguments: &[String]) -> Option<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListWindowsRequest {
+struct ListWindowsArgs {
     session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct NewWindowRequest {
+struct NewWindowArgs {
     name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct KillWindowRequest {
+struct KillWindowArgs {
     target: String,
     force_local: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct KillAllWindowsRequest {
+struct KillAllWindowsArgs {
     force_local: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SwitchWindowRequest {
+struct SwitchWindowArgs {
     target: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct WindowEntry {
-    id: String,
-    name: String,
-    active: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListWindowsResponse {
-    windows: Vec<WindowEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct WindowCommandAck {
-    ok: bool,
-    #[serde(default)]
-    id: Option<String>,
 }
 
 bmux_plugin_sdk::export_plugin!(WindowsPlugin, include_str!("../plugin.toml"));
+
+// Compile-time guards: ensure the string literals used in `route_service!`
+// and `plugin.toml` stay in sync with the BPDL-declared interface ids.
+const _: () = {
+    const fn assert_str_eq(a: &str, b: &str) {
+        assert!(a.len() == b.len());
+        let a_bytes = a.as_bytes();
+        let b_bytes = b.as_bytes();
+        let mut i = 0;
+        while i < a_bytes.len() {
+            assert!(a_bytes[i] == b_bytes[i]);
+            i += 1;
+        }
+    }
+    assert_str_eq(windows_state::INTERFACE_ID, "windows-state");
+    assert_str_eq(windows_commands::INTERFACE_ID, "windows-commands");
+};
 
 #[cfg(test)]
 mod tests {
@@ -1684,9 +1679,9 @@ mod tests {
     fn invoke_service_new_returns_ack_with_id() {
         let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
-            "window-command/v1",
-            "new",
-            encode_service_message(&NewWindowRequest {
+            "windows-commands",
+            "new-window",
+            encode_service_message(&NewWindowArgs {
                 name: Some("ok".to_string()),
             })
             .expect("request should encode"),
@@ -1700,8 +1695,7 @@ mod tests {
             "unexpected error: {:?}",
             response.error
         );
-        let ack: WindowCommandAck =
-            decode_service_message(&response.payload).expect("ack should decode");
+        let ack: WindowAck = decode_service_message(&response.payload).expect("ack should decode");
         assert!(ack.ok);
         assert!(ack.id.is_some());
     }
@@ -1710,9 +1704,9 @@ mod tests {
     fn invoke_service_new_surfaces_denied_error() {
         let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
-            "window-command/v1",
-            "new",
-            encode_service_message(&NewWindowRequest {
+            "windows-commands",
+            "new-window",
+            encode_service_message(&NewWindowArgs {
                 name: Some("deny".to_string()),
             })
             .expect("request should encode"),
@@ -1730,9 +1724,9 @@ mod tests {
     fn invoke_service_switch_returns_ack_with_selected_id() {
         let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
-            "window-command/v1",
-            "switch",
-            encode_service_message(&SwitchWindowRequest {
+            "windows-commands",
+            "switch-window",
+            encode_service_message(&SwitchWindowArgs {
                 target: "alpha".to_string(),
             })
             .expect("request should encode"),
@@ -1746,8 +1740,7 @@ mod tests {
             "unexpected error: {:?}",
             response.error
         );
-        let ack: WindowCommandAck =
-            decode_service_message(&response.payload).expect("ack should decode");
+        let ack: WindowAck = decode_service_message(&response.payload).expect("ack should decode");
         assert!(ack.ok);
         assert!(ack.id.is_some_and(|id| !id.is_empty()));
     }
@@ -1756,8 +1749,8 @@ mod tests {
     fn invoke_service_rejects_invalid_payload() {
         let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
-            "window-command/v1",
-            "kill",
+            "windows-commands",
+            "kill-window",
             vec![1, 2, 3],
             "bmux.windows.write",
             ServiceKind::Command,
@@ -1772,9 +1765,9 @@ mod tests {
     fn invoke_service_kill_surfaces_denied_error() {
         let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
-            "window-command/v1",
-            "kill",
-            encode_service_message(&KillWindowRequest {
+            "windows-commands",
+            "kill-window",
+            encode_service_message(&KillWindowArgs {
                 target: "deny".to_string(),
                 force_local: false,
             })
@@ -1793,7 +1786,7 @@ mod tests {
     fn invoke_service_rejects_unsupported_operation() {
         let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
-            "window-command/v1",
+            "windows-commands",
             "unknown",
             Vec::new(),
             "bmux.windows.write",

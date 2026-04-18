@@ -46,6 +46,7 @@ mod host_services;
 mod native_exports;
 mod process_runtime;
 pub mod prompt;
+mod ready;
 mod service;
 pub mod typed_dispatch;
 mod version;
@@ -68,7 +69,7 @@ pub use context::{
 };
 pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};
-pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost};
+pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost, ResolvedService};
 pub use host_services::{
     ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
     ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
@@ -92,11 +93,16 @@ pub use process_runtime::{
     decode_process_invocation_response, decode_process_runtime_frame,
     encode_process_invocation_request, encode_process_runtime_frame,
 };
+pub use ready::{ReadySignalDecl, ReadyStatus, ReadyTracker};
 pub use service::{
     CURRENT_SERVICE_PROTOCOL_VERSION, PluginService, ProviderId, RegisteredService,
     ServiceEnvelope, ServiceEnvelopeKind, ServiceError, ServiceKind, ServiceProtocolVersion,
     ServiceRequest, ServiceResponse, decode_service_envelope, decode_service_message,
     encode_service_envelope, encode_service_message,
+};
+pub use typed_dispatch::{
+    InProcessTypedDispatch, TypedDispatchError, TypedProviderCell, TypedServiceHandle,
+    TypedServiceKey, TypedServiceRegistry,
 };
 pub use version::{ApiVersion, VersionRange};
 
@@ -275,7 +281,7 @@ pub mod prelude {
 pub mod __private {
     pub use crate::native_exports::{
         activate_export, deactivate_export, handle_event_export, invoke_service_export,
-        manifest_toml_ptr, plugin_instance, run_command_export,
+        manifest_toml_ptr, plugin_instance, register_typed_services_bundled, run_command_export,
     };
 }
 
@@ -424,6 +430,10 @@ macro_rules! bundled_plugin_vtable {
             )
         }
 
+        fn __register_typed_services() -> $crate::TypedServiceRegistry {
+            $crate::__private::register_typed_services_bundled(__instance())
+        }
+
         $crate::StaticPluginVtable {
             entry: __entry,
             run_command_with_context: __run_command_with_context,
@@ -431,6 +441,7 @@ macro_rules! bundled_plugin_vtable {
             deactivate: __deactivate,
             handle_event: __handle_event,
             invoke_service: __invoke_service,
+            register_typed_services: __register_typed_services,
         }
     }};
 }
@@ -444,6 +455,7 @@ pub struct StaticPluginVtable {
     pub deactivate: fn(*const u8, usize) -> i32,
     pub handle_event: fn(*const u8, usize) -> i32,
     pub invoke_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
+    pub register_typed_services: fn() -> TypedServiceRegistry,
 }
 
 impl std::fmt::Debug for StaticPluginVtable {

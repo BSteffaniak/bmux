@@ -1824,6 +1824,7 @@ mod tests {
             event_subscriptions: Vec::new(),
             dependencies: Vec::new(),
             lifecycle: bmux_plugin::PluginLifecycle::default(),
+            ready_signals: Vec::new(),
         };
         let context = plugin_lifecycle_context(
             &config,
@@ -1998,6 +1999,7 @@ mod tests {
             event_subscriptions: Vec::new(),
             dependencies: Vec::new(),
             lifecycle: bmux_plugin::PluginLifecycle::default(),
+            ready_signals: Vec::new(),
         };
 
         let context = plugin_command_context(

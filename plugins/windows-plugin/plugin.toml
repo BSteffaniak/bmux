@@ -27,13 +27,18 @@ version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.windows.read"
-interface_id = "window-query/v1"
+interface_id = "windows-state"
 kind         = "query"
 
 [[services]]
 capability   = "bmux.windows.write"
-interface_id = "window-command/v1"
+interface_id = "windows-commands"
 kind         = "command"
+
+[[services]]
+capability   = "bmux.windows.read"
+interface_id = "windows-events"
+kind         = "event"
 
 [[commands]]
 aliases       = [["window", "new"]]

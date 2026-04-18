@@ -801,7 +801,7 @@ provided_capabilities = ["bmux.windows.read"]
 [[services]]
 capability = "bmux.windows.read"
 kind = "query"
-interface_id = "window-query/v1"
+interface_id = "windows-state"
 
 [plugin_api]
 minimum = "1.0"
@@ -823,7 +823,7 @@ provided_capabilities = ["bmux.windows.read"]
 [[services]]
 capability = "bmux.windows.read"
 kind = "query"
-interface_id = "window-query/v1"
+interface_id = "windows-state"
 
 [plugin_api]
 minimum = "1.0"
@@ -848,7 +848,7 @@ minimum = "1.0"
         let key = (
             HostScope::new("bmux.windows.read").expect("scope should parse"),
             bmux_plugin_sdk::ServiceKind::Query,
-            "window-query/v1".to_string(),
+            "windows-state".to_string(),
         );
         let selected = providers
             .get(&key)

@@ -172,6 +172,77 @@ fn emit_service_trait(iface: &Interface, imports: &ImportMap, out: &mut String) 
         }
     }
     out.push_str("    }\n\n");
+
+    emit_service_client(iface, imports, out, &trait_name);
+}
+
+fn emit_service_client(iface: &Interface, imports: &ImportMap, out: &mut String, trait_name: &str) {
+    let client_name = format!("{}Client", pascal_case(&iface.name));
+    out.push_str("    /// Typed client for this interface.\n");
+    out.push_str("    ///\n");
+    out.push_str("    /// Holds an `Arc<dyn ...Service + Send + Sync>` and forwards every\n");
+    out.push_str("    /// method to the underlying provider. Construct via\n");
+    out.push_str("    /// [`Client::from_handle`] against a resolved typed service handle.\n");
+    out.push_str("    #[derive(Clone)]\n");
+    let _ = writeln!(out, "    pub struct {client_name} {{");
+    let _ = writeln!(
+        out,
+        "        inner: ::std::sync::Arc<dyn {trait_name} + Send + Sync>,",
+    );
+    out.push_str("    }\n\n");
+
+    let _ = writeln!(out, "    impl {client_name} {{");
+    out.push_str("        /// Construct directly from a concrete `Arc` to a provider.\n");
+    out.push_str("        #[must_use]\n");
+    let _ = writeln!(
+        out,
+        "        pub fn new(provider: ::std::sync::Arc<dyn {trait_name} + Send + Sync>) -> Self {{",
+    );
+    out.push_str("            Self { inner: provider }\n");
+    out.push_str("        }\n\n");
+
+    out.push_str("        /// Borrow the inner provider as a trait reference.\n");
+    out.push_str("        #[must_use]\n");
+    let _ = writeln!(
+        out,
+        "        pub fn as_service(&self) -> &(dyn {trait_name} + Send + Sync) {{",
+    );
+    out.push_str("            &*self.inner\n");
+    out.push_str("        }\n");
+
+    // Forward every query/command through the trait.
+    for item in &iface.items {
+        if let InterfaceItem::Query(op) | InterfaceItem::Command(op) = item {
+            emit_client_forwarder(op, imports, out);
+        }
+    }
+
+    out.push_str("    }\n\n");
+}
+
+fn emit_client_forwarder(op: &Operation, imports: &ImportMap, out: &mut String) {
+    let name = snake_case(&op.name);
+    let params = op
+        .params
+        .iter()
+        .map(|f: &Field| format!("{}: {}", snake_case(&f.name), rust_type(&f.ty, imports)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let returns = rust_type(&op.returns, imports);
+    let sep = if op.params.is_empty() { "" } else { ", " };
+    let arg_names = op
+        .params
+        .iter()
+        .map(|f| snake_case(&f.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str("\n        /// Forward to the provider's trait method.\n");
+    let _ = writeln!(
+        out,
+        "        pub fn {name}<'a>(&'a self{sep}{params}) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = {returns}> + Send + 'a>> {{",
+    );
+    let _ = writeln!(out, "            self.inner.{name}({arg_names})");
+    out.push_str("        }\n");
 }
 
 fn emit_operation_signature(op: &Operation, imports: &ImportMap, out: &mut String) {
@@ -348,6 +419,42 @@ mod tests {
         assert!(rust.contains("fn focus_pane"));
         assert!(rust.contains("Option<PaneState>"));
         assert!(rust.contains("::std::result::Result<(), String>"));
+    }
+
+    #[test]
+    fn emits_service_client_with_forwarders() {
+        let src = "plugin p version 1;\n\
+                   interface windows-state {\n\
+                     record pane-state { id: uuid }\n\
+                     query pane-state(id: uuid) -> pane-state?;\n\
+                     command focus-pane(id: uuid) -> result<unit, string>;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            rust.contains("pub struct WindowsStateClient"),
+            "client wrapper not emitted; got: {rust}"
+        );
+        assert!(
+            rust.contains("inner: ::std::sync::Arc<dyn WindowsStateService + Send + Sync>"),
+            "client wrapper should hold Arc<dyn Service + Send + Sync>; got: {rust}"
+        );
+        assert!(
+            rust.contains("pub fn new("),
+            "client should have new ctor; got: {rust}"
+        );
+        assert!(
+            rust.contains("pub fn as_service"),
+            "client should expose as_service borrow; got: {rust}"
+        );
+        assert!(
+            rust.contains("self.inner.pane_state("),
+            "client should forward pane_state through inner; got: {rust}"
+        );
+        assert!(
+            rust.contains("self.inner.focus_pane("),
+            "client should forward focus_pane through inner; got: {rust}"
+        );
     }
 
     #[test]

@@ -1549,6 +1549,7 @@ dependencies = [
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_windows_plugin_api",
  "serde",
  "serde_json",
  "uuid",

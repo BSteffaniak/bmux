@@ -1,39 +1,33 @@
 //! Typed interface dispatch for plugin-to-plugin calls.
 //!
-//! BPDL schemas generate typed consumer traits (e.g.,
-//! `WindowsState`) that plugins implement and consume. This module
-//! provides the primitives that bridge those typed traits to the
-//! untyped [`crate::ServiceRequest`] / [`crate::ServiceResponse`]
-//! transport the plugin host already speaks.
+//! BPDL schemas generate typed service traits (e.g. `WindowsStateService`)
+//! that plugins implement and consume. This module provides the primitives
+//! that bridge those typed traits to the untyped [`crate::ServiceRequest`]
+//! / [`crate::ServiceResponse`] transport the plugin host already speaks.
 //!
 //! # Model
 //!
-//! - The **provider** plugin implements the BPDL-generated trait (e.g.
-//!   `impl WindowsState for MyWindowsPlugin`).
-//! - The **consumer** plugin resolves a handle via
-//!   [`crate::PluginHost::resolve_service`] and receives a
-//!   [`TypedServiceHandle`], which wraps the untyped service transport
-//!   in a way that's ergonomic to call from generated client stubs.
+//! - The **provider** plugin implements the BPDL-generated service trait
+//!   (e.g. `impl WindowsStateService for MyPlugin`). During plugin init
+//!   the provider registers an `Arc<Self>` as a typed handle via
+//!   [`TypedServiceRegistry`].
+//! - The **consumer** plugin resolves a typed handle via
+//!   [`crate::PluginHost::resolve_service`] and obtains a reference to
+//!   the generated `<Iface>Client` wrapper, whose methods call into the
+//!   provider's trait directly without serialization.
 //!
-//! # Serialization
+//! # Serialization fallback
 //!
-//! Calls across the plugin boundary serialize parameters as
-//! `serde_json::Value` inside [`crate::ServiceRequest::payload`]. The
-//! typed client stub serializes typed args into JSON, sends the request,
-//! and deserializes the typed response. When both provider and consumer
-//! are native Rust plugins loaded into the same process, an optimized
-//! "in-process" fast path skips serialization and passes typed values
-//! directly via [`InProcessTypedDispatch`].
-//!
-//! # Extensibility
-//!
-//! Non-Rust SDKs (TypeScript, Python, …) implement the same wire format
-//! — serialized JSON parameters inside `ServiceRequest::payload` — and
-//! gain the same plugin-to-plugin capability automatically.
+//! When the provider and consumer are not in the same process (or the
+//! consumer is a non-Rust SDK), the byte-encoded
+//! [`crate::ServiceRequest`] transport is used instead. The typed
+//! [`InProcessTypedDispatch`] helpers serialize and deserialize JSON
+//! payloads so non-Rust SDKs can interoperate.
 
 use crate::{HostScope, PluginError, Result, ServiceKind};
 use serde::{Serialize, de::DeserializeOwned};
-use std::any::Any;
+use std::any::{Any, TypeId};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Errors returned by typed-dispatch operations that are distinct from
@@ -58,24 +52,70 @@ pub enum TypedDispatchError {
     },
 }
 
+/// Concrete cell holding an `Arc<S>` where `S` may be an unsized trait object.
+///
+/// `Any` only works on sized types, so providers cannot be downcast directly
+/// from `Arc<dyn Any>` to `Arc<dyn SomeTrait>`. The cell sidesteps that by
+/// being a sized, concrete `Any` type that carries the `Arc<S>` inside.
+///
+/// Generated client wrappers resolve a typed handle by asking for a
+/// `TypedProviderCell<dyn SomeService + Send + Sync>` and extracting
+/// the inner `Arc` for their trait object.
+pub struct TypedProviderCell<S: ?Sized + 'static> {
+    provider: Arc<S>,
+}
+
+impl<S: ?Sized + 'static> TypedProviderCell<S> {
+    /// Construct a new cell wrapping `provider`.
+    #[must_use]
+    pub const fn new(provider: Arc<S>) -> Self {
+        Self { provider }
+    }
+
+    /// Borrow the inner `Arc<S>`.
+    #[must_use]
+    pub const fn inner(&self) -> &Arc<S> {
+        &self.provider
+    }
+
+    /// Consume the cell and return the inner `Arc<S>`.
+    #[must_use]
+    pub fn into_inner(self) -> Arc<S> {
+        self.provider
+    }
+}
+
 /// A typed reference to a provider plugin's interface impl.
 ///
-/// In the current revision this is a narrow wrapper around a
-/// type-erased `Arc<dyn Any + Send + Sync>`. Generated client stubs
-/// downcast it to the specific BPDL-generated trait object at each call
-/// site. As the plugin host grows full runtime-dispatch support,
-/// [`TypedServiceHandle`] will expand with routing metadata
-/// (interface id, provider id, protocol version).
+/// Internally the handle stores a type-erased `Arc<dyn Any + Send + Sync>`
+/// whose concrete type is a [`TypedProviderCell<S>`]. Generated client
+/// wrappers use [`Self::provider_as_trait`] to recover `Arc<S>`.
 pub struct TypedServiceHandle {
     capability: HostScope,
     interface_id: String,
     kind: ServiceKind,
     provider: Arc<dyn Any + Send + Sync>,
+    provider_type: TypeId,
+    provider_type_name: &'static str,
+}
+
+impl std::fmt::Debug for TypedServiceHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedServiceHandle")
+            .field("capability", &self.capability)
+            .field("interface_id", &self.interface_id)
+            .field("kind", &self.kind)
+            .field("provider_type_name", &self.provider_type_name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TypedServiceHandle {
-    /// Construct a typed handle. Intended to be called by the plugin
-    /// host when a provider registers its typed impl.
+    /// Construct a typed handle from an `Arc` whose concrete type is
+    /// already `Any`-compatible (i.e. `Sized`).
+    ///
+    /// Prefer [`Self::new_typed`] when the provider is addressed via a
+    /// trait object.
     #[must_use]
     pub fn new(
         capability: HostScope,
@@ -83,11 +123,39 @@ impl TypedServiceHandle {
         kind: ServiceKind,
         provider: Arc<dyn Any + Send + Sync>,
     ) -> Self {
+        let provider_type = (*provider).type_id();
         Self {
             capability,
             interface_id: interface_id.into(),
             kind,
             provider,
+            provider_type,
+            provider_type_name: "<Arc<dyn Any>>",
+        }
+    }
+
+    /// Construct a typed handle from an `Arc<S>` where `S` may be a
+    /// trait object (`dyn Trait + Send + Sync`).
+    ///
+    /// The handle stores the `Arc<S>` inside a [`TypedProviderCell<S>`]
+    /// so callers can later retrieve it via
+    /// [`Self::provider_as_trait::<S>()`].
+    #[must_use]
+    pub fn new_typed<S: ?Sized + Send + Sync + 'static>(
+        capability: HostScope,
+        interface_id: impl Into<String>,
+        kind: ServiceKind,
+        provider: Arc<S>,
+    ) -> Self {
+        let cell: Arc<TypedProviderCell<S>> = Arc::new(TypedProviderCell::new(provider));
+        let erased: Arc<dyn Any + Send + Sync> = cell;
+        Self {
+            capability,
+            interface_id: interface_id.into(),
+            kind,
+            provider: erased,
+            provider_type: TypeId::of::<TypedProviderCell<S>>(),
+            provider_type_name: std::any::type_name::<TypedProviderCell<S>>(),
         }
     }
 
@@ -106,13 +174,12 @@ impl TypedServiceHandle {
         self.kind
     }
 
-    /// Downcast the provider to a concrete type. Generated client stubs
-    /// use this to obtain a reference to the trait impl they were
-    /// compiled against.
+    /// Downcast the provider to a concrete sized type. Callers that
+    /// need a trait object should use [`Self::provider_as_trait`] instead.
     ///
     /// # Errors
     ///
-    /// Returns [`TypedDispatchError::TypeMismatch`] if the registered
+    /// Returns [`PluginError::ServiceProtocol`] if the registered
     /// provider cannot be downcast to `T`.
     pub fn provider_as<T: Any + Send + Sync>(&self) -> Result<Arc<T>> {
         Arc::clone(&self.provider)
@@ -124,14 +191,125 @@ impl TypedServiceHandle {
                 ),
             })
     }
+
+    /// Recover the inner `Arc<S>` when the provider was registered via
+    /// [`Self::new_typed::<S>`]. `S` may be a trait object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::ServiceProtocol`] if the stored cell's
+    /// inner type does not match the requested `S`.
+    pub fn provider_as_trait<S: ?Sized + Send + Sync + 'static>(&self) -> Result<Arc<S>> {
+        if self.provider_type != TypeId::of::<TypedProviderCell<S>>() {
+            return Err(PluginError::ServiceProtocol {
+                details: format!(
+                    "typed dispatch type mismatch for interface '{}': requested {}, registered {}",
+                    self.interface_id,
+                    std::any::type_name::<TypedProviderCell<S>>(),
+                    self.provider_type_name,
+                ),
+            });
+        }
+        let cell: Arc<TypedProviderCell<S>> = Arc::clone(&self.provider)
+            .downcast::<TypedProviderCell<S>>()
+            .map_err(|_| PluginError::ServiceProtocol {
+                details: format!(
+                    "typed dispatch downcast failed for interface '{}'",
+                    self.interface_id
+                ),
+            })?;
+        Ok(Arc::clone(cell.inner()))
+    }
 }
 
-/// In-process typed dispatch for calls between two native Rust plugins
-/// in the same process. Serialization-free and synchronous.
+/// Key used to uniquely identify a typed service entry.
+pub type TypedServiceKey = (HostScope, ServiceKind, String);
+
+/// Collection of typed service handles a plugin provides.
 ///
-/// Non-native plugin consumers use the serialized `ServiceRequest`
-/// transport in [`crate::service`] instead; the plugin host decides
-/// which path to take based on where the provider lives.
+/// Plugins populate the registry during `register_typed_services`; the
+/// host merges all registries into a lookup map keyed by
+/// `(capability, kind, interface_id)`.
+#[derive(Default)]
+pub struct TypedServiceRegistry {
+    entries: BTreeMap<TypedServiceKey, TypedServiceHandle>,
+}
+
+impl TypedServiceRegistry {
+    /// Construct an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a typed service handle. Replaces any existing entry under
+    /// the same key.
+    pub fn insert(&mut self, handle: TypedServiceHandle) {
+        let key = (
+            handle.capability.clone(),
+            handle.kind,
+            handle.interface_id.clone(),
+        );
+        self.entries.insert(key, handle);
+    }
+
+    /// Build a typed handle from an `Arc<S>` (where `S` may be a trait
+    /// object) and insert it into the registry.
+    pub fn insert_typed<S: ?Sized + Send + Sync + 'static>(
+        &mut self,
+        capability: HostScope,
+        kind: ServiceKind,
+        interface_id: impl Into<String>,
+        provider: Arc<S>,
+    ) {
+        self.insert(TypedServiceHandle::new_typed(
+            capability,
+            interface_id,
+            kind,
+            provider,
+        ));
+    }
+
+    /// Return the number of registered handles.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the registry has any entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterate over every registered typed handle.
+    pub fn iter(&self) -> impl Iterator<Item = (&TypedServiceKey, &TypedServiceHandle)> {
+        self.entries.iter()
+    }
+
+    /// Look up a handle by key.
+    #[must_use]
+    pub fn get(
+        &self,
+        capability: &HostScope,
+        kind: ServiceKind,
+        interface_id: &str,
+    ) -> Option<&TypedServiceHandle> {
+        self.entries
+            .get(&(capability.clone(), kind, interface_id.to_string()))
+    }
+
+    /// Consume the registry and return the underlying map.
+    #[must_use]
+    pub fn into_entries(self) -> BTreeMap<TypedServiceKey, TypedServiceHandle> {
+        self.entries
+    }
+}
+
+/// Helpers for round-tripping typed calls across serialized transport.
+///
+/// Used by generated client stubs when the provider is not in-process
+/// (non-Rust SDK, separate process, etc.).
 pub struct InProcessTypedDispatch;
 
 impl InProcessTypedDispatch {
@@ -139,7 +317,7 @@ impl InProcessTypedDispatch {
     ///
     /// # Errors
     ///
-    /// Returns [`TypedDispatchError::Serialize`] if the typed arguments
+    /// Returns [`PluginError::ServiceProtocol`] if the typed arguments
     /// cannot be JSON-encoded.
     pub fn encode_args<T: Serialize>(args: &T) -> Result<Vec<u8>> {
         serde_json::to_vec(args).map_err(|err| PluginError::ServiceProtocol {
@@ -151,8 +329,8 @@ impl InProcessTypedDispatch {
     ///
     /// # Errors
     ///
-    /// Returns [`TypedDispatchError::Deserialize`] if the bytes cannot
-    /// be JSON-decoded into `T`.
+    /// Returns [`PluginError::ServiceProtocol`] if the bytes cannot be
+    /// JSON-decoded into `T`.
     pub fn decode_response<T: DeserializeOwned>(payload: &[u8]) -> Result<T> {
         serde_json::from_slice(payload).map_err(|err| PluginError::ServiceProtocol {
             details: format!("typed dispatch deserialize: {err}"),
@@ -166,6 +344,17 @@ mod tests {
 
     struct Dummy {
         value: u32,
+    }
+
+    trait Greeter: Send + Sync {
+        fn greet(&self) -> String;
+    }
+
+    struct Hello;
+    impl Greeter for Hello {
+        fn greet(&self) -> String {
+            "hi".into()
+        }
     }
 
     #[test]
@@ -191,6 +380,63 @@ mod tests {
             provider,
         );
         assert!(handle.provider_as::<u64>().is_err());
+    }
+
+    #[test]
+    fn new_typed_round_trips_trait_object() {
+        let hello: Arc<dyn Greeter + Send + Sync> = Arc::new(Hello);
+        let handle = TypedServiceHandle::new_typed::<dyn Greeter + Send + Sync>(
+            HostScope::new("bmux.example").expect("cap"),
+            "greeter-iface",
+            ServiceKind::Query,
+            hello,
+        );
+        let recovered = handle
+            .provider_as_trait::<dyn Greeter + Send + Sync>()
+            .expect("round-trip");
+        assert_eq!(recovered.greet(), "hi");
+    }
+
+    #[test]
+    fn provider_as_trait_rejects_wrong_trait() {
+        #[allow(dead_code)]
+        trait Shouter: Send + Sync {
+            fn shout(&self) -> String;
+        }
+
+        let hello: Arc<dyn Greeter + Send + Sync> = Arc::new(Hello);
+        let handle = TypedServiceHandle::new_typed::<dyn Greeter + Send + Sync>(
+            HostScope::new("bmux.example").expect("cap"),
+            "greeter-iface",
+            ServiceKind::Query,
+            hello,
+        );
+        assert!(
+            handle
+                .provider_as_trait::<dyn Shouter + Send + Sync>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn registry_insert_and_lookup_by_key() {
+        let hello: Arc<dyn Greeter + Send + Sync> = Arc::new(Hello);
+        let cap = HostScope::new("bmux.example").expect("cap");
+        let mut registry = TypedServiceRegistry::new();
+        registry.insert_typed::<dyn Greeter + Send + Sync>(
+            cap.clone(),
+            ServiceKind::Query,
+            "greeter-iface",
+            hello,
+        );
+        assert_eq!(registry.len(), 1);
+        let handle = registry
+            .get(&cap, ServiceKind::Query, "greeter-iface")
+            .expect("lookup");
+        let greeter = handle
+            .provider_as_trait::<dyn Greeter + Send + Sync>()
+            .expect("trait recover");
+        assert_eq!(greeter.greet(), "hi");
     }
 
     #[test]

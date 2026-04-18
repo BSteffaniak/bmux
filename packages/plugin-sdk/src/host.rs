@@ -1,4 +1,4 @@
-use crate::{HostScope, PluginError, RegisteredService, Result, ServiceKind};
+use crate::{HostScope, PluginError, RegisteredService, Result, ServiceKind, TypedServiceHandle};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -18,6 +18,47 @@ pub struct HostConnectionInfo {
     pub state_dir: String,
 }
 
+/// Result of looking up a registered service with optional typed dispatch.
+///
+/// Always carries the descriptor; optionally carries an in-process typed
+/// handle when the provider is a native Rust plugin that registered a
+/// trait impl via `register_typed_services`.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedService<'a> {
+    descriptor: &'a RegisteredService,
+    typed: Option<&'a TypedServiceHandle>,
+}
+
+impl<'a> ResolvedService<'a> {
+    /// Construct a resolved service.
+    #[must_use]
+    pub const fn new(
+        descriptor: &'a RegisteredService,
+        typed: Option<&'a TypedServiceHandle>,
+    ) -> Self {
+        Self { descriptor, typed }
+    }
+
+    /// The service descriptor carrying capability, kind, interface id,
+    /// and provider identity.
+    #[must_use]
+    pub const fn descriptor(&self) -> &'a RegisteredService {
+        self.descriptor
+    }
+
+    /// The typed handle, if the provider registered one in-process.
+    #[must_use]
+    pub const fn typed(&self) -> Option<&'a TypedServiceHandle> {
+        self.typed
+    }
+}
+
+impl AsRef<RegisteredService> for ResolvedService<'_> {
+    fn as_ref(&self) -> &RegisteredService {
+        self.descriptor
+    }
+}
+
 pub trait PluginHost: Send + Sync {
     fn plugin_id(&self) -> &str;
     fn metadata(&self) -> &HostMetadata;
@@ -31,6 +72,20 @@ pub trait PluginHost: Send + Sync {
     }
 
     fn available_services(&self) -> &[RegisteredService];
+
+    /// Return the typed handle for a given service key, if one was
+    /// registered by an in-process provider.
+    ///
+    /// The default implementation always returns `None`; hosts that
+    /// support typed dispatch override this to look up their typed map.
+    fn typed_handle(
+        &self,
+        _capability: &HostScope,
+        _kind: ServiceKind,
+        _interface_id: &str,
+    ) -> Option<&TypedServiceHandle> {
+        None
+    }
 
     /// Resolve a registered service by capability, kind, and interface ID.
     ///
@@ -70,6 +125,28 @@ pub trait PluginHost: Send + Sync {
                     interface_id,
                 ),
             })
+    }
+
+    /// Resolve a registered service and any in-process typed handle
+    /// registered for it.
+    ///
+    /// Consumers that can use typed dispatch call this variant and, if
+    /// a typed handle is present, bypass byte-encoded calls by invoking
+    /// the provider's trait directly. Consumers with no typed support
+    /// use [`Self::resolve_service`] and the byte transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::resolve_service`].
+    fn resolve_typed_service(
+        &self,
+        capability: &HostScope,
+        kind: ServiceKind,
+        interface_id: &str,
+    ) -> Result<ResolvedService<'_>> {
+        let descriptor = self.resolve_service(capability, kind, interface_id)?;
+        let typed = self.typed_handle(capability, kind, interface_id);
+        Ok(ResolvedService::new(descriptor, typed))
     }
 }
 
@@ -188,5 +265,29 @@ mod tests {
         )
         .expect_err("missing capability should fail");
         assert!(error.to_string().contains("example.write"));
+    }
+
+    #[test]
+    fn resolve_typed_service_returns_descriptor_and_no_handle_by_default() {
+        let capability = HostScope::new("example.read").expect("cap");
+        let host = MockHost::new(
+            &["example.read"],
+            &[],
+            vec![RegisteredService {
+                capability: capability.clone(),
+                kind: ServiceKind::Query,
+                interface_id: "example-query/v1".to_string(),
+                provider: ProviderId::Plugin("provider.plugin".to_string()),
+            }],
+        );
+        let resolved = PluginHost::resolve_typed_service(
+            &host,
+            &capability,
+            ServiceKind::Query,
+            "example-query/v1",
+        )
+        .expect("resolves");
+        assert_eq!(resolved.descriptor().interface_id, "example-query/v1");
+        assert!(resolved.typed().is_none());
     }
 }

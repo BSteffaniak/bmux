@@ -19,5 +19,6 @@ client can navigate windows independently.
 
 ## Services
 
-- **`window-query/v1`** -- `list` windows
-- **`window-command/v1`** -- `new` / `kill` / `kill_all` / `switch`
+- **`windows-state`** -- `list-windows` (query)
+- **`windows-commands`** -- `new-window` / `kill-window` / `kill-all-windows` / `switch-window` (command)
+- **`windows-events`** -- pane-event stream

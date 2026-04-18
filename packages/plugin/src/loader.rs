@@ -1612,6 +1612,24 @@ pub struct LoadedPlugin {
 }
 
 impl LoadedPlugin {
+    /// Collect the typed service registrations exposed by this plugin.
+    ///
+    /// For statically-linked bundled plugins that share the process
+    /// address space, this invokes the SDK's `register_typed_services`
+    /// hook via the static vtable and returns the populated registry.
+    ///
+    /// Dynamic (`dlopen`) and out-of-process backends cannot currently
+    /// register in-process typed providers; this method returns an
+    /// empty registry for those backends.
+    #[must_use]
+    pub fn collect_typed_services(&self) -> bmux_plugin_sdk::TypedServiceRegistry {
+        match &self.backend {
+            PluginBackend::Static(vtable) => (vtable.register_typed_services)(),
+            PluginBackend::Dynamic(_) | PluginBackend::Process(_) => {
+                bmux_plugin_sdk::TypedServiceRegistry::new()
+            }
+        }
+    }
     fn ensure_process_protocol_version(operation: &str, protocol_version: u16) -> Result<()> {
         if protocol_version == PROCESS_RUNTIME_PROTOCOL_V1 {
             return Ok(());
@@ -4472,6 +4490,7 @@ minimum = "1.0"
                 }],
                 dependencies: Vec::new(),
                 lifecycle: crate::PluginLifecycle::default(),
+                ready_signals: Vec::new(),
             },
             backend: PluginBackend::Dynamic(library),
         };
@@ -4496,7 +4515,14 @@ minimum = "1.0"
             .unwrap_or_default();
         assert!(!source.contains("permission-query/v1"));
         assert!(!source.contains("permission-command/v1"));
+        // Historic interface ids from before the typed-dispatch migration.
         assert!(!source.contains("window-query/v1"));
         assert!(!source.contains("window-command/v1"));
+        // Current typed interface ids also must not be hardcoded in the
+        // loader; they belong to plugin manifests and BPDL-generated
+        // bindings.
+        assert!(!source.contains("\"windows-state\""));
+        assert!(!source.contains("\"windows-commands\""));
+        assert!(!source.contains("\"windows-events\""));
     }
 }

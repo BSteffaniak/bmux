@@ -229,11 +229,11 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
         return EXIT_USAGE;
     };
 
-    let response = match context.call_service::<ListWindowsRequest, ListWindowsResponse>(
+    let windows = match context.call_service::<ListWindowsRequest, Vec<WindowEntry>>(
         "bmux.windows.read",
         ServiceKind::Query,
-        "window-query/v1",
-        "list",
+        "windows-state",
+        "list-windows",
         &ListWindowsRequest {
             session: Some(session.clone()),
         },
@@ -245,7 +245,7 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
         }
     };
 
-    if response.windows.is_empty() {
+    if windows.is_empty() {
         println!("example.native: no windows");
     } else {
         println!("example.native windows:");
@@ -254,10 +254,10 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
             TableColumn::new("WINDOW"),
             TableColumn::new("ACTIVE"),
         ]);
-        for window in response.windows {
+        for window in windows {
             table.push_row(vec![
-                window.id.to_string(),
-                window.name.unwrap_or_else(|| format!("#{}", window.number)),
+                window.id,
+                window.name,
                 if window.active {
                     "yes".to_string()
                 } else {
@@ -291,15 +291,13 @@ fn run_windows_new(context: &NativeCommandContext) -> i32 {
         }
     }
 
-    let response = match context.call_service::<NewWindowRequest, NewWindowResponse>(
+    let _ = session; // No longer scoped per-session in the typed command.
+    let ack = match context.call_service::<NewWindowRequest, WindowAck>(
         "bmux.windows.write",
         ServiceKind::Command,
-        "window-command/v1",
-        "new",
-        &NewWindowRequest {
-            session: Some(session.clone()),
-            name,
-        },
+        "windows-commands",
+        "new-window",
+        &NewWindowRequest { name },
     ) {
         Ok(response) => response,
         Err(error) => {
@@ -309,12 +307,9 @@ fn run_windows_new(context: &NativeCommandContext) -> i32 {
     };
 
     println!(
-        "created window: {} {}",
-        response.window.id,
-        response
-            .window
-            .name
-            .unwrap_or_else(|| format!("#{}", response.window.number))
+        "created window: ok={} id={}",
+        ack.ok,
+        ack.id.as_deref().unwrap_or("(none)"),
     );
     EXIT_OK
 }
@@ -645,27 +640,21 @@ struct ListWindowsRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListWindowsResponse {
-    windows: Vec<WorkspaceWindowSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NewWindowRequest {
-    session: Option<String>,
     name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct NewWindowResponse {
-    window: WorkspaceWindowSummary,
+struct WindowAck {
+    ok: bool,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct WorkspaceWindowSummary {
-    id: uuid::Uuid,
-    session_id: uuid::Uuid,
-    number: u32,
-    name: Option<String>,
+struct WindowEntry {
+    id: String,
+    name: String,
     active: bool,
 }
 

@@ -10,6 +10,12 @@ fn assert_no_domain_markers(source: &str, context: &str) {
         "permission-command/v1",
         "window-query/v1",
         "window-command/v1",
+        // Typed interface ids replacing the legacy `window-*/v1` strings.
+        // Core and CLI-runtime code must stay domain-agnostic; only the
+        // windows plugin references these.
+        "windows-state",
+        "windows-commands",
+        "windows-events",
         "Request::NewWindow",
         "Request::ListWindows",
         "Request::KillWindow",

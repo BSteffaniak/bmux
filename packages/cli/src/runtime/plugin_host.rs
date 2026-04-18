@@ -1,6 +1,10 @@
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_plugin_sdk::{HostConnectionInfo, HostMetadata, HostScope, PluginHost, RegisteredService};
-use std::collections::BTreeSet;
+use bmux_plugin_sdk::{
+    HostConnectionInfo, HostMetadata, HostScope, PluginHost, RegisteredService, ServiceKind,
+    TypedServiceHandle, TypedServiceKey, TypedServiceRegistry,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 pub struct CliPluginHost {
     plugin_id: String,
@@ -9,6 +13,7 @@ pub struct CliPluginHost {
     required_capabilities: BTreeSet<HostScope>,
     provided_capabilities: BTreeSet<HostScope>,
     available_services: Vec<RegisteredService>,
+    typed_services: Arc<BTreeMap<TypedServiceKey, TypedServiceHandle>>,
 }
 
 impl CliPluginHost {
@@ -33,7 +38,29 @@ impl CliPluginHost {
             required_capabilities,
             provided_capabilities,
             available_services,
+            typed_services: Arc::new(BTreeMap::new()),
         }
+    }
+
+    /// Replace the typed services map this host exposes.
+    ///
+    /// Consumers calling [`PluginHost::resolve_typed_service`] on this
+    /// host will receive a [`bmux_plugin_sdk::ResolvedService`] whose
+    /// `typed()` handle is looked up in this map.
+    #[must_use]
+    #[allow(dead_code)] // Consumed by host wiring landing in a follow-up.
+    pub fn with_typed_services(
+        mut self,
+        typed_services: Arc<BTreeMap<TypedServiceKey, TypedServiceHandle>>,
+    ) -> Self {
+        self.typed_services = typed_services;
+        self
+    }
+
+    /// Install a freshly built registry of typed services.
+    #[allow(dead_code)] // Consumed by host wiring landing in a follow-up.
+    pub fn set_typed_services_from_registry(&mut self, registry: TypedServiceRegistry) {
+        self.typed_services = Arc::new(registry.into_entries());
     }
 }
 
@@ -60,6 +87,16 @@ impl PluginHost for CliPluginHost {
 
     fn available_services(&self) -> &[RegisteredService] {
         &self.available_services
+    }
+
+    fn typed_handle(
+        &self,
+        capability: &HostScope,
+        kind: ServiceKind,
+        interface_id: &str,
+    ) -> Option<&TypedServiceHandle> {
+        self.typed_services
+            .get(&(capability.clone(), kind, interface_id.to_string()))
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::{
     NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginEvent,
-    ServiceEnvelopeKind, ServiceResponse, decode_service_envelope, encode_service_envelope,
+    ServiceEnvelopeKind, ServiceResponse, TypedServiceRegistry, decode_service_envelope,
+    encode_service_envelope,
 };
 use std::ffi::{CString, c_char};
 use std::ptr;
@@ -223,6 +224,17 @@ pub trait RustPlugin: Default + Send + 'static {
             ),
         )
     }
+
+    /// Populate a [`TypedServiceRegistry`] with this plugin's typed
+    /// service handles. Called once during plugin activation. Providers
+    /// insert `Arc`s of their service-trait implementations here; the
+    /// host stores the resulting handles so consumers can resolve them
+    /// via [`crate::PluginHost::resolve_service`] and invoke typed
+    /// calls without serialization.
+    ///
+    /// The default is a no-op; plugins that don't provide typed
+    /// services need not override it.
+    fn register_typed_services(&self, _registry: &mut TypedServiceRegistry) {}
 }
 
 // ── FFI helpers ──────────────────────────────────────────────────────────────
@@ -230,6 +242,20 @@ pub trait RustPlugin: Default + Send + 'static {
 #[doc(hidden)]
 pub fn plugin_instance<P: RustPlugin>(instance: &'static OnceLock<Mutex<P>>) -> &'static Mutex<P> {
     instance.get_or_init(|| Mutex::new(P::default()))
+}
+
+/// Invoke a bundled plugin's [`RustPlugin::register_typed_services`] hook
+/// and return the populated registry. Called from the
+/// [`bundled_plugin_vtable!`] macro.
+#[doc(hidden)]
+pub fn register_typed_services_bundled<P: RustPlugin>(
+    instance: &'static Mutex<P>,
+) -> TypedServiceRegistry {
+    let mut registry = TypedServiceRegistry::new();
+    if let Ok(plugin) = instance.lock() {
+        plugin.register_typed_services(&mut registry);
+    }
+    registry
 }
 
 #[doc(hidden)]

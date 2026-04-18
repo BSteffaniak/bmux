@@ -2,23 +2,17 @@
 // depend on `bmux_windows_plugin_api` import these interfaces rather
 // than the windows plugin implementation itself.
 //
-// Design notes:
-//
-// - `windows-state` exposes read-only queries about the current pane/
-//   window layout.
-// - `windows-commands` exposes mutating operations (focus, close). A
-//   follow-up PR will split command authorization through the
-//   permissions plugin.
-// - `windows-events` is an event stream of window/pane lifecycle
-//   changes. Other plugins subscribe to react to changes (e.g., the
-//   decoration plugin restyles on focus change).
+// Three interfaces:
+// - `windows-state` — read-only queries about panes and windows.
+// - `windows-commands` — mutating operations on panes and windows.
+// - `windows-events` — event stream of window/pane lifecycle changes.
 
 plugin bmux.windows version 1;
 
 interface windows-state {
     // A pane's current lifecycle status.
     variant pane-status {
-        running,
+        @default running,
         exited { exit-code: i32 },
     }
 
@@ -32,11 +26,22 @@ interface windows-state {
         status: pane-status,
     }
 
-    // Queries — read-only reads.
+    // Snapshot of a window. Windows are a plugin-layered view over
+    // sessions/contexts; the id is the underlying context id.
+    record window-entry {
+        id: string,
+        name: string,
+        active: bool,
+    }
+
+    // Pane-level queries.
     query pane-state(id: uuid) -> pane-state?;
     query focused-pane(session: uuid) -> uuid?;
     query zoomed-pane(session: uuid) -> uuid?;
     query list-panes(session: uuid) -> list<pane-state>;
+
+    // Window-level queries.
+    query list-windows(session: string?) -> list<window-entry>;
 }
 
 interface windows-commands {
@@ -52,11 +57,30 @@ interface windows-commands {
         close-denied { reason: string },
     }
 
-    // Focus a specific pane.
-    command focus-pane(id: uuid) -> result<unit, focus-error>;
+    // Errors a window-level command can produce.
+    variant window-error {
+        not-found,
+        denied { reason: string },
+        failed { reason: string },
+    }
 
-    // Close a pane.
+    // Acknowledgement returned by mutating window commands. When a new
+    // window is created, `id` carries the new context id; other
+    // commands may leave it empty.
+    record window-ack {
+        ok: bool,
+        id: string?,
+    }
+
+    // Pane-level commands.
+    command focus-pane(id: uuid) -> result<unit, focus-error>;
     command close-pane(id: uuid) -> result<unit, close-error>;
+
+    // Window-level commands.
+    command new-window(name: string?) -> result<window-ack, window-error>;
+    command kill-window(target: string, force-local: bool) -> result<window-ack, window-error>;
+    command kill-all-windows(force-local: bool) -> result<window-ack, window-error>;
+    command switch-window(target: string) -> result<window-ack, window-error>;
 }
 
 interface windows-events {
