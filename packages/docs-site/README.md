@@ -25,9 +25,12 @@ reference pages.
 - `/docs/troubleshooting` -- debugging and failure triage playbook
 - `/docs/operations` -- maintenance and operations workflows
 - `/docs/docs-snippet-tags` -- author guide for verified snippets
-- `/docs/plugins` -- plugin system overview
+- `/docs/plugins` -- plugin architecture
 - `/docs/bpdl-spec` -- normative BPDL grammar and semantics
 - `/docs/plugin-sdk` -- plugin authoring guide
 - `/docs/plugin-example` -- walkthrough of the example plugin
+- `/docs/plugin-ops` -- plugin operations playbook
+- `/docs/plugin-triage-playbook` -- plugin failure triage runbook
+- `/docs/plugin-perf-troubleshooting` -- plugin performance troubleshooting
 - `/docs/changelog` -- release history
 - `/faq` -- frequently asked questions

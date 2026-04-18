@@ -1,211 +1,24 @@
-//! Doc page functions — one per route, embedding markdown via `include_str!`.
+//! Generation helpers for documentation pages.
+//!
+//! The per-page renderers and the routing registry live in
+//! [`crate::doc_pages`]. This module retains only the logic that generates
+//! markdown from in-process data (clap CLI metadata and the config schema)
+//! plus small helpers shared by those generators.
 
 use clap::CommandFactory;
 use clap::builder::ValueHint;
-use hyperchad::markdown::markdown_to_container;
-use hyperchad::template::Containers;
 
 use bmux_config::{BmuxConfig, ConfigDocSchema, ENV_OVERRIDE_DOCS, ThemeConfig};
 use std::collections::BTreeMap;
 
-use crate::layout;
-use crate::theme;
-
-/// Helper: convert markdown string to dark-themed containers.
-fn md(markdown: &str) -> Containers {
-    let mut container = markdown_to_container(markdown);
-    theme::apply_dark_theme(&mut container);
-    vec![container]
-}
-
-// ── Getting Started ─────────────────────────────────────────────────────────
-
-#[must_use]
-pub fn overview() -> Containers {
-    layout::docs_layout("/docs", None, &md(include_str!("../../../../../README.md")))
-}
-
-#[must_use]
-pub fn installation() -> Containers {
-    let readme = include_str!("../../../../../README.md");
-    let content = extract_section(readme, "## Installation", Some("## "));
-    layout::docs_layout("/docs/installation", Some("Installation"), &md(&content))
-}
-
-#[must_use]
-pub fn quickstart() -> Containers {
-    let readme = include_str!("../../../../../README.md");
-    let content = extract_section(readme, "## Current CLI Workflow", Some("## "));
-    layout::docs_layout("/docs/quickstart", Some("Quick Start"), &md(&content))
-}
-
-// ── Reference ───────────────────────────────────────────────────────────────
-
-#[must_use]
-pub fn cli() -> Containers {
-    layout::docs_layout(
-        "/docs/cli",
-        Some("CLI Reference"),
-        &md(&generate_cli_reference()),
-    )
-}
-
-#[must_use]
-pub fn playbooks() -> Containers {
-    layout::docs_layout(
-        "/docs/playbooks",
-        None,
-        &md(include_str!("../../../../../docs/playbooks.md")),
-    )
-}
-
-#[must_use]
-pub fn images() -> Containers {
-    layout::docs_layout(
-        "/docs/images",
-        None,
-        &md(include_str!("../../../../../docs/images.md")),
-    )
-}
-
-#[must_use]
-pub fn config() -> Containers {
-    layout::docs_layout(
-        "/docs/config",
-        Some("Configuration"),
-        &md(&generate_config_reference()),
-    )
-}
-
-#[must_use]
-pub fn concepts() -> Containers {
-    layout::docs_layout(
-        "/docs/concepts",
-        None,
-        &md(include_str!("../../../../../docs/concepts.md")),
-    )
-}
-
-#[must_use]
-pub fn command_cookbook() -> Containers {
-    layout::docs_layout(
-        "/docs/command-cookbook",
-        None,
-        &md(include_str!("../../../../../docs/command-cookbook.md")),
-    )
-}
-
-#[must_use]
-pub fn kiosk() -> Containers {
-    layout::docs_layout(
-        "/docs/kiosk",
-        Some("Kiosk Access"),
-        &md(include_str!("../../../../../docs/kiosk.md")),
-    )
-}
-
-#[must_use]
-pub fn setup_guide() -> Containers {
-    layout::docs_layout(
-        "/docs/setup-guide",
-        None,
-        &md(include_str!("../../../../../docs/setup-guide.md")),
-    )
-}
-
-#[must_use]
-pub fn troubleshooting() -> Containers {
-    layout::docs_layout(
-        "/docs/troubleshooting",
-        None,
-        &md(include_str!("../../../../../docs/troubleshooting.md")),
-    )
-}
-
-#[must_use]
-pub fn operations() -> Containers {
-    layout::docs_layout(
-        "/docs/operations",
-        None,
-        &md(include_str!("../../../../../docs/operations.md")),
-    )
-}
-
-#[must_use]
-pub fn docs_snippet_tags() -> Containers {
-    layout::docs_layout(
-        "/docs/docs-snippet-tags",
-        None,
-        &md(include_str!("../../../../../docs/docs-snippet-tags.md")),
-    )
-}
-
-// ── Plugins ─────────────────────────────────────────────────────────────────
-
-#[must_use]
-pub fn plugins() -> Containers {
-    layout::docs_layout(
-        "/docs/plugins",
-        None,
-        &md(include_str!("../../../../../docs/plugins.md")),
-    )
-}
-
-#[must_use]
-pub fn bpdl_spec() -> Containers {
-    layout::docs_layout(
-        "/docs/bpdl-spec",
-        Some("BPDL Specification"),
-        &md(include_str!("../../../../../docs/bpdl-spec.md")),
-    )
-}
-
-#[must_use]
-pub fn plugin_sdk() -> Containers {
-    layout::docs_layout(
-        "/docs/plugin-sdk",
-        None,
-        &md(include_str!("../../../../../packages/plugin-sdk/README.md")),
-    )
-}
-
-#[must_use]
-pub fn plugin_example() -> Containers {
-    layout::docs_layout(
-        "/docs/plugin-example",
-        None,
-        &md(include_str!(
-            "../../../../../examples/native-plugin/README.md"
-        )),
-    )
-}
-
-// ── Development ─────────────────────────────────────────────────────────────
-
-#[must_use]
-pub fn testing() -> Containers {
-    layout::docs_layout(
-        "/docs/testing",
-        None,
-        &md(include_str!("../../../../../TESTING.md")),
-    )
-}
-
-// ── Not Found ───────────────────────────────────────────────────────────────
-
-#[must_use]
-pub fn not_found() -> Containers {
-    layout::docs_layout(
-        "/not-found",
-        Some("404"),
-        &md("The page you are looking for does not exist."),
-    )
-}
-
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Extract a section from a markdown document by heading.
-fn extract_section(markdown: &str, start_heading: &str, end_prefix: Option<&str>) -> String {
+pub(crate) fn extract_section_for(
+    markdown: &str,
+    start_heading: &str,
+    end_prefix: Option<&str>,
+) -> String {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut start_idx = None;
     let mut end_idx = lines.len();
@@ -238,7 +51,7 @@ fn extract_section(markdown: &str, start_heading: &str, end_prefix: Option<&str>
 /// trait implementations on each config struct. This is always in sync with the
 /// actual code because descriptions come from doc comments and defaults come
 /// from `Default::default()` serialized at compile time.
-fn generate_config_reference() -> String {
+pub(crate) fn generate_config_reference() -> String {
     let mut doc = String::from(
         "bmux is configured via a `bmux.toml` file. If no config file exists, \
          bmux uses sensible defaults for all options.\n\n\
@@ -653,7 +466,7 @@ fn render_fields_table(
 /// Generate the full CLI reference markdown by walking the clap `Command` tree
 /// from `bmux_cli_schema::Cli`. Descriptions come from `///` doc comments on
 /// the derive structs and are always in sync with the actual binary.
-fn generate_cli_reference() -> String {
+pub(crate) fn generate_cli_reference() -> String {
     let cmd = bmux_cli_schema::Cli::command();
     let mut doc = String::new();
     render_command(&mut doc, &cmd, &["bmux"], 0);

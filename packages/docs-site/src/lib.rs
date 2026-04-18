@@ -24,75 +24,27 @@ static CARGO_MANIFEST_DIR: LazyLock<Option<std::path::PathBuf>> =
 
 /// Application router with all configured routes.
 pub static ROUTER: LazyLock<Router> = LazyLock::new(|| {
-    Router::new()
+    let mut router = Router::new()
         // Home
         .with_static_route(&["/", "/home"], |_| async {
             bmux_docs_site_ui::pages::home::home()
-        })
-        // Docs — Getting Started
-        .with_static_route(&["/docs"], |_| async {
-            bmux_docs_site_ui::pages::docs::overview()
-        })
-        .with_static_route(&["/docs/installation"], |_| async {
-            bmux_docs_site_ui::pages::docs::installation()
-        })
-        .with_static_route(&["/docs/quickstart"], |_| async {
-            bmux_docs_site_ui::pages::docs::quickstart()
-        })
-        // Docs — Reference
-        .with_static_route(&["/docs/cli"], |_| async {
-            bmux_docs_site_ui::pages::docs::cli()
-        })
-        .with_static_route(&["/docs/playbooks"], |_| async {
-            bmux_docs_site_ui::pages::docs::playbooks()
-        })
-        .with_static_route(&["/docs/images"], |_| async {
-            bmux_docs_site_ui::pages::docs::images()
-        })
-        .with_static_route(&["/docs/config"], |_| async {
-            bmux_docs_site_ui::pages::docs::config()
-        })
-        .with_static_route(&["/docs/concepts"], |_| async {
-            bmux_docs_site_ui::pages::docs::concepts()
-        })
-        .with_static_route(&["/docs/command-cookbook"], |_| async {
-            bmux_docs_site_ui::pages::docs::command_cookbook()
-        })
-        .with_static_route(&["/docs/kiosk"], |_| async {
-            bmux_docs_site_ui::pages::docs::kiosk()
-        })
-        .with_static_route(&["/docs/setup-guide"], |_| async {
-            bmux_docs_site_ui::pages::docs::setup_guide()
-        })
-        .with_static_route(&["/docs/troubleshooting"], |_| async {
-            bmux_docs_site_ui::pages::docs::troubleshooting()
-        })
-        .with_static_route(&["/docs/operations"], |_| async {
-            bmux_docs_site_ui::pages::docs::operations()
-        })
-        .with_static_route(&["/docs/docs-snippet-tags"], |_| async {
-            bmux_docs_site_ui::pages::docs::docs_snippet_tags()
-        })
-        // Docs — Plugins
-        .with_static_route(&["/docs/plugins"], |_| async {
-            bmux_docs_site_ui::pages::docs::plugins()
-        })
-        .with_static_route(&["/docs/bpdl-spec"], |_| async {
-            bmux_docs_site_ui::pages::docs::bpdl_spec()
-        })
-        .with_static_route(&["/docs/plugin-sdk"], |_| async {
-            bmux_docs_site_ui::pages::docs::plugin_sdk()
-        })
-        .with_static_route(&["/docs/plugin-example"], |_| async {
-            bmux_docs_site_ui::pages::docs::plugin_example()
-        })
-        // Docs — Development
-        .with_static_route(&["/docs/testing"], |_| async {
-            bmux_docs_site_ui::pages::docs::testing()
-        })
+        });
+
+    // Docs pages — derived from the central DOC_PAGES registry so there is
+    // no parallel list of routes to keep in sync with page definitions.
+    for page in bmux_docs_site_ui::doc_pages::DOC_PAGES {
+        let render = page.render;
+        let page_ref: &'static _ = page;
+        router = router.with_static_route(&[page.route], move |_| {
+            let page_ref = page_ref;
+            async move { (render)(page_ref) }
+        });
+    }
+
+    router
         // 404
         .with_static_route(&["/not-found"], |_| async {
-            bmux_docs_site_ui::pages::docs::not_found()
+            bmux_docs_site_ui::doc_pages::not_found()
         })
         // Health check
         .with_route(&["/health"], |_| async {

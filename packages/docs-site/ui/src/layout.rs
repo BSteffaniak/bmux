@@ -141,9 +141,9 @@ pub fn nav_bar() -> Containers {
 fn sidebar_sections(current_path: &str) -> Vec<Containers> {
     let mut sections = Vec::new();
 
-    for section in nav::SECTIONS {
+    for section in nav::SECTIONS.iter() {
         let mut items = Vec::new();
-        for item in section.items {
+        for item in &section.items {
             let is_active = current_path == item.href;
             items.push(sidebar_item(item.label, item.href, is_active));
         }
