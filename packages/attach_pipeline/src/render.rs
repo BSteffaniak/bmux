@@ -366,6 +366,17 @@ pub fn render_attach_scene<W: io::Write>(
             || focused_surface_id == Some(surface.id)
             || focused_pane_id == Some(pane_id);
         if should_draw {
+            // Default fallback border painting. This lives in core so
+            // that a baseline single-terminal attach flow renders
+            // correctly when no decoration plugin is loaded (per the
+            // AGENTS.md "core defaults when plugins are missing" rule).
+            // When the decoration plugin (plugins/decoration-plugin)
+            // takes over painting, this block will execute only when
+            // that plugin is absent or declares the fallback style.
+            // Geometry matches `packages/server/src/lib.rs ::
+            // pane_content_rect_for_outer` — a 1-cell border on all
+            // sides — so `content_rect` and the painted border stay
+            // consistent.
             let (corner, hch, vch) = if zoomed && focus {
                 // Zoomed pane: double-line box drawing characters.
                 ('#', '=', '\u{2551}') // ║ for sides, # corners, = top/bottom
