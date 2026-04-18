@@ -47,6 +47,7 @@ mod native_exports;
 mod process_runtime;
 pub mod prompt;
 mod service;
+pub mod typed_dispatch;
 mod version;
 
 pub use capability::{HostScope, PluginFeature};

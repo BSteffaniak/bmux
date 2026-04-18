@@ -1167,6 +1167,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_decoration_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_decoration_plugin_api",
+ "bmux_windows_plugin_api",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_decoration_plugin_api"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_schema_macros",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_docs_site"
 version = "0.0.1-alpha.0"
 dependencies = [

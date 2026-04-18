@@ -108,6 +108,13 @@ fn emit_enum(e: &EnumDef, out: &mut String) {
 
 fn emit_consumer_trait(iface: &Interface, out: &mut String) {
     let trait_name = pascal_case(&iface.name);
+    // Canonical interface identifier used to look up a typed service via
+    // the plugin host registry. Matches the BPDL `interface <name>` name.
+    let _ = writeln!(
+        out,
+        "    /// Canonical identifier for this interface. Matches the `interface`\n    /// name in the BPDL source exactly; used to look up a provider via\n    /// the plugin host registry.\n    pub const INTERFACE_ID: &str = \"{}\";\n",
+        iface.name
+    );
     out.push_str("    /// Consumer-facing trait for this interface.\n");
     out.push_str("    ///\n");
     out.push_str("    /// Other plugins call these methods to query or command the\n");
@@ -246,5 +253,19 @@ mod tests {
         assert!(rust.contains("fn focus_pane"));
         assert!(rust.contains("Option<PaneState>"));
         assert!(rust.contains("::std::result::Result<(), String>"));
+    }
+
+    #[test]
+    fn emits_interface_id_const() {
+        let src = "plugin p version 1;\n\
+                   interface windows-state {\n\
+                     query ping() -> bool;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            rust.contains("pub const INTERFACE_ID: &str = \"windows-state\";"),
+            "codegen must emit the canonical interface id"
+        );
     }
 }

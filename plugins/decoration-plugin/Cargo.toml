@@ -1,0 +1,29 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Decoration plugin for bmux — paints pane borders and reads windows state"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "decoration"]
+license     = { workspace = true }
+name        = "bmux_decoration_plugin"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_decoration_plugin_api = { workspace = true }
+bmux_windows_plugin_api    = { workspace = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
+uuid                       = { workspace = true, features = ["serde", "std"] }
+
+[package.metadata.cargo-machete]
+# `serde` is consumed by the BPDL-generated bindings of the decoration
+# plugin's own schema (via the decoration-plugin-api crate's re-exports).
+# `bmux_windows_plugin_api` will be depended on for event subscriptions
+# once the plugin-host integration lands; keeping the import here makes
+# the dependency edge explicit.
+ignored = ["serde", "bmux_windows_plugin_api"]
+
+[features]
+default          = []
+fail-on-warnings = []

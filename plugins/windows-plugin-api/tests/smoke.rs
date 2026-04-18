@@ -2,8 +2,8 @@
 //! be constructed, serialized, and used via the trait signature.
 
 use bmux_windows_plugin_api::{
-    windows_events::PaneEvent,
-    windows_state::{PaneState, PaneStatus},
+    windows_events::{self, PaneEvent},
+    windows_state::{self, PaneState, PaneStatus},
 };
 
 #[test]
@@ -36,4 +36,10 @@ fn pane_event_variant_is_tagged() {
     };
     let json = serde_json::to_string(&ev).expect("serialize");
     assert!(json.contains("\"kind\":\"focused\""));
+}
+
+#[test]
+fn interface_ids_match_bpdl_source() {
+    assert_eq!(windows_state::INTERFACE_ID, "windows-state");
+    assert_eq!(windows_events::INTERFACE_ID, "windows-events");
 }
