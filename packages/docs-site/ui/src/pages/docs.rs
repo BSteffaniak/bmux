@@ -152,6 +152,15 @@ pub fn plugins() -> Containers {
 }
 
 #[must_use]
+pub fn bpdl_spec() -> Containers {
+    layout::docs_layout(
+        "/docs/bpdl-spec",
+        Some("BPDL Specification"),
+        &md(include_str!("../../../../../docs/bpdl-spec.md")),
+    )
+}
+
+#[must_use]
 pub fn plugin_sdk() -> Containers {
     layout::docs_layout(
         "/docs/plugin-sdk",

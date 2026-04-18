@@ -26,6 +26,7 @@ reference pages.
 - `/docs/operations` -- maintenance and operations workflows
 - `/docs/docs-snippet-tags` -- author guide for verified snippets
 - `/docs/plugins` -- plugin system overview
+- `/docs/bpdl-spec` -- normative BPDL grammar and semantics
 - `/docs/plugin-sdk` -- plugin authoring guide
 - `/docs/plugin-example` -- walkthrough of the example plugin
 - `/docs/changelog` -- release history

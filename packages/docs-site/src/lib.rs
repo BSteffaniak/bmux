@@ -77,6 +77,9 @@ pub static ROUTER: LazyLock<Router> = LazyLock::new(|| {
         .with_static_route(&["/docs/plugins"], |_| async {
             bmux_docs_site_ui::pages::docs::plugins()
         })
+        .with_static_route(&["/docs/bpdl-spec"], |_| async {
+            bmux_docs_site_ui::pages::docs::bpdl_spec()
+        })
         .with_static_route(&["/docs/plugin-sdk"], |_| async {
             bmux_docs_site_ui::pages::docs::plugin_sdk()
         })

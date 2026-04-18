@@ -72,6 +72,10 @@ pub static SECTIONS: &[NavSection] = &[
                 href: "/docs/plugins",
             },
             NavItem {
+                label: "BPDL Specification",
+                href: "/docs/bpdl-spec",
+            },
+            NavItem {
                 label: "Plugin SDK",
                 href: "/docs/plugin-sdk",
             },
