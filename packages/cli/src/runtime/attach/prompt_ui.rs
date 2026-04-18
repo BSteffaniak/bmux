@@ -433,6 +433,13 @@ impl AttachPromptState {
                 w: layout.surface.rect.w,
                 h: layout.surface.rect.h,
             },
+            // Prompt overlay paints its own 1-cell frame; the fill area is the interior.
+            PaneRect {
+                x: layout.surface.rect.x.saturating_add(1),
+                y: layout.surface.rect.y.saturating_add(1),
+                w: layout.surface.rect.w.saturating_sub(2),
+                h: layout.surface.rect.h.saturating_sub(2),
+            },
             AttachLayer::Overlay,
             true,
         );

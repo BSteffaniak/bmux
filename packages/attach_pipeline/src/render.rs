@@ -20,16 +20,31 @@ pub enum AttachLayer {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttachLayerSurface {
+    /// The outer bounds of this layer surface (used for hit-testing and frame geometry).
     pub rect: PaneRect,
+    /// The interior area that `queue_layer_fill` should paint.
+    ///
+    /// Callers own the inset convention: overlays that paint their own 1-cell border
+    /// pass `rect` inset by 1 on each side; decoration-free layers pass `rect` unchanged.
+    /// The fill helper never infers decoration thickness from `rect` — it just fills
+    /// what it is told to fill. This mirrors the scene-level contract on
+    /// [`bmux_ipc::AttachSurface`] where `content_rect` is the authoritative interior.
+    pub content_rect: PaneRect,
     pub layer: AttachLayer,
     pub opaque: bool,
 }
 
 impl AttachLayerSurface {
     #[must_use]
-    pub const fn new(rect: PaneRect, layer: AttachLayer, opaque: bool) -> Self {
+    pub const fn new(
+        rect: PaneRect,
+        content_rect: PaneRect,
+        layer: AttachLayer,
+        opaque: bool,
+    ) -> Self {
         Self {
             rect,
+            content_rect,
             layer,
             opaque,
         }
@@ -99,27 +114,26 @@ pub fn opaque_row_text(content: &str, width: usize) -> String {
 
 /// Fill an opaque layer interior with spaces.
 ///
+/// The fill area is `surface.content_rect` — callers are responsible for insetting
+/// from `rect` if they paint their own frame. No border math is performed here.
+///
 /// # Errors
 ///
 /// Returns an error when queueing cursor movement or text output fails.
 pub fn queue_layer_fill<W: io::Write>(stdout: &mut W, surface: AttachLayerSurface) -> Result<()> {
-    if !surface.opaque || surface.rect.w <= 2 || surface.rect.h <= 2 {
+    if !surface.opaque || surface.content_rect.w == 0 || surface.content_rect.h == 0 {
         return Ok(());
     }
 
-    let fill = " ".repeat(usize::from(surface.rect.w.saturating_sub(2)));
-    for y in surface.rect.y.saturating_add(1)
-        ..surface
-            .rect
-            .y
-            .saturating_add(surface.rect.h.saturating_sub(1))
-    {
-        queue!(
-            stdout,
-            MoveTo(surface.rect.x.saturating_add(1), y),
-            Print(&fill)
-        )
-        .with_context(|| format!("failed filling {:?} layer row", surface.layer))?;
+    let fill = " ".repeat(usize::from(surface.content_rect.w));
+    let start_y = surface.content_rect.y;
+    let end_y = surface
+        .content_rect
+        .y
+        .saturating_add(surface.content_rect.h);
+    for y in start_y..end_y {
+        queue!(stdout, MoveTo(surface.content_rect.x, y), Print(&fill))
+            .with_context(|| format!("failed filling {:?} layer row", surface.layer))?;
     }
     Ok(())
 }
@@ -611,32 +625,89 @@ mod tests {
         let mut parser = vt100::Parser::new(6, 20, 128);
         parser.process(b"\x1b[2;1H0123456789abcdefghij");
 
-        let surface = AttachLayerSurface::new(
-            PaneRect {
-                x: 0,
-                y: 0,
-                w: 12,
-                h: 4,
-            },
-            AttachLayer::Overlay,
-            true,
-        );
+        let rect = PaneRect {
+            x: 0,
+            y: 0,
+            w: 12,
+            h: 4,
+        };
+        let content_rect = PaneRect {
+            x: 1,
+            y: 1,
+            w: 10,
+            h: 2,
+        };
+        let surface = AttachLayerSurface::new(rect, content_rect, AttachLayer::Overlay, true);
 
         let mut bytes = Vec::new();
         queue_layer_fill(&mut bytes, surface).expect("overlay fill should succeed");
         queue!(
             bytes,
             MoveTo(1, 1),
-            Print(opaque_row_text(
-                "help",
-                usize::from(surface.rect.w.saturating_sub(2))
-            ))
+            Print(opaque_row_text("help", usize::from(surface.content_rect.w)))
         )
         .expect("overlay text should queue");
 
         parser.process(&bytes);
 
         assert_eq!(screen_row(parser.screen(), 1, 12), "0help      b");
+    }
+
+    #[test]
+    fn queue_layer_fill_respects_content_rect_inset() {
+        // Asymmetric inset — content_rect is NOT a simple 1-cell inset of rect.
+        // This guards against future "fixes" that reintroduce `rect - 2` math.
+        let mut parser = vt100::Parser::new(4, 12, 128);
+        // Pre-fill rows 1..=2 with a sentinel so untouched cells stay as 'x'/'y'.
+        parser.process(b"\x1b[2;1Hxxxxxxxxxxxx\x1b[3;1Hyyyyyyyyyyyy");
+
+        let rect = PaneRect {
+            x: 0,
+            y: 0,
+            w: 12,
+            h: 4,
+        };
+        // Content inset by 2 on left, 1 on top, 2 on right, 1 on bottom.
+        let content_rect = PaneRect {
+            x: 2,
+            y: 1,
+            w: 8,
+            h: 2,
+        };
+        let surface = AttachLayerSurface::new(rect, content_rect, AttachLayer::Overlay, true);
+
+        let mut bytes = Vec::new();
+        queue_layer_fill(&mut bytes, surface).expect("overlay fill should succeed");
+        parser.process(&bytes);
+
+        // Row 1: cols 0..2 untouched ('xx'), cols 2..10 spaces, cols 10..12 untouched ('xx').
+        assert_eq!(screen_row(parser.screen(), 1, 12), "xx        xx");
+        // Row 2: same but with 'y' sentinels.
+        assert_eq!(screen_row(parser.screen(), 2, 12), "yy        yy");
+    }
+
+    #[test]
+    fn queue_layer_fill_skips_when_content_rect_empty() {
+        let rect = PaneRect {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+        };
+        let empty = PaneRect {
+            x: 1,
+            y: 1,
+            w: 0,
+            h: 2,
+        };
+        let surface = AttachLayerSurface::new(rect, empty, AttachLayer::Overlay, true);
+
+        let mut bytes = Vec::new();
+        queue_layer_fill(&mut bytes, surface).expect("empty fill should succeed");
+        assert!(
+            bytes.is_empty(),
+            "zero-width content should produce no output"
+        );
     }
 
     #[test]

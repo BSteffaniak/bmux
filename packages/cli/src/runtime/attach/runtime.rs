@@ -2476,9 +2476,12 @@ pub fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(u
         .iter()
         .find(|surface| surface.visible && surface.pane_id == Some(layout_state.focused_pane_id))
         .map(|surface| {
+            // Read the authoritative content_rect from the scene rather than recomputing
+            // a border inset from `surface.rect`. See AGENTS.md "core architecture boundary"
+            // and the content_rect contract on `bmux_ipc::AttachSurface`.
             (
-                usize::from(surface.rect.w.saturating_sub(2).max(1)),
-                usize::from(surface.rect.h.saturating_sub(2).max(1)),
+                usize::from(surface.content_rect.w.max(1)),
+                usize::from(surface.content_rect.h.max(1)),
             )
         })
 }
@@ -3042,16 +3045,20 @@ pub fn queue_attach_help_overlay(
     let x = usize::from(surface_meta.rect.x);
     let y = usize::from(surface_meta.rect.y);
     let body_rows = height.saturating_sub(4).max(1);
-    let surface = AttachLayerSurface::new(
-        PaneRect {
-            x: surface_meta.rect.x,
-            y: surface_meta.rect.y,
-            w: surface_meta.rect.w,
-            h: surface_meta.rect.h,
-        },
-        AttachLayer::Overlay,
-        true,
-    );
+    let outer = PaneRect {
+        x: surface_meta.rect.x,
+        y: surface_meta.rect.y,
+        w: surface_meta.rect.w,
+        h: surface_meta.rect.h,
+    };
+    // Help overlay paints its own 1-cell frame; the fill area is the interior.
+    let content = PaneRect {
+        x: outer.x.saturating_add(1),
+        y: outer.y.saturating_add(1),
+        w: outer.w.saturating_sub(2),
+        h: outer.h.saturating_sub(2),
+    };
+    let surface = AttachLayerSurface::new(outer, content, AttachLayer::Overlay, true);
     let text_width = width.saturating_sub(4);
 
     let top = format!("+{}+", "-".repeat(width.saturating_sub(2)));
@@ -5880,11 +5887,15 @@ mod tests {
                         w: 9,
                         h: 6,
                     },
+                    // Mirror the server-side scene contract: a 1-cell inset on each side.
+                    // The PTY parser below is 4 rows x 20 cols (matching the historical
+                    // `rect - 2` interior). Tests asserting cursor clamps to row 3 / col 2
+                    // rely on `focused_attach_pane_inner_size` returning (7, 4).
                     content_rect: AttachRect {
-                        x: 0,
-                        y: 0,
-                        w: 9,
-                        h: 6,
+                        x: 1,
+                        y: 1,
+                        w: 7,
+                        h: 4,
                     },
                     interactive_regions: Vec::new(),
                     opaque: true,
@@ -6586,7 +6597,9 @@ mod tests {
             in_focused_pane,
         )
         .expect("mouse move should forward once pane enables any-motion mode");
-        assert_eq!(forwarded, b"\x1b[<35;3;3M".to_vec());
+        // Fixture has outer rect (0,0,9,6) with content_rect inset by 1 on each side,
+        // so column=2 row=2 (absolute) translates to pane-local (1,1) → SGR (2,2).
+        assert_eq!(forwarded, b"\x1b[<35;2;2M".to_vec());
     }
 
     #[test]
@@ -7452,6 +7465,73 @@ mod tests {
         ));
         assert!(!view_state.scrollback_active);
         assert_eq!(view_state.scrollback_offset, 0);
+    }
+
+    #[test]
+    fn focused_attach_pane_inner_size_reads_content_rect_not_outer_rect() {
+        // Regression guard: `focused_attach_pane_inner_size` MUST read the scene's
+        // authoritative `content_rect`, not recompute `rect - 2` locally. If someone
+        // "fixes" this back to subtracting a fixed inset from `rect`, this test fails.
+        //
+        // The fixture uses an asymmetric inset (outer 20x10 with content 15x4 at offset
+        // 2,3) so a `rect - 2` regression would return (18, 8) — clearly wrong — instead
+        // of (15, 4).
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: vec![PaneSummary {
+                id: pane_id,
+                index: 1,
+                name: None,
+                focused: true,
+                state: PaneState::Running,
+                state_reason: None,
+            }],
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![AttachSurface {
+                    id: Uuid::new_v4(),
+                    kind: AttachSurfaceKind::Pane,
+                    layer: bmux_ipc::AttachLayer::Pane,
+                    z: 0,
+                    pane_id: Some(pane_id),
+                    rect: AttachRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 10,
+                    },
+                    content_rect: AttachRect {
+                        x: 2,
+                        y: 3,
+                        w: 15,
+                        h: 4,
+                    },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                }],
+            },
+            zoomed: false,
+        });
+
+        assert_eq!(
+            focused_attach_pane_inner_size(&view_state),
+            Some((15, 4)),
+            "inner size must equal the scene's content_rect dims, not rect - 2"
+        );
     }
 
     #[test]
