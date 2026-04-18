@@ -3015,6 +3015,13 @@ pub fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachSurface>
             w: width as u16,
             h: height as u16,
         },
+        content_rect: bmux_ipc::AttachRect {
+            x: x as u16,
+            y: y as u16,
+            w: width as u16,
+            h: height as u16,
+        },
+        interactive_regions: Vec::new(),
         opaque: true,
         visible: true,
         accepts_input: true,
@@ -3214,10 +3221,10 @@ pub fn render_attach_frame(
                 let pane_images: Vec<bmux_image::PaneImage> =
                     images.iter().map(bmux_image::PaneImage::from).collect();
                 let pane_rect = bmux_image::compositor::PaneRect {
-                    x: surface.rect.x,
-                    y: surface.rect.y,
-                    w: surface.rect.w,
-                    h: surface.rect.h,
+                    x: surface.content_rect.x,
+                    y: surface.content_rect.y,
+                    w: surface.content_rect.w,
+                    h: surface.content_rect.h,
                 };
                 let decode_mode = view_state.image_decode_mode;
                 let _ = bmux_image::compositor::render_pane_images(
@@ -5368,13 +5375,16 @@ pub fn attach_mouse_forward_bytes_for_target(
     let target_pane = target_pane?;
     let protocol = attach_pane_mouse_protocol(view_state, target_pane)?;
     // Programs running inside a pane (nvim, tmux, etc.) expect mouse
-    // coordinates relative to the pane's own virtual terminal, not the
-    // whole attach UI. Without this translation the encoder emits absolute
-    // terminal coordinates — well past the pane width — which causes
-    // applications to clamp the cursor to end-of-line on every click.
-    let pane_rect = attach_scene_pane_rect(view_state, target_pane)?;
+    // coordinates relative to the pane's own virtual terminal (its PTY
+    // interior), not the whole attach UI and not the outer surface bounds
+    // (which include any decoration/border painted by a plugin). We
+    // translate against `content_rect` — the authoritative PTY interior
+    // published by the scene producer — so clicks on the first visible
+    // content cell encode to SGR `(1, 1)` regardless of how thick or thin
+    // the surrounding decoration is.
+    let pane_content_rect = attach_scene_pane_content_rect(view_state, target_pane)?;
     let shared_event = mouse_event_to_shared(mouse_event);
-    let local_event = attach_mouse::translate_event_to_pane_local(shared_event, pane_rect)?;
+    let local_event = attach_mouse::translate_event_to_pane_local(shared_event, pane_content_rect)?;
     attach_mouse::encode_for_protocol(
         local_event,
         attach_mouse::PaneProtocol {
@@ -5384,7 +5394,7 @@ pub fn attach_mouse_forward_bytes_for_target(
     )
 }
 
-fn attach_scene_pane_rect(
+fn attach_scene_pane_content_rect(
     view_state: &AttachViewState,
     pane_id: Uuid,
 ) -> Option<bmux_ipc::AttachRect> {
@@ -5397,7 +5407,7 @@ fn attach_scene_pane_rect(
         if !surface.visible || !surface.accepts_input {
             continue;
         }
-        let candidate = (surface.layer, surface.z, index, surface.rect);
+        let candidate = (surface.layer, surface.z, index, surface.content_rect);
         if best.as_ref().is_none_or(|current| {
             (candidate.0, candidate.1, candidate.2) > (current.0, current.1, current.2)
         }) {
@@ -5870,6 +5880,13 @@ mod tests {
                         w: 9,
                         h: 6,
                     },
+                    content_rect: AttachRect {
+                        x: 0,
+                        y: 0,
+                        w: 9,
+                        h: 6,
+                    },
+                    interactive_regions: Vec::new(),
                     opaque: true,
                     visible: true,
                     accepts_input: true,
@@ -6615,6 +6632,8 @@ mod tests {
                     z: 0,
                     pane_id: Some(pane_id),
                     rect,
+                    content_rect: rect,
+                    interactive_regions: Vec::new(),
                     opaque: true,
                     visible: true,
                     accepts_input: true,
@@ -6677,6 +6696,123 @@ mod tests {
         );
     }
 
+    /// Regression test for the "one down, one right" border off-by-one bug.
+    ///
+    /// When a pane has a 1-cell decoration/border, the surface's `rect`
+    /// covers the outer bounds but the PTY (and nvim, tmux, etc. running
+    /// inside it) only sees the interior `content_rect` which starts at
+    /// `rect.x + 1, rect.y + 1`. A click at the visual top-left content
+    /// cell must encode to pane-local `(1, 1)` — SGR `\x1b[<0;1;1M`. If
+    /// the translator uses the outer `rect` instead of `content_rect`, the
+    /// click appears one column right and one row down to the program
+    /// inside the pane.
+    #[test]
+    fn attach_mouse_forward_uses_content_rect_not_outer_rect() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        // Outer rect of the pane surface; content rect is inset by 1 on
+        // each side — matching what the server scene producer now emits.
+        let outer = AttachRect {
+            x: 91,
+            y: 1,
+            w: 90,
+            h: 40,
+        };
+        let content = AttachRect {
+            x: outer.x + 1,
+            y: outer.y + 1,
+            w: outer.w - 2,
+            h: outer.h - 2,
+        };
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: vec![PaneSummary {
+                id: pane_id,
+                index: 1,
+                name: None,
+                focused: true,
+                state: PaneState::Running,
+                state_reason: None,
+            }],
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![AttachSurface {
+                    id: Uuid::new_v4(),
+                    kind: AttachSurfaceKind::Pane,
+                    layer: bmux_ipc::AttachLayer::Pane,
+                    z: 0,
+                    pane_id: Some(pane_id),
+                    rect: outer,
+                    content_rect: content,
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                }],
+            },
+            zoomed: false,
+        });
+        let buffer = view_state
+            .pane_buffers
+            .entry(pane_id)
+            .or_insert_with(|| PaneRenderBuffer {
+                parser: vt100::Parser::new(38, 88, 4_096),
+                last_alternate_screen: false,
+                prev_rows: Vec::new(),
+                sync_update_in_progress: false,
+                expected_stream_start: None,
+            });
+        append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
+
+        // Click at the visual top-left content cell: absolute
+        // (content.x, content.y) = (92, 2). Pane-local = (0, 0) →
+        // encoded SGR = (1, 1).
+        let first_content_cell = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: content.x,
+            row: content.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let forwarded = attach_mouse_forward_bytes_for_target(
+            &view_state,
+            first_content_cell,
+            Some(pane_id),
+            true,
+        )
+        .expect("click on the first content cell should forward");
+        assert_eq!(
+            forwarded,
+            b"\x1b[<0;1;1M".to_vec(),
+            "click at the visual top-left content cell must encode as SGR (1, 1)"
+        );
+
+        // Click on the top border cell (outer.y, outside content_rect):
+        // should not forward PTY bytes because the click is on decoration,
+        // not content.
+        let border_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: outer.x + 5,
+            row: outer.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let forwarded =
+            attach_mouse_forward_bytes_for_target(&view_state, border_click, Some(pane_id), true);
+        assert!(
+            forwarded.is_none(),
+            "clicks on the border (outside content_rect) must not forward PTY bytes"
+        );
+    }
+
     #[test]
     fn resolve_mouse_gesture_action_parses_plugin_command() {
         let mut view_state = AttachViewState::new(AttachOpenInfo {
@@ -6735,6 +6871,13 @@ mod tests {
                             w: 20,
                             h: 10,
                         },
+                        content_rect: AttachRect {
+                            x: 0,
+                            y: 0,
+                            w: 20,
+                            h: 10,
+                        },
+                        interactive_regions: Vec::new(),
                         opaque: true,
                         visible: true,
                         accepts_input: true,
@@ -6752,6 +6895,13 @@ mod tests {
                             w: 8,
                             h: 5,
                         },
+                        content_rect: AttachRect {
+                            x: 2,
+                            y: 2,
+                            w: 8,
+                            h: 5,
+                        },
+                        interactive_regions: Vec::new(),
                         opaque: true,
                         visible: true,
                         accepts_input: true,
@@ -7536,6 +7686,14 @@ mod tests {
                     w: 120,
                     h: 49,
                 },
+                // Content rect reflects the server's 1-cell border inset.
+                content_rect: bmux_ipc::AttachRect {
+                    x: 1,
+                    y: 2,
+                    w: 118,
+                    h: 47,
+                },
+                interactive_regions: Vec::new(),
                 opaque: true,
                 visible: true,
                 accepts_input: true,

@@ -50,11 +50,14 @@ pub fn pane_at(scene: &AttachScene, column: u16, row: u16) -> Option<Uuid> {
     pane_and_rect_at(scene, column, row).map(|(pane_id, _)| pane_id)
 }
 
-/// Like [`pane_at`], but also returns the matched surface's rect.
+/// Like [`pane_at`], but also returns the matched surface's **content rect**.
 ///
-/// Callers use the rect to translate absolute terminal coordinates into
-/// pane-local coordinates before forwarding mouse events to the pane's
-/// program.
+/// Callers use the content rect to translate absolute terminal coordinates
+/// into pane-local coordinates before forwarding mouse events to the pane's
+/// program. The hit-test itself operates on the surface's outer `rect` so
+/// clicks on decoration (borders, titles, etc.) still match the pane —
+/// callers that only care about PTY-content clicks should additionally
+/// check that the point falls inside the returned content rect.
 #[must_use]
 pub fn pane_and_rect_at(scene: &AttachScene, column: u16, row: u16) -> Option<(Uuid, AttachRect)> {
     let mut best: Option<(AttachLayer, i32, usize, Uuid, AttachRect)> = None;
@@ -68,14 +71,20 @@ pub fn pane_and_rect_at(scene: &AttachScene, column: u16, row: u16) -> Option<(U
         if !rect_contains_point(surface.rect, column, row) {
             continue;
         }
-        let candidate = (surface.layer, surface.z, index, pane_id, surface.rect);
+        let candidate = (
+            surface.layer,
+            surface.z,
+            index,
+            pane_id,
+            surface.content_rect,
+        );
         if best.as_ref().is_none_or(|current| {
             (candidate.0, candidate.1, candidate.2) > (current.0, current.1, current.2)
         }) {
             best = Some(candidate);
         }
     }
-    best.map(|(_, _, _, pane_id, rect)| (pane_id, rect))
+    best.map(|(_, _, _, pane_id, content_rect)| (pane_id, content_rect))
 }
 
 /// Translate `event` from absolute terminal coordinates into `rect`'s local space.
@@ -344,6 +353,8 @@ mod tests {
             layer,
             z,
             rect,
+            content_rect: rect,
+            interactive_regions: Vec::new(),
             opaque: true,
             visible,
             accepts_input,

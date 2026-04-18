@@ -67,10 +67,14 @@ pub fn render_pane_images(
         return Ok(());
     }
 
-    let inner_x = pane_rect.x.saturating_add(1);
-    let inner_y = pane_rect.y.saturating_add(1);
-    let inner_w = pane_rect.w.saturating_sub(2);
-    let inner_h = pane_rect.h.saturating_sub(2);
+    // `pane_rect` is the pane's **content rect** — the PTY interior, not
+    // the outer surface bounds. Callers are responsible for passing the
+    // `content_rect` from the scene so decoration thickness is handled by
+    // the scene producer once, not recomputed here.
+    let inner_x = pane_rect.x;
+    let inner_y = pane_rect.y;
+    let inner_w = pane_rect.w;
+    let inner_h = pane_rect.h;
 
     for image in images {
         // Skip images entirely outside the pane inner area.

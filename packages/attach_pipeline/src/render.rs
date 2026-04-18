@@ -336,6 +336,16 @@ pub fn render_attach_scene<W: io::Write>(
             w: surface.rect.w,
             h: surface.rect.h,
         };
+        // Interior used for PTY content and cursor positioning. Read from
+        // the scene's authoritative `content_rect` so that when decoration
+        // thickness changes (e.g. future decoration plugin), this path
+        // automatically follows without any local border math.
+        let content = PaneRect {
+            x: surface.content_rect.x,
+            y: surface.content_rect.y,
+            w: surface.content_rect.w,
+            h: surface.content_rect.h,
+        };
         if rect.w < 2 || rect.h < 2 {
             continue;
         }
@@ -406,8 +416,8 @@ pub fn render_attach_scene<W: io::Write>(
             }
         }
 
-        let inner_width = rect.w.saturating_sub(2);
-        let inner_height = rect.h.saturating_sub(2);
+        let inner_width = content.w;
+        let inner_height = content.h;
         let inner_w = usize::from(inner_width);
         let inner_h = usize::from(inner_height);
         if let Some(entry) = pane_buffers.get_mut(&pane_id) {
@@ -449,8 +459,8 @@ pub fn render_attach_scene<W: io::Write>(
                     )
                 };
                 cursor_state = Some(AttachCursorState {
-                    x: rect.x.saturating_add(1).saturating_add(cursor_col),
-                    y: rect.y.saturating_add(1).saturating_add(cursor_row),
+                    x: content.x.saturating_add(cursor_col),
+                    y: content.y.saturating_add(cursor_row),
                     visible: use_scrollback || !screen.hide_cursor(),
                 });
             }
@@ -458,7 +468,7 @@ pub fn render_attach_scene<W: io::Write>(
                 continue;
             }
             for row in 0..inner_h {
-                let y = rect.y.saturating_add(1 + row as u16);
+                let y = content.y.saturating_add(row as u16);
                 let mut line = String::new();
                 let mut current = CellStyle::default();
                 let mut used_cols = 0usize;
@@ -518,7 +528,7 @@ pub fn render_attach_scene<W: io::Write>(
                 // matches the previous frame's cached version for this row.
                 let cached = entry.prev_rows.get(row);
                 if cached.is_none_or(|c| *c != line) {
-                    queue!(stdout, MoveTo(rect.x.saturating_add(1), y), Print(&line))
+                    queue!(stdout, MoveTo(content.x, y), Print(&line))
                         .context("failed drawing pane content")?;
                     if row < entry.prev_rows.len() {
                         entry.prev_rows[row] = line;
@@ -537,13 +547,9 @@ pub fn render_attach_scene<W: io::Write>(
             }
         } else if should_draw {
             for row in 0..inner_h {
-                let y = rect.y.saturating_add(1 + row as u16);
-                queue!(
-                    stdout,
-                    MoveTo(rect.x.saturating_add(1), y),
-                    Print(" ".repeat(inner_w))
-                )
-                .context("failed clearing pane content")?;
+                let y = content.y.saturating_add(row as u16);
+                queue!(stdout, MoveTo(content.x, y), Print(" ".repeat(inner_w)))
+                    .context("failed clearing pane content")?;
             }
         }
     }
@@ -659,6 +665,13 @@ mod tests {
                     w: 20,
                     h: 6,
                 },
+                content_rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 20,
+                    h: 6,
+                },
+                interactive_regions: Vec::new(),
                 opaque: true,
                 visible: true,
                 accepts_input: true,
@@ -715,6 +728,13 @@ mod tests {
                     w: 12,
                     h: 4,
                 },
+                content_rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 12,
+                    h: 4,
+                },
+                interactive_regions: Vec::new(),
                 opaque: true,
                 visible: true,
                 accepts_input: true,
@@ -767,6 +787,13 @@ mod tests {
                     w: 20,
                     h: 5,
                 },
+                content_rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 20,
+                    h: 5,
+                },
+                interactive_regions: Vec::new(),
                 opaque: true,
                 visible: true,
                 accepts_input: true,
@@ -819,6 +846,7 @@ mod tests {
     // the renderer correctly defers drawing when the flag is set.
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn sync_deferred_pane_skips_content_render() {
         let pane_id = Uuid::from_u128(42);
         let scene = AttachScene {
@@ -835,6 +863,13 @@ mod tests {
                     w: 12,
                     h: 4,
                 },
+                content_rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 12,
+                    h: 4,
+                },
+                interactive_regions: Vec::new(),
                 opaque: true,
                 visible: true,
                 accepts_input: true,
@@ -951,6 +986,13 @@ mod tests {
                     w: 12,
                     h: 4,
                 },
+                content_rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 12,
+                    h: 4,
+                },
+                interactive_regions: Vec::new(),
                 opaque: true,
                 visible: true,
                 accepts_input: true,

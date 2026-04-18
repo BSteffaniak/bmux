@@ -581,6 +581,13 @@ fn prompt_overlay_layout(request: Option<&PromptRequest>) -> Option<PromptOverla
                 w: width as u16,
                 h: height as u16,
             },
+            content_rect: AttachRect {
+                x: x as u16,
+                y: y as u16,
+                w: width as u16,
+                h: height as u16,
+            },
+            interactive_regions: Vec::new(),
             opaque: true,
             visible: true,
             accepts_input: true,

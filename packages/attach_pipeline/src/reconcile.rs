@@ -96,20 +96,26 @@ pub fn resize_attach_parsers_for_scene_with_size(
         if !surface.visible {
             continue;
         }
-        let rect = PaneRect {
-            x: surface.rect.x.min(cols.saturating_sub(1)),
-            y: surface.rect.y.min(rows.saturating_sub(1)),
-            w: surface.rect.w.min(cols),
-            h: surface
-                .rect
-                .h
-                .min(rows.saturating_sub(surface.rect.y.min(rows.saturating_sub(1)))),
-        };
-        if rect.w < 2 || rect.h < 2 {
+        // Size the pane parser to the scene's authoritative content_rect
+        // (the PTY interior), clamped to the viewport. This keeps the
+        // parser's dimensions aligned with what the renderer, PTY sizer,
+        // and mouse translator all agree is the pane's interior — no
+        // hardcoded border math here.
+        let content_x = surface.content_rect.x.min(cols.saturating_sub(1));
+        let content_y = surface.content_rect.y.min(rows.saturating_sub(1));
+        let max_w = cols.saturating_sub(content_x);
+        let max_h = rows.saturating_sub(content_y);
+        let inner_w = surface.content_rect.w.min(max_w).max(1);
+        let inner_h = surface.content_rect.h.min(max_h).max(1);
+        if inner_w == 0 || inner_h == 0 {
             continue;
         }
-        let inner_w = rect.w.saturating_sub(2).max(1);
-        let inner_h = rect.h.saturating_sub(2).max(1);
+        let _ = PaneRect {
+            x: content_x,
+            y: content_y,
+            w: inner_w,
+            h: inner_h,
+        };
         let buffer = pane_buffers.entry(pane_id).or_default();
         buffer.parser.screen_mut().set_size(inner_h, inner_w);
     }

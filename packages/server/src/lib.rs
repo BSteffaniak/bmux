@@ -18,14 +18,14 @@ use bmux_ipc::{
     AttachPaneMouseProtocol, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
     AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector,
     ContextSessionBindingSummary, ContextSummary, ControlCatalogScope, ControlCatalogSnapshot,
-    Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
-    PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection,
-    PaneState, PaneSummary, PerformanceRecordingLevel, PerformanceRuntimeSettings,
-    ProtocolContract, RecordingEventKind, RecordingPayload, RecordingProfile,
-    RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
-    RecordingRollingUsage, RecordingSummary, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
-    encode, negotiate_protocol,
+    Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, InteractiveRegion, IpcEndpoint,
+    PaneFocusDirection, PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
+    PaneSplitDirection, PaneState, PaneSummary, PerformanceRecordingLevel,
+    PerformanceRuntimeSettings, ProtocolContract, RecordingEventKind, RecordingPayload,
+    RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
+    RecordingRollingStatus, RecordingRollingUsage, RecordingSummary, Request, Response,
+    ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
+    default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -3043,6 +3043,85 @@ const fn attach_rect_from_layout_rect(rect: LayoutRect) -> AttachRect {
     }
 }
 
+/// Compute the `content_rect` for a pane surface that has a 1-cell border on
+/// all sides. This matches the border currently painted by
+/// `packages/attach_pipeline/src/render.rs`. When the decoration plugin
+/// eventually owns border painting, this helper will be replaced by a
+/// plugin-driven layout pass. Until then, a single source of truth lives here.
+const fn pane_content_rect_for_outer(rect: AttachRect) -> AttachRect {
+    // A pane smaller than 2 cells in either dimension has no interior; use the
+    // full rect so downstream consumers don't see a zero-sized content rect.
+    // (The server's PTY sizer still guards with `.max(1)`.)
+    if rect.w < 2 || rect.h < 2 {
+        return rect;
+    }
+    AttachRect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        w: rect.w - 2,
+        h: rect.h - 2,
+    }
+}
+
+/// Build the four `InteractiveRegion`s that make up a 1-cell border around a
+/// pane. Each border edge is declared as a separate region so that hit-tests
+/// can report which edge was clicked. Owning plugin id matches the identifier
+/// used by the (future) decoration plugin; today it's used by core's
+/// focus-follow-click behavior as a fallback.
+fn border_regions_for_rect(rect: AttachRect, owning_plugin_id: &str) -> Vec<InteractiveRegion> {
+    if rect.w < 2 || rect.h < 2 {
+        return Vec::new();
+    }
+    let mut regions = Vec::with_capacity(4);
+    // Top edge, full width including corners.
+    regions.push(InteractiveRegion {
+        rect: AttachRect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: 1,
+        },
+        region_id: "border-top".to_string(),
+        owning_plugin_id: owning_plugin_id.to_string(),
+    });
+    // Bottom edge, full width including corners.
+    regions.push(InteractiveRegion {
+        rect: AttachRect {
+            x: rect.x,
+            y: rect.y + rect.h - 1,
+            w: rect.w,
+            h: 1,
+        },
+        region_id: "border-bottom".to_string(),
+        owning_plugin_id: owning_plugin_id.to_string(),
+    });
+    // Left edge, excluding corners (already covered by top/bottom).
+    if rect.h > 2 {
+        regions.push(InteractiveRegion {
+            rect: AttachRect {
+                x: rect.x,
+                y: rect.y + 1,
+                w: 1,
+                h: rect.h - 2,
+            },
+            region_id: "border-left".to_string(),
+            owning_plugin_id: owning_plugin_id.to_string(),
+        });
+        // Right edge, excluding corners.
+        regions.push(InteractiveRegion {
+            rect: AttachRect {
+                x: rect.x + rect.w - 1,
+                y: rect.y + 1,
+                w: 1,
+                h: rect.h - 2,
+            },
+            region_id: "border-right".to_string(),
+            owning_plugin_id: owning_plugin_id.to_string(),
+        });
+    }
+    regions
+}
+
 fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
     let (cols, rows, status_top_inset, status_bottom_inset) =
         viewport.map_or((0, 0, 0, 0), |viewport| {
@@ -3064,6 +3143,10 @@ fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
     }
 }
 
+// Building the attach scene requires constructing every surface's
+// `rect` + `content_rect` + border `interactive_regions` literally;
+// splitting this further would hurt readability more than it helps.
+#[allow(clippy::too_many_lines)]
 fn build_attach_scene(
     session_id: SessionId,
     runtime: &SessionRuntimeHandle,
@@ -3075,12 +3158,15 @@ fn build_attach_scene(
     if let Some(zoomed_id) = runtime.zoomed_pane_id
         && runtime.panes.contains_key(&zoomed_id)
     {
+        let zoomed_rect = attach_rect_from_layout_rect(scene_root);
         let zoomed_surface = AttachSurface {
             id: zoomed_id,
             kind: AttachSurfaceKind::Pane,
             layer: AttachLayer::Pane,
             z: 0,
-            rect: attach_rect_from_layout_rect(scene_root),
+            rect: zoomed_rect,
+            content_rect: pane_content_rect_for_outer(zoomed_rect),
+            interactive_regions: border_regions_for_rect(zoomed_rect, "bmux.decoration"),
             opaque: true,
             visible: true,
             accepts_input: true,
@@ -3096,17 +3182,22 @@ fn build_attach_scene(
                 .floating_surfaces
                 .iter()
                 .filter(|surface| runtime.panes.contains_key(&surface.pane_id))
-                .map(|surface| AttachSurface {
-                    id: surface.id,
-                    kind: AttachSurfaceKind::FloatingPane,
-                    layer: AttachLayer::FloatingPane,
-                    z: surface.z,
-                    rect: attach_rect_from_layout_rect(surface.rect),
-                    opaque: surface.opaque,
-                    visible: surface.visible,
-                    accepts_input: surface.accepts_input,
-                    cursor_owner: surface.cursor_owner,
-                    pane_id: Some(surface.pane_id),
+                .map(|surface| {
+                    let rect = attach_rect_from_layout_rect(surface.rect);
+                    AttachSurface {
+                        id: surface.id,
+                        kind: AttachSurfaceKind::FloatingPane,
+                        layer: AttachLayer::FloatingPane,
+                        z: surface.z,
+                        rect,
+                        content_rect: pane_content_rect_for_outer(rect),
+                        interactive_regions: border_regions_for_rect(rect, "bmux.decoration"),
+                        opaque: surface.opaque,
+                        visible: surface.visible,
+                        accepts_input: surface.accepts_input,
+                        cursor_owner: surface.cursor_owner,
+                        pane_id: Some(surface.pane_id),
+                    }
                 }),
         );
 
@@ -3128,18 +3219,23 @@ fn build_attach_scene(
         .into_iter()
         .enumerate()
         .filter_map(|(index, pane_id)| {
-            rects.get(&pane_id).copied().map(|rect| AttachSurface {
-                id: pane_id,
-                kind: AttachSurfaceKind::Pane,
-                layer: AttachLayer::Pane,
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                z: index as i32,
-                rect: attach_rect_from_layout_rect(rect),
-                opaque: true,
-                visible: true,
-                accepts_input: true,
-                cursor_owner: pane_id == runtime.focused_pane_id,
-                pane_id: Some(pane_id),
+            rects.get(&pane_id).copied().map(|rect| {
+                let attach_rect = attach_rect_from_layout_rect(rect);
+                AttachSurface {
+                    id: pane_id,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: AttachLayer::Pane,
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    z: index as i32,
+                    rect: attach_rect,
+                    content_rect: pane_content_rect_for_outer(attach_rect),
+                    interactive_regions: border_regions_for_rect(attach_rect, "bmux.decoration"),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: pane_id == runtime.focused_pane_id,
+                    pane_id: Some(pane_id),
+                }
             })
         })
         .collect::<Vec<_>>();
@@ -3149,17 +3245,22 @@ fn build_attach_scene(
             .floating_surfaces
             .iter()
             .filter(|surface| runtime.panes.contains_key(&surface.pane_id))
-            .map(|surface| AttachSurface {
-                id: surface.id,
-                kind: AttachSurfaceKind::FloatingPane,
-                layer: AttachLayer::FloatingPane,
-                z: surface.z,
-                rect: attach_rect_from_layout_rect(surface.rect),
-                opaque: surface.opaque,
-                visible: surface.visible,
-                accepts_input: surface.accepts_input,
-                cursor_owner: surface.cursor_owner,
-                pane_id: Some(surface.pane_id),
+            .map(|surface| {
+                let rect = attach_rect_from_layout_rect(surface.rect);
+                AttachSurface {
+                    id: surface.id,
+                    kind: AttachSurfaceKind::FloatingPane,
+                    layer: AttachLayer::FloatingPane,
+                    z: surface.z,
+                    rect,
+                    content_rect: pane_content_rect_for_outer(rect),
+                    interactive_regions: border_regions_for_rect(rect, "bmux.decoration"),
+                    opaque: surface.opaque,
+                    visible: surface.visible,
+                    accepts_input: surface.accepts_input,
+                    cursor_owner: surface.cursor_owner,
+                    pane_id: Some(surface.pane_id),
+                }
             }),
     );
 
@@ -3173,8 +3274,13 @@ fn build_attach_scene(
 }
 
 fn pane_pty_size(layout_rect: LayoutRect) -> (u16, u16) {
-    let cols = layout_rect.w.saturating_sub(2).max(1);
-    let rows = layout_rect.h.saturating_sub(2).max(1);
+    // PTY size must match the surface's `content_rect` so that what the
+    // program inside the pane draws aligns with what the renderer/mouse
+    // hit-tester sees. We route through the same helper that computes
+    // `content_rect` in scene construction to keep them consistent.
+    let content = pane_content_rect_for_outer(attach_rect_from_layout_rect(layout_rect));
+    let cols = content.w.max(1);
+    let rows = content.h.max(1);
     (rows, cols)
 }
 

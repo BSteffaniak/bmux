@@ -421,11 +421,37 @@ pub struct AttachSurface {
     pub layer: AttachLayer,
     pub z: i32,
     pub rect: AttachRect,
+    /// Region within `rect` where the pane's PTY content lives. Authoritative;
+    /// consumers (renderer, PTY sizer, mouse hit-tester, image compositor) must
+    /// read this rather than subtracting borders from `rect`. Scene producers
+    /// fill this in based on whatever decoration is applied; when no
+    /// decoration is present, `content_rect == rect`.
+    pub content_rect: AttachRect,
+    /// Named sub-rectangles of `rect` that belong to a plugin-owned surface
+    /// decoration. Hit-testing routes clicks on these regions to the owning
+    /// plugin as `SurfaceRegionMouseEvent`s. Must not overlap `content_rect`
+    /// or each other.
+    #[serde(default)]
+    pub interactive_regions: Vec<InteractiveRegion>,
     pub opaque: bool,
     pub visible: bool,
     pub accepts_input: bool,
     pub cursor_owner: bool,
     pub pane_id: Option<Uuid>,
+}
+
+/// Named rectangular region within an `AttachSurface` that routes mouse
+/// input to a plugin. The region is rendered by the plugin that declared
+/// it; core only hit-tests and dispatches events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractiveRegion {
+    /// Absolute terminal coordinates of this region.
+    pub rect: AttachRect,
+    /// Plugin-chosen identifier, unique within the owning surface.
+    pub region_id: String,
+    /// Plugin id that owns this region. Mouse events on this region are
+    /// dispatched to this plugin.
+    pub owning_plugin_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1737,6 +1763,13 @@ mod tests {
                         w: 80,
                         h: 24,
                     },
+                    content_rect: AttachRect {
+                        x: 0,
+                        y: 1,
+                        w: 80,
+                        h: 24,
+                    },
+                    interactive_regions: Vec::new(),
                     opaque: true,
                     visible: true,
                     accepts_input: true,
@@ -2280,6 +2313,13 @@ mod tests {
                         w: 80,
                         h: 24,
                     },
+                    content_rect: AttachRect {
+                        x: 1,
+                        y: 2,
+                        w: 78,
+                        h: 22,
+                    },
+                    interactive_regions: Vec::new(),
                     opaque: true,
                     visible: true,
                     accepts_input: true,
@@ -2297,6 +2337,13 @@ mod tests {
                         w: 40,
                         h: 10,
                     },
+                    content_rect: AttachRect {
+                        x: 6,
+                        y: 6,
+                        w: 38,
+                        h: 8,
+                    },
+                    interactive_regions: Vec::new(),
                     opaque: false,
                     visible: true,
                     accepts_input: true,

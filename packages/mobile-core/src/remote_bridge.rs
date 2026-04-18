@@ -1292,7 +1292,9 @@ async fn handle_session_mouse_event(
     session_id: Uuid,
     event: TerminalMouseEvent,
 ) -> Result<()> {
-    let Some((target_pane, pane_rect)) = state.target_pane_and_rect_at(event.col, event.row) else {
+    let Some((target_pane, pane_content_rect)) =
+        state.target_pane_and_rect_at(event.col, event.row)
+    else {
         return Ok(());
     };
 
@@ -1328,7 +1330,8 @@ async fn handle_session_mouse_event(
     // Programs inside the pane expect pane-local coordinates. See the
     // matching translation in `attach_mouse_forward_bytes_for_target` for
     // the attach CLI path.
-    let Some(local_event) = attach_mouse::translate_event_to_pane_local(mouse_event, pane_rect)
+    let Some(local_event) =
+        attach_mouse::translate_event_to_pane_local(mouse_event, pane_content_rect)
     else {
         return Ok(());
     };
