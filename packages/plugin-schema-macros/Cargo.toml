@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools::procedural-macro-helpers"]
+description = "Proc macro for including a BPDL schema and generating Rust bindings"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "bpdl", "proc-macro"]
+license     = { workspace = true }
+name        = "bmux_plugin_schema_macros"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+proc-macro = true
+
+[dependencies]
+bmux_plugin_schema = { workspace = true }
+proc-macro2        = { workspace = true }
+quote              = { workspace = true }
+syn                = { workspace = true, features = ["full"] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -1,0 +1,82 @@
+// Public, typed contract of the windows plugin. Other plugins that
+// depend on `bmux_windows_plugin_api` import these interfaces rather
+// than the windows plugin implementation itself.
+//
+// Design notes:
+//
+// - `windows-state` exposes read-only queries about the current pane/
+//   window layout.
+// - `windows-commands` exposes mutating operations (focus, close). A
+//   follow-up PR will split command authorization through the
+//   permissions plugin.
+// - `windows-events` is an event stream of window/pane lifecycle
+//   changes. Other plugins subscribe to react to changes (e.g., the
+//   decoration plugin restyles on focus change).
+
+plugin bmux.windows version 1;
+
+interface windows-state {
+    // A pane's current lifecycle status.
+    variant pane-status {
+        running,
+        exited { exit-code: i32 },
+    }
+
+    // Snapshot of a single pane's state.
+    record pane-state {
+        id: uuid,
+        session-id: uuid,
+        focused: bool,
+        zoomed: bool,
+        name: string?,
+        status: pane-status,
+    }
+
+    // Queries — read-only reads.
+    query pane-state(id: uuid) -> pane-state?;
+    query focused-pane(session: uuid) -> uuid?;
+    query zoomed-pane(session: uuid) -> uuid?;
+    query list-panes(session: uuid) -> list<pane-state>;
+}
+
+interface windows-commands {
+    // Errors a focus command can produce.
+    variant focus-error {
+        pane-not-found,
+        focus-denied { reason: string },
+    }
+
+    // Errors a close command can produce.
+    variant close-error {
+        pane-not-found,
+        close-denied { reason: string },
+    }
+
+    // Focus a specific pane.
+    command focus-pane(id: uuid) -> result<unit, focus-error>;
+
+    // Close a pane.
+    command close-pane(id: uuid) -> result<unit, close-error>;
+}
+
+interface windows-events {
+    // A single event describing a pane-level state change.
+    variant pane-event {
+        // A pane gained focus.
+        focused { pane-id: uuid },
+        // A pane lost focus.
+        unfocused { pane-id: uuid },
+        // A pane was zoomed to fill its session viewport.
+        zoomed { pane-id: uuid },
+        // A zoomed pane was restored.
+        unzoomed { pane-id: uuid },
+        // A new pane was opened.
+        opened { pane-id: uuid, session-id: uuid },
+        // A pane was closed.
+        closed { pane-id: uuid },
+        // The pane's lifecycle status changed (e.g., running -> exited).
+        status-changed { pane-id: uuid },
+    }
+
+    events pane-event;
+}

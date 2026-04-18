@@ -1370,6 +1370,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_plugin_schema"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bmux_plugin_schema_macros"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_schema",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1508,6 +1526,16 @@ dependencies = [
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_windows_plugin_api"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_schema_macros",
  "serde",
  "serde_json",
  "uuid",

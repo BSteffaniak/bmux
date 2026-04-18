@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "BMUX Plugin Definition Language (BPDL) — parser, validator, and Rust codegen for typed plugin interfaces"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "schema", "idl", "bpdl"]
+license     = { workspace = true }
+name        = "bmux_plugin_schema"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde     = { workspace = true, features = ["derive", "std"] }
+thiserror = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

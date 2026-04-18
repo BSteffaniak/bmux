@@ -22,6 +22,8 @@ members = [
     "packages/ipc",
     "packages/keybind",
     "packages/plugin",
+    "packages/plugin-schema",
+    "packages/plugin-schema-macros",
     "packages/plugin-sdk",
     "packages/perf-tools",
     "packages/server",
@@ -45,6 +47,7 @@ members = [
     "plugins/permissions-plugin",
     "plugins/prompted-actions-plugin",
     "plugins/windows-plugin",
+    "plugins/windows-plugin-api",
 ]
 
 resolver = "2"
@@ -111,6 +114,8 @@ bmux_keyboard               = { version = "0.0.1-alpha.0", default-features = fa
 bmux_mobile_core            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-core" }
 bmux_mobile_ffi             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-ffi" }
 bmux_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
+bmux_plugin_schema          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-schema" }
+bmux_plugin_schema_macros   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-schema-macros" }
 bmux_plugin_sdk             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bmux_sandbox_harness        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/sandbox-harness" }
 bmux_server                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
@@ -128,6 +133,7 @@ bmux_permissions_plugin      = { version = "0.0.1-alpha.0", default-features = f
 bmux_plugin_cli_plugin       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/plugin-cli-plugin" }
 bmux_prompted_actions_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/prompted-actions-plugin" }
 bmux_windows_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/windows-plugin" }
+bmux_windows_plugin_api      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/windows-plugin-api" }
 
 # Docs site crates
 bmux_docs_site_ui = { version = "0.0.1-alpha.0", default-features = false, path = "packages/docs-site/ui" }
