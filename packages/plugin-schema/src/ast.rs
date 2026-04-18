@@ -1,8 +1,9 @@
 //! Typed AST for a BPDL schema.
 //!
 //! A [`Schema`] represents a complete `.bpdl` file. It carries the plugin
-//! header (`plugin <id> version <n>;`) and a list of [`Interface`] blocks.
-//! Each interface defines user types (records, variants, enums) and
+//! header (`plugin <id> version <n>;`), optional [`Import`]s referencing
+//! other plugin schemas, and a list of [`Interface`] blocks. Each
+//! interface defines user types (records, variants, enums) and
 //! operations (queries, commands, and at most one event stream).
 
 use crate::Span;
@@ -11,6 +12,9 @@ use crate::Span;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     pub plugin: PluginHeader,
+    /// `import <alias> = <plugin.id>;` directives. Resolved against a
+    /// caller-provided imports table at validation and codegen time.
+    pub imports: Vec<Import>,
     pub interfaces: Vec<Interface>,
 }
 
@@ -19,6 +23,16 @@ pub struct Schema {
 pub struct PluginHeader {
     pub plugin_id: String,
     pub version: u32,
+    pub span: Span,
+}
+
+/// An `import <alias> = <plugin.id>;` declaration at the top of a schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Import {
+    /// Local alias used in qualified type references (`windows.pane-state`).
+    pub alias: String,
+    /// The imported plugin's `plugin <id>` value.
+    pub plugin_id: String,
     pub span: Span,
 }
 
@@ -75,6 +89,8 @@ pub struct VariantCase {
     /// Empty for unit cases (`focused`), non-empty for struct-like cases
     /// (`exited { code: i32 }`).
     pub payload: Vec<Field>,
+    /// Marked `@default`. Only legal for unit cases.
+    pub is_default: bool,
     pub span: Span,
 }
 
@@ -91,6 +107,8 @@ pub struct EnumDef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumCase {
     pub name: String,
+    /// Marked `@default`. At most one per enum.
+    pub is_default: bool,
     pub span: Span,
 }
 
@@ -111,10 +129,16 @@ pub enum TypeRef {
     Primitive(Primitive),
     /// Reference to a record/variant/enum defined in the same interface.
     Named(String),
+    /// Qualified reference to a type in an imported schema:
+    /// `<alias>.<type-name>`.
+    Qualified { alias: String, name: String },
     /// `T?` — nullable.
     Option(Box<TypeRef>),
     /// `list<T>` — variable-length sequence.
     List(Box<TypeRef>),
+    /// `map<K, V>` — keyed collection. Lowered to `BTreeMap<K, V>` in
+    /// Rust codegen to guarantee deterministic iteration order.
+    Map(Box<TypeRef>, Box<TypeRef>),
     /// `result<T, E>` — typed success/error.
     Result(Box<TypeRef>, Box<TypeRef>),
     /// `unit` — empty payload / void.
@@ -180,5 +204,27 @@ impl Primitive {
             "uuid" => Self::Uuid,
             _ => return None,
         })
+    }
+
+    /// Is this primitive a legal `map<K, _>` key type?
+    ///
+    /// Allowed: string, uuid, all integer primitives. Disallowed:
+    /// `bool` (tiny domain, usually a mistake), floats (not `Ord`),
+    /// `bytes` (large keys in RPC payloads is almost always wrong).
+    #[must_use]
+    pub const fn is_valid_map_key(self) -> bool {
+        matches!(
+            self,
+            Self::U8
+                | Self::U16
+                | Self::U32
+                | Self::U64
+                | Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::I64
+                | Self::String
+                | Self::Uuid
+        )
     }
 }

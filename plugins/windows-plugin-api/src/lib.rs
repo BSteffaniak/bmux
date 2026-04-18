@@ -8,9 +8,9 @@
 //! Consumers pattern:
 //!
 //! ```ignore
-//! use bmux_windows_plugin_api::windows_state::WindowsState;
+//! use bmux_windows_plugin_api::windows_state::WindowsStateService;
 //!
-//! fn somewhere(state: &dyn WindowsState, id: uuid::Uuid) {
+//! fn somewhere(state: &dyn WindowsStateService, id: uuid::Uuid) {
 //!     let focused = state.focused_pane(id);
 //!     // ...
 //! }
@@ -20,4 +20,6 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-bmux_plugin_schema_macros::schema!("bpdl/windows-plugin.bpdl");
+bmux_plugin_schema_macros::schema! {
+    source: "bpdl/windows-plugin.bpdl",
+}

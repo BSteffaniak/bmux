@@ -1,0 +1,12 @@
+error: validation error: type cycle in interface `i`: a -> b -> a (break the cycle with `?`, `list<T>`, or `map<_, T>` value)
+  --> tests/ui/fail/type_cycle.rs:1:1
+   |
+ 1 | / bmux_plugin_schema_macros::schema_inline!(
+ 2 | |     r#"
+ 3 | | plugin p version 1;
+...  |
+ 9 | | "#
+10 | | );
+   | |_^
+   |
+   = note: this error originates in the macro `bmux_plugin_schema_macros::schema_inline` (in Nightly builds, run with -Z macro-backtrace for more info)

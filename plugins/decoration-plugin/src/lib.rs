@@ -20,34 +20,20 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use bmux_decoration_plugin_api::decoration_state::{
-    BorderStyle, DecorationEvent, DecorationState, PaneDecoration, SetStyleError,
+    BorderStyle, DecorationEvent, DecorationStateService, PaneDecoration, SetStyleError,
 };
 use uuid::Uuid;
 
 /// In-memory state store.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct State {
     /// Per-pane overrides. Panes without an override fall through to
     /// [`State::default_border`].
     panes: HashMap<Uuid, PaneDecoration>,
     /// Global default, used for any pane without a specific override.
+    /// `BorderStyle` has `@default ascii` in the BPDL schema, so
+    /// `BorderStyle::default()` yields `BorderStyle::Ascii`.
     default_border: BorderStyle,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            panes: HashMap::new(),
-            default_border: default_border_style(),
-        }
-    }
-}
-
-/// Matches the current core renderer's output (ASCII `+ - |`). Chosen
-/// explicitly rather than implicitly so changing the default is a
-/// single-line visible change.
-const fn default_border_style() -> BorderStyle {
-    BorderStyle::Ascii
 }
 
 /// The decoration plugin's concrete implementation. Thread-safe via an
@@ -79,7 +65,7 @@ impl DecorationPlugin {
     }
 }
 
-impl DecorationState for DecorationPlugin {
+impl DecorationStateService for DecorationPlugin {
     fn pane_decoration<'a>(
         &'a self,
         pane_id: Uuid,
@@ -93,7 +79,7 @@ impl DecorationState for DecorationPlugin {
         Box::pin(async move {
             self.state
                 .lock()
-                .map_or_else(|_| default_border_style(), |s| s.default_border)
+                .map_or_else(|_| BorderStyle::default(), |s| s.default_border)
         })
     }
 
@@ -180,6 +166,14 @@ mod tests {
         let plugin = DecorationPlugin::new();
         let style = block_on(plugin.default_border_style());
         assert_eq!(style, BorderStyle::Ascii);
+    }
+
+    #[test]
+    fn border_style_default_is_ascii() {
+        // Smoke test that BPDL's `@default ascii` produces the expected
+        // `Default` impl — the feature that lets us delete the
+        // old local `default_border_style()` helper.
+        assert_eq!(BorderStyle::default(), BorderStyle::Ascii);
     }
 
     #[test]

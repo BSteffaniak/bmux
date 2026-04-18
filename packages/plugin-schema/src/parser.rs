@@ -3,8 +3,8 @@
 use crate::{
     Error, Span,
     ast::{
-        EnumCase, EnumDef, Field, Interface, InterfaceItem, Operation, PluginHeader, Primitive,
-        RecordDef, Schema, TypeRef, VariantCase, VariantDef,
+        EnumCase, EnumDef, Field, Import, Interface, InterfaceItem, Operation, PluginHeader,
+        Primitive, RecordDef, Schema, TypeRef, VariantCase, VariantDef,
     },
     lexer::{Token, TokenKind},
 };
@@ -29,16 +29,24 @@ struct Parser<'a> {
 impl Parser<'_> {
     fn parse_schema(&mut self) -> Result<Schema, Error> {
         let plugin = self.parse_plugin_header()?;
+        let mut imports = Vec::new();
+        while self.check(&TokenKind::Import) {
+            imports.push(self.parse_import()?);
+        }
         let mut interfaces = Vec::new();
         while self.peek().is_some() {
             interfaces.push(self.parse_interface()?);
         }
-        Ok(Schema { plugin, interfaces })
+        Ok(Schema {
+            plugin,
+            imports,
+            interfaces,
+        })
     }
 
     fn parse_plugin_header(&mut self) -> Result<PluginHeader, Error> {
         let span = self.expect(&TokenKind::Plugin, "expected `plugin` keyword")?;
-        let plugin_id = self.expect_identifier("expected plugin id after `plugin`")?;
+        let plugin_id = self.parse_dotted_ident("expected plugin id after `plugin`")?;
         self.expect(&TokenKind::Version, "expected `version` keyword")?;
         let version = self.expect_int("expected integer version literal")?;
         self.expect(&TokenKind::Semicolon, "expected `;` ending plugin header")?;
@@ -49,6 +57,19 @@ impl Parser<'_> {
         Ok(PluginHeader {
             plugin_id,
             version,
+            span,
+        })
+    }
+
+    fn parse_import(&mut self) -> Result<Import, Error> {
+        let span = self.expect(&TokenKind::Import, "expected `import` keyword")?;
+        let alias = self.expect_identifier("expected import alias")?;
+        self.expect(&TokenKind::Equals, "expected `=` after import alias")?;
+        let plugin_id = self.parse_dotted_ident("expected plugin id in import")?;
+        self.expect(&TokenKind::Semicolon, "expected `;` ending import")?;
+        Ok(Import {
+            alias,
+            plugin_id,
             span,
         })
     }
@@ -101,6 +122,7 @@ impl Parser<'_> {
         self.expect(&TokenKind::LBrace, "expected `{` opening variant cases")?;
         let mut cases = Vec::new();
         while !self.check(&TokenKind::RBrace) {
+            let is_default = self.consume_default_annotation();
             let case_span = self.peek().map_or(Span::new(0, 0), |t| t.span);
             let case_name = self.expect_identifier("expected variant case name")?;
             let payload = if self.check(&TokenKind::LBrace) {
@@ -111,9 +133,18 @@ impl Parser<'_> {
             } else {
                 Vec::new()
             };
+            if is_default && !payload.is_empty() {
+                return Err(Error::Parse {
+                    span: case_span,
+                    message: format!(
+                        "@default is only allowed on unit cases; variant case `{case_name}` carries payload",
+                    ),
+                });
+            }
             cases.push(VariantCase {
                 name: case_name,
                 payload,
+                is_default,
                 span: case_span,
             });
             if self.check(&TokenKind::Comma) {
@@ -132,10 +163,12 @@ impl Parser<'_> {
         self.expect(&TokenKind::LBrace, "expected `{` opening enum cases")?;
         let mut cases = Vec::new();
         while !self.check(&TokenKind::RBrace) {
+            let is_default = self.consume_default_annotation();
             let case_span = self.peek().map_or(Span::new(0, 0), |t| t.span);
             let case_name = self.expect_identifier("expected enum case name")?;
             cases.push(EnumCase {
                 name: case_name,
+                is_default,
                 span: case_span,
             });
             if self.check(&TokenKind::Comma) {
@@ -227,6 +260,15 @@ impl Parser<'_> {
                 self.expect(&TokenKind::RAngle, "expected `>` closing `list<...>`")?;
                 TypeRef::List(Box::new(inner))
             }
+            TokenKind::Map => {
+                self.advance();
+                self.expect(&TokenKind::LAngle, "expected `<` after `map`")?;
+                let key = self.parse_type()?;
+                self.expect(&TokenKind::Comma, "expected `,` between map types")?;
+                let value = self.parse_type()?;
+                self.expect(&TokenKind::RAngle, "expected `>` closing `map<...>`")?;
+                TypeRef::Map(Box::new(key), Box::new(value))
+            }
             TokenKind::Result => {
                 self.advance();
                 self.expect(&TokenKind::LAngle, "expected `<` after `result`")?;
@@ -242,7 +284,17 @@ impl Parser<'_> {
             }
             TokenKind::Identifier(ref name) => {
                 self.advance();
-                if let Some(prim) = Primitive::from_keyword(name) {
+                // Qualified reference: `alias.type-name`.
+                if self.check(&TokenKind::Dot) {
+                    self.advance();
+                    let type_name = self.expect_identifier(
+                        "expected type name after `.` in qualified type reference",
+                    )?;
+                    TypeRef::Qualified {
+                        alias: name.clone(),
+                        name: type_name,
+                    }
+                } else if let Some(prim) = Primitive::from_keyword(name) {
                     TypeRef::Primitive(prim)
                 } else {
                     TypeRef::Named(name.clone())
@@ -263,6 +315,39 @@ impl Parser<'_> {
         } else {
             Ok(ty)
         }
+    }
+
+    /// Parse a dotted identifier sequence (`bmux.windows`, `plugin.name`).
+    /// Requires at least one identifier; subsequent `.<ident>` segments
+    /// are joined with `.` in the returned string.
+    fn parse_dotted_ident(&mut self, message: &str) -> Result<String, Error> {
+        let mut out = self.expect_identifier(message)?;
+        while self.check(&TokenKind::Dot) {
+            self.advance();
+            let seg = self.expect_identifier("expected identifier after `.`")?;
+            out.push('.');
+            out.push_str(&seg);
+        }
+        Ok(out)
+    }
+
+    /// Consume `@default` if present. Returns true if consumed.
+    fn consume_default_annotation(&mut self) -> bool {
+        if !self.check(&TokenKind::At) {
+            return false;
+        }
+        // Peek one past `@` for an identifier `default`.
+        if let Some(Token {
+            kind: TokenKind::Identifier(name),
+            ..
+        }) = self.tokens.get(self.index + 1)
+            && name == "default"
+        {
+            self.advance(); // @
+            self.advance(); // default
+            return true;
+        }
+        false
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -353,6 +438,7 @@ mod tests {
         assert_eq!(schema.plugin.plugin_id, "bmux.windows");
         assert_eq!(schema.plugin.version, 1);
         assert!(schema.interfaces.is_empty());
+        assert!(schema.imports.is_empty());
     }
 
     #[test]
@@ -404,5 +490,83 @@ mod tests {
         assert!(matches!(items[1], InterfaceItem::Query(_)));
         assert!(matches!(items[2], InterfaceItem::Command(_)));
         assert!(matches!(items[3], InterfaceItem::Events(_)));
+    }
+
+    #[test]
+    fn parses_import_directive() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+             import windows = bmux.windows;\n\
+             interface i { record r { id: uuid } }",
+        );
+        assert_eq!(schema.imports.len(), 1);
+        assert_eq!(schema.imports[0].alias, "windows");
+        assert_eq!(schema.imports[0].plugin_id, "bmux.windows");
+    }
+
+    #[test]
+    fn parses_map_type() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+             interface i {\n\
+               record r { labels: map<string, u32> }\n\
+             }",
+        );
+        let InterfaceItem::Record(rec) = &schema.interfaces[0].items[0] else {
+            panic!("expected record");
+        };
+        let TypeRef::Map(k, v) = &rec.fields[0].ty else {
+            panic!("expected map type");
+        };
+        assert!(matches!(**k, TypeRef::Primitive(Primitive::String)));
+        assert!(matches!(**v, TypeRef::Primitive(Primitive::U32)));
+    }
+
+    #[test]
+    fn parses_qualified_type_reference() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+             import windows = bmux.windows;\n\
+             interface i {\n\
+               query q(id: uuid) -> windows.pane-state;\n\
+             }",
+        );
+        let InterfaceItem::Query(op) = &schema.interfaces[0].items[0] else {
+            panic!("expected query");
+        };
+        let TypeRef::Qualified { alias, name } = &op.returns else {
+            panic!("expected qualified type ref");
+        };
+        assert_eq!(alias, "windows");
+        assert_eq!(name, "pane-state");
+    }
+
+    #[test]
+    fn parses_default_on_enum_case() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+             interface i {\n\
+               enum e { a, @default b, c }\n\
+             }",
+        );
+        let InterfaceItem::Enum(en) = &schema.interfaces[0].items[0] else {
+            panic!("expected enum");
+        };
+        assert!(!en.cases[0].is_default);
+        assert!(en.cases[1].is_default);
+        assert!(!en.cases[2].is_default);
+    }
+
+    #[test]
+    fn rejects_default_on_variant_case_with_payload() {
+        let tokens = tokenize(
+            "plugin p version 1;\n\
+             interface i {\n\
+               variant v { @default on { reason: string }, off }\n\
+             }",
+        )
+        .expect("lex");
+        let err = parse(&tokens).unwrap_err();
+        assert!(matches!(err, Error::Parse { .. }));
     }
 }

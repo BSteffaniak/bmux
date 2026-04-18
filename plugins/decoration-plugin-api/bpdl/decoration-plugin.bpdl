@@ -17,7 +17,7 @@ interface decoration-state {
         // No decoration at all; `content_rect` equals `rect`.
         none,
         // 1-cell ASCII border using `+ - |`. Default today.
-        ascii,
+        @default ascii,
         // 1-cell Unicode single-line box-drawing.
         single,
         // 1-cell Unicode double-line box-drawing.

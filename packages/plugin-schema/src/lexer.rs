@@ -1,9 +1,9 @@
 //! Tokenizer for BPDL.
 //!
 //! The grammar uses a small set of tokens: keywords (`plugin`, `version`,
-//! `interface`, `record`, `variant`, `enum`, `query`, `command`, `events`,
-//! `list`, `result`), identifiers, integer literals, and punctuation
-//! (`{ } ( ) , ; : ? < > . - ->`).
+//! `interface`, `import`, `record`, `variant`, `enum`, `query`, `command`,
+//! `events`, `list`, `map`, `result`, `unit`), identifiers, integer
+//! literals, and punctuation (`{ } ( ) , ; : ? < > . = @ ->`).
 
 use crate::{Error, Span};
 
@@ -19,6 +19,7 @@ pub enum TokenKind {
     Plugin,
     Version,
     Interface,
+    Import,
     Record,
     Variant,
     Enum,
@@ -26,6 +27,7 @@ pub enum TokenKind {
     Command,
     Events,
     List,
+    Map,
     Result,
     Unit,
 
@@ -44,6 +46,9 @@ pub enum TokenKind {
     Colon,
     Question,
     Arrow,
+    Equals,
+    At,
+    Dot,
 }
 
 /// Tokenize a BPDL source string into a list of [`Token`]s.
@@ -173,6 +178,30 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                     span: start,
                 });
             }
+            '=' => {
+                chars.next();
+                column += 1;
+                tokens.push(Token {
+                    kind: TokenKind::Equals,
+                    span: start,
+                });
+            }
+            '@' => {
+                chars.next();
+                column += 1;
+                tokens.push(Token {
+                    kind: TokenKind::At,
+                    span: start,
+                });
+            }
+            '.' => {
+                chars.next();
+                column += 1;
+                tokens.push(Token {
+                    kind: TokenKind::Dot,
+                    span: start,
+                });
+            }
             '-' => {
                 chars.next();
                 column += 1;
@@ -200,6 +229,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                     "plugin" => TokenKind::Plugin,
                     "version" => TokenKind::Version,
                     "interface" => TokenKind::Interface,
+                    "import" => TokenKind::Import,
                     "record" => TokenKind::Record,
                     "variant" => TokenKind::Variant,
                     "enum" => TokenKind::Enum,
@@ -207,6 +237,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                     "command" => TokenKind::Command,
                     "events" => TokenKind::Events,
                     "list" => TokenKind::List,
+                    "map" => TokenKind::Map,
                     "result" => TokenKind::Result,
                     "unit" => TokenKind::Unit,
                     _ => TokenKind::Identifier(ident),
@@ -240,11 +271,16 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
     Ok(tokens)
 }
 
+/// Consume an identifier body. Identifiers use `[a-zA-Z_]` followed by
+/// `[a-zA-Z0-9_-]`. Note: `.` is NOT part of an identifier — it's a
+/// standalone [`TokenKind::Dot`] used for plugin ids (`bmux.windows`)
+/// and qualified type refs (`alias.type-name`). The parser re-joins
+/// identifier sequences across dots where the grammar requires it.
 fn consume_identifier(mut iter: std::iter::Peekable<std::str::Chars<'_>>) -> (String, usize) {
     let mut s = String::new();
     let mut consumed = 0;
     while let Some(&c) = iter.peek() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
             s.push(c);
             iter.next();
             consumed += 1;
@@ -282,7 +318,9 @@ mod tests {
             kinds,
             vec![
                 TokenKind::Plugin,
-                TokenKind::Identifier("bmux.windows".to_string()),
+                TokenKind::Identifier("bmux".to_string()),
+                TokenKind::Dot,
+                TokenKind::Identifier("windows".to_string()),
                 TokenKind::Version,
                 TokenKind::IntLiteral(1),
                 TokenKind::Semicolon,
@@ -310,5 +348,55 @@ mod tests {
     fn rejects_stray_dash() {
         let err = tokenize("plugin a version 1; foo - bar").unwrap_err();
         assert!(matches!(err, Error::Lex { .. }));
+    }
+
+    #[test]
+    fn tokenizes_import_directive() {
+        let toks = tokenize("import windows = bmux.windows;").expect("lex");
+        let kinds: Vec<_> = toks.into_iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Import,
+                TokenKind::Identifier("windows".to_string()),
+                TokenKind::Equals,
+                TokenKind::Identifier("bmux".to_string()),
+                TokenKind::Dot,
+                TokenKind::Identifier("windows".to_string()),
+                TokenKind::Semicolon,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_map_keyword() {
+        let toks = tokenize("map<string, u32>").expect("lex");
+        let kinds: Vec<_> = toks.into_iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Map,
+                TokenKind::LAngle,
+                TokenKind::Identifier("string".to_string()),
+                TokenKind::Comma,
+                TokenKind::Identifier("u32".to_string()),
+                TokenKind::RAngle,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_at_and_equals() {
+        let toks = tokenize("@default = ascii").expect("lex");
+        let kinds: Vec<_> = toks.into_iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::At,
+                TokenKind::Identifier("default".to_string()),
+                TokenKind::Equals,
+                TokenKind::Identifier("ascii".to_string()),
+            ]
+        );
     }
 }

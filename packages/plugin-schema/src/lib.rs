@@ -12,10 +12,14 @@
 //! - The [`lexer`] module: tokenizer.
 //! - The [`parser`] module: recursive-descent parser producing [`ast`] nodes.
 //! - The [`validator`] module: semantic checks (duplicate names, unknown
-//!   type references, cycles in records/variants).
+//!   type references, cycles in records/variants, map-key validity,
+//!   `@default` uniqueness, import-alias resolution).
 //! - The [`codegen_rust`] module: emits Rust source that defines the
-//!   records, variants, enums, and consumer/provider traits for an
-//!   interface.
+//!   records, variants, enums, `Default` impls (for `@default` cases),
+//!   and `<Iface>Service` traits for an interface. Qualified type
+//!   references are resolved through a caller-provided import table.
+//! - The [`registry`] module: runtime schema registry used by the
+//!   plugin host to check consumer/provider compatibility.
 //!
 //! # Example schema
 //!
@@ -47,8 +51,10 @@ pub mod ast;
 pub mod codegen_rust;
 pub mod lexer;
 pub mod parser;
+pub mod registry;
 pub mod validator;
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Location in a source file. Line and column are 1-based.
@@ -84,7 +90,10 @@ pub enum Error {
     Validate { message: String },
 }
 
-/// Parse a BPDL source string into an AST and validate it.
+/// Parse a BPDL source string into an AST and validate it in isolation.
+///
+/// Qualified type references are tolerated as long as the alias is
+/// declared via `import`, but the imported type is not resolved.
 ///
 /// # Errors
 ///
@@ -96,5 +105,27 @@ pub fn compile(source: &str) -> Result<ast::Schema, Error> {
     let tokens = lexer::tokenize(source)?;
     let schema = parser::parse(&tokens)?;
     validator::validate(&schema)?;
+    Ok(schema)
+}
+
+/// Parse and validate a schema with imports fully resolved.
+///
+/// `imports` maps each `import <alias>` declared in this schema to the
+/// imported plugin's already-parsed [`ast::Schema`]. Qualified type
+/// references (`alias.type`) are resolved against this table during
+/// validation; unknown aliases or unknown types cause
+/// [`Error::Validate`].
+///
+/// # Errors
+///
+/// As [`compile`], plus additional validation errors when imports
+/// cannot be resolved.
+pub fn compile_with_imports(
+    source: &str,
+    imports: &BTreeMap<String, ast::Schema>,
+) -> Result<ast::Schema, Error> {
+    let tokens = lexer::tokenize(source)?;
+    let schema = parser::parse(&tokens)?;
+    validator::validate_with_imports(&schema, imports)?;
     Ok(schema)
 }
