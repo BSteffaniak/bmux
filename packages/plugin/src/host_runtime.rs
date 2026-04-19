@@ -126,13 +126,21 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn session_list(&self) -> Result<SessionListResponse> {
-        self.call_service(
-            "bmux.sessions.read",
-            ServiceKind::Query,
-            "session-query/v1",
-            "list",
-            &(),
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::ListSessions)? {
+            bmux_ipc::ResponsePayload::SessionList { sessions } => Ok(SessionListResponse {
+                sessions: sessions
+                    .into_iter()
+                    .map(|entry| bmux_plugin_sdk::SessionSummary {
+                        id: entry.id,
+                        name: entry.name,
+                        client_count: entry.client_count,
+                    })
+                    .collect(),
+            }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for session_list".to_string(),
+            }),
+        }
     }
 
     /// Create a new session.
@@ -141,13 +149,16 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn session_create(&self, request: &SessionCreateRequest) -> Result<SessionCreateResponse> {
-        self.call_service(
-            "bmux.sessions.write",
-            ServiceKind::Command,
-            "session-command/v1",
-            "new",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::NewSession {
+            name: request.name.clone(),
+        })? {
+            bmux_ipc::ResponsePayload::SessionCreated { id, name } => {
+                Ok(SessionCreateResponse { id, name })
+            }
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for session_create".to_string(),
+            }),
+        }
     }
 
     /// Kill a session.
@@ -156,13 +167,15 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn session_kill(&self, request: &SessionKillRequest) -> Result<SessionKillResponse> {
-        self.call_service(
-            "bmux.sessions.write",
-            ServiceKind::Command,
-            "session-command/v1",
-            "kill",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::KillSession {
+            selector: host_session_selector_to_ipc(&request.selector),
+            force_local: request.force_local,
+        })? {
+            bmux_ipc::ResponsePayload::SessionKilled { id } => Ok(SessionKillResponse { id }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for session_kill".to_string(),
+            }),
+        }
     }
 
     /// Select (attach to) a session.
@@ -171,13 +184,18 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn session_select(&self, request: &SessionSelectRequest) -> Result<SessionSelectResponse> {
-        self.call_service(
-            "bmux.sessions.write",
-            ServiceKind::Command,
-            "session-command/v1",
-            "select",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::Attach {
+            selector: host_session_selector_to_ipc(&request.selector),
+        })? {
+            bmux_ipc::ResponsePayload::Attached { grant } => Ok(SessionSelectResponse {
+                session_id: grant.session_id,
+                attach_token: grant.attach_token,
+                expires_at_epoch_ms: grant.expires_at_epoch_ms,
+            }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for session_select".to_string(),
+            }),
+        }
     }
 
     /// Get the current client identity.
@@ -186,13 +204,31 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn current_client(&self) -> Result<CurrentClientResponse> {
-        self.call_service(
-            "bmux.clients.read",
-            ServiceKind::Query,
-            "client-query/v1",
-            "current",
-            &(),
-        )
+        let bmux_ipc::ResponsePayload::ClientIdentity { id: client_id } =
+            self.execute_kernel_request(bmux_ipc::Request::WhoAmI)?
+        else {
+            return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for whoami".to_string(),
+            });
+        };
+        match self.execute_kernel_request(bmux_ipc::Request::ListClients)? {
+            bmux_ipc::ResponsePayload::ClientList { clients } => {
+                let current = clients.into_iter().find(|entry| entry.id == client_id);
+                Ok(CurrentClientResponse {
+                    id: client_id,
+                    selected_session_id: current
+                        .as_ref()
+                        .and_then(|entry| entry.selected_session_id),
+                    following_client_id: current
+                        .as_ref()
+                        .and_then(|entry| entry.following_client_id),
+                    following_global: current.as_ref().is_some_and(|entry| entry.following_global),
+                })
+            }
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for current_client".to_string(),
+            }),
+        }
     }
 
     /// List all contexts.
@@ -201,13 +237,21 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn context_list(&self) -> Result<ContextListResponse> {
-        self.call_service(
-            "bmux.contexts.read",
-            ServiceKind::Query,
-            "context-query/v1",
-            "list",
-            &(),
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::ListContexts)? {
+            bmux_ipc::ResponsePayload::ContextList { contexts } => Ok(ContextListResponse {
+                contexts: contexts
+                    .into_iter()
+                    .map(|entry| bmux_plugin_sdk::ContextSummary {
+                        id: entry.id,
+                        name: entry.name,
+                        attributes: entry.attributes,
+                    })
+                    .collect(),
+            }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for context_list".to_string(),
+            }),
+        }
     }
 
     /// Get the current context.
@@ -216,13 +260,18 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn context_current(&self) -> Result<ContextCurrentResponse> {
-        self.call_service(
-            "bmux.contexts.read",
-            ServiceKind::Query,
-            "context-query/v1",
-            "current",
-            &(),
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::CurrentContext)? {
+            bmux_ipc::ResponsePayload::CurrentContext { context } => Ok(ContextCurrentResponse {
+                context: context.map(|entry| bmux_plugin_sdk::ContextSummary {
+                    id: entry.id,
+                    name: entry.name,
+                    attributes: entry.attributes,
+                }),
+            }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for context_current".to_string(),
+            }),
+        }
     }
 
     /// Create a new context.
@@ -231,13 +280,21 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn context_create(&self, request: &ContextCreateRequest) -> Result<ContextCreateResponse> {
-        self.call_service(
-            "bmux.contexts.write",
-            ServiceKind::Command,
-            "context-command/v1",
-            "create",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::CreateContext {
+            name: request.name.clone(),
+            attributes: request.attributes.clone(),
+        })? {
+            bmux_ipc::ResponsePayload::ContextCreated { context } => Ok(ContextCreateResponse {
+                context: bmux_plugin_sdk::ContextSummary {
+                    id: context.id,
+                    name: context.name,
+                    attributes: context.attributes,
+                },
+            }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for context_create".to_string(),
+            }),
+        }
     }
 
     /// Select (switch to) a context.
@@ -246,13 +303,20 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn context_select(&self, request: &ContextSelectRequest) -> Result<ContextSelectResponse> {
-        self.call_service(
-            "bmux.contexts.write",
-            ServiceKind::Command,
-            "context-command/v1",
-            "select",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::SelectContext {
+            selector: host_context_selector_to_ipc(&request.selector),
+        })? {
+            bmux_ipc::ResponsePayload::ContextSelected { context } => Ok(ContextSelectResponse {
+                context: bmux_plugin_sdk::ContextSummary {
+                    id: context.id,
+                    name: context.name,
+                    attributes: context.attributes,
+                },
+            }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for context_select".to_string(),
+            }),
+        }
     }
 
     /// Close a context.
@@ -261,13 +325,15 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn context_close(&self, request: &ContextCloseRequest) -> Result<ContextCloseResponse> {
-        self.call_service(
-            "bmux.contexts.write",
-            ServiceKind::Command,
-            "context-command/v1",
-            "close",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::CloseContext {
+            selector: host_context_selector_to_ipc(&request.selector),
+            force: request.force,
+        })? {
+            bmux_ipc::ResponsePayload::ContextClosed { id } => Ok(ContextCloseResponse { id }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for context_close".to_string(),
+            }),
+        }
     }
 
     /// List panes.
@@ -276,13 +342,24 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_list(&self, request: &PaneListRequest) -> Result<PaneListResponse> {
-        self.call_service(
-            "bmux.panes.read",
-            ServiceKind::Query,
-            "pane-query/v1",
-            "list",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::ListPanes {
+            session: request.session.as_ref().map(host_session_selector_to_ipc),
+        })? {
+            bmux_ipc::ResponsePayload::PaneList { panes } => Ok(PaneListResponse {
+                panes: panes
+                    .into_iter()
+                    .map(|entry| bmux_plugin_sdk::PaneSummary {
+                        id: entry.id,
+                        index: entry.index,
+                        name: entry.name,
+                        focused: entry.focused,
+                    })
+                    .collect(),
+            }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for pane_list".to_string(),
+            }),
+        }
     }
 
     /// Split a pane.
@@ -291,13 +368,19 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_split(&self, request: &PaneSplitRequest) -> Result<PaneSplitResponse> {
-        self.call_service(
-            "bmux.panes.write",
-            ServiceKind::Command,
-            "pane-command/v1",
-            "split",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::SplitPane {
+            session: request.session.as_ref().map(host_session_selector_to_ipc),
+            target: request.target.as_ref().map(host_pane_selector_to_ipc),
+            direction: host_split_direction_to_ipc(request.direction),
+            ratio_pct: None,
+        })? {
+            bmux_ipc::ResponsePayload::PaneSplit { id, session_id } => {
+                Ok(PaneSplitResponse { id, session_id })
+            }
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for pane_split".to_string(),
+            }),
+        }
     }
 
     /// Launch a pane with explicit command metadata.
@@ -306,13 +389,25 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_launch(&self, request: &PaneLaunchRequest) -> Result<PaneLaunchResponse> {
-        self.call_service(
-            "bmux.panes.write",
-            ServiceKind::Command,
-            "pane-command/v1",
-            "launch",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::LaunchPane {
+            session: request.session.as_ref().map(host_session_selector_to_ipc),
+            target: request.target.as_ref().map(host_pane_selector_to_ipc),
+            direction: host_split_direction_to_ipc(request.direction),
+            name: request.name.clone(),
+            command: bmux_ipc::PaneLaunchCommand {
+                program: request.command.program.clone(),
+                args: request.command.args.clone(),
+                cwd: request.command.cwd.clone(),
+                env: request.command.env.clone(),
+            },
+        })? {
+            bmux_ipc::ResponsePayload::PaneLaunched { id, session_id } => {
+                Ok(PaneLaunchResponse { id, session_id })
+            }
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for pane_launch".to_string(),
+            }),
+        }
     }
 
     /// Focus a pane.
@@ -321,13 +416,18 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_focus(&self, request: &PaneFocusRequest) -> Result<PaneFocusResponse> {
-        self.call_service(
-            "bmux.panes.write",
-            ServiceKind::Command,
-            "pane-command/v1",
-            "focus",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::FocusPane {
+            session: request.session.as_ref().map(host_session_selector_to_ipc),
+            target: request.target.as_ref().map(host_pane_selector_to_ipc),
+            direction: request.direction.map(host_focus_direction_to_ipc),
+        })? {
+            bmux_ipc::ResponsePayload::PaneFocused { id, session_id } => {
+                Ok(PaneFocusResponse { id, session_id })
+            }
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for pane_focus".to_string(),
+            }),
+        }
     }
 
     /// Resize a pane.
@@ -336,13 +436,18 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_resize(&self, request: &PaneResizeRequest) -> Result<PaneResizeResponse> {
-        self.call_service(
-            "bmux.panes.write",
-            ServiceKind::Command,
-            "pane-command/v1",
-            "resize",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::ResizePane {
+            session: request.session.as_ref().map(host_session_selector_to_ipc),
+            target: request.target.as_ref().map(host_pane_selector_to_ipc),
+            delta: request.delta,
+        })? {
+            bmux_ipc::ResponsePayload::PaneResized { session_id } => {
+                Ok(PaneResizeResponse { session_id })
+            }
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for pane_resize".to_string(),
+            }),
+        }
     }
 
     /// Close a pane.
@@ -351,13 +456,23 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_close(&self, request: &PaneCloseRequest) -> Result<PaneCloseResponse> {
-        self.call_service(
-            "bmux.panes.write",
-            ServiceKind::Command,
-            "pane-command/v1",
-            "close",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::ClosePane {
+            session: request.session.as_ref().map(host_session_selector_to_ipc),
+            target: request.target.as_ref().map(host_pane_selector_to_ipc),
+        })? {
+            bmux_ipc::ResponsePayload::PaneClosed {
+                id,
+                session_id,
+                session_closed,
+            } => Ok(PaneCloseResponse {
+                id,
+                session_id,
+                session_closed,
+            }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for pane_close".to_string(),
+            }),
+        }
     }
 
     /// Toggle the zoom state of the currently-active pane in the
@@ -367,13 +482,22 @@ pub trait HostRuntimeApi: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_zoom(&self, request: &PaneZoomRequest) -> Result<PaneZoomResponse> {
-        self.call_service(
-            "bmux.panes.write",
-            ServiceKind::Command,
-            "pane-command/v1",
-            "zoom",
-            request,
-        )
+        match self.execute_kernel_request(bmux_ipc::Request::ZoomPane {
+            session: request.session.as_ref().map(host_session_selector_to_ipc),
+        })? {
+            bmux_ipc::ResponsePayload::PaneZoomed {
+                session_id,
+                pane_id,
+                zoomed,
+            } => Ok(PaneZoomResponse {
+                session_id,
+                pane_id,
+                zoomed,
+            }),
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for pane_zoom".to_string(),
+            }),
+        }
     }
 
     /// Get a value from plugin storage.
@@ -441,3 +565,55 @@ pub trait HostRuntimeApi: ServiceCaller {
 }
 
 impl<T> HostRuntimeApi for T where T: ServiceCaller + ?Sized {}
+
+// ── SDK → IPC converters ────────────────────────────────────────────
+
+fn host_session_selector_to_ipc(
+    selector: &bmux_plugin_sdk::SessionSelector,
+) -> bmux_ipc::SessionSelector {
+    match selector {
+        bmux_plugin_sdk::SessionSelector::ById(id) => bmux_ipc::SessionSelector::ById(*id),
+        bmux_plugin_sdk::SessionSelector::ByName(name) => {
+            bmux_ipc::SessionSelector::ByName(name.clone())
+        }
+    }
+}
+
+fn host_context_selector_to_ipc(
+    selector: &bmux_plugin_sdk::ContextSelector,
+) -> bmux_ipc::ContextSelector {
+    match selector {
+        bmux_plugin_sdk::ContextSelector::ById(id) => bmux_ipc::ContextSelector::ById(*id),
+        bmux_plugin_sdk::ContextSelector::ByName(name) => {
+            bmux_ipc::ContextSelector::ByName(name.clone())
+        }
+    }
+}
+
+const fn host_pane_selector_to_ipc(
+    selector: &bmux_plugin_sdk::PaneSelector,
+) -> bmux_ipc::PaneSelector {
+    match selector {
+        bmux_plugin_sdk::PaneSelector::ById(id) => bmux_ipc::PaneSelector::ById(*id),
+        bmux_plugin_sdk::PaneSelector::ByIndex(index) => bmux_ipc::PaneSelector::ByIndex(*index),
+        bmux_plugin_sdk::PaneSelector::Active => bmux_ipc::PaneSelector::Active,
+    }
+}
+
+const fn host_split_direction_to_ipc(
+    direction: bmux_plugin_sdk::PaneSplitDirection,
+) -> bmux_ipc::PaneSplitDirection {
+    match direction {
+        bmux_plugin_sdk::PaneSplitDirection::Vertical => bmux_ipc::PaneSplitDirection::Vertical,
+        bmux_plugin_sdk::PaneSplitDirection::Horizontal => bmux_ipc::PaneSplitDirection::Horizontal,
+    }
+}
+
+const fn host_focus_direction_to_ipc(
+    direction: bmux_plugin_sdk::PaneFocusDirection,
+) -> bmux_ipc::PaneFocusDirection {
+    match direction {
+        bmux_plugin_sdk::PaneFocusDirection::Next => bmux_ipc::PaneFocusDirection::Next,
+        bmux_plugin_sdk::PaneFocusDirection::Prev => bmux_ipc::PaneFocusDirection::Prev,
+    }
+}

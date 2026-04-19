@@ -1922,13 +1922,161 @@ mod tests {
             }
         }
 
+        #[allow(clippy::too_many_lines)]
         fn execute_kernel_request(
             &self,
-            _request: bmux_ipc::Request,
+            request: bmux_ipc::Request,
         ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
-            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-                operation: "mock_execute_kernel_request",
-            })
+            // Translate the IPC `Request` to the mock's legacy
+            // `call_service_raw` interface_id/operation/payload shape
+            // so tests can keep exercising the mock's existing
+            // domain-specific handlers.
+            match request {
+                bmux_ipc::Request::ListContexts => {
+                    let bytes = self.call_service_raw(
+                        "bmux.contexts.read",
+                        bmux_plugin_sdk::ServiceKind::Query,
+                        "context-query/v1",
+                        "list",
+                        Vec::new(),
+                    )?;
+                    let response: bmux_plugin_sdk::ContextListResponse =
+                        bmux_plugin_sdk::decode_service_message(&bytes)?;
+                    Ok(bmux_ipc::ResponsePayload::ContextList {
+                        contexts: response
+                            .contexts
+                            .into_iter()
+                            .map(|c| bmux_ipc::ContextSummary {
+                                id: c.id,
+                                name: c.name,
+                                attributes: c.attributes,
+                            })
+                            .collect(),
+                    })
+                }
+                bmux_ipc::Request::CurrentContext => {
+                    let bytes = self.call_service_raw(
+                        "bmux.contexts.read",
+                        bmux_plugin_sdk::ServiceKind::Query,
+                        "context-query/v1",
+                        "current",
+                        Vec::new(),
+                    )?;
+                    let response: bmux_plugin_sdk::ContextCurrentResponse =
+                        bmux_plugin_sdk::decode_service_message(&bytes)?;
+                    Ok(bmux_ipc::ResponsePayload::CurrentContext {
+                        context: response.context.map(|c| bmux_ipc::ContextSummary {
+                            id: c.id,
+                            name: c.name,
+                            attributes: c.attributes,
+                        }),
+                    })
+                }
+                bmux_ipc::Request::CreateContext { name, attributes } => {
+                    let payload = bmux_plugin_sdk::encode_service_message(
+                        &bmux_plugin_sdk::ContextCreateRequest { name, attributes },
+                    )?;
+                    let bytes = self.call_service_raw(
+                        "bmux.contexts.write",
+                        bmux_plugin_sdk::ServiceKind::Command,
+                        "context-command/v1",
+                        "create",
+                        payload,
+                    )?;
+                    let response: bmux_plugin_sdk::ContextCreateResponse =
+                        bmux_plugin_sdk::decode_service_message(&bytes)?;
+                    Ok(bmux_ipc::ResponsePayload::ContextCreated {
+                        context: bmux_ipc::ContextSummary {
+                            id: response.context.id,
+                            name: response.context.name,
+                            attributes: response.context.attributes,
+                        },
+                    })
+                }
+                bmux_ipc::Request::SelectContext { selector } => {
+                    let host_selector = match selector {
+                        bmux_ipc::ContextSelector::ById(id) => {
+                            bmux_plugin_sdk::ContextSelector::ById(id)
+                        }
+                        bmux_ipc::ContextSelector::ByName(name) => {
+                            bmux_plugin_sdk::ContextSelector::ByName(name)
+                        }
+                    };
+                    let payload = bmux_plugin_sdk::encode_service_message(
+                        &bmux_plugin_sdk::ContextSelectRequest {
+                            selector: host_selector,
+                        },
+                    )?;
+                    let bytes = self.call_service_raw(
+                        "bmux.contexts.write",
+                        bmux_plugin_sdk::ServiceKind::Command,
+                        "context-command/v1",
+                        "select",
+                        payload,
+                    )?;
+                    let response: bmux_plugin_sdk::ContextSelectResponse =
+                        bmux_plugin_sdk::decode_service_message(&bytes)?;
+                    Ok(bmux_ipc::ResponsePayload::ContextSelected {
+                        context: bmux_ipc::ContextSummary {
+                            id: response.context.id,
+                            name: response.context.name,
+                            attributes: response.context.attributes,
+                        },
+                    })
+                }
+                bmux_ipc::Request::CloseContext { selector, force } => {
+                    let host_selector = match selector {
+                        bmux_ipc::ContextSelector::ById(id) => {
+                            bmux_plugin_sdk::ContextSelector::ById(id)
+                        }
+                        bmux_ipc::ContextSelector::ByName(name) => {
+                            bmux_plugin_sdk::ContextSelector::ByName(name)
+                        }
+                    };
+                    let payload = bmux_plugin_sdk::encode_service_message(
+                        &bmux_plugin_sdk::ContextCloseRequest {
+                            selector: host_selector,
+                            force,
+                        },
+                    )?;
+                    let bytes = self.call_service_raw(
+                        "bmux.contexts.write",
+                        bmux_plugin_sdk::ServiceKind::Command,
+                        "context-command/v1",
+                        "close",
+                        payload,
+                    )?;
+                    let response: bmux_plugin_sdk::ContextCloseResponse =
+                        bmux_plugin_sdk::decode_service_message(&bytes)?;
+                    Ok(bmux_ipc::ResponsePayload::ContextClosed { id: response.id })
+                }
+                bmux_ipc::Request::WhoAmI => Ok(bmux_ipc::ResponsePayload::ClientIdentity {
+                    id: self.current_client_id,
+                }),
+                bmux_ipc::Request::ListClients => {
+                    let bytes = self.call_service_raw(
+                        "bmux.clients.read",
+                        bmux_plugin_sdk::ServiceKind::Query,
+                        "client-query/v1",
+                        "current",
+                        Vec::new(),
+                    )?;
+                    let response: bmux_plugin_sdk::CurrentClientResponse =
+                        bmux_plugin_sdk::decode_service_message(&bytes)?;
+                    Ok(bmux_ipc::ResponsePayload::ClientList {
+                        clients: vec![bmux_ipc::ClientSummary {
+                            id: response.id,
+                            selected_session_id: response.selected_session_id,
+                            selected_context_id: None,
+                            following_client_id: response.following_client_id,
+                            following_global: response.following_global,
+                        }],
+                    })
+                }
+                _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                    operation: "mock_execute_kernel_request",
+                }),
+            }
         }
     }
 

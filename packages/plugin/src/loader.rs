@@ -6,35 +6,21 @@ use crate::{
     discover_registered_plugins_in_roots,
 };
 use bmux_ipc::{
-    ContextSelector as IpcContextSelector, PaneFocusDirection as IpcPaneFocusDirection,
-    PaneLaunchCommand as IpcPaneLaunchCommand, PaneSelector as IpcPaneSelector,
-    PaneSplitDirection as IpcPaneSplitDirection, Request as IpcRequest, Response as IpcResponse,
-    ResponsePayload as IpcResponsePayload, SessionSelector as IpcSessionSelector,
+    Request as IpcRequest, Response as IpcResponse, ResponsePayload as IpcResponsePayload,
 };
 use bmux_plugin_sdk::{
     CORE_CLI_BRIDGE_PROTOCOL_V1, CORE_CLI_COMMAND_INTERFACE_V1,
     CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
-    ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
-    ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
-    ContextSelector as HostContextSelector, ContextSummary as HostContextSummary,
-    CoreCliCommandRequest, CoreCliCommandResponse, CurrentClientResponse, HostConnectionInfo,
-    HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, HostMetadata, HostScope,
-    LogWriteLevel, NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
+    CoreCliCommandRequest, CoreCliCommandResponse, HostConnectionInfo, HostKernelBridge,
+    HostKernelBridgeRequest, HostKernelBridgeResponse, HostMetadata, HostScope, LogWriteLevel,
+    NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
     PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
     PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1, PROCESS_RUNTIME_TRANSPORT_STDIO_V1,
-    PaneCloseRequest, PaneCloseResponse, PaneFocusDirection as HostPaneFocusDirection,
-    PaneFocusRequest, PaneFocusResponse, PaneLaunchRequest, PaneLaunchResponse, PaneListRequest,
-    PaneListResponse, PaneResizeRequest, PaneResizeResponse, PaneSelector as HostPaneSelector,
-    PaneSplitDirection as HostPaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
-    PaneSummary as HostPaneSummary, PaneZoomRequest, PaneZoomResponse, PluginCliCommandRequest,
-    PluginCliCommandResponse, PluginError, PluginEvent, ProcessInvocationRequest,
-    ProcessInvocationResponse, RecordingWriteEventRequest, RecordingWriteEventResponse,
-    RegisteredService, Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse,
-    SessionCreateRequest, SessionCreateResponse, SessionKillRequest, SessionKillResponse,
-    SessionListResponse, SessionSelectRequest, SessionSelectResponse,
-    SessionSelector as HostSessionSelector, SessionSummary as HostSessionSummary,
-    StaticPluginVtable, decode_process_invocation_response, decode_service_envelope,
-    decode_service_message, encode_host_kernel_bridge_cli_command_payload,
+    PluginCliCommandRequest, PluginCliCommandResponse, PluginError, PluginEvent,
+    ProcessInvocationRequest, ProcessInvocationResponse, RecordingWriteEventRequest,
+    RecordingWriteEventResponse, RegisteredService, Result, ServiceEnvelopeKind, ServiceKind,
+    ServiceRequest, ServiceResponse, StaticPluginVtable, decode_process_invocation_response,
+    decode_service_envelope, decode_service_message, encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload, encode_process_invocation_request,
     encode_service_envelope, encode_service_message,
 };
@@ -1033,371 +1019,6 @@ fn handle_core_service_call(
                 }),
             }
         }
-        ("session-query/v1", "list") => {
-            let response = execute_kernel_request(host_kernel_bridge, IpcRequest::ListSessions)?;
-            match response {
-                IpcResponsePayload::SessionList { sessions } => {
-                    let sessions = sessions
-                        .into_iter()
-                        .map(|entry| HostSessionSummary {
-                            id: entry.id,
-                            name: entry.name,
-                            client_count: entry.client_count,
-                        })
-                        .collect();
-                    encode_service_message(&SessionListResponse { sessions })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for session-query/v1:list".to_string(),
-                }),
-            }
-        }
-        ("client-query/v1", "current") => {
-            let IpcResponsePayload::ClientIdentity { id: client_id } =
-                execute_kernel_request(host_kernel_bridge, IpcRequest::WhoAmI)?
-            else {
-                return Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for client-query/v1:current whoami"
-                        .to_string(),
-                });
-            };
-            let response = execute_kernel_request(host_kernel_bridge, IpcRequest::ListClients)?;
-            match response {
-                IpcResponsePayload::ClientList { clients } => {
-                    let current = clients.into_iter().find(|entry| entry.id == client_id);
-                    encode_service_message(&CurrentClientResponse {
-                        id: client_id,
-                        selected_session_id: current
-                            .as_ref()
-                            .and_then(|entry| entry.selected_session_id),
-                        following_client_id: current
-                            .as_ref()
-                            .and_then(|entry| entry.following_client_id),
-                        following_global: current
-                            .as_ref()
-                            .is_some_and(|entry| entry.following_global),
-                    })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for client-query/v1:current list-clients"
-                        .to_string(),
-                }),
-            }
-        }
-        ("context-query/v1", "list") => {
-            let response = execute_kernel_request(host_kernel_bridge, IpcRequest::ListContexts)?;
-            match response {
-                IpcResponsePayload::ContextList { contexts } => {
-                    let contexts = contexts
-                        .into_iter()
-                        .map(|entry| HostContextSummary {
-                            id: entry.id,
-                            name: entry.name,
-                            attributes: entry.attributes,
-                        })
-                        .collect();
-                    encode_service_message(&ContextListResponse { contexts })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for context-query/v1:list".to_string(),
-                }),
-            }
-        }
-        ("context-query/v1", "current") => {
-            let response = execute_kernel_request(host_kernel_bridge, IpcRequest::CurrentContext)?;
-            match response {
-                IpcResponsePayload::CurrentContext { context } => {
-                    let context = context.map(|entry| HostContextSummary {
-                        id: entry.id,
-                        name: entry.name,
-                        attributes: entry.attributes,
-                    });
-                    encode_service_message(&ContextCurrentResponse { context })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for context-query/v1:current".to_string(),
-                }),
-            }
-        }
-        ("context-command/v1", "create") => {
-            let request: ContextCreateRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::CreateContext {
-                    name: request.name,
-                    attributes: request.attributes,
-                },
-            )?;
-            match response {
-                IpcResponsePayload::ContextCreated { context } => {
-                    encode_service_message(&ContextCreateResponse {
-                        context: HostContextSummary {
-                            id: context.id,
-                            name: context.name,
-                            attributes: context.attributes,
-                        },
-                    })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for context-command/v1:create"
-                        .to_string(),
-                }),
-            }
-        }
-        ("context-command/v1", "select") => {
-            let request: ContextSelectRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::SelectContext {
-                    selector: context_selector_to_ipc(request.selector),
-                },
-            )?;
-            match response {
-                IpcResponsePayload::ContextSelected { context } => {
-                    encode_service_message(&ContextSelectResponse {
-                        context: HostContextSummary {
-                            id: context.id,
-                            name: context.name,
-                            attributes: context.attributes,
-                        },
-                    })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for context-command/v1:select"
-                        .to_string(),
-                }),
-            }
-        }
-        ("context-command/v1", "close") => {
-            let request: ContextCloseRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::CloseContext {
-                    selector: context_selector_to_ipc(request.selector),
-                    force: request.force,
-                },
-            )?;
-            match response {
-                IpcResponsePayload::ContextClosed { id } => {
-                    encode_service_message(&ContextCloseResponse { id })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for context-command/v1:close".to_string(),
-                }),
-            }
-        }
-        ("session-command/v1", "new") => {
-            let request: SessionCreateRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::NewSession { name: request.name },
-            )?;
-            match response {
-                IpcResponsePayload::SessionCreated { id, name } => {
-                    encode_service_message(&SessionCreateResponse { id, name })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for session-command/v1:new".to_string(),
-                }),
-            }
-        }
-        ("session-command/v1", "kill") => {
-            let request: SessionKillRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::KillSession {
-                    selector: session_selector_to_ipc(request.selector),
-                    force_local: request.force_local,
-                },
-            )?;
-            match response {
-                IpcResponsePayload::SessionKilled { id } => {
-                    encode_service_message(&SessionKillResponse { id })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for session-command/v1:kill".to_string(),
-                }),
-            }
-        }
-        ("session-command/v1", "select") => {
-            let request: SessionSelectRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::Attach {
-                    selector: session_selector_to_ipc(request.selector),
-                },
-            )?;
-            match response {
-                IpcResponsePayload::Attached { grant } => {
-                    encode_service_message(&SessionSelectResponse {
-                        session_id: grant.session_id,
-                        attach_token: grant.attach_token,
-                        expires_at_epoch_ms: grant.expires_at_epoch_ms,
-                    })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for session-command/v1:select"
-                        .to_string(),
-                }),
-            }
-        }
-        ("pane-query/v1", "list") => {
-            let request: PaneListRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::ListPanes {
-                    session: request.session.map(session_selector_to_ipc),
-                },
-            )?;
-            match response {
-                IpcResponsePayload::PaneList { panes } => {
-                    let panes = panes
-                        .into_iter()
-                        .map(|entry| HostPaneSummary {
-                            id: entry.id,
-                            index: entry.index,
-                            name: entry.name,
-                            focused: entry.focused,
-                        })
-                        .collect();
-                    encode_service_message(&PaneListResponse { panes })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for pane-query/v1:list".to_string(),
-                }),
-            }
-        }
-        ("pane-command/v1", "split") => {
-            let request: PaneSplitRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::SplitPane {
-                    session: request.session.map(session_selector_to_ipc),
-                    target: request.target.map(pane_selector_to_ipc),
-                    direction: pane_split_direction_to_ipc(request.direction),
-                    ratio_pct: None,
-                },
-            )?;
-            match response {
-                IpcResponsePayload::PaneSplit { id, session_id } => {
-                    encode_service_message(&PaneSplitResponse { id, session_id })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for pane-command/v1:split".to_string(),
-                }),
-            }
-        }
-        ("pane-command/v1", "launch") => {
-            let request: PaneLaunchRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::LaunchPane {
-                    session: request.session.map(session_selector_to_ipc),
-                    target: request.target.map(pane_selector_to_ipc),
-                    direction: pane_split_direction_to_ipc(request.direction),
-                    name: request.name,
-                    command: IpcPaneLaunchCommand {
-                        program: request.command.program,
-                        args: request.command.args,
-                        cwd: request.command.cwd,
-                        env: request.command.env,
-                    },
-                },
-            )?;
-            match response {
-                IpcResponsePayload::PaneLaunched { id, session_id } => {
-                    encode_service_message(&PaneLaunchResponse { id, session_id })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for pane-command/v1:launch".to_string(),
-                }),
-            }
-        }
-        ("pane-command/v1", "focus") => {
-            let request: PaneFocusRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::FocusPane {
-                    session: request.session.map(session_selector_to_ipc),
-                    target: request.target.map(pane_selector_to_ipc),
-                    direction: request.direction.map(pane_focus_direction_to_ipc),
-                },
-            )?;
-            match response {
-                IpcResponsePayload::PaneFocused { id, session_id } => {
-                    encode_service_message(&PaneFocusResponse { id, session_id })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for pane-command/v1:focus".to_string(),
-                }),
-            }
-        }
-        ("pane-command/v1", "resize") => {
-            let request: PaneResizeRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::ResizePane {
-                    session: request.session.map(session_selector_to_ipc),
-                    target: request.target.map(pane_selector_to_ipc),
-                    delta: request.delta,
-                },
-            )?;
-            match response {
-                IpcResponsePayload::PaneResized { session_id } => {
-                    encode_service_message(&PaneResizeResponse { session_id })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for pane-command/v1:resize".to_string(),
-                }),
-            }
-        }
-        ("pane-command/v1", "close") => {
-            let request: PaneCloseRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::ClosePane {
-                    session: request.session.map(session_selector_to_ipc),
-                    target: request.target.map(pane_selector_to_ipc),
-                },
-            )?;
-            match response {
-                IpcResponsePayload::PaneClosed {
-                    id,
-                    session_id,
-                    session_closed,
-                } => encode_service_message(&PaneCloseResponse {
-                    id,
-                    session_id,
-                    session_closed,
-                }),
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for pane-command/v1:close".to_string(),
-                }),
-            }
-        }
-        ("pane-command/v1", "zoom") => {
-            let request: PaneZoomRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::ZoomPane {
-                    session: request.session.map(session_selector_to_ipc),
-                },
-            )?;
-            match response {
-                IpcResponsePayload::PaneZoomed {
-                    session_id,
-                    pane_id,
-                    zoomed,
-                } => encode_service_message(&PaneZoomResponse {
-                    session_id,
-                    pane_id,
-                    zoomed,
-                }),
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for pane-command/v1:zoom".to_string(),
-                }),
-            }
-        }
         _ => Err(PluginError::UnsupportedHostOperation {
             operation: "call_service",
         }),
@@ -1464,43 +1085,6 @@ fn emit_plugin_log(
     }
 
     Ok(())
-}
-
-fn session_selector_to_ipc(selector: HostSessionSelector) -> IpcSessionSelector {
-    match selector {
-        HostSessionSelector::ById(id) => IpcSessionSelector::ById(id),
-        HostSessionSelector::ByName(name) => IpcSessionSelector::ByName(name),
-    }
-}
-
-fn context_selector_to_ipc(selector: HostContextSelector) -> IpcContextSelector {
-    match selector {
-        HostContextSelector::ById(id) => IpcContextSelector::ById(id),
-        HostContextSelector::ByName(name) => IpcContextSelector::ByName(name),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-const fn pane_selector_to_ipc(selector: HostPaneSelector) -> IpcPaneSelector {
-    match selector {
-        HostPaneSelector::ById(id) => IpcPaneSelector::ById(id),
-        HostPaneSelector::ByIndex(index) => IpcPaneSelector::ByIndex(index),
-        HostPaneSelector::Active => IpcPaneSelector::Active,
-    }
-}
-
-const fn pane_split_direction_to_ipc(direction: HostPaneSplitDirection) -> IpcPaneSplitDirection {
-    match direction {
-        HostPaneSplitDirection::Vertical => IpcPaneSplitDirection::Vertical,
-        HostPaneSplitDirection::Horizontal => IpcPaneSplitDirection::Horizontal,
-    }
-}
-
-const fn pane_focus_direction_to_ipc(direction: HostPaneFocusDirection) -> IpcPaneFocusDirection {
-    match direction {
-        HostPaneFocusDirection::Next => IpcPaneFocusDirection::Next,
-        HostPaneFocusDirection::Prev => IpcPaneFocusDirection::Prev,
-    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2537,7 +2121,7 @@ fn ensure_match(
 #[cfg(test)]
 mod tests {
     use super::{LoadedPlugin, PluginBackend};
-    use crate::{PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
+    use crate::{HostRuntimeApi, PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
     use bmux_plugin_sdk::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, NativeLifecycleContext,
         NativeServiceContext, PluginEvent, PluginEventKind, PluginEventSubscription,
@@ -3580,14 +3164,8 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response: bmux_plugin_sdk::SessionListResponse = context
-            .call_service(
-                "bmux.sessions.read",
-                bmux_plugin_sdk::ServiceKind::Query,
-                "session-query/v1",
-                "list",
-                &(),
-            )
+        let response = context
+            .session_list()
             .expect("core session query should succeed");
         assert_eq!(response.sessions.len(), 1);
 
@@ -3637,18 +3215,12 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let _response: bmux_plugin_sdk::PaneSplitResponse = context
-            .call_service(
-                "bmux.panes.write",
-                bmux_plugin_sdk::ServiceKind::Command,
-                "pane-command/v1",
-                "split",
-                &bmux_plugin_sdk::PaneSplitRequest {
-                    session: None,
-                    target: None,
-                    direction: bmux_plugin_sdk::PaneSplitDirection::Vertical,
-                },
-            )
+        let _response = context
+            .pane_split(&bmux_plugin_sdk::PaneSplitRequest {
+                session: None,
+                target: None,
+                direction: bmux_plugin_sdk::PaneSplitDirection::Vertical,
+            })
             .expect("core pane command should succeed");
 
         let last_is_split = KERNEL_REQUESTS.with(|log| {
@@ -3697,25 +3269,19 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let _response: bmux_plugin_sdk::PaneLaunchResponse = context
-            .call_service(
-                "bmux.panes.write",
-                bmux_plugin_sdk::ServiceKind::Command,
-                "pane-command/v1",
-                "launch",
-                &bmux_plugin_sdk::PaneLaunchRequest {
-                    session: None,
-                    target: None,
-                    direction: bmux_plugin_sdk::PaneSplitDirection::Vertical,
-                    name: Some("remote-a".to_string()),
-                    command: bmux_plugin_sdk::PaneLaunchCommand {
-                        program: "ssh".to_string(),
-                        args: vec!["host-a".to_string()],
-                        cwd: Some("/tmp".to_string()),
-                        env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
-                    },
+        let _response = context
+            .pane_launch(&bmux_plugin_sdk::PaneLaunchRequest {
+                session: None,
+                target: None,
+                direction: bmux_plugin_sdk::PaneSplitDirection::Vertical,
+                name: Some("remote-a".to_string()),
+                command: bmux_plugin_sdk::PaneLaunchCommand {
+                    program: "ssh".to_string(),
+                    args: vec!["host-a".to_string()],
+                    cwd: Some("/tmp".to_string()),
+                    env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
                 },
-            )
+            })
             .expect("core pane launch should succeed");
 
         let last_is_launch = KERNEL_REQUESTS.with(|log| {
@@ -3764,16 +3330,10 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let _response: bmux_plugin_sdk::SessionCreateResponse = context
-            .call_service(
-                "bmux.sessions.write",
-                bmux_plugin_sdk::ServiceKind::Command,
-                "session-command/v1",
-                "new",
-                &bmux_plugin_sdk::SessionCreateRequest {
-                    name: Some("created".to_string()),
-                },
-            )
+        let _response = context
+            .session_create(&bmux_plugin_sdk::SessionCreateRequest {
+                name: Some("created".to_string()),
+            })
             .expect("core session command should succeed");
 
         let last_is_new_session = KERNEL_REQUESTS.with(|log| {
@@ -4042,14 +3602,8 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response: bmux_plugin_sdk::CurrentClientResponse = context
-            .call_service(
-                "bmux.clients.read",
-                bmux_plugin_sdk::ServiceKind::Query,
-                "client-query/v1",
-                "current",
-                &(),
-            )
+        let response = context
+            .current_client()
             .expect("core client query should succeed");
         assert_eq!(
             response.id,
@@ -4116,14 +3670,8 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response: bmux_plugin_sdk::CurrentClientResponse = context
-            .call_service(
-                "bmux.clients.read",
-                bmux_plugin_sdk::ServiceKind::Query,
-                "client-query/v1",
-                "current",
-                &(),
-            )
+        let response = context
+            .current_client()
             .expect("core client query should succeed when list-clients omits current client");
         assert_eq!(
             response.id,
@@ -4175,16 +3723,10 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response: bmux_plugin_sdk::SessionSelectResponse = context
-            .call_service(
-                "bmux.sessions.write",
-                bmux_plugin_sdk::ServiceKind::Command,
-                "session-command/v1",
-                "select",
-                &bmux_plugin_sdk::SessionSelectRequest {
-                    selector: bmux_plugin_sdk::SessionSelector::ById(target_session_id),
-                },
-            )
+        let response = context
+            .session_select(&bmux_plugin_sdk::SessionSelectRequest {
+                selector: bmux_plugin_sdk::SessionSelector::ById(target_session_id),
+            })
             .expect("core session select should succeed");
         assert_eq!(response.session_id, target_session_id);
         assert_eq!(response.expires_at_epoch_ms, 42);
@@ -4239,15 +3781,9 @@ minimum = "1.0"
         };
 
         let error = context
-            .call_service::<bmux_plugin_sdk::SessionCreateRequest, bmux_plugin_sdk::SessionCreateResponse>(
-                "bmux.sessions.write",
-                bmux_plugin_sdk::ServiceKind::Command,
-                "session-command/v1",
-                "new",
-                &bmux_plugin_sdk::SessionCreateRequest {
-                    name: Some("deny".to_string()),
-                },
-            )
+            .session_create(&bmux_plugin_sdk::SessionCreateRequest {
+                name: Some("deny".to_string()),
+            })
             .expect_err("kernel denial should propagate as service error");
 
         assert!(
@@ -4295,14 +3831,8 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response: bmux_plugin_sdk::PaneListResponse = context
-            .call_service(
-                "bmux.panes.read",
-                bmux_plugin_sdk::ServiceKind::Query,
-                "pane-query/v1",
-                "list",
-                &bmux_plugin_sdk::PaneListRequest { session: None },
-            )
+        let response = context
+            .pane_list(&bmux_plugin_sdk::PaneListRequest { session: None })
             .expect("core pane query should succeed");
         assert_eq!(response.panes.len(), 1);
 
@@ -4352,45 +3882,27 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let _focused: bmux_plugin_sdk::PaneFocusResponse = context
-            .call_service(
-                "bmux.panes.write",
-                bmux_plugin_sdk::ServiceKind::Command,
-                "pane-command/v1",
-                "focus",
-                &bmux_plugin_sdk::PaneFocusRequest {
-                    session: None,
-                    target: Some(bmux_plugin_sdk::PaneSelector::Active),
-                    direction: Some(bmux_plugin_sdk::PaneFocusDirection::Next),
-                },
-            )
+        let _focused = context
+            .pane_focus(&bmux_plugin_sdk::PaneFocusRequest {
+                session: None,
+                target: Some(bmux_plugin_sdk::PaneSelector::Active),
+                direction: Some(bmux_plugin_sdk::PaneFocusDirection::Next),
+            })
             .expect("focus command should succeed");
 
-        let _resized: bmux_plugin_sdk::PaneResizeResponse = context
-            .call_service(
-                "bmux.panes.write",
-                bmux_plugin_sdk::ServiceKind::Command,
-                "pane-command/v1",
-                "resize",
-                &bmux_plugin_sdk::PaneResizeRequest {
-                    session: None,
-                    target: Some(bmux_plugin_sdk::PaneSelector::Active),
-                    delta: 1,
-                },
-            )
+        let _resized = context
+            .pane_resize(&bmux_plugin_sdk::PaneResizeRequest {
+                session: None,
+                target: Some(bmux_plugin_sdk::PaneSelector::Active),
+                delta: 1,
+            })
             .expect("resize command should succeed");
 
-        let _closed: bmux_plugin_sdk::PaneCloseResponse = context
-            .call_service(
-                "bmux.panes.write",
-                bmux_plugin_sdk::ServiceKind::Command,
-                "pane-command/v1",
-                "close",
-                &bmux_plugin_sdk::PaneCloseRequest {
-                    session: None,
-                    target: Some(bmux_plugin_sdk::PaneSelector::Active),
-                },
-            )
+        let _closed = context
+            .pane_close(&bmux_plugin_sdk::PaneCloseRequest {
+                session: None,
+                target: Some(bmux_plugin_sdk::PaneSelector::Active),
+            })
             .expect("close command should succeed");
 
         let (has_focus, has_resize, has_close) = KERNEL_REQUESTS.with(|log| {

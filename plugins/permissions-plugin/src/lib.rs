@@ -1160,11 +1160,56 @@ mod tests {
 
         fn execute_kernel_request(
             &self,
-            _request: bmux_ipc::Request,
+            request: bmux_ipc::Request,
         ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
-            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-                operation: "mock_execute_kernel_request",
-            })
+            match request {
+                bmux_ipc::Request::ListSessions => Ok(bmux_ipc::ResponsePayload::SessionList {
+                    sessions: self
+                        .sessions
+                        .iter()
+                        .map(|s| bmux_ipc::SessionSummary {
+                            id: s.id,
+                            name: s.name.clone(),
+                            client_count: s.client_count,
+                        })
+                        .collect(),
+                }),
+                bmux_ipc::Request::WhoAmI => Ok(bmux_ipc::ResponsePayload::ClientIdentity {
+                    id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                }),
+                bmux_ipc::Request::ListClients => Ok(bmux_ipc::ResponsePayload::ClientList {
+                    clients: vec![bmux_ipc::ClientSummary {
+                        id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                        selected_session_id: self.selected_session_id,
+                        selected_context_id: None,
+                        following_client_id: None,
+                        following_global: false,
+                    }],
+                }),
+                bmux_ipc::Request::ListContexts => Ok(bmux_ipc::ResponsePayload::ContextList {
+                    contexts: self
+                        .contexts
+                        .iter()
+                        .map(|c| bmux_ipc::ContextSummary {
+                            id: c.id,
+                            name: c.name.clone(),
+                            attributes: c.attributes.clone(),
+                        })
+                        .collect(),
+                }),
+                bmux_ipc::Request::CurrentContext => {
+                    Ok(bmux_ipc::ResponsePayload::CurrentContext {
+                        context: self.contexts.first().map(|c| bmux_ipc::ContextSummary {
+                            id: c.id,
+                            name: c.name.clone(),
+                            attributes: c.attributes.clone(),
+                        }),
+                    })
+                }
+                _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                    operation: "mock_execute_kernel_request",
+                }),
+            }
         }
     }
 
