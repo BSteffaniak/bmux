@@ -2146,7 +2146,15 @@ pub async fn handle_attach_ui_action(
                 PaneFocusDirection::Next
             };
             let selector = attached_session_selector(view_state);
-            let _ = client.focus_pane(Some(selector), direction).await?;
+            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+                client,
+                "focus-pane-in-direction",
+                &windows_cmd_args::FocusPaneInDirection {
+                    session: Some(ipc_to_typed_selector(selector)),
+                    direction: typed_windows::ipc_focus_to_typed_direction(direction),
+                },
+            )
+            .await?;
         }
         RuntimeAction::IncreaseSplit
         | RuntimeAction::DecreaseSplit

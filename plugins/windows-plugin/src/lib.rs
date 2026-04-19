@@ -108,6 +108,31 @@ impl RustPlugin for WindowsPlugin {
                     .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
                     .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
             },
+            "windows-commands", "close-active-pane" => |req: CloseActivePaneArgs, ctx| {
+                let request = bmux_plugin_sdk::PaneCloseRequest {
+                    session: req.session.as_ref().and_then(selector_to_session),
+                    target: None,
+                };
+                ctx.pane_close(&request)
+                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
+                    .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
+            },
+            "windows-commands", "focus-pane-in-direction" => |req: FocusPaneInDirectionArgs, ctx| {
+                let Some(focus_dir) = pane_direction_to_focus(req.direction) else {
+                    return Err(ServiceResponse::error(
+                        "invalid_request",
+                        "direction must be Next/Prev (Horizontal/Vertical aren't meaningful)",
+                    ));
+                };
+                let request = bmux_plugin_sdk::PaneFocusRequest {
+                    session: req.session.as_ref().and_then(selector_to_session),
+                    target: None,
+                    direction: Some(focus_dir),
+                };
+                ctx.pane_focus(&request)
+                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
+                    .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
+            },
             "windows-commands", "split-pane" => |req: SplitPaneArgs, ctx| {
                 let request = bmux_plugin_sdk::PaneSplitRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
@@ -883,7 +908,6 @@ const fn pane_direction_to_split(direction: PaneDirection) -> bmux_plugin_sdk::P
     }
 }
 
-#[allow(dead_code)] // Used once pane_focus routing supports direction hints from typed callers.
 const fn pane_direction_to_focus(
     direction: PaneDirection,
 ) -> Option<bmux_plugin_sdk::PaneFocusDirection> {
@@ -983,6 +1007,54 @@ impl WindowsCommandsService for WindowsCommandsHandle {
             };
             caller
                 .pane_close(&request)
+                .map(|response| PaneAck {
+                    ok: true,
+                    pane_id: Some(response.id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn close_active_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let request = bmux_plugin_sdk::PaneCloseRequest {
+                session: session.as_ref().and_then(selector_to_session),
+                target: None,
+            };
+            caller
+                .pane_close(&request)
+                .map(|response| PaneAck {
+                    ok: true,
+                    pane_id: Some(response.id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn focus_pane_in_direction<'a>(
+        &'a self,
+        session: Option<Selector>,
+        direction: PaneDirection,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let Some(focus_dir) = pane_direction_to_focus(direction) else {
+                return Err(PaneMutationError::InvalidArgument {
+                    reason: "direction must be Next/Prev (Horizontal/Vertical aren't meaningful)"
+                        .into(),
+                });
+            };
+            let request = bmux_plugin_sdk::PaneFocusRequest {
+                session: session.as_ref().and_then(selector_to_session),
+                target: None,
+                direction: Some(focus_dir),
+            };
+            caller
+                .pane_focus(&request)
                 .map(|response| PaneAck {
                     ok: true,
                     pane_id: Some(response.id),
@@ -1303,6 +1375,19 @@ struct ClosePaneBySelectorArgs {
     #[serde(default)]
     session: Option<Selector>,
     target: Selector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CloseActivePaneArgs {
+    #[serde(default)]
+    session: Option<Selector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FocusPaneInDirectionArgs {
+    #[serde(default)]
+    session: Option<Selector>,
+    direction: PaneDirection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

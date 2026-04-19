@@ -98,6 +98,19 @@ pub mod args {
         pub session: Option<Selector>,
         pub target: Selector,
     }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct CloseActivePane {
+        #[serde(default)]
+        pub session: Option<Selector>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FocusPaneInDirection {
+        #[serde(default)]
+        pub session: Option<Selector>,
+        pub direction: PaneDirection,
+    }
 }
 
 /// Convert an IPC [`SessionSelector`] to the typed BPDL [`Selector`].

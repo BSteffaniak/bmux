@@ -2325,64 +2325,113 @@ async fn apply_attach_runtime_actions(
                 .map_err(|e| anyhow::anyhow!("split focused horizontal failed: {e}"))?;
             }
             crate::input::RuntimeAction::FocusNext => {
-                client
-                    .focus_pane(
-                        Some(SessionSelector::ById(runtime.state.attached_id)),
-                        PaneFocusDirection::Next,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("focus next failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "focus-pane-in-direction",
+                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                            PaneFocusDirection::Next,
+                        ),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("focus next failed: {e}"))?;
             }
             crate::input::RuntimeAction::FocusPrev => {
-                client
-                    .focus_pane(
-                        Some(SessionSelector::ById(runtime.state.attached_id)),
-                        PaneFocusDirection::Prev,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("focus prev failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "focus-pane-in-direction",
+                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                            PaneFocusDirection::Prev,
+                        ),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("focus prev failed: {e}"))?;
             }
             crate::input::RuntimeAction::FocusLeft => {
-                client
-                    .focus_pane(
-                        Some(SessionSelector::ById(runtime.state.attached_id)),
-                        PaneFocusDirection::Prev,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("focus left failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "focus-pane-in-direction",
+                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                            PaneFocusDirection::Prev,
+                        ),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("focus left failed: {e}"))?;
             }
             crate::input::RuntimeAction::FocusRight => {
-                client
-                    .focus_pane(
-                        Some(SessionSelector::ById(runtime.state.attached_id)),
-                        PaneFocusDirection::Next,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("focus right failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "focus-pane-in-direction",
+                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                            PaneFocusDirection::Next,
+                        ),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("focus right failed: {e}"))?;
             }
             crate::input::RuntimeAction::FocusUp => {
-                client
-                    .focus_pane(
-                        Some(SessionSelector::ById(runtime.state.attached_id)),
-                        PaneFocusDirection::Prev,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("focus up failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "focus-pane-in-direction",
+                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                            PaneFocusDirection::Prev,
+                        ),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("focus up failed: {e}"))?;
             }
             crate::input::RuntimeAction::FocusDown => {
-                client
-                    .focus_pane(
-                        Some(SessionSelector::ById(runtime.state.attached_id)),
-                        PaneFocusDirection::Next,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("focus down failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "focus-pane-in-direction",
+                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                            PaneFocusDirection::Next,
+                        ),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("focus down failed: {e}"))?;
             }
             crate::input::RuntimeAction::CloseFocusedPane => {
-                client
-                    .close_pane(Some(SessionSelector::ById(runtime.state.attached_id)))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("close focused pane failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "close-active-pane",
+                    &crate::runtime::typed_windows::args::CloseActivePane {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("close focused pane failed: {e}"))?;
             }
             crate::input::RuntimeAction::ZoomPane => {
                 client

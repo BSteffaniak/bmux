@@ -121,6 +121,18 @@ interface windows-commands {
         -> result<pane-ack, pane-mutation-error>;
     command close-pane-by-selector(session: selector?, target: selector)
         -> result<pane-ack, pane-mutation-error>;
+    // Close the currently-active pane in the targeted session.
+    // Equivalent to `close-pane-by-selector` with an empty target, but
+    // gives consumers a dedicated name that documents the "close active
+    // pane" semantic.
+    command close-active-pane(session: selector?)
+        -> result<pane-ack, pane-mutation-error>;
+    // Focus the next/previous pane in the layout relative to the
+    // currently-active pane. The direction is interpreted by the host
+    // today; once the windows plugin owns focus ordering internally,
+    // this shifts to a plugin-local lookup.
+    command focus-pane-in-direction(session: selector?, direction: pane-direction)
+        -> result<pane-ack, pane-mutation-error>;
 
     // Split / launch / resize / zoom / restart.
     // Each targets a session (by uuid or name) and an existing pane
