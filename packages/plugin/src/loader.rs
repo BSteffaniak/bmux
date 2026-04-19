@@ -625,26 +625,14 @@ thread_local! {
 
 fn begin_command_outcome_capture() {
     COMMAND_OUTCOME_CAPTURE.with(|slot| {
-        *slot.borrow_mut() = Some(bmux_plugin_sdk::PluginCommandOutcome {
-            effects: Vec::new(),
-        });
-    });
-}
-
-fn record_command_effect(effect: bmux_plugin_sdk::PluginCommandEffect) {
-    COMMAND_OUTCOME_CAPTURE.with(|slot| {
-        if let Some(outcome) = slot.borrow_mut().as_mut() {
-            outcome.effects.push(effect);
-        }
+        *slot.borrow_mut() = Some(bmux_plugin_sdk::PluginCommandOutcome::default());
     });
 }
 
 fn finish_command_outcome_capture() -> bmux_plugin_sdk::PluginCommandOutcome {
     COMMAND_OUTCOME_CAPTURE
         .with(|slot| slot.borrow_mut().take())
-        .unwrap_or(bmux_plugin_sdk::PluginCommandOutcome {
-            effects: Vec::new(),
-        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,6 +715,13 @@ impl ServiceCaller for NativeCommandContext {
             payload,
         )
     }
+
+    fn execute_kernel_request(
+        &self,
+        request: bmux_ipc::Request,
+    ) -> Result<bmux_ipc::ResponsePayload> {
+        execute_kernel_request(self.host_kernel_bridge, request)
+    }
 }
 
 impl ServiceCaller for NativeLifecycleContext {
@@ -757,6 +752,13 @@ impl ServiceCaller for NativeLifecycleContext {
             payload,
         )
     }
+
+    fn execute_kernel_request(
+        &self,
+        request: bmux_ipc::Request,
+    ) -> Result<bmux_ipc::ResponsePayload> {
+        execute_kernel_request(self.host_kernel_bridge, request)
+    }
 }
 
 impl ServiceCaller for NativeServiceContext {
@@ -786,6 +788,13 @@ impl ServiceCaller for NativeServiceContext {
             operation,
             payload,
         )
+    }
+
+    fn execute_kernel_request(
+        &self,
+        request: bmux_ipc::Request,
+    ) -> Result<bmux_ipc::ResponsePayload> {
+        execute_kernel_request(self.host_kernel_bridge, request)
     }
 }
 
@@ -1121,9 +1130,6 @@ fn handle_core_service_call(
             )?;
             match response {
                 IpcResponsePayload::ContextCreated { context } => {
-                    record_command_effect(bmux_plugin_sdk::PluginCommandEffect::SelectContext {
-                        context_id: context.id,
-                    });
                     encode_service_message(&ContextCreateResponse {
                         context: HostContextSummary {
                             id: context.id,
@@ -1148,9 +1154,6 @@ fn handle_core_service_call(
             )?;
             match response {
                 IpcResponsePayload::ContextSelected { context } => {
-                    record_command_effect(bmux_plugin_sdk::PluginCommandEffect::SelectContext {
-                        context_id: context.id,
-                    });
                     encode_service_message(&ContextSelectResponse {
                         context: HostContextSummary {
                             id: context.id,
@@ -1501,7 +1504,7 @@ const fn pane_focus_direction_to_ipc(direction: HostPaneFocusDirection) -> IpcPa
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_kernel_request(
+pub fn execute_kernel_request(
     host_kernel_bridge: Option<HostKernelBridge>,
     request: IpcRequest,
 ) -> Result<IpcResponsePayload> {
@@ -1862,12 +1865,7 @@ impl LoadedPlugin {
             )
         };
 
-        Ok((
-            status,
-            bmux_plugin_sdk::PluginCommandOutcome {
-                effects: Vec::new(),
-            },
-        ))
+        Ok((status, bmux_plugin_sdk::PluginCommandOutcome::default()))
     }
 
     /// # Errors
@@ -2196,12 +2194,7 @@ impl LoadedPlugin {
                     outcome,
                 } => {
                     Self::ensure_process_protocol_version("command", protocol_version)?;
-                    Ok((
-                        status,
-                        outcome.unwrap_or(bmux_plugin_sdk::PluginCommandOutcome {
-                            effects: Vec::new(),
-                        }),
-                    ))
+                    Ok((status, outcome.unwrap_or_default()))
                 }
                 ProcessInvocationResponse::Error {
                     protocol_version,
@@ -2217,9 +2210,7 @@ impl LoadedPlugin {
 
         Ok((
             status.code().unwrap_or(1),
-            bmux_plugin_sdk::PluginCommandOutcome {
-                effects: Vec::new(),
-            },
+            bmux_plugin_sdk::PluginCommandOutcome::default(),
         ))
     }
 }

@@ -1107,10 +1107,33 @@ pub(super) async fn run_target_verify_capture(
         let mut client = BmuxClient::connect_with_paths(&paths, "bmux-cli-recording-verify")
             .await
             .map_err(map_cli_client_error)?;
-        let session_id = client
-            .new_session(Some("verify-replay".to_string()))
-            .await
-            .map_err(map_cli_client_error)?;
+        let session_id = {
+            #[derive(serde::Serialize)]
+            struct Args {
+                name: Option<String>,
+            }
+            let payload = bmux_codec::to_vec(&Args {
+                name: Some("verify-replay".to_string()),
+            })
+            .context("encoding new-session args")?;
+            let bytes = client
+                .invoke_service_raw(
+                    super::typed_sessions::SESSIONS_WRITE_CAPABILITY.as_str(),
+                    super::typed_sessions::COMMAND_KIND,
+                    super::typed_sessions::SESSIONS_COMMANDS_INTERFACE.as_str(),
+                    super::typed_sessions::OP_NEW_SESSION,
+                    payload,
+                )
+                .await
+                .map_err(map_cli_client_error)?;
+            let outcome: std::result::Result<
+                bmux_sessions_plugin_api::sessions_commands::SessionAck,
+                bmux_sessions_plugin_api::sessions_commands::NewSessionError,
+            > = bmux_codec::from_bytes(&bytes).context("decoding new-session response")?;
+            outcome
+                .map(|ack| ack.id)
+                .map_err(|err| anyhow::anyhow!("new-session failed: {err:?}"))?
+        };
         let grant = client
             .attach_grant(SessionSelector::ById(session_id))
             .await

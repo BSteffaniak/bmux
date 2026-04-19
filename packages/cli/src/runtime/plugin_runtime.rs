@@ -5,8 +5,8 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
-    HostScope, NativeCommandContext, NativeLifecycleContext, PluginCommandEffect,
-    PluginCommandOutcome, PluginEvent, PluginEventKind, RegisteredService,
+    HostScope, NativeCommandContext, NativeLifecycleContext, PluginCommandOutcome, PluginEvent,
+    PluginEventKind, RegisteredService,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -18,9 +18,8 @@ use tracing::{debug, warn};
 
 use super::{
     KernelClientFactory, available_capability_providers, available_service_descriptors,
-    begin_host_kernel_effect_capture, connect_raw, core_provided_capabilities,
-    enter_host_kernel_client_factory, enter_host_kernel_connection,
-    finish_host_kernel_effect_capture, host_kernel_bridge, map_cli_client_error,
+    connect_raw, core_provided_capabilities, enter_host_kernel_client_factory,
+    enter_host_kernel_connection, host_kernel_bridge, map_cli_client_error,
     plugin_commands::PluginCommandRegistry, plugin_host, server_event_name,
     service_descriptors_from_declarations,
 };
@@ -1458,33 +1457,18 @@ pub(super) fn run_plugin_command_internal(
         plugin_search_roots,
         state.registered_plugin_infos.clone(),
     );
-    begin_host_kernel_effect_capture();
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
     let _host_kernel_factory_guard =
         kernel_client_factory.map(|f| enter_host_kernel_client_factory(Arc::clone(f)));
     let run_result =
         loaded.run_command_with_context_and_outcome(command_name, args, Some(&context));
-    let fallback_effects = finish_host_kernel_effect_capture();
-    let (status, mut outcome) = run_result.map_err(|error| {
+    let (status, outcome) = run_result.map_err(|error| {
         anyhow::anyhow!(format_plugin_command_run_error(
             plugin_id,
             command_name,
             &error
         ))
     })?;
-    if outcome.effects.is_empty() && !fallback_effects.is_empty() {
-        let mut seen = std::collections::BTreeSet::new();
-        for effect in fallback_effects {
-            match effect {
-                PluginCommandEffect::SelectContext { context_id } if seen.insert(context_id) => {
-                    outcome
-                        .effects
-                        .push(PluginCommandEffect::SelectContext { context_id });
-                }
-                PluginCommandEffect::SelectContext { .. } => {}
-            }
-        }
-    }
     Ok(PluginCommandExecution { status, outcome })
 }
 
@@ -1614,7 +1598,6 @@ mod tests {
     use crate::runtime::cli_parse::{ParsedRuntimeCli, parse_runtime_cli_with_registry};
     use crate::runtime::dispatch::built_in_handler_for_command;
 
-    use crate::runtime::plugin_kernel::maybe_record_host_kernel_effect;
     use crate::runtime::session_cli::format_destructive_op_error;
     use crate::runtime::terminal_doctor::{filter_trace_events, merged_runtime_keybindings};
     use crate::runtime::terminal_protocol::{ProtocolDirection, ProtocolTraceEvent};
@@ -1623,7 +1606,6 @@ mod tests {
     use bmux_config::{BmuxConfig, ConfigPaths};
     use bmux_ipc::ErrorCode;
     use bmux_plugin::{PluginManifest, PluginRegistry};
-    use bmux_plugin_sdk::PluginCommandEffect;
     use std::ffi::OsString;
     use std::fs;
     use uuid::Uuid;
@@ -2712,41 +2694,5 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[test]
-    fn host_kernel_effect_capture_records_select_context_from_select_response() {
-        begin_host_kernel_effect_capture();
-        let context_id = Uuid::from_u128(42);
-        maybe_record_host_kernel_effect(
-            &bmux_ipc::Request::SelectContext {
-                selector: bmux_ipc::ContextSelector::ById(context_id),
-            },
-            &bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextSelected {
-                context: bmux_ipc::ContextSummary {
-                    id: context_id,
-                    name: Some("ctx".to_string()),
-                    attributes: std::collections::BTreeMap::new(),
-                },
-            }),
-        );
-        let captured = finish_host_kernel_effect_capture();
-        assert_eq!(
-            captured,
-            vec![PluginCommandEffect::SelectContext { context_id }]
-        );
-    }
-
-    #[test]
-    fn host_kernel_effect_capture_ignores_non_context_responses() {
-        begin_host_kernel_effect_capture();
-        maybe_record_host_kernel_effect(
-            &bmux_ipc::Request::ListSessions,
-            &bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
-                sessions: Vec::new(),
-            }),
-        );
-        let captured = finish_host_kernel_effect_capture();
-        assert!(captured.is_empty());
     }
 }

@@ -16,13 +16,13 @@
 //! [`crate::host_runtime::HostRuntimeApi`] defaults expect.
 
 use bmux_plugin_sdk::{
-    HostConnectionInfo, HostKernelBridge, HostMetadata, RegisteredService, Result, ServiceKind,
-    TypedServiceRegistrationContext,
+    HostConnectionInfo, HostKernelBridge, HostMetadata, PluginError, RegisteredService, Result,
+    ServiceKind, TypedServiceRegistrationContext,
 };
 use std::collections::BTreeMap;
 
 use crate::host_runtime::ServiceCaller;
-use crate::loader::call_service_raw;
+use crate::loader::{call_service_raw, execute_kernel_request};
 
 /// Standalone [`ServiceCaller`] usable by long-lived typed service
 /// handles.
@@ -95,5 +95,17 @@ impl ServiceCaller for TypedServiceCaller {
             operation,
             payload,
         )
+    }
+
+    fn execute_kernel_request(
+        &self,
+        request: bmux_ipc::Request,
+    ) -> Result<bmux_ipc::ResponsePayload> {
+        let bridge = self
+            .host_kernel_bridge
+            .ok_or(PluginError::UnsupportedHostOperation {
+                operation: "execute_kernel_request",
+            })?;
+        execute_kernel_request(Some(bridge), request)
     }
 }

@@ -15,6 +15,7 @@ bmux_attach_pipeline = { workspace = true }
 bmux_client = { workspace = true }
 bmux_codec = { workspace = true }
 bmux_ipc = { workspace = true, features = ["compression-zstd"] }
+bmux_sessions_plugin_api = { workspace = true }
 bmux_windows_plugin_api = { workspace = true }
 iroh = { workspace = true }
 rustls = { workspace = true }

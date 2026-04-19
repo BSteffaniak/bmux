@@ -7,8 +7,9 @@ use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_ipc::{InvokeServiceKind, RecordingRollingStartOptions, SessionSummary};
+use bmux_ipc::{InvokeServiceKind, RecordingRollingStartOptions};
 use bmux_plugin_sdk::{PluginCliCommandRequest, PluginCliCommandResponse};
+use bmux_sessions_plugin_api::sessions_state::SessionSummary;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -24,8 +25,26 @@ use super::{
         HostedHostState, hosted_not_ready_reason, status_not_ready_lines, status_ready_lines,
     },
     map_cli_client_error, recording, run_server_start, run_session_attach,
-    run_session_attach_with_client,
+    run_session_attach_with_client, typed_sessions,
 };
+
+/// Typed dispatch wrapper for `sessions-state:list-sessions` via
+/// `BmuxClient::invoke_service_raw`. Replaces `BmuxClient::list_sessions`
+/// as part of the M4 purge of domain-specific client methods.
+async fn typed_list_sessions_remote(client: &mut BmuxClient) -> Result<Vec<SessionSummary>> {
+    let payload = bmux_codec::to_vec(&()).context("encoding list-sessions args")?;
+    let bytes = client
+        .invoke_service_raw(
+            typed_sessions::SESSIONS_READ_CAPABILITY.as_str(),
+            typed_sessions::QUERY_KIND,
+            typed_sessions::SESSIONS_STATE_INTERFACE.as_str(),
+            typed_sessions::OP_LIST_SESSIONS,
+            payload,
+        )
+        .await
+        .map_err(map_cli_client_error)?;
+    bmux_codec::from_bytes::<Vec<SessionSummary>>(&bytes).context("decoding list-sessions response")
+}
 use bmux_cli_schema::HostedModeArg;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, HostedMode, RemoteServerStartMode};
 use bmux_ipc::IpcEndpoint;
@@ -7323,7 +7342,7 @@ pub(super) async fn run_remote_complete_sessions(target: &str) -> Result<u8> {
                 .0
         }
     };
-    let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
+    let sessions = typed_list_sessions_remote(&mut client).await?;
     let ordered = sessions_ordered_by_recent(target, &sessions)?;
     for session in ordered {
         let value = session.name.unwrap_or_else(|| session.id.to_string());
@@ -7352,7 +7371,7 @@ async fn resolve_local_attach_session() -> Result<Option<String>> {
         ConnectionContext::new(Some("local")),
     )
     .await?;
-    let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
+    let sessions = typed_list_sessions_remote(&mut client).await?;
     select_session_interactively("local", &sessions)
 }
 
@@ -7365,7 +7384,7 @@ async fn resolve_remote_attach_session(
             "session argument is required in non-interactive mode.\nList sessions: bmux --target {target_label} list-sessions"
         );
     }
-    let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
+    let sessions = typed_list_sessions_remote(client).await?;
     select_session_interactively(target_label, &sessions)
 }
 

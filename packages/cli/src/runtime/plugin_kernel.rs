@@ -6,8 +6,8 @@ use bmux_ipc::InvokeServiceKind;
 use bmux_plugin::PluginRegistry;
 use bmux_plugin_sdk::{
     CORE_CLI_COMMAND_CAPABILITY, CORE_CLI_COMMAND_INTERFACE_V1, HostConnectionInfo, HostScope,
-    PluginCliCommandRequest, PluginCliCommandResponse, PluginCommandEffect, RegisteredService,
-    ServiceKind, ServiceRequest,
+    PluginCliCommandRequest, PluginCliCommandResponse, RegisteredService, ServiceKind,
+    ServiceRequest,
 };
 use bmux_server::{BmuxServer, ServiceInvokeContext};
 use clap::Parser;
@@ -37,7 +37,6 @@ thread_local! {
     static SERVICE_KERNEL_CONTEXT: RefCell<Option<ServiceInvokeContext>> = const { RefCell::new(None) };
     static HOST_KERNEL_CONNECTION: RefCell<Option<HostConnectionInfo>> = const { RefCell::new(None) };
     static HOST_KERNEL_CLIENT_FACTORY: RefCell<Option<KernelClientFactory>> = const { RefCell::new(None) };
-    static HOST_KERNEL_EFFECT_CAPTURE: RefCell<Option<Vec<PluginCommandEffect>>> = const { RefCell::new(None) };
 }
 
 pub(super) struct ServiceKernelContextGuard;
@@ -100,50 +99,12 @@ pub(super) fn enter_host_kernel_client_factory(
     HostKernelClientFactoryGuard
 }
 
-pub(super) fn begin_host_kernel_effect_capture() {
-    HOST_KERNEL_EFFECT_CAPTURE.with(|slot| {
-        *slot.borrow_mut() = Some(Vec::new());
-    });
-}
-
-pub(super) fn record_host_kernel_effect(effect: PluginCommandEffect) {
-    HOST_KERNEL_EFFECT_CAPTURE.with(|slot| {
-        if let Some(captured) = slot.borrow_mut().as_mut() {
-            captured.push(effect);
-        }
-    });
-}
-
-pub(super) fn finish_host_kernel_effect_capture() -> Vec<PluginCommandEffect> {
-    HOST_KERNEL_EFFECT_CAPTURE
-        .with(|slot| slot.borrow_mut().take())
-        .unwrap_or_default()
-}
-
-#[allow(clippy::match_same_arms)] // CreateContext and SelectContext both produce SelectContext effect; different patterns, same intent
-pub(super) fn maybe_record_host_kernel_effect(
-    request: &bmux_ipc::Request,
-    response: &bmux_ipc::Response,
-) {
-    let effect = match (request, response) {
-        (
-            bmux_ipc::Request::CreateContext { .. },
-            bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextCreated { context }),
-        ) => Some(PluginCommandEffect::SelectContext {
-            context_id: context.id,
-        }),
-        (
-            bmux_ipc::Request::SelectContext { .. },
-            bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextSelected { context }),
-        ) => Some(PluginCommandEffect::SelectContext {
-            context_id: context.id,
-        }),
-        _ => None,
-    };
-    if let Some(effect) = effect {
-        record_host_kernel_effect(effect);
-    }
-}
+// M4 Stage 7: the plugin-command-effect side-channel was removed.
+// The former `begin/finish/maybe_record_host_kernel_effect` helpers
+// are gone; cross-domain mutations now flow through typed
+// plugin-to-plugin dispatch and the attach runtime observes context
+// changes by comparing before/after `current-context` around a
+// plugin command invocation.
 
 pub(super) fn call_host_kernel_via_client(
     connection: &HostConnectionInfo,
@@ -175,7 +136,6 @@ pub(super) fn call_host_kernel_via_client(
             client.request_raw(request.clone()).await
         })
     }?;
-    maybe_record_host_kernel_effect(&request, &response);
     bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
 }
 
@@ -210,7 +170,6 @@ fn call_host_kernel_via_factory(factory: &KernelClientFactory, payload: &[u8]) -
                 .context("remote kernel bridge request failed")
         })
     }?;
-    maybe_record_host_kernel_effect(&request, &response);
     bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
 }
 

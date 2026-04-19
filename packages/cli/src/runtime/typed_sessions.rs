@@ -51,6 +51,7 @@ pub struct NewSessionArgs {
 #[derive(Debug, Clone, Serialize)]
 pub struct KillSessionArgs {
     pub selector: CommandSessionSelector,
+    pub force_local: bool,
 }
 
 /// Wire-format argument for the typed `select-session` command.

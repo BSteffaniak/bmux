@@ -16,9 +16,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bmux_clients_plugin_api = { workspace = true }
+bmux_ipc                = { workspace = true }
 bmux_plugin             = { workspace = true }
 bmux_plugin_sdk         = { workspace = true }
-uuid                    = { workspace = true, features = ["std"] }
+serde                   = { workspace = true, features = ["derive", "std"] }
+uuid                    = { workspace = true, features = ["serde", "std"] }
 
 [features]
 fail-on-warnings = [

@@ -553,6 +553,78 @@ where
         .map_err(|error| anyhow::anyhow!("decoding {operation} response: {error}"))
 }
 
+/// Invoke a `sessions-commands` typed operation on a [`BmuxClient`].
+async fn invoke_sessions_command_bmux<Req, Resp>(
+    client: &mut BmuxClient,
+    operation: &str,
+    args: &Req,
+) -> anyhow::Result<Resp>
+where
+    Req: serde::Serialize + Sync,
+    Resp: serde::de::DeserializeOwned,
+{
+    let payload = bmux_codec::to_vec(args)
+        .map_err(|error| anyhow::anyhow!("encoding {operation}: {error}"))?;
+    let response_bytes = client
+        .invoke_service_raw(
+            crate::runtime::typed_sessions::SESSIONS_WRITE_CAPABILITY.as_str(),
+            bmux_ipc::InvokeServiceKind::Command,
+            crate::runtime::typed_sessions::SESSIONS_COMMANDS_INTERFACE.as_str(),
+            operation,
+            payload,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("client invoke_service_raw failed: {e}"))?;
+    bmux_codec::from_bytes::<Resp>(&response_bytes)
+        .map_err(|error| anyhow::anyhow!("decoding {operation} response: {error}"))
+}
+
+/// Invoke the typed `sessions-commands:new-session` operation. Returns
+/// the new session's id on success.
+async fn typed_new_session_playbook(
+    client: &mut BmuxClient,
+    name: Option<String>,
+) -> anyhow::Result<Uuid> {
+    #[derive(serde::Serialize)]
+    struct Args {
+        name: Option<String>,
+    }
+    let outcome = invoke_sessions_command_bmux::<
+        _,
+        std::result::Result<
+            bmux_sessions_plugin_api::sessions_commands::SessionAck,
+            bmux_sessions_plugin_api::sessions_commands::NewSessionError,
+        >,
+    >(client, "new-session", &Args { name })
+    .await?;
+    outcome
+        .map(|ack| ack.id)
+        .map_err(|err| anyhow::anyhow!("new-session failed: {err:?}"))
+}
+
+/// Invoke the typed `sessions-commands:kill-session` operation.
+/// Returns the killed session's id on success.
+async fn typed_kill_session_playbook(
+    client: &mut BmuxClient,
+    selector: SessionSelector,
+) -> anyhow::Result<Uuid> {
+    let args = crate::runtime::typed_sessions::KillSessionArgs {
+        selector: crate::runtime::typed_sessions::from_ipc_selector(selector),
+        force_local: false,
+    };
+    let outcome = invoke_sessions_command_bmux::<
+        _,
+        std::result::Result<
+            bmux_sessions_plugin_api::sessions_commands::SessionAck,
+            bmux_sessions_plugin_api::sessions_commands::KillSessionError,
+        >,
+    >(client, "kill-session", &args)
+    .await?;
+    outcome
+        .map(|ack| ack.id)
+        .map_err(|err| anyhow::anyhow!("kill-session failed: {err:?}"))
+}
+
 /// Run a playbook to completion, returning the result.
 ///
 /// Handles Ctrl+C gracefully: on signal, the sandbox server is cleaned up
@@ -1536,10 +1608,7 @@ pub(super) async fn execute_step(
     match &step.action {
         Action::NewSession { name } => {
             let resolved_name = name.as_ref().map(|n| runtime_vars.resolve_opt(n));
-            let sid = client
-                .new_session(resolved_name.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("new-session failed: {e}"))?;
+            let sid = typed_new_session_playbook(client, resolved_name.clone()).await?;
             debug!("created session {sid}");
 
             // Update runtime vars
@@ -1589,10 +1658,7 @@ pub(super) async fn execute_step(
 
         Action::KillSession { name } => {
             let selector = SessionSelector::ByName(name.clone());
-            let killed_id = client
-                .kill_session(selector)
-                .await
-                .map_err(|e| anyhow::anyhow!("kill-session failed: {e}"))?;
+            let killed_id = typed_kill_session_playbook(client, selector).await?;
             // Only clear state if we killed the session we were attached to.
             if *session_id == Some(killed_id) {
                 *session_id = None;
@@ -2526,10 +2592,7 @@ async fn apply_attach_runtime_actions(
                 }
             }
             crate::input::RuntimeAction::NewSession | crate::input::RuntimeAction::NewWindow => {
-                let new_sid = client
-                    .new_session(None)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("new session failed from attach action: {e}"))?;
+                let new_sid = typed_new_session_playbook(client, None).await?;
                 runtime.state.attached_id = new_sid;
             }
             crate::input::RuntimeAction::PluginCommand { .. }

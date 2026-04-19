@@ -1115,8 +1115,10 @@ name = "bmux_clients_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_clients_plugin_api",
+ "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "serde",
  "uuid",
 ]
 
@@ -1203,8 +1205,11 @@ name = "bmux_contexts_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_contexts_plugin_api",
+ "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "serde",
+ "uuid",
 ]
 
 [[package]]
@@ -1378,6 +1383,7 @@ dependencies = [
  "bmux_client",
  "bmux_codec",
  "bmux_ipc",
+ "bmux_sessions_plugin_api",
  "bmux_windows_plugin_api",
  "iroh",
  "rustls",
@@ -1580,9 +1586,12 @@ dependencies = [
 name = "bmux_sessions_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_sessions_plugin_api",
+ "serde",
+ "uuid",
 ]
 
 [[package]]

@@ -65,6 +65,22 @@ pub trait ServiceCaller {
         let response = self.call_service_raw(capability, kind, interface_id, operation, payload)?;
         bmux_plugin_sdk::decode_service_message(&response)
     }
+
+    /// Dispatch an IPC request directly to the host kernel.
+    ///
+    /// Used by domain plugins (sessions, contexts, clients, windows)
+    /// that own typed services backed by core state the host kernel
+    /// exposes over IPC. The typed service layer would otherwise cycle
+    /// back into the plugin's own handlers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host kernel bridge is missing
+    /// (typical in tests), or the server returns an error response.
+    fn execute_kernel_request(
+        &self,
+        request: bmux_ipc::Request,
+    ) -> Result<bmux_ipc::ResponsePayload>;
 }
 
 pub trait HostRuntimeApi: ServiceCaller {

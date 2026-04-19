@@ -2,12 +2,16 @@ use anyhow::{Context, Result};
 use bmux_cli_schema::{LogLevel, RecordingEventKindArg, RecordingProfileArg};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions, SessionSummary};
+use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
 use bmux_server::BmuxServer;
+use bmux_sessions_plugin_api::sessions_commands::{NewSessionError, SessionAck};
+use bmux_sessions_plugin_api::sessions_state::SessionSummary;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use tracing::{Level, warn};
 use uuid::Uuid;
+
+use super::typed_sessions;
 
 use super::{
     ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_WRITER_GUARD,
@@ -169,15 +173,12 @@ pub(super) async fn ensure_server_running_for_default_attach(
 }
 
 pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Result<Uuid> {
-    let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
+    let sessions = typed_list_sessions_for_bootstrap(client).await?;
 
     if sessions.is_empty() {
         let name = next_default_tab_name(&sessions);
-        let id = client
-            .new_session(Some(name.clone()))
-            .await
-            .map_err(map_cli_client_error)?;
-        return Ok(id);
+        let ack = typed_new_session_for_bootstrap(client, Some(name)).await?;
+        return Ok(ack.id);
     }
 
     let _client_id = client.whoami().await.map_err(map_cli_client_error)?;
@@ -185,11 +186,8 @@ pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Re
 
     if writable_sessions.is_empty() {
         let name = next_default_tab_name(&sessions);
-        let id = client
-            .new_session(Some(name.clone()))
-            .await
-            .map_err(map_cli_client_error)?;
-        return Ok(id);
+        let ack = typed_new_session_for_bootstrap(client, Some(name)).await?;
+        return Ok(ack.id);
     }
 
     let mut sorted = writable_sessions;
@@ -204,6 +202,50 @@ pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Re
         .next()
         .expect("non-empty sessions should have first entry");
     Ok(session.id)
+}
+
+/// Typed dispatch wrapper for `sessions-state:list-sessions` via
+/// `BmuxClient::invoke_service_raw`. Replaces the deprecated
+/// `BmuxClient::list_sessions` convenience method that predated the
+/// typed plugin contract.
+async fn typed_list_sessions_for_bootstrap(client: &mut BmuxClient) -> Result<Vec<SessionSummary>> {
+    let payload = bmux_codec::to_vec(&()).context("encoding list-sessions args")?;
+    let bytes = client
+        .invoke_service_raw(
+            typed_sessions::SESSIONS_READ_CAPABILITY.as_str(),
+            typed_sessions::QUERY_KIND,
+            typed_sessions::SESSIONS_STATE_INTERFACE.as_str(),
+            typed_sessions::OP_LIST_SESSIONS,
+            payload,
+        )
+        .await
+        .map_err(map_cli_client_error)?;
+    bmux_codec::from_bytes::<Vec<SessionSummary>>(&bytes).context("decoding list-sessions response")
+}
+
+/// Typed dispatch wrapper for `sessions-commands:new-session`.
+async fn typed_new_session_for_bootstrap(
+    client: &mut BmuxClient,
+    name: Option<String>,
+) -> Result<SessionAck> {
+    #[derive(serde::Serialize)]
+    struct Args {
+        name: Option<String>,
+    }
+    let payload = bmux_codec::to_vec(&Args { name }).context("encoding new-session args")?;
+    let bytes = client
+        .invoke_service_raw(
+            typed_sessions::SESSIONS_WRITE_CAPABILITY.as_str(),
+            typed_sessions::COMMAND_KIND,
+            typed_sessions::SESSIONS_COMMANDS_INTERFACE.as_str(),
+            typed_sessions::OP_NEW_SESSION,
+            payload,
+        )
+        .await
+        .map_err(map_cli_client_error)?;
+    let outcome = bmux_codec::from_bytes::<Result<SessionAck, NewSessionError>>(&bytes)
+        .context("decoding new-session response")?;
+    outcome.map_err(|err| anyhow::anyhow!("failed to create session: {err:?}"))
 }
 
 pub(super) fn next_default_tab_name(sessions: &[SessionSummary]) -> String {

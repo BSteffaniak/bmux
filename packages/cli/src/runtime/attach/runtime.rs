@@ -13,9 +13,7 @@ use bmux_ipc::{
     PaneFocusDirection, PaneSplitDirection, SessionSelector, SessionSummary,
 };
 use bmux_keybind::{action_to_config_name, parse_action};
-use bmux_plugin_sdk::{
-    HostScope, PluginCommandEffect, PluginCommandOutcome, ServiceKind, ServiceRequest,
-};
+use bmux_plugin_sdk::{HostScope, PluginCommandOutcome, ServiceKind, ServiceRequest};
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -80,7 +78,303 @@ const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
 /// already been marked `Ready`.
 const DECORATION_READY_TIMEOUT: Duration = Duration::from_millis(2000);
 
-use super::super::typed_windows;
+use super::super::{typed_clients, typed_contexts, typed_sessions, typed_windows};
+
+/// Typed dispatch wrapper for `sessions-commands:kill-session`.
+async fn typed_kill_session_attach(
+    client: &mut StreamingBmuxClient,
+    selector: bmux_ipc::SessionSelector,
+    force_local: bool,
+) -> std::result::Result<
+    std::result::Result<
+        bmux_sessions_plugin_api::sessions_commands::SessionAck,
+        bmux_sessions_plugin_api::sessions_commands::KillSessionError,
+    >,
+    ClientError,
+> {
+    let args = typed_sessions::KillSessionArgs {
+        selector: typed_sessions::from_ipc_selector(selector),
+        force_local,
+    };
+    let payload = bmux_codec::to_vec(&args).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding kill-session args: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            typed_sessions::SESSIONS_WRITE_CAPABILITY.as_str(),
+            typed_sessions::COMMAND_KIND,
+            typed_sessions::SESSIONS_COMMANDS_INTERFACE.as_str(),
+            typed_sessions::OP_KILL_SESSION,
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding kill-session response: {error}"),
+    })
+}
+
+/// Typed dispatch wrapper for `contexts-state:list-contexts`.
+async fn typed_list_contexts_attach(
+    client: &mut StreamingBmuxClient,
+) -> std::result::Result<Vec<bmux_contexts_plugin_api::contexts_state::ContextSummary>, ClientError>
+{
+    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding list-contexts args: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
+            typed_contexts::QUERY_KIND,
+            typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
+            typed_contexts::OP_LIST_CONTEXTS,
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding list-contexts response: {error}"),
+    })
+}
+
+/// Typed dispatch wrapper for `contexts-state:current-context`.
+async fn typed_current_context_attach(
+    client: &mut StreamingBmuxClient,
+) -> std::result::Result<
+    Option<bmux_contexts_plugin_api::contexts_state::ContextSummary>,
+    ClientError,
+> {
+    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding current-context args: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
+            typed_contexts::QUERY_KIND,
+            typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
+            typed_contexts::OP_CURRENT_CONTEXT,
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding current-context response: {error}"),
+    })
+}
+
+/// Typed dispatch wrapper for `clients-state:list-clients` on a plain
+/// [`BmuxClient`] (used before streaming upgrade).
+async fn typed_list_clients_bmux(
+    client: &mut BmuxClient,
+) -> std::result::Result<Vec<bmux_clients_plugin_api::clients_state::ClientSummary>, ClientError> {
+    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding list-clients args: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            typed_clients::CLIENTS_READ_CAPABILITY.as_str(),
+            typed_clients::QUERY_KIND,
+            typed_clients::CLIENTS_STATE_INTERFACE.as_str(),
+            typed_clients::OP_LIST_CLIENTS,
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding list-clients response: {error}"),
+    })
+}
+
+/// Typed dispatch wrapper for `contexts-state:list-contexts` on a
+/// plain [`BmuxClient`].
+async fn typed_list_contexts_bmux(
+    client: &mut BmuxClient,
+) -> std::result::Result<Vec<bmux_contexts_plugin_api::contexts_state::ContextSummary>, ClientError>
+{
+    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding list-contexts args: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
+            typed_contexts::QUERY_KIND,
+            typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
+            typed_contexts::OP_LIST_CONTEXTS,
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding list-contexts response: {error}"),
+    })
+}
+
+/// Typed dispatch wrapper for `contexts-state:current-context` on a
+/// plain [`BmuxClient`].
+#[allow(dead_code)] // Used once callers migrate; kept ready for Stage 8 re-homing.
+async fn typed_current_context_bmux(
+    client: &mut BmuxClient,
+) -> std::result::Result<
+    Option<bmux_contexts_plugin_api::contexts_state::ContextSummary>,
+    ClientError,
+> {
+    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding current-context args: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
+            typed_contexts::QUERY_KIND,
+            typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
+            typed_contexts::OP_CURRENT_CONTEXT,
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding current-context response: {error}"),
+    })
+}
+
+/// Typed dispatch wrapper for `clients-state:list-clients`.
+#[allow(dead_code)] // Used once callers migrate; kept ready for Stage 8 re-homing.
+async fn typed_list_clients_attach(
+    client: &mut StreamingBmuxClient,
+) -> std::result::Result<Vec<bmux_clients_plugin_api::clients_state::ClientSummary>, ClientError> {
+    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding list-clients args: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            typed_clients::CLIENTS_READ_CAPABILITY.as_str(),
+            typed_clients::QUERY_KIND,
+            typed_clients::CLIENTS_STATE_INTERFACE.as_str(),
+            typed_clients::OP_LIST_CLIENTS,
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding list-clients response: {error}"),
+    })
+}
+
+/// Convert a typed `ContextSummary` (from `bmux_contexts_plugin_api`)
+/// to the IPC `ContextSummary` used throughout the attach runtime.
+/// Field layouts are identical so this is a straightforward move.
+fn typed_to_ipc_context_summary(
+    typed: bmux_contexts_plugin_api::contexts_state::ContextSummary,
+) -> ContextSummary {
+    ContextSummary {
+        id: typed.id,
+        name: typed.name,
+        attributes: typed.attributes,
+    }
+}
+
+/// Typed dispatch wrapper for `contexts-commands:create-context`.
+async fn typed_create_context_attach(
+    client: &mut StreamingBmuxClient,
+    name: Option<String>,
+    attributes: std::collections::BTreeMap<String, String>,
+) -> std::result::Result<ContextSummary, ClientError> {
+    #[derive(serde::Serialize)]
+    struct Args {
+        name: Option<String>,
+        attributes: std::collections::BTreeMap<String, String>,
+    }
+    let payload = bmux_codec::to_vec(&Args { name, attributes }).map_err(|error| {
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding create-context args: {error}"),
+        }
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            typed_contexts::CONTEXTS_WRITE_CAPABILITY.as_str(),
+            typed_contexts::COMMAND_KIND,
+            typed_contexts::CONTEXTS_COMMANDS_INTERFACE.as_str(),
+            typed_contexts::OP_CREATE_CONTEXT,
+            payload,
+        )
+        .await?;
+    let outcome: std::result::Result<
+        bmux_contexts_plugin_api::contexts_commands::ContextAck,
+        bmux_contexts_plugin_api::contexts_commands::CreateContextError,
+    > = bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding create-context response: {error}"),
+    })?;
+    match outcome {
+        Ok(ack) => {
+            // Typed contract returns only the id; reconstruct a
+            // minimal `ContextSummary` since the host runtime doesn't
+            // surface the newly created context's full details here.
+            Ok(ContextSummary {
+                id: ack.id,
+                name: None,
+                attributes: std::collections::BTreeMap::new(),
+            })
+        }
+        Err(err) => Err(ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("create-context failed: {err:?}"),
+        }),
+    }
+}
+
+/// Typed dispatch wrapper for `contexts-commands:select-context`.
+async fn typed_select_context_attach(
+    client: &mut StreamingBmuxClient,
+    context_id: uuid::Uuid,
+) -> std::result::Result<(), ClientError> {
+    #[derive(serde::Serialize)]
+    struct Selector {
+        id: Option<uuid::Uuid>,
+        name: Option<String>,
+    }
+    #[derive(serde::Serialize)]
+    struct Args {
+        selector: Selector,
+    }
+    let args = Args {
+        selector: Selector {
+            id: Some(context_id),
+            name: None,
+        },
+    };
+    let payload = bmux_codec::to_vec(&args).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding select-context args: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            typed_contexts::CONTEXTS_WRITE_CAPABILITY.as_str(),
+            typed_contexts::COMMAND_KIND,
+            typed_contexts::CONTEXTS_COMMANDS_INTERFACE.as_str(),
+            typed_contexts::OP_SELECT_CONTEXT,
+            payload,
+        )
+        .await?;
+    let outcome: std::result::Result<
+        bmux_contexts_plugin_api::contexts_commands::ContextAck,
+        bmux_contexts_plugin_api::contexts_commands::SelectContextError,
+    > = bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding select-context response: {error}"),
+    })?;
+    outcome.map(|_| ()).map_err(|err| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("select-context failed: {err:?}"),
+    })
+}
 
 /// Invoke a `windows-commands` typed command by routing through the
 /// server's generic `Request::InvokeService` envelope.
@@ -634,8 +928,7 @@ pub async fn run_session_attach_with_client(
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
         // Inline follow target resolution using BmuxClient (before streaming upgrade).
-        let clients = client
-            .list_clients()
+        let clients = typed_list_clients_bmux(&mut client)
             .await
             .map_err(map_attach_client_error)?;
         let leader = clients
@@ -645,8 +938,7 @@ pub async fn run_session_attach_with_client(
         let context_id = if let Some(cid) = leader.selected_context_id {
             cid
         } else if let Some(sid) = leader.selected_session_id {
-            let contexts = client
-                .list_contexts()
+            let contexts = typed_list_contexts_bmux(&mut client)
                 .await
                 .map_err(map_attach_client_error)?;
             contexts
@@ -1466,14 +1758,22 @@ pub async fn handle_attach_runtime_action(
 ) -> std::result::Result<(), ClientError> {
     match action {
         RuntimeAction::NewWindow | RuntimeAction::NewSession => {
-            let default_name = client
-                .list_contexts()
+            let default_name = typed_list_contexts_attach(client)
                 .await
                 .ok()
-                .map(|contexts| next_default_tab_name_for_contexts(&contexts));
-            let context = client
-                .create_context(default_name, std::collections::BTreeMap::new())
-                .await?;
+                .map(|contexts| {
+                    let ipc: Vec<ContextSummary> = contexts
+                        .into_iter()
+                        .map(typed_to_ipc_context_summary)
+                        .collect();
+                    next_default_tab_name_for_contexts(&ipc)
+                });
+            let context = typed_create_context_attach(
+                client,
+                default_name,
+                std::collections::BTreeMap::new(),
+            )
+            .await?;
             let attach_info = open_attach_for_context(client, context.id).await?;
             view_state.attached_id = attach_info.session_id;
             view_state.attached_context_id = attach_info.context_id.or(Some(context.id));
@@ -1499,33 +1799,25 @@ pub async fn handle_attach_runtime_action(
     Ok(())
 }
 
+/// Apply a plugin-command outcome against the attach view state.
+///
+/// Historically this iterated a `PluginCommandEffect` list the plugin
+/// emitted to drive side effects (context retargeting, etc.). In M4
+/// Stage 7 the effect channel was deleted: cross-domain state changes
+/// are plugin-to-plugin typed-dispatch calls now, and the attach
+/// runtime detects that a plugin command changed the current context
+/// by observing the before/after `current-context` delta (see
+/// [`plugin_fallback_retarget_context_id`] and the caller).
+///
+/// The function is kept as a no-op-friendly shim so call sites don't
+/// need conditional compilation; it always returns `Ok(false)`.
+#[allow(clippy::unused_async)] // Keep async to preserve signature for call sites.
 pub async fn apply_plugin_command_outcome(
-    client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
-    outcome: PluginCommandOutcome,
+    _client: &mut StreamingBmuxClient,
+    _view_state: &mut AttachViewState,
+    _outcome: PluginCommandOutcome,
 ) -> std::result::Result<bool, ClientError> {
-    let mut applied = false;
-    trace!(
-        effect_count = outcome.effects.len(),
-        attached_context_id = ?view_state.attached_context_id,
-        attached_session_id = %view_state.attached_id,
-        "attach.plugin_outcome.received"
-    );
-    for effect in outcome.effects {
-        match effect {
-            PluginCommandEffect::SelectContext { context_id } => {
-                debug!(
-                    target_context_id = %context_id,
-                    attached_context_id = ?view_state.attached_context_id,
-                    attached_session_id = %view_state.attached_id,
-                    "attach.plugin_outcome.select_context"
-                );
-                retarget_attach_to_context(client, view_state, context_id).await?;
-                applied = true;
-            }
-        }
-    }
-    Ok(applied)
+    Ok(false)
 }
 
 pub async fn retarget_attach_to_context(
@@ -1540,9 +1832,7 @@ pub async fn retarget_attach_to_context(
         to_context_id = %context_id,
         "attach.retarget.start"
     );
-    let _ = client
-        .select_context(ContextSelector::ById(context_id))
-        .await?;
+    typed_select_context_attach(client, context_id).await?;
     let attach_info = open_attach_for_context(client, context_id).await?;
     view_state.attached_id = attach_info.session_id;
     view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
@@ -1728,16 +2018,18 @@ pub async fn handle_attach_plugin_command_action(
     view_state: &mut AttachViewState,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> std::result::Result<(), ClientError> {
-    let before_context_id = client
-        .current_context()
+    let before_context_id = typed_current_context_attach(client)
         .await
         .map_or(None, |context| context.map(|entry| entry.id));
-    let before_context_ids = client.list_contexts().await.ok().map(|contexts| {
-        contexts
-            .into_iter()
-            .map(|context| context.id)
-            .collect::<std::collections::BTreeSet<_>>()
-    });
+    let before_context_ids = typed_list_contexts_attach(client)
+        .await
+        .ok()
+        .map(|contexts| {
+            contexts
+                .into_iter()
+                .map(|context| context.id)
+                .collect::<std::collections::BTreeSet<_>>()
+        });
     debug!(
         plugin_id = %plugin_id,
         command_name = %command_name,
@@ -1789,13 +2081,11 @@ pub async fn handle_attach_plugin_command_action(
         }
         Ok(execution) => {
             let status = execution.status;
-            let effect_count = execution.outcome.effects.len();
             if status != 0 {
                 warn!(
                     plugin_id = %plugin_id,
                     command_name = %command_name,
                     status,
-                    effect_count,
                     before_context_id = ?before_context_id,
                     attached_context_id = ?view_state.attached_context_id,
                     attached_session_id = %view_state.attached_id,
@@ -1825,20 +2115,21 @@ pub async fn handle_attach_plugin_command_action(
                     }
                 };
 
-            let after_context_id = client
-                .current_context()
+            let after_context_id = typed_current_context_attach(client)
                 .await
                 .map_or(None, |context| context.map(|entry| entry.id));
-            let after_context_ids = client.list_contexts().await.ok().map(|contexts| {
-                contexts
-                    .into_iter()
-                    .map(|context| context.id)
-                    .collect::<std::collections::BTreeSet<_>>()
-            });
+            let after_context_ids = typed_list_contexts_attach(client)
+                .await
+                .ok()
+                .map(|contexts| {
+                    contexts
+                        .into_iter()
+                        .map(|context| context.id)
+                        .collect::<std::collections::BTreeSet<_>>()
+                });
             debug!(
                 plugin_id = %plugin_id,
                 command_name = %command_name,
-                effect_count,
                 outcome_applied,
                 before_context_id = ?before_context_id,
                 after_context_id = ?after_context_id,
@@ -2615,9 +2906,7 @@ pub async fn switch_attach_session_relative(
         && let Some(target_context_id) =
             relative_context_id(&view_state.cached_contexts, current_context_id, step)
     {
-        let _ = client
-            .select_context(ContextSelector::ById(target_context_id))
-            .await?;
+        typed_select_context_attach(client, target_context_id).await?;
         let attach_info = open_attach_for_context(client, target_context_id).await?;
         view_state.attached_id = attach_info.session_id;
         view_state.attached_context_id = attach_info.context_id.or(Some(target_context_id));
@@ -4657,7 +4946,7 @@ pub async fn recover_attach_after_session_removed(
 ) -> std::result::Result<bool, ClientError> {
     refresh_attach_status_catalog_best_effort(client, view_state).await;
 
-    if let Ok(Some(context)) = client.current_context().await
+    if let Ok(Some(context)) = typed_current_context_attach(client).await
         && retarget_attach_to_context(client, view_state, context.id)
             .await
             .is_ok()
@@ -4952,8 +5241,22 @@ pub async fn handle_attach_prompt_completion(
             AttachInternalPromptAction::QuitSession => {
                 if prompt_response_is_confirmed(&completion.response) {
                     let selector = attached_session_selector(view_state);
-                    match client.kill_session(selector).await {
-                        Ok(_) => return Ok(Some(AttachLoopControl::Break(AttachExitReason::Quit))),
+                    match typed_kill_session_attach(client, selector, false).await {
+                        Ok(Ok(_)) => {
+                            return Ok(Some(AttachLoopControl::Break(AttachExitReason::Quit)));
+                        }
+                        Ok(Err(err)) => {
+                            let error = ClientError::ServerError {
+                                code: bmux_ipc::ErrorCode::Internal,
+                                message: format!("kill-session failed: {err:?}"),
+                            };
+                            let status = attach_quit_failure_status(&error);
+                            view_state.set_transient_status(
+                                status,
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                        }
                         Err(error) => {
                             let status = attach_quit_failure_status(&error);
                             view_state.set_transient_status(

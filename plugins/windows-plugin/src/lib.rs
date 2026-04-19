@@ -1921,6 +1921,15 @@ mod tests {
                 }),
             }
         }
+
+        fn execute_kernel_request(
+            &self,
+            _request: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                operation: "mock_execute_kernel_request",
+            })
+        }
     }
 
     fn sample_sessions() -> Vec<SessionSummary> {

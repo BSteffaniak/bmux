@@ -1,18 +1,10 @@
 //! bmux contexts plugin — typed owner of context lifecycle.
 //!
 //! Provides typed services for other plugins and attach-side callers
-//! to list, create, select, and close contexts without going through
-//! the legacy `bmux_client::BmuxClient::*_context` methods.
+//! to list, create, select, and close contexts.
 //!
-//! # Current phase: typed facade over `HostRuntimeApi::context_*`
-//!
-//! In this phase the contexts-plugin does not own context state
-//! directly. Its typed service handles delegate to the core host
-//! runtime via [`bmux_plugin::TypedServiceCaller`] and return the
-//! results through the BPDL-generated types. Once callers are all
-//! migrated off `BmuxClient::*_context` and the core host-runtime's
-//! context methods are deleted (M4 Stage 8), the contexts-plugin
-//! will re-home the underlying state.
+//! The plugin reaches the server's context state directly via the IPC
+//! kernel-bridge escape hatch (`ServiceCaller::execute_kernel_request`).
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
@@ -26,22 +18,52 @@ use bmux_contexts_plugin_api::contexts_state::{
     self, ContextQueryError, ContextSelector as StateContextSelector, ContextSummary,
     ContextsStateService,
 };
-use bmux_plugin::{HostRuntimeApi, TypedServiceCaller};
+use bmux_plugin::{ServiceCaller, TypedServiceCaller};
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{
-    ContextCloseRequest as CoreContextCloseRequest,
-    ContextCreateRequest as CoreContextCreateRequest,
-    ContextSelectRequest as CoreContextSelectRequest, ContextSelector as CoreContextSelector,
-    HostScope, TypedServiceRegistrationContext, TypedServiceRegistry,
-};
+use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// Top-level plugin type. Holds no state today (the runtime data lives
-/// in the core host runtime that this plugin delegates to); the type
-/// exists so the SDK's `export_plugin!` macro has something to own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CreateContextArgs {
+    #[serde(default)]
+    name: Option<String>,
+    attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SelectorArgs {
+    selector: WireSelector,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloseContextArgs {
+    selector: WireSelector,
+    force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireSelector {
+    #[serde(default)]
+    id: Option<::uuid::Uuid>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl WireSelector {
+    fn to_ipc(&self) -> Option<bmux_ipc::ContextSelector> {
+        if let Some(id) = self.id {
+            return Some(bmux_ipc::ContextSelector::ById(id));
+        }
+        self.name
+            .as_ref()
+            .map(|name| bmux_ipc::ContextSelector::ByName(name.clone()))
+    }
+}
+
 #[derive(Default)]
 pub struct ContextsPlugin;
 
@@ -50,25 +72,39 @@ impl RustPlugin for ContextsPlugin {
         &mut self,
         _context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        // The contexts plugin doesn't expose CLI commands in this
-        // phase; context management is still driven by the core
-        // `bmux context *` subcommands until Stage 6 migrates those
-        // onto plugin-owned commands.
         Err(PluginCommandError::unknown_command(""))
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
-        // Byte-dispatch surface is not used today; typed dispatch
-        // covers the entire contract. Fall through so the host's
-        // generic "unsupported operation" response is uniform.
-        ServiceResponse::error(
-            "unsupported_service_operation",
-            format!(
-                "contexts plugin has no byte-dispatch service handler for '{}:{}'",
-                context.request.service.interface_id.as_str(),
-                context.request.operation.as_str(),
-            ),
-        )
+        bmux_plugin_sdk::route_service!(context, {
+            "contexts-state", "list-contexts" => |_req: (), ctx| {
+                list_contexts_via_ipc(ctx)
+                    .map_err(|e| ServiceResponse::error("list_failed", e))
+            },
+            "contexts-state", "get-context" => |req: SelectorArgs, ctx| {
+                get_context_via_ipc(ctx, &req.selector)
+                    .map_err(|e| ServiceResponse::error("get_failed", e))
+            },
+            "contexts-state", "current-context" => |_req: (), ctx| {
+                current_context_via_ipc(ctx)
+                    .map_err(|e| ServiceResponse::error("current_failed", e))
+            },
+            "contexts-commands", "create-context" => |req: CreateContextArgs, ctx| {
+                Ok::<Result<ContextAck, CreateContextError>, ServiceResponse>(
+                    create_context_via_ipc(ctx, req.name, req.attributes)
+                )
+            },
+            "contexts-commands", "select-context" => |req: SelectorArgs, ctx| {
+                Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(
+                    select_context_via_ipc(ctx, &req.selector)
+                )
+            },
+            "contexts-commands", "close-context" => |req: CloseContextArgs, ctx| {
+                Ok::<Result<ContextAck, CloseContextError>, ServiceResponse>(
+                    close_context_via_ipc(ctx, &req.selector, req.force)
+                )
+            },
+        })
     }
 
     fn register_typed_services(
@@ -105,7 +141,115 @@ impl RustPlugin for ContextsPlugin {
     }
 }
 
-// ── Typed state (query) handle ───────────────────────────────────────
+// ── IPC helpers ──────────────────────────────────────────────────────
+
+fn list_contexts_via_ipc(caller: &impl ServiceCaller) -> Result<Vec<ContextSummary>, String> {
+    match caller.execute_kernel_request(bmux_ipc::Request::ListContexts) {
+        Ok(bmux_ipc::ResponsePayload::ContextList { contexts }) => {
+            Ok(contexts.into_iter().map(ipc_summary_to_typed).collect())
+        }
+        Ok(_) => Err("unexpected response payload for list-contexts".to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn get_context_via_ipc(
+    caller: &impl ServiceCaller,
+    selector: &WireSelector,
+) -> Result<Result<ContextSummary, ContextQueryError>, String> {
+    let Some(ipc_selector) = selector.to_ipc() else {
+        return Ok(Err(ContextQueryError::InvalidSelector {
+            reason: "selector must specify either id or name".to_string(),
+        }));
+    };
+    match caller.execute_kernel_request(bmux_ipc::Request::ListContexts) {
+        Ok(bmux_ipc::ResponsePayload::ContextList { contexts }) => Ok(contexts
+            .into_iter()
+            .find(|summary| matches_selector(summary, &ipc_selector))
+            .map(ipc_summary_to_typed)
+            .ok_or(ContextQueryError::NotFound)),
+        Ok(_) => Err("unexpected response payload for list-contexts".to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn current_context_via_ipc(caller: &impl ServiceCaller) -> Result<Option<ContextSummary>, String> {
+    match caller.execute_kernel_request(bmux_ipc::Request::CurrentContext) {
+        Ok(bmux_ipc::ResponsePayload::CurrentContext { context }) => {
+            Ok(context.map(ipc_summary_to_typed))
+        }
+        Ok(_) => Err("unexpected response payload for current-context".to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn create_context_via_ipc(
+    caller: &impl ServiceCaller,
+    name: Option<String>,
+    attributes: BTreeMap<String, String>,
+) -> Result<ContextAck, CreateContextError> {
+    match caller.execute_kernel_request(bmux_ipc::Request::CreateContext { name, attributes }) {
+        Ok(bmux_ipc::ResponsePayload::ContextCreated { context }) => {
+            Ok(ContextAck { id: context.id })
+        }
+        Ok(_) => Err(CreateContextError::Failed {
+            reason: "unexpected response payload for create-context".to_string(),
+        }),
+        Err(err) => Err(CreateContextError::Failed {
+            reason: err.to_string(),
+        }),
+    }
+}
+
+fn select_context_via_ipc(
+    caller: &impl ServiceCaller,
+    selector: &WireSelector,
+) -> Result<ContextAck, SelectContextError> {
+    let Some(ipc_selector) = selector.to_ipc() else {
+        return Err(SelectContextError::Denied {
+            reason: "selector must specify either id or name".to_string(),
+        });
+    };
+    match caller.execute_kernel_request(bmux_ipc::Request::SelectContext {
+        selector: ipc_selector,
+    }) {
+        Ok(bmux_ipc::ResponsePayload::ContextSelected { context }) => {
+            Ok(ContextAck { id: context.id })
+        }
+        Ok(_) => Err(SelectContextError::Denied {
+            reason: "unexpected response payload for select-context".to_string(),
+        }),
+        Err(err) => Err(SelectContextError::Denied {
+            reason: err.to_string(),
+        }),
+    }
+}
+
+fn close_context_via_ipc(
+    caller: &impl ServiceCaller,
+    selector: &WireSelector,
+    force: bool,
+) -> Result<ContextAck, CloseContextError> {
+    let Some(ipc_selector) = selector.to_ipc() else {
+        return Err(CloseContextError::Failed {
+            reason: "selector must specify either id or name".to_string(),
+        });
+    };
+    match caller.execute_kernel_request(bmux_ipc::Request::CloseContext {
+        selector: ipc_selector,
+        force,
+    }) {
+        Ok(bmux_ipc::ResponsePayload::ContextClosed { id }) => Ok(ContextAck { id }),
+        Ok(_) => Err(CloseContextError::Failed {
+            reason: "unexpected response payload for close-context".to_string(),
+        }),
+        Err(err) => Err(CloseContextError::Failed {
+            reason: err.to_string(),
+        }),
+    }
+}
+
+// ── Typed state handle ───────────────────────────────────────────────
 
 pub struct ContextsStateHandle {
     caller: Arc<TypedServiceCaller>,
@@ -121,18 +265,7 @@ impl ContextsStateService for ContextsStateHandle {
     fn list_contexts<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Vec<ContextSummary>> + Send + 'a>> {
-        Box::pin(async move {
-            self.caller.context_list().map_or_else(
-                |_| Vec::new(),
-                |response| {
-                    response
-                        .contexts
-                        .into_iter()
-                        .map(core_summary_to_typed)
-                        .collect()
-                },
-            )
-        })
+        Box::pin(async move { list_contexts_via_ipc(self.caller.as_ref()).unwrap_or_default() })
     }
 
     fn get_context<'a>(
@@ -144,38 +277,21 @@ impl ContextsStateService for ContextsStateHandle {
         >,
     > {
         Box::pin(async move {
-            let Some(core_selector) = state_selector_to_core(&selector) else {
-                return Err(ContextQueryError::InvalidSelector {
-                    reason: "selector must specify either id or name".to_string(),
-                });
+            let wire = WireSelector {
+                id: selector.id,
+                name: selector.name,
             };
-            // Core has no selector-targeted `get` operation; list and
-            // filter client-side. Shim until Stage 8 re-homes state.
-            let response =
-                self.caller
-                    .context_list()
-                    .map_err(|err| ContextQueryError::InvalidSelector {
-                        reason: err.to_string(),
-                    })?;
-            response
-                .contexts
-                .into_iter()
-                .find(|summary| matches_selector(summary, &core_selector))
-                .map(core_summary_to_typed)
-                .ok_or(ContextQueryError::NotFound)
+            match get_context_via_ipc(self.caller.as_ref(), &wire) {
+                Ok(result) => result,
+                Err(reason) => Err(ContextQueryError::InvalidSelector { reason }),
+            }
         })
     }
 
     fn current_context<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Option<ContextSummary>> + Send + 'a>> {
-        Box::pin(async move {
-            self.caller
-                .context_current()
-                .ok()
-                .and_then(|response| response.context)
-                .map(core_summary_to_typed)
-        })
+        Box::pin(async move { current_context_via_ipc(self.caller.as_ref()).ok().flatten() })
     }
 }
 
@@ -199,17 +315,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
     ) -> Pin<
         Box<dyn Future<Output = std::result::Result<ContextAck, CreateContextError>> + Send + 'a>,
     > {
-        Box::pin(async move {
-            let response = self
-                .caller
-                .context_create(&CoreContextCreateRequest { name, attributes })
-                .map_err(|err| CreateContextError::Failed {
-                    reason: err.to_string(),
-                })?;
-            Ok(ContextAck {
-                id: response.context.id,
-            })
-        })
+        Box::pin(async move { create_context_via_ipc(self.caller.as_ref(), name, attributes) })
     }
 
     fn select_context<'a>(
@@ -219,22 +325,11 @@ impl ContextsCommandsService for ContextsCommandsHandle {
         Box<dyn Future<Output = std::result::Result<ContextAck, SelectContextError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let Some(core_selector) = command_selector_to_core(&selector) else {
-                return Err(SelectContextError::Denied {
-                    reason: "selector must specify either id or name".to_string(),
-                });
+            let wire = WireSelector {
+                id: selector.id,
+                name: selector.name,
             };
-            let response = self
-                .caller
-                .context_select(&CoreContextSelectRequest {
-                    selector: core_selector,
-                })
-                .map_err(|err| SelectContextError::Denied {
-                    reason: err.to_string(),
-                })?;
-            Ok(ContextAck {
-                id: response.context.id,
-            })
+            select_context_via_ipc(self.caller.as_ref(), &wire)
         })
     }
 
@@ -245,58 +340,28 @@ impl ContextsCommandsService for ContextsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = std::result::Result<ContextAck, CloseContextError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let Some(core_selector) = command_selector_to_core(&selector) else {
-                return Err(CloseContextError::Failed {
-                    reason: "selector must specify either id or name".to_string(),
-                });
+            let wire = WireSelector {
+                id: selector.id,
+                name: selector.name,
             };
-            let response = self
-                .caller
-                .context_close(&CoreContextCloseRequest {
-                    selector: core_selector,
-                    force,
-                })
-                .map_err(|err| CloseContextError::Failed {
-                    reason: err.to_string(),
-                })?;
-            Ok(ContextAck { id: response.id })
+            close_context_via_ipc(self.caller.as_ref(), &wire, force)
         })
     }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn state_selector_to_core(selector: &StateContextSelector) -> Option<CoreContextSelector> {
-    if let Some(id) = selector.id {
-        return Some(CoreContextSelector::ById(id));
-    }
-    selector
-        .name
-        .as_ref()
-        .map(|name| CoreContextSelector::ByName(name.clone()))
-}
-
-fn command_selector_to_core(selector: &CommandContextSelector) -> Option<CoreContextSelector> {
-    if let Some(id) = selector.id {
-        return Some(CoreContextSelector::ById(id));
-    }
-    selector
-        .name
-        .as_ref()
-        .map(|name| CoreContextSelector::ByName(name.clone()))
-}
-
 fn matches_selector(
-    summary: &bmux_plugin_sdk::ContextSummary,
-    selector: &CoreContextSelector,
+    summary: &bmux_ipc::ContextSummary,
+    selector: &bmux_ipc::ContextSelector,
 ) -> bool {
     match selector {
-        CoreContextSelector::ById(id) => summary.id == *id,
-        CoreContextSelector::ByName(name) => summary.name.as_deref() == Some(name.as_str()),
+        bmux_ipc::ContextSelector::ById(id) => summary.id == *id,
+        bmux_ipc::ContextSelector::ByName(name) => summary.name.as_deref() == Some(name.as_str()),
     }
 }
 
-fn core_summary_to_typed(summary: bmux_plugin_sdk::ContextSummary) -> ContextSummary {
+fn ipc_summary_to_typed(summary: bmux_ipc::ContextSummary) -> ContextSummary {
     ContextSummary {
         id: summary.id,
         name: summary.name,

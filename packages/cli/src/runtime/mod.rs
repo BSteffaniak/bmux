@@ -111,9 +111,8 @@ use playbook_cli::{
 };
 use plugin_kernel::{
     EFFECTIVE_LOG_LEVEL, KernelClientFactory, LOG_WRITER_GUARD, available_capability_providers,
-    available_service_descriptors, begin_host_kernel_effect_capture, core_provided_capabilities,
-    enter_host_kernel_client_factory, enter_host_kernel_connection,
-    finish_host_kernel_effect_capture, host_kernel_bridge, register_plugin_service_handlers,
+    available_service_descriptors, core_provided_capabilities, enter_host_kernel_client_factory,
+    enter_host_kernel_connection, host_kernel_bridge, register_plugin_service_handlers,
     service_descriptors_from_declarations,
 };
 use plugin_runtime::{

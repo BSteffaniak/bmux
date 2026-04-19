@@ -301,13 +301,17 @@ pub struct RecordingWriteEventResponse {
     pub accepted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PluginCommandEffect {
-    SelectContext { context_id: Uuid },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginCommandOutcome {
-    pub effects: Vec<PluginCommandEffect>,
+    // Intentionally empty. Previously carried a `Vec<PluginCommandEffect>`
+    // with a single `SelectContext` variant used to retarget the attach
+    // view after a context-selection command. In M4 Stage 7 that
+    // side-channel was deleted: cross-domain mutations now go through
+    // typed dispatch (the contexts plugin's `select-context` command
+    // sets the context directly) and the attach runtime retargets
+    // based on observing the `before/after current-context` delta
+    // rather than a plugin-emitted effect list. Kept as an empty
+    // struct so `PluginCommandExecution::outcome` retains a stable
+    // shape; drop this type in a future milestone once no consumer
+    // references it.
 }

@@ -78,7 +78,7 @@ interface sessions-commands {
     }
 
     command new-session(name: string?) -> result<session-ack, new-session-error>;
-    command kill-session(selector: session-selector)
+    command kill-session(selector: session-selector, force-local: bool)
         -> result<session-ack, kill-session-error>;
     command select-session(selector: session-selector)
         -> result<session-ack, select-session-error>;

@@ -511,6 +511,7 @@ enum RequestDslResult {
 }
 
 /// Convert a `Request` variant to a DSL action line, if applicable.
+#[allow(clippy::too_many_lines)] // Large match block over every domain Request variant.
 fn request_to_dsl(
     request: &Request,
     has_session: &mut bool,
@@ -524,6 +525,49 @@ fn request_to_dsl(
             RequestDslResult::Line(name.as_ref().map_or_else(
                 || "new-session".to_string(),
                 |n| format!("new-session name='{n}'"),
+            ))
+        }
+        Request::InvokeService {
+            interface_id,
+            operation,
+            payload,
+            ..
+        } => {
+            // Typed-dispatch `sessions-commands:new-session` replaces
+            // the legacy `Request::NewSession` as of M4; decode the
+            // typed payload and emit the same DSL line.
+            if interface_id == "sessions-commands" && operation == "new-session" {
+                #[derive(serde::Deserialize)]
+                struct NewSessionArgs {
+                    name: Option<String>,
+                }
+                if let Ok(args) = bmux_codec::from_bytes::<NewSessionArgs>(payload) {
+                    *has_session = true;
+                    return RequestDslResult::Line(args.name.map_or_else(
+                        || "new-session".to_string(),
+                        |n| format!("new-session name='{n}'"),
+                    ));
+                }
+            }
+            // Typed-dispatch `sessions-commands:kill-session`.
+            if interface_id == "sessions-commands" && operation == "kill-session" {
+                #[derive(serde::Deserialize)]
+                struct KillSessionArgs {
+                    selector: SelectorSlim,
+                }
+                #[derive(serde::Deserialize)]
+                struct SelectorSlim {
+                    #[serde(default)]
+                    name: Option<String>,
+                }
+                if let Ok(args) = bmux_codec::from_bytes::<KillSessionArgs>(payload)
+                    && let Some(name) = args.selector.name
+                {
+                    return RequestDslResult::Line(format!("kill-session name='{name}'"));
+                }
+            }
+            RequestDslResult::Line(format!(
+                "# unhandled invoke-service {interface_id}:{operation}"
             ))
         }
         Request::SplitPane { direction, .. } => {
