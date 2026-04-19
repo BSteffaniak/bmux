@@ -35,6 +35,7 @@ bmux_session               = { workspace = true }
 bmux_slots                 = { workspace = true }
 bmux_terminal              = { workspace = true }
 bmux_terminal_protocol     = { workspace = true }
+bmux_windows_plugin_api    = { workspace = true }
 
 # Bundled plugins (optional, statically linked as rlib when enabled)
 bmux_clipboard_plugin = { workspace = true, optional = true, features = [

@@ -2269,4 +2269,64 @@ mod tests {
         assert_eq!(kill_count, 1);
         assert!(first_kill_matches);
     }
+
+    /// Verify that `register_typed_services` installs both typed
+    /// handles (`windows-state` Query, `windows-commands` Command) in
+    /// the registry and that they downcast to the generated BPDL
+    /// service trait objects.
+    #[test]
+    fn register_typed_services_installs_both_typed_handles() {
+        let plugin = WindowsPlugin::default();
+        let mut registry = TypedServiceRegistry::new();
+        let empty_caps: Vec<String> = Vec::new();
+        let services: Vec<bmux_plugin_sdk::RegisteredService> = Vec::new();
+        let settings = std::collections::BTreeMap::new();
+        let host_metadata = bmux_plugin_sdk::HostMetadata {
+            product_name: "test".to_string(),
+            product_version: "0".to_string(),
+            plugin_api_version: bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION,
+            plugin_abi_version: bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION,
+        };
+        let host_connection = bmux_plugin_sdk::HostConnectionInfo {
+            config_dir: "/tmp".to_string(),
+            runtime_dir: "/tmp".to_string(),
+            data_dir: "/tmp".to_string(),
+            state_dir: "/tmp".to_string(),
+        };
+        let context = TypedServiceRegistrationContext {
+            plugin_id: "bmux.windows",
+            host_kernel_bridge: None,
+            required_capabilities: &empty_caps,
+            provided_capabilities: &empty_caps,
+            services: &services,
+            available_capabilities: &empty_caps,
+            enabled_plugins: &empty_caps,
+            plugin_search_roots: &empty_caps,
+            host: &host_metadata,
+            connection: &host_connection,
+            plugin_settings_map: &settings,
+        };
+        plugin.register_typed_services(context, &mut registry);
+
+        let read_cap = HostScope::new("bmux.windows.read").expect("read capability");
+        let write_cap = HostScope::new("bmux.windows.write").expect("write capability");
+
+        let state_handle = registry
+            .get(&read_cap, ServiceKind::Query, windows_state::INTERFACE_ID)
+            .expect("state handle registered");
+        let _state = state_handle
+            .provider_as_trait::<dyn WindowsStateService + Send + Sync>()
+            .expect("state handle downcasts to typed trait");
+
+        let commands_handle = registry
+            .get(
+                &write_cap,
+                ServiceKind::Command,
+                windows_commands::INTERFACE_ID,
+            )
+            .expect("commands handle registered");
+        let _commands = commands_handle
+            .provider_as_trait::<dyn WindowsCommandsService + Send + Sync>()
+            .expect("commands handle downcasts to typed trait");
+    }
 }

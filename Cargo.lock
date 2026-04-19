@@ -1036,6 +1036,7 @@ dependencies = [
  "bmux_terminal",
  "bmux_terminal_protocol",
  "bmux_windows_plugin",
+ "bmux_windows_plugin_api",
  "clap",
  "crossterm",
  "dirs",

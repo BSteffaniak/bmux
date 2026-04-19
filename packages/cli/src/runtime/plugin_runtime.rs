@@ -946,6 +946,58 @@ pub(super) fn typed_service_registry_snapshot() -> std::sync::Arc<
     TYPED_SERVICE_REGISTRY.with(|cell| std::sync::Arc::clone(&cell.borrow()))
 }
 
+/// Resolve the typed `windows-commands` service handle from the current
+/// registry, if the windows plugin is loaded and registered typed
+/// services.
+///
+/// Returns `None` when the windows plugin is absent, when it registered
+/// only byte-encoded services, or when the capability identifier is
+/// malformed. The typed path is a strict opt-in — callers that must
+/// work regardless of plugin state should fall back to the existing
+/// byte-encoded `bmux_client` methods.
+#[must_use]
+#[allow(dead_code)] // Consumed by attach-flow routing changes landing in a follow-up.
+pub(super) fn resolve_windows_commands_service() -> Option<
+    std::sync::Arc<
+        dyn bmux_windows_plugin_api::windows_commands::WindowsCommandsService + Send + Sync,
+    >,
+> {
+    let write_cap = bmux_plugin_sdk::HostScope::new("bmux.windows.write").ok()?;
+    let registry = typed_service_registry_snapshot();
+    let handle = registry.get(&(
+        write_cap,
+        bmux_plugin_sdk::ServiceKind::Command,
+        bmux_windows_plugin_api::windows_commands::INTERFACE_ID.to_string(),
+    ))?;
+    handle
+        .provider_as_trait::<
+            dyn bmux_windows_plugin_api::windows_commands::WindowsCommandsService + Send + Sync,
+        >()
+        .ok()
+}
+
+/// Resolve the typed `windows-state` service handle from the current
+/// registry. Mirrors [`resolve_windows_commands_service`] for the
+/// read-only query interface.
+#[must_use]
+#[allow(dead_code)] // Consumed by attach-flow routing changes landing in a follow-up.
+pub(super) fn resolve_windows_state_service() -> Option<
+    std::sync::Arc<dyn bmux_windows_plugin_api::windows_state::WindowsStateService + Send + Sync>,
+> {
+    let read_cap = bmux_plugin_sdk::HostScope::new("bmux.windows.read").ok()?;
+    let registry = typed_service_registry_snapshot();
+    let handle = registry.get(&(
+        read_cap,
+        bmux_plugin_sdk::ServiceKind::Query,
+        bmux_windows_plugin_api::windows_state::INTERFACE_ID.to_string(),
+    ))?;
+    handle
+        .provider_as_trait::<
+            dyn bmux_windows_plugin_api::windows_state::WindowsStateService + Send + Sync,
+        >()
+        .ok()
+}
+
 /// Snapshot the current [`bmux_plugin_sdk::ReadyTracker`]. Cheap clone
 /// (internal `Arc`); consumers observe signal state via
 /// [`bmux_plugin_sdk::ReadyTracker::is_ready`] /
