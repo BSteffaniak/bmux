@@ -256,8 +256,7 @@ summary = "hello"
 execution = "provider_exec"
 
 [[event_subscriptions]]
-kinds = ["system"]
-names = ["server_started"]
+kinds = ["bmux.core/server-started"]
 "#,
         )
         .expect("manifest should parse");

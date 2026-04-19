@@ -204,8 +204,8 @@ impl RustPlugin for WindowsPlugin {
         };
 
         let (Ok(read_cap), Ok(write_cap)) = (
-            HostScope::new("bmux.windows.read"),
-            HostScope::new("bmux.windows.write"),
+            HostScope::new(bmux_windows_plugin_api::capabilities::WINDOWS_READ.as_str()),
+            HostScope::new(bmux_windows_plugin_api::capabilities::WINDOWS_WRITE.as_str()),
         ) else {
             return;
         };
@@ -1447,20 +1447,16 @@ bmux_plugin_sdk::export_plugin!(WindowsPlugin, include_str!("../plugin.toml"));
 
 // Compile-time guards: ensure the string literals used in `route_service!`
 // and `plugin.toml` stay in sync with the BPDL-declared interface ids.
-const _: () = {
-    const fn assert_str_eq(a: &str, b: &str) {
-        assert!(a.len() == b.len());
-        let a_bytes = a.as_bytes();
-        let b_bytes = b.as_bytes();
-        let mut i = 0;
-        while i < a_bytes.len() {
-            assert!(a_bytes[i] == b_bytes[i]);
-            i += 1;
-        }
-    }
-    assert_str_eq(windows_state::INTERFACE_ID, "windows-state");
-    assert_str_eq(windows_commands::INTERFACE_ID, "windows-commands");
-};
+// Runtime assertion (executed once at the top of the test suite) that
+// the BPDL-generated interface ids exactly match the canonical strings
+// the plugin manifest and typed-service dispatch expect. A regression
+// in either side will surface immediately.
+#[cfg(test)]
+#[test]
+fn interface_ids_match_bpdl_constants() {
+    assert_eq!(windows_state::INTERFACE_ID.as_str(), "windows-state");
+    assert_eq!(windows_commands::INTERFACE_ID.as_str(), "windows-commands");
+}
 
 #[cfg(test)]
 mod tests {
@@ -2621,7 +2617,11 @@ mod tests {
         let write_cap = HostScope::new("bmux.windows.write").expect("write capability");
 
         let state_handle = registry
-            .get(&read_cap, ServiceKind::Query, windows_state::INTERFACE_ID)
+            .get(
+                &read_cap,
+                ServiceKind::Query,
+                windows_state::INTERFACE_ID.as_str(),
+            )
             .expect("state handle registered");
         let _state = state_handle
             .provider_as_trait::<dyn WindowsStateService + Send + Sync>()
@@ -2631,7 +2631,7 @@ mod tests {
             .get(
                 &write_cap,
                 ServiceKind::Command,
-                windows_commands::INTERFACE_ID,
+                windows_commands::INTERFACE_ID.as_str(),
             )
             .expect("commands handle registered");
         let _commands = commands_handle

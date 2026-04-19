@@ -541,9 +541,9 @@ where
         .map_err(|error| anyhow::anyhow!("encoding {operation}: {error}"))?;
     let response_bytes = client
         .invoke_service_raw(
-            crate::runtime::typed_windows::WINDOWS_WRITE_CAPABILITY,
+            crate::runtime::typed_windows::WINDOWS_WRITE_CAPABILITY.as_str(),
             bmux_ipc::InvokeServiceKind::Command,
-            crate::runtime::typed_windows::WINDOWS_COMMANDS_INTERFACE,
+            crate::runtime::typed_windows::WINDOWS_COMMANDS_INTERFACE.as_str(),
             operation,
             payload,
         )

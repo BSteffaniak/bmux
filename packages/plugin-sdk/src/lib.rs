@@ -43,6 +43,7 @@ mod error;
 mod event;
 mod host;
 mod host_services;
+mod ident;
 mod native_exports;
 mod process_runtime;
 pub mod prompt;
@@ -68,7 +69,7 @@ pub use context::{
     encode_host_kernel_bridge_plugin_command_payload,
 };
 pub use error::{PluginError, Result};
-pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};
+pub use event::{PluginEvent, PluginEventPayload, PluginEventSubscription};
 pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost, ResolvedService};
 pub use host_services::{
     ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
@@ -83,6 +84,7 @@ pub use host_services::{
     SessionListResponse, SessionSelectRequest, SessionSelectResponse, SessionSelector,
     SessionSummary, StorageGetRequest, StorageGetResponse, StorageSetRequest,
 };
+pub use ident::{CapabilityId, InterfaceId, OperationId, PluginEventKind};
 pub use native_exports::{
     EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, PluginCommandError, RustPlugin,
     TypedServiceRegistrationContext,

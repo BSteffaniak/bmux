@@ -179,8 +179,7 @@ summary    = "Storage key"
 value_name = "KEY"
 
 [[event_subscriptions]]
-kinds = ["system", "window"]
-names = ["server_started", "window_created"]
+kinds = ["bmux.core/server-started", "bmux.windows/pane-event"]
 
 [[dependencies]]
 plugin_id   = "bmux.permissions"

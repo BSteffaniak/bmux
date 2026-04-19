@@ -23,3 +23,22 @@
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/windows-plugin.bpdl",
 }
+
+/// Capability identifiers gating access to this plugin's surfaces.
+///
+/// Written by hand (not BPDL-generated) until the schema language grows
+/// a `[[capabilities]]` declaration; consumers should reference these
+/// constants rather than hand-typing capability strings so a rename
+/// would flow through the type system.
+pub mod capabilities {
+    use bmux_plugin_sdk::CapabilityId;
+
+    /// Capability gating read access to windows-plugin query surfaces
+    /// (listing panes, focused-pane lookup, window enumeration, etc.).
+    pub const WINDOWS_READ: CapabilityId = CapabilityId::from_static("bmux.windows.read");
+
+    /// Capability gating write access to windows-plugin command
+    /// surfaces (split, launch, focus, resize, close, zoom, restart,
+    /// window lifecycle).
+    pub const WINDOWS_WRITE: CapabilityId = CapabilityId::from_static("bmux.windows.write");
+}

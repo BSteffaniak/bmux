@@ -1331,9 +1331,9 @@ async fn handle_session_mouse_event(
         })?;
         let _response_bytes = client
             .invoke_service_raw(
-                "bmux.windows.write",
+                bmux_windows_plugin_api::capabilities::WINDOWS_WRITE.as_str(),
                 bmux_ipc::InvokeServiceKind::Command,
-                "windows-commands",
+                bmux_windows_plugin_api::windows_commands::INTERFACE_ID.as_str(),
                 "focus-pane-by-selector",
                 encoded,
             )

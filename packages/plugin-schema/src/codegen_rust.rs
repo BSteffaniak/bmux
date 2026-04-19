@@ -59,12 +59,12 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
     out.push_str("// AUTO-GENERATED FROM BPDL. DO NOT EDIT BY HAND.\n\n");
     out.push_str("use serde::{Deserialize, Serialize};\n\n");
     for iface in &schema.interfaces {
-        emit_interface(iface, imports, &mut out);
+        emit_interface(&schema.plugin.plugin_id, iface, imports, &mut out);
     }
     out
 }
 
-fn emit_interface(iface: &Interface, imports: &ImportMap, out: &mut String) {
+fn emit_interface(plugin_id: &str, iface: &Interface, imports: &ImportMap, out: &mut String) {
     let module_name = snake_case(&iface.name);
     let _ = writeln!(out, "pub mod {module_name} {{");
     out.push_str("    use super::*;\n\n");
@@ -78,10 +78,15 @@ fn emit_interface(iface: &Interface, imports: &ImportMap, out: &mut String) {
         }
     }
 
-    // Service trait contains queries + commands. Events are exposed via
-    // a typed subscription the SDK generates separately from the trait
-    // surface, so they're only informational in the codegen.
+    // Service trait contains queries + commands. Events are exposed
+    // separately as a typed `EVENT_KIND` constant + payload type
+    // alias below.
     emit_service_trait(iface, imports, out);
+
+    // If this interface declares `events <type>`, emit a canonical
+    // `PluginEventKind` constant plus a `EventPayload` type alias so
+    // both producers and subscribers import from the same place.
+    emit_event_bindings(plugin_id, iface, imports, out);
 
     out.push_str("}\n\n");
 }
@@ -157,7 +162,7 @@ fn emit_service_trait(iface: &Interface, imports: &ImportMap, out: &mut String) 
     // the plugin host registry. Matches the BPDL `interface <name>` name.
     let _ = writeln!(
         out,
-        "    /// Canonical identifier for this interface. Matches the `interface`\n    /// name in the BPDL source exactly; used to look up a provider via\n    /// the plugin host registry.\n    pub const INTERFACE_ID: &str = \"{}\";\n",
+        "    /// Canonical identifier for this interface. Matches the `interface`\n    /// name in the BPDL source exactly; used to look up a provider via\n    /// the plugin host registry.\n    pub const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = ::bmux_plugin_sdk::InterfaceId::from_static(\"{}\");\n",
         iface.name
     );
     out.push_str("    /// Service trait for this interface.\n");
@@ -174,6 +179,36 @@ fn emit_service_trait(iface: &Interface, imports: &ImportMap, out: &mut String) 
     out.push_str("    }\n\n");
 
     emit_service_client(iface, imports, out, &trait_name);
+}
+
+/// Emit event-stream bindings for an interface that declares
+/// `events <type>`. Generates:
+///
+/// - `pub const EVENT_KIND: PluginEventKind` — the namespaced kind
+///   (`<plugin.id>/<interface-name>`) used when publishing and
+///   subscribing.
+/// - `pub type EventPayload = <type>` — a convenient alias for the
+///   event payload type so both producer and subscriber can refer to
+///   it without re-stating the BPDL type name.
+///
+/// Interfaces without an `events` declaration emit nothing here.
+fn emit_event_bindings(plugin_id: &str, iface: &Interface, imports: &ImportMap, out: &mut String) {
+    let Some(event_ty) = iface.items.iter().find_map(|item| match item {
+        InterfaceItem::Events(ty) => Some(ty),
+        _ => None,
+    }) else {
+        return;
+    };
+    let kind_literal = format!("{plugin_id}/{}", iface.name);
+    let _ = writeln!(
+        out,
+        "    /// Canonical [`bmux_plugin_sdk::PluginEventKind`] for this\n    /// interface's event stream. Publishers and subscribers both\n    /// reference this constant; the underlying wire value is\n    /// `\"{kind_literal}\"`.\n    pub const EVENT_KIND: ::bmux_plugin_sdk::PluginEventKind = ::bmux_plugin_sdk::PluginEventKind::from_static(\"{kind_literal}\");\n"
+    );
+    let ty = rust_type(event_ty, imports);
+    let _ = writeln!(
+        out,
+        "    /// Payload type published on this interface's event stream.\n    pub type EventPayload = {ty};\n"
+    );
 }
 
 fn emit_service_client(iface: &Interface, imports: &ImportMap, out: &mut String, trait_name: &str) {
@@ -466,8 +501,49 @@ mod tests {
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
         assert!(
-            rust.contains("pub const INTERFACE_ID: &str = \"windows-state\";"),
-            "codegen must emit the canonical interface id"
+            rust.contains(
+                "pub const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = ::bmux_plugin_sdk::InterfaceId::from_static(\"windows-state\");"
+            ),
+            "codegen must emit the canonical interface id as a typed const; got: {rust}"
+        );
+    }
+
+    #[test]
+    fn emits_event_bindings_for_events_declaration() {
+        let src = "plugin bmux.windows version 1;\n\
+                   interface windows-events {\n\
+                     variant pane-event { focused { pane_id: uuid }, closed { pane_id: uuid } }\n\
+                     events pane-event;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            rust.contains(
+                "pub const EVENT_KIND: ::bmux_plugin_sdk::PluginEventKind = ::bmux_plugin_sdk::PluginEventKind::from_static(\"bmux.windows/windows-events\");"
+            ),
+            "codegen must emit typed EVENT_KIND for interface with events; got: {rust}"
+        );
+        assert!(
+            rust.contains("pub type EventPayload = PaneEvent;"),
+            "codegen must emit EventPayload alias; got: {rust}"
+        );
+    }
+
+    #[test]
+    fn emits_no_event_bindings_without_events_declaration() {
+        let src = "plugin p version 1;\n\
+                   interface windows-state {\n\
+                     query ping() -> bool;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            !rust.contains("EVENT_KIND"),
+            "interfaces without events must not emit EVENT_KIND; got: {rust}"
+        );
+        assert!(
+            !rust.contains("EventPayload"),
+            "interfaces without events must not emit EventPayload; got: {rust}"
         );
     }
 

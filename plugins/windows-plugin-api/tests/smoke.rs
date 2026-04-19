@@ -43,3 +43,27 @@ fn interface_ids_match_bpdl_source() {
     assert_eq!(windows_state::INTERFACE_ID, "windows-state");
     assert_eq!(windows_events::INTERFACE_ID, "windows-events");
 }
+
+#[test]
+fn event_kind_constant_is_namespaced_by_plugin_id() {
+    // `plugin bmux.windows` in the BPDL source means every interface's
+    // event stream is namespaced under `bmux.windows/<interface-name>`.
+    assert_eq!(windows_events::EVENT_KIND, "bmux.windows/windows-events");
+}
+
+#[test]
+fn event_payload_alias_matches_declared_type() {
+    // The generated `EventPayload` alias must resolve to the same
+    // `PaneEvent` variant the BPDL declared. Constructing one via the
+    // alias round-trips through JSON identically to the direct type.
+    let via_alias: windows_events::EventPayload = windows_events::EventPayload::Focused {
+        pane_id: uuid::Uuid::nil(),
+    };
+    let via_type: PaneEvent = PaneEvent::Focused {
+        pane_id: uuid::Uuid::nil(),
+    };
+    assert_eq!(
+        serde_json::to_string(&via_alias).unwrap(),
+        serde_json::to_string(&via_type).unwrap()
+    );
+}

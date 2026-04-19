@@ -82,12 +82,6 @@ const DECORATION_READY_TIMEOUT: Duration = Duration::from_millis(2000);
 
 use super::super::typed_windows;
 
-/// Capability guarding the windows plugin's `windows-commands` service.
-const WINDOWS_WRITE_CAPABILITY: &str = typed_windows::WINDOWS_WRITE_CAPABILITY;
-
-/// Interface id for the windows plugin's mutating command surface.
-const WINDOWS_COMMANDS_INTERFACE: &str = typed_windows::WINDOWS_COMMANDS_INTERFACE;
-
 /// Invoke a `windows-commands` typed command by routing through the
 /// server's generic `Request::InvokeService` envelope.
 async fn invoke_windows_command<Req, Resp>(
@@ -105,9 +99,9 @@ where
     })?;
     let response_bytes = client
         .invoke_service_raw(
-            WINDOWS_WRITE_CAPABILITY,
+            typed_windows::WINDOWS_WRITE_CAPABILITY.as_str(),
             InvokeServiceKind::Command,
-            WINDOWS_COMMANDS_INTERFACE,
+            typed_windows::WINDOWS_COMMANDS_INTERFACE.as_str(),
             operation,
             payload,
         )

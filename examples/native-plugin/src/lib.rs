@@ -60,7 +60,7 @@ impl RustPlugin for ExamplePlugin {
     }
 
     fn handle_event(&mut self, event: PluginEvent) -> Result<i32, PluginCommandError> {
-        println!("example.native: observed event {}", event.name);
+        println!("example.native: observed event {}", event.kind);
         Ok(EXIT_OK)
     }
 }

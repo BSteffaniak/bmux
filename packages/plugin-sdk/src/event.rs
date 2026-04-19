@@ -2,66 +2,56 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-use crate::{PluginError, Result};
+use crate::{PluginError, PluginEventKind, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginEventKind {
-    System,
-    Session,
-    Window,
-    Pane,
-    Client,
-    Command,
-    Terminal,
-    Custom,
-    /// A typed plugin-to-plugin event emitted through a BPDL-declared
-    /// `events <type>` stream. The [`PluginEvent::name`] carries the
-    /// canonical interface id that declared the stream; the
-    /// [`PluginEvent::payload`] is the JSON-serialized typed event.
-    Typed,
-}
-
+/// A published plugin event.
+///
+/// Events in bmux are fully owned by plugins: the publisher declares an
+/// `events <type>` stream in its BPDL schema and the generated plugin-api
+/// crate exposes a `pub const EVENT_KIND: PluginEventKind` that both the
+/// publisher and any subscriber reference. Core relays the envelope
+/// without interpreting the kind; on the wire it is a plain string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginEvent {
+    /// Canonical identifier for the event stream this event belongs to
+    /// (for example `"bmux.windows/pane-event"`).
     pub kind: PluginEventKind,
-    pub name: String,
+    /// Serialized event payload. Decoders interpret this according to
+    /// the type the owning plugin declared for the stream.
     #[serde(default)]
     pub payload: PluginEventPayload,
 }
 
 impl PluginEvent {
-    /// Construct a typed plugin event. `interface_id` should match the
-    /// BPDL interface that declared the event stream (for example,
-    /// `"windows-events"`). The typed payload is serialized via serde.
+    /// Construct a typed plugin event. `kind` should be the
+    /// BPDL-generated [`PluginEventKind`] constant for this event
+    /// stream; the typed payload is serialized via serde.
     ///
     /// # Errors
     ///
     /// Returns [`PluginError::ServiceProtocol`] if the typed payload
     /// fails to serialize.
-    pub fn typed<T: Serialize>(interface_id: impl Into<String>, value: &T) -> Result<Self> {
+    pub fn typed<T: Serialize>(kind: PluginEventKind, value: &T) -> Result<Self> {
         let payload = serde_json::to_value(value).map_err(|err| PluginError::ServiceProtocol {
             details: format!("typed event serialize: {err}"),
         })?;
-        Ok(Self {
-            kind: PluginEventKind::Typed,
-            name: interface_id.into(),
-            payload,
-        })
+        Ok(Self { kind, payload })
     }
 
     /// Decode a typed event's payload into a concrete type.
     ///
-    /// Returns `None` if the event is not a typed event or if its
-    /// [`PluginEvent::name`] doesn't match the expected interface id.
+    /// Returns `None` if the event's [`PluginEvent::kind`] does not
+    /// match `expected_kind`.
     ///
     /// # Errors
     ///
     /// Returns [`PluginError::ServiceProtocol`] if the payload exists
-    /// and matches the expected interface but fails to deserialize
-    /// into `T`.
-    pub fn decode_typed<T: DeserializeOwned>(&self, interface_id: &str) -> Result<Option<T>> {
-        if self.kind != PluginEventKind::Typed || self.name != interface_id {
+    /// and matches the expected kind but fails to deserialize into `T`.
+    pub fn decode_typed<T: DeserializeOwned>(
+        &self,
+        expected_kind: &PluginEventKind,
+    ) -> Result<Option<T>> {
+        if self.kind != *expected_kind {
             return Ok(None);
         }
         let value: T = serde_json::from_value(self.payload.clone()).map_err(|err| {
@@ -75,32 +65,46 @@ impl PluginEvent {
 
 pub type PluginEventPayload = Value;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A subscription filter that matches published events by kind.
+///
+/// An empty [`PluginEventSubscription`] matches every event. When
+/// `kinds` is non-empty, only events whose [`PluginEvent::kind`] is in
+/// the set match.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PluginEventSubscription {
     #[serde(default)]
     pub kinds: BTreeSet<PluginEventKind>,
-    #[serde(default)]
-    pub names: BTreeSet<String>,
 }
 
 impl PluginEventSubscription {
+    /// A subscription that matches every event.
     #[must_use]
-    pub fn matches(&self, event: &PluginEvent) -> bool {
-        let kind_matches = self.kinds.is_empty() || self.kinds.contains(&event.kind);
-        let name_matches = self.names.is_empty() || self.names.contains(&event.name);
-        kind_matches && name_matches
+    pub fn all() -> Self {
+        Self::default()
     }
 
-    /// Build a subscription targeting one typed event stream by its
-    /// interface id. Matches only [`PluginEventKind::Typed`] events
-    /// with a matching [`PluginEvent::name`].
+    /// A subscription that matches only events with the given kind.
     #[must_use]
-    pub fn typed(interface_id: impl Into<String>) -> Self {
+    pub fn for_kind(kind: PluginEventKind) -> Self {
         let mut kinds = BTreeSet::new();
-        kinds.insert(PluginEventKind::Typed);
-        let mut names = BTreeSet::new();
-        names.insert(interface_id.into());
-        Self { kinds, names }
+        kinds.insert(kind);
+        Self { kinds }
+    }
+
+    /// A subscription that matches any of the provided kinds.
+    #[must_use]
+    pub fn for_kinds<I>(kinds: I) -> Self
+    where
+        I: IntoIterator<Item = PluginEventKind>,
+    {
+        Self {
+            kinds: kinds.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn matches(&self, event: &PluginEvent) -> bool {
+        self.kinds.is_empty() || self.kinds.contains(&event.kind)
     }
 }
 
@@ -108,69 +112,72 @@ impl PluginEventSubscription {
 mod tests {
     use super::*;
 
+    const TEST_KIND: PluginEventKind = PluginEventKind::from_static("test.fixture/sample-event");
+    const OTHER_KIND: PluginEventKind = PluginEventKind::from_static("test.fixture/other-event");
+
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct SampleEvent {
-        pane_id: u64,
-        kind: String,
+        item_id: u64,
+        action: String,
     }
 
     #[test]
     fn typed_event_round_trips_through_payload() {
         let event = SampleEvent {
-            pane_id: 7,
-            kind: "focused".into(),
+            item_id: 7,
+            action: "focused".into(),
         };
-        let envelope = PluginEvent::typed("windows-events", &event).expect("encode");
-        assert_eq!(envelope.kind, PluginEventKind::Typed);
-        assert_eq!(envelope.name, "windows-events");
+        let envelope = PluginEvent::typed(TEST_KIND, &event).expect("encode");
+        assert_eq!(envelope.kind, TEST_KIND);
 
         let decoded: SampleEvent = envelope
-            .decode_typed("windows-events")
+            .decode_typed(&TEST_KIND)
             .expect("decode")
             .expect("match");
         assert_eq!(decoded, event);
     }
 
     #[test]
-    fn decode_typed_rejects_wrong_interface() {
+    fn decode_typed_rejects_wrong_kind() {
         let event = SampleEvent {
-            pane_id: 1,
-            kind: "focused".into(),
+            item_id: 1,
+            action: "focused".into(),
         };
-        let envelope = PluginEvent::typed("windows-events", &event).expect("encode");
+        let envelope = PluginEvent::typed(TEST_KIND, &event).expect("encode");
 
         let result: Option<SampleEvent> = envelope
-            .decode_typed("decoration-events")
+            .decode_typed(&OTHER_KIND)
             .expect("decode returns ok");
         assert!(
             result.is_none(),
-            "event with different interface id should not decode"
+            "event with different kind should not decode"
         );
     }
 
     #[test]
-    fn typed_subscription_only_matches_matching_typed_events() {
-        let sub = PluginEventSubscription::typed("windows-events");
+    fn subscription_for_kind_matches_only_that_kind() {
+        let sub = PluginEventSubscription::for_kind(TEST_KIND);
 
         let matching = PluginEvent {
-            kind: PluginEventKind::Typed,
-            name: "windows-events".into(),
+            kind: TEST_KIND,
             payload: serde_json::json!({}),
         };
         assert!(sub.matches(&matching));
 
-        let untyped = PluginEvent {
-            kind: PluginEventKind::Window,
-            name: "windows-events".into(),
+        let other = PluginEvent {
+            kind: OTHER_KIND,
             payload: serde_json::json!({}),
         };
-        assert!(!sub.matches(&untyped));
+        assert!(!sub.matches(&other));
+    }
 
-        let wrong_iface = PluginEvent {
-            kind: PluginEventKind::Typed,
-            name: "decoration-events".into(),
+    #[test]
+    fn empty_subscription_matches_everything() {
+        let sub = PluginEventSubscription::all();
+        let event = PluginEvent {
+            kind: TEST_KIND,
             payload: serde_json::json!({}),
         };
-        assert!(!sub.matches(&wrong_iface));
+        assert!(sub.matches(&event));
     }
 }

@@ -4482,8 +4482,7 @@ version = "0.1.0"
 entry = "unused.dylib"
 
 [[event_subscriptions]]
-kinds = ["system"]
-names = ["server_started"]
+kinds = ["bmux.core/server-started"]
 
 [plugin_api]
 minimum = "1.0"
@@ -4530,10 +4529,9 @@ minimum = "1.0"
                 provided_features: BTreeSet::new(),
                 services: Vec::new(),
                 commands: Vec::new(),
-                event_subscriptions: vec![PluginEventSubscription {
-                    kinds: BTreeSet::from([PluginEventKind::System]),
-                    names: BTreeSet::from(["server_started".to_string()]),
-                }],
+                event_subscriptions: vec![PluginEventSubscription::for_kind(
+                    PluginEventKind::from_static("bmux.core/server-started"),
+                )],
                 dependencies: Vec::new(),
                 lifecycle: crate::PluginLifecycle::default(),
                 ready_signals: Vec::new(),
@@ -4542,13 +4540,11 @@ minimum = "1.0"
         };
 
         assert!(loaded.receives_event(&PluginEvent {
-            kind: PluginEventKind::System,
-            name: "server_started".to_string(),
+            kind: PluginEventKind::from_static("bmux.core/server-started"),
             payload: serde_json::Value::Null,
         }));
         assert!(!loaded.receives_event(&PluginEvent {
-            kind: PluginEventKind::System,
-            name: "server_stopping".to_string(),
+            kind: PluginEventKind::from_static("bmux.core/server-stopping"),
             payload: serde_json::Value::Null,
         }));
     }

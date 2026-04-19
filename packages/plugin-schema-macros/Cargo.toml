@@ -20,17 +20,20 @@ quote              = { workspace = true }
 syn                = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
-serde    = { workspace = true, features = ["derive", "std"] }
-trybuild = { workspace = true }
-uuid     = { workspace = true, features = ["v4", "serde"] }
+bmux_plugin_sdk = { workspace = true }
+serde           = { workspace = true, features = ["derive", "std"] }
+trybuild        = { workspace = true }
+uuid            = { workspace = true, features = ["v4", "serde"] }
 
-# serde and uuid are consumed only by the trybuild-generated ephemeral
-# fixture crate that compiles `tests/ui/**/*.rs`. cargo-machete can't
-# see into that synthesized crate, so it flags both as unused in this
-# package. They are genuinely needed for the pass fixtures to compile
-# the serde-deriving BPDL-generated code.
+# serde, uuid, and bmux_plugin_sdk are consumed only by the
+# trybuild-generated ephemeral fixture crate that compiles
+# `tests/ui/**/*.rs`. cargo-machete can't see into that synthesized
+# crate, so it flags all three as unused in this package. They are
+# genuinely needed for the pass fixtures to compile the
+# serde-deriving BPDL-generated code, which references
+# `::bmux_plugin_sdk::InterfaceId` in emitted constants.
 [package.metadata.cargo-machete]
-ignored = ["serde", "uuid"]
+ignored = ["serde", "uuid", "bmux_plugin_sdk"]
 
 [features]
 default          = []

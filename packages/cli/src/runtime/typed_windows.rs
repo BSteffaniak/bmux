@@ -15,15 +15,28 @@
 
 use bmux_codec::{from_bytes, to_vec};
 use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector};
-use bmux_windows_plugin_api::windows_commands::{self, PaneAck, PaneDirection, Selector};
+use bmux_plugin_sdk::{CapabilityId, InterfaceId};
+use bmux_windows_plugin_api::{
+    capabilities::WINDOWS_WRITE,
+    windows_commands::{self, PaneAck, PaneDirection, Selector},
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Capability guarding the windows plugin's mutating command surface.
-pub const WINDOWS_WRITE_CAPABILITY: &str = "bmux.windows.write";
+///
+/// Re-exported from [`bmux_windows_plugin_api::capabilities::WINDOWS_WRITE`]
+/// so callers here and in the attach runtime consume the same typed
+/// constant the plugin author declared.
+pub const WINDOWS_WRITE_CAPABILITY: CapabilityId = WINDOWS_WRITE;
 
 /// Interface id for the windows plugin's mutating command surface.
-pub const WINDOWS_COMMANDS_INTERFACE: &str = "windows-commands";
+///
+/// Re-exported from the BPDL-generated
+/// [`bmux_windows_plugin_api::windows_commands::INTERFACE_ID`] so every
+/// caller in core or CLI-side code reaches the same typed constant
+/// rather than hand-typing the string.
+pub const WINDOWS_COMMANDS_INTERFACE: InterfaceId = windows_commands::INTERFACE_ID;
 
 /// BPDL-shaped typed arg structs for the `windows-commands` byte-wire
 /// path. These mirror the [`bmux_windows_plugin_api::windows_commands`]
@@ -232,31 +245,6 @@ where
         message: source.to_string(),
     })
 }
-
-/// Guard against drift between the hardcoded interface id strings and
-/// the BPDL-generated constant. Keeping these in lock step is the
-/// whole point of the typed contract.
-const _: () = {
-    const fn bytes_match(a: &str, b: &str) -> bool {
-        if a.len() != b.len() {
-            return false;
-        }
-        let a_bytes = a.as_bytes();
-        let b_bytes = b.as_bytes();
-        let mut i = 0;
-        while i < a_bytes.len() {
-            if a_bytes[i] != b_bytes[i] {
-                return false;
-            }
-            i += 1;
-        }
-        true
-    }
-    assert!(bytes_match(
-        WINDOWS_COMMANDS_INTERFACE,
-        windows_commands::INTERFACE_ID,
-    ));
-};
 
 /// Re-export of [`bmux_windows_plugin_api::windows_commands::PaneAck`]
 /// so callers can deserialize responses without pulling the api crate

@@ -776,8 +776,7 @@ pub(super) fn plugin_command_context(
 
 pub(super) fn plugin_system_event(name: &str) -> PluginEvent {
     PluginEvent {
-        kind: PluginEventKind::System,
-        name: name.to_string(),
+        kind: PluginEventKind::from_owned(format!("bmux.core/{name}")),
         payload: serde_json::json!({
             "product": "bmux",
             "version": env!("CARGO_PKG_VERSION"),
@@ -1240,7 +1239,7 @@ pub(super) fn dispatch_loaded_plugin_event(
         let _ = plugin.dispatch_event(event).with_context(|| {
             format!(
                 "failed dispatching plugin event '{}' to '{}'",
-                event.name,
+                event.kind.as_str(),
                 plugin.declaration.id.as_str()
             )
         })?;
@@ -1321,37 +1320,21 @@ pub(super) fn plugin_event_from_server_event(
 ) -> Result<PluginEvent> {
     Ok(PluginEvent {
         kind: plugin_event_kind_from_server_event(event),
-        name: server_event_name(event).to_string(),
         payload: serde_json::to_value(event).context("failed encoding server event payload")?,
     })
 }
 
-pub(super) const fn plugin_event_kind_from_server_event(
+/// Translate a legacy `ServerEvent` into a namespaced [`PluginEventKind`].
+///
+/// The returned kind uses the `bmux.core/<event-name>` namespace for now so
+/// every legacy server-emitted event slots into the generic kind scheme.
+/// Once the server-side domain concepts are owned by plugins (sessions /
+/// windows / contexts / clients), each plugin will publish its own event
+/// streams with its own kinds and this shim disappears.
+pub(super) fn plugin_event_kind_from_server_event(
     event: &bmux_client::ServerEvent,
 ) -> PluginEventKind {
-    match event {
-        bmux_client::ServerEvent::ServerStarted | bmux_client::ServerEvent::ServerStopping => {
-            PluginEventKind::System
-        }
-        bmux_client::ServerEvent::SessionCreated { .. }
-        | bmux_client::ServerEvent::SessionRemoved { .. }
-        | bmux_client::ServerEvent::ControlCatalogChanged { .. }
-        | bmux_client::ServerEvent::FollowStarted { .. }
-        | bmux_client::ServerEvent::FollowStopped { .. }
-        | bmux_client::ServerEvent::FollowTargetGone { .. }
-        | bmux_client::ServerEvent::FollowTargetChanged { .. } => PluginEventKind::Session,
-        bmux_client::ServerEvent::ClientAttached { .. }
-        | bmux_client::ServerEvent::ClientDetached { .. } => PluginEventKind::Client,
-        bmux_client::ServerEvent::AttachViewChanged { .. }
-        | bmux_client::ServerEvent::PaneOutputAvailable { .. }
-        | bmux_client::ServerEvent::PaneOutput { .. }
-        | bmux_client::ServerEvent::PaneImageAvailable { .. }
-        | bmux_client::ServerEvent::PaneExited { .. }
-        | bmux_client::ServerEvent::PaneRestarted { .. } => PluginEventKind::Pane,
-        bmux_client::ServerEvent::RecordingStarted { .. }
-        | bmux_client::ServerEvent::RecordingStopped { .. }
-        | bmux_client::ServerEvent::PerformanceSettingsUpdated { .. } => PluginEventKind::System,
-    }
+    PluginEventKind::from_owned(format!("bmux.core/{}", server_event_name(event)))
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Status clamped to 0..255 before cast
@@ -2426,8 +2409,7 @@ mod tests {
     #[test]
     fn plugin_system_event_uses_system_kind_and_name() {
         let event = plugin_system_event("server_started");
-        assert_eq!(event.kind, bmux_plugin_sdk::PluginEventKind::System);
-        assert_eq!(event.name, "server_started");
+        assert_eq!(event.kind.as_str(), "bmux.core/server_started");
         assert_eq!(
             event
                 .payload
@@ -2446,8 +2428,7 @@ mod tests {
         })
         .expect("plugin event should build");
         let session_id_text = session_id.to_string();
-        assert_eq!(event.kind, bmux_plugin_sdk::PluginEventKind::Session);
-        assert_eq!(event.name, "session_created");
+        assert_eq!(event.kind.as_str(), "bmux.core/session_created");
         assert!(event.payload.to_string().contains(&session_id_text));
     }
 

@@ -23,8 +23,8 @@ use bmux_decoration_plugin_api::decoration_state::{
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
-    BorderGlyphs, Color, DecorationScene, FallbackStyle, INTERFACE_ID as SCENE_INTERFACE_ID,
-    PaintCommand, Rect, Style, SurfaceDecoration,
+    BorderGlyphs, Color, DecorationScene, FallbackStyle, PaintCommand, Rect, Style,
+    SurfaceDecoration,
 };
 use uuid::Uuid;
 
@@ -368,23 +368,19 @@ pub fn sample_event_for_pane(pane_id: Uuid) -> DecorationEvent {
 /// publishing its first [`DecorationScene`].
 pub const SCENE_PUBLISHED_SIGNAL: &str = "scene-published";
 
-// Compile-time assertion that the interface ids hardcoded in
-// `plugin.toml` and the typed-service registration match the
-// BPDL-generated constants.
-const _: () = {
-    const fn assert_str_eq(a: &str, b: &str) {
-        assert!(a.len() == b.len());
-        let a_bytes = a.as_bytes();
-        let b_bytes = b.as_bytes();
-        let mut i = 0;
-        while i < a_bytes.len() {
-            assert!(a_bytes[i] == b_bytes[i]);
-            i += 1;
-        }
-    }
-    assert_str_eq(DECORATION_STATE_INTERFACE_ID, "decoration-state");
-    assert_str_eq(SCENE_INTERFACE_ID, "scene-protocol");
-};
+// Runtime assertion (executed once at the top of the test suite) that
+// the interface ids hardcoded in `plugin.toml` and the typed-service
+// registration match the BPDL-generated constants. A regression in
+// either the BPDL schema or the manifest will surface immediately.
+#[cfg(test)]
+#[test]
+fn interface_ids_match_bpdl_constants() {
+    assert_eq!(DECORATION_STATE_INTERFACE_ID.as_str(), "decoration-state");
+    assert_eq!(
+        bmux_scene_protocol::scene_protocol::INTERFACE_ID.as_str(),
+        "scene-protocol"
+    );
+}
 
 bmux_plugin_sdk::export_plugin!(DecorationPlugin, include_str!("../plugin.toml"));
 
@@ -530,7 +526,11 @@ mod tests {
         plugin.register_typed_services(context, &mut registry);
         let cap = HostScope::new("bmux.decoration.read").expect("cap");
         let handle = registry
-            .get(&cap, ServiceKind::Query, DECORATION_STATE_INTERFACE_ID)
+            .get(
+                &cap,
+                ServiceKind::Query,
+                DECORATION_STATE_INTERFACE_ID.as_str(),
+            )
             .expect("handle present");
         let service = handle
             .provider_as_trait::<dyn DecorationStateService + Send + Sync>()
