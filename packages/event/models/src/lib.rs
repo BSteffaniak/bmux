@@ -2,8 +2,6 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_session_models::{ClientId, PaneId, SessionId};
-use bmux_terminal_models::PaneSize;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -168,128 +166,8 @@ pub struct MouseEvent {
 // ============================================================================
 // Events
 // ============================================================================
-
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum SessionEvent {
-    Created {
-        session_id: SessionId,
-        name: Option<String>,
-    },
-    Destroyed {
-        session_id: SessionId,
-    },
-    ClientAttached {
-        session_id: SessionId,
-        client_id: ClientId,
-    },
-    ClientDetached {
-        session_id: SessionId,
-        client_id: ClientId,
-    },
-    Renamed {
-        session_id: SessionId,
-        old_name: Option<String>,
-        new_name: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum PaneEvent {
-    Created {
-        pane_id: PaneId,
-        size: PaneSize,
-    },
-    Destroyed {
-        pane_id: PaneId,
-    },
-    Resized {
-        pane_id: PaneId,
-        old_size: PaneSize,
-        new_size: PaneSize,
-    },
-    TitleChanged {
-        pane_id: PaneId,
-        old_title: Option<String>,
-        new_title: Option<String>,
-    },
-    WorkingDirectoryChanged {
-        pane_id: PaneId,
-        old_dir: Option<String>,
-        new_dir: Option<String>,
-    },
-    ShellCommandChanged {
-        pane_id: PaneId,
-        old_cmd: Option<String>,
-        new_cmd: Option<String>,
-    },
-    Activated {
-        pane_id: PaneId,
-    },
-    Deactivated {
-        pane_id: PaneId,
-    },
-    Output {
-        pane_id: PaneId,
-        data: Vec<u8>,
-    },
-}
-
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum ClientEvent {
-    Connected {
-        client_id: ClientId,
-        independent_view: bool,
-    },
-    Disconnected {
-        client_id: ClientId,
-    },
-    AttachedToSession {
-        client_id: ClientId,
-        session_id: SessionId,
-    },
-    DetachedFromSession {
-        client_id: ClientId,
-        session_id: SessionId,
-    },
-    ModeChanged {
-        client_id: ClientId,
-        old_mode: Mode,
-        new_mode: Mode,
-    },
-    FollowingChanged {
-        client_id: ClientId,
-        following: Option<ClientId>,
-    },
-    ViewChanged {
-        client_id: ClientId,
-        session_id: SessionId,
-        pane_id: PaneId,
-    },
-}
-
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum InputEvent {
-    Key {
-        client_id: ClientId,
-        event: KeyEvent,
-    },
-    Mouse {
-        client_id: ClientId,
-        event: MouseEvent,
-    },
-    Paste {
-        client_id: ClientId,
-        content: String,
-    },
-    Resize {
-        client_id: ClientId,
-        size: PaneSize,
-    },
-}
+// System Events
+// ============================================================================
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -303,55 +181,14 @@ pub enum SystemEvent {
     Error { message: String },
 }
 
-// ============================================================================
-// Top-level Event enum
-// ============================================================================
-
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Event {
-    Session(SessionEvent),
-    Pane(PaneEvent),
-    Client(ClientEvent),
-    Input(InputEvent),
     System(SystemEvent),
 }
 
 impl Event {
-    /// Create a session created event
-    #[must_use]
-    pub const fn session_created(session_id: SessionId, name: Option<String>) -> Self {
-        Self::Session(SessionEvent::Created { session_id, name })
-    }
-
-    /// Create a pane created event
-    #[must_use]
-    pub const fn pane_created(pane_id: PaneId, size: PaneSize) -> Self {
-        Self::Pane(PaneEvent::Created { pane_id, size })
-    }
-
-    /// Create a client connected event
-    #[must_use]
-    pub const fn client_connected(client_id: ClientId, independent_view: bool) -> Self {
-        Self::Client(ClientEvent::Connected {
-            client_id,
-            independent_view,
-        })
-    }
-
-    /// Create a key input event
-    #[must_use]
-    pub const fn key_input(client_id: ClientId, event: KeyEvent) -> Self {
-        Self::Input(InputEvent::Key { client_id, event })
-    }
-
-    /// Create a mouse input event
-    #[must_use]
-    pub const fn mouse_input(client_id: ClientId, event: MouseEvent) -> Self {
-        Self::Input(InputEvent::Mouse { client_id, event })
-    }
-
-    /// Create a system error event
+    /// Create a system error event.
     #[must_use]
     pub const fn system_error(message: String) -> Self {
         Self::System(SystemEvent::Error { message })

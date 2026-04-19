@@ -13,9 +13,16 @@ for the author-facing Rust API.
 
 1. **Core is domain-agnostic.** `packages/server`, `packages/client`,
    `packages/ipc`, `packages/session`, `packages/terminal`, and
-   `packages/event` contain no windows-domain or permissions-domain
-   logic. Plugins own all product concepts. Runtime core scope also
-   includes `packages/cli/src/runtime/**` (Option B boundary).
+   `packages/event` must contain no domain-specific logic — no
+   windows, sessions, contexts, clients, panes, or permissions
+   concepts should appear in type names, fields, operations, or
+   event names. Plugins own all product concepts. Runtime core
+   scope also includes `packages/cli/src/runtime/**` (Option B
+   boundary). Plugin infrastructure (`packages/plugin-sdk`,
+   `packages/plugin`, `packages/plugin-schema`,
+   `packages/plugin-schema-macros`) must also stay domain-agnostic —
+   they provide only generic host primitives (storage, log,
+   recording, capability scopes, service dispatch).
 2. **Plugins are composable and typed.** Plugins declare their public
    API in BPDL (see [`bpdl-spec.md`](./bpdl-spec.md)). Other plugins
    consume those APIs as typed Rust traits generated at compile time.
@@ -60,10 +67,41 @@ Plugins live under `plugins/`. Each "real" plugin ships **two crates**:
 
 Examples currently in tree:
 
+- `plugins/sessions-plugin-api` + `plugins/sessions-plugin` (owns
+  session lifecycle: list, create, kill, select).
+- `plugins/contexts-plugin-api` + `plugins/contexts-plugin` (owns
+  context state: list, create, select, close, current).
+- `plugins/clients-plugin-api` + `plugins/clients-plugin` (owns
+  per-client identity, selected session, follow state).
 - `plugins/windows-plugin-api` + `plugins/windows-plugin` (owns pane /
   window / tab lifecycle; exposes state queries, commands, events).
 - `plugins/decoration-plugin-api` + `plugins/decoration-plugin` (owns
   pane visual styling; depends on `windows-plugin-api`).
+- `plugins/permissions-plugin` (owns role/permission policy).
+- `plugins/cluster-plugin` (owns multi-session input broadcasting).
+
+### Host runtime surface for plugins
+
+Two traits live in `packages/plugin` and are implemented for the
+three plugin context types (`NativeCommandContext`,
+`NativeLifecycleContext`, `NativeServiceContext`) plus the long-lived
+`TypedServiceCaller`:
+
+- **`ServiceCaller`** — the generic dispatch primitive. Provides
+  `call_service_raw`, `call_service`, and `execute_kernel_request`.
+  Domain-agnostic: takes interface ids and operation names as opaque
+  strings.
+- **`HostRuntimeApi`** — generic convenience methods only. Covers
+  `core_cli_command_run_path`, `plugin_command_run`, `storage_get`,
+  `storage_set`, `log_write`, `recording_write_event`. No domain
+  methods (`pane_*`, `session_*`, `context_*`, `current_client`)
+  exist on this trait.
+- **`DomainCompat`** — opt-in extension trait providing the former
+  domain convenience methods (`session_list`, `context_create`,
+  `pane_focus`, `current_client`, etc.) as ergonomic wrappers over
+  `execute_kernel_request`. Plugins that want them explicitly import
+  `use bmux_plugin::DomainCompat;`. Core plugin infrastructure never
+  depends on this trait.
 
 ## Interaction patterns
 

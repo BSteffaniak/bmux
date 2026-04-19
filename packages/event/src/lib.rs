@@ -11,10 +11,7 @@
 pub use bmux_event_models as models;
 
 // Re-export commonly used types
-pub use models::{
-    ClientEvent, Event, InputEvent, KeyCode, KeyEvent, KeyModifiers, Mode, MouseEvent, PaneEvent,
-    SessionEvent, SystemEvent,
-};
+pub use models::{Event, KeyCode, KeyEvent, KeyModifiers, Mode, MouseEvent, SystemEvent};
 
 use anyhow::Result;
 use tokio::sync::broadcast;
