@@ -69,6 +69,77 @@ impl RustPlugin for WindowsPlugin {
                 switch_window(ctx, selector, &self.last_selected_by_client)
                     .map_err(|e| ServiceResponse::error("switch_failed", e))
             },
+            "windows-commands", "focus-pane" => |req: FocusPaneArgs, ctx| {
+                let request = bmux_plugin_sdk::PaneFocusRequest {
+                    session: None,
+                    target: Some(bmux_plugin_sdk::PaneSelector::ById(req.id)),
+                    direction: None,
+                };
+                ctx.pane_focus(&request)
+                    .map(|_| PaneAck { ok: true, pane_id: Some(req.id) })
+                    .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
+            },
+            "windows-commands", "close-pane" => |req: ClosePaneArgs, ctx| {
+                let request = bmux_plugin_sdk::PaneCloseRequest {
+                    session: None,
+                    target: Some(bmux_plugin_sdk::PaneSelector::ById(req.id)),
+                };
+                ctx.pane_close(&request)
+                    .map(|_| PaneAck { ok: true, pane_id: Some(req.id) })
+                    .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
+            },
+            "windows-commands", "split-pane" => |req: SplitPaneArgs, ctx| {
+                let request = bmux_plugin_sdk::PaneSplitRequest {
+                    session: req.session.as_ref().and_then(selector_to_session),
+                    target: req.target.as_ref().map(selector_to_pane),
+                    direction: pane_direction_to_split(req.direction),
+                };
+                ctx.pane_split(&request)
+                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
+                    .map_err(|e| ServiceResponse::error("split_failed", e.to_string()))
+            },
+            "windows-commands", "launch-pane" => |req: LaunchPaneArgs, ctx| {
+                let request = bmux_plugin_sdk::PaneLaunchRequest {
+                    session: req.session.as_ref().and_then(selector_to_session),
+                    target: req.target.as_ref().map(selector_to_pane),
+                    direction: pane_direction_to_split(req.direction),
+                    name: req.name,
+                    command: bmux_plugin_sdk::PaneLaunchCommand {
+                        program: req.program,
+                        args: req.args,
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    },
+                };
+                ctx.pane_launch(&request)
+                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
+                    .map_err(|e| ServiceResponse::error("launch_failed", e.to_string()))
+            },
+            "windows-commands", "resize-pane" => |req: ResizePaneArgs, ctx| {
+                let request = bmux_plugin_sdk::PaneResizeRequest {
+                    session: req.session.as_ref().and_then(selector_to_session),
+                    target: req.target.as_ref().map(selector_to_pane),
+                    delta: req.delta,
+                };
+                ctx.pane_resize(&request)
+                    .map(|_| PaneAck { ok: true, pane_id: None })
+                    .map_err(|e| ServiceResponse::error("resize_failed", e.to_string()))
+            },
+            "windows-commands", "zoom-pane" => |_req: ZoomPaneArgs, _ctx| {
+                // Zoom has no host primitive yet; mirror the typed
+                // trait impl's error so both transports behave the
+                // same.
+                Err::<PaneAck, _>(ServiceResponse::error(
+                    "unsupported",
+                    "zoom-pane typed command is not wired to a host primitive yet",
+                ))
+            },
+            "windows-commands", "restart-pane" => |_req: RestartPaneArgs, _ctx| {
+                Err::<PaneAck, _>(ServiceResponse::error(
+                    "unsupported",
+                    "restart-pane typed command is not wired to a host primitive yet",
+                ))
+            },
         })
     }
 
@@ -1132,6 +1203,67 @@ struct KillAllWindowsArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SwitchWindowArgs {
     target: String,
+}
+
+/// Byte-wire envelope for `windows-commands/focus-pane`. The BPDL
+/// trait's `focus_pane(id: uuid)` parameters serialize as a JSON
+/// object with a single `id` field at the wire boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FocusPaneArgs {
+    id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClosePaneArgs {
+    id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SplitPaneArgs {
+    #[serde(default)]
+    session: Option<Selector>,
+    #[serde(default)]
+    target: Option<Selector>,
+    direction: PaneDirection,
+    #[serde(default)]
+    ratio_pct: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LaunchPaneArgs {
+    #[serde(default)]
+    session: Option<Selector>,
+    #[serde(default)]
+    target: Option<Selector>,
+    direction: PaneDirection,
+    #[serde(default)]
+    name: Option<String>,
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ResizePaneArgs {
+    #[serde(default)]
+    session: Option<Selector>,
+    #[serde(default)]
+    target: Option<Selector>,
+    delta: i16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ZoomPaneArgs {
+    #[serde(default)]
+    session: Option<Selector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RestartPaneArgs {
+    #[serde(default)]
+    session: Option<Selector>,
+    #[serde(default)]
+    target: Option<Selector>,
 }
 
 bmux_plugin_sdk::export_plugin!(WindowsPlugin, include_str!("../plugin.toml"));

@@ -10,7 +10,7 @@ use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, S
 use bmux_ipc::{
     AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ContextSelector,
     ContextSessionBindingSummary, ContextSummary, ControlCatalogSnapshot, InvokeServiceKind,
-    PaneFocusDirection, PaneSelector, PaneSplitDirection, SessionSelector, SessionSummary,
+    PaneFocusDirection, PaneSplitDirection, SessionSelector, SessionSummary,
 };
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_plugin_sdk::{
@@ -79,6 +79,137 @@ const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
 /// without the decoration plugin stays fast) and when the signal has
 /// already been marked `Ready`.
 const DECORATION_READY_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Capability guarding the windows plugin's `windows-commands` service.
+const WINDOWS_WRITE_CAPABILITY: &str = "bmux.windows.write";
+
+/// Interface id for the windows plugin's mutating command surface.
+const WINDOWS_COMMANDS_INTERFACE: &str = "windows-commands";
+
+/// Invoke a `windows-commands` typed command by routing through the
+/// server's generic `Request::InvokeService` envelope. Args are
+/// serialized with `bmux_codec` to match the `route_service!` macro on
+/// the plugin side; the response is decoded likewise.
+///
+/// The attach client process does not have a local plugin host, so it
+/// cannot call `WindowsCommandsService` methods directly — this helper
+/// is the cross-process bridge.
+async fn invoke_windows_command<Req, Resp>(
+    client: &mut StreamingBmuxClient,
+    operation: &str,
+    args: &Req,
+) -> std::result::Result<Resp, ClientError>
+where
+    Req: serde::Serialize + Sync,
+    Resp: serde::de::DeserializeOwned,
+{
+    let payload = bmux_codec::to_vec(args).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding {operation}: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            WINDOWS_WRITE_CAPABILITY,
+            InvokeServiceKind::Command,
+            WINDOWS_COMMANDS_INTERFACE,
+            operation,
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes::<Resp>(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding {operation} response: {error}"),
+    })
+}
+
+/// BPDL-shaped typed arg structs for the `windows-commands` byte-wire
+/// path. These mirror the [`bmux_windows_plugin_api::windows_commands`]
+/// generated parameter lists exactly so the plugin's `route_service!`
+/// decoder lands the same values the typed trait method would.
+#[allow(dead_code)] // Remaining structs come into use as more call sites migrate.
+mod windows_cmd_args {
+    use bmux_windows_plugin_api::windows_commands::{PaneDirection, Selector};
+    use serde::{Deserialize, Serialize};
+    use uuid::Uuid;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FocusPane {
+        pub id: Uuid,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ClosePane {
+        pub id: Uuid,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SplitPane {
+        #[serde(default)]
+        pub session: Option<Selector>,
+        #[serde(default)]
+        pub target: Option<Selector>,
+        pub direction: PaneDirection,
+        #[serde(default)]
+        pub ratio_pct: Option<u32>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ResizePane {
+        #[serde(default)]
+        pub session: Option<Selector>,
+        #[serde(default)]
+        pub target: Option<Selector>,
+        pub delta: i16,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ZoomPane {
+        #[serde(default)]
+        pub session: Option<Selector>,
+    }
+}
+
+/// Convert an IPC [`SessionSelector`] to the typed BPDL [`Selector`].
+fn ipc_to_typed_selector(
+    selector: SessionSelector,
+) -> bmux_windows_plugin_api::windows_commands::Selector {
+    use bmux_windows_plugin_api::windows_commands::Selector as TypedSelector;
+    match selector {
+        SessionSelector::ById(id) => TypedSelector {
+            id: Some(id),
+            name: None,
+        },
+        SessionSelector::ByName(name) => TypedSelector {
+            id: None,
+            name: Some(name),
+        },
+    }
+}
+
+/// Convert an IPC [`PaneFocusDirection`] to the typed BPDL
+/// [`PaneDirection`] used by pane commands.
+#[allow(dead_code)] // Consumed when focus-by-direction migrates to typed dispatch.
+const fn ipc_focus_to_typed_direction(
+    direction: PaneFocusDirection,
+) -> bmux_windows_plugin_api::windows_commands::PaneDirection {
+    use bmux_windows_plugin_api::windows_commands::PaneDirection;
+    match direction {
+        PaneFocusDirection::Next => PaneDirection::Right,
+        PaneFocusDirection::Prev => PaneDirection::Left,
+    }
+}
+
+/// Convert an IPC [`PaneSplitDirection`] to the typed BPDL
+/// [`PaneDirection`].
+const fn ipc_split_to_typed_direction(
+    direction: PaneSplitDirection,
+) -> bmux_windows_plugin_api::windows_commands::PaneDirection {
+    use bmux_windows_plugin_api::windows_commands::PaneDirection;
+    match direction {
+        PaneSplitDirection::Vertical => PaneDirection::Vertical,
+        PaneSplitDirection::Horizontal => PaneDirection::Horizontal,
+    }
+}
 
 #[derive(Default)]
 pub struct DisplayCaptureFanout {
@@ -2059,15 +2190,31 @@ pub async fn handle_attach_ui_action(
         }
         RuntimeAction::SplitFocusedVertical => {
             let selector = attached_session_selector(view_state);
-            let _ = client
-                .split_pane(Some(selector), PaneSplitDirection::Vertical)
-                .await?;
+            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+                client,
+                "split-pane",
+                &windows_cmd_args::SplitPane {
+                    session: Some(ipc_to_typed_selector(selector)),
+                    target: None,
+                    direction: ipc_split_to_typed_direction(PaneSplitDirection::Vertical),
+                    ratio_pct: None,
+                },
+            )
+            .await?;
         }
         RuntimeAction::SplitFocusedHorizontal => {
             let selector = attached_session_selector(view_state);
-            let _ = client
-                .split_pane(Some(selector), PaneSplitDirection::Horizontal)
-                .await?;
+            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+                client,
+                "split-pane",
+                &windows_cmd_args::SplitPane {
+                    session: Some(ipc_to_typed_selector(selector)),
+                    target: None,
+                    direction: ipc_split_to_typed_direction(PaneSplitDirection::Horizontal),
+                    ratio_pct: None,
+                },
+            )
+            .await?;
         }
         RuntimeAction::FocusNext
         | RuntimeAction::FocusPrev
@@ -2103,7 +2250,16 @@ pub async fn handle_attach_ui_action(
                 -1
             };
             let selector = attached_session_selector(view_state);
-            client.resize_pane(Some(selector), delta).await?;
+            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+                client,
+                "resize-pane",
+                &windows_cmd_args::ResizePane {
+                    session: Some(ipc_to_typed_selector(selector)),
+                    target: None,
+                    delta,
+                },
+            )
+            .await?;
         }
         RuntimeAction::CloseFocusedPane => {
             let Some(pane_id) = focused_attach_pane_id(view_state) else {
@@ -4888,11 +5044,20 @@ pub async fn handle_attach_prompt_completion(
             }
             AttachInternalPromptAction::ClosePane { pane_id } => {
                 if prompt_response_is_confirmed(&completion.response) {
-                    let selector = attached_session_selector(view_state);
-                    let _ = client
-                        .focus_pane_target(Some(selector.clone()), PaneSelector::ById(pane_id))
+                    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
+                        invoke_windows_command(
+                            client,
+                            "focus-pane",
+                            &windows_cmd_args::FocusPane { id: pane_id },
+                        )
                         .await?;
-                    client.close_pane(Some(selector)).await?;
+                    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
+                        invoke_windows_command(
+                            client,
+                            "close-pane",
+                            &windows_cmd_args::ClosePane { id: pane_id },
+                        )
+                        .await?;
                     view_state.set_transient_status(
                         "pane closed",
                         Instant::now(),
@@ -5740,12 +5905,12 @@ pub async fn focus_attach_pane(
         return Ok(());
     }
 
-    client
-        .focus_pane_target(
-            Some(SessionSelector::ById(view_state.attached_id)),
-            PaneSelector::ById(pane_id),
-        )
-        .await?;
+    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+        client,
+        "focus-pane",
+        &windows_cmd_args::FocusPane { id: pane_id },
+    )
+    .await?;
 
     view_state.mouse.last_focused_pane_id = Some(pane_id);
     view_state.dirty.layout_needs_refresh = true;
