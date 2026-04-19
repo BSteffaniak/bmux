@@ -882,6 +882,78 @@ pub(super) fn ready_tracker_snapshot() -> bmux_plugin_sdk::ReadyTracker {
     READY_TRACKER.with(|cell| cell.borrow().clone())
 }
 
+/// Populate a [`bmux_attach_pipeline::scene_cache::SharedSceneCache`]
+/// with the decoration plugin's current [`bmux_scene_protocol::scene_protocol::DecorationScene`].
+///
+/// Resolves the typed `decoration-state` service from the thread-local
+/// typed-service registry, invokes `scene_snapshot`, and writes the
+/// result through the revision-guarded cache update. Silently no-ops
+/// when no decoration plugin is registered, when the typed handle is
+/// not present (e.g. the plugin is loaded but opted out of typed
+/// dispatch), or when the plugin's `scene_snapshot` produces a stale
+/// revision.
+///
+/// The push-based event subscription path will later invalidate the
+/// cache incrementally; this helper handles the cold-start case where
+/// the render loop needs a scene before any event has fired.
+pub(super) fn prime_decoration_scene_cache(
+    cache: &bmux_attach_pipeline::scene_cache::SharedSceneCache,
+) {
+    let Ok(read_cap) = bmux_plugin_sdk::HostScope::new("bmux.decoration.read") else {
+        return;
+    };
+    let registry = typed_service_registry_snapshot();
+    let Some(handle) = registry.get(&(
+        read_cap,
+        bmux_plugin_sdk::ServiceKind::Query,
+        "decoration-state".to_string(),
+    )) else {
+        return;
+    };
+    let Ok(service) = handle.provider_as_trait::<
+        dyn bmux_decoration_plugin_api::decoration_state::DecorationStateService + Send + Sync,
+    >() else {
+        return;
+    };
+    let scene = block_on_future(service.scene_snapshot());
+    if let Ok(mut guard) = cache.write() {
+        guard.set_scene(scene);
+    }
+}
+
+/// Minimal single-threaded executor for driving a typed-dispatch
+/// future to completion from synchronous code.
+///
+/// Typed service method futures returned by the BPDL-generated trait
+/// are `Pin<Box<dyn Future + Send>>`. Runtime consumers that live
+/// inside synchronous call paths (e.g. the attach startup sequence
+/// priming the scene cache) can use this helper without pulling in a
+/// full tokio runtime. The futures produced by the decoration plugin's
+/// typed service are `async move { ... }` blocks that never suspend,
+/// so `Poll::Pending` shouldn't be reachable in practice; if it is
+/// observed we spin briefly and yield rather than hanging the thread.
+fn block_on_future<T>(
+    fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>>,
+) -> T {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct NoopWake;
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut cx = Context::from_waker(&waker);
+    let mut pinned = fut;
+    loop {
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
 pub(super) fn activate_loaded_plugins(
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
     config: &BmuxConfig,

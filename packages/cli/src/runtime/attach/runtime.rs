@@ -73,6 +73,12 @@ const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 /// naturally yields CPU time to the PTY reader thread, so no explicit
 /// sleep/yield is needed between rounds.
 const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
+/// How long attach startup waits for the decoration plugin to signal
+/// `scene-published` before rendering its first frame. The wait short-
+/// circuits when the plugin never declared the signal (so attaching
+/// without the decoration plugin stays fast) and when the signal has
+/// already been marked `Ready`.
+const DECORATION_READY_TIMEOUT: Duration = Duration::from_millis(2000);
 
 #[derive(Default)]
 pub struct DisplayCaptureFanout {
@@ -679,6 +685,31 @@ pub async fn run_session_attach_with_client(
     } else {
         StatusPosition::Off
     };
+
+    // Wait briefly for the decoration plugin to signal that it has
+    // published its first scene. If the plugin isn't registered, this
+    // returns immediately because the signal was never declared;
+    // otherwise it blocks up to the configured timeout. Consumers that
+    // want to disable the gate can unregister the plugin or configure a
+    // zero-timeout policy (planned follow-up).
+    let ready_tracker = super::super::plugin_runtime::ready_tracker_snapshot();
+    if ready_tracker
+        .status("bmux.decoration", "scene-published")
+        .is_some()
+    {
+        let _ready = ready_tracker.await_ready(
+            "bmux.decoration",
+            "scene-published",
+            DECORATION_READY_TIMEOUT,
+        );
+    }
+
+    // Prime the decoration scene cache with the decoration plugin's
+    // current snapshot. Later updates arrive via the typed
+    // `scene-protocol` event stream; this one-shot pull guarantees the
+    // render path has something to consult on its very first frame
+    // when the plugin is registered.
+    super::super::plugin_runtime::prime_decoration_scene_cache(&view_state.decoration_scene_cache);
 
     update_attach_viewport(
         &mut client,
@@ -3190,6 +3221,17 @@ pub fn render_attach_frame(
     let render_scene =
         view_state.dirty.full_pane_redraw || !view_state.dirty.pane_dirty_ids.is_empty();
     let cursor_state = if render_scene {
+        // Clone the scene cache into a local snapshot so the RwLock
+        // guard is released before `render_attach_scene` runs. The
+        // cache is small (per-surface SurfaceDecoration entries) and
+        // rarely contended; cloning avoids holding the lock across
+        // the render path and keeps clippy's
+        // significant_drop_tightening invariant clean.
+        let scene_cache_snapshot = view_state
+            .decoration_scene_cache
+            .read()
+            .ok()
+            .map(|guard| guard.clone());
         render_attach_scene(
             &mut frame_bytes,
             &layout_state.scene,
@@ -3205,7 +3247,7 @@ pub fn render_attach_frame(
             view_state.selection_anchor,
             layout_state.zoomed,
             terminal::size().unwrap_or((0, 0)),
-            None,
+            scene_cache_snapshot.as_ref(),
         )?
     } else {
         view_state.last_cursor_state

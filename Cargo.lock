@@ -1017,6 +1017,7 @@ dependencies = [
  "bmux_cluster_plugin",
  "bmux_config",
  "bmux_decoration_plugin",
+ "bmux_decoration_plugin_api",
  "bmux_env",
  "bmux_event",
  "bmux_fonts",
