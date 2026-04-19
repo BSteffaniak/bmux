@@ -2121,7 +2121,7 @@ fn ensure_match(
 #[cfg(test)]
 mod tests {
     use super::{LoadedPlugin, PluginBackend};
-    use crate::{HostRuntimeApi, PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
+    use crate::{DomainCompat, PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
     use bmux_plugin_sdk::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, NativeLifecycleContext,
         NativeServiceContext, PluginEvent, PluginEventKind, PluginEventSubscription,

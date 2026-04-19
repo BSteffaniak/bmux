@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::HostRuntimeApi;
+use bmux_plugin::{DomainCompat, HostRuntimeApi};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{SessionSelector, StorageGetRequest, StorageSetRequest};
 use serde::{Deserialize, Serialize};
@@ -215,7 +215,9 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
     }
 }
 
-fn resolve_current_session(caller: &impl HostRuntimeApi) -> Result<String, String> {
+fn resolve_current_session(
+    caller: &(impl HostRuntimeApi + DomainCompat),
+) -> Result<String, String> {
     let current_client = caller.current_client().map_err(|error| error.to_string())?;
     let sessions = caller
         .session_list()
@@ -251,7 +253,7 @@ impl StoredPermissions {
 const PERMISSIONS_STORAGE_KEY: &str = "permissions-v1";
 
 fn list_entries(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + DomainCompat),
     session: &str,
 ) -> Result<Vec<PermissionEntry>, String> {
     let session_id = resolve_session_id(caller, session)?;
@@ -263,7 +265,10 @@ fn list_entries(
         .unwrap_or_default())
 }
 
-fn grant_entry(caller: &impl HostRuntimeApi, request: GrantRequest) -> Result<(), String> {
+fn grant_entry(
+    caller: &(impl HostRuntimeApi + DomainCompat),
+    request: GrantRequest,
+) -> Result<(), String> {
     validate_role(&request.role)?;
     let session_id = resolve_session_id(caller, &request.session)?;
     let mut state = load_state(caller)?;
@@ -282,7 +287,10 @@ fn grant_entry(caller: &impl HostRuntimeApi, request: GrantRequest) -> Result<()
     save_state(caller, &state)
 }
 
-fn revoke_entry(caller: &impl HostRuntimeApi, request: &RevokeRequest) -> Result<(), String> {
+fn revoke_entry(
+    caller: &(impl HostRuntimeApi + DomainCompat),
+    request: &RevokeRequest,
+) -> Result<(), String> {
     let session_id = resolve_session_id(caller, &request.session)?;
     let mut state = load_state(caller)?;
     if let Some(entries) = state.by_session_id.get_mut(&session_id) {
@@ -292,7 +300,7 @@ fn revoke_entry(caller: &impl HostRuntimeApi, request: &RevokeRequest) -> Result
 }
 
 fn evaluate_policy(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + DomainCompat),
     request: &SessionPolicyCheckRequest,
 ) -> Result<SessionPolicyCheckResponse, String> {
     if request.action == "hot_path_execution" {
@@ -321,7 +329,7 @@ fn evaluate_policy(
 }
 
 fn evaluate_hot_path_execution_policy(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + DomainCompat),
     request: &SessionPolicyCheckRequest,
 ) -> Result<SessionPolicyCheckResponse, String> {
     let Some(execution_class) = request.execution_class.as_deref() else {
@@ -374,7 +382,7 @@ fn evaluate_hot_path_execution_policy(
 }
 
 fn list_hot_path_overrides(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + DomainCompat),
     request: ListHotPathOverridesRequest,
 ) -> Result<ListHotPathOverridesResponse, String> {
     let session_id = match request.session {
@@ -397,7 +405,7 @@ fn list_hot_path_overrides(
 }
 
 fn grant_hot_path_override(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + DomainCompat),
     request: GrantHotPathOverrideRequest,
 ) -> Result<(), String> {
     validate_hot_path_override_fields(
@@ -432,7 +440,7 @@ fn grant_hot_path_override(
 }
 
 fn revoke_hot_path_override(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + DomainCompat),
     request: &RevokeHotPathOverrideRequest,
 ) -> Result<(), String> {
     validate_hot_path_override_fields(
@@ -512,7 +520,7 @@ fn validate_hot_path_override_fields(
 }
 
 fn resolve_override_scope(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + DomainCompat),
     scope: &str,
     session: Option<&str>,
     context: Option<&str>,
@@ -544,7 +552,7 @@ fn resolve_override_scope(
 }
 
 fn inspect_hot_path_decision(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + DomainCompat),
     request: &CheckHotPathDecisionRequest,
 ) -> Result<CheckHotPathDecisionResponse, String> {
     if request.plugin_id.trim().is_empty() {
@@ -619,7 +627,7 @@ fn inspect_hot_path_decision(
 }
 
 fn watch_hot_path_policy_decision(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + DomainCompat),
     request: &CheckHotPathDecisionRequest,
     as_json: bool,
     compact: bool,
@@ -812,7 +820,7 @@ fn classify_action(action: &str) -> PolicyActionKind {
     }
 }
 
-fn load_state(caller: &impl HostRuntimeApi) -> Result<StoredPermissions, String> {
+fn load_state(caller: &(impl HostRuntimeApi + DomainCompat)) -> Result<StoredPermissions, String> {
     let response = caller
         .storage_get(&StorageGetRequest {
             key: PERMISSIONS_STORAGE_KEY.to_string(),
@@ -824,7 +832,10 @@ fn load_state(caller: &impl HostRuntimeApi) -> Result<StoredPermissions, String>
     )
 }
 
-fn save_state(caller: &impl HostRuntimeApi, state: &StoredPermissions) -> Result<(), String> {
+fn save_state(
+    caller: &(impl HostRuntimeApi + DomainCompat),
+    state: &StoredPermissions,
+) -> Result<(), String> {
     let value = encode_service_message(state).map_err(|error| error.to_string())?;
     caller
         .storage_set(&StorageSetRequest {
@@ -835,7 +846,10 @@ fn save_state(caller: &impl HostRuntimeApi, state: &StoredPermissions) -> Result
     Ok(())
 }
 
-fn resolve_session_id(caller: &impl HostRuntimeApi, session: &str) -> Result<Uuid, String> {
+fn resolve_session_id(
+    caller: &(impl HostRuntimeApi + DomainCompat),
+    session: &str,
+) -> Result<Uuid, String> {
     let selector = if let Ok(id) = Uuid::parse_str(session) {
         SessionSelector::ById(id)
     } else if session.trim().is_empty() {
@@ -857,7 +871,10 @@ fn resolve_session_id(caller: &impl HostRuntimeApi, session: &str) -> Result<Uui
         .ok_or_else(|| format!("session '{session}' not found"))
 }
 
-fn resolve_context_id(caller: &impl HostRuntimeApi, context: &str) -> Result<Uuid, String> {
+fn resolve_context_id(
+    caller: &(impl HostRuntimeApi + DomainCompat),
+    context: &str,
+) -> Result<Uuid, String> {
     let selector = if let Ok(id) = Uuid::parse_str(context) {
         bmux_plugin_sdk::ContextSelector::ById(id)
     } else if context.trim().is_empty() {

@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::{HostRuntimeApi, TypedServiceCaller};
+use bmux_plugin::{DomainCompat, HostRuntimeApi, TypedServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     ContextCloseRequest, ContextCreateRequest, ContextSelector, HostScope, StorageGetRequest,

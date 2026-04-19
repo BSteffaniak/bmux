@@ -16,6 +16,7 @@
 pub mod action_dispatch;
 mod declaration;
 mod discovery;
+mod domain_compat;
 mod host_runtime;
 mod loader;
 mod manifest;
@@ -32,6 +33,7 @@ pub use discovery::{
     discover_plugin_manifests_in_roots, discover_registered_plugins,
     discover_registered_plugins_in_roots,
 };
+pub use domain_compat::DomainCompat;
 pub use host_runtime::{HostRuntimeApi, ServiceCaller};
 pub use loader::{LoadedPlugin, NativePluginLoader, load_registered_plugin, load_static_plugin};
 pub use manifest::{

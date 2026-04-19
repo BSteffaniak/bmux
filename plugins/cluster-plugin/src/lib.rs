@@ -3,8 +3,8 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_config::BmuxConfig;
-use bmux_plugin::HostRuntimeApi;
 use bmux_plugin::prompt;
+use bmux_plugin::{DomainCompat, HostRuntimeApi};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, NativeCommandContext, PaneCloseRequest, PaneLaunchCommand,
@@ -53,7 +53,7 @@ trait ClusterRuntimeOps {
     fn storage_set(&self, request: &StorageSetRequest) -> Result<(), String>;
 }
 
-impl<T: HostRuntimeApi + ?Sized> ClusterRuntimeOps for T {
+impl<T: HostRuntimeApi + DomainCompat + ?Sized> ClusterRuntimeOps for T {
     fn core_cli_command_run_path(
         &self,
         request: &CoreCliCommandRequest,
@@ -62,42 +62,42 @@ impl<T: HostRuntimeApi + ?Sized> ClusterRuntimeOps for T {
     }
 
     fn session_list(&self) -> Result<bmux_plugin_sdk::SessionListResponse, String> {
-        HostRuntimeApi::session_list(self).map_err(|error| error.to_string())
+        DomainCompat::session_list(self).map_err(|error| error.to_string())
     }
 
     fn session_create(
         &self,
         request: &SessionCreateRequest,
     ) -> Result<bmux_plugin_sdk::SessionCreateResponse, String> {
-        HostRuntimeApi::session_create(self, request).map_err(|error| error.to_string())
+        DomainCompat::session_create(self, request).map_err(|error| error.to_string())
     }
 
     fn session_select(
         &self,
         request: &SessionSelectRequest,
     ) -> Result<bmux_plugin_sdk::SessionSelectResponse, String> {
-        HostRuntimeApi::session_select(self, request).map_err(|error| error.to_string())
+        DomainCompat::session_select(self, request).map_err(|error| error.to_string())
     }
 
     fn pane_list(
         &self,
         request: &PaneListRequest,
     ) -> Result<bmux_plugin_sdk::PaneListResponse, String> {
-        HostRuntimeApi::pane_list(self, request).map_err(|error| error.to_string())
+        DomainCompat::pane_list(self, request).map_err(|error| error.to_string())
     }
 
     fn pane_launch(
         &self,
         request: &PaneLaunchRequest,
     ) -> Result<bmux_plugin_sdk::PaneLaunchResponse, String> {
-        HostRuntimeApi::pane_launch(self, request).map_err(|error| error.to_string())
+        DomainCompat::pane_launch(self, request).map_err(|error| error.to_string())
     }
 
     fn pane_close(
         &self,
         request: &PaneCloseRequest,
     ) -> Result<bmux_plugin_sdk::PaneCloseResponse, String> {
-        HostRuntimeApi::pane_close(self, request).map_err(|error| error.to_string())
+        DomainCompat::pane_close(self, request).map_err(|error| error.to_string())
     }
 
     fn storage_get(
