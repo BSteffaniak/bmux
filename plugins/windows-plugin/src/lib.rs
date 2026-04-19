@@ -2,25 +2,38 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::HostRuntimeApi;
+use bmux_plugin::{HostRuntimeApi, TypedServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    ContextCloseRequest, ContextCreateRequest, ContextSelector, StorageGetRequest,
-    StorageSetRequest,
+    ContextCloseRequest, ContextCreateRequest, ContextSelector, HostScope, StorageGetRequest,
+    StorageSetRequest, TypedServiceRegistrationContext, TypedServiceRegistry,
 };
-use bmux_windows_plugin_api::windows_commands::{self, WindowAck};
-use bmux_windows_plugin_api::windows_state::{self, WindowEntry};
+use bmux_windows_plugin_api::windows_commands::{
+    self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, Selector, WindowAck,
+    WindowError, WindowsCommandsService,
+};
+use bmux_windows_plugin_api::windows_state::{self, PaneState, WindowEntry, WindowsStateService};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 const ACTIVE_WINDOW_CONTEXT_KEY: &str = "windows.active_context_id";
 const PREVIOUS_WINDOW_CONTEXT_KEY: &str = "windows.previous_context_id";
 const WINDOW_ORDER_KEY: &str = "windows.order";
 
+/// Shared "last selected pane per client" map. Mutated by the
+/// byte-encoded `switch-window` handler (via the plugin's mutable
+/// access in `invoke_service`) AND by the typed
+/// [`WindowsCommandsService::switch_window`] impl (via a clone of the
+/// same [`Arc<Mutex<_>>`]). Both paths observe the same state.
+type LastSelectedByClient = Arc<Mutex<BTreeMap<Uuid, Uuid>>>;
+
 #[derive(Default)]
 pub struct WindowsPlugin {
-    last_selected_by_client: BTreeMap<Uuid, Uuid>,
+    last_selected_by_client: LastSelectedByClient,
 }
 
 impl RustPlugin for WindowsPlugin {
@@ -53,18 +66,54 @@ impl RustPlugin for WindowsPlugin {
             "windows-commands", "switch-window" => |req: SwitchWindowArgs, ctx| {
                 let selector = parse_selector(&req.target)
                     .map_err(|e| ServiceResponse::error("invalid_request", e))?;
-                switch_window(ctx, selector, &mut self.last_selected_by_client)
+                switch_window(ctx, selector, &self.last_selected_by_client)
                     .map_err(|e| ServiceResponse::error("switch_failed", e))
             },
         })
     }
+
+    fn register_typed_services(
+        &self,
+        context: TypedServiceRegistrationContext<'_>,
+        registry: &mut TypedServiceRegistry,
+    ) {
+        // Provider handles share the same `LastSelectedByClient` map
+        // as the byte-encoded path on `WindowsPlugin` so state stays
+        // consistent between transports.
+        let shared = WindowsSharedState {
+            caller: Arc::new(TypedServiceCaller::from_registration_context(&context)),
+            last_selected_by_client: self.last_selected_by_client.clone(),
+        };
+
+        let (Ok(read_cap), Ok(write_cap)) = (
+            HostScope::new("bmux.windows.read"),
+            HostScope::new("bmux.windows.write"),
+        ) else {
+            return;
+        };
+
+        let commands: Arc<dyn WindowsCommandsService + Send + Sync> =
+            Arc::new(WindowsCommandsHandle::new(shared.clone()));
+        registry.insert_typed::<dyn WindowsCommandsService + Send + Sync>(
+            write_cap,
+            ServiceKind::Command,
+            windows_commands::INTERFACE_ID,
+            commands,
+        );
+
+        let state: Arc<dyn WindowsStateService + Send + Sync> =
+            Arc::new(WindowsStateHandle::new(shared));
+        registry.insert_typed::<dyn WindowsStateService + Send + Sync>(
+            read_cap,
+            ServiceKind::Query,
+            windows_state::INTERFACE_ID,
+            state,
+        );
+    }
 }
 
 #[allow(clippy::too_many_lines)]
-fn handle_command(
-    plugin: &mut WindowsPlugin,
-    context: &NativeCommandContext,
-) -> Result<(), String> {
+fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Result<(), String> {
     match context.command.as_str() {
         "new-window" => {
             let name = option_value(&context.arguments, "name");
@@ -136,7 +185,7 @@ fn handle_command(
             let target = positional_value(&context.arguments)
                 .ok_or_else(|| "missing required TARGET argument".to_string())?;
             let selector = parse_selector(&target)?;
-            let ack = switch_window(context, selector, &mut plugin.last_selected_by_client)?;
+            let ack = switch_window(context, selector, &plugin.last_selected_by_client)?;
             let context_id = ack
                 .id
                 .ok_or_else(|| "switch-window did not return selected context id".to_string())?;
@@ -147,7 +196,7 @@ fn handle_command(
             let ack = cycle_window(
                 context,
                 WindowCycleDirection::Next,
-                &mut plugin.last_selected_by_client,
+                &plugin.last_selected_by_client,
             )?;
             if let Some(id) = ack.id {
                 println!("next-window selected context {id}");
@@ -158,7 +207,7 @@ fn handle_command(
             let ack = cycle_window(
                 context,
                 WindowCycleDirection::Previous,
-                &mut plugin.last_selected_by_client,
+                &plugin.last_selected_by_client,
             )?;
             if let Some(id) = ack.id {
                 println!("prev-window selected context {id}");
@@ -169,7 +218,7 @@ fn handle_command(
             let ack = cycle_window(
                 context,
                 WindowCycleDirection::Last,
-                &mut plugin.last_selected_by_client,
+                &plugin.last_selected_by_client,
             )?;
             if let Some(id) = ack.id {
                 println!("last-window selected context {id}");
@@ -185,14 +234,14 @@ fn handle_command(
             if index == 0 {
                 return Err("window index must be 1 or greater".to_string());
             }
-            let ack = goto_window_by_index(context, index, &mut plugin.last_selected_by_client)?;
+            let ack = goto_window_by_index(context, index, &plugin.last_selected_by_client)?;
             if let Some(id) = ack.id {
                 println!("goto-window {index} selected context {id}");
             }
             Ok(())
         }
         "close-current-window" => {
-            let ack = close_current_window(context, &mut plugin.last_selected_by_client)?;
+            let ack = close_current_window(context, &plugin.last_selected_by_client)?;
             if let Some(id) = ack.id {
                 println!("closed current window context {id}");
             }
@@ -322,7 +371,7 @@ fn kill_all_windows(caller: &impl HostRuntimeApi, force_local: bool) -> Result<W
 fn switch_window(
     caller: &impl HostRuntimeApi,
     selector: ContextSelector,
-    last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
+    last_selected_by_client: &LastSelectedByClient,
 ) -> Result<WindowAck, String> {
     let contexts = caller
         .context_list()
@@ -338,8 +387,9 @@ fn switch_window(
     if let Ok(client) = caller.current_client()
         && let Some(previous) = previous_context
         && previous != context_id
+        && let Ok(mut map) = last_selected_by_client.lock()
     {
-        last_selected_by_client.insert(client.id, previous);
+        map.insert(client.id, previous);
     }
     if let Some(previous) = previous_context
         && previous != context_id
@@ -357,7 +407,7 @@ fn switch_window(
 fn cycle_window(
     caller: &impl HostRuntimeApi,
     direction: WindowCycleDirection,
-    last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
+    last_selected_by_client: &LastSelectedByClient,
 ) -> Result<WindowAck, String> {
     let contexts = caller
         .context_list()
@@ -379,10 +429,12 @@ fn cycle_window(
             contexts[(current_index + contexts.len() - 1) % contexts.len()].id
         }
         WindowCycleDirection::Last => {
-            let remembered_by_client = caller
-                .current_client()
-                .ok()
-                .and_then(|client| last_selected_by_client.get(&client.id).copied());
+            let remembered_by_client = caller.current_client().ok().and_then(|client| {
+                last_selected_by_client
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(&client.id).copied())
+            });
             let remembered = remembered_by_client
                 .or_else(|| {
                     get_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY)
@@ -409,7 +461,7 @@ fn cycle_window(
 fn goto_window_by_index(
     caller: &impl HostRuntimeApi,
     index: usize,
-    last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
+    last_selected_by_client: &LastSelectedByClient,
 ) -> Result<WindowAck, String> {
     if index == 0 {
         return Err("window index must be 1 or greater".to_string());
@@ -440,7 +492,7 @@ fn goto_window_by_index(
 
 fn close_current_window(
     caller: &impl HostRuntimeApi,
-    last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
+    last_selected_by_client: &LastSelectedByClient,
 ) -> Result<WindowAck, String> {
     let contexts = caller
         .context_list()
@@ -649,6 +701,369 @@ fn set_stored_window_order_ids(
             value,
         })
         .map_err(|error| error.to_string())
+}
+
+// ── Typed service handles ────────────────────────────────────────────
+//
+// The BPDL-generated `WindowsCommandsService` and `WindowsStateService`
+// traits are implemented on dedicated handle structs that carry an owned
+// `TypedServiceCaller`. The byte-encoded `invoke_service` path remains
+// for consumers that don't use typed dispatch; both paths share the
+// same underlying sync helpers and the same `LastSelectedByClient` map,
+// so behaviour is identical between routes.
+
+/// Shared state backing both the typed commands handle and the byte-
+/// encoded dispatch path.
+#[derive(Clone)]
+struct WindowsSharedState {
+    caller: Arc<TypedServiceCaller>,
+    last_selected_by_client: LastSelectedByClient,
+}
+
+/// Typed implementation of [`WindowsCommandsService`]. Wraps a
+/// [`TypedServiceCaller`] so trait methods can drive host calls
+/// directly without a per-call [`NativeServiceContext`].
+pub struct WindowsCommandsHandle {
+    shared: WindowsSharedState,
+}
+
+impl WindowsCommandsHandle {
+    const fn new(shared: WindowsSharedState) -> Self {
+        Self { shared }
+    }
+}
+
+/// Typed implementation of [`WindowsStateService`]. Reads live pane
+/// state through the same host runtime the byte path uses.
+pub struct WindowsStateHandle {
+    shared: WindowsSharedState,
+}
+
+impl WindowsStateHandle {
+    const fn new(shared: WindowsSharedState) -> Self {
+        Self { shared }
+    }
+}
+
+/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_sdk::SessionSelector`]
+/// used by the byte-encoded host API. Prefers `id` when both are set.
+fn selector_to_session(selector: &Selector) -> Option<bmux_plugin_sdk::SessionSelector> {
+    if let Some(id) = selector.id {
+        return Some(bmux_plugin_sdk::SessionSelector::ById(id));
+    }
+    selector
+        .name
+        .as_ref()
+        .map(|name| bmux_plugin_sdk::SessionSelector::ByName(name.clone()))
+}
+
+/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_sdk::PaneSelector`].
+/// The BPDL selector has `id` / `name`; panes don't currently accept
+/// a name selector on the host side, so a bare `name` falls back to
+/// the active pane. Consumers that need index-based selection can
+/// extend the BPDL `selector` record later.
+fn selector_to_pane(selector: &Selector) -> bmux_plugin_sdk::PaneSelector {
+    selector.id.map_or(
+        bmux_plugin_sdk::PaneSelector::Active,
+        bmux_plugin_sdk::PaneSelector::ById,
+    )
+}
+
+const fn pane_direction_to_split(direction: PaneDirection) -> bmux_plugin_sdk::PaneSplitDirection {
+    // The BPDL enum covers split *and* focus directions; only Horizontal
+    // and Vertical are meaningful for splitting. Anything else folds to
+    // Horizontal as the safest default — the trait's `split_pane` caller
+    // is expected to pick Horizontal/Vertical explicitly.
+    match direction {
+        PaneDirection::Vertical => bmux_plugin_sdk::PaneSplitDirection::Vertical,
+        PaneDirection::Horizontal
+        | PaneDirection::Left
+        | PaneDirection::Right
+        | PaneDirection::Up
+        | PaneDirection::Down => bmux_plugin_sdk::PaneSplitDirection::Horizontal,
+    }
+}
+
+#[allow(dead_code)] // Used once pane_focus routing supports direction hints from typed callers.
+const fn pane_direction_to_focus(
+    direction: PaneDirection,
+) -> Option<bmux_plugin_sdk::PaneFocusDirection> {
+    match direction {
+        // Only Next/Prev make sense at the IPC level today. The rest
+        // map to "no direction hint" so the host focuses the targeted
+        // pane explicitly.
+        PaneDirection::Horizontal | PaneDirection::Vertical => None,
+        PaneDirection::Right | PaneDirection::Down => {
+            Some(bmux_plugin_sdk::PaneFocusDirection::Next)
+        }
+        PaneDirection::Left | PaneDirection::Up => Some(bmux_plugin_sdk::PaneFocusDirection::Prev),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Used as a fn-pointer in `.map_err(...)`; ref-taking would require closures.
+fn map_host_error<E: ToString>(err: E) -> PaneMutationError {
+    PaneMutationError::Failed {
+        reason: err.to_string(),
+    }
+}
+
+impl WindowsCommandsService for WindowsCommandsHandle {
+    fn focus_pane<'a>(
+        &'a self,
+        id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), FocusError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let request = bmux_plugin_sdk::PaneFocusRequest {
+                session: None,
+                target: Some(bmux_plugin_sdk::PaneSelector::ById(id)),
+                direction: None,
+            };
+            caller
+                .pane_focus(&request)
+                .map(|_| ())
+                .map_err(|error| FocusError::FocusDenied {
+                    reason: error.to_string(),
+                })
+        })
+    }
+
+    fn close_pane<'a>(
+        &'a self,
+        id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CloseError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let request = bmux_plugin_sdk::PaneCloseRequest {
+                session: None,
+                target: Some(bmux_plugin_sdk::PaneSelector::ById(id)),
+            };
+            caller
+                .pane_close(&request)
+                .map(|_| ())
+                .map_err(|error| CloseError::CloseDenied {
+                    reason: error.to_string(),
+                })
+        })
+    }
+
+    fn split_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Option<Selector>,
+        direction: PaneDirection,
+        _ratio_pct: Option<u32>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let request = bmux_plugin_sdk::PaneSplitRequest {
+                session: session.as_ref().and_then(selector_to_session),
+                target: target.as_ref().map(selector_to_pane),
+                direction: pane_direction_to_split(direction),
+            };
+            caller
+                .pane_split(&request)
+                .map(|response| PaneAck {
+                    ok: true,
+                    pane_id: Some(response.id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn launch_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Option<Selector>,
+        direction: PaneDirection,
+        name: Option<String>,
+        program: String,
+        args: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let request = bmux_plugin_sdk::PaneLaunchRequest {
+                session: session.as_ref().and_then(selector_to_session),
+                target: target.as_ref().map(selector_to_pane),
+                direction: pane_direction_to_split(direction),
+                name,
+                command: bmux_plugin_sdk::PaneLaunchCommand {
+                    program,
+                    args,
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            };
+            caller
+                .pane_launch(&request)
+                .map(|response| PaneAck {
+                    ok: true,
+                    pane_id: Some(response.id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn resize_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Option<Selector>,
+        delta: i16,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let request = bmux_plugin_sdk::PaneResizeRequest {
+                session: session.as_ref().and_then(selector_to_session),
+                target: target.as_ref().map(selector_to_pane),
+                delta,
+            };
+            caller
+                .pane_resize(&request)
+                .map(|_| PaneAck {
+                    ok: true,
+                    pane_id: None,
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn zoom_pane<'a>(
+        &'a self,
+        _session: Option<Selector>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        Box::pin(async move {
+            // The host doesn't expose a byte-encoded zoom service
+            // today (zoom is computed in the attach layout); surface
+            // a clear "not yet wired" error rather than silently
+            // succeeding. Once core exposes a zoom primitive the
+            // typed path wires straight through.
+            Err(PaneMutationError::Failed {
+                reason: "zoom-pane typed command is not wired to a host primitive yet".into(),
+            })
+        })
+    }
+
+    fn restart_pane<'a>(
+        &'a self,
+        _session: Option<Selector>,
+        _target: Option<Selector>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(PaneMutationError::Failed {
+                reason: "restart-pane typed command is not wired to a host primitive yet".into(),
+            })
+        })
+    }
+
+    fn new_window<'a>(
+        &'a self,
+        name: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<WindowAck, WindowError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            create_window(&*caller, name).map_err(|reason| WindowError::Failed { reason })
+        })
+    }
+
+    fn kill_window<'a>(
+        &'a self,
+        target: String,
+        force_local: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<WindowAck, WindowError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let selector =
+                parse_selector(&target).map_err(|reason| WindowError::Failed { reason })?;
+            kill_window(&*caller, selector, force_local)
+                .map_err(|reason| WindowError::Failed { reason })
+        })
+    }
+
+    fn kill_all_windows<'a>(
+        &'a self,
+        force_local: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<WindowAck, WindowError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            kill_all_windows(&*caller, force_local).map_err(|reason| WindowError::Failed { reason })
+        })
+    }
+
+    fn switch_window<'a>(
+        &'a self,
+        target: String,
+    ) -> Pin<Box<dyn Future<Output = Result<WindowAck, WindowError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        let last_selected = self.shared.last_selected_by_client.clone();
+        Box::pin(async move {
+            let selector =
+                parse_selector(&target).map_err(|reason| WindowError::Failed { reason })?;
+            switch_window(&*caller, selector, &last_selected)
+                .map_err(|reason| WindowError::Failed { reason })
+        })
+    }
+}
+
+impl WindowsStateService for WindowsStateHandle {
+    fn pane_state<'a>(
+        &'a self,
+        _id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Option<PaneState>> + Send + 'a>> {
+        // Pane-level state hasn't been wired yet; return `None` for now
+        // and revisit when the scene surfaces enough for the plugin to
+        // materialize a full `PaneState` without the host-runtime API
+        // exposing pane metadata.
+        Box::pin(async move { None })
+    }
+
+    fn focused_pane<'a>(
+        &'a self,
+        _session: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Option<Uuid>> + Send + 'a>> {
+        Box::pin(async move { None })
+    }
+
+    fn zoomed_pane<'a>(
+        &'a self,
+        _session: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Option<Uuid>> + Send + 'a>> {
+        Box::pin(async move { None })
+    }
+
+    fn list_panes<'a>(
+        &'a self,
+        session: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Vec<PaneState>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let request = bmux_plugin_sdk::PaneListRequest {
+                session: Some(bmux_plugin_sdk::SessionSelector::ById(session)),
+            };
+            let Ok(response) = caller.pane_list(&request) else {
+                return Vec::new();
+            };
+            response
+                .panes
+                .into_iter()
+                .map(|pane| PaneState {
+                    id: pane.id,
+                    session_id: session,
+                    focused: pane.focused,
+                    zoomed: false,
+                    name: pane.name,
+                    status: windows_state::PaneStatus::default(),
+                })
+                .collect()
+        })
+    }
+
+    fn list_windows<'a>(
+        &'a self,
+        session: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Vec<WindowEntry>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move { list_windows(&*caller, session.as_deref()).unwrap_or_default() })
+    }
 }
 
 #[cfg(test)]
@@ -1396,11 +1811,11 @@ mod tests {
     #[test]
     fn switch_window_requires_target_context_to_exist() {
         let host = MockHost::with_sessions(sample_sessions());
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
         let error = switch_window(
             &host,
             SessionSelector::ById(Uuid::new_v4()),
-            &mut last_selected_by_client,
+            &last_selected_by_client,
         )
         .expect_err("switch should fail when context is missing");
         assert!(error.contains("not found"));
@@ -1411,12 +1826,12 @@ mod tests {
         let sessions = sample_sessions();
         let target_id = sessions[1].id;
         let host = MockHost::with_sessions(sessions);
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
         let ack = switch_window(
             &host,
             SessionSelector::ById(target_id),
-            &mut last_selected_by_client,
+            &last_selected_by_client,
         )
         .expect("switch should succeed");
         assert!(ack.ok);
@@ -1439,12 +1854,12 @@ mod tests {
             .get(1)
             .expect("sample sessions should include second item")
             .id;
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
         let ack = switch_window(
             &host,
             SessionSelector::ById(target_id),
-            &mut last_selected_by_client,
+            &last_selected_by_client,
         )
         .expect("switch should succeed even if current client query fails");
         assert!(ack.ok);
@@ -1457,14 +1872,10 @@ mod tests {
         let sessions = sample_sessions();
         let target_id = sessions[1].id;
         let host = MockHost::with_sessions(sessions);
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
-        let ack = cycle_window(
-            &host,
-            WindowCycleDirection::Next,
-            &mut last_selected_by_client,
-        )
-        .expect("next window should succeed");
+        let ack = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
+            .expect("next window should succeed");
         assert!(ack.ok);
         let target_text = target_id.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
@@ -1491,12 +1902,12 @@ mod tests {
         ];
         let target_id = sessions[2].id;
         let host = MockHost::with_sessions(sessions);
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
         let ack = cycle_window(
             &host,
             WindowCycleDirection::Previous,
-            &mut last_selected_by_client,
+            &last_selected_by_client,
         )
         .expect("previous window should succeed");
         assert!(ack.ok);
@@ -1511,30 +1922,22 @@ mod tests {
         let second_id = sessions[1].id;
         let third_id = sessions[2].id;
         let host = MockHost::with_sessions(sessions);
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
-        let next = cycle_window(
-            &host,
-            WindowCycleDirection::Next,
-            &mut last_selected_by_client,
-        )
-        .expect("next window should succeed");
+        let next = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
+            .expect("next window should succeed");
         let second_text = second_id.to_string();
         assert_eq!(next.id.as_deref(), Some(second_text.as_str()));
 
-        let next_again = cycle_window(
-            &host,
-            WindowCycleDirection::Next,
-            &mut last_selected_by_client,
-        )
-        .expect("second next window should succeed");
+        let next_again = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
+            .expect("second next window should succeed");
         let third_text = third_id.to_string();
         assert_eq!(next_again.id.as_deref(), Some(third_text.as_str()));
 
         let previous = cycle_window(
             &host,
             WindowCycleDirection::Previous,
-            &mut last_selected_by_client,
+            &last_selected_by_client,
         )
         .expect("previous window should succeed");
         assert_eq!(previous.id.as_deref(), Some(second_text.as_str()));
@@ -1557,14 +1960,10 @@ mod tests {
         let second_id = sessions[1].id;
         let third_id = sessions[2].id;
         let host = MockHost::with_sessions(sessions);
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
-        let _ = cycle_window(
-            &host,
-            WindowCycleDirection::Next,
-            &mut last_selected_by_client,
-        )
-        .expect("next window should succeed");
+        let _ = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
+            .expect("next window should succeed");
 
         let windows = list_windows(&host, None).expect("list should succeed");
         assert_eq!(windows.len(), 3);
@@ -1598,13 +1997,9 @@ mod tests {
             attributes: BTreeMap::new(),
         }];
         let host = MockHost::with_sessions(sessions);
-        let mut last_selected_by_client = BTreeMap::new();
-        let error = cycle_window(
-            &host,
-            WindowCycleDirection::Last,
-            &mut last_selected_by_client,
-        )
-        .expect_err("last window should require alternate session");
+        let last_selected_by_client = LastSelectedByClient::default();
+        let error = cycle_window(&host, WindowCycleDirection::Last, &last_selected_by_client)
+            .expect_err("last window should require alternate session");
         assert!(error.contains("no alternate window"));
     }
 
@@ -1613,21 +2008,13 @@ mod tests {
         let sessions = sample_sessions();
         let target_id = sessions[0].id;
         let host = MockHost::with_sessions(sessions);
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
-        let _ = cycle_window(
-            &host,
-            WindowCycleDirection::Next,
-            &mut last_selected_by_client,
-        )
-        .expect("next window should succeed");
+        let _ = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
+            .expect("next window should succeed");
 
-        let ack = cycle_window(
-            &host,
-            WindowCycleDirection::Last,
-            &mut last_selected_by_client,
-        )
-        .expect("last window should use remembered selection");
+        let ack = cycle_window(&host, WindowCycleDirection::Last, &last_selected_by_client)
+            .expect("last window should use remembered selection");
 
         assert!(ack.ok);
         let target_text = target_id.to_string();
@@ -1665,11 +2052,11 @@ mod tests {
             .first()
             .expect("sample sessions should exist")
             .id;
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
         let error = switch_window(
             &host,
             SessionSelector::ById(target),
-            &mut last_selected_by_client,
+            &last_selected_by_client,
         )
         .expect_err("switch should fail when select fails");
         assert!(error.contains("mock select failure"));
@@ -1805,9 +2192,9 @@ mod tests {
         let sessions = sample_sessions();
         let first_id = sessions[0].id;
         let host = MockHost::with_sessions(sessions);
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
-        let ack = goto_window_by_index(&host, 1, &mut last_selected_by_client)
+        let ack = goto_window_by_index(&host, 1, &last_selected_by_client)
             .expect("goto index 1 should succeed");
         assert!(ack.ok);
         let first_text = first_id.to_string();
@@ -1819,9 +2206,9 @@ mod tests {
         let sessions = sample_sessions();
         let second_id = sessions[1].id;
         let host = MockHost::with_sessions(sessions);
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
-        let ack = goto_window_by_index(&host, 2, &mut last_selected_by_client)
+        let ack = goto_window_by_index(&host, 2, &last_selected_by_client)
             .expect("goto index 2 should succeed");
         assert!(ack.ok);
         let second_text = second_id.to_string();
@@ -1831,9 +2218,9 @@ mod tests {
     #[test]
     fn goto_window_by_index_rejects_zero() {
         let host = MockHost::with_sessions(sample_sessions());
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
-        let error = goto_window_by_index(&host, 0, &mut last_selected_by_client)
+        let error = goto_window_by_index(&host, 0, &last_selected_by_client)
             .expect_err("index 0 should fail");
         assert!(error.contains("1 or greater"));
     }
@@ -1841,9 +2228,9 @@ mod tests {
     #[test]
     fn goto_window_by_index_rejects_out_of_range() {
         let host = MockHost::with_sessions(sample_sessions());
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
-        let error = goto_window_by_index(&host, 99, &mut last_selected_by_client)
+        let error = goto_window_by_index(&host, 99, &last_selected_by_client)
             .expect_err("index 99 should fail");
         assert!(error.contains("out of range"));
     }
@@ -1853,9 +2240,9 @@ mod tests {
         let sessions = sample_sessions();
         let first_id = sessions[0].id;
         let host = MockHost::with_sessions(sessions);
-        let mut last_selected_by_client = BTreeMap::new();
+        let last_selected_by_client = LastSelectedByClient::default();
 
-        let ack = close_current_window(&host, &mut last_selected_by_client)
+        let ack = close_current_window(&host, &last_selected_by_client)
             .expect("close current should succeed");
         assert!(ack.ok);
         let first_text = first_id.to_string();
