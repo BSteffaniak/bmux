@@ -2518,8 +2518,30 @@ pub async fn handle_attach_ui_action(
             handle_attach_runtime_action(client, action, view_state).await?;
         }
         RuntimeAction::RestartFocusedPane => {
+            #[derive(serde::Serialize)]
+            struct Args {
+                selector: Option<bmux_ipc::SessionSelector>,
+            }
             let selector = attached_session_selector(view_state);
-            let _ = client.restart_pane(Some(selector)).await?;
+            // Typed dispatch replaces the legacy `BmuxClient::restart_pane`
+            // convenience method; route through
+            // `windows-commands:restart-pane` directly.
+            let payload = bmux_codec::to_vec(&Args {
+                selector: Some(selector),
+            })
+            .map_err(|error| ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("encoding restart-pane args: {error}"),
+            })?;
+            let _response_bytes = client
+                .invoke_service_raw(
+                    typed_windows::WINDOWS_WRITE_CAPABILITY.as_str(),
+                    typed_windows::COMMAND_KIND,
+                    typed_windows::WINDOWS_COMMANDS_INTERFACE.as_str(),
+                    "restart-pane",
+                    payload,
+                )
+                .await?;
             view_state.set_transient_status(
                 "pane restarted",
                 Instant::now(),

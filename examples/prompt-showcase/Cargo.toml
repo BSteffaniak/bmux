@@ -12,10 +12,16 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-anyhow               = { workspace = true, features = ["std"] }
-bmux_cli             = { workspace = true }
-bmux_sandbox_harness = { workspace = true }
-tokio                = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+anyhow                   = { workspace = true, features = ["std"] }
+bmux_cli                 = { workspace = true }
+bmux_client              = { workspace = true }
+bmux_codec               = { workspace = true }
+bmux_ipc                 = { workspace = true }
+bmux_sandbox_harness     = { workspace = true }
+bmux_sessions_plugin_api = { workspace = true }
+serde                    = { workspace = true, features = ["derive", "std"] }
+tokio                    = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+uuid                     = { workspace = true, features = ["std"] }
 
 [features]
 fail-on-warnings = [

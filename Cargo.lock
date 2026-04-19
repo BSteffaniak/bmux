@@ -1491,9 +1491,15 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
  "bmux_cli",
+ "bmux_client",
+ "bmux_codec",
  "bmux_example_native_plugin",
+ "bmux_ipc",
  "bmux_sandbox_harness",
+ "bmux_sessions_plugin_api",
+ "serde",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1502,8 +1508,14 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
  "bmux_cli",
+ "bmux_client",
+ "bmux_codec",
+ "bmux_ipc",
  "bmux_sandbox_harness",
+ "bmux_sessions_plugin_api",
+ "serde",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -3,8 +3,37 @@ use bmux_cli::attach::{
     self, AttachExitReason, PromptOption, PromptRequest, PromptResponse, PromptSubmitError,
     PromptValue,
 };
+use bmux_client::BmuxClient;
 use bmux_sandbox_harness::SandboxHarness;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+/// Typed dispatch for `sessions-commands:new-session` — replaces the
+/// legacy `BmuxClient::new_session` convenience method deleted in M4.
+async fn typed_new_session(client: &mut BmuxClient, name: Option<String>) -> Result<Uuid> {
+    #[derive(serde::Serialize)]
+    struct Args {
+        name: Option<String>,
+    }
+    let payload = bmux_codec::to_vec(&Args { name }).context("encoding new-session args")?;
+    let bytes = client
+        .invoke_service_raw(
+            "bmux.sessions.write",
+            bmux_ipc::InvokeServiceKind::Command,
+            "sessions-commands",
+            "new-session",
+            payload,
+        )
+        .await
+        .context("new-session invoke failed")?;
+    let outcome: std::result::Result<
+        bmux_sessions_plugin_api::sessions_commands::SessionAck,
+        bmux_sessions_plugin_api::sessions_commands::NewSessionError,
+    > = bmux_codec::from_bytes(&bytes).context("decoding new-session response")?;
+    outcome
+        .map(|ack| ack.id)
+        .map_err(|err| anyhow::anyhow!("new-session failed: {err:?}"))
+}
 
 const PROMPT_HOST_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 const PROMPT_HOST_WAIT_POLL: Duration = Duration::from_millis(75);
@@ -30,8 +59,7 @@ async fn run_showcase(sandbox: &SandboxHarness) -> Result<()> {
         .connect("bmux-prompt-showcase")
         .await
         .context("failed connecting to sandbox")?;
-    let session_id = attach_client
-        .new_session(Some("prompt-showcase".to_string()))
+    let session_id = typed_new_session(&mut attach_client, Some("prompt-showcase".to_string()))
         .await
         .context("failed creating prompt showcase session")?;
 

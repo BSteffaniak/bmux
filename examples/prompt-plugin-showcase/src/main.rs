@@ -1,6 +1,35 @@
 use anyhow::{Context, Result};
 use bmux_cli::attach::{self, AttachExitReason};
+use bmux_client::BmuxClient;
 use bmux_sandbox_harness::SandboxHarness;
+use uuid::Uuid;
+
+/// Typed dispatch for `sessions-commands:new-session` — replaces the
+/// legacy `BmuxClient::new_session` convenience method deleted in M4.
+async fn typed_new_session(client: &mut BmuxClient, name: Option<String>) -> Result<Uuid> {
+    #[derive(serde::Serialize)]
+    struct Args {
+        name: Option<String>,
+    }
+    let payload = bmux_codec::to_vec(&Args { name }).context("encoding new-session args")?;
+    let bytes = client
+        .invoke_service_raw(
+            "bmux.sessions.write",
+            bmux_ipc::InvokeServiceKind::Command,
+            "sessions-commands",
+            "new-session",
+            payload,
+        )
+        .await
+        .context("new-session invoke failed")?;
+    let outcome: std::result::Result<
+        bmux_sessions_plugin_api::sessions_commands::SessionAck,
+        bmux_sessions_plugin_api::sessions_commands::NewSessionError,
+    > = bmux_codec::from_bytes(&bytes).context("decoding new-session response")?;
+    outcome
+        .map(|ack| ack.id)
+        .map_err(|err| anyhow::anyhow!("new-session failed: {err:?}"))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,10 +52,12 @@ async fn run_showcase(sandbox: &SandboxHarness) -> Result<()> {
         .connect("bmux-plugin-prompt-showcase")
         .await
         .context("failed connecting to sandbox")?;
-    let session_id = attach_client
-        .new_session(Some("plugin-prompt-showcase".to_string()))
-        .await
-        .context("failed creating plugin prompt showcase session")?;
+    let session_id = typed_new_session(
+        &mut attach_client,
+        Some("plugin-prompt-showcase".to_string()),
+    )
+    .await
+    .context("failed creating plugin prompt showcase session")?;
 
     let target = session_id.to_string();
 

@@ -56,6 +56,46 @@ async fn typed_list_sessions(client: &mut BmuxClient) -> Result<Vec<TypedSession
         .context("decoding list-sessions response")
 }
 
+/// Invoke `sessions-commands:kill-session` on a `BmuxClient`.
+///
+/// Replaces the legacy `BmuxClient::kill_session_with_options`.
+async fn typed_kill_session(
+    client: &mut BmuxClient,
+    selector: SessionSelector,
+    force_local: bool,
+) -> std::result::Result<uuid::Uuid, ClientError> {
+    let args = typed_sessions::KillSessionArgs {
+        selector: typed_sessions::from_ipc_selector(selector),
+        force_local,
+    };
+    let payload = bmux_codec::to_vec(&args).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding kill-session args: {error}"),
+    })?;
+    let bytes = client
+        .invoke_service_raw(
+            typed_sessions::SESSIONS_WRITE_CAPABILITY.as_str(),
+            typed_sessions::COMMAND_KIND,
+            typed_sessions::SESSIONS_COMMANDS_INTERFACE.as_str(),
+            typed_sessions::OP_KILL_SESSION,
+            payload,
+        )
+        .await?;
+    let outcome: std::result::Result<
+        SessionAck,
+        bmux_sessions_plugin_api::sessions_commands::KillSessionError,
+    > = bmux_codec::from_bytes(&bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding kill-session response: {error}"),
+    })?;
+    outcome
+        .map(|ack| ack.id)
+        .map_err(|err| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("kill-session failed: {err:?}"),
+        })
+}
+
 /// Invoke `clients-state:list-clients` on a `BmuxClient`.
 async fn typed_list_clients(client: &mut BmuxClient) -> Result<Vec<TypedClientSummary>> {
     let payload = bmux_codec::to_vec(&()).context("encoding list-clients args")?;
@@ -386,8 +426,7 @@ pub(super) async fn run_session_kill(
     };
 
     let _ = kill_preflight_identity(&mut client, force_local).await?;
-    let killed_id = client
-        .kill_session_with_options(selector, force_local)
+    let killed_id = typed_kill_session(&mut client, selector, force_local)
         .await
         .map_err(|error| {
             anyhow::anyhow!(format_destructive_op_error("session", error, force_local))
@@ -435,9 +474,7 @@ pub(super) async fn run_session_kill_all(
     let mut failed_count = 0usize;
     let mut failure_summary = KillFailureSummary::default();
     for session in sessions {
-        match client
-            .kill_session_with_options(SessionSelector::ById(session.id), force_local)
-            .await
+        match typed_kill_session(&mut client, SessionSelector::ById(session.id), force_local).await
         {
             Ok(killed_id) => {
                 println!("killed session: {killed_id}");
