@@ -121,6 +121,12 @@ impl ClientsStateService for ClientsStateHandle {
             Ok(ClientSummary {
                 id: response.id,
                 selected_session_id: response.selected_session_id,
+                // Core's `CurrentClientResponse` does not currently
+                // carry a selected context id; the clients-plugin will
+                // surface that once Stage 8 re-homes state into this
+                // plugin and the notion of "current context per
+                // client" moves here.
+                selected_context_id: None,
                 following_client_id: response.following_client_id,
                 following_global: response.following_global,
             })

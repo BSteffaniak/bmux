@@ -13,14 +13,12 @@
 
 #![allow(dead_code)] // Pieces are consumed incrementally as call sites migrate.
 
-use bmux_codec::{from_bytes, to_vec};
 use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector};
 use bmux_plugin_sdk::{CapabilityId, InterfaceId};
 use bmux_windows_plugin_api::{
     capabilities::WINDOWS_WRITE,
     windows_commands::{self, PaneAck, PaneDirection, Selector},
 };
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Capability guarding the windows plugin's mutating command surface.
@@ -186,64 +184,6 @@ pub const fn ipc_split_to_typed_direction(direction: PaneSplitDirection) -> Pane
         PaneSplitDirection::Vertical => PaneDirection::Vertical,
         PaneSplitDirection::Horizontal => PaneDirection::Horizontal,
     }
-}
-
-/// Errors returned by [`invoke_with`].
-#[derive(Debug)]
-pub enum InvokeError {
-    /// Serializing the typed arg struct to the wire format failed.
-    Encode { operation: String, message: String },
-    /// Deserializing the typed response from the wire format failed.
-    Decode { operation: String, message: String },
-    /// The client transport returned an error before the response was
-    /// received.
-    Client(String),
-}
-
-impl std::fmt::Display for InvokeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Encode { operation, message } => {
-                write!(f, "encoding {operation} args failed: {message}")
-            }
-            Self::Decode { operation, message } => {
-                write!(f, "decoding {operation} response failed: {message}")
-            }
-            Self::Client(message) => write!(f, "client transport failed: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for InvokeError {}
-
-/// Minimal async abstraction over the two concrete IPC client types
-/// ([`bmux_client::BmuxClient`] and
-/// [`bmux_client::StreamingBmuxClient`]), both of which expose
-/// `invoke_service_raw` with identical signatures but no shared trait.
-///
-/// Callers pass a closure that owns the client borrow and issues the
-/// raw invocation; this keeps the helper client-type-agnostic.
-#[allow(clippy::future_not_send)]
-pub async fn invoke_with<F, Fut, Req, Resp>(
-    operation: &str,
-    args: &Req,
-    invoke: F,
-) -> Result<Resp, InvokeError>
-where
-    Req: Serialize + Sync,
-    Resp: for<'de> Deserialize<'de>,
-    F: FnOnce(Vec<u8>) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
-{
-    let payload = to_vec(args).map_err(|source| InvokeError::Encode {
-        operation: operation.to_string(),
-        message: source.to_string(),
-    })?;
-    let response_bytes = invoke(payload).await.map_err(InvokeError::Client)?;
-    from_bytes::<Resp>(&response_bytes).map_err(|source| InvokeError::Decode {
-        operation: operation.to_string(),
-        message: source.to_string(),
-    })
 }
 
 /// Re-export of [`bmux_windows_plugin_api::windows_commands::PaneAck`]

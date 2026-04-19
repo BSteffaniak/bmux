@@ -13,6 +13,7 @@ fn client_summary_round_trips() {
     let summary = ClientSummary {
         id: uuid::Uuid::nil(),
         selected_session_id: Some(uuid::Uuid::nil()),
+        selected_context_id: None,
         following_client_id: None,
         following_global: true,
     };

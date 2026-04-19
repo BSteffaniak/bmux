@@ -17,6 +17,7 @@ interface clients-state {
     record client-summary {
         id: uuid,
         selected_session_id: uuid?,
+        selected_context_id: uuid?,
         following_client_id: uuid?,
         following_global: bool,
     }
