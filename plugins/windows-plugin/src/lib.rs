@@ -42,6 +42,7 @@ impl RustPlugin for WindowsPlugin {
         Ok(EXIT_OK)
     }
 
+    #[allow(clippy::too_many_lines)] // route_service! covers every windows-commands op; the block is naturally long.
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "windows-state", "list-windows" => |req: ListWindowsArgs, ctx| {
@@ -86,6 +87,25 @@ impl RustPlugin for WindowsPlugin {
                 };
                 ctx.pane_close(&request)
                     .map(|_| PaneAck { ok: true, pane_id: Some(req.id) })
+                    .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
+            },
+            "windows-commands", "focus-pane-by-selector" => |req: FocusPaneBySelectorArgs, ctx| {
+                let request = bmux_plugin_sdk::PaneFocusRequest {
+                    session: req.session.as_ref().and_then(selector_to_session),
+                    target: Some(selector_to_pane(&req.target)),
+                    direction: None,
+                };
+                ctx.pane_focus(&request)
+                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
+                    .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
+            },
+            "windows-commands", "close-pane-by-selector" => |req: ClosePaneBySelectorArgs, ctx| {
+                let request = bmux_plugin_sdk::PaneCloseRequest {
+                    session: req.session.as_ref().and_then(selector_to_session),
+                    target: Some(selector_to_pane(&req.target)),
+                };
+                ctx.pane_close(&request)
+                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
                     .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
             },
             "windows-commands", "split-pane" => |req: SplitPaneArgs, ctx| {
@@ -833,11 +853,19 @@ fn selector_to_session(selector: &Selector) -> Option<bmux_plugin_sdk::SessionSe
 /// a name selector on the host side, so a bare `name` falls back to
 /// the active pane. Consumers that need index-based selection can
 /// extend the BPDL `selector` record later.
-fn selector_to_pane(selector: &Selector) -> bmux_plugin_sdk::PaneSelector {
-    selector.id.map_or(
-        bmux_plugin_sdk::PaneSelector::Active,
-        bmux_plugin_sdk::PaneSelector::ById,
-    )
+/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_sdk::PaneSelector`].
+/// Precedence: `id` → `index` → `name` → active. Name-based pane
+/// selection has no direct IPC equivalent today, so a bare `name`
+/// falls back to the active pane.
+#[allow(clippy::option_if_let_else)] // Chained `if let` is clearer than nested `map_or` here.
+const fn selector_to_pane(selector: &Selector) -> bmux_plugin_sdk::PaneSelector {
+    if let Some(id) = selector.id {
+        bmux_plugin_sdk::PaneSelector::ById(id)
+    } else if let Some(index) = selector.index {
+        bmux_plugin_sdk::PaneSelector::ByIndex(index)
+    } else {
+        bmux_plugin_sdk::PaneSelector::Active
+    }
 }
 
 const fn pane_direction_to_split(direction: PaneDirection) -> bmux_plugin_sdk::PaneSplitDirection {
@@ -915,6 +943,51 @@ impl WindowsCommandsService for WindowsCommandsHandle {
                 .map_err(|error| CloseError::CloseDenied {
                     reason: error.to_string(),
                 })
+        })
+    }
+
+    fn focus_pane_by_selector<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Selector,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let pane_selector = selector_to_pane(&target);
+            let request = bmux_plugin_sdk::PaneFocusRequest {
+                session: session.as_ref().and_then(selector_to_session),
+                target: Some(pane_selector),
+                direction: None,
+            };
+            caller
+                .pane_focus(&request)
+                .map(|response| PaneAck {
+                    ok: true,
+                    pane_id: Some(response.id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn close_pane_by_selector<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Selector,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let pane_selector = selector_to_pane(&target);
+            let request = bmux_plugin_sdk::PaneCloseRequest {
+                session: session.as_ref().and_then(selector_to_session),
+                target: Some(pane_selector),
+            };
+            caller
+                .pane_close(&request)
+                .map(|response| PaneAck {
+                    ok: true,
+                    pane_id: Some(response.id),
+                })
+                .map_err(map_host_error)
         })
     }
 
@@ -1216,6 +1289,20 @@ struct FocusPaneArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ClosePaneArgs {
     id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FocusPaneBySelectorArgs {
+    #[serde(default)]
+    session: Option<Selector>,
+    target: Selector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClosePaneBySelectorArgs {
+    #[serde(default)]
+    session: Option<Selector>,
+    target: Selector,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

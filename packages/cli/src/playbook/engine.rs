@@ -524,6 +524,35 @@ impl AttachInputRuntime {
     }
 }
 
+/// Invoke a `windows-commands` typed operation on a [`BmuxClient`] by
+/// routing through `Request::InvokeService`. Mirrors the pattern the
+/// attach runtime uses on its `StreamingBmuxClient` handle; separate
+/// helpers exist because the two client types share no trait.
+async fn invoke_windows_command_bmux<Req, Resp>(
+    client: &mut BmuxClient,
+    operation: &str,
+    args: &Req,
+) -> anyhow::Result<Resp>
+where
+    Req: serde::Serialize + Sync,
+    Resp: serde::de::DeserializeOwned,
+{
+    let payload = bmux_codec::to_vec(args)
+        .map_err(|error| anyhow::anyhow!("encoding {operation}: {error}"))?;
+    let response_bytes = client
+        .invoke_service_raw(
+            crate::runtime::typed_windows::WINDOWS_WRITE_CAPABILITY,
+            bmux_ipc::InvokeServiceKind::Command,
+            crate::runtime::typed_windows::WINDOWS_COMMANDS_INTERFACE,
+            operation,
+            payload,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("client invoke_service_raw failed: {e}"))?;
+    bmux_codec::from_bytes::<Resp>(&response_bytes)
+        .map_err(|error| anyhow::anyhow!("decoding {operation} response: {error}"))
+}
+
 /// Run a playbook to completion, returning the result.
 ///
 /// Handles Ctrl+C gracefully: on signal, the sandbox server is cleaned up
@@ -1583,10 +1612,26 @@ pub(super) async fn execute_step(
                 SplitDirection::Vertical => PaneSplitDirection::Vertical,
                 SplitDirection::Horizontal => PaneSplitDirection::Horizontal,
             };
-            let pane_id = client
-                .split_pane(Some(SessionSelector::ById(sid)), ipc_dir)
+            let ack: bmux_windows_plugin_api::windows_commands::PaneAck =
+                invoke_windows_command_bmux(
+                    client,
+                    "split-pane",
+                    &crate::runtime::typed_windows::args::SplitPane {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(sid),
+                        )),
+                        target: None,
+                        direction: crate::runtime::typed_windows::ipc_split_to_typed_direction(
+                            ipc_dir,
+                        ),
+                        ratio_pct: None,
+                    },
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("split-pane failed: {e}"))?;
+            let pane_id = ack
+                .pane_id
+                .ok_or_else(|| anyhow::anyhow!("split-pane returned no pane id"))?;
 
             // Let the new pane shell start
             drain_output_until_idle(
@@ -1608,9 +1653,20 @@ pub(super) async fn execute_step(
         Action::FocusPane { target } => {
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
-            let selector = bmux_ipc::PaneSelector::ByIndex(*target);
-            client
-                .focus_pane_target(Some(SessionSelector::ById(sid)), selector)
+            let selector = crate::runtime::typed_windows::ipc_pane_to_typed_selector(
+                &bmux_ipc::PaneSelector::ByIndex(*target),
+            );
+            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
+                invoke_windows_command_bmux(
+                    client,
+                    "focus-pane-by-selector",
+                    &crate::runtime::typed_windows::args::FocusPaneBySelector {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(sid),
+                        )),
+                        target: selector,
+                    },
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("focus-pane failed: {e}"))?;
             runtime_vars.focused_pane = *target;
@@ -1620,21 +1676,31 @@ pub(super) async fn execute_step(
         Action::ClosePane { target } => {
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
-            match target {
-                Some(idx) => {
-                    let selector = bmux_ipc::PaneSelector::ByIndex(*idx);
-                    client
-                        .close_pane_target(Some(SessionSelector::ById(sid)), selector)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("close-pane failed: {e}"))?;
-                }
-                None => {
-                    client
-                        .close_pane(Some(SessionSelector::ById(sid)))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("close-pane failed: {e}"))?;
-                }
-            }
+            let selector = target.as_ref().map_or_else(
+                || {
+                    crate::runtime::typed_windows::ipc_pane_to_typed_selector(
+                        &bmux_ipc::PaneSelector::Active,
+                    )
+                },
+                |idx| {
+                    crate::runtime::typed_windows::ipc_pane_to_typed_selector(
+                        &bmux_ipc::PaneSelector::ByIndex(*idx),
+                    )
+                },
+            );
+            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
+                invoke_windows_command_bmux(
+                    client,
+                    "close-pane-by-selector",
+                    &crate::runtime::typed_windows::args::ClosePaneBySelector {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(sid),
+                        )),
+                        target: selector,
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("close-pane failed: {e}"))?;
             runtime_vars.pane_count = runtime_vars.pane_count.saturating_sub(1);
             Ok(None)
         }
@@ -2223,22 +2289,40 @@ async fn apply_attach_runtime_actions(
                 bail!("attach input requested detach; unsupported inside playbook step")
             }
             crate::input::RuntimeAction::SplitFocusedVertical => {
-                client
-                    .split_pane(
-                        Some(SessionSelector::ById(runtime.state.attached_id)),
-                        PaneSplitDirection::Vertical,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("split focused vertical failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "split-pane",
+                    &crate::runtime::typed_windows::args::SplitPane {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                        target: None,
+                        direction: crate::runtime::typed_windows::ipc_split_to_typed_direction(
+                            PaneSplitDirection::Vertical,
+                        ),
+                        ratio_pct: None,
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("split focused vertical failed: {e}"))?;
             }
             crate::input::RuntimeAction::SplitFocusedHorizontal => {
-                client
-                    .split_pane(
-                        Some(SessionSelector::ById(runtime.state.attached_id)),
-                        PaneSplitDirection::Horizontal,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("split focused horizontal failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "split-pane",
+                    &crate::runtime::typed_windows::args::SplitPane {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                        target: None,
+                        direction: crate::runtime::typed_windows::ipc_split_to_typed_direction(
+                            PaneSplitDirection::Horizontal,
+                        ),
+                        ratio_pct: None,
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("split focused horizontal failed: {e}"))?;
             }
             crate::input::RuntimeAction::FocusNext => {
                 client
@@ -2309,18 +2393,36 @@ async fn apply_attach_runtime_actions(
             crate::input::RuntimeAction::IncreaseSplit
             | crate::input::RuntimeAction::ResizeRight
             | crate::input::RuntimeAction::ResizeDown => {
-                client
-                    .resize_pane(Some(SessionSelector::ById(runtime.state.attached_id)), 1)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("resize increase failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "resize-pane",
+                    &crate::runtime::typed_windows::args::ResizePane {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                        target: None,
+                        delta: 1,
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("resize increase failed: {e}"))?;
             }
             crate::input::RuntimeAction::DecreaseSplit
             | crate::input::RuntimeAction::ResizeLeft
             | crate::input::RuntimeAction::ResizeUp => {
-                client
-                    .resize_pane(Some(SessionSelector::ById(runtime.state.attached_id)), -1)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("resize decrease failed: {e}"))?;
+                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
+                    client,
+                    "resize-pane",
+                    &crate::runtime::typed_windows::args::ResizePane {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                        target: None,
+                        delta: -1,
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("resize decrease failed: {e}"))?;
             }
             crate::input::RuntimeAction::EnterScrollMode => {
                 runtime.state.scrollback_active = true;

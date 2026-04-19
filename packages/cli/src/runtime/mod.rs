@@ -57,6 +57,9 @@ pub mod slot;
 mod slot_cli;
 mod terminal_doctor;
 mod terminal_protocol;
+#[allow(clippy::redundant_pub_crate)]
+// Used from sibling playbook module via crate::runtime::typed_windows.
+pub(crate) mod typed_windows;
 
 use self::logs_watch::{
     active_log_file_path, run_logs_profiles_delete, run_logs_profiles_list,

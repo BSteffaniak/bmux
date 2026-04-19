@@ -80,20 +80,16 @@ const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
 /// already been marked `Ready`.
 const DECORATION_READY_TIMEOUT: Duration = Duration::from_millis(2000);
 
+use super::super::typed_windows;
+
 /// Capability guarding the windows plugin's `windows-commands` service.
-const WINDOWS_WRITE_CAPABILITY: &str = "bmux.windows.write";
+const WINDOWS_WRITE_CAPABILITY: &str = typed_windows::WINDOWS_WRITE_CAPABILITY;
 
 /// Interface id for the windows plugin's mutating command surface.
-const WINDOWS_COMMANDS_INTERFACE: &str = "windows-commands";
+const WINDOWS_COMMANDS_INTERFACE: &str = typed_windows::WINDOWS_COMMANDS_INTERFACE;
 
 /// Invoke a `windows-commands` typed command by routing through the
-/// server's generic `Request::InvokeService` envelope. Args are
-/// serialized with `bmux_codec` to match the `route_service!` macro on
-/// the plugin side; the response is decoded likewise.
-///
-/// The attach client process does not have a local plugin host, so it
-/// cannot call `WindowsCommandsService` methods directly — this helper
-/// is the cross-process bridge.
+/// server's generic `Request::InvokeService` envelope.
 async fn invoke_windows_command<Req, Resp>(
     client: &mut StreamingBmuxClient,
     operation: &str,
@@ -122,94 +118,13 @@ where
     })
 }
 
-/// BPDL-shaped typed arg structs for the `windows-commands` byte-wire
-/// path. These mirror the [`bmux_windows_plugin_api::windows_commands`]
-/// generated parameter lists exactly so the plugin's `route_service!`
-/// decoder lands the same values the typed trait method would.
-#[allow(dead_code)] // Remaining structs come into use as more call sites migrate.
-mod windows_cmd_args {
-    use bmux_windows_plugin_api::windows_commands::{PaneDirection, Selector};
-    use serde::{Deserialize, Serialize};
-    use uuid::Uuid;
+/// Re-export of the shared arg structs for convenience at call sites.
+use typed_windows::args as windows_cmd_args;
+use typed_windows::{ipc_split_to_typed_direction, ipc_to_typed_selector};
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct FocusPane {
-        pub id: Uuid,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ClosePane {
-        pub id: Uuid,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct SplitPane {
-        #[serde(default)]
-        pub session: Option<Selector>,
-        #[serde(default)]
-        pub target: Option<Selector>,
-        pub direction: PaneDirection,
-        #[serde(default)]
-        pub ratio_pct: Option<u32>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ResizePane {
-        #[serde(default)]
-        pub session: Option<Selector>,
-        #[serde(default)]
-        pub target: Option<Selector>,
-        pub delta: i16,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ZoomPane {
-        #[serde(default)]
-        pub session: Option<Selector>,
-    }
-}
-
-/// Convert an IPC [`SessionSelector`] to the typed BPDL [`Selector`].
-fn ipc_to_typed_selector(
-    selector: SessionSelector,
-) -> bmux_windows_plugin_api::windows_commands::Selector {
-    use bmux_windows_plugin_api::windows_commands::Selector as TypedSelector;
-    match selector {
-        SessionSelector::ById(id) => TypedSelector {
-            id: Some(id),
-            name: None,
-        },
-        SessionSelector::ByName(name) => TypedSelector {
-            id: None,
-            name: Some(name),
-        },
-    }
-}
-
-/// Convert an IPC [`PaneFocusDirection`] to the typed BPDL
-/// [`PaneDirection`] used by pane commands.
-#[allow(dead_code)] // Consumed when focus-by-direction migrates to typed dispatch.
-const fn ipc_focus_to_typed_direction(
-    direction: PaneFocusDirection,
-) -> bmux_windows_plugin_api::windows_commands::PaneDirection {
-    use bmux_windows_plugin_api::windows_commands::PaneDirection;
-    match direction {
-        PaneFocusDirection::Next => PaneDirection::Right,
-        PaneFocusDirection::Prev => PaneDirection::Left,
-    }
-}
-
-/// Convert an IPC [`PaneSplitDirection`] to the typed BPDL
-/// [`PaneDirection`].
-const fn ipc_split_to_typed_direction(
-    direction: PaneSplitDirection,
-) -> bmux_windows_plugin_api::windows_commands::PaneDirection {
-    use bmux_windows_plugin_api::windows_commands::PaneDirection;
-    match direction {
-        PaneSplitDirection::Vertical => PaneDirection::Vertical,
-        PaneSplitDirection::Horizontal => PaneDirection::Horizontal,
-    }
-}
+// ── legacy in-attach-runtime helpers that were moved to
+// ── `super::super::typed_windows` are deleted below. Anything that
+// ── still needs converter helpers should import them above.
 
 #[derive(Default)]
 pub struct DisplayCaptureFanout {

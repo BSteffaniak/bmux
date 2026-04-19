@@ -100,17 +100,27 @@ interface windows-commands {
         down,
     }
 
-    // Selector identifying a session or pane; one of the optional
-    // fields should be populated. `id` takes precedence when both are
-    // set.
+    // Selector identifying a session or pane. Exactly one of `id`,
+    // `name`, or `index` should be populated. `id` wins when multiple
+    // are set. `index` is only meaningful for pane selectors scoped
+    // to a session.
     record selector {
         id: uuid?,
         name: string?,
+        index: u32?,
     }
 
     // Pane-level commands.
     command focus-pane(id: uuid) -> result<unit, focus-error>;
     command close-pane(id: uuid) -> result<unit, close-error>;
+    // Selector-targeted variants. These accept the full `selector`
+    // record (id / name / index / active-by-empty) so callers that
+    // address panes by position within a session don't have to resolve
+    // an id first.
+    command focus-pane-by-selector(session: selector?, target: selector)
+        -> result<pane-ack, pane-mutation-error>;
+    command close-pane-by-selector(session: selector?, target: selector)
+        -> result<pane-ack, pane-mutation-error>;
 
     // Split / launch / resize / zoom / restart.
     // Each targets a session (by uuid or name) and an existing pane
