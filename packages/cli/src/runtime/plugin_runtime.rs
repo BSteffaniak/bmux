@@ -65,6 +65,7 @@ pub(super) fn plugin_host_for_declaration(
         declaration.provided_capabilities.clone(),
         available_services,
     )
+    .with_typed_services(typed_service_registry_snapshot())
 }
 
 #[cfg(test)]
@@ -143,6 +144,10 @@ declare_bundled_plugins! {
     feature = "bundled-plugin-windows",
     manifest = include_str!("../../../../plugins/windows-plugin/plugin.toml"),
     plugin_type = bmux_windows_plugin::WindowsPlugin;
+
+    feature = "bundled-plugin-decoration",
+    manifest = include_str!("../../../../plugins/decoration-plugin/plugin.toml"),
+    plugin_type = bmux_decoration_plugin::DecorationPlugin;
 }
 
 fn bundled_manifest_plugin_id(manifest: &str) -> Option<String> {
@@ -780,11 +785,115 @@ pub(super) fn plugin_system_event(name: &str) -> PluginEvent {
     }
 }
 
+thread_local! {
+    /// Shared map of typed service handles published by loaded plugins.
+    ///
+    /// Built once during `activate_loaded_plugins`; consumers that want
+    /// typed dispatch (skipping byte-encoded serialization) read a
+    /// snapshot via [`typed_service_registry_snapshot`] and attach it
+    /// to a [`plugin_host::CliPluginHost`] so
+    /// `PluginHost::resolve_typed_service` surfaces the handle.
+    static TYPED_SERVICE_REGISTRY: std::cell::RefCell<
+        std::sync::Arc<
+            std::collections::BTreeMap<
+                bmux_plugin_sdk::TypedServiceKey,
+                bmux_plugin_sdk::TypedServiceHandle,
+            >,
+        >,
+    > = std::cell::RefCell::new(std::sync::Arc::new(std::collections::BTreeMap::new()));
+
+    /// Per-thread readiness tracker observing every loaded plugin's
+    /// declared ready signals. Each plugin's signals are declared as
+    /// `Pending` during `install_typed_service_registry` and flipped
+    /// to `Ready` after the plugin's `activate` call returns.
+    /// Subsystems (e.g. the attach render loop) consult the tracker
+    /// via [`ready_tracker_snapshot`] to sequence startup against
+    /// plugin availability.
+    static READY_TRACKER: std::cell::RefCell<bmux_plugin_sdk::ReadyTracker> =
+        std::cell::RefCell::new(bmux_plugin_sdk::ReadyTracker::new());
+}
+
+/// Harvest every loaded plugin's typed services and install the
+/// combined map on the thread-local registry. Also declares each
+/// plugin's ready signals on the thread-local [`ReadyTracker`] so
+/// consumers can wait for specific signals to flip.
+fn install_typed_service_registry(loaded_plugins: &[bmux_plugin::LoadedPlugin]) {
+    let mut map: std::collections::BTreeMap<
+        bmux_plugin_sdk::TypedServiceKey,
+        bmux_plugin_sdk::TypedServiceHandle,
+    > = std::collections::BTreeMap::new();
+    for plugin in loaded_plugins {
+        for (key, handle) in plugin.collect_typed_services().into_entries() {
+            map.insert(key, handle);
+        }
+    }
+    TYPED_SERVICE_REGISTRY.with(|cell| {
+        *cell.borrow_mut() = std::sync::Arc::new(map);
+    });
+
+    READY_TRACKER.with(|cell| {
+        let tracker = cell.borrow();
+        for plugin in loaded_plugins {
+            tracker.declare(
+                plugin.declaration.id.as_str(),
+                &plugin.declaration.ready_signals,
+            );
+        }
+    });
+}
+
+/// Flip every ready signal declared by `plugin` to
+/// [`bmux_plugin_sdk::ReadyStatus::Ready`]. Called after the plugin's
+/// `activate` returns `Ok` to signal that any subsystem waiting on one
+/// of its signals can proceed. Plugins that need more granular control
+/// (e.g. waiting on async work beyond activation) will be extended
+/// with an explicit `mark_ready` host-kernel bridge operation later.
+fn mark_plugin_ready_signals(plugin: &bmux_plugin::LoadedPlugin) {
+    READY_TRACKER.with(|cell| {
+        let tracker = cell.borrow();
+        for signal in &plugin.declaration.ready_signals {
+            tracker.mark_ready(plugin.declaration.id.as_str(), &signal.name);
+        }
+    });
+}
+
+/// Snapshot the current typed service registry. Consumers that wire a
+/// [`plugin_host::CliPluginHost`] pass this into
+/// [`plugin_host::CliPluginHost::with_typed_services`] so typed
+/// resolution surfaces any typed handle the loaded plugins registered.
+#[must_use]
+pub(super) fn typed_service_registry_snapshot() -> std::sync::Arc<
+    std::collections::BTreeMap<
+        bmux_plugin_sdk::TypedServiceKey,
+        bmux_plugin_sdk::TypedServiceHandle,
+    >,
+> {
+    TYPED_SERVICE_REGISTRY.with(|cell| std::sync::Arc::clone(&cell.borrow()))
+}
+
+/// Snapshot the current [`bmux_plugin_sdk::ReadyTracker`]. Cheap clone
+/// (internal `Arc`); consumers observe signal state via
+/// [`bmux_plugin_sdk::ReadyTracker::is_ready`] /
+/// [`bmux_plugin_sdk::ReadyTracker::await_ready`] without coupling to
+/// the plugin-runtime module's thread-local cell.
+#[must_use]
+#[allow(dead_code)] // Consumed by attach-render ready-gate wiring landing in a follow-up.
+pub(super) fn ready_tracker_snapshot() -> bmux_plugin_sdk::ReadyTracker {
+    READY_TRACKER.with(|cell| cell.borrow().clone())
+}
+
 pub(super) fn activate_loaded_plugins(
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
     config: &BmuxConfig,
     paths: &ConfigPaths,
 ) -> Result<()> {
+    // Snapshot the typed services each plugin exposes before we
+    // activate anyone; bundled plugins can have their typed handles
+    // harvested without side effects, and consumers that resolve a
+    // typed service observe a stable registry across the lifetime of
+    // the attach session.
+    install_typed_service_registry(loaded_plugins);
+
     let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
     let connection_info = HostConnectionInfo {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
@@ -859,6 +968,7 @@ pub(super) fn activate_loaded_plugins(
         }
 
         activated.push(plugin);
+        mark_plugin_ready_signals(plugin);
     }
 
     Ok(())

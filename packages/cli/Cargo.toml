@@ -42,6 +42,9 @@ bmux_clipboard_plugin = { workspace = true, optional = true, features = [
 bmux_cluster_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
+bmux_decoration_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
 bmux_permissions_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -143,6 +146,7 @@ fail-on-warnings = [
     "bmux_terminal/fail-on-warnings",
     "bmux_terminal_protocol/fail-on-warnings",
     "bmux_windows_plugin?/fail-on-warnings",
+    "bmux_decoration_plugin?/fail-on-warnings",
 ]
 
 # Kitty keyboard protocol support (CSI u encoding/decoding + inner program negotiation)
@@ -159,12 +163,14 @@ bundled-plugins = [
     "bundled-plugin-cli",
     "bundled-plugin-prompted-actions",
     "bundled-plugin-windows",
+    "bundled-plugin-decoration",
 ]
 
 # Individual plugin features for selective bundling
 bundled-plugin-cli              = ["dep:bmux_plugin_cli_plugin"]
 bundled-plugin-clipboard        = ["dep:bmux_clipboard_plugin"]
 bundled-plugin-cluster          = ["dep:bmux_cluster_plugin"]
+bundled-plugin-decoration       = ["dep:bmux_decoration_plugin"]
 bundled-plugin-permissions      = ["dep:bmux_permissions_plugin"]
 bundled-plugin-prompted-actions = ["dep:bmux_prompted_actions_plugin"]
 bundled-plugin-windows          = ["dep:bmux_windows_plugin"]

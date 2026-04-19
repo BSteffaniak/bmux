@@ -10,6 +10,8 @@
 
 plugin bmux.decoration version 1;
 
+import scene = bmux.scene;
+
 interface decoration-state {
     // Built-in border styles the plugin can paint today. Plugins or
     // config may add custom styles later via a separate interface.
@@ -40,6 +42,11 @@ interface decoration-state {
     // Queries.
     query pane-decoration(pane-id: uuid) -> pane-decoration?;
     query default-border-style() -> border-style;
+    // Snapshot of the current decoration scene across every pane the
+    // plugin knows about. Consumers query this before the push-based
+    // event pipe is wired and switch to event subscriptions once
+    // available.
+    query scene-snapshot() -> scene.decoration-scene;
 
     // Commands.
     command set-pane-border(pane-id: uuid, border: border-style) -> result<unit, set-style-error>;

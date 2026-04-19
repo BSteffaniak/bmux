@@ -1,0 +1,26 @@
+execution_class       = "native_fast"
+id                    = "bmux.decoration"
+name                  = "bmux Decoration"
+provided_capabilities = ["bmux.decoration.read", "bmux.decoration.write"]
+provided_features     = ["bmux.decoration"]
+required_capabilities = ["bmux.events.subscribe"]
+version               = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.decoration.read"
+interface_id = "decoration-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.decoration.write"
+interface_id = "decoration-state"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.decoration.read"
+interface_id = "scene-protocol"
+kind         = "event"
+
+[[ready_signals]]
+description = "Initial DecorationScene has been published to the event bus."
+name        = "scene-published"

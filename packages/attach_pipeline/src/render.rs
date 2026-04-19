@@ -112,6 +112,95 @@ pub fn opaque_row_text(content: &str, width: usize) -> String {
     rendered
 }
 
+/// Apply every paint command in a [`crate::scene_cache::SurfaceDecoration`]
+/// to the terminal, emitting the equivalent of each command's styled
+/// text at its `(col, row)` position. Styles are translated to ANSI
+/// SGR escape sequences and reset after each run so they don't leak
+/// into subsequent writes.
+fn apply_decoration_paint_commands<W: io::Write>(
+    stdout: &mut W,
+    surface: &crate::scene_cache::SurfaceDecoration,
+) -> Result<()> {
+    for command in &surface.paint_commands {
+        queue!(stdout, MoveTo(command.col, command.row))
+            .context("failed positioning decoration paint command")?;
+        let prelude = scene_style_sgr_prelude(&command.style);
+        if !prelude.is_empty() {
+            queue!(stdout, Print(&prelude))
+                .context("failed emitting decoration paint command style")?;
+        }
+        queue!(stdout, Print(&command.text))
+            .context("failed emitting decoration paint command text")?;
+        // Hard reset so styles don't leak into subsequent writes. The
+        // CSI 0 m sequence is the canonical "reset all attributes".
+        queue!(stdout, Print("\x1b[0m"))
+            .context("failed resetting decoration paint command style")?;
+    }
+    Ok(())
+}
+
+/// Translate a [`crate::scene_cache::SceneStyle`] to the equivalent
+/// ANSI SGR prelude. Returns an empty string when every attribute is
+/// at its default, so the caller can skip the write entirely.
+fn scene_style_sgr_prelude(style: &crate::scene_cache::SceneStyle) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if style.bold {
+        params.push("1".to_string());
+    }
+    if style.italic {
+        params.push("3".to_string());
+    }
+    if style.underline {
+        params.push("4".to_string());
+    }
+    if style.reverse {
+        params.push("7".to_string());
+    }
+    if let Some(fg) = style.fg.as_ref() {
+        params.push(scene_color_to_sgr(*fg, false));
+    }
+    if let Some(bg) = style.bg.as_ref() {
+        params.push(scene_color_to_sgr(*bg, true));
+    }
+    if params.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", params.join(";"))
+    }
+}
+
+/// Map a [`crate::scene_cache::SceneStyle`] colour enum value to its
+/// SGR numeric code for either foreground (`background = false`) or
+/// background (`background = true`).
+///
+/// `Default` and `Reset` both map to "reset" on that channel.
+fn scene_color_to_sgr(color: crate::scene_cache::Color, background: bool) -> String {
+    use crate::scene_cache::Color;
+    let base_fg = match color {
+        Color::Default | Color::Reset => {
+            return if background { "49" } else { "39" }.to_string();
+        }
+        Color::Black => 30,
+        Color::Red => 31,
+        Color::Green => 32,
+        Color::Yellow => 33,
+        Color::Blue => 34,
+        Color::Magenta => 35,
+        Color::Cyan => 36,
+        Color::White => 37,
+        Color::BrightBlack => 90,
+        Color::BrightRed => 91,
+        Color::BrightGreen => 92,
+        Color::BrightYellow => 93,
+        Color::BrightBlue => 94,
+        Color::BrightMagenta => 95,
+        Color::BrightCyan => 96,
+        Color::BrightWhite => 97,
+    };
+    let code = if background { base_fg + 10 } else { base_fg };
+    code.to_string()
+}
+
 /// Fill an opaque layer interior with spaces.
 ///
 /// The fill area is `surface.content_rect` — callers are responsible for insetting
@@ -294,6 +383,7 @@ pub fn render_attach_scene<W: io::Write>(
     selection_anchor: Option<AttachScrollbackPosition>,
     zoomed: bool,
     terminal_size: (u16, u16),
+    decoration_scene_cache: Option<&crate::scene_cache::DecorationSceneCache>,
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal_size;
     if cols == 0 || rows <= status_top_inset.saturating_add(status_bottom_inset) {
@@ -380,64 +470,72 @@ pub fn render_attach_scene<W: io::Write>(
             || focused_surface_id == Some(surface.id)
             || focused_pane_id == Some(pane_id);
         if should_draw {
-            // Default fallback border painting. This lives in core so
-            // that a baseline single-terminal attach flow renders
-            // correctly when no decoration plugin is loaded (per the
-            // AGENTS.md "core defaults when plugins are missing" rule).
-            // When the decoration plugin (plugins/decoration-plugin)
-            // takes over painting, this block will execute only when
-            // that plugin is absent or declares the fallback style.
-            // Geometry matches `packages/server/src/lib.rs ::
-            // pane_content_rect_for_outer` — a 1-cell border on all
-            // sides — so `content_rect` and the painted border stay
-            // consistent.
-            let (corner, hch, vch) = if zoomed && focus {
-                // Zoomed pane: double-line box drawing characters.
-                ('#', '=', '\u{2551}') // ║ for sides, # corners, = top/bottom
-            } else if focus {
-                ('+', '=', '|')
+            // Prefer the decoration plugin's paint commands when a
+            // matching surface entry is cached. Consumers populate the
+            // cache via the typed `scene_snapshot` query (for now) or
+            // the `scene-protocol` event stream (once wired).
+            let decoration_entry =
+                decoration_scene_cache.and_then(|cache| cache.surface(&surface.id));
+            if let Some(entry) = decoration_entry {
+                apply_decoration_paint_commands(stdout, entry)
+                    .context("failed applying decoration paint commands")?;
             } else {
-                ('+', '-', '|')
-            };
-            let top = draw_box_line(usize::from(rect.w), corner, hch, corner);
-            let bottom = draw_box_line(usize::from(rect.w), corner, hch, corner);
-            queue!(stdout, MoveTo(rect.x, rect.y), Print(top))
-                .context("failed drawing pane top")?;
-            queue!(
-                stdout,
-                MoveTo(rect.x, rect.y.saturating_add(rect.h.saturating_sub(1))),
-                Print(bottom)
-            )
-            .context("failed drawing pane bottom")?;
-
-            for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
-                queue!(stdout, MoveTo(rect.x, y), Print(vch))
-                    .context("failed drawing pane left border")?;
-                queue!(
-                    stdout,
-                    MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y),
-                    Print(vch)
-                )
-                .context("failed drawing pane right border")?;
-            }
-
-            if rect.w > 6 {
-                let badge = match pane_states
-                    .get(&pane_id)
-                    .copied()
-                    .unwrap_or(PaneState::Running)
-                {
-                    PaneState::Running => "[RUNNING]",
-                    PaneState::Exited => "[EXITED]",
+                // Core fallback painting. This stays while the
+                // decoration plugin is still being wired up and the
+                // scene cache has no entry for this surface; once the
+                // plugin populates the scene with real paint commands
+                // for every visible surface, this block is deleted
+                // outright (AGENTS.md "core defaults when plugins are
+                // missing" will be carried by the decoration plugin
+                // itself publishing a default style).
+                let (corner, hch, vch) = if zoomed && focus {
+                    // Zoomed pane: double-line box drawing characters.
+                    ('#', '=', '\u{2551}') // ║ for sides, # corners, = top/bottom
+                } else if focus {
+                    ('+', '=', '|')
+                } else {
+                    ('+', '-', '|')
                 };
-                let max_badge_width = usize::from(rect.w.saturating_sub(4));
-                let badge_text = opaque_row_text(badge, badge.len().min(max_badge_width));
+                let top = draw_box_line(usize::from(rect.w), corner, hch, corner);
+                let bottom = draw_box_line(usize::from(rect.w), corner, hch, corner);
+                queue!(stdout, MoveTo(rect.x, rect.y), Print(top))
+                    .context("failed drawing pane top")?;
                 queue!(
                     stdout,
-                    MoveTo(rect.x.saturating_add(2), rect.y),
-                    Print(badge_text)
+                    MoveTo(rect.x, rect.y.saturating_add(rect.h.saturating_sub(1))),
+                    Print(bottom)
                 )
-                .context("failed drawing pane state badge")?;
+                .context("failed drawing pane bottom")?;
+
+                for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
+                    queue!(stdout, MoveTo(rect.x, y), Print(vch))
+                        .context("failed drawing pane left border")?;
+                    queue!(
+                        stdout,
+                        MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y),
+                        Print(vch)
+                    )
+                    .context("failed drawing pane right border")?;
+                }
+
+                if rect.w > 6 {
+                    let badge = match pane_states
+                        .get(&pane_id)
+                        .copied()
+                        .unwrap_or(PaneState::Running)
+                    {
+                        PaneState::Running => "[RUNNING]",
+                        PaneState::Exited => "[EXITED]",
+                    };
+                    let max_badge_width = usize::from(rect.w.saturating_sub(4));
+                    let badge_text = opaque_row_text(badge, badge.len().min(max_badge_width));
+                    queue!(
+                        stdout,
+                        MoveTo(rect.x.saturating_add(2), rect.y),
+                        Print(badge_text)
+                    )
+                    .context("failed drawing pane state badge")?;
+                }
             }
         }
 
@@ -785,6 +883,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            None,
         )
         .expect("render should succeed");
 
@@ -846,6 +945,7 @@ mod tests {
             Some(AttachScrollbackPosition { row: 0, col: 1 }),
             false,
             (80, 24),
+            None,
         )
         .expect("render should succeed");
 
@@ -910,6 +1010,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            None,
         )
         .expect("render should succeed");
 
@@ -917,6 +1018,132 @@ mod tests {
         if !rendered.is_empty() {
             assert!(rendered.contains("[EXITED]"));
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Test fixture builds a full scene + cache + assertions inline.
+    fn render_attach_scene_applies_decoration_paint_commands_when_cache_has_surface() {
+        use crate::scene_cache::{
+            Color, DecorationScene, DecorationSceneCache, PaintCommand, SceneRect, SceneStyle,
+            SurfaceDecoration,
+        };
+        use std::collections::BTreeMap as StdBTreeMap;
+
+        let pane_id = Uuid::from_u128(71);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(72),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 20,
+                    h: 5,
+                },
+                content_rect: AttachRect {
+                    x: 1,
+                    y: 2,
+                    w: 18,
+                    h: 3,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let panes = vec![PaneSummary {
+            id: pane_id,
+            index: 1,
+            name: None,
+            focused: true,
+            state: PaneState::Running,
+            state_reason: None,
+        }];
+        let mut pane_buffers = BTreeMap::new();
+        pane_buffers.insert(pane_id, PaneRenderBuffer::default());
+
+        let mut surfaces = StdBTreeMap::new();
+        surfaces.insert(
+            pane_id,
+            SurfaceDecoration {
+                surface_id: pane_id,
+                rect: SceneRect {
+                    x: 0,
+                    y: 1,
+                    w: 20,
+                    h: 5,
+                },
+                content_rect: SceneRect {
+                    x: 1,
+                    y: 2,
+                    w: 18,
+                    h: 3,
+                },
+                paint_commands: vec![PaintCommand {
+                    col: 0,
+                    row: 1,
+                    text: "DECO!".to_string(),
+                    style: SceneStyle {
+                        fg: Some(Color::BrightYellow),
+                        bg: None,
+                        bold: true,
+                        underline: false,
+                        italic: false,
+                        reverse: false,
+                    },
+                }],
+            },
+        );
+        let mut cache = DecorationSceneCache::new();
+        cache.force_scene(DecorationScene {
+            revision: 1,
+            surfaces,
+        });
+
+        let mut output = Vec::new();
+        let _ = render_attach_scene(
+            &mut output,
+            &scene,
+            &panes,
+            &mut pane_buffers,
+            &BTreeSet::from([pane_id]),
+            true,
+            1,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (80, 24),
+            Some(&cache),
+        )
+        .expect("render should succeed");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        assert!(
+            rendered.contains("DECO!"),
+            "decoration paint command text should appear in render output"
+        );
+        assert!(
+            !rendered.contains("[RUNNING]"),
+            "core fallback badge must not paint when the scene cache covers the surface"
+        );
+        assert!(
+            rendered.contains("\x1b[1;93m"),
+            "bright-yellow + bold SGR sequence should be emitted; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\x1b[0m"),
+            "style reset should terminate the paint command; got: {rendered:?}"
+        );
     }
 
     // ── Synchronized update (DEC mode 2026) render deferral tests ──
@@ -982,6 +1209,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            None,
         )
         .expect("initial render should succeed");
         assert!(!output1.is_empty(), "initial render should produce output");
@@ -1010,6 +1238,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            None,
         )
         .expect("deferred render should succeed");
 
@@ -1042,6 +1271,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            None,
         )
         .expect("completed render should succeed");
 
@@ -1106,6 +1336,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            None,
         )
         .expect("full redraw should succeed despite sync flag");
 

@@ -3205,6 +3205,7 @@ pub fn render_attach_frame(
             view_state.selection_anchor,
             layout_state.zoomed,
             terminal::size().unwrap_or((0, 0)),
+            None,
         )?
     } else {
         view_state.last_cursor_state

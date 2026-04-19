@@ -1,29 +1,38 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Decoration plugin for bmux — paints pane borders and reads windows state"
+description = "Decoration plugin for bmux — paints pane borders and publishes scene updates"
 edition     = { workspace = true }
 keywords    = ["bmux", "plugin", "decoration"]
 license     = { workspace = true }
 name        = "bmux_decoration_plugin"
+publish     = false
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 bmux_decoration_plugin_api = { workspace = true }
+bmux_plugin_sdk            = { workspace = true }
+bmux_scene_protocol        = { workspace = true }
 bmux_windows_plugin_api    = { workspace = true }
 serde                      = { workspace = true, features = ["derive", "std"] }
 uuid                       = { workspace = true, features = ["serde", "std"] }
 
 [package.metadata.cargo-machete]
-# `serde` is consumed by the BPDL-generated bindings of the decoration
-# plugin's own schema (via the decoration-plugin-api crate's re-exports).
-# `bmux_windows_plugin_api` will be depended on for event subscriptions
-# once the plugin-host integration lands; keeping the import here makes
-# the dependency edge explicit.
+# `serde` is consumed by the BPDL-generated bindings re-exported from the
+# decoration-plugin-api crate. `bmux_windows_plugin_api` will drive
+# pane-event subscriptions once host-side plumbing lands.
 ignored = ["serde", "bmux_windows_plugin_api"]
 
 [features]
-default          = []
-fail-on-warnings = []
+default = []
+fail-on-warnings = [
+    "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_decoration_plugin_api/fail-on-warnings",
+    "bmux_scene_protocol/fail-on-warnings",
+]
+static-bundled = []

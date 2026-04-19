@@ -11,4 +11,10 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/decoration-plugin.bpdl",
+    imports: {
+        scene: {
+            source: "../../packages/scene-protocol/bpdl/scene-protocol.bpdl",
+            crate_path: ::bmux_scene_protocol,
+        },
+    },
 }

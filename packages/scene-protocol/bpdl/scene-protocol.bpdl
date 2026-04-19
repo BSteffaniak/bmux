@@ -1,0 +1,91 @@
+// Scene decoration protocol shared between core and any plugin that
+// contributes visual chrome around pane surfaces.
+//
+// The decoration plugin publishes a `DecorationScene` on the typed
+// event bus; core caches the latest version and, during frame
+// assembly, consults the cache for each visible surface to obtain its
+// authoritative `content_rect` and any paint commands layered over or
+// around the pane. When no scene has been published core draws nothing
+// around panes (no compiled-in fallback).
+
+plugin bmux.scene version 1;
+
+interface scene-protocol {
+    // Basic rectangle used for both surface geometry and paint
+    // coordinates. Units are terminal cells; origin is top-left.
+    record rect {
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+    }
+
+    // A 16-colour palette plus `default` (terminal default fg/bg) and
+    // `reset` (hard-clear any prior style). Richer colour modes (24-bit
+    // RGB, 256-colour indexed) are deferred additively.
+    enum color {
+        @default default,
+        reset,
+        black,
+        red,
+        green,
+        yellow,
+        blue,
+        magenta,
+        cyan,
+        white,
+        bright-black,
+        bright-red,
+        bright-green,
+        bright-yellow,
+        bright-blue,
+        bright-magenta,
+        bright-cyan,
+        bright-white,
+    }
+
+    // Per-cell style applied to a paint command's text. All flags
+    // default to false; missing colours fall through to the terminal's
+    // current default.
+    record style {
+        fg: color?,
+        bg: color?,
+        bold: bool,
+        underline: bool,
+        italic: bool,
+        reverse: bool,
+    }
+
+    // A run of cells to paint at a specific position. `text` is
+    // treated as a single-line string; callers are responsible for not
+    // emitting newline control bytes. The run extends rightward from
+    // `(col, row)` for `text.len()` display columns.
+    record paint-command {
+        col: u16,
+        row: u16,
+        text: string,
+        style: style,
+    }
+
+    // All decoration data for a single scene surface. The
+    // `content_rect` is authoritative for mouse translation and PTY
+    // sizing — it may differ from the outer `rect` to reserve space
+    // for the paint commands (borders, badges, etc.).
+    record surface-decoration {
+        surface-id: uuid,
+        rect: rect,
+        content-rect: rect,
+        paint-commands: list<paint-command>,
+    }
+
+    // Snapshot of every decorated surface. Published by the decoration
+    // plugin through the typed event bus whenever its state changes
+    // (focus, theme, per-pane override). Consumers replace their
+    // cached snapshot when `revision` exceeds the one they hold.
+    record decoration-scene {
+        revision: u64,
+        surfaces: map<uuid, surface-decoration>,
+    }
+
+    events decoration-scene;
+}

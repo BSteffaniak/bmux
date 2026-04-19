@@ -1,18 +1,17 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Typed public API of the bmux decoration plugin (BPDL-generated bindings)"
+description = "Typed scene-decoration protocol shared by bmux core and any decoration plugin"
 edition     = { workspace = true }
-keywords    = ["bmux", "plugin", "api", "decoration"]
+keywords    = ["bmux", "scene", "decoration", "protocol"]
 license     = { workspace = true }
-name        = "bmux_decoration_plugin_api"
+name        = "bmux_scene_protocol"
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
 bmux_plugin_schema_macros = { workspace = true }
-bmux_scene_protocol       = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std"] }
 uuid                      = { workspace = true, features = ["serde", "std"] }
 
@@ -23,9 +22,7 @@ serde_json = { workspace = true }
 # `serde` is consumed by code generated from the BPDL schema via the
 # `bmux_plugin_schema_macros::schema!` proc macro; cargo-machete cannot
 # see into proc-macro-generated source.
-# `bmux_scene_protocol` is referenced by generated qualified type paths
-# for the imported `scene.decoration-scene` return of `scene-snapshot`.
-ignored = ["serde", "bmux_scene_protocol"]
+ignored = ["serde"]
 
 [features]
 default          = []
