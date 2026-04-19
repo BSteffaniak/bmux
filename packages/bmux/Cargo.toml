@@ -12,10 +12,8 @@ version     = { workspace = true }
 
 [dependencies]
 # Core packages (always available)
-bmux_config   = { workspace = true, optional = true }
-bmux_event    = { workspace = true, optional = true }
-bmux_session  = { workspace = true, optional = true }
-bmux_terminal = { workspace = true, optional = true }
+bmux_config = { workspace = true, optional = true }
+bmux_event  = { workspace = true, optional = true }
 
 # Feature-gated packages
 bmux_cli             = { workspace = true, optional = true }
@@ -41,8 +39,6 @@ fail-on-warnings = [
     "bmux_plugin_sdk?/fail-on-warnings",
     "bmux_sandbox_harness?/fail-on-warnings",
     "bmux_server?/fail-on-warnings",
-    "bmux_session?/fail-on-warnings",
-    "bmux_terminal?/fail-on-warnings",
 ]
 
 # Feature groups
@@ -56,7 +52,7 @@ all = [
     "sandbox_harness",
     "server",
 ]
-core = ["config", "event", "session", "terminal"]
+core = ["config", "event"]
 
 # Individual package features
 cli             = ["dep:bmux_cli"]
@@ -68,5 +64,3 @@ plugin          = ["dep:bmux_plugin"]
 plugin_sdk      = ["dep:bmux_plugin_sdk"]
 sandbox_harness = ["dep:bmux_sandbox_harness"]
 server          = ["dep:bmux_server"]
-session         = ["dep:bmux_session"]
-terminal        = ["dep:bmux_terminal"]

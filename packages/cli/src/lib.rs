@@ -8,8 +8,6 @@
 
 pub use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_event::{Event, EventDispatcher, ModalSystem, Mode};
-pub use bmux_session::{SessionId, SessionInfo, SessionManager};
-pub use bmux_terminal::{TerminalInstance, TerminalManager};
 
 mod connection;
 mod runtime;

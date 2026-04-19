@@ -976,8 +976,6 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_sandbox_harness",
  "bmux_server",
- "bmux_session",
- "bmux_terminal",
 ]
 
 [[package]]
@@ -1036,11 +1034,9 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_prompted_actions_plugin",
  "bmux_server",
- "bmux_session",
  "bmux_sessions_plugin",
  "bmux_sessions_plugin_api",
  "bmux_slots",
- "bmux_terminal",
  "bmux_terminal_protocol",
  "bmux_windows_plugin",
  "bmux_windows_plugin_api",

@@ -2,53 +2,25 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! bmux - Modern terminal multiplexer written in Rust
+//! bmux — modern terminal multiplexer written in Rust.
 //!
-//! bmux is a high-performance terminal multiplexer that introduces innovative
-//! features like multi-client session sharing with independent views, vim-inspired
-//! modal interactions, and a planned plugin architecture.
-//!
-//! This crate serves as an umbrella package that optionally re-exports all bmux
-//! functionality based on enabled features.
+//! Umbrella crate that re-exports the domain-agnostic bmux building
+//! blocks behind optional cargo features. Domain concepts (sessions,
+//! windows, panes, clients, contexts, permissions) live in plugins and
+//! are consumed through their `*-plugin-api` crates — not from this
+//! umbrella.
 //!
 //! # Features
 //!
-//! ## Core Features
-//! - `session` - Session management functionality
-//! - `terminal` - Terminal handling and PTY management  
-//! - `event` - Event system and modal interactions
-//! - `config` - Configuration management
-//!
-//! ## Application Features
-//! - `cli` - Command-line interface (enables the `bmux` binary)
-//! - `server` - Server component for multi-client support
-//! - `client` - Client component for connecting to sessions
-//!
-//! ## Extension Features
-//! - `keybind` - Key binding system
-//! - `plugin` - Planned plugin system for extensibility
-//!
-//! ## Feature Groups
-//! - `core` - Enables all core features
-//! - `all` - Enables all features (default)
-//!
-//! # Usage
-//!
-//! ```rust
-//! // Use specific functionality
-//! #[cfg(feature = "session")]
-//! use bmux::session;
-//!
-//! #[cfg(feature = "terminal")]
-//! use bmux::terminal;
-//! ```
-
-// Core re-exports
-#[cfg(feature = "session")]
-pub use bmux_session as session;
-
-#[cfg(feature = "terminal")]
-pub use bmux_terminal as terminal;
+//! - `event` — modal input event system.
+//! - `config` — configuration loader.
+//! - `cli` — `bmux` binary entrypoint and runtime.
+//! - `server` — server-side daemon.
+//! - `client` — IPC client library.
+//! - `keybind` — key-binding parser.
+//! - `plugin` — host-side plugin loader and registry.
+//! - `plugin_sdk` — plugin author SDK.
+//! - `sandbox_harness` — integration test harness.
 
 #[cfg(feature = "event")]
 pub use bmux_event as event;
@@ -56,7 +28,6 @@ pub use bmux_event as event;
 #[cfg(feature = "config")]
 pub use bmux_config as config;
 
-// Application re-exports
 #[cfg(feature = "cli")]
 pub use bmux_cli as cli;
 
@@ -66,7 +37,6 @@ pub use bmux_server as server;
 #[cfg(feature = "client")]
 pub use bmux_client as client;
 
-// Extension re-exports
 #[cfg(feature = "keybind")]
 pub use bmux_keybind as keybind;
 
@@ -79,14 +49,8 @@ pub use bmux_plugin_sdk as plugin_sdk;
 #[cfg(feature = "sandbox_harness")]
 pub use bmux_sandbox_harness as sandbox_harness;
 
-/// Prelude module for commonly used types across all enabled features
+/// Prelude module for commonly used domain-agnostic types.
 pub mod prelude {
-    #[cfg(feature = "session")]
-    pub use crate::session::{Session, SessionId, SessionInfo, SessionManager};
-
-    #[cfg(feature = "terminal")]
-    pub use crate::terminal::{PaneSize, TerminalInstance, TerminalManager};
-
     #[cfg(feature = "event")]
     pub use crate::event::{Event, EventDispatcher, ModalSystem, Mode};
 

@@ -198,3 +198,173 @@ fn plugin_production_code_uses_generic_host_api_only() {
         assert_no_raw_host_kernel_coupling(production_section(source), path);
     }
 }
+
+/// M4 Stage 10: verify that `packages/event` is fully domain-agnostic.
+/// The former `Session/Pane/Client/Input` event enums and constructors
+/// were deleted — this test ensures they don't silently reappear.
+#[test]
+fn event_core_crate_has_no_domain_event_types() {
+    let sources = [
+        (
+            "packages/event/src/lib.rs",
+            include_str!("../../event/src/lib.rs"),
+        ),
+        (
+            "packages/event/models/src/lib.rs",
+            include_str!("../../event/models/src/lib.rs"),
+        ),
+    ];
+
+    let denied = [
+        "pub enum SessionEvent",
+        "pub enum PaneEvent",
+        "pub enum ClientEvent",
+        "pub enum InputEvent",
+        "fn session_created",
+        "fn pane_created",
+        "fn client_connected",
+        "fn key_input",
+        "fn mouse_input",
+        "Session(SessionEvent)",
+        "Pane(PaneEvent)",
+        "Client(ClientEvent)",
+        "Input(InputEvent)",
+    ];
+
+    for (path, source) in sources {
+        let source = production_section(source);
+        for marker in denied {
+            assert!(
+                !source.contains(marker),
+                "{path} must stay domain-agnostic; reintroduced marker {marker}",
+            );
+        }
+    }
+}
+
+/// M4 Stage 10: verify that the `bmux` umbrella crate doesn't
+/// re-export domain crates. `session` and `terminal` features were
+/// removed; only domain-agnostic building blocks should be exposed.
+#[test]
+fn bmux_umbrella_has_no_domain_reexports() {
+    let lib_source = include_str!("../../bmux/src/lib.rs");
+    let manifest_source = include_str!("../../bmux/Cargo.toml");
+
+    let lib_denied = [
+        "bmux_session",
+        "bmux_terminal",
+        "pub use crate::session",
+        "pub use crate::terminal",
+        "SessionId",
+        "SessionInfo",
+        "SessionManager",
+        "TerminalInstance",
+        "TerminalManager",
+        "PaneSize",
+    ];
+    for marker in lib_denied {
+        assert!(
+            !lib_source.contains(marker),
+            "packages/bmux/src/lib.rs must not reference domain marker \
+             {marker}",
+        );
+    }
+
+    let manifest_denied = [
+        "bmux_session",
+        "bmux_terminal",
+        "bmux_session_models",
+        "bmux_terminal_models",
+    ];
+    for marker in manifest_denied {
+        assert!(
+            !manifest_source.contains(marker),
+            "packages/bmux/Cargo.toml must not depend on domain crate \
+             {marker}",
+        );
+    }
+}
+
+/// M4 Stage 10: verify that `packages/cli/src/lib.rs` doesn't
+/// re-export domain types. The `SessionId` / `SessionInfo` /
+/// `SessionManager` / `TerminalInstance` / `TerminalManager`
+/// re-exports were deleted — this guards against regression.
+#[test]
+fn cli_crate_does_not_reexport_domain_types() {
+    let source = include_str!("../src/lib.rs");
+    let denied = [
+        "pub use bmux_session::",
+        "pub use bmux_terminal::",
+        "pub use bmux_session_models::",
+        "pub use bmux_terminal_models::",
+        "SessionId",
+        "SessionInfo",
+        "SessionManager",
+        "TerminalInstance",
+        "TerminalManager",
+    ];
+
+    for marker in denied {
+        assert!(
+            !source.contains(marker),
+            "packages/cli/src/lib.rs must not re-export domain \
+             marker {marker}; domain types belong in plugin-api crates",
+        );
+    }
+}
+
+/// M4 Stage 10: verify that `packages/event/models` doesn't depend on
+/// session/terminal domain model crates. The domain event types were
+/// deleted — the Cargo.toml must not silently regrow those deps.
+#[test]
+fn event_models_crate_has_no_domain_dependencies() {
+    let source = include_str!("../../event/models/Cargo.toml");
+    let denied = ["bmux_session_models", "bmux_terminal_models"];
+
+    for marker in denied {
+        assert!(
+            !source.contains(marker),
+            "packages/event/models/Cargo.toml must not depend on {marker}; \
+             domain event types were deleted in M4 Stage 10",
+        );
+    }
+}
+
+/// M4 Stage 10: verify that `packages/client` no longer carries
+/// domain convenience methods. All session/context/pane/client
+/// operations route through `BmuxClient::invoke_service_raw` via typed
+/// plugin-api dispatch, not through hand-coded IPC request methods.
+#[test]
+fn client_core_crate_has_no_domain_convenience_methods() {
+    let source = include_str!("../../client/src/lib.rs");
+    let source = production_section(source);
+
+    let denied = [
+        "pub async fn new_session",
+        "pub async fn list_sessions",
+        "pub async fn kill_session",
+        "pub async fn list_clients",
+        "pub async fn create_context",
+        "pub async fn list_contexts",
+        "pub async fn select_context",
+        "pub async fn close_context",
+        "pub async fn current_context",
+        "pub async fn split_pane",
+        "pub async fn launch_pane",
+        "pub async fn focus_pane",
+        "pub async fn resize_pane",
+        "pub async fn close_pane",
+        "pub async fn restart_pane",
+        "pub async fn zoom_pane",
+        "pub async fn list_panes",
+    ];
+
+    for marker in denied {
+        assert!(
+            !source.contains(marker),
+            "packages/client/src/lib.rs must not reintroduce domain \
+             convenience method {marker}; route through typed dispatch \
+             via invoke_service_raw instead",
+        );
+    }
+}
