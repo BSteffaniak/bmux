@@ -817,13 +817,88 @@ thread_local! {
 /// combined map on the thread-local registry. Also declares each
 /// plugin's ready signals on the thread-local [`ReadyTracker`] so
 /// consumers can wait for specific signals to flip.
-fn install_typed_service_registry(loaded_plugins: &[bmux_plugin::LoadedPlugin]) {
+fn install_typed_service_registry(
+    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+) {
+    // Build a bridge that plugins may stash inside their typed
+    // service handles. It shares the same dispatch function as the
+    // per-activation bridge in `plugin_lifecycle_context`, so host
+    // calls from trait methods reach the same kernel routing as
+    // host calls from `invoke_service` / `run_command`.
+    let bridge = bmux_plugin_sdk::HostKernelBridge::from_fn(host_kernel_bridge);
+
+    // Shared data that every plugin's typed-services context references
+    // read-only. Collected once and borrowed per plugin so typed handles
+    // can construct standalone `ServiceCaller` wrappers that drive
+    // `call_service_raw` without needing a per-activation
+    // `NativeLifecycleContext` on every typed call.
+    let available_capabilities = core_provided_capabilities()
+        .into_iter()
+        .chain(
+            loaded_plugins
+                .iter()
+                .flat_map(|plugin| plugin.declaration.provided_capabilities.iter().cloned()),
+        )
+        .map(|capability| capability.to_string())
+        .collect::<Vec<_>>();
+    let available_services = service_descriptors_from_declarations(
+        loaded_plugins.iter().map(|plugin| &plugin.declaration),
+    );
+    let enabled_plugins = loaded_plugins
+        .iter()
+        .map(|plugin| plugin.declaration.id.as_str().to_string())
+        .collect::<Vec<_>>();
+    let search_roots = resolve_plugin_search_paths(config, paths)
+        .map(|paths| {
+            paths
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let host_metadata = plugin_host_metadata();
+    let host_connection = bmux_plugin_sdk::HostConnectionInfo {
+        config_dir: paths.config_dir.to_string_lossy().into_owned(),
+        runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
+        data_dir: paths.data_dir.to_string_lossy().into_owned(),
+        state_dir: paths.state_dir.to_string_lossy().into_owned(),
+    };
+    let plugin_settings_map: std::collections::BTreeMap<String, toml::Value> =
+        config.plugins.settings.clone();
+
     let mut map: std::collections::BTreeMap<
         bmux_plugin_sdk::TypedServiceKey,
         bmux_plugin_sdk::TypedServiceHandle,
     > = std::collections::BTreeMap::new();
     for plugin in loaded_plugins {
-        for (key, handle) in plugin.collect_typed_services().into_entries() {
+        let required_caps: Vec<String> = plugin
+            .declaration
+            .required_capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let provided_caps: Vec<String> = plugin
+            .declaration
+            .provided_capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let context = bmux_plugin_sdk::TypedServiceRegistrationContext {
+            plugin_id: plugin.declaration.id.as_str(),
+            host_kernel_bridge: Some(&bridge),
+            required_capabilities: &required_caps,
+            provided_capabilities: &provided_caps,
+            services: &available_services,
+            available_capabilities: &available_capabilities,
+            enabled_plugins: &enabled_plugins,
+            plugin_search_roots: &search_roots,
+            host: &host_metadata,
+            connection: &host_connection,
+            plugin_settings_map: &plugin_settings_map,
+        };
+        for (key, handle) in plugin.collect_typed_services(context).into_entries() {
             map.insert(key, handle);
         }
     }
@@ -964,7 +1039,7 @@ pub(super) fn activate_loaded_plugins(
     // harvested without side effects, and consumers that resolve a
     // typed service observe a stable registry across the lifetime of
     // the attach session.
-    install_typed_service_registry(loaded_plugins);
+    install_typed_service_registry(loaded_plugins, config, paths);
 
     let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
     let connection_info = HostConnectionInfo {

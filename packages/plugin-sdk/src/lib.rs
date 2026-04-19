@@ -85,6 +85,7 @@ pub use host_services::{
 };
 pub use native_exports::{
     EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, PluginCommandError, RustPlugin,
+    TypedServiceRegistrationContext,
 };
 pub use process_runtime::{
     PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
@@ -430,8 +431,10 @@ macro_rules! bundled_plugin_vtable {
             )
         }
 
-        fn __register_typed_services() -> $crate::TypedServiceRegistry {
-            $crate::__private::register_typed_services_bundled(__instance())
+        fn __register_typed_services(
+            context: $crate::TypedServiceRegistrationContext<'_>,
+        ) -> $crate::TypedServiceRegistry {
+            $crate::__private::register_typed_services_bundled(__instance(), context)
         }
 
         $crate::StaticPluginVtable {
@@ -455,7 +458,8 @@ pub struct StaticPluginVtable {
     pub deactivate: fn(*const u8, usize) -> i32,
     pub handle_event: fn(*const u8, usize) -> i32,
     pub invoke_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
-    pub register_typed_services: fn() -> TypedServiceRegistry,
+    pub register_typed_services:
+        fn(context: TypedServiceRegistrationContext<'_>) -> TypedServiceRegistry,
 }
 
 impl std::fmt::Debug for StaticPluginVtable {

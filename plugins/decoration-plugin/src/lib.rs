@@ -21,7 +21,7 @@ use bmux_decoration_plugin_api::decoration_state::{
     INTERFACE_ID as DECORATION_STATE_INTERFACE_ID, PaneDecoration, SetStyleError,
 };
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{HostScope, TypedServiceRegistry};
+use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
     BorderGlyphs, Color, DecorationScene, FallbackStyle, INTERFACE_ID as SCENE_INTERFACE_ID,
     PaintCommand, Rect, Style, SurfaceDecoration,
@@ -318,7 +318,11 @@ impl RustPlugin for DecorationPlugin {
         Ok(EXIT_OK)
     }
 
-    fn register_typed_services(&self, registry: &mut TypedServiceRegistry) {
+    fn register_typed_services(
+        &self,
+        _context: TypedServiceRegistrationContext<'_>,
+        registry: &mut TypedServiceRegistry,
+    ) {
         let handle: Arc<DecorationServiceHandle> =
             Arc::new(DecorationServiceHandle::new(self.state.clone_arc()));
         let service: Arc<dyn DecorationStateService + Send + Sync> = handle;
@@ -495,7 +499,35 @@ mod tests {
     fn register_typed_services_installs_decoration_state_service() {
         let plugin = DecorationPlugin::new();
         let mut registry = TypedServiceRegistry::new();
-        plugin.register_typed_services(&mut registry);
+        let empty_caps: Vec<String> = Vec::new();
+        let empty_services: Vec<bmux_plugin_sdk::RegisteredService> = Vec::new();
+        let settings = std::collections::BTreeMap::new();
+        let host_metadata = bmux_plugin_sdk::HostMetadata {
+            product_name: "test".to_string(),
+            product_version: "0".to_string(),
+            plugin_api_version: bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION,
+            plugin_abi_version: bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION,
+        };
+        let host_connection = bmux_plugin_sdk::HostConnectionInfo {
+            config_dir: "/tmp".to_string(),
+            runtime_dir: "/tmp".to_string(),
+            data_dir: "/tmp".to_string(),
+            state_dir: "/tmp".to_string(),
+        };
+        let context = TypedServiceRegistrationContext {
+            plugin_id: "bmux.decoration",
+            host_kernel_bridge: None,
+            required_capabilities: &empty_caps,
+            provided_capabilities: &empty_caps,
+            services: &empty_services,
+            available_capabilities: &empty_caps,
+            enabled_plugins: &empty_caps,
+            plugin_search_roots: &empty_caps,
+            host: &host_metadata,
+            connection: &host_connection,
+            plugin_settings_map: &settings,
+        };
+        plugin.register_typed_services(context, &mut registry);
         let cap = HostScope::new("bmux.decoration.read").expect("cap");
         let handle = registry
             .get(&cap, ServiceKind::Query, DECORATION_STATE_INTERFACE_ID)

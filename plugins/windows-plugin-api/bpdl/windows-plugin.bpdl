@@ -64,6 +64,16 @@ interface windows-commands {
         failed { reason: string },
     }
 
+    // Errors a pane mutation command (split/launch/resize/zoom/
+    // restart) can produce.
+    variant pane-mutation-error {
+        pane-not-found,
+        session-not-found,
+        invalid-argument { reason: string },
+        denied { reason: string },
+        failed { reason: string },
+    }
+
     // Acknowledgement returned by mutating window commands. When a new
     // window is created, `id` carries the new context id; other
     // commands may leave it empty.
@@ -72,9 +82,69 @@ interface windows-commands {
         id: string?,
     }
 
+    // Acknowledgement returned by pane-mutation commands. `pane-id`
+    // carries the freshly-created pane id for split/launch; other
+    // commands leave it empty.
+    record pane-ack {
+        ok: bool,
+        pane-id: uuid?,
+    }
+
+    // Direction in which a pane split/focus action moves.
+    enum pane-direction {
+        @default horizontal,
+        vertical,
+        left,
+        right,
+        up,
+        down,
+    }
+
+    // Selector identifying a session or pane; one of the optional
+    // fields should be populated. `id` takes precedence when both are
+    // set.
+    record selector {
+        id: uuid?,
+        name: string?,
+    }
+
     // Pane-level commands.
     command focus-pane(id: uuid) -> result<unit, focus-error>;
     command close-pane(id: uuid) -> result<unit, close-error>;
+
+    // Split / launch / resize / zoom / restart.
+    // Each targets a session (by uuid or name) and an existing pane
+    // (likewise), plus operation-specific extras.
+    command split-pane(
+        session: selector?,
+        target: selector?,
+        direction: pane-direction,
+        ratio-pct: u32?,
+    ) -> result<pane-ack, pane-mutation-error>;
+
+    command launch-pane(
+        session: selector?,
+        target: selector?,
+        direction: pane-direction,
+        name: string?,
+        program: string,
+        args: list<string>,
+    ) -> result<pane-ack, pane-mutation-error>;
+
+    command resize-pane(
+        session: selector?,
+        target: selector?,
+        delta: i16,
+    ) -> result<pane-ack, pane-mutation-error>;
+
+    command zoom-pane(
+        session: selector?,
+    ) -> result<pane-ack, pane-mutation-error>;
+
+    command restart-pane(
+        session: selector?,
+        target: selector?,
+    ) -> result<pane-ack, pane-mutation-error>;
 
     // Window-level commands.
     command new-window(name: string?) -> result<window-ack, window-error>;

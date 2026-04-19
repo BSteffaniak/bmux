@@ -226,15 +226,63 @@ pub trait RustPlugin: Default + Send + 'static {
     }
 
     /// Populate a [`TypedServiceRegistry`] with this plugin's typed
-    /// service handles. Called once during plugin activation. Providers
-    /// insert `Arc`s of their service-trait implementations here; the
-    /// host stores the resulting handles so consumers can resolve them
-    /// via [`crate::PluginHost::resolve_service`] and invoke typed
+    /// service handles. Called once at plugin-host setup time, before
+    /// [`Self::activate`]. Providers insert `Arc`s of their
+    /// service-trait implementations into the registry; the host
+    /// stores the resulting handles so consumers can resolve them via
+    /// [`crate::PluginHost::resolve_typed_service`] and invoke typed
     /// calls without serialization.
+    ///
+    /// `context` exposes the [`crate::HostKernelBridge`] and plugin
+    /// identity so providers can construct handles that make host-
+    /// level calls from inside their trait methods. Implementations
+    /// that don't need host access can ignore it.
     ///
     /// The default is a no-op; plugins that don't provide typed
     /// services need not override it.
-    fn register_typed_services(&self, _registry: &mut TypedServiceRegistry) {}
+    fn register_typed_services(
+        &self,
+        _context: TypedServiceRegistrationContext<'_>,
+        _registry: &mut TypedServiceRegistry,
+    ) {
+    }
+}
+
+/// Context passed to [`RustPlugin::register_typed_services`].
+///
+/// Carries everything a provider plugin needs to construct stateful
+/// typed handles — most importantly a [`crate::HostKernelBridge`]
+/// reference so the handle can call into the host from inside its
+/// trait methods, plus the plugin identity and capability/service
+/// inventory needed to build a standalone
+/// [`crate::ServiceCaller`] wrapper if the handle needs one.
+#[derive(Debug, Clone)]
+pub struct TypedServiceRegistrationContext<'a> {
+    /// The plugin's own id (matches `plugin_id` everywhere else).
+    pub plugin_id: &'a str,
+    /// Handle used to dispatch calls to the host kernel. `None` when
+    /// the host is not wired for bridge-style dispatch (e.g. some
+    /// test harnesses); typed handles that need host access should
+    /// treat that as a reason to skip registration and log a warning.
+    pub host_kernel_bridge: Option<&'a crate::HostKernelBridge>,
+    /// Capabilities this plugin declared as required in its manifest.
+    pub required_capabilities: &'a [String],
+    /// Capabilities this plugin provides to other plugins.
+    pub provided_capabilities: &'a [String],
+    /// Registered services visible to this plugin for cross-plugin calls.
+    pub services: &'a [crate::RegisteredService],
+    /// All capabilities available in the current host environment.
+    pub available_capabilities: &'a [String],
+    /// IDs of all currently enabled plugins.
+    pub enabled_plugins: &'a [String],
+    /// Filesystem roots where plugin manifests are discovered.
+    pub plugin_search_roots: &'a [String],
+    /// Host runtime metadata (product name, version, API version).
+    pub host: &'a crate::HostMetadata,
+    /// Host connection paths (config dir, runtime dir, data dir, state dir).
+    pub connection: &'a crate::HostConnectionInfo,
+    /// Settings map for all plugins (keyed by plugin ID).
+    pub plugin_settings_map: &'a std::collections::BTreeMap<String, toml::Value>,
 }
 
 // ── FFI helpers ──────────────────────────────────────────────────────────────
@@ -250,10 +298,11 @@ pub fn plugin_instance<P: RustPlugin>(instance: &'static OnceLock<Mutex<P>>) -> 
 #[doc(hidden)]
 pub fn register_typed_services_bundled<P: RustPlugin>(
     instance: &'static Mutex<P>,
+    context: TypedServiceRegistrationContext<'_>,
 ) -> TypedServiceRegistry {
     let mut registry = TypedServiceRegistry::new();
     if let Ok(plugin) = instance.lock() {
-        plugin.register_typed_services(&mut registry);
+        plugin.register_typed_services(context, &mut registry);
     }
     registry
 }

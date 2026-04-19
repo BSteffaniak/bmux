@@ -21,6 +21,7 @@ mod loader;
 mod manifest;
 pub mod prompt;
 mod registry;
+mod typed_service_caller;
 
 pub use declaration::{
     NativePlugin, PluginDeclaration, PluginDependency, PluginEntrypoint, PluginExecutionClass,
@@ -40,6 +41,7 @@ pub use registry::{
     CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
     ServiceProvider,
 };
+pub use typed_service_caller::TypedServiceCaller;
 
 /// Default exported symbol used to invoke a plugin command.
 pub const DEFAULT_NATIVE_COMMAND_SYMBOL: &str = "bmux_plugin_run_command_v1";

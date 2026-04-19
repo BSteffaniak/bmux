@@ -790,7 +790,22 @@ impl ServiceCaller for NativeServiceContext {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
-fn call_service_raw(
+/// Low-level byte-encoded service dispatch used by every
+/// [`ServiceCaller`] impl on the context types
+/// ([`NativeCommandContext`], [`NativeLifecycleContext`],
+/// [`NativeServiceContext`]).
+///
+/// This is exposed publicly so typed service providers can construct
+/// a standalone [`ServiceCaller`] that lives as long as the typed
+/// handle (rather than piggy-backing on a short-lived context). The
+/// args mirror the fields a context holds and would normally pass
+/// through to this helper.
+///
+/// # Errors
+///
+/// Returns any error produced by capability validation, service lookup,
+/// or the underlying provider plugin.
+pub fn call_service_raw(
     caller_plugin_id: &str,
     required_capabilities: &[String],
     provided_capabilities: &[String],
@@ -1618,13 +1633,20 @@ impl LoadedPlugin {
     /// address space, this invokes the SDK's `register_typed_services`
     /// hook via the static vtable and returns the populated registry.
     ///
+    /// `context` is forwarded to the plugin's hook so providers that
+    /// need host access from inside their trait methods can capture
+    /// the bridge and capability metadata at registration time.
+    ///
     /// Dynamic (`dlopen`) and out-of-process backends cannot currently
     /// register in-process typed providers; this method returns an
     /// empty registry for those backends.
     #[must_use]
-    pub fn collect_typed_services(&self) -> bmux_plugin_sdk::TypedServiceRegistry {
+    pub fn collect_typed_services(
+        &self,
+        context: bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
+    ) -> bmux_plugin_sdk::TypedServiceRegistry {
         match &self.backend {
-            PluginBackend::Static(vtable) => (vtable.register_typed_services)(),
+            PluginBackend::Static(vtable) => (vtable.register_typed_services)(context),
             PluginBackend::Dynamic(_) | PluginBackend::Process(_) => {
                 bmux_plugin_sdk::TypedServiceRegistry::new()
             }
