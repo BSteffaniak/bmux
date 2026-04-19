@@ -37,6 +37,11 @@ interface decoration-state {
         pane-id: uuid,
         border: border-style,
         focused: bool,
+        // Text to draw as the status badge when the pane is running.
+        // Empty or absent => no badge is drawn in that state.
+        running-badge: string?,
+        // Text to draw as the status badge when the pane has exited.
+        exited-badge: string?,
     }
 
     // Queries.

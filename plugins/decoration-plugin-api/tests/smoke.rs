@@ -11,6 +11,8 @@ fn pane_decoration_record_round_trips() {
         pane_id: uuid::Uuid::nil(),
         border: BorderStyle::Ascii,
         focused: true,
+        running_badge: Some("[RUNNING]".to_string()),
+        exited_badge: Some("[EXITED]".to_string()),
     };
     let json = serde_json::to_string(&value).expect("serialize");
     let round: PaneDecoration = serde_json::from_str(&json).expect("deserialize");

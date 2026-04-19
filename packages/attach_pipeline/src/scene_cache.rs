@@ -10,7 +10,8 @@
 use uuid::Uuid;
 
 pub use bmux_scene_protocol::scene_protocol::{
-    Color, DecorationScene, PaintCommand, Rect as SceneRect, Style as SceneStyle, SurfaceDecoration,
+    BorderGlyphs, Color, DecorationScene, FallbackStyle, PaintCommand, Rect as SceneRect,
+    Style as SceneStyle, SurfaceDecoration,
 };
 
 /// Render-side cache of the latest decoration scene.
@@ -72,6 +73,17 @@ impl DecorationSceneCache {
             .and_then(|scene| scene.surfaces.get(surface_id))
     }
 
+    /// Return the plugin-published fallback style used for panes that
+    /// are not represented explicitly in the scene's `surfaces` map.
+    /// Returns `None` when no scene has been cached yet or when the
+    /// cached scene carries no fallback.
+    #[must_use]
+    pub fn fallback_style(&self) -> Option<&FallbackStyle> {
+        self.scene
+            .as_ref()
+            .and_then(|scene| scene.fallback.as_ref())
+    }
+
     /// Whether any scene has been cached yet.
     #[must_use]
     pub const fn has_scene(&self) -> bool {
@@ -122,7 +134,11 @@ mod tests {
                 paint_commands: Vec::new(),
             },
         );
-        DecorationScene { revision, surfaces }
+        DecorationScene {
+            revision,
+            surfaces,
+            fallback: None,
+        }
     }
 
     #[test]

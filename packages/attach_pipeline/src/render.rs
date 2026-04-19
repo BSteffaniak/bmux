@@ -87,19 +87,6 @@ fn contains_alternate_screen_sequence(bytes: &[u8]) -> bool {
         .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle))
 }
 
-fn draw_box_line(width: usize, left: char, mid: char, right: char) -> String {
-    if width <= 1 {
-        return left.to_string();
-    }
-    let mut line = String::new();
-    line.push(left);
-    if width > 2 {
-        line.extend(std::iter::repeat_n(mid, width - 2));
-    }
-    line.push(right);
-    line
-}
-
 #[must_use]
 pub fn opaque_row_text(content: &str, width: usize) -> String {
     let mut rendered = content.to_string();
@@ -137,6 +124,165 @@ fn apply_decoration_paint_commands<W: io::Write>(
             .context("failed resetting decoration paint command style")?;
     }
     Ok(())
+}
+
+/// Paint a border + status badge around `rect` using the plugin-owned
+/// [`crate::scene_cache::FallbackStyle`] when present, or compiled-in
+/// ASCII defaults otherwise.
+///
+/// This is the transitional path that core walks for surfaces the
+/// decoration plugin has not covered with per-surface `paint_commands`.
+/// It remains in core only because the plugin lacks geometry feedback
+/// today; once the plugin is geometry-aware it will emit explicit
+/// paint commands for every surface and this helper can be deleted.
+fn draw_fallback_decoration<W: io::Write>(
+    stdout: &mut W,
+    rect: PaneRect,
+    focus: bool,
+    zoomed: bool,
+    pane_state: PaneState,
+    fallback: Option<&crate::scene_cache::FallbackStyle>,
+) -> Result<()> {
+    if rect.w < 2 || rect.h < 2 {
+        return Ok(());
+    }
+    let glyph_choice = fallback_border_glyphs(fallback, focus, zoomed);
+    let (corner, hch, vch) = border_glyphs_triplet(&glyph_choice);
+    if !(corner.is_empty() && hch.is_empty() && vch.is_empty()) {
+        let top = draw_border_row(usize::from(rect.w), corner, hch, corner);
+        let bottom = top.clone();
+        queue!(stdout, MoveTo(rect.x, rect.y), Print(top)).context("failed drawing pane top")?;
+        queue!(
+            stdout,
+            MoveTo(rect.x, rect.y.saturating_add(rect.h.saturating_sub(1))),
+            Print(bottom)
+        )
+        .context("failed drawing pane bottom")?;
+
+        for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
+            queue!(stdout, MoveTo(rect.x, y), Print(vch))
+                .context("failed drawing pane left border")?;
+            queue!(
+                stdout,
+                MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y),
+                Print(vch)
+            )
+            .context("failed drawing pane right border")?;
+        }
+    }
+
+    if rect.w > 6 {
+        let badge = fallback_badge_text(fallback, pane_state);
+        if !badge.is_empty() {
+            let max_badge_width = usize::from(rect.w.saturating_sub(4));
+            let badge_text = opaque_row_text(badge, badge.len().min(max_badge_width));
+            queue!(
+                stdout,
+                MoveTo(rect.x.saturating_add(2), rect.y),
+                Print(badge_text)
+            )
+            .context("failed drawing pane state badge")?;
+        }
+    }
+    Ok(())
+}
+
+/// Pick the plugin-published border glyph set for the given focus /
+/// zoom state, falling back to the built-in ASCII default when the
+/// decoration plugin has not published a style yet.
+fn fallback_border_glyphs(
+    fallback: Option<&crate::scene_cache::FallbackStyle>,
+    focus: bool,
+    zoomed: bool,
+) -> crate::scene_cache::BorderGlyphs {
+    use crate::scene_cache::BorderGlyphs;
+    if let Some(style) = fallback {
+        return if zoomed && focus {
+            style.border_zoomed.clone()
+        } else if focus {
+            style.border_focused.clone()
+        } else {
+            style.border_unfocused.clone()
+        };
+    }
+    if zoomed && focus {
+        BorderGlyphs::AsciiZoomed
+    } else if focus {
+        BorderGlyphs::AsciiFocused
+    } else {
+        BorderGlyphs::Ascii
+    }
+}
+
+/// Expand a [`crate::scene_cache::BorderGlyphs`] choice into the
+/// `(corner, horizontal, vertical)` strings used by the border-row
+/// painter. Returns empty strings for `None` or `Custom` so the caller
+/// can skip painting entirely.
+///
+/// `Custom` glyphs would need lifetime-extended access to the plugin-
+/// supplied record. Until the renderer supports owned custom glyphs,
+/// `Custom` is treated as "no border"; the plugin will likely publish
+/// per-surface paint commands for custom work instead.
+const fn border_glyphs_triplet(
+    choice: &crate::scene_cache::BorderGlyphs,
+) -> (&'static str, &'static str, &'static str) {
+    use crate::scene_cache::BorderGlyphs;
+    match choice {
+        BorderGlyphs::None | BorderGlyphs::Custom { .. } => ("", "", ""),
+        BorderGlyphs::Ascii => ("+", "-", "|"),
+        BorderGlyphs::AsciiFocused => ("+", "=", "|"),
+        BorderGlyphs::AsciiZoomed => ("#", "=", "\u{2551}"),
+        BorderGlyphs::SingleLine => ("\u{250c}", "\u{2500}", "\u{2502}"),
+        BorderGlyphs::DoubleLine => ("\u{2554}", "\u{2550}", "\u{2551}"),
+    }
+}
+
+/// Pick the badge text for `pane_state` from the plugin's fallback
+/// style, falling back to the built-in text when the decoration
+/// plugin has not published a style.
+const fn fallback_badge_text(
+    fallback: Option<&crate::scene_cache::FallbackStyle>,
+    pane_state: PaneState,
+) -> &str {
+    match (fallback, pane_state) {
+        (Some(style), PaneState::Running) => string_as_str(&style.running_badge),
+        (Some(style), PaneState::Exited) => string_as_str(&style.exited_badge),
+        (None, PaneState::Running) => "[RUNNING]",
+        (None, PaneState::Exited) => "[EXITED]",
+    }
+}
+
+/// Const-context `&String -> &str` conversion. Avoids relying on the
+/// `Deref` blanket impl inside a `const fn`.
+const fn string_as_str(s: &String) -> &str {
+    // SAFETY: `String` is guaranteed to hold valid UTF-8 and its
+    // `as_bytes` view is identical to the underlying `&str`'s.
+    unsafe { std::str::from_utf8_unchecked(s.as_bytes()) }
+}
+
+/// Compose a horizontal border row: `left` corner, `mid` repeated
+/// `width - 2` times, `right` corner. `left` / `mid` / `right` are
+/// expected to be single-display-column strings; non-ASCII box glyphs
+/// (Unicode `─`, `│`) work because they lie in the 1-column grapheme
+/// range.
+#[allow(clippy::suspicious_operation_groupings)] // Byte-length arithmetic for String capacity; clippy misfires.
+fn draw_border_row(width: usize, left: &str, mid: &str, right: &str) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return left.to_string();
+    }
+    let body_len = mid.len() * width.saturating_sub(2);
+    let mut line = String::with_capacity(left.len() + body_len + right.len());
+    line.push_str(left);
+    if width > 2 {
+        for _ in 0..(width - 2) {
+            line.push_str(mid);
+        }
+    }
+    line.push_str(right);
+    line
 }
 
 /// Translate a [`crate::scene_cache::SceneStyle`] to the equivalent
@@ -480,62 +626,23 @@ pub fn render_attach_scene<W: io::Write>(
                 apply_decoration_paint_commands(stdout, entry)
                     .context("failed applying decoration paint commands")?;
             } else {
-                // Core fallback painting. This stays while the
-                // decoration plugin is still being wired up and the
-                // scene cache has no entry for this surface; once the
-                // plugin populates the scene with real paint commands
-                // for every visible surface, this block is deleted
-                // outright (AGENTS.md "core defaults when plugins are
-                // missing" will be carried by the decoration plugin
-                // itself publishing a default style).
-                let (corner, hch, vch) = if zoomed && focus {
-                    // Zoomed pane: double-line box drawing characters.
-                    ('#', '=', '\u{2551}') // ║ for sides, # corners, = top/bottom
-                } else if focus {
-                    ('+', '=', '|')
-                } else {
-                    ('+', '-', '|')
-                };
-                let top = draw_box_line(usize::from(rect.w), corner, hch, corner);
-                let bottom = draw_box_line(usize::from(rect.w), corner, hch, corner);
-                queue!(stdout, MoveTo(rect.x, rect.y), Print(top))
-                    .context("failed drawing pane top")?;
-                queue!(
+                // The plugin has no per-surface entry for this pane.
+                // Use the plugin's published fallback style when
+                // available; otherwise use compiled-in glyphs (the
+                // "decoration plugin absent" path).
+                let fallback = decoration_scene_cache
+                    .and_then(|cache| cache.fallback_style().map(|style| (*style).clone()));
+                draw_fallback_decoration(
                     stdout,
-                    MoveTo(rect.x, rect.y.saturating_add(rect.h.saturating_sub(1))),
-                    Print(bottom)
-                )
-                .context("failed drawing pane bottom")?;
-
-                for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
-                    queue!(stdout, MoveTo(rect.x, y), Print(vch))
-                        .context("failed drawing pane left border")?;
-                    queue!(
-                        stdout,
-                        MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y),
-                        Print(vch)
-                    )
-                    .context("failed drawing pane right border")?;
-                }
-
-                if rect.w > 6 {
-                    let badge = match pane_states
+                    rect,
+                    focus,
+                    zoomed,
+                    pane_states
                         .get(&pane_id)
                         .copied()
-                        .unwrap_or(PaneState::Running)
-                    {
-                        PaneState::Running => "[RUNNING]",
-                        PaneState::Exited => "[EXITED]",
-                    };
-                    let max_badge_width = usize::from(rect.w.saturating_sub(4));
-                    let badge_text = opaque_row_text(badge, badge.len().min(max_badge_width));
-                    queue!(
-                        stdout,
-                        MoveTo(rect.x.saturating_add(2), rect.y),
-                        Print(badge_text)
-                    )
-                    .context("failed drawing pane state badge")?;
-                }
+                        .unwrap_or(PaneState::Running),
+                    fallback.as_ref(),
+                )?;
             }
         }
 
@@ -1105,6 +1212,7 @@ mod tests {
         cache.force_scene(DecorationScene {
             revision: 1,
             surfaces,
+            fallback: None,
         });
 
         let mut output = Vec::new();
@@ -1143,6 +1251,100 @@ mod tests {
         assert!(
             rendered.contains("\x1b[0m"),
             "style reset should terminate the paint command; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_attach_scene_applies_plugin_fallback_style_for_uncovered_surface() {
+        use crate::scene_cache::{
+            BorderGlyphs, DecorationScene, DecorationSceneCache, FallbackStyle,
+        };
+        use std::collections::BTreeMap as StdBTreeMap;
+
+        let pane_id = Uuid::from_u128(91);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(92),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 5,
+                },
+                content_rect: AttachRect {
+                    x: 1,
+                    y: 1,
+                    w: 18,
+                    h: 3,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let panes = vec![PaneSummary {
+            id: pane_id,
+            index: 1,
+            name: None,
+            focused: true,
+            state: PaneState::Exited,
+            state_reason: Some("exited".to_string()),
+        }];
+        let mut pane_buffers = BTreeMap::new();
+        pane_buffers.insert(pane_id, PaneRenderBuffer::default());
+
+        // Scene has a fallback style but no per-surface entry for this
+        // pane's id — the renderer must fall through to the plugin's
+        // badge and border choices.
+        let mut cache = DecorationSceneCache::new();
+        cache.force_scene(DecorationScene {
+            revision: 1,
+            surfaces: StdBTreeMap::new(),
+            fallback: Some(FallbackStyle {
+                border_unfocused: BorderGlyphs::Ascii,
+                border_focused: BorderGlyphs::AsciiFocused,
+                border_zoomed: BorderGlyphs::AsciiZoomed,
+                running_badge: "run".to_string(),
+                exited_badge: "bye".to_string(),
+            }),
+        });
+
+        let mut output = Vec::new();
+        let _ = render_attach_scene(
+            &mut output,
+            &scene,
+            &panes,
+            &mut pane_buffers,
+            &BTreeSet::from([pane_id]),
+            true,
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (80, 24),
+            Some(&cache),
+        )
+        .expect("render should succeed");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        assert!(
+            rendered.contains("bye"),
+            "plugin-published exited badge should appear; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("[EXITED]"),
+            "compiled-in fallback badge must not appear when plugin publishes one; got: {rendered:?}"
         );
     }
 

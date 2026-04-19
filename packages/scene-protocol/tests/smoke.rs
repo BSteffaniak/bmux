@@ -54,6 +54,7 @@ fn decoration_scene_round_trips_through_json() {
     let scene = DecorationScene {
         revision: 7,
         surfaces,
+        fallback: None,
     };
 
     let json = serde_json::to_string(&scene).expect("scene encodes");

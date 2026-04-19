@@ -23,8 +23,8 @@ use bmux_decoration_plugin_api::decoration_state::{
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
-    Color, DecorationScene, INTERFACE_ID as SCENE_INTERFACE_ID, PaintCommand, Rect, Style,
-    SurfaceDecoration,
+    BorderGlyphs, Color, DecorationScene, FallbackStyle, INTERFACE_ID as SCENE_INTERFACE_ID,
+    PaintCommand, Rect, Style, SurfaceDecoration,
 };
 use uuid::Uuid;
 
@@ -93,11 +93,7 @@ impl DecorationStateService for DecorationServiceHandle {
             if let Some(p) = state.panes.get(&pane_id) {
                 return Some(p.clone());
             }
-            Some(PaneDecoration {
-                pane_id,
-                border: state.default_border,
-                focused: false,
-            })
+            Some(default_pane_decoration(pane_id, state.default_border))
         })
     }
 
@@ -134,11 +130,7 @@ impl DecorationStateService for DecorationServiceHandle {
             let entry = state
                 .panes
                 .entry(pane_id)
-                .or_insert_with(|| PaneDecoration {
-                    pane_id,
-                    border,
-                    focused: false,
-                });
+                .or_insert_with(|| default_pane_decoration(pane_id, border));
             entry.border = border;
             bump_revision(&mut state);
             Ok(())
@@ -178,6 +170,7 @@ fn build_scene(state: &State) -> DecorationScene {
     DecorationScene {
         revision: state.scene_revision,
         surfaces,
+        fallback: Some(default_fallback_style()),
     }
 }
 
@@ -186,6 +179,19 @@ fn empty_scene() -> DecorationScene {
     DecorationScene {
         revision: 0,
         surfaces: BTreeMap::new(),
+        fallback: None,
+    }
+}
+
+/// Plugin-owned defaults used by the renderer for panes that aren't
+/// represented explicitly in the scene's `surfaces` map.
+fn default_fallback_style() -> FallbackStyle {
+    FallbackStyle {
+        border_unfocused: BorderGlyphs::Ascii,
+        border_focused: BorderGlyphs::AsciiFocused,
+        border_zoomed: BorderGlyphs::AsciiZoomed,
+        running_badge: DEFAULT_RUNNING_BADGE.to_string(),
+        exited_badge: DEFAULT_EXITED_BADGE.to_string(),
     }
 }
 
@@ -221,6 +227,26 @@ impl DecorationPlugin {
             .inner
             .lock()
             .map_or_else(|_| empty_scene(), |state| build_scene(&state))
+    }
+}
+
+/// Default badge text rendered when a pane is running. Plugins that
+/// want different text call `set_pane_border` (or a future dedicated
+/// `set_pane_badges` command) to override per-pane.
+pub const DEFAULT_RUNNING_BADGE: &str = "[RUNNING]";
+
+/// Default badge text rendered when a pane has exited.
+pub const DEFAULT_EXITED_BADGE: &str = "[EXITED]";
+
+/// Build a [`PaneDecoration`] with the plugin's default style values
+/// for a pane that hasn't been touched by an explicit override.
+fn default_pane_decoration(pane_id: Uuid, border: BorderStyle) -> PaneDecoration {
+    PaneDecoration {
+        pane_id,
+        border,
+        focused: false,
+        running_badge: Some(DEFAULT_RUNNING_BADGE.to_string()),
+        exited_badge: Some(DEFAULT_EXITED_BADGE.to_string()),
     }
 }
 
