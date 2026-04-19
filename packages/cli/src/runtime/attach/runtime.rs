@@ -5449,7 +5449,13 @@ fn attach_scene_pane_content_rect(
     pane_id: Uuid,
 ) -> Option<bmux_ipc::AttachRect> {
     let layout_state = view_state.cached_layout_state.as_ref()?;
-    let mut best: Option<(bmux_ipc::AttachLayer, i32, usize, bmux_ipc::AttachRect)> = None;
+    let mut best: Option<(
+        bmux_ipc::AttachLayer,
+        i32,
+        usize,
+        uuid::Uuid,
+        bmux_ipc::AttachRect,
+    )> = None;
     for (index, surface) in layout_state.scene.surfaces.iter().enumerate() {
         if surface.pane_id != Some(pane_id) {
             continue;
@@ -5457,14 +5463,39 @@ fn attach_scene_pane_content_rect(
         if !surface.visible || !surface.accepts_input {
             continue;
         }
-        let candidate = (surface.layer, surface.z, index, surface.content_rect);
+        let candidate = (
+            surface.layer,
+            surface.z,
+            index,
+            surface.id,
+            surface.content_rect,
+        );
         if best.as_ref().is_none_or(|current| {
             (candidate.0, candidate.1, candidate.2) > (current.0, current.1, current.2)
         }) {
             best = Some(candidate);
         }
     }
-    best.map(|(_, _, _, rect)| rect)
+    let (_, _, _, surface_id, scene_rect) = best?;
+
+    // Prefer the decoration plugin's published `content_rect` for this
+    // surface when it carries real geometry. Zero-sized entries are
+    // placeholders the plugin emits when it hasn't been told about the
+    // layout yet; those stay pinned to the scene producer's value.
+    if let Ok(cache) = view_state.decoration_scene_cache.read()
+        && let Some(entry) = cache.surface(&surface_id)
+        && entry.content_rect.w > 0
+        && entry.content_rect.h > 0
+    {
+        return Some(bmux_ipc::AttachRect {
+            x: entry.content_rect.x,
+            y: entry.content_rect.y,
+            w: entry.content_rect.w,
+            h: entry.content_rect.h,
+        });
+    }
+
+    Some(scene_rect)
 }
 
 #[cfg(test)]
@@ -6866,6 +6897,151 @@ mod tests {
         assert!(
             forwarded.is_none(),
             "clicks on the border (outside content_rect) must not forward PTY bytes"
+        );
+    }
+
+    /// The decoration plugin can publish a tighter `content_rect` than
+    /// the scene producer (e.g., a plugin that paints a 2-cell border).
+    /// When the plugin's rect is non-zero, the mouse translator must
+    /// prefer it over the scene producer's value so clicks on the
+    /// first visual content cell under that thicker border still
+    /// encode to SGR `(1, 1)`.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn attach_mouse_forward_honors_decoration_cache_content_rect() {
+        use bmux_attach_pipeline::scene_cache::{DecorationScene, SceneRect, SurfaceDecoration};
+        use std::collections::BTreeMap as StdBTreeMap;
+
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let surface_id = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        // Scene producer publishes a 1-cell inset.
+        let outer = AttachRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        };
+        let scene_content = AttachRect {
+            x: 1,
+            y: 1,
+            w: 38,
+            h: 8,
+        };
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: vec![PaneSummary {
+                id: pane_id,
+                index: 1,
+                name: None,
+                focused: true,
+                state: PaneState::Running,
+                state_reason: None,
+            }],
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![AttachSurface {
+                    id: surface_id,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: bmux_ipc::AttachLayer::Pane,
+                    z: 0,
+                    pane_id: Some(pane_id),
+                    rect: outer,
+                    content_rect: scene_content,
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                }],
+            },
+            zoomed: false,
+        });
+
+        // Decoration plugin publishes a tighter 2-cell inset for this
+        // surface.
+        let plugin_content = SceneRect {
+            x: 2,
+            y: 2,
+            w: 36,
+            h: 6,
+        };
+        let mut surfaces = StdBTreeMap::new();
+        surfaces.insert(
+            surface_id,
+            SurfaceDecoration {
+                surface_id,
+                rect: SceneRect {
+                    x: outer.x,
+                    y: outer.y,
+                    w: outer.w,
+                    h: outer.h,
+                },
+                content_rect: plugin_content.clone(),
+                paint_commands: Vec::new(),
+            },
+        );
+        if let Ok(mut cache) = view_state.decoration_scene_cache.write() {
+            cache.force_scene(DecorationScene {
+                revision: 1,
+                surfaces,
+                fallback: None,
+            });
+        }
+
+        let buffer = view_state
+            .pane_buffers
+            .entry(pane_id)
+            .or_insert_with(|| PaneRenderBuffer {
+                parser: vt100::Parser::new(6, 36, 4_096),
+                last_alternate_screen: false,
+                prev_rows: Vec::new(),
+                sync_update_in_progress: false,
+                expected_stream_start: None,
+            });
+        append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
+
+        // Click on absolute (plugin_content.x, plugin_content.y) — the
+        // first visible content cell when the plugin's 2-cell border
+        // is painted. Should encode to pane-local (0, 0) → SGR (1, 1).
+        let first_cell = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: plugin_content.x,
+            row: plugin_content.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let forwarded =
+            attach_mouse_forward_bytes_for_target(&view_state, first_cell, Some(pane_id), true)
+                .expect("click on plugin's first content cell should forward");
+        assert_eq!(
+            forwarded,
+            b"\x1b[<0;1;1M".to_vec(),
+            "decoration cache's content_rect must take precedence over the scene producer's"
+        );
+
+        // Click at (scene_content.x, scene_content.y) — the scene
+        // producer's first content cell, but UNDER the plugin's 2-cell
+        // border. Should NOT forward bytes.
+        let scene_cell = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: scene_content.x,
+            row: scene_content.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let forwarded =
+            attach_mouse_forward_bytes_for_target(&view_state, scene_cell, Some(pane_id), true);
+        assert!(
+            forwarded.is_none(),
+            "clicks under the plugin's wider border must not forward bytes"
         );
     }
 
