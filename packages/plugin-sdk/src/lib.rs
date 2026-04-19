@@ -77,11 +77,11 @@ pub use host_services::{
     PaneCloseRequest, PaneCloseResponse, PaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
     PaneLaunchCommand, PaneLaunchRequest, PaneLaunchResponse, PaneListRequest, PaneListResponse,
     PaneResizeRequest, PaneResizeResponse, PaneSelector, PaneSplitDirection, PaneSplitRequest,
-    PaneSplitResponse, PaneSummary, PluginCommandEffect, PluginCommandOutcome,
-    RecordingWriteEventRequest, RecordingWriteEventResponse, SessionCreateRequest,
-    SessionCreateResponse, SessionKillRequest, SessionKillResponse, SessionListResponse,
-    SessionSelectRequest, SessionSelectResponse, SessionSelector, SessionSummary,
-    StorageGetRequest, StorageGetResponse, StorageSetRequest,
+    PaneSplitResponse, PaneSummary, PaneZoomRequest, PaneZoomResponse, PluginCommandEffect,
+    PluginCommandOutcome, RecordingWriteEventRequest, RecordingWriteEventResponse,
+    SessionCreateRequest, SessionCreateResponse, SessionKillRequest, SessionKillResponse,
+    SessionListResponse, SessionSelectRequest, SessionSelectResponse, SessionSelector,
+    SessionSummary, StorageGetRequest, StorageGetResponse, StorageSetRequest,
 };
 pub use native_exports::{
     EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, PluginCommandError, RustPlugin,

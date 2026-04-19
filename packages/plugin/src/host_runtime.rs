@@ -12,11 +12,11 @@ use bmux_plugin_sdk::{
     CoreCliCommandRequest, CoreCliCommandResponse, CurrentClientResponse, LogWriteRequest,
     PaneCloseRequest, PaneCloseResponse, PaneFocusRequest, PaneFocusResponse, PaneLaunchRequest,
     PaneLaunchResponse, PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
-    PaneSplitRequest, PaneSplitResponse, PluginCliCommandRequest, PluginCliCommandResponse,
-    RecordingWriteEventRequest, RecordingWriteEventResponse, Result, ServiceKind,
-    SessionCreateRequest, SessionCreateResponse, SessionKillRequest, SessionKillResponse,
-    SessionListResponse, SessionSelectRequest, SessionSelectResponse, StorageGetRequest,
-    StorageGetResponse, StorageSetRequest,
+    PaneSplitRequest, PaneSplitResponse, PaneZoomRequest, PaneZoomResponse,
+    PluginCliCommandRequest, PluginCliCommandResponse, RecordingWriteEventRequest,
+    RecordingWriteEventResponse, Result, ServiceKind, SessionCreateRequest, SessionCreateResponse,
+    SessionKillRequest, SessionKillResponse, SessionListResponse, SessionSelectRequest,
+    SessionSelectResponse, StorageGetRequest, StorageGetResponse, StorageSetRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -340,6 +340,22 @@ pub trait HostRuntimeApi: ServiceCaller {
             ServiceKind::Command,
             "pane-command/v1",
             "close",
+            request,
+        )
+    }
+
+    /// Toggle the zoom state of the currently-active pane in the
+    /// targeted session (or the selected session when none is given).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
+    fn pane_zoom(&self, request: &PaneZoomRequest) -> Result<PaneZoomResponse> {
+        self.call_service(
+            "bmux.panes.write",
+            ServiceKind::Command,
+            "pane-command/v1",
+            "zoom",
             request,
         )
     }

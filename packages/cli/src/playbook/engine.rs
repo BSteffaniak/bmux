@@ -2434,10 +2434,20 @@ async fn apply_attach_runtime_actions(
                 .map_err(|e| anyhow::anyhow!("close focused pane failed: {e}"))?;
             }
             crate::input::RuntimeAction::ZoomPane => {
-                client
-                    .zoom_pane(Some(SessionSelector::ById(runtime.state.attached_id)))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("zoom pane failed: {e}"))?;
+                invoke_windows_command_bmux::<
+                    _,
+                    bmux_windows_plugin_api::windows_commands::PaneZoomAck,
+                >(
+                    client,
+                    "zoom-pane",
+                    &crate::runtime::typed_windows::args::ZoomPane {
+                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
+                            SessionSelector::ById(runtime.state.attached_id),
+                        )),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("zoom pane failed: {e}"))?;
             }
             crate::input::RuntimeAction::IncreaseSplit
             | crate::input::RuntimeAction::ResizeRight

@@ -8,7 +8,7 @@ use bmux_client::{BmuxClient, ClientError, ServerEvent, StreamingBmuxClient};
 use bmux_ipc::compressed_stream::CompressedStream;
 use bmux_ipc::transport::{ErasedIpcStream, IpcTransportError};
 use bmux_ipc::{
-    AttachPaneChunk, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ErrorCode, PaneSelector,
+    AttachPaneChunk, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ErrorCode,
     SessionSelector,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
@@ -1307,10 +1307,35 @@ async fn handle_session_mouse_event(
     ) && matches!(event.button, Some(TerminalMouseButton::Left));
 
     if focus_before_forward && !in_focused_pane {
-        client
-            .focus_pane_target(
-                Some(SessionSelector::ById(session_id)),
-                PaneSelector::ById(target_pane),
+        #[derive(serde::Serialize)]
+        struct FocusPaneBySelectorArgs {
+            session: bmux_windows_plugin_api::windows_commands::Selector,
+            target: bmux_windows_plugin_api::windows_commands::Selector,
+        }
+        let args = FocusPaneBySelectorArgs {
+            session: bmux_windows_plugin_api::windows_commands::Selector {
+                id: Some(session_id),
+                name: None,
+                index: None,
+            },
+            target: bmux_windows_plugin_api::windows_commands::Selector {
+                id: Some(target_pane),
+                name: None,
+                index: None,
+            },
+        };
+        let encoded = bmux_codec::to_vec(&args).map_err(|error| {
+            MobileCoreError::TerminalBackendFailure(format!(
+                "encoding focus-pane-by-selector args: {error}"
+            ))
+        })?;
+        let _response_bytes = client
+            .invoke_service_raw(
+                "bmux.windows.write",
+                bmux_ipc::InvokeServiceKind::Command,
+                "windows-commands",
+                "focus-pane-by-selector",
+                encoded,
             )
             .await
             .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;

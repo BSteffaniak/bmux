@@ -26,14 +26,15 @@ use bmux_plugin_sdk::{
     PaneFocusRequest, PaneFocusResponse, PaneLaunchRequest, PaneLaunchResponse, PaneListRequest,
     PaneListResponse, PaneResizeRequest, PaneResizeResponse, PaneSelector as HostPaneSelector,
     PaneSplitDirection as HostPaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
-    PaneSummary as HostPaneSummary, PluginCliCommandRequest, PluginCliCommandResponse, PluginError,
-    PluginEvent, ProcessInvocationRequest, ProcessInvocationResponse, RecordingWriteEventRequest,
-    RecordingWriteEventResponse, RegisteredService, Result, ServiceEnvelopeKind, ServiceKind,
-    ServiceRequest, ServiceResponse, SessionCreateRequest, SessionCreateResponse,
-    SessionKillRequest, SessionKillResponse, SessionListResponse, SessionSelectRequest,
-    SessionSelectResponse, SessionSelector as HostSessionSelector,
-    SessionSummary as HostSessionSummary, StaticPluginVtable, decode_process_invocation_response,
-    decode_service_envelope, decode_service_message, encode_host_kernel_bridge_cli_command_payload,
+    PaneSummary as HostPaneSummary, PaneZoomRequest, PaneZoomResponse, PluginCliCommandRequest,
+    PluginCliCommandResponse, PluginError, PluginEvent, ProcessInvocationRequest,
+    ProcessInvocationResponse, RecordingWriteEventRequest, RecordingWriteEventResponse,
+    RegisteredService, Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse,
+    SessionCreateRequest, SessionCreateResponse, SessionKillRequest, SessionKillResponse,
+    SessionListResponse, SessionSelectRequest, SessionSelectResponse,
+    SessionSelector as HostSessionSelector, SessionSummary as HostSessionSummary,
+    StaticPluginVtable, decode_process_invocation_response, decode_service_envelope,
+    decode_service_message, encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload, encode_process_invocation_request,
     encode_service_envelope, encode_service_message,
 };
@@ -1368,6 +1369,29 @@ fn handle_core_service_call(
                 }),
                 _ => Err(PluginError::ServiceProtocol {
                     details: "unexpected response payload for pane-command/v1:close".to_string(),
+                }),
+            }
+        }
+        ("pane-command/v1", "zoom") => {
+            let request: PaneZoomRequest = decode_service_message(payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::ZoomPane {
+                    session: request.session.map(session_selector_to_ipc),
+                },
+            )?;
+            match response {
+                IpcResponsePayload::PaneZoomed {
+                    session_id,
+                    pane_id,
+                    zoomed,
+                } => encode_service_message(&PaneZoomResponse {
+                    session_id,
+                    pane_id,
+                    zoomed,
+                }),
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for pane-command/v1:zoom".to_string(),
                 }),
             }
         }

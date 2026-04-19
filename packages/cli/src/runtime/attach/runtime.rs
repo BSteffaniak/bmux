@@ -2213,8 +2213,20 @@ pub async fn handle_attach_ui_action(
         }
         RuntimeAction::ZoomPane => {
             let selector = attached_session_selector(view_state);
-            let (_pane_id, zoomed) = client.zoom_pane(Some(selector)).await?;
-            let status = if zoomed { "Pane zoomed" } else { "Zoom exited" };
+            let ack: bmux_windows_plugin_api::windows_commands::PaneZoomAck =
+                invoke_windows_command(
+                    client,
+                    "zoom-pane",
+                    &windows_cmd_args::ZoomPane {
+                        session: Some(ipc_to_typed_selector(selector)),
+                    },
+                )
+                .await?;
+            let status = if ack.zoomed {
+                "Pane zoomed"
+            } else {
+                "Zoom exited"
+            };
             view_state.set_transient_status(status, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
         }
         RuntimeAction::NewWindow | RuntimeAction::NewSession => {

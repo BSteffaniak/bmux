@@ -90,6 +90,14 @@ interface windows-commands {
         pane-id: uuid?,
     }
 
+    // Acknowledgement returned by `zoom-pane`. Carries the pane that
+    // was toggled plus the post-toggle zoom state so callers can
+    // render an accurate status without a follow-up query.
+    record pane-zoom-ack {
+        pane-id: uuid,
+        zoomed: bool,
+    }
+
     // Direction in which a pane split/focus action moves.
     enum pane-direction {
         @default horizontal,
@@ -161,7 +169,7 @@ interface windows-commands {
 
     command zoom-pane(
         session: selector?,
-    ) -> result<pane-ack, pane-mutation-error>;
+    ) -> result<pane-zoom-ack, pane-mutation-error>;
 
     command restart-pane(
         session: selector?,

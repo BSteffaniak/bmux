@@ -1328,7 +1328,9 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_attach_pipeline",
  "bmux_client",
+ "bmux_codec",
  "bmux_ipc",
+ "bmux_windows_plugin_api",
  "iroh",
  "rustls",
  "rustls-native-certs",

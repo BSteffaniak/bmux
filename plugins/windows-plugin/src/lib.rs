@@ -9,8 +9,8 @@ use bmux_plugin_sdk::{
     StorageSetRequest, TypedServiceRegistrationContext, TypedServiceRegistry,
 };
 use bmux_windows_plugin_api::windows_commands::{
-    self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, Selector, WindowAck,
-    WindowError, WindowsCommandsService,
+    self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, PaneZoomAck, Selector,
+    WindowAck, WindowError, WindowsCommandsService,
 };
 use bmux_windows_plugin_api::windows_state::{self, PaneState, WindowEntry, WindowsStateService};
 use serde::{Deserialize, Serialize};
@@ -170,14 +170,16 @@ impl RustPlugin for WindowsPlugin {
                     .map(|_| PaneAck { ok: true, pane_id: None })
                     .map_err(|e| ServiceResponse::error("resize_failed", e.to_string()))
             },
-            "windows-commands", "zoom-pane" => |_req: ZoomPaneArgs, _ctx| {
-                // Zoom has no host primitive yet; mirror the typed
-                // trait impl's error so both transports behave the
-                // same.
-                Err::<PaneAck, _>(ServiceResponse::error(
-                    "unsupported",
-                    "zoom-pane typed command is not wired to a host primitive yet",
-                ))
+            "windows-commands", "zoom-pane" => |req: ZoomPaneArgs, ctx| {
+                let request = bmux_plugin_sdk::PaneZoomRequest {
+                    session: req.session.as_ref().and_then(selector_to_session),
+                };
+                ctx.pane_zoom(&request)
+                    .map(|resp| PaneZoomAck {
+                        pane_id: resp.pane_id,
+                        zoomed: resp.zoomed,
+                    })
+                    .map_err(|e| ServiceResponse::error("zoom_failed", e.to_string()))
             },
             "windows-commands", "restart-pane" => |_req: RestartPaneArgs, _ctx| {
                 Err::<PaneAck, _>(ServiceResponse::error(
@@ -1145,17 +1147,20 @@ impl WindowsCommandsService for WindowsCommandsHandle {
 
     fn zoom_pane<'a>(
         &'a self,
-        _session: Option<Selector>,
-    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        session: Option<Selector>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneZoomAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            // The host doesn't expose a byte-encoded zoom service
-            // today (zoom is computed in the attach layout); surface
-            // a clear "not yet wired" error rather than silently
-            // succeeding. Once core exposes a zoom primitive the
-            // typed path wires straight through.
-            Err(PaneMutationError::Failed {
-                reason: "zoom-pane typed command is not wired to a host primitive yet".into(),
-            })
+            let request = bmux_plugin_sdk::PaneZoomRequest {
+                session: session.as_ref().and_then(selector_to_session),
+            };
+            caller
+                .pane_zoom(&request)
+                .map(|response| PaneZoomAck {
+                    pane_id: response.pane_id,
+                    zoomed: response.zoomed,
+                })
+                .map_err(map_host_error)
         })
     }
 

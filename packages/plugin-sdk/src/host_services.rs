@@ -233,6 +233,28 @@ pub struct PaneCloseResponse {
     pub session_closed: bool,
 }
 
+/// Request for the host-provided `pane-command/v1:zoom` service.
+///
+/// Toggles the zoom state of the currently-active pane in `session`,
+/// or of the selected session when no session is supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneZoomRequest {
+    #[serde(default)]
+    pub session: Option<SessionSelector>,
+}
+
+/// Response for the host-provided `pane-command/v1:zoom` service.
+///
+/// Carries the pane the zoom toggle applied to plus the post-toggle
+/// zoom state so callers can render an accurate status without a
+/// follow-up query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneZoomResponse {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub zoomed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageGetRequest {
     pub key: String,
