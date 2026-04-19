@@ -121,6 +121,10 @@ macro_rules! declare_bundled_plugins {
 }
 
 declare_bundled_plugins! {
+    feature = "bundled-plugin-clients",
+    manifest = include_str!("../../../../plugins/clients-plugin/plugin.toml"),
+    plugin_type = bmux_clients_plugin::ClientsPlugin;
+
     feature = "bundled-plugin-clipboard",
     manifest = include_str!("../../../../plugins/clipboard-plugin/plugin.toml"),
     plugin_type = bmux_clipboard_plugin::ClipboardPlugin;
@@ -128,6 +132,10 @@ declare_bundled_plugins! {
     feature = "bundled-plugin-cluster",
     manifest = include_str!("../../../../plugins/cluster-plugin/plugin.toml"),
     plugin_type = bmux_cluster_plugin::ClusterPlugin;
+
+    feature = "bundled-plugin-contexts",
+    manifest = include_str!("../../../../plugins/contexts-plugin/plugin.toml"),
+    plugin_type = bmux_contexts_plugin::ContextsPlugin;
 
     feature = "bundled-plugin-permissions",
     manifest = include_str!("../../../../plugins/permissions-plugin/plugin.toml"),
@@ -140,6 +148,10 @@ declare_bundled_plugins! {
     feature = "bundled-plugin-prompted-actions",
     manifest = include_str!("../../../../plugins/prompted-actions-plugin/plugin.toml"),
     plugin_type = bmux_prompted_actions_plugin::PromptedActionsPlugin;
+
+    feature = "bundled-plugin-sessions",
+    manifest = include_str!("../../../../plugins/sessions-plugin/plugin.toml"),
+    plugin_type = bmux_sessions_plugin::SessionsPlugin;
 
     feature = "bundled-plugin-windows",
     manifest = include_str!("../../../../plugins/windows-plugin/plugin.toml"),

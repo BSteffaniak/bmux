@@ -1,0 +1,23 @@
+execution_class       = "native_fast"
+id                    = "bmux.sessions"
+name                  = "bmux Sessions"
+owns_namespaces       = []
+provided_capabilities = ["bmux.sessions.read", "bmux.sessions.write"]
+provided_features     = ["bmux.sessions"]
+required_capabilities = ["bmux.sessions.read", "bmux.sessions.write"]
+version               = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.sessions.read"
+interface_id = "sessions-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.sessions.write"
+interface_id = "sessions-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.sessions.read"
+interface_id = "sessions-events"
+kind         = "event"

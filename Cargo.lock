@@ -1013,10 +1013,12 @@ dependencies = [
  "bmux_cli_output",
  "bmux_cli_schema",
  "bmux_client",
+ "bmux_clients_plugin",
  "bmux_clipboard_plugin",
  "bmux_cluster_plugin",
  "bmux_codec",
  "bmux_config",
+ "bmux_contexts_plugin",
  "bmux_decoration_plugin",
  "bmux_decoration_plugin_api",
  "bmux_env",
@@ -1033,6 +1035,7 @@ dependencies = [
  "bmux_prompted_actions_plugin",
  "bmux_server",
  "bmux_session",
+ "bmux_sessions_plugin",
  "bmux_slots",
  "bmux_terminal",
  "bmux_terminal_protocol",
@@ -1105,6 +1108,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_clients_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_clients_plugin_api",
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_clients_plugin_api"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_clipboard"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1169,6 +1193,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "bmux_contexts_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_contexts_plugin_api",
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+]
+
+[[package]]
+name = "bmux_contexts_plugin_api"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -1526,6 +1570,26 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_sessions_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "bmux_sessions_plugin_api",
+]
+
+[[package]]
+name = "bmux_sessions_plugin_api"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 

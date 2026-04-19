@@ -1,0 +1,28 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shipped clients plugin for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "clients"]
+license     = { workspace = true }
+name        = "bmux_clients_plugin"
+publish     = false
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmux_clients_plugin_api = { workspace = true }
+bmux_plugin             = { workspace = true }
+bmux_plugin_sdk         = { workspace = true }
+uuid                    = { workspace = true, features = ["std"] }
+
+[features]
+fail-on-warnings = [
+    "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]
+static-bundled = []

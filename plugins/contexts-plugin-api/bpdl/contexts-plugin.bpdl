@@ -1,0 +1,100 @@
+// Public, typed contract of the contexts plugin. Contexts are a
+// higher-level grouping layer over sessions, used for organizing
+// work (project-level boundaries, filter scopes, focus frames).
+// Other plugins that depend on `bmux_contexts_plugin_api` import
+// these interfaces rather than the contexts plugin implementation.
+//
+// Three interfaces:
+// - `contexts-state` — read-only queries about contexts.
+// - `contexts-commands` — mutating operations on contexts.
+// - `contexts-events` — lifecycle event stream.
+
+plugin bmux.contexts version 1;
+
+interface contexts-state {
+    // Snapshot of a single context's public state.
+    record context-summary {
+        id: uuid,
+        name: string?,
+        attributes: map<string, string>,
+    }
+
+    // Selector identifying a context. Exactly one of `id` or `name`
+    // should be populated; `id` wins when both are set.
+    //
+    // Defined here and re-declared in `contexts-commands` because BPDL
+    // doesn't currently support cross-interface type references within
+    // the same plugin.
+    record context-selector {
+        id: uuid?,
+        name: string?,
+    }
+
+    // Errors a context query can produce.
+    variant context-query-error {
+        not-found,
+        invalid-selector { reason: string },
+    }
+
+    query list-contexts() -> list<context-summary>;
+    query get-context(selector: context-selector) -> result<context-summary, context-query-error>;
+    query current-context() -> context-summary?;
+}
+
+interface contexts-commands {
+    // Selector identifying a context. Mirrors
+    // `contexts-state.context-selector` — see note there.
+    record context-selector {
+        id: uuid?,
+        name: string?,
+    }
+
+    // Errors a `create-context` command can produce.
+    variant create-context-error {
+        name-already-exists { name: string },
+        invalid-name { reason: string },
+        failed { reason: string },
+    }
+
+    // Errors a `select-context` command can produce.
+    variant select-context-error {
+        not-found,
+        denied { reason: string },
+    }
+
+    // Errors a `close-context` command can produce.
+    variant close-context-error {
+        not-found,
+        denied { reason: string },
+        failed { reason: string },
+    }
+
+    // Acknowledgement returned by mutating context commands. `id`
+    // carries the target context id after the operation (the newly
+    // created one for `create-context`, or the resolved selector for
+    // `select-context` / `close-context`).
+    record context-ack {
+        id: uuid,
+    }
+
+    command create-context(name: string?, attributes: map<string, string>)
+        -> result<context-ack, create-context-error>;
+    command select-context(selector: context-selector)
+        -> result<context-ack, select-context-error>;
+    command close-context(selector: context-selector, force: bool)
+        -> result<context-ack, close-context-error>;
+}
+
+interface contexts-events {
+    // A single event describing a context lifecycle change.
+    variant context-event {
+        // A new context was created.
+        created { context-id: uuid, name: string? },
+        // A context was closed / removed.
+        closed { context-id: uuid },
+        // A context was selected (became current for a client).
+        selected { context-id: uuid },
+    }
+
+    events context-event;
+}

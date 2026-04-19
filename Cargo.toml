@@ -42,13 +42,19 @@ members = [
     "packages/image",
     "packages/docs-site",
     "packages/docs-site/ui",
+    "plugins/clients-plugin",
+    "plugins/clients-plugin-api",
     "plugins/clipboard-plugin",
     "plugins/cluster-plugin",
+    "plugins/contexts-plugin",
+    "plugins/contexts-plugin-api",
     "plugins/decoration-plugin",
     "plugins/decoration-plugin-api",
     "plugins/plugin-cli-plugin",
     "plugins/permissions-plugin",
     "plugins/prompted-actions-plugin",
+    "plugins/sessions-plugin",
+    "plugins/sessions-plugin-api",
     "plugins/windows-plugin",
     "plugins/windows-plugin-api",
 ]
@@ -131,13 +137,19 @@ bmux_terminal_models        = { version = "0.0.1-alpha.0", default-features = fa
 bmux_terminal_protocol      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }
 
 # Bundled plugin crates (used as optional rlib deps in bmux_cli)
+bmux_clients_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/clients-plugin" }
+bmux_clients_plugin_api      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/clients-plugin-api" }
 bmux_clipboard_plugin        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/clipboard-plugin" }
 bmux_cluster_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/cluster-plugin" }
+bmux_contexts_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/contexts-plugin" }
+bmux_contexts_plugin_api     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/contexts-plugin-api" }
 bmux_decoration_plugin       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/decoration-plugin" }
 bmux_decoration_plugin_api   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/decoration-plugin-api" }
 bmux_permissions_plugin      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/permissions-plugin" }
 bmux_plugin_cli_plugin       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/plugin-cli-plugin" }
 bmux_prompted_actions_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/prompted-actions-plugin" }
+bmux_sessions_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/sessions-plugin" }
+bmux_sessions_plugin_api     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/sessions-plugin-api" }
 bmux_windows_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/windows-plugin" }
 bmux_windows_plugin_api      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/windows-plugin-api" }
 

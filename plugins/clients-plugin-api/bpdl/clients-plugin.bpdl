@@ -1,0 +1,84 @@
+// Public, typed contract of the clients plugin. Tracks per-client
+// identity and view state: which session the client has selected,
+// which client (if any) this one is following, and whether global
+// following is enabled. Other plugins that depend on
+// `bmux_clients_plugin_api` import these interfaces rather than the
+// clients plugin implementation.
+//
+// Three interfaces:
+// - `clients-state` — read-only queries.
+// - `clients-commands` — mutating operations.
+// - `clients-events` — lifecycle event stream.
+
+plugin bmux.clients version 1;
+
+interface clients-state {
+    // Snapshot of a single client's public view state.
+    record client-summary {
+        id: uuid,
+        selected_session_id: uuid?,
+        following_client_id: uuid?,
+        following_global: bool,
+    }
+
+    // Errors a client query can produce.
+    variant client-query-error {
+        not-found,
+        no-current-client,
+    }
+
+    // List every currently-connected client.
+    query list-clients() -> list<client-summary>;
+
+    // Return the summary of the client issuing this call (if any).
+    query current-client() -> result<client-summary, client-query-error>;
+}
+
+interface clients-commands {
+    // Errors a `set-current-session` command can produce.
+    variant set-current-session-error {
+        not-found,
+        denied { reason: string },
+    }
+
+    // Errors a `set-following` command can produce.
+    variant set-following-error {
+        target-not-found,
+        denied { reason: string },
+    }
+
+    // Acknowledgement returned by mutating client commands.
+    record client-ack {
+        client-id: uuid,
+    }
+
+    // Change the current client's selected session.
+    command set-current-session(session-id: uuid)
+        -> result<client-ack, set-current-session-error>;
+
+    // Toggle follow mode for the current client. Passing a target
+    // client id enables directed following; passing none and
+    // `global=true` enables global follow; both absent disables follow.
+    command set-following(target-client-id: uuid?, global: bool)
+        -> result<client-ack, set-following-error>;
+}
+
+interface clients-events {
+    // A single event describing a client lifecycle change.
+    variant client-event {
+        // A client attached to the server.
+        attached { client-id: uuid },
+        // A client detached from the server.
+        detached { client-id: uuid },
+        // A client's selected session changed.
+        session-selected { client-id: uuid, session-id: uuid },
+        // A client started or stopped following.
+        follow-changed {
+            client-id: uuid,
+            target-client-id: uuid?,
+            global: bool,
+        },
+    }
+
+    events client-event;
+}

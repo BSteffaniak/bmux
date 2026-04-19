@@ -1,0 +1,23 @@
+execution_class       = "native_fast"
+id                    = "bmux.clients"
+name                  = "bmux Clients"
+owns_namespaces       = []
+provided_capabilities = ["bmux.clients.read", "bmux.clients.write"]
+provided_features     = ["bmux.clients"]
+required_capabilities = ["bmux.clients.read", "bmux.clients.write"]
+version               = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.clients.read"
+interface_id = "clients-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.clients.write"
+interface_id = "clients-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.clients.read"
+interface_id = "clients-events"
+kind         = "event"

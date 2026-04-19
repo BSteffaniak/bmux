@@ -1,0 +1,100 @@
+// Public, typed contract of the sessions plugin. Other plugins that
+// depend on `bmux_sessions_plugin_api` import these interfaces rather
+// than the sessions plugin implementation itself.
+//
+// Three interfaces:
+// - `sessions-state` — read-only queries about sessions.
+// - `sessions-commands` — mutating operations on sessions.
+// - `sessions-events` — lifecycle event stream.
+
+plugin bmux.sessions version 1;
+
+interface sessions-state {
+    // Snapshot of a single session's public state. `client_count` is
+    // the number of clients currently attached to this session; the
+    // sessions plugin tracks this without needing a separate clients
+    // query.
+    record session-summary {
+        id: uuid,
+        name: string?,
+        client_count: u32,
+    }
+
+    // Selector identifying a session. Exactly one of `id` or `name`
+    // should be populated; `id` wins when both are set.
+    //
+    // Defined here and re-declared in `sessions-commands` because BPDL
+    // doesn't currently support cross-interface type references within
+    // the same plugin. Both copies use identical field layout so a
+    // value serializes the same either way.
+    record session-selector {
+        id: uuid?,
+        name: string?,
+    }
+
+    // Errors a session query can produce.
+    variant session-query-error {
+        not-found,
+        invalid-selector { reason: string },
+    }
+
+    query list-sessions() -> list<session-summary>;
+    query get-session(selector: session-selector) -> result<session-summary, session-query-error>;
+}
+
+interface sessions-commands {
+    // Selector identifying a session. Mirrors
+    // `sessions-state.session-selector` — see note there.
+    record session-selector {
+        id: uuid?,
+        name: string?,
+    }
+
+    // Errors a `new-session` command can produce.
+    variant new-session-error {
+        name-already-exists { name: string },
+        invalid-name { reason: string },
+        failed { reason: string },
+    }
+
+    // Errors a `kill-session` command can produce.
+    variant kill-session-error {
+        not-found,
+        failed { reason: string },
+    }
+
+    // Errors a `select-session` command can produce.
+    variant select-session-error {
+        not-found,
+        denied { reason: string },
+    }
+
+    // Acknowledgement returned by mutating session commands. `id`
+    // carries the target session id after the operation (the newly
+    // created one for `new-session`, or the resolved selector for
+    // `kill-session` / `select-session`).
+    record session-ack {
+        id: uuid,
+    }
+
+    command new-session(name: string?) -> result<session-ack, new-session-error>;
+    command kill-session(selector: session-selector)
+        -> result<session-ack, kill-session-error>;
+    command select-session(selector: session-selector)
+        -> result<session-ack, select-session-error>;
+}
+
+interface sessions-events {
+    // A single event describing a session lifecycle change.
+    variant session-event {
+        // A new session was created.
+        created { session-id: uuid, name: string? },
+        // A session was removed.
+        removed { session-id: uuid },
+        // A session became the currently-selected one for at least
+        // one client.
+        selected { session-id: uuid },
+    }
+
+    events session-event;
+}

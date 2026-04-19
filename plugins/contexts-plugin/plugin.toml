@@ -1,0 +1,23 @@
+execution_class       = "native_fast"
+id                    = "bmux.contexts"
+name                  = "bmux Contexts"
+owns_namespaces       = []
+provided_capabilities = ["bmux.contexts.read", "bmux.contexts.write"]
+provided_features     = ["bmux.contexts"]
+required_capabilities = ["bmux.contexts.read", "bmux.contexts.write"]
+version               = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.contexts.read"
+interface_id = "contexts-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.contexts.write"
+interface_id = "contexts-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.contexts.read"
+interface_id = "contexts-events"
+kind         = "event"
