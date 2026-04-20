@@ -154,6 +154,22 @@ fn core_packages_do_not_reference_domain_plugin_markers() {
             "packages/event/models/src/lib.rs",
             include_str!("../../event/models/src/lib.rs"),
         ),
+        (
+            "packages/plugin-sdk/src/host_services.rs",
+            include_str!("../../plugin-sdk/src/host_services.rs"),
+        ),
+        (
+            "packages/plugin-sdk/src/lib.rs",
+            include_str!("../../plugin-sdk/src/lib.rs"),
+        ),
+        (
+            "packages/plugin/src/host_runtime.rs",
+            include_str!("../../plugin/src/host_runtime.rs"),
+        ),
+        (
+            "packages/plugin/src/lib.rs",
+            include_str!("../../plugin/src/lib.rs"),
+        ),
     ];
 
     for (path, source) in core_sources {
