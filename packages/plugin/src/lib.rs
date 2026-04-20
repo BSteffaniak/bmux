@@ -16,6 +16,7 @@
 pub mod action_dispatch;
 mod declaration;
 mod discovery;
+mod event_bus;
 mod host_runtime;
 mod loader;
 mod manifest;
@@ -32,6 +33,9 @@ pub use discovery::{
     DEFAULT_PLUGIN_MANIFEST_FILE, PluginDiscoveryReport, discover_plugin_manifests,
     discover_plugin_manifests_in_roots, discover_registered_plugins,
     discover_registered_plugins_in_roots,
+};
+pub use event_bus::{
+    DEFAULT_EVENT_BUS_CAPACITY, EventBus, EventBusError, EventBusResult, global_event_bus,
 };
 pub use host_runtime::{HostRuntimeApi, ServiceCaller};
 pub use loader::{LoadedPlugin, NativePluginLoader, load_registered_plugin, load_static_plugin};

@@ -18,11 +18,14 @@ use bmux_contexts_plugin_api::contexts_commands::{
     self, CloseContextError, ContextAck, ContextSelector as CommandContextSelector,
     ContextsCommandsService, CreateContextError, SelectContextError,
 };
+use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
 use bmux_contexts_plugin_api::contexts_state::{
     self, ContextQueryError, ContextSelector as StateContextSelector, ContextSummary,
     ContextsStateService,
 };
-use bmux_plugin::{ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
+use bmux_plugin::{
+    ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
+};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use serde::{Deserialize, Serialize};
@@ -78,6 +81,10 @@ impl RustPlugin for ContextsPlugin {
     ) -> std::result::Result<i32, PluginCommandError> {
         let state: Arc<RwLock<ContextState>> = Arc::new(RwLock::new(ContextState::default()));
         global_plugin_state_registry().register::<ContextState>(&state);
+        // Register the typed event channel for `contexts-events`.
+        // Consumers subscribe via
+        // `global_event_bus().subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)`.
+        global_event_bus().register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -201,8 +208,18 @@ fn create_context_via_ipc(
     name: Option<String>,
     attributes: BTreeMap<String, String>,
 ) -> Result<ContextAck, CreateContextError> {
+    let name_for_event = name.clone();
     match caller.execute_kernel_request(bmux_ipc::Request::CreateContext { name, attributes }) {
         Ok(bmux_ipc::ResponsePayload::ContextCreated { context }) => {
+            // Emit typed event so in-process subscribers can react.
+            // Errors are swallowed (fire-and-forget semantics).
+            let _ = global_event_bus().emit(
+                &contexts_events::EVENT_KIND,
+                ContextEvent::Created {
+                    context_id: context.id,
+                    name: name_for_event,
+                },
+            );
             Ok(ContextAck { id: context.id })
         }
         Ok(_) => Err(CreateContextError::Failed {
@@ -227,6 +244,12 @@ fn select_context_via_ipc(
         selector: ipc_selector,
     }) {
         Ok(bmux_ipc::ResponsePayload::ContextSelected { context }) => {
+            let _ = global_event_bus().emit(
+                &contexts_events::EVENT_KIND,
+                ContextEvent::Selected {
+                    context_id: context.id,
+                },
+            );
             Ok(ContextAck { id: context.id })
         }
         Ok(_) => Err(SelectContextError::Denied {
@@ -252,7 +275,13 @@ fn close_context_via_ipc(
         selector: ipc_selector,
         force,
     }) {
-        Ok(bmux_ipc::ResponsePayload::ContextClosed { id }) => Ok(ContextAck { id }),
+        Ok(bmux_ipc::ResponsePayload::ContextClosed { id }) => {
+            let _ = global_event_bus().emit(
+                &contexts_events::EVENT_KIND,
+                ContextEvent::Closed { context_id: id },
+            );
+            Ok(ContextAck { id })
+        }
         Ok(_) => Err(CloseContextError::Failed {
             reason: "unexpected response payload for close-context".to_string(),
         }),
