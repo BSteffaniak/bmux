@@ -1749,12 +1749,10 @@ pub async fn handle_attach_runtime_action(
 
 /// Apply a plugin-command outcome against the attach view state.
 ///
-/// Historically this iterated a `PluginCommandEffect` list the plugin
-/// emitted to drive side effects (context retargeting, etc.). In M4
-/// Stage 7 the effect channel was deleted: cross-domain state changes
-/// are plugin-to-plugin typed-dispatch calls now, and the attach
-/// runtime detects that a plugin command changed the current context
-/// by observing the before/after `current-context` delta (see
+/// Cross-domain state changes are plugin-to-plugin typed-dispatch
+/// calls, not a plugin-emitted effect list. The attach runtime detects
+/// that a plugin command changed the current context by observing the
+/// before/after `current-context` delta (see
 /// [`plugin_fallback_retarget_context_id`] and the caller).
 ///
 /// The function is kept as a no-op-friendly shim so call sites don't

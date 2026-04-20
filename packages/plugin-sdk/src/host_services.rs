@@ -50,15 +50,11 @@ pub struct RecordingWriteEventResponse {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginCommandOutcome {
-    // Intentionally empty. Previously carried a `Vec<PluginCommandEffect>`
-    // with a single `SelectContext` variant used to retarget the attach
-    // view after a context-selection command. In M4 Stage 7 that
-    // side-channel was deleted: cross-domain mutations now go through
-    // typed dispatch (the contexts plugin's `select-context` command
-    // sets the context directly) and the attach runtime retargets
-    // based on observing the `before/after current-context` delta
-    // rather than a plugin-emitted effect list. Kept as an empty
+    // Intentionally empty. Cross-domain mutations flow through typed
+    // dispatch (for example the contexts plugin's `select-context`
+    // command sets the context directly) and the attach runtime
+    // retargets based on observing the `before/after current-context`
+    // delta rather than a plugin-emitted effect list. Kept as an empty
     // struct so `PluginCommandExecution::outcome` retains a stable
-    // shape; drop this type in a future milestone once no consumer
-    // references it.
+    // shape; drop this type once no consumer references it.
 }

@@ -103,7 +103,7 @@ three plugin context types (`NativeCommandContext`,
   `use bmux_plugin::DomainCompat;`. Core plugin infrastructure never
   depends on this trait.
 
-## Host state registry (M4 Stage 10)
+## Host state registry
 
 Foundational state types owned by plugins (not by core server
 internals) live in `packages/plugin-domain-compat`. Each plugin's

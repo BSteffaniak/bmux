@@ -199,10 +199,9 @@ fn plugin_production_code_uses_generic_host_api_only() {
     }
 }
 
-/// M4 Stage 10: verify that `packages/event/models` is fully
-/// domain-agnostic. The former `Session/Pane/Client/Input` event
-/// enums and constructors were deleted — this test ensures they
-/// don't silently reappear.
+/// Verify that `packages/event/models` is fully domain-agnostic. The
+/// former `Session/Pane/Client/Input` event enums and constructors
+/// must not silently reappear.
 #[test]
 fn event_core_crate_has_no_domain_event_types() {
     let sources = [(
@@ -239,9 +238,9 @@ fn event_core_crate_has_no_domain_event_types() {
     }
 }
 
-/// M4 Stage 10: verify that the `bmux` umbrella crate doesn't
-/// re-export domain crates. `session` and `terminal` features were
-/// removed; only domain-agnostic building blocks should be exposed.
+/// Verify that the `bmux` umbrella crate doesn't re-export domain
+/// crates. Only domain-agnostic building blocks should be exposed;
+/// `session` and `terminal` features are not present.
 #[test]
 fn bmux_umbrella_has_no_domain_reexports() {
     let lib_source = include_str!("../../bmux/src/lib.rs");
@@ -282,10 +281,9 @@ fn bmux_umbrella_has_no_domain_reexports() {
     }
 }
 
-/// M4 Stage 10: verify that `packages/cli/src/lib.rs` doesn't
-/// re-export domain types. The `SessionId` / `SessionInfo` /
-/// `SessionManager` / `TerminalInstance` / `TerminalManager`
-/// re-exports were deleted — this guards against regression.
+/// Verify that `packages/cli/src/lib.rs` doesn't re-export domain
+/// types. `SessionId` / `SessionInfo` / `SessionManager` /
+/// `TerminalInstance` / `TerminalManager` must not be re-exported.
 #[test]
 fn cli_crate_does_not_reexport_domain_types() {
     let source = include_str!("../src/lib.rs");
@@ -310,10 +308,10 @@ fn cli_crate_does_not_reexport_domain_types() {
     }
 }
 
-/// M4 Stage 10: verify that `packages/plugin-sdk` is fully
-/// domain-agnostic. The domain types (`Pane*`, `Session*`, `Context*`,
-/// `CurrentClient*`) moved to `packages/plugin-domain-compat`; this
-/// test prevents them from sneaking back in.
+/// Verify that `packages/plugin-sdk` is fully domain-agnostic. Domain
+/// types (`Pane*`, `Session*`, `Context*`, `CurrentClient*`) live in
+/// `packages/plugin-domain-compat`; they must not sneak back into the
+/// SDK.
 #[test]
 fn plugin_sdk_has_no_domain_types() {
     let source = include_str!("../../plugin-sdk/src/host_services.rs");
@@ -367,10 +365,9 @@ fn plugin_sdk_has_no_domain_types() {
     }
 }
 
-/// M4 Stage 10: verify that `packages/session/models` stays minimal.
-/// Dead types `LayoutError`, `PaneError`, `ClientError`, `ClientInfo`,
-/// `SessionError`, `PaneId` were deleted; this test prevents their
-/// reintroduction.
+/// Verify that `packages/session/models` stays minimal. Dead types
+/// `LayoutError`, `PaneError`, `ClientError`, `ClientInfo`,
+/// `SessionError`, `PaneId` must not be reintroduced.
 #[test]
 fn session_models_is_minimal() {
     let source = include_str!("../../session/models/src/lib.rs");
@@ -393,9 +390,9 @@ fn session_models_is_minimal() {
     }
 }
 
-/// M4 Stage 10: verify that `packages/event/models` doesn't depend on
-/// session/terminal domain model crates. The domain event types were
-/// deleted — the Cargo.toml must not silently regrow those deps.
+/// Verify that `packages/event/models` doesn't depend on
+/// session/terminal domain model crates. The Cargo.toml must not
+/// silently regrow those deps.
 #[test]
 fn event_models_crate_has_no_domain_dependencies() {
     let source = include_str!("../../event/models/Cargo.toml");
@@ -405,14 +402,13 @@ fn event_models_crate_has_no_domain_dependencies() {
         assert!(
             !source.contains(marker),
             "packages/event/models/Cargo.toml must not depend on {marker}; \
-             domain event types were deleted in M4 Stage 10",
+             domain event types must not be reintroduced",
         );
     }
 }
 
-/// M4 Stage 10.3: verify that `FollowState` is no longer defined in
-/// `packages/server` and is instead imported from
-/// `bmux_plugin_domain_compat`. The clients plugin's `activate`
+/// Verify that `FollowState` is defined in `bmux_plugin_domain_compat`
+/// and not in `packages/server`. The clients plugin's `activate`
 /// callback registers a canonical handle into
 /// [`bmux_plugin::PluginStateRegistry`]; server code uses a
 /// locally-owned `Arc<RwLock<FollowState>>` constructed fresh per
@@ -467,12 +463,11 @@ fn follow_state_is_owned_by_clients_plugin() {
     );
 }
 
-/// M4 Stage 10.4: verify that `ContextState` is no longer defined in
-/// `packages/server` and is instead imported from
-/// `bmux_plugin_domain_compat`. The runtime handle is registered into
-/// `bmux_plugin::global_plugin_state_registry()` by the contexts
-/// plugin's `activate` callback; server obtains it via `.get` /
-/// `.expect_state` at startup.
+/// Verify that `ContextState` is defined in
+/// `bmux_plugin_domain_compat` and not in `packages/server`. The
+/// contexts plugin's `activate` callback registers a canonical handle
+/// into [`bmux_plugin::PluginStateRegistry`]; server code uses a
+/// locally-owned `Arc<RwLock<ContextState>>` per server instance.
 #[test]
 fn context_state_is_owned_by_contexts_plugin() {
     let server_source = include_str!("../../server/src/lib.rs");
@@ -515,24 +510,24 @@ fn context_state_is_owned_by_contexts_plugin() {
     );
 }
 
-/// M4 Stage 10.5: verify that `SessionManager` is no longer defined
-/// in `packages/session` (or `packages/server`) and is instead owned
-/// by `bmux_plugin_domain_compat`. The sessions plugin's `activate`
-/// callback registers a canonical handle into
+/// Verify that `SessionManager` is defined in
+/// `bmux_plugin_domain_compat` and not in `packages/session` or
+/// `packages/server`. The sessions plugin's `activate` callback
+/// registers a canonical handle into
 /// [`bmux_plugin::PluginStateRegistry`].
 #[test]
 fn session_manager_is_owned_by_sessions_plugin() {
-    // `packages/session` was deleted in M4 Stage 10.5 after SessionManager
-    // moved to `bmux_plugin_domain_compat`. Verify the crate is gone.
+    // `packages/session` is absent; SessionManager lives in
+    // `bmux_plugin_domain_compat`.
     let session_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../session");
     assert!(
         !session_dir.join("Cargo.toml").exists(),
-        "packages/session/Cargo.toml must be deleted (only \
+        "packages/session/Cargo.toml must be absent (only \
          packages/session/models survives as bmux_session_models)",
     );
     assert!(
         !session_dir.join("src/lib.rs").exists(),
-        "packages/session/src/lib.rs must be deleted; SessionManager \
+        "packages/session/src/lib.rs must be absent; SessionManager \
          lives in bmux_plugin_domain_compat",
     );
 
@@ -576,10 +571,10 @@ fn session_manager_is_owned_by_sessions_plugin() {
     );
 }
 
-/// M4 Stage 10: verify that `packages/client` no longer carries
-/// domain convenience methods. All session/context/pane/client
-/// operations route through `BmuxClient::invoke_service_raw` via typed
-/// plugin-api dispatch, not through hand-coded IPC request methods.
+/// Verify that `packages/client` carries no domain convenience
+/// methods. All session/context/pane/client operations must route
+/// through `BmuxClient::invoke_service_raw` via typed plugin-api
+/// dispatch, not through hand-coded IPC request methods.
 #[test]
 fn client_core_crate_has_no_domain_convenience_methods() {
     let source = include_str!("../../client/src/lib.rs");

@@ -29,8 +29,9 @@ use super::{
 };
 
 /// Typed dispatch wrapper for `sessions-state:list-sessions` via
-/// `BmuxClient::invoke_service_raw`. Replaces `BmuxClient::list_sessions`
-/// as part of the M4 purge of domain-specific client methods.
+/// `BmuxClient::invoke_service_raw`. `BmuxClient` no longer carries a
+/// domain-specific `list_sessions` method — callers route through the
+/// typed sessions-plugin API instead.
 async fn typed_list_sessions_remote(client: &mut BmuxClient) -> Result<Vec<SessionSummary>> {
     let payload = bmux_codec::to_vec(&()).context("encoding list-sessions args")?;
     let bytes = client

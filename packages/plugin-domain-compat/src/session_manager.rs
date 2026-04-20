@@ -1,18 +1,17 @@
 //! Session manager, owned by the sessions plugin.
 //!
 //! `SessionManager` tracks every session known to the host: its
-//! identity, name, and client set. During M4 it lives in
+//! identity, name, and client set. It lives in
 //! `bmux_plugin_domain_compat` so both core and plugins can name it;
 //! the runtime handle is registered into
 //! [`bmux_plugin::PluginStateRegistry`] by the sessions plugin, and
 //! core server code accesses it via `global_plugin_state_registry`.
 //!
 //! The heavier `SessionRuntimeManager` (pane PTY processes, snapshot
-//! plumbing, event fan-out) remains in `packages/server` for this M4
-//! slice — it is too entangled with server-specific runtime primitives
-//! (portable-pty, tokio channels, recording runtimes) to relocate
-//! without a dependency explosion. Migrating the runtime manager is a
-//! deferred slice.
+//! plumbing, event fan-out) remains in `packages/server` — it is too
+//! entangled with server-specific runtime primitives (portable-pty,
+//! tokio channels, recording runtimes) to relocate without a
+//! dependency explosion.
 
 use anyhow::Result;
 use bmux_session_models::{Session, SessionId, SessionInfo};

@@ -1,11 +1,9 @@
-//! Opt-in domain-compat extension for bmux plugins.
+//! Opt-in domain-flavored surface for bmux plugins.
 //!
-//! This crate is a temporary migration shim during the M4 "Generic
-//! Core" refactor. Core plugin infrastructure (`bmux_plugin_sdk` and
-//! `bmux_plugin`) is strictly domain-agnostic. Plugins that still need
-//! ergonomic access to session/context/pane/client domain concepts
-//! opt in by depending on this crate and bringing [`DomainCompat`]
-//! into scope:
+//! Core plugin infrastructure (`bmux_plugin_sdk` and `bmux_plugin`) is
+//! strictly domain-agnostic. Plugins that want ergonomic access to
+//! session/context/pane/client concepts opt in by depending on this
+//! crate and bringing [`DomainCompat`] into scope:
 //!
 //! ```ignore
 //! use bmux_plugin_domain_compat::DomainCompat;
@@ -13,10 +11,15 @@
 //! let sessions = caller.session_list()?;
 //! ```
 //!
+//! This crate also hosts the canonical state types owned by
+//! foundational plugins ([`FollowState`], [`ContextState`],
+//! [`SessionManager`]) so core and plugins can share them without core
+//! depending on plugin crates.
+//!
 //! Every method on [`DomainCompat`] is a thin wrapper over
-//! [`bmux_plugin::ServiceCaller::execute_kernel_request`]. When the
-//! IPC variants this crate depends on are eventually deleted, the
-//! whole crate becomes deletable.
+//! [`bmux_plugin::ServiceCaller::execute_kernel_request`]. The crate
+//! becomes deletable once every IPC variant it wraps is replaced by a
+//! typed plugin service.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]

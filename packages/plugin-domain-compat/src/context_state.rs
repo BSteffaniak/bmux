@@ -7,8 +7,8 @@
 //! - Which context each connected client has selected.
 //! - A most-recently-used queue for fallback selection.
 //!
-//! During M4 this type lives in `bmux_plugin_domain_compat` (a neutral
-//! crate reachable by both core and plugins). The state instance is
+//! This type lives in `bmux_plugin_domain_compat` (a neutral crate
+//! reachable by both core and plugins). The state instance is
 //! constructed and registered into [`bmux_plugin::PluginStateRegistry`]
 //! by the contexts plugin; core server code obtains the registered
 //! handle via `global_plugin_state_registry().expect_state::<ContextState>()`.

@@ -99,12 +99,10 @@ pub(super) fn enter_host_kernel_client_factory(
     HostKernelClientFactoryGuard
 }
 
-// M4 Stage 7: the plugin-command-effect side-channel was removed.
-// The former `begin/finish/maybe_record_host_kernel_effect` helpers
-// are gone; cross-domain mutations now flow through typed
-// plugin-to-plugin dispatch and the attach runtime observes context
-// changes by comparing before/after `current-context` around a
-// plugin command invocation.
+// Cross-domain mutations flow through typed plugin-to-plugin dispatch
+// rather than a plugin-command-effect side-channel; the attach runtime
+// observes context changes by comparing before/after `current-context`
+// around a plugin command invocation.
 
 pub(super) fn call_host_kernel_via_client(
     connection: &HostConnectionInfo,

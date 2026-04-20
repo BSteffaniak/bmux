@@ -4,11 +4,11 @@
 //! (provided via `bmux_ipc`) and are therefore defined here rather than
 //! in the SDK.
 //!
-//! After M4 Stage 8 `HostRuntimeApi` carries only truly generic
-//! primitives. Domain-specific conveniences (`session_*`, `context_*`,
-//! `pane_*`, `current_client`) have moved to a separate opt-in
-//! extension trait [`DomainCompat`](crate::DomainCompat) so the core
-//! plugin runtime stays domain-agnostic.
+//! `HostRuntimeApi` carries only truly generic primitives.
+//! Domain-specific conveniences (`session_*`, `context_*`, `pane_*`,
+//! `current_client`) live on a separate opt-in extension trait,
+//! [`DomainCompat`](bmux_plugin_domain_compat::DomainCompat), so the
+//! core plugin runtime stays domain-agnostic.
 
 use bmux_plugin_sdk::{
     CORE_CLI_COMMAND_CAPABILITY, CORE_CLI_COMMAND_INTERFACE_V1,
@@ -90,12 +90,13 @@ pub trait ServiceCaller {
 /// Every blanket-implemented method is a thin wrapper over a well-known
 /// host-provided service (`bmux.storage`, `bmux.logs.write`, etc.).
 ///
-/// For historical convenience methods that spoke in session/context/
-/// pane/client domain terms, see
-/// [`DomainCompat`](crate::DomainCompat). Those are opt-in extension
-/// trait methods that build on [`ServiceCaller::execute_kernel_request`]
-/// rather than first-class `HostRuntimeApi` methods — domain concepts
-/// don't belong in the core runtime surface.
+/// For convenience methods that speak in session/context/pane/client
+/// domain terms, see
+/// [`DomainCompat`](bmux_plugin_domain_compat::DomainCompat). Those
+/// are opt-in extension-trait methods built on
+/// [`ServiceCaller::execute_kernel_request`] rather than first-class
+/// `HostRuntimeApi` methods — domain concepts don't belong in the
+/// core runtime surface.
 pub trait HostRuntimeApi: ServiceCaller {
     /// Run a core built-in CLI command path in-process.
     ///

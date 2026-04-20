@@ -8,8 +8,8 @@
 //! (or other plugins) need to access directly, without introducing a
 //! compile-time dependency from core crates on plugin crates. The
 //! shared state type `T` itself must live in a neutral crate so both
-//! owner and consumer can name it (for M4 this is
-//! `bmux_plugin_domain_compat`).
+//! owner and consumer can name it; today that crate is
+//! `bmux_plugin_domain_compat`.
 //!
 //! # Lifecycle
 //!

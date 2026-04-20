@@ -533,9 +533,9 @@ fn request_to_dsl(
             payload,
             ..
         } => {
-            // Typed-dispatch `sessions-commands:new-session` replaces
-            // the legacy `Request::NewSession` as of M4; decode the
-            // typed payload and emit the same DSL line.
+            // New sessions flow through `sessions-commands:new-session`
+            // typed dispatch; decode the typed payload and emit the
+            // same DSL line.
             if interface_id == "sessions-commands" && operation == "new-session" {
                 #[derive(serde::Deserialize)]
                 struct NewSessionArgs {

@@ -613,15 +613,15 @@ fn epoch_millis_now() -> u64 {
 }
 
 // `FollowState` / `FollowEntry` / `FollowTargetUpdate` are owned by the
-// clients plugin (M4 Stage 10.3). The types live in
+// clients plugin. The types live in
 // `bmux_plugin_domain_compat::follow_state`; the runtime handle is
 // registered into `bmux_plugin::global_plugin_state_registry()` by
 // `bmux_clients_plugin::ClientsPlugin::activate`. Server code accesses
 // the shared handle through `ServerState::follow_state`, which is an
 // `Arc<RwLock<FollowState>>` obtained from the plugin state registry.
 
-// `ContextState` / `RuntimeContext` are owned by the contexts plugin
-// (M4 Stage 10.4). The types live in
+// `ContextState` / `RuntimeContext` are owned by the contexts plugin.
+// The types live in
 // `bmux_plugin_domain_compat::context_state`; the runtime handle is
 // registered into `bmux_plugin::global_plugin_state_registry()` by
 // `bmux_contexts_plugin::ContextsPlugin::activate`. Server code
@@ -4537,16 +4537,15 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
 
 /// Construct a fresh `Arc<RwLock<T>>` state handle for the server.
 ///
-/// M4 architectural note: the plugin state types (`FollowState`,
-/// `ContextState`, `SessionManager`) live in
-/// `bmux_plugin_domain_compat`, are owned-at-the-type-level by
-/// their respective plugins, and are registered into the global
-/// [`PluginStateRegistry`] by each plugin's `activate` callback so
-/// plugins and other observers can reach them. The server, however,
-/// constructs its own canonical instance per-server so that multiple
-/// `BmuxServer` instances (tests especially) don't accidentally share
-/// state. The server-owned handle is what flows through the request
-/// pipeline.
+/// The plugin state types (`FollowState`, `ContextState`,
+/// `SessionManager`) live in `bmux_plugin_domain_compat`, are
+/// owned-at-the-type-level by their respective plugins, and are
+/// registered into the global [`PluginStateRegistry`] by each plugin's
+/// `activate` callback so plugins and other observers can reach them.
+/// The server, however, constructs its own canonical instance
+/// per-server so that multiple `BmuxServer` instances (tests
+/// especially) don't accidentally share state. The server-owned handle
+/// is what flows through the request pipeline.
 fn make_server_state<T: Default + Send + Sync + 'static>() -> Arc<std::sync::RwLock<T>> {
     Arc::new(std::sync::RwLock::new(T::default()))
 }

@@ -4,8 +4,9 @@ use bmux_client::BmuxClient;
 use bmux_sandbox_harness::SandboxHarness;
 use uuid::Uuid;
 
-/// Typed dispatch for `sessions-commands:new-session` — replaces the
-/// legacy `BmuxClient::new_session` convenience method deleted in M4.
+/// Typed dispatch for `sessions-commands:new-session`. `BmuxClient`
+/// no longer exposes a `new_session` convenience method; callers route
+/// through the typed sessions-plugin API.
 async fn typed_new_session(client: &mut BmuxClient, name: Option<String>) -> Result<Uuid> {
     #[derive(serde::Serialize)]
     struct Args {

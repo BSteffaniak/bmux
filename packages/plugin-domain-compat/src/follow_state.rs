@@ -8,11 +8,13 @@
 //! - Follow relationships: which clients mirror another client's
 //!   selection ("following a leader").
 //!
-//! During M4 this type lives in `bmux_plugin_domain_compat` (a neutral
-//! crate reachable by both core and plugins). The state instance is
-//! constructed and registered into [`bmux_plugin::PluginStateRegistry`]
-//! by the clients plugin; core server code obtains the registered
-//! handle via `global_plugin_state_registry().expect_state::<FollowState>()`.
+//! This type lives in `bmux_plugin_domain_compat` (a neutral crate
+//! reachable by both core and plugins) so that the clients plugin can
+//! own it without forcing core to depend on plugin crates. The state
+//! instance is constructed and registered into
+//! [`bmux_plugin::PluginStateRegistry`] by the clients plugin; core
+//! server code obtains the registered handle via
+//! `global_plugin_state_registry().expect_state::<FollowState>()`.
 //!
 //! The wire-level operations that mutate follow state (start follow,
 //! stop follow, update selected target) ultimately route through the
