@@ -27,7 +27,6 @@ members = [
     "packages/plugin-sdk",
     "packages/perf-tools",
     "packages/server",
-    "packages/session",
     "packages/session/models",
     "packages/sandbox-harness",
     "packages/scene-protocol",
@@ -127,7 +126,6 @@ bmux_plugin_sdk             = { version = "0.0.1-alpha.0", default-features = fa
 bmux_sandbox_harness        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/sandbox-harness" }
 bmux_scene_protocol         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/scene-protocol" }
 bmux_server                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
-bmux_session                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bmux_session_models         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
 bmux_slots                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/slots" }
 bmux_terminal_protocol      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }

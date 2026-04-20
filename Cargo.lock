@@ -1111,6 +1111,7 @@ dependencies = [
  "bmux_clients_plugin_api",
  "bmux_ipc",
  "bmux_plugin",
+ "bmux_plugin_domain_compat",
  "bmux_plugin_sdk",
  "serde",
  "uuid",
@@ -1202,6 +1203,7 @@ dependencies = [
  "bmux_contexts_plugin_api",
  "bmux_ipc",
  "bmux_plugin",
+ "bmux_plugin_domain_compat",
  "bmux_plugin_sdk",
  "serde",
  "uuid",
@@ -1441,9 +1443,11 @@ dependencies = [
 name = "bmux_plugin_domain_compat"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "anyhow",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_session_models",
  "serde",
  "uuid",
 ]
@@ -1559,7 +1563,8 @@ dependencies = [
  "bmux_config",
  "bmux_image",
  "bmux_ipc",
- "bmux_session",
+ "bmux_plugin_domain_compat",
+ "bmux_session_models",
  "bmux_terminal_protocol",
  "portable-pty",
  "serde",
@@ -1569,14 +1574,6 @@ dependencies = [
  "tracing",
  "uuid",
  "vt100",
-]
-
-[[package]]
-name = "bmux_session"
-version = "0.0.1-alpha.0"
-dependencies = [
- "anyhow",
- "bmux_session_models",
 ]
 
 [[package]]
@@ -1593,6 +1590,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_ipc",
  "bmux_plugin",
+ "bmux_plugin_domain_compat",
  "bmux_plugin_sdk",
  "bmux_sessions_plugin_api",
  "serde",

@@ -143,10 +143,6 @@ fn core_packages_do_not_reference_domain_plugin_markers() {
             include_str!("../../ipc/src/lib.rs"),
         ),
         (
-            "packages/session/src/lib.rs",
-            include_str!("../../session/src/lib.rs"),
-        ),
-        (
             "packages/session/models/src/lib.rs",
             include_str!("../../session/models/src/lib.rs"),
         ),
@@ -412,6 +408,172 @@ fn event_models_crate_has_no_domain_dependencies() {
              domain event types were deleted in M4 Stage 10",
         );
     }
+}
+
+/// M4 Stage 10.3: verify that `FollowState` is no longer defined in
+/// `packages/server` and is instead imported from
+/// `bmux_plugin_domain_compat`. The clients plugin's `activate`
+/// callback registers a canonical handle into
+/// [`bmux_plugin::PluginStateRegistry`]; server code uses a
+/// locally-owned `Arc<RwLock<FollowState>>` constructed fresh per
+/// server instance (so multi-server tests don't share state).
+#[test]
+fn follow_state_is_owned_by_clients_plugin() {
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_source = production_section(server_source);
+
+    let server_denied = [
+        "struct FollowState {",
+        "impl FollowState {",
+        "struct FollowEntry {",
+        "struct FollowTargetUpdate {",
+        "follow_state: Mutex<FollowState>",
+    ];
+    for marker in server_denied {
+        assert!(
+            !server_source.contains(marker),
+            "packages/server/src/lib.rs must not define {marker}; \
+             FollowState lives in bmux_plugin_domain_compat and is \
+             registered by the clients plugin",
+        );
+    }
+
+    // Server must import FollowState from the neutral crate.
+    assert!(
+        server_source.contains("use bmux_plugin_domain_compat::"),
+        "packages/server/src/lib.rs must import FollowState via \
+         `use bmux_plugin_domain_compat::...`",
+    );
+
+    // Domain-compat hosts the canonical type.
+    let compat_source = include_str!("../../plugin-domain-compat/src/follow_state.rs");
+    assert!(
+        compat_source.contains("pub struct FollowState"),
+        "packages/plugin-domain-compat/src/follow_state.rs must export \
+         the canonical `FollowState` struct",
+    );
+
+    // Clients plugin must register it on activate.
+    let clients_source = include_str!("../../../plugins/clients-plugin/src/lib.rs");
+    assert!(
+        clients_source.contains("global_plugin_state_registry()"),
+        "plugins/clients-plugin/src/lib.rs must register FollowState \
+         into the global plugin state registry on activate",
+    );
+    assert!(
+        clients_source.contains("register::<FollowState>"),
+        "plugins/clients-plugin/src/lib.rs must call `register::<FollowState>` \
+         to install the state handle",
+    );
+}
+
+/// M4 Stage 10.4: verify that `ContextState` is no longer defined in
+/// `packages/server` and is instead imported from
+/// `bmux_plugin_domain_compat`. The runtime handle is registered into
+/// `bmux_plugin::global_plugin_state_registry()` by the contexts
+/// plugin's `activate` callback; server obtains it via `.get` /
+/// `.expect_state` at startup.
+#[test]
+fn context_state_is_owned_by_contexts_plugin() {
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_source = production_section(server_source);
+
+    let server_denied = [
+        "struct ContextState {",
+        "impl ContextState {",
+        "struct RuntimeContext {",
+        "context_state: Mutex<ContextState>",
+    ];
+    for marker in server_denied {
+        assert!(
+            !server_source.contains(marker),
+            "packages/server/src/lib.rs must not define {marker}; \
+             ContextState lives in bmux_plugin_domain_compat and is \
+             registered by the contexts plugin",
+        );
+    }
+
+    // Domain-compat hosts the canonical type.
+    let compat_source = include_str!("../../plugin-domain-compat/src/context_state.rs");
+    assert!(
+        compat_source.contains("pub struct ContextState"),
+        "packages/plugin-domain-compat/src/context_state.rs must export \
+         the canonical `ContextState` struct",
+    );
+
+    // Contexts plugin must register it on activate.
+    let contexts_source = include_str!("../../../plugins/contexts-plugin/src/lib.rs");
+    assert!(
+        contexts_source.contains("global_plugin_state_registry()"),
+        "plugins/contexts-plugin/src/lib.rs must register ContextState \
+         into the global plugin state registry on activate",
+    );
+    assert!(
+        contexts_source.contains("register::<ContextState>"),
+        "plugins/contexts-plugin/src/lib.rs must call `register::<ContextState>` \
+         to install the state handle",
+    );
+}
+
+/// M4 Stage 10.5: verify that `SessionManager` is no longer defined
+/// in `packages/session` (or `packages/server`) and is instead owned
+/// by `bmux_plugin_domain_compat`. The sessions plugin's `activate`
+/// callback registers a canonical handle into
+/// [`bmux_plugin::PluginStateRegistry`].
+#[test]
+fn session_manager_is_owned_by_sessions_plugin() {
+    // `packages/session` was deleted in M4 Stage 10.5 after SessionManager
+    // moved to `bmux_plugin_domain_compat`. Verify the crate is gone.
+    let session_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../session");
+    assert!(
+        !session_dir.join("Cargo.toml").exists(),
+        "packages/session/Cargo.toml must be deleted (only \
+         packages/session/models survives as bmux_session_models)",
+    );
+    assert!(
+        !session_dir.join("src/lib.rs").exists(),
+        "packages/session/src/lib.rs must be deleted; SessionManager \
+         lives in bmux_plugin_domain_compat",
+    );
+
+    // Server must not define or Mutex-wrap SessionManager.
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_source = production_section(server_source);
+    let server_denied = [
+        "pub struct SessionManager",
+        "struct SessionManager {",
+        "impl SessionManager {",
+        "session_manager: Mutex<SessionManager>",
+    ];
+    for marker in server_denied {
+        assert!(
+            !server_source.contains(marker),
+            "packages/server/src/lib.rs must not define {marker}; \
+             SessionManager lives in bmux_plugin_domain_compat and is \
+             registered by the sessions plugin",
+        );
+    }
+
+    // Domain-compat hosts the canonical type.
+    let compat_source = include_str!("../../plugin-domain-compat/src/session_manager.rs");
+    assert!(
+        compat_source.contains("pub struct SessionManager"),
+        "packages/plugin-domain-compat/src/session_manager.rs must export \
+         the canonical `SessionManager` struct",
+    );
+
+    // Sessions plugin must register it on activate.
+    let sessions_source = include_str!("../../../plugins/sessions-plugin/src/lib.rs");
+    assert!(
+        sessions_source.contains("global_plugin_state_registry()"),
+        "plugins/sessions-plugin/src/lib.rs must register SessionManager \
+         into the global plugin state registry on activate",
+    );
+    assert!(
+        sessions_source.contains("register::<SessionManager>"),
+        "plugins/sessions-plugin/src/lib.rs must call `register::<SessionManager>` \
+         to install the state handle",
+    );
 }
 
 /// M4 Stage 10: verify that `packages/client` no longer carries

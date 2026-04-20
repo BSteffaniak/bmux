@@ -13,7 +13,8 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::{ServiceCaller, TypedServiceCaller};
+use bmux_plugin::{ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
+use bmux_plugin_domain_compat::SessionManager;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_sessions_plugin_api::sessions_commands::{
@@ -27,7 +28,7 @@ use bmux_sessions_plugin_api::sessions_state::{
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Wire-format argument for the typed `new-session` byte-dispatch call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +73,15 @@ impl WireSelector {
 pub struct SessionsPlugin;
 
 impl RustPlugin for SessionsPlugin {
+    fn activate(
+        &mut self,
+        _context: NativeLifecycleContext,
+    ) -> std::result::Result<i32, PluginCommandError> {
+        let state: Arc<RwLock<SessionManager>> = Arc::new(RwLock::new(SessionManager::new()));
+        global_plugin_state_registry().register::<SessionManager>(&state);
+        Ok(bmux_plugin_sdk::EXIT_OK)
+    }
+
     fn run_command(
         &mut self,
         _context: NativeCommandContext,

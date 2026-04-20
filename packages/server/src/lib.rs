@@ -16,18 +16,21 @@ use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
     AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneInputMode,
     AttachPaneMouseProtocol, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-    AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector,
-    ContextSessionBindingSummary, ContextSummary, ControlCatalogScope, ControlCatalogSnapshot,
-    Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, InteractiveRegion, IpcEndpoint,
-    PaneFocusDirection, PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
-    PaneSplitDirection, PaneState, PaneSummary, PerformanceRecordingLevel,
-    PerformanceRuntimeSettings, ProtocolContract, RecordingEventKind, RecordingPayload,
-    RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
+    AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector, ContextSessionBindingSummary,
+    ControlCatalogScope, ControlCatalogSnapshot, Envelope, EnvelopeKind, ErrorCode, ErrorResponse,
+    Event, InteractiveRegion, IpcEndpoint, PaneFocusDirection, PaneLaunchCommand,
+    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
+    PerformanceRecordingLevel, PerformanceRuntimeSettings, ProtocolContract, RecordingEventKind,
+    RecordingPayload, RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
     RecordingRollingStatus, RecordingRollingUsage, RecordingSummary, Request, Response,
     ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
     default_supported_capabilities, encode, negotiate_protocol,
 };
-use bmux_session::{ClientId, Session, SessionId, SessionManager};
+use bmux_plugin_domain_compat::{
+    CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, FollowEntry, FollowState, RuntimeContext,
+    SessionManager,
+};
+use bmux_session_models::{ClientId, Session, SessionId};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
     ClientSelectedContextSnapshotV1, ClientSelectedSessionSnapshotV2,
@@ -53,7 +56,7 @@ use crate::recording::{RecordMeta, RecordingRuntime};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
-const CONTEXT_SESSION_ID_ATTRIBUTE: &str = "bmux.session_id";
+// `CONTEXT_SESSION_ID_ATTRIBUTE` lives in `bmux_plugin_domain_compat::context_state`.
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
 /// Headroom reserved for envelope framing, layout metadata, pane summaries, and
 /// scene data so that the combined output chunks + metadata never exceed the IPC
@@ -283,11 +286,11 @@ pub struct BmuxServer {
 }
 
 struct ServerState {
-    session_manager: Mutex<SessionManager>,
+    session_manager: Arc<std::sync::RwLock<SessionManager>>,
     session_runtimes: Mutex<SessionRuntimeManager>,
     attach_tokens: Mutex<AttachTokenManager>,
-    follow_state: Mutex<FollowState>,
-    context_state: Mutex<ContextState>,
+    follow_state: Arc<std::sync::RwLock<FollowState>>,
+    context_state: Arc<std::sync::RwLock<ContextState>>,
     snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
     manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
     rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
@@ -609,428 +612,32 @@ fn epoch_millis_now() -> u64 {
     now.as_millis() as u64
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FollowEntry {
-    leader_client_id: ClientId,
-    global: bool,
-}
+// `FollowState` / `FollowEntry` / `FollowTargetUpdate` are owned by the
+// clients plugin (M4 Stage 10.3). The types live in
+// `bmux_plugin_domain_compat::follow_state`; the runtime handle is
+// registered into `bmux_plugin::global_plugin_state_registry()` by
+// `bmux_clients_plugin::ClientsPlugin::activate`. Server code accesses
+// the shared handle through `ServerState::follow_state`, which is an
+// `Arc<RwLock<FollowState>>` obtained from the plugin state registry.
 
-#[allow(clippy::struct_field_names)]
-#[derive(Debug, Clone, Copy)]
-struct FollowTargetUpdate {
-    follower_client_id: ClientId,
-    leader_client_id: ClientId,
-    context_id: Option<Uuid>,
-    session_id: Option<SessionId>,
-}
-
-#[derive(Debug, Default)]
-struct FollowState {
-    connected_clients: std::collections::BTreeSet<ClientId>,
-    selected_contexts: BTreeMap<ClientId, Option<Uuid>>,
-    selected_sessions: BTreeMap<ClientId, Option<SessionId>>,
-    follows: BTreeMap<ClientId, FollowEntry>,
-}
-
-impl FollowState {
-    fn connect_client(&mut self, client_id: ClientId) {
-        self.connected_clients.insert(client_id);
-        self.selected_contexts.entry(client_id).or_insert(None);
-        self.selected_sessions.entry(client_id).or_insert(None);
-    }
-
-    fn disconnect_client(&mut self, client_id: ClientId) -> Vec<Event> {
-        self.connected_clients.remove(&client_id);
-        self.selected_contexts.remove(&client_id);
-        self.selected_sessions.remove(&client_id);
-        self.follows.remove(&client_id);
-
-        #[allow(clippy::needless_collect)]
-        let impacted_followers = self
-            .follows
-            .iter()
-            .filter_map(|(follower_id, entry)| {
-                (entry.leader_client_id == client_id).then_some(*follower_id)
-            })
-            .collect::<Vec<_>>();
-
-        impacted_followers
-            .into_iter()
-            .filter_map(|follower_id| {
-                self.follows
-                    .remove(&follower_id)
-                    .map(|entry| Event::FollowTargetGone {
-                        follower_client_id: follower_id.0,
-                        former_leader_client_id: entry.leader_client_id.0,
-                    })
-            })
-            .collect()
-    }
-
-    fn set_selected_target(
-        &mut self,
-        client_id: ClientId,
-        context_id: Option<Uuid>,
-        session_id: Option<SessionId>,
-    ) {
-        if self.connected_clients.contains(&client_id) {
-            self.selected_contexts.insert(client_id, context_id);
-            self.selected_sessions.insert(client_id, session_id);
-        }
-    }
-
-    fn selected_target(&self, client_id: ClientId) -> Option<(Option<Uuid>, Option<SessionId>)> {
-        Some((
-            self.selected_contexts.get(&client_id).copied()?,
-            self.selected_sessions.get(&client_id).copied()?,
-        ))
-    }
-
-    fn start_follow(
-        &mut self,
-        follower_client_id: ClientId,
-        leader_client_id: ClientId,
-        global: bool,
-    ) -> std::result::Result<(Option<Uuid>, Option<SessionId>), &'static str> {
-        if follower_client_id == leader_client_id {
-            return Err("cannot follow self");
-        }
-        if !self.connected_clients.contains(&leader_client_id) {
-            return Err("target client not connected");
-        }
-        if !self.connected_clients.contains(&follower_client_id) {
-            return Err("follower client not connected");
-        }
-
-        self.follows.insert(
-            follower_client_id,
-            FollowEntry {
-                leader_client_id,
-                global,
-            },
-        );
-
-        if global {
-            let leader_context = self
-                .selected_contexts
-                .get(&leader_client_id)
-                .copied()
-                .flatten();
-            let leader_session = self
-                .selected_sessions
-                .get(&leader_client_id)
-                .copied()
-                .flatten();
-            self.selected_contexts
-                .insert(follower_client_id, leader_context);
-            self.selected_sessions
-                .insert(follower_client_id, leader_session);
-            return Ok((leader_context, leader_session));
-        }
-
-        Ok((None, None))
-    }
-
-    fn stop_follow(&mut self, follower_client_id: ClientId) -> bool {
-        self.follows.remove(&follower_client_id).is_some()
-    }
-
-    fn sync_followers_from_leader(
-        &mut self,
-        leader_client_id: ClientId,
-        selected_context: Option<Uuid>,
-        selected_session: Option<SessionId>,
-    ) -> Vec<FollowTargetUpdate> {
-        let followers = self
-            .follows
-            .iter()
-            .filter_map(|(follower_id, entry)| {
-                (entry.leader_client_id == leader_client_id && entry.global).then_some(*follower_id)
-            })
-            .collect::<Vec<_>>();
-
-        let mut updates = Vec::new();
-        for follower_id in followers {
-            if self.connected_clients.contains(&follower_id) {
-                let previous = self.selected_sessions.get(&follower_id).copied().flatten();
-                let previous_context = self.selected_contexts.get(&follower_id).copied().flatten();
-                self.selected_contexts.insert(follower_id, selected_context);
-                self.selected_sessions.insert(follower_id, selected_session);
-                let changed = previous != selected_session || previous_context != selected_context;
-                if changed {
-                    updates.push(FollowTargetUpdate {
-                        follower_client_id: follower_id,
-                        leader_client_id,
-                        context_id: selected_context,
-                        session_id: selected_session,
-                    });
-                }
-            }
-        }
-
-        updates
-    }
-
-    fn list_clients(&self) -> Vec<ClientSummary> {
-        self.connected_clients
-            .iter()
-            .map(|client_id| {
-                let selected_session_id = self
-                    .selected_sessions
-                    .get(client_id)
-                    .and_then(|selected| selected.map(|session_id| session_id.0));
-                let selected_context_id = self.selected_contexts.get(client_id).copied().flatten();
-                let (following_client_id, following_global) =
-                    self.follows.get(client_id).map_or((None, false), |entry| {
-                        (Some(entry.leader_client_id.0), entry.global)
-                    });
-
-                ClientSummary {
-                    id: client_id.0,
-                    selected_context_id,
-                    selected_session_id,
-                    following_client_id,
-                    following_global,
-                }
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RuntimeContext {
-    id: Uuid,
-    name: Option<String>,
-    attributes: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Default)]
-struct ContextState {
-    contexts: BTreeMap<Uuid, RuntimeContext>,
-    session_by_context: BTreeMap<Uuid, SessionId>,
-    selected_by_client: BTreeMap<ClientId, Uuid>,
-    mru_contexts: VecDeque<Uuid>,
-}
-
-impl ContextState {
-    fn list(&self) -> Vec<ContextSummary> {
-        let mut ordered_ids = self.mru_contexts.iter().copied().collect::<Vec<_>>();
-        for id in self.contexts.keys().copied() {
-            if !ordered_ids.contains(&id) {
-                ordered_ids.push(id);
-            }
-        }
-
-        ordered_ids
-            .into_iter()
-            .filter_map(|id| self.contexts.get(&id))
-            .map(Self::to_summary)
-            .collect()
-    }
-
-    fn create(
-        &mut self,
-        client_id: ClientId,
-        name: Option<String>,
-        attributes: BTreeMap<String, String>,
-    ) -> ContextSummary {
-        let context = RuntimeContext {
-            id: Uuid::new_v4(),
-            name,
-            attributes,
-        };
-        let id = context.id;
-        self.contexts.insert(id, context.clone());
-        self.selected_by_client.insert(client_id, id);
-        self.touch_mru(id);
-        Self::to_summary(&context)
-    }
-
-    fn current_for_client(&self, client_id: ClientId) -> Option<ContextSummary> {
-        let selected = self
-            .selected_by_client
-            .get(&client_id)
-            .copied()
-            .filter(|id| self.contexts.contains_key(id))
-            .or_else(|| {
-                self.mru_contexts
-                    .iter()
-                    .copied()
-                    .find(|id| self.contexts.contains_key(id))
-            })?;
-        self.contexts.get(&selected).map(Self::to_summary)
-    }
-
-    fn current_session_for_client(&self, client_id: ClientId) -> Option<SessionId> {
-        let selected = self
-            .selected_by_client
-            .get(&client_id)
-            .copied()
-            .filter(|id| self.contexts.contains_key(id))
-            .or_else(|| {
-                self.mru_contexts
-                    .iter()
-                    .copied()
-                    .find(|id| self.contexts.contains_key(id))
-            })?;
-        self.session_by_context.get(&selected).copied()
-    }
-
-    fn context_for_session(&self, session_id: SessionId) -> Option<Uuid> {
-        self.session_by_context
-            .iter()
-            .find_map(|(context_id, mapped_session_id)| {
-                (*mapped_session_id == session_id).then_some(*context_id)
-            })
-    }
-
-    fn select_for_client(
-        &mut self,
-        client_id: ClientId,
-        selector: &ContextSelector,
-    ) -> std::result::Result<ContextSummary, &'static str> {
-        let id = self.resolve_id(selector)?;
-        self.selected_by_client.insert(client_id, id);
-        self.touch_mru(id);
-        self.contexts
-            .get(&id)
-            .map(Self::to_summary)
-            .ok_or("context not found")
-    }
-
-    fn close(
-        &mut self,
-        client_id: ClientId,
-        selector: &ContextSelector,
-        _force: bool,
-    ) -> std::result::Result<(Uuid, Option<SessionId>), &'static str> {
-        let id = self.resolve_id(selector)?;
-        self.remove_context_by_id(id, Some(client_id))
-            .ok_or("context not found")
-    }
-
-    fn remove_contexts_for_session(&mut self, session_id: SessionId) -> Vec<Uuid> {
-        let context_ids = self
-            .session_by_context
-            .iter()
-            .filter_map(|(context_id, mapped)| (*mapped == session_id).then_some(*context_id))
-            .collect::<Vec<_>>();
-        let mut removed = Vec::with_capacity(context_ids.len());
-        for context_id in context_ids {
-            if let Some((removed_id, _)) = self.remove_context_by_id(context_id, None) {
-                removed.push(removed_id);
-            }
-        }
-        removed
-    }
-
-    fn bind_session(
-        &mut self,
-        context_id: Uuid,
-        session_id: SessionId,
-    ) -> std::result::Result<(), &'static str> {
-        let Some(context) = self.contexts.get_mut(&context_id) else {
-            return Err("context not found");
-        };
-        context.attributes.insert(
-            CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
-            session_id.0.to_string(),
-        );
-        self.session_by_context.insert(context_id, session_id);
-        Ok(())
-    }
-
-    fn disconnect_client(&mut self, client_id: ClientId) {
-        self.selected_by_client.remove(&client_id);
-    }
-
-    fn resolve_id(&self, selector: &ContextSelector) -> std::result::Result<Uuid, &'static str> {
-        match selector {
-            ContextSelector::ById(id) => {
-                if self.contexts.contains_key(id) {
-                    Ok(*id)
-                } else {
-                    Err("context not found")
-                }
-            }
-            ContextSelector::ByName(name) => {
-                let mut matches = self
-                    .contexts
-                    .values()
-                    .filter(|context| context.name.as_deref() == Some(name.as_str()))
-                    .map(|context| context.id);
-                let Some(first) = matches.next() else {
-                    return Err("context not found");
-                };
-                if matches.next().is_some() {
-                    return Err("context selector by name is ambiguous");
-                }
-                Ok(first)
-            }
-        }
-    }
-
-    fn touch_mru(&mut self, id: Uuid) {
-        self.mru_contexts.retain(|entry| *entry != id);
-        self.mru_contexts.push_front(id);
-    }
-
-    fn remove_context_by_id(
-        &mut self,
-        context_id: Uuid,
-        preferred_client: Option<ClientId>,
-    ) -> Option<(Uuid, Option<SessionId>)> {
-        let removed = self.contexts.remove(&context_id)?;
-        let removed_session = self.session_by_context.remove(&context_id);
-        self.mru_contexts.retain(|entry| *entry != context_id);
-
-        let replacement = self
-            .mru_contexts
-            .iter()
-            .copied()
-            .find(|candidate| self.contexts.contains_key(candidate));
-
-        let impacted = self
-            .selected_by_client
-            .iter()
-            .filter_map(|(id_key, selected)| (*selected == removed.id).then_some(*id_key))
-            .collect::<Vec<_>>();
-        for impacted_client in impacted {
-            if let Some(next_id) = replacement {
-                self.selected_by_client.insert(impacted_client, next_id);
-            } else {
-                self.selected_by_client.remove(&impacted_client);
-            }
-        }
-
-        if let Some(client_id) = preferred_client
-            && !self.selected_by_client.contains_key(&client_id)
-            && let Some(next_id) = replacement
-        {
-            self.selected_by_client.insert(client_id, next_id);
-        }
-
-        Some((removed.id, removed_session))
-    }
-
-    fn to_summary(context: &RuntimeContext) -> ContextSummary {
-        ContextSummary {
-            id: context.id,
-            name: context.name.clone(),
-            attributes: context.attributes.clone(),
-        }
-    }
-}
+// `ContextState` / `RuntimeContext` are owned by the contexts plugin
+// (M4 Stage 10.4). The types live in
+// `bmux_plugin_domain_compat::context_state`; the runtime handle is
+// registered into `bmux_plugin::global_plugin_state_registry()` by
+// `bmux_contexts_plugin::ContextsPlugin::activate`. Server code
+// accesses the shared handle through `ServerState::context_state`,
+// which is an `Arc<RwLock<ContextState>>` obtained from the plugin
+// state registry.
 
 fn current_context_id_for_client(state: &Arc<ServerState>, client_id: ClientId) -> Option<Uuid> {
-    let context_state = state.context_state.lock().ok()?;
+    let context_state = state.context_state.read().ok()?;
     context_state
         .current_for_client(client_id)
         .map(|context| context.id)
 }
 
 fn current_context_id_for_session(state: &Arc<ServerState>, session_id: SessionId) -> Option<Uuid> {
-    let context_state = state.context_state.lock().ok()?;
+    let context_state = state.context_state.read().ok()?;
     context_state.context_for_session(session_id)
 }
 
@@ -1038,7 +645,7 @@ fn current_context_session_for_client(
     state: &Arc<ServerState>,
     client_id: ClientId,
 ) -> Option<SessionId> {
-    let context_state = state.context_state.lock().ok()?;
+    let context_state = state.context_state.read().ok()?;
     context_state.current_session_for_client(client_id)
 }
 
@@ -1048,7 +655,7 @@ fn prune_context_mappings_for_session(
 ) -> Result<Vec<Uuid>> {
     let mut context_state = state
         .context_state
-        .lock()
+        .write()
         .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
     Ok(context_state.remove_contexts_for_session(session_id))
 }
@@ -1056,7 +663,7 @@ fn prune_context_mappings_for_session(
 fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Result<SessionId> {
     let mut manager = state
         .session_manager
-        .lock()
+        .write()
         .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
     if let Some(requested_name) = name.as_deref()
         && manager
@@ -1080,7 +687,7 @@ fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Res
         drop(runtime_manager);
         let _ = state
             .session_manager
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?
             .remove_session(&session_id);
         anyhow::bail!("failed creating session runtime: {error:#}");
@@ -4928,6 +4535,22 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
         .and_then(|reason| reason.clone())
 }
 
+/// Construct a fresh `Arc<RwLock<T>>` state handle for the server.
+///
+/// M4 architectural note: the plugin state types (`FollowState`,
+/// `ContextState`, `SessionManager`) live in
+/// `bmux_plugin_domain_compat`, are owned-at-the-type-level by
+/// their respective plugins, and are registered into the global
+/// [`PluginStateRegistry`] by each plugin's `activate` callback so
+/// plugins and other observers can reach them. The server, however,
+/// constructs its own canonical instance per-server so that multiple
+/// `BmuxServer` instances (tests especially) don't accidentally share
+/// state. The server-owned handle is what flows through the request
+/// pipeline.
+fn make_server_state<T: Default + Send + Sync + 'static>() -> Arc<std::sync::RwLock<T>> {
+    Arc::new(std::sync::RwLock::new(T::default()))
+}
+
 impl BmuxServer {
     #[allow(clippy::too_many_arguments)]
     fn new_with_snapshot(
@@ -4981,7 +4604,7 @@ impl BmuxServer {
         Self {
             endpoint,
             state: Arc::new(ServerState {
-                session_manager: Mutex::new(SessionManager::new()),
+                session_manager: make_server_state::<SessionManager>(),
                 session_runtimes: Mutex::new(SessionRuntimeManager::new(
                     shell,
                     pane_term,
@@ -4994,8 +4617,8 @@ impl BmuxServer {
                     event_broadcast_tx.clone(),
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
-                follow_state: Mutex::new(FollowState::default()),
-                context_state: Mutex::new(ContextState::default()),
+                follow_state: make_server_state::<FollowState>(),
+                context_state: make_server_state::<ContextState>(),
                 snapshot_runtime,
                 manual_recording_runtime,
                 rolling_recording_runtime,
@@ -5361,7 +4984,7 @@ impl BmuxServer {
             }
             shutdown_runtime_handle(removed_runtime).await;
         }
-        if let Ok(mut session_manager) = self.state.session_manager.lock() {
+        if let Ok(mut session_manager) = self.state.session_manager.write() {
             *session_manager = SessionManager::new();
         }
         let _ = emit_event(&self.state, Event::ServerStopping);
@@ -5457,7 +5080,7 @@ async fn handle_connection(
     {
         let mut follow_state = state
             .follow_state
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         follow_state.connect_client(client_id);
     }
@@ -6014,7 +5637,7 @@ fn build_control_catalog_snapshot(state: &Arc<ServerState>) -> Result<ControlCat
     let revision = current_control_catalog_revision(state);
     let sessions = state
         .session_manager
-        .lock()
+        .read()
         .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?
         .list_sessions()
         .into_iter()
@@ -6028,7 +5651,7 @@ fn build_control_catalog_snapshot(state: &Arc<ServerState>) -> Result<ControlCat
     let (contexts, context_session_bindings) = {
         let context_state = state
             .context_state
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
         let mut contexts = context_state.list();
         let context_session_bindings = context_state
@@ -6205,7 +5828,7 @@ fn sync_selected_target_from_follow_state(
     let follow_selected = {
         let follow_state = state
             .follow_state
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         follow_state.selected_target(client_id)
     };
@@ -6214,7 +5837,7 @@ fn sync_selected_target_from_follow_state(
         if let Some(context_id) = follow_selected_context {
             let mut context_state = state
                 .context_state
-                .lock()
+                .write()
                 .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
             let _ = context_state.select_for_client(client_id, &ContextSelector::ById(context_id));
         }
@@ -6237,7 +5860,7 @@ fn reconcile_selected_session_membership(
 
     let mut manager = state
         .session_manager
-        .lock()
+        .write()
         .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
 
     if let Some(previous_session) = previous
@@ -6265,7 +5888,7 @@ fn persist_selected_session(
     let updates = {
         let mut follow_state = state
             .follow_state
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         follow_state.set_selected_target(client_id, selected_context, selected_session);
         follow_state.sync_followers_from_leader(client_id, selected_context, selected_session)
@@ -6295,7 +5918,7 @@ fn disconnect_follow_state(state: &Arc<ServerState>, client_id: ClientId) -> Res
     let events = {
         let mut follow_state = state
             .follow_state
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         follow_state.disconnect_client(client_id)
     };
@@ -6313,7 +5936,7 @@ fn clear_selected_session_for_all(
 ) -> Result<()> {
     let mut follow_state = state
         .follow_state
-        .lock()
+        .write()
         .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
 
     let affected_clients = follow_state
@@ -6430,7 +6053,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
     let sessions = {
         let manager = state
             .session_manager
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
         manager.list_sessions()
     };
@@ -6438,7 +6061,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
     let session_snapshots = {
         let manager = state
             .session_manager
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
         let runtime_manager = state
             .session_runtimes
@@ -6608,7 +6231,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
     let (follows, selected_sessions) = {
         let follow_state = state
             .follow_state
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         let follows = follow_state
             .follows
@@ -6636,7 +6259,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
     let (contexts, context_session_bindings, selected_contexts, mru_contexts) = {
         let context_state = state
             .context_state
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
 
         let contexts = context_state
@@ -6944,7 +6567,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
     {
         let mut session_manager = state
             .session_manager
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
         let mut runtime_manager = state
             .session_runtimes
@@ -7044,7 +6667,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
         let session_catalog = {
             let session_manager = state
                 .session_manager
-                .lock()
+                .read()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             session_manager
                 .list_sessions()
@@ -7061,7 +6684,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
 
         let mut context_state = state
             .context_state
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
         context_state.contexts.clear();
         context_state.session_by_context.clear();
@@ -7149,7 +6772,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
     {
         let mut follow_state = state
             .follow_state
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         follow_state.follows.clear();
         follow_state.selected_contexts.clear();
@@ -7157,7 +6780,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
 
         let session_manager = state
             .session_manager
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
 
         for selected in &snapshot.selected_sessions {
@@ -7217,14 +6840,14 @@ async fn restore_snapshot_replace(
     {
         let mut session_manager = state
             .session_manager
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
         *session_manager = SessionManager::new();
     }
     {
         let mut follow_state = state
             .follow_state
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         follow_state.follows.clear();
         follow_state.selected_contexts.clear();
@@ -7302,7 +6925,7 @@ async fn ensure_attach_session_exists(
     let exists = {
         let manager = state
             .session_manager
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
         manager.get_session(&session_id).is_some()
     };
@@ -7554,7 +7177,7 @@ async fn handle_request(
             let context_bind_result = {
                 let mut context_state = state
                     .context_state
-                    .lock()
+                    .write()
                     .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
                 let context = context_state.create(client_id, name.clone(), BTreeMap::new());
                 match context_state.bind_session(context.id, session_id) {
@@ -7571,7 +7194,7 @@ async fn handle_request(
                 let removed_runtime = {
                     let mut manager = state
                         .session_manager
-                        .lock()
+                        .write()
                         .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                     let _ = manager.remove_session(&session_id);
                     drop(manager);
@@ -7599,7 +7222,7 @@ async fn handle_request(
         Request::ListPanes { session } => {
             let manager = state
                 .session_manager
-                .lock()
+                .read()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let session_id = match resolve_session_request_session_id(
                 &manager,
@@ -7636,7 +7259,7 @@ async fn handle_request(
             let session_id = {
                 let manager = state
                     .session_manager
-                    .lock()
+                    .read()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 match resolve_session_request_session_id(
                     &manager,
@@ -7689,7 +7312,7 @@ async fn handle_request(
             let session_id = {
                 let manager = state
                     .session_manager
-                    .lock()
+                    .read()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 match resolve_session_request_session_id(
                     &manager,
@@ -7741,7 +7364,7 @@ async fn handle_request(
             let session_id = {
                 let manager = state
                     .session_manager
-                    .lock()
+                    .read()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 match resolve_session_request_session_id(
                     &manager,
@@ -7805,7 +7428,7 @@ async fn handle_request(
             let session_id = {
                 let manager = state
                     .session_manager
-                    .lock()
+                    .read()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 match resolve_session_request_session_id(
                     &manager,
@@ -7848,7 +7471,7 @@ async fn handle_request(
             let session_id = {
                 let manager = state
                     .session_manager
-                    .lock()
+                    .read()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 match resolve_session_request_session_id(
                     &manager,
@@ -7894,7 +7517,7 @@ async fn handle_request(
                 shutdown_runtime_handle(removed_session).await;
                 let mut manager = state
                     .session_manager
-                    .lock()
+                    .write()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 let _ = manager.remove_session(&removed_session_id);
                 drop(manager);
@@ -7936,7 +7559,7 @@ async fn handle_request(
             let session_id = {
                 let manager = state
                     .session_manager
-                    .lock()
+                    .read()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 match resolve_session_request_session_id(
                     &manager,
@@ -7987,7 +7610,7 @@ async fn handle_request(
             let session_id = {
                 let manager = state
                     .session_manager
-                    .lock()
+                    .read()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 match resolve_session_request_session_id(
                     &manager,
@@ -8034,7 +7657,7 @@ async fn handle_request(
         Request::ListSessions => {
             let sessions = state
                 .session_manager
-                .lock()
+                .read()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?
                 .list_sessions()
                 .into_iter()
@@ -8049,7 +7672,7 @@ async fn handle_request(
         Request::ListClients => {
             let follow_state = state
                 .follow_state
-                .lock()
+                .read()
                 .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
             let mut clients = follow_state.list_clients();
             drop(follow_state);
@@ -8076,7 +7699,7 @@ async fn handle_request(
             let (context, bind_result) = {
                 let mut context_state = state
                     .context_state
-                    .lock()
+                    .write()
                     .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
                 let context = context_state.create(client_id, name, attributes);
                 let bind_result = context_state.bind_session(context.id, session_id);
@@ -8094,7 +7717,7 @@ async fn handle_request(
         Request::ListContexts => {
             let contexts = state
                 .context_state
-                .lock()
+                .read()
                 .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?
                 .list();
             Response::Ok(ResponsePayload::ContextList { contexts })
@@ -8103,7 +7726,7 @@ async fn handle_request(
             let selection_result = {
                 let mut context_state = state
                     .context_state
-                    .lock()
+                    .write()
                     .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
                 match context_state.select_for_client(client_id, &selector) {
                     Ok(context) => {
@@ -8139,7 +7762,7 @@ async fn handle_request(
             let close_result = {
                 let mut context_state = state
                     .context_state
-                    .lock()
+                    .write()
                     .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
                 context_state.close(client_id, &selector, force)
             };
@@ -8149,7 +7772,7 @@ async fn handle_request(
                         let removed_runtime = {
                             let mut manager = state
                                 .session_manager
-                                .lock()
+                                .write()
                                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                             let _ = manager.remove_session(&session_id);
                             if *selected_session == Some(session_id) {
@@ -8199,7 +7822,7 @@ async fn handle_request(
         Request::CurrentContext => {
             let context = state
                 .context_state
-                .lock()
+                .read()
                 .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?
                 .current_for_client(client_id);
             Response::Ok(ResponsePayload::CurrentContext { context })
@@ -8215,7 +7838,7 @@ async fn handle_request(
             let session_id = {
                 let manager = state
                     .session_manager
-                    .lock()
+                    .read()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 let Some(session_id) = resolve_session_id(&manager, &selector) else {
                     return Ok(Response::Err(ErrorResponse {
@@ -8252,7 +7875,7 @@ async fn handle_request(
             let removed_runtime = {
                 let mut manager = state
                     .session_manager
-                    .lock()
+                    .write()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 if manager.remove_session(&session_id).is_err() {
                     return Ok(Response::Err(ErrorResponse {
@@ -8311,7 +7934,7 @@ async fn handle_request(
             let (initial_target_context, initial_target_session) = {
                 let mut follow_state = state
                     .follow_state
-                    .lock()
+                    .write()
                     .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
                 match follow_state.start_follow(client_id, leader_client_id, global) {
                     Ok(initial) => initial,
@@ -8337,7 +7960,7 @@ async fn handle_request(
                 if let Some(initial_target_context) = initial_target_context {
                     let mut context_state = state
                         .context_state
-                        .lock()
+                        .write()
                         .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
                     let _ = context_state.select_for_client(
                         client_id,
@@ -8378,7 +8001,7 @@ async fn handle_request(
             let removed = {
                 let mut follow_state = state
                     .follow_state
-                    .lock()
+                    .write()
                     .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
                 follow_state.stop_follow(client_id)
             };
@@ -8399,7 +8022,7 @@ async fn handle_request(
         Request::Attach { selector } => {
             let mut manager = state
                 .session_manager
-                .lock()
+                .write()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let Some(next_session_id) = resolve_session_id(&manager, &selector) else {
                 return Ok(Response::Err(ErrorResponse {
@@ -8455,7 +8078,7 @@ async fn handle_request(
             let (selected_context_id, next_session_id) = {
                 let mut context_state = state
                     .context_state
-                    .lock()
+                    .write()
                     .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
                 let context = match context_state.select_for_client(client_id, &selector) {
                     Ok(context) => context,
@@ -8480,7 +8103,7 @@ async fn handle_request(
 
             let mut manager = state
                 .session_manager
-                .lock()
+                .write()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             if let Some(previous_session_id) = selected_session.take()
                 && previous_session_id != next_session_id
@@ -9038,7 +8661,7 @@ async fn handle_request(
             }
             let mut manager = state
                 .session_manager
-                .lock()
+                .write()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let previous_selected_session = selected_session.take();
             if let Some(current_selected_session) = previous_selected_session
@@ -10202,7 +9825,7 @@ fn detach_client_state_on_disconnect(
     {
         let mut context_state = state
             .context_state
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
         context_state.disconnect_client(client_id);
     }
@@ -10213,7 +9836,7 @@ fn detach_client_state_on_disconnect(
 
     let mut manager = state
         .session_manager
-        .lock()
+        .write()
         .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
     if let Some(session_id) = previous_selected
         && let Some(session) = manager.get_session_mut(&session_id)
@@ -12522,7 +12145,7 @@ mod tests {
             let context_state = server
                 .state
                 .context_state
-                .lock()
+                .read()
                 .expect("context state lock should succeed");
             context_state
                 .session_by_context
@@ -12766,7 +12389,7 @@ mod tests {
             let context_state = server
                 .state
                 .context_state
-                .lock()
+                .read()
                 .expect("context state lock should succeed");
             context_state
                 .session_by_context
@@ -12779,7 +12402,7 @@ mod tests {
             let mut manager = server
                 .state
                 .session_manager
-                .lock()
+                .write()
                 .expect("session manager lock should succeed");
             let _ = manager.remove_session(&mapped_session_id);
         }

@@ -18,14 +18,15 @@ use bmux_contexts_plugin_api::contexts_state::{
     self, ContextQueryError, ContextSelector as StateContextSelector, ContextSummary,
     ContextsStateService,
 };
-use bmux_plugin::{ServiceCaller, TypedServiceCaller};
+use bmux_plugin::{ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
+use bmux_plugin_domain_compat::ContextState;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CreateContextArgs {
@@ -68,6 +69,15 @@ impl WireSelector {
 pub struct ContextsPlugin;
 
 impl RustPlugin for ContextsPlugin {
+    fn activate(
+        &mut self,
+        _context: NativeLifecycleContext,
+    ) -> std::result::Result<i32, PluginCommandError> {
+        let state: Arc<RwLock<ContextState>> = Arc::new(RwLock::new(ContextState::default()));
+        global_plugin_state_registry().register::<ContextState>(&state);
+        Ok(bmux_plugin_sdk::EXIT_OK)
+    }
+
     fn run_command(
         &mut self,
         _context: NativeCommandContext,

@@ -12,11 +12,12 @@ version     = { workspace = true }
 
 [dependencies]
 # Internal bmux packages
-bmux_config            = { workspace = true }
-bmux_image             = { workspace = true, optional = true }
-bmux_ipc               = { workspace = true }
-bmux_session           = { workspace = true }
-bmux_terminal_protocol = { workspace = true }
+bmux_config               = { workspace = true }
+bmux_image                = { workspace = true, optional = true }
+bmux_ipc                  = { workspace = true }
+bmux_plugin_domain_compat = { workspace = true }
+bmux_session_models       = { workspace = true, features = ["serde"] }
+bmux_terminal_protocol    = { workspace = true }
 
 # External dependencies
 anyhow       = { workspace = true, features = ["std"] }
@@ -41,7 +42,8 @@ fail-on-warnings = [
     "bmux_config/fail-on-warnings",
     "bmux_image?/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
-    "bmux_session/fail-on-warnings",
+    "bmux_plugin_domain_compat/fail-on-warnings",
+    "bmux_session_models/fail-on-warnings",
     "bmux_terminal_protocol/fail-on-warnings",
 ]
 
@@ -57,4 +59,4 @@ image-registry = [
 compression = ["bmux_ipc/compression"]
 
 # Serialization features
-serde = ["bmux_session/serde"]
+serde = ["bmux_session_models/serde"]

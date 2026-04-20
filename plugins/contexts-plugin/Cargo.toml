@@ -15,12 +15,13 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bmux_contexts_plugin_api = { workspace = true }
-bmux_ipc                 = { workspace = true }
-bmux_plugin              = { workspace = true }
-bmux_plugin_sdk          = { workspace = true }
-serde                    = { workspace = true, features = ["derive", "std"] }
-uuid                     = { workspace = true, features = ["serde", "std"] }
+bmux_contexts_plugin_api  = { workspace = true }
+bmux_ipc                  = { workspace = true }
+bmux_plugin               = { workspace = true }
+bmux_plugin_domain_compat = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+uuid                      = { workspace = true, features = ["serde", "std"] }
 
 [features]
 fail-on-warnings = [

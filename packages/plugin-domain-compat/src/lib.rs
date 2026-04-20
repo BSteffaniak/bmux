@@ -23,6 +23,14 @@
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::result_large_err)]
 
+pub mod context_state;
+pub mod follow_state;
+pub mod session_manager;
+
+pub use context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
+pub use follow_state::{FollowEntry, FollowState, FollowTargetUpdate};
+pub use session_manager::SessionManager;
+
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::{PluginError, Result};
 use serde::{Deserialize, Serialize};
