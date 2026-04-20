@@ -1,11 +1,8 @@
 //! Session manager, owned by the sessions plugin.
 //!
 //! `SessionManager` tracks every session known to the host: its
-//! identity, name, and client set. It lives in
-//! `bmux_plugin_domain_compat` so both core and plugins can name it;
-//! the runtime handle is registered into
-//! [`bmux_plugin::PluginStateRegistry`] by the sessions plugin, and
-//! core server code accesses it via `global_plugin_state_registry`.
+//! identity, name, and client set. The sessions plugin owns this type;
+//! core server code names it via `use bmux_sessions_plugin::SessionManager`.
 //!
 //! The heavier `SessionRuntimeManager` (pane PTY processes, snapshot
 //! plumbing, event fan-out) remains in `packages/server` — it is too

@@ -11,11 +11,6 @@
 //! let sessions = caller.session_list()?;
 //! ```
 //!
-//! This crate also hosts the canonical state types owned by
-//! foundational plugins ([`FollowState`], [`ContextState`],
-//! [`SessionManager`]) so core and plugins can share them without core
-//! depending on plugin crates.
-//!
 //! Every method on [`DomainCompat`] is a thin wrapper over
 //! [`bmux_plugin::ServiceCaller::execute_kernel_request`]. The crate
 //! becomes deletable once every IPC variant it wraps is replaced by a
@@ -25,14 +20,6 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::result_large_err)]
-
-pub mod context_state;
-pub mod follow_state;
-pub mod session_manager;
-
-pub use context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
-pub use follow_state::{FollowEntry, FollowState, FollowTargetUpdate};
-pub use session_manager::SessionManager;
 
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::{PluginError, Result};

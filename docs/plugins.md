@@ -105,14 +105,13 @@ three plugin context types (`NativeCommandContext`,
 
 ## Host state registry
 
-Foundational state types owned by plugins (not by core server
-internals) live in `packages/plugin-domain-compat`. Each plugin's
-`activate` callback constructs its default state and registers it with
-the process-wide \[`bmux_plugin::PluginStateRegistry`\]:
+Foundational state types are owned by their respective plugin crates.
+Each plugin's `activate` callback constructs its default state and
+registers it with the process-wide \[`bmux_plugin::PluginStateRegistry`\]:
 
 ```rust,ignore
 use bmux_plugin::global_plugin_state_registry;
-use bmux_plugin_domain_compat::FollowState;
+use bmux_clients_plugin::FollowState;
 use std::sync::{Arc, RwLock};
 
 impl RustPlugin for ClientsPlugin {
@@ -128,28 +127,30 @@ The registry is a `TypeId`-keyed typemap holding
 `Arc<dyn Any + Send + Sync>` entries. Consumers resolve by concrete
 type: `global_plugin_state_registry().get::<FollowState>()`.
 
-**Server state ownership model.** Server core still constructs a fresh
+**Server state ownership model.** Server core constructs a fresh
 `Arc<RwLock<T>>` per `BmuxServer` instance (via `make_server_state::<T>()`
 in `packages/server/src/lib.rs`) so that multiple servers running in the
-same process don't share state. The plugin registration is canonical at
-the process level and available to other plugins or tooling that want to
-peek at a live handle outside a specific server instance. The server's
-authoritative handle flows through its request pipeline.
+same process don't share state. Server imports the state types directly
+from the owning plugin crates (`use bmux_clients_plugin::FollowState`,
+`use bmux_contexts_plugin::ContextState`,
+`use bmux_sessions_plugin::SessionManager`). The plugin registration is
+canonical at the process level and available to other plugins or tooling
+that want to peek at a live handle outside a specific server instance.
+The server's authoritative handle flows through its request pipeline.
 
-The following plugin-owned state types live in
-`packages/plugin-domain-compat`:
+Plugin-owned state type locations:
 
-| Type             | Owner plugin      | Location                                               |
-| ---------------- | ----------------- | ------------------------------------------------------ |
-| `FollowState`    | `clients-plugin`  | `packages/plugin-domain-compat/src/follow_state.rs`    |
-| `ContextState`   | `contexts-plugin` | `packages/plugin-domain-compat/src/context_state.rs`   |
-| `SessionManager` | `sessions-plugin` | `packages/plugin-domain-compat/src/session_manager.rs` |
+| Type             | Owner plugin      | Location                                         |
+| ---------------- | ----------------- | ------------------------------------------------ |
+| `FollowState`    | `clients-plugin`  | `plugins/clients-plugin/src/follow_state.rs`     |
+| `ContextState`   | `contexts-plugin` | `plugins/contexts-plugin/src/context_state.rs`   |
+| `SessionManager` | `sessions-plugin` | `plugins/sessions-plugin/src/session_manager.rs` |
 
 `SessionRuntimeManager` (the heavier pane-runtime / snapshot /
 recording orchestration struct) remains in `packages/server` for now —
 it is too entangled with server-specific runtime primitives
 (`portable-pty`, tokio channels, recording runtimes) to relocate
-without pulling those dependencies into domain-compat. Migrating it is
+without pulling those dependencies into a plugin crate. Migrating it is
 tracked as future work.
 
 ## Interaction patterns

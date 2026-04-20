@@ -8,9 +8,11 @@ mod persistence;
 pub mod recording;
 
 use anyhow::{Context, Result};
+use bmux_clients_plugin::{FollowEntry, FollowState};
 use bmux_config::{
     BmuxConfig, ConfigPaths, PerformanceRecordingLevel as ConfigPerformanceRecordingLevel,
 };
+use bmux_contexts_plugin::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
@@ -26,11 +28,8 @@ use bmux_ipc::{
     ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
     default_supported_capabilities, encode, negotiate_protocol,
 };
-use bmux_plugin_domain_compat::{
-    CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, FollowEntry, FollowState, RuntimeContext,
-    SessionManager,
-};
 use bmux_session_models::{ClientId, Session, SessionId};
+use bmux_sessions_plugin::SessionManager;
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
     ClientSelectedContextSnapshotV1, ClientSelectedSessionSnapshotV2,
@@ -56,7 +55,7 @@ use crate::recording::{RecordMeta, RecordingRuntime};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
-// `CONTEXT_SESSION_ID_ATTRIBUTE` lives in `bmux_plugin_domain_compat::context_state`.
+// `CONTEXT_SESSION_ID_ATTRIBUTE` lives in `bmux_contexts_plugin::context_state`.
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
 /// Headroom reserved for envelope framing, layout metadata, pane summaries, and
 /// scene data so that the combined output chunks + metadata never exceed the IPC
@@ -614,7 +613,7 @@ fn epoch_millis_now() -> u64 {
 
 // `FollowState` / `FollowEntry` / `FollowTargetUpdate` are owned by the
 // clients plugin. The types live in
-// `bmux_plugin_domain_compat::follow_state`; the runtime handle is
+// `bmux_clients_plugin::follow_state`; the runtime handle is
 // registered into `bmux_plugin::global_plugin_state_registry()` by
 // `bmux_clients_plugin::ClientsPlugin::activate`. Server code accesses
 // the shared handle through `ServerState::follow_state`, which is an
@@ -622,7 +621,7 @@ fn epoch_millis_now() -> u64 {
 
 // `ContextState` / `RuntimeContext` are owned by the contexts plugin.
 // The types live in
-// `bmux_plugin_domain_compat::context_state`; the runtime handle is
+// `bmux_contexts_plugin::context_state`; the runtime handle is
 // registered into `bmux_plugin::global_plugin_state_registry()` by
 // `bmux_contexts_plugin::ContextsPlugin::activate`. Server code
 // accesses the shared handle through `ServerState::context_state`,
@@ -4538,14 +4537,17 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
 /// Construct a fresh `Arc<RwLock<T>>` state handle for the server.
 ///
 /// The plugin state types (`FollowState`, `ContextState`,
-/// `SessionManager`) live in `bmux_plugin_domain_compat`, are
-/// owned-at-the-type-level by their respective plugins, and are
-/// registered into the global [`PluginStateRegistry`] by each plugin's
-/// `activate` callback so plugins and other observers can reach them.
-/// The server, however, constructs its own canonical instance
-/// per-server so that multiple `BmuxServer` instances (tests
-/// especially) don't accidentally share state. The server-owned handle
-/// is what flows through the request pipeline.
+/// `SessionManager`) are owned-at-the-type-level by their respective
+/// plugins and exported from the plugin crates themselves
+/// (`bmux_clients_plugin::FollowState`,
+/// `bmux_contexts_plugin::ContextState`,
+/// `bmux_sessions_plugin::SessionManager`). Plugins also register
+/// canonical instances into the global [`PluginStateRegistry`] on
+/// `activate` so other plugins and observers can reach them. The
+/// server constructs its own canonical instance per-server so that
+/// multiple `BmuxServer` instances (tests especially) don't
+/// accidentally share state. The server-owned handle is what flows
+/// through the request pipeline.
 fn make_server_state<T: Default + Send + Sync + 'static>() -> Arc<std::sync::RwLock<T>> {
     Arc::new(std::sync::RwLock::new(T::default()))
 }

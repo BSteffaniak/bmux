@@ -8,6 +8,10 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+pub mod follow_state;
+
+pub use follow_state::{FollowEntry, FollowState, FollowTargetUpdate};
+
 use bmux_clients_plugin_api::clients_commands::{
     self, ClientAck, ClientsCommandsService, SetCurrentSessionError, SetFollowingError,
 };
@@ -15,7 +19,6 @@ use bmux_clients_plugin_api::clients_state::{
     self, ClientQueryError, ClientSummary, ClientsStateService,
 };
 use bmux_plugin::{ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
-use bmux_plugin_domain_compat::FollowState;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use serde::{Deserialize, Serialize};

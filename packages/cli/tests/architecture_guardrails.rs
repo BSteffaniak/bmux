@@ -407,12 +407,14 @@ fn event_models_crate_has_no_domain_dependencies() {
     }
 }
 
-/// Verify that `FollowState` is defined in `bmux_plugin_domain_compat`
-/// and not in `packages/server`. The clients plugin's `activate`
-/// callback registers a canonical handle into
-/// [`bmux_plugin::PluginStateRegistry`]; server code uses a
-/// locally-owned `Arc<RwLock<FollowState>>` constructed fresh per
-/// server instance (so multi-server tests don't share state).
+/// Verify that `FollowState` is defined in `bmux_clients_plugin` and
+/// not in `packages/server`. The clients plugin owns the type; server
+/// imports it via `use bmux_clients_plugin::FollowState` and
+/// constructs a locally-owned `Arc<RwLock<FollowState>>` per server
+/// instance (so multi-server tests don't share state). The plugin also
+/// registers a canonical handle into
+/// [`bmux_plugin::PluginStateRegistry`] on `activate` for other
+/// observers.
 #[test]
 fn follow_state_is_owned_by_clients_plugin() {
     let server_source = include_str!("../../server/src/lib.rs");
@@ -429,23 +431,22 @@ fn follow_state_is_owned_by_clients_plugin() {
         assert!(
             !server_source.contains(marker),
             "packages/server/src/lib.rs must not define {marker}; \
-             FollowState lives in bmux_plugin_domain_compat and is \
-             registered by the clients plugin",
+             FollowState lives in bmux_clients_plugin",
         );
     }
 
-    // Server must import FollowState from the neutral crate.
+    // Server must import FollowState from the clients plugin.
     assert!(
-        server_source.contains("use bmux_plugin_domain_compat::"),
+        server_source.contains("use bmux_clients_plugin::"),
         "packages/server/src/lib.rs must import FollowState via \
-         `use bmux_plugin_domain_compat::...`",
+         `use bmux_clients_plugin::...`",
     );
 
-    // Domain-compat hosts the canonical type.
-    let compat_source = include_str!("../../plugin-domain-compat/src/follow_state.rs");
+    // Clients plugin hosts the canonical type.
+    let plugin_source = include_str!("../../../plugins/clients-plugin/src/follow_state.rs");
     assert!(
-        compat_source.contains("pub struct FollowState"),
-        "packages/plugin-domain-compat/src/follow_state.rs must export \
+        plugin_source.contains("pub struct FollowState"),
+        "plugins/clients-plugin/src/follow_state.rs must export \
          the canonical `FollowState` struct",
     );
 
@@ -463,11 +464,11 @@ fn follow_state_is_owned_by_clients_plugin() {
     );
 }
 
-/// Verify that `ContextState` is defined in
-/// `bmux_plugin_domain_compat` and not in `packages/server`. The
-/// contexts plugin's `activate` callback registers a canonical handle
-/// into [`bmux_plugin::PluginStateRegistry`]; server code uses a
-/// locally-owned `Arc<RwLock<ContextState>>` per server instance.
+/// Verify that `ContextState` is defined in `bmux_contexts_plugin`
+/// and not in `packages/server`. The contexts plugin owns the type;
+/// server imports it via `use bmux_contexts_plugin::ContextState` and
+/// uses a locally-owned `Arc<RwLock<ContextState>>` per server
+/// instance.
 #[test]
 fn context_state_is_owned_by_contexts_plugin() {
     let server_source = include_str!("../../server/src/lib.rs");
@@ -483,16 +484,22 @@ fn context_state_is_owned_by_contexts_plugin() {
         assert!(
             !server_source.contains(marker),
             "packages/server/src/lib.rs must not define {marker}; \
-             ContextState lives in bmux_plugin_domain_compat and is \
-             registered by the contexts plugin",
+             ContextState lives in bmux_contexts_plugin",
         );
     }
 
-    // Domain-compat hosts the canonical type.
-    let compat_source = include_str!("../../plugin-domain-compat/src/context_state.rs");
+    // Server must import ContextState from the contexts plugin.
     assert!(
-        compat_source.contains("pub struct ContextState"),
-        "packages/plugin-domain-compat/src/context_state.rs must export \
+        server_source.contains("use bmux_contexts_plugin::"),
+        "packages/server/src/lib.rs must import ContextState via \
+         `use bmux_contexts_plugin::...`",
+    );
+
+    // Contexts plugin hosts the canonical type.
+    let plugin_source = include_str!("../../../plugins/contexts-plugin/src/context_state.rs");
+    assert!(
+        plugin_source.contains("pub struct ContextState"),
+        "plugins/contexts-plugin/src/context_state.rs must export \
          the canonical `ContextState` struct",
     );
 
@@ -510,15 +517,14 @@ fn context_state_is_owned_by_contexts_plugin() {
     );
 }
 
-/// Verify that `SessionManager` is defined in
-/// `bmux_plugin_domain_compat` and not in `packages/session` or
-/// `packages/server`. The sessions plugin's `activate` callback
-/// registers a canonical handle into
-/// [`bmux_plugin::PluginStateRegistry`].
+/// Verify that `SessionManager` is defined in `bmux_sessions_plugin`
+/// and not in `packages/session` or `packages/server`. The sessions
+/// plugin owns the type; server imports it via
+/// `use bmux_sessions_plugin::SessionManager`.
 #[test]
 fn session_manager_is_owned_by_sessions_plugin() {
     // `packages/session` is absent; SessionManager lives in
-    // `bmux_plugin_domain_compat`.
+    // `bmux_sessions_plugin`.
     let session_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../session");
     assert!(
         !session_dir.join("Cargo.toml").exists(),
@@ -528,7 +534,7 @@ fn session_manager_is_owned_by_sessions_plugin() {
     assert!(
         !session_dir.join("src/lib.rs").exists(),
         "packages/session/src/lib.rs must be absent; SessionManager \
-         lives in bmux_plugin_domain_compat",
+         lives in bmux_sessions_plugin",
     );
 
     // Server must not define or Mutex-wrap SessionManager.
@@ -544,16 +550,22 @@ fn session_manager_is_owned_by_sessions_plugin() {
         assert!(
             !server_source.contains(marker),
             "packages/server/src/lib.rs must not define {marker}; \
-             SessionManager lives in bmux_plugin_domain_compat and is \
-             registered by the sessions plugin",
+             SessionManager lives in bmux_sessions_plugin",
         );
     }
 
-    // Domain-compat hosts the canonical type.
-    let compat_source = include_str!("../../plugin-domain-compat/src/session_manager.rs");
+    // Server must import SessionManager from the sessions plugin.
     assert!(
-        compat_source.contains("pub struct SessionManager"),
-        "packages/plugin-domain-compat/src/session_manager.rs must export \
+        server_source.contains("use bmux_sessions_plugin::"),
+        "packages/server/src/lib.rs must import SessionManager via \
+         `use bmux_sessions_plugin::...`",
+    );
+
+    // Sessions plugin hosts the canonical type.
+    let plugin_source = include_str!("../../../plugins/sessions-plugin/src/session_manager.rs");
+    assert!(
+        plugin_source.contains("pub struct SessionManager"),
+        "plugins/sessions-plugin/src/session_manager.rs must export \
          the canonical `SessionManager` struct",
     );
 
@@ -609,3 +621,8 @@ fn client_core_crate_has_no_domain_convenience_methods() {
         );
     }
 }
+
+// The permissions-plugin DomainCompat migration is tracked as a
+// follow-up workstream. When it lands, add a guardrail here that
+// asserts `bmux_plugin_domain_compat` is absent from permissions-plugin
+// production dependencies and source.

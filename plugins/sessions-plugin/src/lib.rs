@@ -13,8 +13,11 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+pub mod session_manager;
+
+pub use session_manager::SessionManager;
+
 use bmux_plugin::{ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
-use bmux_plugin_domain_compat::SessionManager;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_sessions_plugin_api::sessions_commands::{

@@ -10,6 +10,10 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+pub mod context_state;
+
+pub use context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
+
 use bmux_contexts_plugin_api::contexts_commands::{
     self, CloseContextError, ContextAck, ContextSelector as CommandContextSelector,
     ContextsCommandsService, CreateContextError, SelectContextError,
@@ -19,7 +23,6 @@ use bmux_contexts_plugin_api::contexts_state::{
     ContextsStateService,
 };
 use bmux_plugin::{ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
-use bmux_plugin_domain_compat::ContextState;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use serde::{Deserialize, Serialize};
