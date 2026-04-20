@@ -12,8 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 # Core packages (always available)
-bmux_config       = { workspace = true, optional = true }
-bmux_event_models = { workspace = true, optional = true }
+bmux_config = { workspace = true, optional = true }
 
 # Feature-gated packages
 bmux_cli             = { workspace = true, optional = true }
@@ -33,7 +32,6 @@ fail-on-warnings = [
     "bmux_cli?/fail-on-warnings",
     "bmux_client?/fail-on-warnings",
     "bmux_config?/fail-on-warnings",
-    "bmux_event_models?/fail-on-warnings",
     "bmux_keybind?/fail-on-warnings",
     "bmux_plugin?/fail-on-warnings",
     "bmux_plugin_sdk?/fail-on-warnings",
@@ -52,13 +50,12 @@ all = [
     "sandbox_harness",
     "server",
 ]
-core = ["config", "event"]
+core = ["config"]
 
 # Individual package features
 cli             = ["dep:bmux_cli"]
 client          = ["dep:bmux_client"]
 config          = ["dep:bmux_config"]
-event           = ["dep:bmux_event_models"]
 keybind         = ["dep:bmux_keybind"]
 plugin          = ["dep:bmux_plugin"]
 plugin_sdk      = ["dep:bmux_plugin_sdk"]

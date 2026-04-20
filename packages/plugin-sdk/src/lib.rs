@@ -72,16 +72,8 @@ pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventPayload, PluginEventSubscription};
 pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost, ResolvedService};
 pub use host_services::{
-    ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
-    ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
-    ContextSelector, ContextSummary, CurrentClientResponse, LogWriteLevel, LogWriteRequest,
-    PaneCloseRequest, PaneCloseResponse, PaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
-    PaneLaunchCommand, PaneLaunchRequest, PaneLaunchResponse, PaneListRequest, PaneListResponse,
-    PaneResizeRequest, PaneResizeResponse, PaneSelector, PaneSplitDirection, PaneSplitRequest,
-    PaneSplitResponse, PaneSummary, PaneZoomRequest, PaneZoomResponse, PluginCommandOutcome,
-    RecordingWriteEventRequest, RecordingWriteEventResponse, SessionCreateRequest,
-    SessionCreateResponse, SessionListResponse, SessionSelectRequest, SessionSelectResponse,
-    SessionSelector, SessionSummary, StorageGetRequest, StorageGetResponse, StorageSetRequest,
+    LogWriteLevel, LogWriteRequest, PluginCommandOutcome, RecordingWriteEventRequest,
+    RecordingWriteEventResponse, StorageGetRequest, StorageGetResponse, StorageSetRequest,
 };
 pub use ident::{CapabilityId, InterfaceId, OperationId, PluginEventKind};
 pub use native_exports::{

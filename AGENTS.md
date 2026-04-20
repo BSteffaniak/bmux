@@ -14,13 +14,11 @@ BMUX core must remain domain-agnostic. Windows, sessions, contexts, clients, and
   - `packages/client/**`
   - `packages/ipc/**`
   - `packages/session/**`
-  - `packages/terminal/**`
   - `packages/event/**`
-- Plugin infrastructure (not core architecture but also must stay domain-agnostic):
   - `packages/plugin-sdk/**` — shared SDK types, identifier newtypes, typed-dispatch primitives
   - `packages/plugin/**` — host-side plugin loader, registry, and runtime traits
   - `packages/plugin-schema/**` + `packages/plugin-schema-macros/**` — BPDL codegen
-  - Must provide only generic host primitives (`storage`, `log`, `recording`, `call_service`, `execute_kernel_request`). Domain convenience lives in the opt-in `bmux_plugin::DomainCompat` extension trait, which plugins import via `use bmux_plugin::DomainCompat;`.
+- Core architecture must provide only generic host primitives (`storage`, `log`, `recording`, `call_service`, `execute_kernel_request`). Domain convenience lives in the opt-in `bmux_plugin::DomainCompat` extension trait, which plugins import via `use bmux_plugin::DomainCompat;`.
 - In core architecture, avoid domain-specific types/fields/events/APIs for any plugin domain.
 - Domain behavior must be implemented through plugins and generic plugin/service invoke paths (`Request::InvokeService` + typed plugin-api crates, or `ServiceCaller::execute_kernel_request` for kernel-level primitives).
 - Core defaults when plugins are missing:

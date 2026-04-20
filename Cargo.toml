@@ -21,6 +21,7 @@ members = [
     "packages/ipc",
     "packages/keybind",
     "packages/plugin",
+    "packages/plugin-domain-compat",
     "packages/plugin-schema",
     "packages/plugin-schema-macros",
     "packages/plugin-sdk",
@@ -119,6 +120,7 @@ bmux_keyboard               = { version = "0.0.1-alpha.0", default-features = fa
 bmux_mobile_core            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-core" }
 bmux_mobile_ffi             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-ffi" }
 bmux_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
+bmux_plugin_domain_compat   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-domain-compat" }
 bmux_plugin_schema          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-schema" }
 bmux_plugin_schema_macros   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-schema-macros" }
 bmux_plugin_sdk             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }

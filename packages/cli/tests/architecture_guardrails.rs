@@ -298,6 +298,63 @@ fn cli_crate_does_not_reexport_domain_types() {
     }
 }
 
+/// M4 Stage 10: verify that `packages/plugin-sdk` is fully
+/// domain-agnostic. The domain types (`Pane*`, `Session*`, `Context*`,
+/// `CurrentClient*`) moved to `packages/plugin-domain-compat`; this
+/// test prevents them from sneaking back in.
+#[test]
+fn plugin_sdk_has_no_domain_types() {
+    let source = include_str!("../../plugin-sdk/src/host_services.rs");
+    let denied = [
+        "pub struct SessionSummary",
+        "pub struct ContextSummary",
+        "pub struct PaneSummary",
+        "pub enum SessionSelector",
+        "pub enum ContextSelector",
+        "pub enum PaneSelector",
+        "pub enum PaneSplitDirection",
+        "pub enum PaneFocusDirection",
+        "pub struct SessionCreateRequest",
+        "pub struct SessionCreateResponse",
+        "pub struct SessionListResponse",
+        "pub struct SessionSelectRequest",
+        "pub struct SessionSelectResponse",
+        "pub struct CurrentClientResponse",
+        "pub struct ContextCreateRequest",
+        "pub struct ContextCreateResponse",
+        "pub struct ContextListResponse",
+        "pub struct ContextSelectRequest",
+        "pub struct ContextSelectResponse",
+        "pub struct ContextCloseRequest",
+        "pub struct ContextCloseResponse",
+        "pub struct ContextCurrentResponse",
+        "pub struct PaneListRequest",
+        "pub struct PaneListResponse",
+        "pub struct PaneSplitRequest",
+        "pub struct PaneSplitResponse",
+        "pub struct PaneLaunchCommand",
+        "pub struct PaneLaunchRequest",
+        "pub struct PaneLaunchResponse",
+        "pub struct PaneFocusRequest",
+        "pub struct PaneFocusResponse",
+        "pub struct PaneResizeRequest",
+        "pub struct PaneResizeResponse",
+        "pub struct PaneCloseRequest",
+        "pub struct PaneCloseResponse",
+        "pub struct PaneZoomRequest",
+        "pub struct PaneZoomResponse",
+    ];
+
+    for marker in denied {
+        assert!(
+            !source.contains(marker),
+            "packages/plugin-sdk/src/host_services.rs is core \
+             plugin infrastructure; domain type {marker} belongs in \
+             packages/plugin-domain-compat instead",
+        );
+    }
+}
+
 /// M4 Stage 10: verify that `packages/session/models` stays minimal.
 /// Dead types `LayoutError`, `PaneError`, `ClientError`, `ClientInfo`,
 /// `SessionError`, `PaneId` were deleted; this test prevents their

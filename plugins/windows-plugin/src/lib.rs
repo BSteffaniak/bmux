@@ -2,11 +2,13 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::{DomainCompat, HostRuntimeApi, TypedServiceCaller};
+use bmux_plugin::{HostRuntimeApi, TypedServiceCaller};
+use bmux_plugin_domain_compat::DomainCompat;
+use bmux_plugin_domain_compat::{ContextCloseRequest, ContextCreateRequest, ContextSelector};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    ContextCloseRequest, ContextCreateRequest, ContextSelector, HostScope, StorageGetRequest,
-    StorageSetRequest, TypedServiceRegistrationContext, TypedServiceRegistry,
+    HostScope, StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext,
+    TypedServiceRegistry,
 };
 use bmux_windows_plugin_api::windows_commands::{
     self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, PaneZoomAck, Selector,
@@ -71,9 +73,9 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("switch_failed", e))
             },
             "windows-commands", "focus-pane" => |req: FocusPaneArgs, ctx| {
-                let request = bmux_plugin_sdk::PaneFocusRequest {
+                let request = bmux_plugin_domain_compat::PaneFocusRequest {
                     session: None,
-                    target: Some(bmux_plugin_sdk::PaneSelector::ById(req.id)),
+                    target: Some(bmux_plugin_domain_compat::PaneSelector::ById(req.id)),
                     direction: None,
                 };
                 ctx.pane_focus(&request)
@@ -81,16 +83,16 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
             },
             "windows-commands", "close-pane" => |req: ClosePaneArgs, ctx| {
-                let request = bmux_plugin_sdk::PaneCloseRequest {
+                let request = bmux_plugin_domain_compat::PaneCloseRequest {
                     session: None,
-                    target: Some(bmux_plugin_sdk::PaneSelector::ById(req.id)),
+                    target: Some(bmux_plugin_domain_compat::PaneSelector::ById(req.id)),
                 };
                 ctx.pane_close(&request)
                     .map(|_| PaneAck { ok: true, pane_id: Some(req.id) })
                     .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
             },
             "windows-commands", "focus-pane-by-selector" => |req: FocusPaneBySelectorArgs, ctx| {
-                let request = bmux_plugin_sdk::PaneFocusRequest {
+                let request = bmux_plugin_domain_compat::PaneFocusRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: Some(selector_to_pane(&req.target)),
                     direction: None,
@@ -100,7 +102,7 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
             },
             "windows-commands", "close-pane-by-selector" => |req: ClosePaneBySelectorArgs, ctx| {
-                let request = bmux_plugin_sdk::PaneCloseRequest {
+                let request = bmux_plugin_domain_compat::PaneCloseRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: Some(selector_to_pane(&req.target)),
                 };
@@ -109,7 +111,7 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
             },
             "windows-commands", "close-active-pane" => |req: CloseActivePaneArgs, ctx| {
-                let request = bmux_plugin_sdk::PaneCloseRequest {
+                let request = bmux_plugin_domain_compat::PaneCloseRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: None,
                 };
@@ -124,7 +126,7 @@ impl RustPlugin for WindowsPlugin {
                         "direction must be Next/Prev (Horizontal/Vertical aren't meaningful)",
                     ));
                 };
-                let request = bmux_plugin_sdk::PaneFocusRequest {
+                let request = bmux_plugin_domain_compat::PaneFocusRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: None,
                     direction: Some(focus_dir),
@@ -134,7 +136,7 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
             },
             "windows-commands", "split-pane" => |req: SplitPaneArgs, ctx| {
-                let request = bmux_plugin_sdk::PaneSplitRequest {
+                let request = bmux_plugin_domain_compat::PaneSplitRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: req.target.as_ref().map(selector_to_pane),
                     direction: pane_direction_to_split(req.direction),
@@ -144,12 +146,12 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("split_failed", e.to_string()))
             },
             "windows-commands", "launch-pane" => |req: LaunchPaneArgs, ctx| {
-                let request = bmux_plugin_sdk::PaneLaunchRequest {
+                let request = bmux_plugin_domain_compat::PaneLaunchRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: req.target.as_ref().map(selector_to_pane),
                     direction: pane_direction_to_split(req.direction),
                     name: req.name,
-                    command: bmux_plugin_sdk::PaneLaunchCommand {
+                    command: bmux_plugin_domain_compat::PaneLaunchCommand {
                         program: req.program,
                         args: req.args,
                         cwd: None,
@@ -161,7 +163,7 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("launch_failed", e.to_string()))
             },
             "windows-commands", "resize-pane" => |req: ResizePaneArgs, ctx| {
-                let request = bmux_plugin_sdk::PaneResizeRequest {
+                let request = bmux_plugin_domain_compat::PaneResizeRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: req.target.as_ref().map(selector_to_pane),
                     delta: req.delta,
@@ -171,7 +173,7 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("resize_failed", e.to_string()))
             },
             "windows-commands", "zoom-pane" => |req: ZoomPaneArgs, ctx| {
-                let request = bmux_plugin_sdk::PaneZoomRequest {
+                let request = bmux_plugin_domain_compat::PaneZoomRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                 };
                 ctx.pane_zoom(&request)
@@ -438,7 +440,9 @@ fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<W
     })
 }
 
-fn next_default_tab_name_for_contexts(contexts: &[bmux_plugin_sdk::ContextSummary]) -> String {
+fn next_default_tab_name_for_contexts(
+    contexts: &[bmux_plugin_domain_compat::ContextSummary],
+) -> String {
     let mut next = 1_u32;
     loop {
         let candidate = format!("tab-{next}");
@@ -498,7 +502,7 @@ fn switch_window(
     let previous_context = resolve_effective_current_context_with_contexts(caller, &contexts)?;
     let context_id = resolve_context_id_from_contexts(&contexts, &selector)?;
     caller
-        .context_select(&bmux_plugin_sdk::ContextSelectRequest {
+        .context_select(&bmux_plugin_domain_compat::ContextSelectRequest {
             selector: ContextSelector::ById(context_id),
         })
         .map_err(|error| error.to_string())?;
@@ -654,7 +658,7 @@ fn close_current_window(
 }
 
 fn resolve_context_id_from_contexts(
-    contexts: &[bmux_plugin_sdk::ContextSummary],
+    contexts: &[bmux_plugin_domain_compat::ContextSummary],
     selector: &ContextSelector,
 ) -> Result<Uuid, String> {
     contexts
@@ -677,7 +681,7 @@ fn resolve_effective_current_context(caller: &impl HostRuntimeApi) -> Result<Opt
 
 fn resolve_effective_current_context_with_contexts(
     caller: &impl HostRuntimeApi,
-    contexts: &[bmux_plugin_sdk::ContextSummary],
+    contexts: &[bmux_plugin_domain_compat::ContextSummary],
 ) -> Result<Option<Uuid>, String> {
     let current = caller
         .context_current()
@@ -726,8 +730,8 @@ fn set_stored_context_id(
 
 fn order_contexts_for_navigation(
     caller: &impl HostRuntimeApi,
-    contexts: Vec<bmux_plugin_sdk::ContextSummary>,
-) -> Result<Vec<bmux_plugin_sdk::ContextSummary>, String> {
+    contexts: Vec<bmux_plugin_domain_compat::ContextSummary>,
+) -> Result<Vec<bmux_plugin_domain_compat::ContextSummary>, String> {
     let order_ids = resolve_window_order_ids(caller, &contexts)?;
     let mut by_id = contexts
         .into_iter()
@@ -741,7 +745,7 @@ fn order_contexts_for_navigation(
 
 fn resolve_window_order_ids(
     caller: &impl HostRuntimeApi,
-    contexts: &[bmux_plugin_sdk::ContextSummary],
+    contexts: &[bmux_plugin_domain_compat::ContextSummary],
 ) -> Result<Vec<Uuid>, String> {
     let mut order_ids = get_stored_window_order_ids(caller)?;
     let mut changed = false;
@@ -863,65 +867,69 @@ impl WindowsStateHandle {
     }
 }
 
-/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_sdk::SessionSelector`]
+/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_domain_compat::SessionSelector`]
 /// used by the byte-encoded host API. Prefers `id` when both are set.
-fn selector_to_session(selector: &Selector) -> Option<bmux_plugin_sdk::SessionSelector> {
+fn selector_to_session(selector: &Selector) -> Option<bmux_plugin_domain_compat::SessionSelector> {
     if let Some(id) = selector.id {
-        return Some(bmux_plugin_sdk::SessionSelector::ById(id));
+        return Some(bmux_plugin_domain_compat::SessionSelector::ById(id));
     }
     selector
         .name
         .as_ref()
-        .map(|name| bmux_plugin_sdk::SessionSelector::ByName(name.clone()))
+        .map(|name| bmux_plugin_domain_compat::SessionSelector::ByName(name.clone()))
 }
 
-/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_sdk::PaneSelector`].
+/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_domain_compat::PaneSelector`].
 /// The BPDL selector has `id` / `name`; panes don't currently accept
 /// a name selector on the host side, so a bare `name` falls back to
 /// the active pane. Consumers that need index-based selection can
 /// extend the BPDL `selector` record later.
-/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_sdk::PaneSelector`].
+/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_domain_compat::PaneSelector`].
 /// Precedence: `id` → `index` → `name` → active. Name-based pane
 /// selection has no direct IPC equivalent today, so a bare `name`
 /// falls back to the active pane.
 #[allow(clippy::option_if_let_else)] // Chained `if let` is clearer than nested `map_or` here.
-const fn selector_to_pane(selector: &Selector) -> bmux_plugin_sdk::PaneSelector {
+const fn selector_to_pane(selector: &Selector) -> bmux_plugin_domain_compat::PaneSelector {
     if let Some(id) = selector.id {
-        bmux_plugin_sdk::PaneSelector::ById(id)
+        bmux_plugin_domain_compat::PaneSelector::ById(id)
     } else if let Some(index) = selector.index {
-        bmux_plugin_sdk::PaneSelector::ByIndex(index)
+        bmux_plugin_domain_compat::PaneSelector::ByIndex(index)
     } else {
-        bmux_plugin_sdk::PaneSelector::Active
+        bmux_plugin_domain_compat::PaneSelector::Active
     }
 }
 
-const fn pane_direction_to_split(direction: PaneDirection) -> bmux_plugin_sdk::PaneSplitDirection {
+const fn pane_direction_to_split(
+    direction: PaneDirection,
+) -> bmux_plugin_domain_compat::PaneSplitDirection {
     // The BPDL enum covers split *and* focus directions; only Horizontal
     // and Vertical are meaningful for splitting. Anything else folds to
     // Horizontal as the safest default — the trait's `split_pane` caller
     // is expected to pick Horizontal/Vertical explicitly.
     match direction {
-        PaneDirection::Vertical => bmux_plugin_sdk::PaneSplitDirection::Vertical,
+        PaneDirection::Vertical => bmux_plugin_domain_compat::PaneSplitDirection::Vertical,
         PaneDirection::Horizontal
         | PaneDirection::Left
         | PaneDirection::Right
         | PaneDirection::Up
-        | PaneDirection::Down => bmux_plugin_sdk::PaneSplitDirection::Horizontal,
+        | PaneDirection::Down => bmux_plugin_domain_compat::PaneSplitDirection::Horizontal,
     }
 }
 
 const fn pane_direction_to_focus(
     direction: PaneDirection,
-) -> Option<bmux_plugin_sdk::PaneFocusDirection> {
+) -> Option<bmux_plugin_domain_compat::PaneFocusDirection> {
     match direction {
         // Only Next/Prev make sense at the IPC level today. The rest
         // map to "no direction hint" so the host focuses the targeted
         // pane explicitly.
         PaneDirection::Horizontal | PaneDirection::Vertical => None,
         PaneDirection::Right | PaneDirection::Down => {
-            Some(bmux_plugin_sdk::PaneFocusDirection::Next)
+            Some(bmux_plugin_domain_compat::PaneFocusDirection::Next)
         }
-        PaneDirection::Left | PaneDirection::Up => Some(bmux_plugin_sdk::PaneFocusDirection::Prev),
+        PaneDirection::Left | PaneDirection::Up => {
+            Some(bmux_plugin_domain_compat::PaneFocusDirection::Prev)
+        }
     }
 }
 
@@ -939,9 +947,9 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<(), FocusError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_sdk::PaneFocusRequest {
+            let request = bmux_plugin_domain_compat::PaneFocusRequest {
                 session: None,
-                target: Some(bmux_plugin_sdk::PaneSelector::ById(id)),
+                target: Some(bmux_plugin_domain_compat::PaneSelector::ById(id)),
                 direction: None,
             };
             caller
@@ -959,9 +967,9 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<(), CloseError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_sdk::PaneCloseRequest {
+            let request = bmux_plugin_domain_compat::PaneCloseRequest {
                 session: None,
-                target: Some(bmux_plugin_sdk::PaneSelector::ById(id)),
+                target: Some(bmux_plugin_domain_compat::PaneSelector::ById(id)),
             };
             caller
                 .pane_close(&request)
@@ -980,7 +988,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
             let pane_selector = selector_to_pane(&target);
-            let request = bmux_plugin_sdk::PaneFocusRequest {
+            let request = bmux_plugin_domain_compat::PaneFocusRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: Some(pane_selector),
                 direction: None,
@@ -1003,7 +1011,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
             let pane_selector = selector_to_pane(&target);
-            let request = bmux_plugin_sdk::PaneCloseRequest {
+            let request = bmux_plugin_domain_compat::PaneCloseRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: Some(pane_selector),
             };
@@ -1023,7 +1031,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_sdk::PaneCloseRequest {
+            let request = bmux_plugin_domain_compat::PaneCloseRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: None,
             };
@@ -1050,7 +1058,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
                         .into(),
                 });
             };
-            let request = bmux_plugin_sdk::PaneFocusRequest {
+            let request = bmux_plugin_domain_compat::PaneFocusRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: None,
                 direction: Some(focus_dir),
@@ -1074,7 +1082,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_sdk::PaneSplitRequest {
+            let request = bmux_plugin_domain_compat::PaneSplitRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: target.as_ref().map(selector_to_pane),
                 direction: pane_direction_to_split(direction),
@@ -1100,12 +1108,12 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_sdk::PaneLaunchRequest {
+            let request = bmux_plugin_domain_compat::PaneLaunchRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: target.as_ref().map(selector_to_pane),
                 direction: pane_direction_to_split(direction),
                 name,
-                command: bmux_plugin_sdk::PaneLaunchCommand {
+                command: bmux_plugin_domain_compat::PaneLaunchCommand {
                     program,
                     args,
                     cwd: None,
@@ -1130,7 +1138,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_sdk::PaneResizeRequest {
+            let request = bmux_plugin_domain_compat::PaneResizeRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: target.as_ref().map(selector_to_pane),
                 delta,
@@ -1151,7 +1159,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneZoomAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_sdk::PaneZoomRequest {
+            let request = bmux_plugin_domain_compat::PaneZoomRequest {
                 session: session.as_ref().and_then(selector_to_session),
             };
             caller
@@ -1257,8 +1265,8 @@ impl WindowsStateService for WindowsStateHandle {
     ) -> Pin<Box<dyn Future<Output = Vec<PaneState>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_sdk::PaneListRequest {
-                session: Some(bmux_plugin_sdk::SessionSelector::ById(session)),
+            let request = bmux_plugin_domain_compat::PaneListRequest {
+                session: Some(bmux_plugin_domain_compat::SessionSelector::ById(session)),
             };
             let Ok(response) = caller.pane_list(&request) else {
                 return Vec::new();
@@ -1462,12 +1470,15 @@ fn interface_ids_match_bpdl_constants() {
 mod tests {
     use super::*;
     use bmux_plugin::ServiceCaller;
+    use bmux_plugin_domain_compat::{
+        ContextCloseRequest, ContextCreateRequest, ContextListResponse, ContextSelectRequest,
+        ContextSelectResponse, ContextSelector as SessionSelector,
+        ContextSummary as SessionSummary,
+    };
     use bmux_plugin_sdk::{
-        ApiVersion, ContextCloseRequest, ContextCreateRequest, ContextListResponse,
-        ContextSelectRequest, ContextSelectResponse, ContextSelector as SessionSelector,
-        ContextSummary as SessionSummary, HostConnectionInfo, HostKernelBridge, HostMetadata,
-        HostScope, NativeServiceContext, ProviderId, RegisteredService, ServiceKind,
-        ServiceRequest, decode_service_message, encode_service_message,
+        ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, HostScope,
+        NativeServiceContext, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
+        decode_service_message, encode_service_message,
     };
     use std::sync::Mutex;
 
@@ -1804,7 +1815,7 @@ mod tests {
                         .lock()
                         .expect("create log lock should succeed")
                         .push(request.name.clone());
-                    encode_service_message(&bmux_plugin_sdk::ContextCreateResponse {
+                    encode_service_message(&bmux_plugin_domain_compat::ContextCreateResponse {
                         context: SessionSummary {
                             id: Uuid::new_v4(),
                             name: request.name,
@@ -1823,7 +1834,7 @@ mod tests {
                         .lock()
                         .expect("kill log lock should succeed")
                         .push(request.clone());
-                    encode_service_message(&bmux_plugin_sdk::ContextCloseResponse {
+                    encode_service_message(&bmux_plugin_domain_compat::ContextCloseResponse {
                         id: match request.selector {
                             SessionSelector::ById(id) => id,
                             SessionSelector::ByName(_) => Uuid::new_v4(),
@@ -1879,7 +1890,9 @@ mod tests {
                         .expect("selected context lock should succeed");
                     let context = current_context_id
                         .and_then(|id| self.sessions.iter().find(|entry| entry.id == id).cloned());
-                    encode_service_message(&bmux_plugin_sdk::ContextCurrentResponse { context })
+                    encode_service_message(&bmux_plugin_domain_compat::ContextCurrentResponse {
+                        context,
+                    })
                 }
                 ("client-query/v1", "current") => {
                     if self.fail_current_client {
@@ -1891,7 +1904,7 @@ mod tests {
                         .selected_session_id
                         .lock()
                         .expect("selected session lock should succeed");
-                    encode_service_message(&bmux_plugin_sdk::CurrentClientResponse {
+                    encode_service_message(&bmux_plugin_domain_compat::CurrentClientResponse {
                         id: self.current_client_id,
                         selected_session_id,
                         following_client_id: None,
@@ -1940,7 +1953,7 @@ mod tests {
                         "list",
                         Vec::new(),
                     )?;
-                    let response: bmux_plugin_sdk::ContextListResponse =
+                    let response: bmux_plugin_domain_compat::ContextListResponse =
                         bmux_plugin_sdk::decode_service_message(&bytes)?;
                     Ok(bmux_ipc::ResponsePayload::ContextList {
                         contexts: response
@@ -1962,7 +1975,7 @@ mod tests {
                         "current",
                         Vec::new(),
                     )?;
-                    let response: bmux_plugin_sdk::ContextCurrentResponse =
+                    let response: bmux_plugin_domain_compat::ContextCurrentResponse =
                         bmux_plugin_sdk::decode_service_message(&bytes)?;
                     Ok(bmux_ipc::ResponsePayload::CurrentContext {
                         context: response.context.map(|c| bmux_ipc::ContextSummary {
@@ -1974,7 +1987,7 @@ mod tests {
                 }
                 bmux_ipc::Request::CreateContext { name, attributes } => {
                     let payload = bmux_plugin_sdk::encode_service_message(
-                        &bmux_plugin_sdk::ContextCreateRequest { name, attributes },
+                        &bmux_plugin_domain_compat::ContextCreateRequest { name, attributes },
                     )?;
                     let bytes = self.call_service_raw(
                         "bmux.contexts.write",
@@ -1983,7 +1996,7 @@ mod tests {
                         "create",
                         payload,
                     )?;
-                    let response: bmux_plugin_sdk::ContextCreateResponse =
+                    let response: bmux_plugin_domain_compat::ContextCreateResponse =
                         bmux_plugin_sdk::decode_service_message(&bytes)?;
                     Ok(bmux_ipc::ResponsePayload::ContextCreated {
                         context: bmux_ipc::ContextSummary {
@@ -1996,14 +2009,14 @@ mod tests {
                 bmux_ipc::Request::SelectContext { selector } => {
                     let host_selector = match selector {
                         bmux_ipc::ContextSelector::ById(id) => {
-                            bmux_plugin_sdk::ContextSelector::ById(id)
+                            bmux_plugin_domain_compat::ContextSelector::ById(id)
                         }
                         bmux_ipc::ContextSelector::ByName(name) => {
-                            bmux_plugin_sdk::ContextSelector::ByName(name)
+                            bmux_plugin_domain_compat::ContextSelector::ByName(name)
                         }
                     };
                     let payload = bmux_plugin_sdk::encode_service_message(
-                        &bmux_plugin_sdk::ContextSelectRequest {
+                        &bmux_plugin_domain_compat::ContextSelectRequest {
                             selector: host_selector,
                         },
                     )?;
@@ -2014,7 +2027,7 @@ mod tests {
                         "select",
                         payload,
                     )?;
-                    let response: bmux_plugin_sdk::ContextSelectResponse =
+                    let response: bmux_plugin_domain_compat::ContextSelectResponse =
                         bmux_plugin_sdk::decode_service_message(&bytes)?;
                     Ok(bmux_ipc::ResponsePayload::ContextSelected {
                         context: bmux_ipc::ContextSummary {
@@ -2027,14 +2040,14 @@ mod tests {
                 bmux_ipc::Request::CloseContext { selector, force } => {
                     let host_selector = match selector {
                         bmux_ipc::ContextSelector::ById(id) => {
-                            bmux_plugin_sdk::ContextSelector::ById(id)
+                            bmux_plugin_domain_compat::ContextSelector::ById(id)
                         }
                         bmux_ipc::ContextSelector::ByName(name) => {
-                            bmux_plugin_sdk::ContextSelector::ByName(name)
+                            bmux_plugin_domain_compat::ContextSelector::ByName(name)
                         }
                     };
                     let payload = bmux_plugin_sdk::encode_service_message(
-                        &bmux_plugin_sdk::ContextCloseRequest {
+                        &bmux_plugin_domain_compat::ContextCloseRequest {
                             selector: host_selector,
                             force,
                         },
@@ -2046,7 +2059,7 @@ mod tests {
                         "close",
                         payload,
                     )?;
-                    let response: bmux_plugin_sdk::ContextCloseResponse =
+                    let response: bmux_plugin_domain_compat::ContextCloseResponse =
                         bmux_plugin_sdk::decode_service_message(&bytes)?;
                     Ok(bmux_ipc::ResponsePayload::ContextClosed { id: response.id })
                 }
@@ -2061,7 +2074,7 @@ mod tests {
                         "current",
                         Vec::new(),
                     )?;
-                    let response: bmux_plugin_sdk::CurrentClientResponse =
+                    let response: bmux_plugin_domain_compat::CurrentClientResponse =
                         bmux_plugin_sdk::decode_service_message(&bytes)?;
                     Ok(bmux_ipc::ResponsePayload::ClientList {
                         clients: vec![bmux_ipc::ClientSummary {

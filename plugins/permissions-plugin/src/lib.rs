@@ -2,9 +2,10 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::{DomainCompat, HostRuntimeApi};
+use bmux_plugin::HostRuntimeApi;
+use bmux_plugin_domain_compat::{DomainCompat, SessionSelector};
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{SessionSelector, StorageGetRequest, StorageSetRequest};
+use bmux_plugin_sdk::{StorageGetRequest, StorageSetRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -876,11 +877,11 @@ fn resolve_context_id(
     context: &str,
 ) -> Result<Uuid, String> {
     let selector = if let Ok(id) = Uuid::parse_str(context) {
-        bmux_plugin_sdk::ContextSelector::ById(id)
+        bmux_plugin_domain_compat::ContextSelector::ById(id)
     } else if context.trim().is_empty() {
         return Err("context must not be empty".to_string());
     } else {
-        bmux_plugin_sdk::ContextSelector::ByName(context.to_string())
+        bmux_plugin_domain_compat::ContextSelector::ByName(context.to_string())
     };
     let contexts = caller
         .context_list()
@@ -889,8 +890,8 @@ fn resolve_context_id(
     contexts
         .into_iter()
         .find(|entry| match &selector {
-            bmux_plugin_sdk::ContextSelector::ById(id) => entry.id == *id,
-            bmux_plugin_sdk::ContextSelector::ByName(name) => {
+            bmux_plugin_domain_compat::ContextSelector::ById(id) => entry.id == *id,
+            bmux_plugin_domain_compat::ContextSelector::ByName(name) => {
                 entry.name.as_deref() == Some(name.as_str())
             }
         })
@@ -1059,10 +1060,12 @@ bmux_plugin_sdk::export_plugin!(PermissionsPlugin, include_str!("../plugin.toml"
 mod tests {
     use super::*;
     use bmux_plugin::ServiceCaller;
+    use bmux_plugin_domain_compat::{
+        ContextListResponse, ContextSummary, SessionListResponse, SessionSummary,
+    };
     use bmux_plugin_sdk::{
-        ApiVersion, ContextListResponse, ContextSummary, HostConnectionInfo, HostKernelBridge,
-        HostMetadata, HostScope, NativeServiceContext, ProviderId, RegisteredService, ServiceKind,
-        ServiceRequest, SessionListResponse, SessionSummary,
+        ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, HostScope,
+        NativeServiceContext, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
     };
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -1136,7 +1139,7 @@ mod tests {
                     sessions: self.sessions.clone(),
                 }),
                 ("client-query/v1", "current") => {
-                    encode_service_message(&bmux_plugin_sdk::CurrentClientResponse {
+                    encode_service_message(&bmux_plugin_domain_compat::CurrentClientResponse {
                         id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
                         selected_session_id: self.selected_session_id,
                         following_client_id: None,
@@ -1165,7 +1168,7 @@ mod tests {
                     contexts: self.contexts.clone(),
                 }),
                 ("context-query/v1", "current") => {
-                    encode_service_message(&bmux_plugin_sdk::ContextCurrentResponse {
+                    encode_service_message(&bmux_plugin_domain_compat::ContextCurrentResponse {
                         context: self.contexts.first().cloned(),
                     })
                 }

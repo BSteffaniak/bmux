@@ -1,35 +1,272 @@
-//! Domain-specific convenience extension over
-//! [`ServiceCaller::execute_kernel_request`].
+//! Opt-in domain-compat extension for bmux plugins.
 //!
-//! `HostRuntimeApi` is deliberately domain-agnostic. Plugins that want
-//! the old ergonomics of `caller.session_list()` /
-//! `caller.context_create(...)` / `caller.pane_focus(...)` opt in to
-//! this extension trait with `use bmux_plugin::DomainCompat;`.
+//! This crate is a temporary migration shim during the M4 "Generic
+//! Core" refactor. Core plugin infrastructure (`bmux_plugin_sdk` and
+//! `bmux_plugin`) is strictly domain-agnostic. Plugins that still need
+//! ergonomic access to session/context/pane/client domain concepts
+//! opt in by depending on this crate and bringing [`DomainCompat`]
+//! into scope:
 //!
-//! Each method here is a thin wrapper that encodes a
-//! [`bmux_ipc::Request`], dispatches through the kernel bridge, and
-//! reshapes the response into one of the `bmux_plugin_sdk` domain
-//! structs (same field shapes as the pre-M4 `HostRuntimeApi` default
-//! methods used). The whole module is a migration convenience — in a
-//! future milestone the plugins will consume the typed
-//! plugin-api crates (`bmux_sessions_plugin_api`,
-//! `bmux_contexts_plugin_api`, `bmux_windows_plugin_api`,
-//! `bmux_clients_plugin_api`) directly and this trait will be
-//! deletable.
+//! ```ignore
+//! use bmux_plugin_domain_compat::DomainCompat;
+//!
+//! let sessions = caller.session_list()?;
+//! ```
+//!
+//! Every method on [`DomainCompat`] is a thin wrapper over
+//! [`bmux_plugin::ServiceCaller::execute_kernel_request`]. When the
+//! IPC variants this crate depends on are eventually deleted, the
+//! whole crate becomes deletable.
 
-use bmux_plugin_sdk::{
-    ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
-    ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
-    ContextSelector, ContextSummary, CurrentClientResponse, PaneCloseRequest, PaneCloseResponse,
-    PaneFocusDirection, PaneFocusRequest, PaneFocusResponse, PaneLaunchRequest, PaneLaunchResponse,
-    PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse, PaneSelector,
-    PaneSplitDirection, PaneSplitRequest, PaneSplitResponse, PaneSummary, PaneZoomRequest,
-    PaneZoomResponse, PluginError, Result, SessionCreateRequest, SessionCreateResponse,
-    SessionListResponse, SessionSelectRequest, SessionSelectResponse, SessionSelector,
-    SessionSummary,
-};
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
+#![allow(clippy::result_large_err)]
 
-use crate::host_runtime::ServiceCaller;
+use bmux_plugin::ServiceCaller;
+use bmux_plugin_sdk::{PluginError, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use uuid::Uuid;
+
+// ── Domain summary types ────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub client_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSummary {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSummary {
+    pub id: Uuid,
+    pub index: u32,
+    pub name: Option<String>,
+    pub focused: bool,
+}
+
+// ── Selectors / directions ──────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionSelector {
+    ById(Uuid),
+    ByName(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextSelector {
+    ById(Uuid),
+    ByName(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneSelector {
+    ById(Uuid),
+    ByIndex(u32),
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneSplitDirection {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneFocusDirection {
+    Next,
+    Prev,
+}
+
+// ── Requests / responses ────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCreateRequest {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCreateResponse {
+    pub id: Uuid,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionListResponse {
+    pub sessions: Vec<SessionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSelectRequest {
+    pub selector: SessionSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSelectResponse {
+    pub session_id: Uuid,
+    pub attach_token: Uuid,
+    pub expires_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentClientResponse {
+    pub id: Uuid,
+    pub selected_session_id: Option<Uuid>,
+    pub following_client_id: Option<Uuid>,
+    pub following_global: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCreateRequest {
+    pub name: Option<String>,
+    pub attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCreateResponse {
+    pub context: ContextSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextListResponse {
+    pub contexts: Vec<ContextSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSelectRequest {
+    pub selector: ContextSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSelectResponse {
+    pub context: ContextSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCloseRequest {
+    pub selector: ContextSelector,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCloseResponse {
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCurrentResponse {
+    pub context: Option<ContextSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneListRequest {
+    pub session: Option<SessionSelector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneListResponse {
+    pub panes: Vec<PaneSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSplitRequest {
+    pub session: Option<SessionSelector>,
+    pub target: Option<PaneSelector>,
+    pub direction: PaneSplitDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneLaunchCommand {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneLaunchRequest {
+    pub session: Option<SessionSelector>,
+    pub target: Option<PaneSelector>,
+    pub direction: PaneSplitDirection,
+    pub name: Option<String>,
+    pub command: PaneLaunchCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSplitResponse {
+    pub id: Uuid,
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneLaunchResponse {
+    pub id: Uuid,
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneFocusRequest {
+    pub session: Option<SessionSelector>,
+    pub target: Option<PaneSelector>,
+    pub direction: Option<PaneFocusDirection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneFocusResponse {
+    pub id: Uuid,
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneResizeRequest {
+    pub session: Option<SessionSelector>,
+    pub target: Option<PaneSelector>,
+    pub delta: i16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneResizeResponse {
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneCloseRequest {
+    pub session: Option<SessionSelector>,
+    pub target: Option<PaneSelector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneCloseResponse {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub session_closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneZoomRequest {
+    #[serde(default)]
+    pub session: Option<SessionSelector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneZoomResponse {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub zoomed: bool,
+}
 
 // ── SDK → IPC selector converters ───────────────────────────────────
 
@@ -75,11 +312,13 @@ fn unexpected(operation: &'static str) -> PluginError {
     }
 }
 
+// ── Extension trait ─────────────────────────────────────────────────
+
 /// Opt-in extension trait providing domain-shaped convenience methods
 /// on top of [`ServiceCaller::execute_kernel_request`].
 ///
 /// Blanket-implemented for all `T: ServiceCaller + ?Sized`; plugins
-/// bring it into scope with `use bmux_plugin::DomainCompat;`.
+/// bring it into scope with `use bmux_plugin_domain_compat::DomainCompat;`.
 pub trait DomainCompat: ServiceCaller {
     /// List all sessions.
     ///

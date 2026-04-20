@@ -26,7 +26,6 @@ bmux_config                = { workspace = true }
 bmux_contexts_plugin_api   = { workspace = true }
 bmux_decoration_plugin_api = { workspace = true }
 bmux_env                   = { workspace = true }
-bmux_event_models          = { workspace = true }
 bmux_fonts                 = { workspace = true, default-features = false }
 bmux_ipc                   = { workspace = true }
 bmux_keybind               = { workspace = true }
@@ -146,7 +145,6 @@ fail-on-warnings = [
     "bmux_cluster_plugin?/fail-on-warnings",
     "bmux_config/fail-on-warnings",
     "bmux_contexts_plugin?/fail-on-warnings",
-    "bmux_event_models/fail-on-warnings",
     "bmux_image?/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_keybind/fail-on-warnings",
@@ -202,12 +200,7 @@ bundled-fonts = ["bmux_fonts/bundled-fonts", "bmux_fonts/bundled-nerd-fonts"]
 compression = ["bmux_ipc/compression", "bmux_server/compression"]
 
 # Serialization features
-serde = [
-    "bmux_client/serde",
-    "bmux_event_models/serde",
-    "bmux_keyboard/serde",
-    "bmux_server/serde",
-]
+serde = ["bmux_client/serde", "bmux_keyboard/serde", "bmux_server/serde"]
 
 # Terminal image protocol support
 image-iterm2 = [

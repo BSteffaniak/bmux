@@ -12,7 +12,6 @@
 //!
 //! # Features
 //!
-//! - `event` — modal input event system.
 //! - `config` — configuration loader.
 //! - `cli` — `bmux` binary entrypoint and runtime.
 //! - `server` — server-side daemon.
@@ -21,9 +20,6 @@
 //! - `plugin` — host-side plugin loader and registry.
 //! - `plugin_sdk` — plugin author SDK.
 //! - `sandbox_harness` — integration test harness.
-
-#[cfg(feature = "event")]
-pub use bmux_event_models as event;
 
 #[cfg(feature = "config")]
 pub use bmux_config as config;
@@ -51,9 +47,6 @@ pub use bmux_sandbox_harness as sandbox_harness;
 
 /// Prelude module for commonly used domain-agnostic types.
 pub mod prelude {
-    #[cfg(feature = "event")]
-    pub use crate::event::Mode;
-
     #[cfg(feature = "config")]
     pub use crate::config::{BmuxConfig, ConfigPaths};
 }

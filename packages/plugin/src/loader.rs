@@ -2121,7 +2121,8 @@ fn ensure_match(
 #[cfg(test)]
 mod tests {
     use super::{LoadedPlugin, PluginBackend};
-    use crate::{DomainCompat, PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
+    use crate::{PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
+    use bmux_plugin_domain_compat::DomainCompat;
     use bmux_plugin_sdk::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, NativeLifecycleContext,
         NativeServiceContext, PluginEvent, PluginEventKind, PluginEventSubscription,
@@ -3216,10 +3217,10 @@ minimum = "1.0"
         };
 
         let _response = context
-            .pane_split(&bmux_plugin_sdk::PaneSplitRequest {
+            .pane_split(&bmux_plugin_domain_compat::PaneSplitRequest {
                 session: None,
                 target: None,
-                direction: bmux_plugin_sdk::PaneSplitDirection::Vertical,
+                direction: bmux_plugin_domain_compat::PaneSplitDirection::Vertical,
             })
             .expect("core pane command should succeed");
 
@@ -3270,12 +3271,12 @@ minimum = "1.0"
         };
 
         let _response = context
-            .pane_launch(&bmux_plugin_sdk::PaneLaunchRequest {
+            .pane_launch(&bmux_plugin_domain_compat::PaneLaunchRequest {
                 session: None,
                 target: None,
-                direction: bmux_plugin_sdk::PaneSplitDirection::Vertical,
+                direction: bmux_plugin_domain_compat::PaneSplitDirection::Vertical,
                 name: Some("remote-a".to_string()),
-                command: bmux_plugin_sdk::PaneLaunchCommand {
+                command: bmux_plugin_domain_compat::PaneLaunchCommand {
                     program: "ssh".to_string(),
                     args: vec!["host-a".to_string()],
                     cwd: Some("/tmp".to_string()),
@@ -3331,7 +3332,7 @@ minimum = "1.0"
         };
 
         let _response = context
-            .session_create(&bmux_plugin_sdk::SessionCreateRequest {
+            .session_create(&bmux_plugin_domain_compat::SessionCreateRequest {
                 name: Some("created".to_string()),
             })
             .expect("core session command should succeed");
@@ -3724,8 +3725,8 @@ minimum = "1.0"
         };
 
         let response = context
-            .session_select(&bmux_plugin_sdk::SessionSelectRequest {
-                selector: bmux_plugin_sdk::SessionSelector::ById(target_session_id),
+            .session_select(&bmux_plugin_domain_compat::SessionSelectRequest {
+                selector: bmux_plugin_domain_compat::SessionSelector::ById(target_session_id),
             })
             .expect("core session select should succeed");
         assert_eq!(response.session_id, target_session_id);
@@ -3781,7 +3782,7 @@ minimum = "1.0"
         };
 
         let error = context
-            .session_create(&bmux_plugin_sdk::SessionCreateRequest {
+            .session_create(&bmux_plugin_domain_compat::SessionCreateRequest {
                 name: Some("deny".to_string()),
             })
             .expect_err("kernel denial should propagate as service error");
@@ -3832,7 +3833,7 @@ minimum = "1.0"
         };
 
         let response = context
-            .pane_list(&bmux_plugin_sdk::PaneListRequest { session: None })
+            .pane_list(&bmux_plugin_domain_compat::PaneListRequest { session: None })
             .expect("core pane query should succeed");
         assert_eq!(response.panes.len(), 1);
 
@@ -3883,25 +3884,25 @@ minimum = "1.0"
         };
 
         let _focused = context
-            .pane_focus(&bmux_plugin_sdk::PaneFocusRequest {
+            .pane_focus(&bmux_plugin_domain_compat::PaneFocusRequest {
                 session: None,
-                target: Some(bmux_plugin_sdk::PaneSelector::Active),
-                direction: Some(bmux_plugin_sdk::PaneFocusDirection::Next),
+                target: Some(bmux_plugin_domain_compat::PaneSelector::Active),
+                direction: Some(bmux_plugin_domain_compat::PaneFocusDirection::Next),
             })
             .expect("focus command should succeed");
 
         let _resized = context
-            .pane_resize(&bmux_plugin_sdk::PaneResizeRequest {
+            .pane_resize(&bmux_plugin_domain_compat::PaneResizeRequest {
                 session: None,
-                target: Some(bmux_plugin_sdk::PaneSelector::Active),
+                target: Some(bmux_plugin_domain_compat::PaneSelector::Active),
                 delta: 1,
             })
             .expect("resize command should succeed");
 
         let _closed = context
-            .pane_close(&bmux_plugin_sdk::PaneCloseRequest {
+            .pane_close(&bmux_plugin_domain_compat::PaneCloseRequest {
                 session: None,
-                target: Some(bmux_plugin_sdk::PaneSelector::Active),
+                target: Some(bmux_plugin_domain_compat::PaneSelector::Active),
             })
             .expect("close command should succeed");
 
