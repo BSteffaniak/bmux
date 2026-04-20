@@ -67,48 +67,24 @@ pub struct Session {
     pub id: SessionId,
     pub name: Option<String>,
     pub clients: BTreeSet<ClientId>,
-    pub created_at: std::time::SystemTime,
-    pub last_activity: std::time::SystemTime,
 }
 
 impl Session {
     #[must_use]
     pub fn new(name: Option<String>) -> Self {
-        let now = std::time::SystemTime::now();
         Self {
             id: SessionId::new(),
             name,
             clients: BTreeSet::new(),
-            created_at: now,
-            last_activity: now,
         }
     }
 
     pub fn add_client(&mut self, client_id: ClientId) {
         self.clients.insert(client_id);
-        self.update_activity();
     }
 
     pub fn remove_client(&mut self, client_id: &ClientId) -> bool {
-        let removed = self.clients.remove(client_id);
-        if removed {
-            self.update_activity();
-        }
-        removed
-    }
-
-    #[must_use]
-    pub fn has_client(&self, client_id: &ClientId) -> bool {
-        self.clients.contains(client_id)
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
-    }
-
-    fn update_activity(&mut self) {
-        self.last_activity = std::time::SystemTime::now();
+        self.clients.remove(client_id)
     }
 }
 
@@ -118,8 +94,6 @@ pub struct SessionInfo {
     pub id: SessionId,
     pub name: Option<String>,
     pub client_count: usize,
-    pub created_at: std::time::SystemTime,
-    pub last_activity: std::time::SystemTime,
 }
 
 impl From<&Session> for SessionInfo {
@@ -128,8 +102,6 @@ impl From<&Session> for SessionInfo {
             id: session.id,
             name: session.name.clone(),
             client_count: session.clients.len(),
-            created_at: session.created_at,
-            last_activity: session.last_activity,
         }
     }
 }

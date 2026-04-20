@@ -7,7 +7,7 @@
 //! This package provides the command-line interface functionality for bmux.
 
 pub use bmux_config::{BmuxConfig, ConfigPaths};
-pub use bmux_event::{Event, EventDispatcher, ModalSystem, Mode};
+pub use bmux_event::{Event, Mode};
 
 mod connection;
 mod runtime;

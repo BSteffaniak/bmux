@@ -52,7 +52,7 @@ pub use bmux_sandbox_harness as sandbox_harness;
 /// Prelude module for commonly used domain-agnostic types.
 pub mod prelude {
     #[cfg(feature = "event")]
-    pub use crate::event::{Event, EventDispatcher, ModalSystem, Mode};
+    pub use crate::event::{Event, Mode};
 
     #[cfg(feature = "config")]
     pub use crate::config::{BmuxConfig, ConfigPaths};

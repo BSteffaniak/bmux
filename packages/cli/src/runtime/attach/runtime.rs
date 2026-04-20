@@ -214,58 +214,6 @@ async fn typed_list_contexts_bmux(
     })
 }
 
-/// Typed dispatch wrapper for `contexts-state:current-context` on a
-/// plain [`BmuxClient`].
-#[allow(dead_code)] // Used once callers migrate; kept ready for Stage 8 re-homing.
-async fn typed_current_context_bmux(
-    client: &mut BmuxClient,
-) -> std::result::Result<
-    Option<bmux_contexts_plugin_api::contexts_state::ContextSummary>,
-    ClientError,
-> {
-    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding current-context args: {error}"),
-    })?;
-    let response_bytes = client
-        .invoke_service_raw(
-            typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
-            typed_contexts::QUERY_KIND,
-            typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
-            typed_contexts::OP_CURRENT_CONTEXT,
-            payload,
-        )
-        .await?;
-    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding current-context response: {error}"),
-    })
-}
-
-/// Typed dispatch wrapper for `clients-state:list-clients`.
-#[allow(dead_code)] // Used once callers migrate; kept ready for Stage 8 re-homing.
-async fn typed_list_clients_attach(
-    client: &mut StreamingBmuxClient,
-) -> std::result::Result<Vec<bmux_clients_plugin_api::clients_state::ClientSummary>, ClientError> {
-    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding list-clients args: {error}"),
-    })?;
-    let response_bytes = client
-        .invoke_service_raw(
-            typed_clients::CLIENTS_READ_CAPABILITY.as_str(),
-            typed_clients::QUERY_KIND,
-            typed_clients::CLIENTS_STATE_INTERFACE.as_str(),
-            typed_clients::OP_LIST_CLIENTS,
-            payload,
-        )
-        .await?;
-    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding list-clients response: {error}"),
-    })
-}
-
 /// Convert a typed `ContextSummary` (from `bmux_contexts_plugin_api`)
 /// to the IPC `ContextSummary` used throughout the attach runtime.
 /// Field layouts are identical so this is a straightforward move.

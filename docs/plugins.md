@@ -342,10 +342,41 @@ See the windows and decoration plugins for reference.
 
 ## Guardrails and validation
 
-- Keep architecture guardrail tests blocking for domain leakage in
-  core and runtime production paths.
-- Keep parity contract tests for bundled windows/permissions command
-  surfaces.
+The `packages/cli/tests/architecture_guardrails.rs` file contains
+string-matching tests that fail if forbidden markers appear in the
+core crates. The current invariants include:
+
+- `runtime_production_code_is_domain_agnostic` — CLI runtime files
+  reference only generic service/plugin APIs.
+- `core_packages_do_not_reference_domain_plugin_markers` — core
+  crates (`server`, `client`, `session/models`, `event`, `event/models`)
+  don't reference windows/permissions interface ids or legacy IPC
+  request variants.
+- `plugin_production_code_uses_generic_host_api_only` — bundled
+  plugins reach core via `ServiceCaller::execute_kernel_request` or
+  plugin-api crates, not raw IPC.
+- `event_core_crate_has_no_domain_event_types` — the `packages/event`
+  crates carry no `SessionEvent`/`PaneEvent`/`ClientEvent`/`InputEvent`
+  enums or helper constructors.
+- `event_models_crate_has_no_domain_dependencies` — `bmux_event_models`
+  never depends on `bmux_session_models` or `bmux_terminal_models`.
+- `client_core_crate_has_no_domain_convenience_methods` — the IPC
+  client library exposes no `new_session`/`list_contexts`/`split_pane`/
+  etc. convenience methods; callers route through
+  `BmuxClient::invoke_service_raw` with typed plugin-api payloads.
+- `cli_crate_does_not_reexport_domain_types` — `packages/cli/src/lib.rs`
+  doesn't re-export `SessionId`/`SessionManager`/`TerminalInstance`/etc.
+- `bmux_umbrella_has_no_domain_reexports` — the top-level `bmux` crate
+  re-exports only domain-agnostic building blocks.
+- `session_models_is_minimal` — `packages/session/models` carries
+  only the minimum types the server still needs (`SessionId`,
+  `ClientId`, `Session`, `SessionInfo`). Dead types (`LayoutError`,
+  `PaneError`, `ClientError`, `ClientInfo`, `SessionError`, `PaneId`)
+  are deleted and can't be reintroduced.
+
+When adding functionality, new guardrail tests should be added to
+lock in any new structural invariants the change establishes.
+
 - Required validation for runtime/code changes follows `AGENTS.md`.
 
 ## Routing policy (config)
