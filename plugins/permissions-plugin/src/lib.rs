@@ -1274,8 +1274,8 @@ mod tests {
                         context: self.contexts.first().cloned(),
                     })
                 }
-                // Typed contexts-state surface used by DomainCompat's
-                // rewritten context_list / context_current implementations.
+                // Typed contexts-state surface used by this plugin's
+                // context_list / context_current helpers.
                 ("contexts-state", "list-contexts") => encode_service_message(&self.contexts),
                 ("contexts-state", "current-context") => {
                     let current = self.contexts.first().cloned();

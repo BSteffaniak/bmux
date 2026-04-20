@@ -12,7 +12,7 @@ use bmux_plugin_sdk::{
     CoreCliCommandRequest, NativeCommandContext, StorageGetRequest, StorageSetRequest,
 };
 use domain_ipc::{
-    DomainCompat, PaneCloseRequest, PaneLaunchCommand, PaneLaunchRequest, PaneListRequest,
+    KernelOps, PaneCloseRequest, PaneLaunchCommand, PaneLaunchRequest, PaneListRequest,
     PaneSelector, PaneSplitDirection, SessionCreateRequest, SessionSelectRequest, SessionSelector,
 };
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ trait ClusterRuntimeOps {
     fn storage_set(&self, request: &StorageSetRequest) -> Result<(), String>;
 }
 
-impl<T: HostRuntimeApi + DomainCompat + ?Sized> ClusterRuntimeOps for T {
+impl<T: HostRuntimeApi + KernelOps + ?Sized> ClusterRuntimeOps for T {
     fn core_cli_command_run_path(
         &self,
         request: &CoreCliCommandRequest,
@@ -63,39 +63,39 @@ impl<T: HostRuntimeApi + DomainCompat + ?Sized> ClusterRuntimeOps for T {
     }
 
     fn session_list(&self) -> Result<domain_ipc::SessionListResponse, String> {
-        DomainCompat::session_list(self).map_err(|error| error.to_string())
+        KernelOps::session_list(self).map_err(|error| error.to_string())
     }
 
     fn session_create(
         &self,
         request: &SessionCreateRequest,
     ) -> Result<domain_ipc::SessionCreateResponse, String> {
-        DomainCompat::session_create(self, request).map_err(|error| error.to_string())
+        KernelOps::session_create(self, request).map_err(|error| error.to_string())
     }
 
     fn session_select(
         &self,
         request: &SessionSelectRequest,
     ) -> Result<domain_ipc::SessionSelectResponse, String> {
-        DomainCompat::session_select(self, request).map_err(|error| error.to_string())
+        KernelOps::session_select(self, request).map_err(|error| error.to_string())
     }
 
     fn pane_list(&self, request: &PaneListRequest) -> Result<domain_ipc::PaneListResponse, String> {
-        DomainCompat::pane_list(self, request).map_err(|error| error.to_string())
+        KernelOps::pane_list(self, request).map_err(|error| error.to_string())
     }
 
     fn pane_launch(
         &self,
         request: &PaneLaunchRequest,
     ) -> Result<domain_ipc::PaneLaunchResponse, String> {
-        DomainCompat::pane_launch(self, request).map_err(|error| error.to_string())
+        KernelOps::pane_launch(self, request).map_err(|error| error.to_string())
     }
 
     fn pane_close(
         &self,
         request: &PaneCloseRequest,
     ) -> Result<domain_ipc::PaneCloseResponse, String> {
-        DomainCompat::pane_close(self, request).map_err(|error| error.to_string())
+        KernelOps::pane_close(self, request).map_err(|error| error.to_string())
     }
 
     fn storage_get(

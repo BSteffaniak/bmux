@@ -15,7 +15,7 @@ use bmux_windows_plugin_api::windows_commands::{
     WindowAck, WindowError, WindowsCommandsService,
 };
 use bmux_windows_plugin_api::windows_state::{self, PaneState, WindowEntry, WindowsStateService};
-use domain_ipc::DomainCompat;
+use domain_ipc::KernelOps;
 use domain_ipc::{ContextCloseRequest, ContextCreateRequest, ContextSelector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -1550,7 +1550,7 @@ mod tests {
 
     /// Install a thread-local router that answers the typed cross-
     /// plugin service calls windows-plugin makes through
-    /// `DomainCompat`'s context/session helpers. Tests that exercise
+    /// `KernelOps`'s context/session helpers. Tests that exercise
     /// `invoke_service`-style service dispatch keep the returned
     /// guard alive for the duration of the test.
     ///
@@ -1853,7 +1853,7 @@ mod tests {
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
             match (interface_id, operation) {
                 // Typed contexts-plugin-api interfaces (the canonical
-                // cross-plugin dispatch path used by DomainCompat after
+                // cross-plugin dispatch path used by KernelOps after
                 // the `Request::*Context*` IPC variants were retired).
                 ("contexts-state", "list-contexts") => {
                     let mru_ids = self

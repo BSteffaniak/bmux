@@ -303,12 +303,14 @@ fn unexpected(operation: &'static str) -> PluginError {
 
 // ── Extension trait ─────────────────────────────────────────────────
 
-/// Opt-in extension trait providing domain-shaped convenience methods
-/// on top of [`ServiceCaller::execute_kernel_request`].
+/// Extension trait bundling core-IPC helpers for session/pane/context/
+/// client operations. Each method wraps a call to
+/// [`ServiceCaller::execute_kernel_request`] with a typed request/
+/// response shape.
 ///
-/// Blanket-implemented for all `T: ServiceCaller + ?Sized`; plugins
-/// bring it into scope with `use crate::domain_ipc::DomainCompat;`.
-pub trait DomainCompat: ServiceCaller {
+/// Blanket-implemented for all `T: ServiceCaller + ?Sized`; this
+/// plugin brings it into scope with `use crate::domain_ipc::KernelOps;`.
+pub trait KernelOps: ServiceCaller {
     /// List all sessions.
     ///
     /// # Errors
@@ -745,4 +747,4 @@ pub trait DomainCompat: ServiceCaller {
     }
 }
 
-impl<T: ServiceCaller + ?Sized> DomainCompat for T {}
+impl<T: ServiceCaller + ?Sized> KernelOps for T {}
