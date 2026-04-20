@@ -378,6 +378,16 @@ pub struct ServiceInvokeContext {
 }
 
 impl ServiceInvokeContext {
+    /// Connected-client id on whose behalf this service invocation is
+    /// dispatched. Plugin handlers use this to know which client made
+    /// a request without a separate `WhoAmI` round-trip.
+    #[must_use]
+    pub const fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+}
+
+impl ServiceInvokeContext {
     async fn execute_request(&self, request: Request) -> Result<Response> {
         let mut selection = self.selection.lock().await;
         let mut selected_session = selection.0;
@@ -4536,11 +4546,9 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
 
 /// Construct a fresh `Arc<RwLock<T>>` state handle for the server.
 ///
-/// The plugin state types (`FollowState`, `ContextState`,
-/// `SessionManager`) are owned-at-the-type-level by their respective
-/// plugins and exported from the plugin crates themselves
-/// (`bmux_clients_plugin::FollowState`,
-/// `bmux_contexts_plugin::ContextState`,
+/// The plugin state types (`FollowState`, `SessionManager`) are
+/// owned-at-the-type-level by their respective plugins and exported
+/// from the plugin crates themselves (`bmux_clients_plugin::FollowState`,
 /// `bmux_sessions_plugin::SessionManager`). Plugins also register
 /// canonical instances into the global [`PluginStateRegistry`] on
 /// `activate` so other plugins and observers can reach them. The
@@ -4548,8 +4556,29 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
 /// multiple `BmuxServer` instances (tests especially) don't
 /// accidentally share state. The server-owned handle is what flows
 /// through the request pipeline.
+///
+/// `ContextState` is exceptional: it is owned exclusively by
+/// `bmux_contexts_plugin`. Server uses
+/// [`plugin_owned_state::<ContextState>`] to read from the plugin's
+/// canonical registered handle; any reads/writes must go through the
+/// plugin's typed API. `make_server_state` is NOT used for
+/// `ContextState`.
 fn make_server_state<T: Default + Send + Sync + 'static>() -> Arc<std::sync::RwLock<T>> {
     Arc::new(std::sync::RwLock::new(T::default()))
+}
+
+/// Obtain the plugin-registered state handle for `T`, falling back to
+/// a freshly-constructed default if no plugin has registered yet (for
+/// tests that spin up `BmuxServer` without activating the owning
+/// plugin).
+fn plugin_owned_state<T: Default + Send + Sync + 'static>() -> Arc<std::sync::RwLock<T>> {
+    let registry = bmux_plugin::global_plugin_state_registry();
+    if let Some(existing) = registry.get::<T>() {
+        return existing;
+    }
+    let fresh = Arc::new(std::sync::RwLock::new(T::default()));
+    registry.register::<T>(&fresh);
+    fresh
 }
 
 impl BmuxServer {
@@ -4619,7 +4648,7 @@ impl BmuxServer {
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 follow_state: make_server_state::<FollowState>(),
-                context_state: make_server_state::<ContextState>(),
+                context_state: plugin_owned_state::<ContextState>(),
                 snapshot_runtime,
                 manual_recording_runtime,
                 rolling_recording_runtime,
@@ -7683,151 +7712,6 @@ async fn handle_request(
             }
             Response::Ok(ResponsePayload::ClientList { clients })
         }
-        Request::CreateContext { name, attributes } => {
-            let session_id = match create_session_runtime(state, name.clone()) {
-                Ok(session_id) => session_id,
-                Err(error) => {
-                    let message = error.to_string();
-                    let code = if message.starts_with("session already exists with name") {
-                        ErrorCode::AlreadyExists
-                    } else {
-                        ErrorCode::Internal
-                    };
-                    return Ok(Response::Err(ErrorResponse { code, message }));
-                }
-            };
-
-            let (context, bind_result) = {
-                let mut context_state = state
-                    .context_state
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
-                let context = context_state.create(client_id, name, attributes);
-                let bind_result = context_state.bind_session(context.id, session_id);
-                drop(context_state);
-                (context, bind_result)
-            };
-            if let Err(message) = bind_result {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::Internal,
-                    message: message.to_string(),
-                }));
-            }
-            Response::Ok(ResponsePayload::ContextCreated { context })
-        }
-        Request::ListContexts => {
-            let contexts = state
-                .context_state
-                .read()
-                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?
-                .list();
-            Response::Ok(ResponsePayload::ContextList { contexts })
-        }
-        Request::SelectContext { selector } => {
-            let selection_result = {
-                let mut context_state = state
-                    .context_state
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
-                match context_state.select_for_client(client_id, &selector) {
-                    Ok(context) => {
-                        let session_id = context_state.current_session_for_client(client_id);
-                        drop(context_state);
-                        Ok((context, session_id))
-                    }
-                    Err(message) => Err(message),
-                }
-            };
-
-            match selection_result {
-                Ok((context, Some(session_id))) => {
-                    let previous_selected = *selected_session;
-                    *selected_session = Some(session_id);
-                    reconcile_selected_session_membership(
-                        state,
-                        client_id,
-                        previous_selected,
-                        *selected_session,
-                    )?;
-                    persist_selected_session(state, client_id, *selected_session)?;
-                    Response::Ok(ResponsePayload::ContextSelected { context })
-                }
-                Ok((context, None)) => Response::Ok(ResponsePayload::ContextSelected { context }),
-                Err(message) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: message.to_string(),
-                }),
-            }
-        }
-        Request::CloseContext { selector, force } => {
-            let close_result = {
-                let mut context_state = state
-                    .context_state
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
-                context_state.close(client_id, &selector, force)
-            };
-            match close_result {
-                Ok((id, session_id)) => {
-                    if let Some(session_id) = session_id {
-                        let removed_runtime = {
-                            let mut manager = state
-                                .session_manager
-                                .write()
-                                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                            let _ = manager.remove_session(&session_id);
-                            if *selected_session == Some(session_id) {
-                                *selected_session = None;
-                                persist_selected_session(state, client_id, None)?;
-                            }
-                            if *attached_stream_session == Some(session_id) {
-                                *attached_stream_session = None;
-                            }
-                            drop(manager);
-
-                            let mut runtime_manager =
-                                state.session_runtimes.lock().map_err(|_| {
-                                    anyhow::anyhow!("session runtime manager lock poisoned")
-                                })?;
-                            runtime_manager.remove_runtime(session_id).ok()
-                        };
-
-                        if let Some(removed_runtime) = removed_runtime {
-                            if removed_runtime.had_attached_clients {
-                                emit_event(state, Event::ClientDetached { id: session_id.0 })?;
-                            }
-                            tokio::spawn(async move {
-                                shutdown_runtime_handle(removed_runtime).await;
-                            });
-                        }
-
-                        let mut attach_tokens = state
-                            .attach_tokens
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-                        attach_tokens.remove_for_session(session_id);
-                        drop(attach_tokens);
-
-                        clear_selected_session_for_all(state, session_id)?;
-                        emit_event(state, Event::SessionRemoved { id: session_id.0 })?;
-                    }
-
-                    Response::Ok(ResponsePayload::ContextClosed { id })
-                }
-                Err(message) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: message.to_string(),
-                }),
-            }
-        }
-        Request::CurrentContext => {
-            let context = state
-                .context_state
-                .read()
-                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?
-                .current_for_client(client_id);
-            Response::Ok(ResponsePayload::CurrentContext { context })
-        }
         Request::ControlCatalogSnapshot { since_revision: _ } => {
             let snapshot = build_control_catalog_snapshot(state)?;
             Response::Ok(ResponsePayload::ControlCatalogSnapshot { snapshot })
@@ -9358,8 +9242,6 @@ async fn handle_request(
     if let Response::Ok(payload) = &response {
         match payload {
             ResponsePayload::SessionCreated { .. }
-            | ResponsePayload::ContextCreated { .. }
-            | ResponsePayload::ContextClosed { .. }
             | ResponsePayload::SessionKilled { .. }
             | ResponsePayload::PaneClosed {
                 session_closed: true,
@@ -9405,9 +9287,6 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::ServerStop
             | Request::ServerRestoreApply
             | Request::NewSession { .. }
-            | Request::CreateContext { .. }
-            | Request::SelectContext { .. }
-            | Request::CloseContext { .. }
             | Request::KillSession { .. }
             | Request::SplitPane { .. }
             | Request::LaunchPane { .. }
@@ -9444,9 +9323,6 @@ const fn response_requires_snapshot(response: &Response) -> bool {
         response,
         Response::Ok(
             ResponsePayload::SessionCreated { .. }
-                | ResponsePayload::ContextCreated { .. }
-                | ResponsePayload::ContextSelected { .. }
-                | ResponsePayload::ContextClosed { .. }
                 | ResponsePayload::PaneSplit { .. }
                 | ResponsePayload::PaneLaunched { .. }
                 | ResponsePayload::PaneFocused { .. }
@@ -9478,11 +9354,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::NewSession { .. } => "new_session",
         Request::ListSessions => "list_sessions",
         Request::ListClients => "list_clients",
-        Request::CreateContext { .. } => "create_context",
-        Request::ListContexts => "list_contexts",
-        Request::SelectContext { .. } => "select_context",
-        Request::CloseContext { .. } => "close_context",
-        Request::CurrentContext => "current_context",
         Request::KillSession { .. } => "kill_session",
         Request::ListPanes { .. } => "list_panes",
         Request::SplitPane { .. } => "split_pane",
@@ -9764,11 +9635,6 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::SessionCreated { .. } => "session_created",
         ResponsePayload::SessionList { .. } => "session_list",
         ResponsePayload::ClientList { .. } => "client_list",
-        ResponsePayload::ContextCreated { .. } => "context_created",
-        ResponsePayload::ContextList { .. } => "context_list",
-        ResponsePayload::ContextSelected { .. } => "context_selected",
-        ResponsePayload::ContextClosed { .. } => "context_closed",
-        ResponsePayload::CurrentContext { .. } => "current_context",
         ResponsePayload::SessionKilled { .. } => "session_killed",
         ResponsePayload::PaneList { .. } => "pane_list",
         ResponsePayload::PaneSplit { .. } => "pane_split",
@@ -11931,395 +11797,11 @@ mod tests {
         assert!(restarted_summary.state_reason.is_none());
     }
 
-    #[tokio::test]
-    async fn create_context_sets_current_context_for_client() {
-        let server = BmuxServer::new(test_endpoint());
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let mut attributes = BTreeMap::new();
-        attributes.insert("core.kind".to_string(), "editor".to_string());
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CreateContext {
-                name: Some("alpha".to_string()),
-                attributes,
-            },
-        )
-        .await;
-        let context_id = match created {
-            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
-            response => panic!("expected context created response, got {response:?}"),
-        };
-
-        let current = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CurrentContext,
-        )
-        .await;
-        match current {
-            Response::Ok(ResponsePayload::CurrentContext {
-                context: Some(context),
-            }) => {
-                assert_eq!(context.id, context_id);
-                assert_eq!(context.name.as_deref(), Some("alpha"));
-            }
-            response => panic!("expected current context response, got {response:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn control_catalog_snapshot_includes_context_session_bindings() {
-        let server = BmuxServer::new(test_endpoint());
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CreateContext {
-                name: Some("alpha".to_string()),
-                attributes: BTreeMap::new(),
-            },
-        )
-        .await;
-        let created_context_id = match created {
-            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
-            response => panic!("expected context created response, got {response:?}"),
-        };
-
-        let snapshot_response = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::ControlCatalogSnapshot {
-                since_revision: None,
-            },
-        )
-        .await;
-
-        let snapshot = match snapshot_response {
-            Response::Ok(ResponsePayload::ControlCatalogSnapshot { snapshot }) => snapshot,
-            response => panic!("expected control catalog snapshot response, got {response:?}"),
-        };
-
-        assert!(
-            snapshot.revision >= 2,
-            "catalog revision should advance after context creation"
-        );
-        assert!(
-            snapshot
-                .contexts
-                .iter()
-                .any(|context| context.id == created_context_id),
-            "created context should be present in catalog snapshot"
-        );
-        assert!(
-            snapshot
-                .context_session_bindings
-                .iter()
-                .any(|binding| binding.context_id == created_context_id),
-            "created context should have a session binding in catalog snapshot"
-        );
-    }
-
-    #[tokio::test]
-    async fn poll_events_includes_control_catalog_changed() {
-        let server = BmuxServer::new(test_endpoint());
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let subscribed = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::SubscribeEvents,
-        )
-        .await;
-        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
-
-        let _ = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CreateContext {
-                name: Some("control-event".to_string()),
-                attributes: BTreeMap::new(),
-            },
-        )
-        .await;
-
-        let polled = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::PollEvents { max_events: 16 },
-        )
-        .await;
-        let events = match polled {
-            Response::Ok(ResponsePayload::EventBatch { events }) => events,
-            response => panic!("expected event batch response, got {response:?}"),
-        };
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, Event::ControlCatalogChanged { .. })),
-            "poll_events should include control catalog events"
-        );
-    }
-
-    #[tokio::test]
-    async fn new_session_creates_bound_context_for_client() {
-        let server = BmuxServer::new(test_endpoint());
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let session_name = "session-window".to_string();
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::NewSession {
-                name: Some(session_name.clone()),
-            },
-        )
-        .await;
-        let session_id = match created {
-            Response::Ok(ResponsePayload::SessionCreated {
-                id,
-                name: Some(name),
-            }) => {
-                assert_eq!(name, session_name);
-                id
-            }
-            response => panic!("expected session created response, got {response:?}"),
-        };
-
-        let current = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CurrentContext,
-        )
-        .await;
-
-        let context = match current {
-            Response::Ok(ResponsePayload::CurrentContext {
-                context: Some(context),
-            }) => context,
-            response => panic!("expected current context response, got {response:?}"),
-        };
-        assert_eq!(context.name.as_deref(), Some(session_name.as_str()));
-
-        let mapped_session = {
-            let context_state = server
-                .state
-                .context_state
-                .read()
-                .expect("context state lock should succeed");
-            context_state
-                .session_by_context
-                .get(&context.id)
-                .copied()
-                .expect("new session context should bind session")
-        };
-        assert_eq!(mapped_session.0, session_id);
-    }
-
-    #[tokio::test]
-    async fn attach_context_updates_selected_context_and_grant_context_id() {
-        let server = BmuxServer::new(test_endpoint());
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let first = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CreateContext {
-                name: Some("first".to_string()),
-                attributes: BTreeMap::new(),
-            },
-        )
-        .await;
-        let first_id = match first {
-            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
-            response => panic!("expected first context created response, got {response:?}"),
-        };
-
-        let second = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CreateContext {
-                name: Some("second".to_string()),
-                attributes: BTreeMap::new(),
-            },
-        )
-        .await;
-        let second_id = match second {
-            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
-            response => panic!("expected second context created response, got {response:?}"),
-        };
-
-        let attached = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::AttachContext {
-                selector: ContextSelector::ById(first_id),
-            },
-        )
-        .await;
-        match attached {
-            Response::Ok(ResponsePayload::Attached { grant }) => {
-                assert_eq!(grant.context_id, Some(first_id));
-            }
-            response => panic!("expected attached response, got {response:?}"),
-        }
-
-        let current = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CurrentContext,
-        )
-        .await;
-        match current {
-            Response::Ok(ResponsePayload::CurrentContext {
-                context: Some(context),
-            }) => assert_eq!(context.id, first_id),
-            response => panic!("expected current context response, got {response:?}"),
-        }
-
-        let _ = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CloseContext {
-                selector: ContextSelector::ById(first_id),
-                force: true,
-            },
-        )
-        .await;
-        let _ = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CloseContext {
-                selector: ContextSelector::ById(second_id),
-                force: true,
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn select_context_completes_without_deadlock() {
-        let server = BmuxServer::new(test_endpoint());
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CreateContext {
-                name: Some("alpha".to_string()),
-                attributes: BTreeMap::new(),
-            },
-        )
-        .await;
-        let context_id = match created {
-            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
-            response => panic!("expected context created response, got {response:?}"),
-        };
-
-        let selected = tokio::time::timeout(
-            Duration::from_secs(1),
-            execute_request(
-                &server,
-                client_id,
-                principal_id,
-                &mut selected_session,
-                &mut attached_stream_session,
-                Request::SelectContext {
-                    selector: ContextSelector::ById(context_id),
-                },
-            ),
-        )
-        .await
-        .expect("select context should not deadlock");
-
-        match selected {
-            Response::Ok(ResponsePayload::ContextSelected { context }) => {
-                assert_eq!(context.id, context_id);
-            }
-            response => panic!("expected context selected response, got {response:?}"),
-        }
-
-        let _ = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CloseContext {
-                selector: ContextSelector::ById(context_id),
-                force: true,
-            },
-        )
-        .await;
-    }
+    // Tests for deleted Request::{CreateContext, SelectContext,
+    // CloseContext, CurrentContext, AttachContext} handlers were
+    // removed along with the Request variants themselves. The
+    // contexts-plugin now owns context lifecycle; corresponding
+    // tests live in `plugins/contexts-plugin`.
 
     #[test]
     fn remove_contexts_for_session_clears_mapping_and_reselects_client() {
@@ -12359,105 +11841,6 @@ mod tests {
             context_state.current_session_for_client(client_id),
             Some(second_session_id)
         );
-    }
-
-    #[tokio::test]
-    async fn attach_context_prunes_stale_context_session_mapping() {
-        let server = BmuxServer::new(test_endpoint());
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CreateContext {
-                name: Some("stale".to_string()),
-                attributes: BTreeMap::new(),
-            },
-        )
-        .await;
-        let context_id = match created {
-            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
-            response => panic!("expected context created response, got {response:?}"),
-        };
-
-        let mapped_session_id = {
-            let context_state = server
-                .state
-                .context_state
-                .read()
-                .expect("context state lock should succeed");
-            context_state
-                .session_by_context
-                .get(&context_id)
-                .copied()
-                .expect("created context should have session mapping")
-        };
-
-        {
-            let mut manager = server
-                .state
-                .session_manager
-                .write()
-                .expect("session manager lock should succeed");
-            let _ = manager.remove_session(&mapped_session_id);
-        }
-
-        {
-            let mut runtimes = server
-                .state
-                .session_runtimes
-                .lock()
-                .expect("session runtime manager lock should succeed");
-            let _ = runtimes.remove_runtime(mapped_session_id);
-        }
-
-        let first_attach = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::AttachContext {
-                selector: ContextSelector::ById(context_id),
-            },
-        )
-        .await;
-        match first_attach {
-            Response::Err(error) => {
-                assert_eq!(error.code, ErrorCode::NotFound);
-                assert!(error.message.starts_with("session not found:"));
-            }
-            response @ Response::Ok(_) => {
-                panic!("expected attach context not found response, got {response:?}")
-            }
-        }
-
-        let second_attach = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::AttachContext {
-                selector: ContextSelector::ById(context_id),
-            },
-        )
-        .await;
-        match second_attach {
-            Response::Err(error) => {
-                assert_eq!(error.code, ErrorCode::NotFound);
-                assert_eq!(error.message, "context not found");
-            }
-            response @ Response::Ok(_) => {
-                panic!("expected attach context not found response, got {response:?}")
-            }
-        }
     }
 
     #[tokio::test]

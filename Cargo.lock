@@ -1149,8 +1149,8 @@ name = "bmux_cluster_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_config",
+ "bmux_ipc",
  "bmux_plugin",
- "bmux_plugin_domain_compat",
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
@@ -1205,6 +1205,7 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_session_models",
+ "bmux_sessions_plugin_api",
  "serde",
  "uuid",
 ]
@@ -1404,7 +1405,6 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_ipc",
  "bmux_plugin",
- "bmux_plugin_domain_compat",
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
@@ -1563,6 +1563,7 @@ dependencies = [
  "bmux_contexts_plugin",
  "bmux_image",
  "bmux_ipc",
+ "bmux_plugin",
  "bmux_session_models",
  "bmux_sessions_plugin",
  "bmux_terminal_protocol",
@@ -1631,9 +1632,9 @@ dependencies = [
 name = "bmux_windows_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_contexts_plugin_api",
  "bmux_ipc",
  "bmux_plugin",
- "bmux_plugin_domain_compat",
  "bmux_plugin_sdk",
  "bmux_windows_plugin_api",
  "serde",

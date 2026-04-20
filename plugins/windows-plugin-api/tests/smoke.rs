@@ -31,11 +31,14 @@ fn pane_status_variant_payload_serializes_case() {
 
 #[test]
 fn pane_event_variant_is_tagged() {
+    // External-tagged enums serialize to `{"variant_name": <payload>}`
+    // in JSON. Variant names use snake_case via
+    // `#[serde(rename_all = "snake_case")]`.
     let ev = PaneEvent::Focused {
         pane_id: uuid::Uuid::nil(),
     };
     let json = serde_json::to_string(&ev).expect("serialize");
-    assert!(json.contains("\"kind\":\"focused\""));
+    assert!(json.contains("\"focused\""));
 }
 
 #[test]

@@ -23,6 +23,7 @@ mod manifest;
 mod plugin_state;
 pub mod prompt;
 mod registry;
+pub mod test_support;
 mod typed_service_caller;
 
 pub use declaration::{

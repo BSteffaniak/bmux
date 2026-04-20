@@ -181,6 +181,12 @@ pub struct NativeCommandContext {
     /// Settings map for all plugins (keyed by plugin ID).
     #[serde(default, with = "toml_value_map")]
     pub plugin_settings_map: BTreeMap<String, toml::Value>,
+    /// Identifier of the client that issued this command (the
+    /// connected-client id, not a plugin id). `None` for
+    /// server-internal invocations where no specific client is
+    /// associated.
+    #[serde(default)]
+    pub caller_client_id: Option<uuid::Uuid>,
     /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,
@@ -221,6 +227,12 @@ pub struct NativeServiceContext {
     /// Settings map for all plugins (keyed by plugin ID).
     #[serde(default, with = "toml_value_map")]
     pub plugin_settings_map: BTreeMap<String, toml::Value>,
+    /// Identifier of the client that issued this service request (the
+    /// connected-client id, not a plugin id). `None` for
+    /// server-internal invocations where no specific client is
+    /// associated (e.g. CLI subcommands without an attached session).
+    #[serde(default)]
+    pub caller_client_id: Option<uuid::Uuid>,
     /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,

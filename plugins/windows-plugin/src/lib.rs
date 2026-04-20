@@ -2,9 +2,9 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod domain_ipc;
+
 use bmux_plugin::{HostRuntimeApi, TypedServiceCaller};
-use bmux_plugin_domain_compat::DomainCompat;
-use bmux_plugin_domain_compat::{ContextCloseRequest, ContextCreateRequest, ContextSelector};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     HostScope, StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext,
@@ -15,6 +15,8 @@ use bmux_windows_plugin_api::windows_commands::{
     WindowAck, WindowError, WindowsCommandsService,
 };
 use bmux_windows_plugin_api::windows_state::{self, PaneState, WindowEntry, WindowsStateService};
+use domain_ipc::DomainCompat;
+use domain_ipc::{ContextCloseRequest, ContextCreateRequest, ContextSelector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
@@ -73,9 +75,9 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("switch_failed", e))
             },
             "windows-commands", "focus-pane" => |req: FocusPaneArgs, ctx| {
-                let request = bmux_plugin_domain_compat::PaneFocusRequest {
+                let request = domain_ipc::PaneFocusRequest {
                     session: None,
-                    target: Some(bmux_plugin_domain_compat::PaneSelector::ById(req.id)),
+                    target: Some(domain_ipc::PaneSelector::ById(req.id)),
                     direction: None,
                 };
                 ctx.pane_focus(&request)
@@ -83,16 +85,16 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
             },
             "windows-commands", "close-pane" => |req: ClosePaneArgs, ctx| {
-                let request = bmux_plugin_domain_compat::PaneCloseRequest {
+                let request = domain_ipc::PaneCloseRequest {
                     session: None,
-                    target: Some(bmux_plugin_domain_compat::PaneSelector::ById(req.id)),
+                    target: Some(domain_ipc::PaneSelector::ById(req.id)),
                 };
                 ctx.pane_close(&request)
                     .map(|_| PaneAck { ok: true, pane_id: Some(req.id) })
                     .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
             },
             "windows-commands", "focus-pane-by-selector" => |req: FocusPaneBySelectorArgs, ctx| {
-                let request = bmux_plugin_domain_compat::PaneFocusRequest {
+                let request = domain_ipc::PaneFocusRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: Some(selector_to_pane(&req.target)),
                     direction: None,
@@ -102,7 +104,7 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
             },
             "windows-commands", "close-pane-by-selector" => |req: ClosePaneBySelectorArgs, ctx| {
-                let request = bmux_plugin_domain_compat::PaneCloseRequest {
+                let request = domain_ipc::PaneCloseRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: Some(selector_to_pane(&req.target)),
                 };
@@ -111,7 +113,7 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
             },
             "windows-commands", "close-active-pane" => |req: CloseActivePaneArgs, ctx| {
-                let request = bmux_plugin_domain_compat::PaneCloseRequest {
+                let request = domain_ipc::PaneCloseRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: None,
                 };
@@ -126,7 +128,7 @@ impl RustPlugin for WindowsPlugin {
                         "direction must be Next/Prev (Horizontal/Vertical aren't meaningful)",
                     ));
                 };
-                let request = bmux_plugin_domain_compat::PaneFocusRequest {
+                let request = domain_ipc::PaneFocusRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: None,
                     direction: Some(focus_dir),
@@ -136,7 +138,7 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
             },
             "windows-commands", "split-pane" => |req: SplitPaneArgs, ctx| {
-                let request = bmux_plugin_domain_compat::PaneSplitRequest {
+                let request = domain_ipc::PaneSplitRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: req.target.as_ref().map(selector_to_pane),
                     direction: pane_direction_to_split(req.direction),
@@ -146,12 +148,12 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("split_failed", e.to_string()))
             },
             "windows-commands", "launch-pane" => |req: LaunchPaneArgs, ctx| {
-                let request = bmux_plugin_domain_compat::PaneLaunchRequest {
+                let request = domain_ipc::PaneLaunchRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: req.target.as_ref().map(selector_to_pane),
                     direction: pane_direction_to_split(req.direction),
                     name: req.name,
-                    command: bmux_plugin_domain_compat::PaneLaunchCommand {
+                    command: domain_ipc::PaneLaunchCommand {
                         program: req.program,
                         args: req.args,
                         cwd: None,
@@ -163,7 +165,7 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("launch_failed", e.to_string()))
             },
             "windows-commands", "resize-pane" => |req: ResizePaneArgs, ctx| {
-                let request = bmux_plugin_domain_compat::PaneResizeRequest {
+                let request = domain_ipc::PaneResizeRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: req.target.as_ref().map(selector_to_pane),
                     delta: req.delta,
@@ -173,7 +175,7 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("resize_failed", e.to_string()))
             },
             "windows-commands", "zoom-pane" => |req: ZoomPaneArgs, ctx| {
-                let request = bmux_plugin_domain_compat::PaneZoomRequest {
+                let request = domain_ipc::PaneZoomRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                 };
                 ctx.pane_zoom(&request)
@@ -440,9 +442,7 @@ fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<W
     })
 }
 
-fn next_default_tab_name_for_contexts(
-    contexts: &[bmux_plugin_domain_compat::ContextSummary],
-) -> String {
+fn next_default_tab_name_for_contexts(contexts: &[domain_ipc::ContextSummary]) -> String {
     let mut next = 1_u32;
     loop {
         let candidate = format!("tab-{next}");
@@ -502,7 +502,7 @@ fn switch_window(
     let previous_context = resolve_effective_current_context_with_contexts(caller, &contexts)?;
     let context_id = resolve_context_id_from_contexts(&contexts, &selector)?;
     caller
-        .context_select(&bmux_plugin_domain_compat::ContextSelectRequest {
+        .context_select(&domain_ipc::ContextSelectRequest {
             selector: ContextSelector::ById(context_id),
         })
         .map_err(|error| error.to_string())?;
@@ -658,7 +658,7 @@ fn close_current_window(
 }
 
 fn resolve_context_id_from_contexts(
-    contexts: &[bmux_plugin_domain_compat::ContextSummary],
+    contexts: &[domain_ipc::ContextSummary],
     selector: &ContextSelector,
 ) -> Result<Uuid, String> {
     contexts
@@ -681,7 +681,7 @@ fn resolve_effective_current_context(caller: &impl HostRuntimeApi) -> Result<Opt
 
 fn resolve_effective_current_context_with_contexts(
     caller: &impl HostRuntimeApi,
-    contexts: &[bmux_plugin_domain_compat::ContextSummary],
+    contexts: &[domain_ipc::ContextSummary],
 ) -> Result<Option<Uuid>, String> {
     let current = caller
         .context_current()
@@ -730,8 +730,8 @@ fn set_stored_context_id(
 
 fn order_contexts_for_navigation(
     caller: &impl HostRuntimeApi,
-    contexts: Vec<bmux_plugin_domain_compat::ContextSummary>,
-) -> Result<Vec<bmux_plugin_domain_compat::ContextSummary>, String> {
+    contexts: Vec<domain_ipc::ContextSummary>,
+) -> Result<Vec<domain_ipc::ContextSummary>, String> {
     let order_ids = resolve_window_order_ids(caller, &contexts)?;
     let mut by_id = contexts
         .into_iter()
@@ -745,7 +745,7 @@ fn order_contexts_for_navigation(
 
 fn resolve_window_order_ids(
     caller: &impl HostRuntimeApi,
-    contexts: &[bmux_plugin_domain_compat::ContextSummary],
+    contexts: &[domain_ipc::ContextSummary],
 ) -> Result<Vec<Uuid>, String> {
     let mut order_ids = get_stored_window_order_ids(caller)?;
     let mut changed = false;
@@ -867,69 +867,63 @@ impl WindowsStateHandle {
     }
 }
 
-/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_domain_compat::SessionSelector`]
+/// Convert a typed [`Selector`] to the IPC [`domain_ipc::SessionSelector`]
 /// used by the byte-encoded host API. Prefers `id` when both are set.
-fn selector_to_session(selector: &Selector) -> Option<bmux_plugin_domain_compat::SessionSelector> {
+fn selector_to_session(selector: &Selector) -> Option<domain_ipc::SessionSelector> {
     if let Some(id) = selector.id {
-        return Some(bmux_plugin_domain_compat::SessionSelector::ById(id));
+        return Some(domain_ipc::SessionSelector::ById(id));
     }
     selector
         .name
         .as_ref()
-        .map(|name| bmux_plugin_domain_compat::SessionSelector::ByName(name.clone()))
+        .map(|name| domain_ipc::SessionSelector::ByName(name.clone()))
 }
 
-/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_domain_compat::PaneSelector`].
+/// Convert a typed [`Selector`] to the IPC [`domain_ipc::PaneSelector`].
 /// The BPDL selector has `id` / `name`; panes don't currently accept
 /// a name selector on the host side, so a bare `name` falls back to
 /// the active pane. Consumers that need index-based selection can
 /// extend the BPDL `selector` record later.
-/// Convert a typed [`Selector`] to the IPC [`bmux_plugin_domain_compat::PaneSelector`].
+/// Convert a typed [`Selector`] to the IPC [`domain_ipc::PaneSelector`].
 /// Precedence: `id` → `index` → `name` → active. Name-based pane
 /// selection has no direct IPC equivalent today, so a bare `name`
 /// falls back to the active pane.
 #[allow(clippy::option_if_let_else)] // Chained `if let` is clearer than nested `map_or` here.
-const fn selector_to_pane(selector: &Selector) -> bmux_plugin_domain_compat::PaneSelector {
+const fn selector_to_pane(selector: &Selector) -> domain_ipc::PaneSelector {
     if let Some(id) = selector.id {
-        bmux_plugin_domain_compat::PaneSelector::ById(id)
+        domain_ipc::PaneSelector::ById(id)
     } else if let Some(index) = selector.index {
-        bmux_plugin_domain_compat::PaneSelector::ByIndex(index)
+        domain_ipc::PaneSelector::ByIndex(index)
     } else {
-        bmux_plugin_domain_compat::PaneSelector::Active
+        domain_ipc::PaneSelector::Active
     }
 }
 
-const fn pane_direction_to_split(
-    direction: PaneDirection,
-) -> bmux_plugin_domain_compat::PaneSplitDirection {
+const fn pane_direction_to_split(direction: PaneDirection) -> domain_ipc::PaneSplitDirection {
     // The BPDL enum covers split *and* focus directions; only Horizontal
     // and Vertical are meaningful for splitting. Anything else folds to
     // Horizontal as the safest default — the trait's `split_pane` caller
     // is expected to pick Horizontal/Vertical explicitly.
     match direction {
-        PaneDirection::Vertical => bmux_plugin_domain_compat::PaneSplitDirection::Vertical,
+        PaneDirection::Vertical => domain_ipc::PaneSplitDirection::Vertical,
         PaneDirection::Horizontal
         | PaneDirection::Left
         | PaneDirection::Right
         | PaneDirection::Up
-        | PaneDirection::Down => bmux_plugin_domain_compat::PaneSplitDirection::Horizontal,
+        | PaneDirection::Down => domain_ipc::PaneSplitDirection::Horizontal,
     }
 }
 
 const fn pane_direction_to_focus(
     direction: PaneDirection,
-) -> Option<bmux_plugin_domain_compat::PaneFocusDirection> {
+) -> Option<domain_ipc::PaneFocusDirection> {
     match direction {
         // Only Next/Prev make sense at the IPC level today. The rest
         // map to "no direction hint" so the host focuses the targeted
         // pane explicitly.
         PaneDirection::Horizontal | PaneDirection::Vertical => None,
-        PaneDirection::Right | PaneDirection::Down => {
-            Some(bmux_plugin_domain_compat::PaneFocusDirection::Next)
-        }
-        PaneDirection::Left | PaneDirection::Up => {
-            Some(bmux_plugin_domain_compat::PaneFocusDirection::Prev)
-        }
+        PaneDirection::Right | PaneDirection::Down => Some(domain_ipc::PaneFocusDirection::Next),
+        PaneDirection::Left | PaneDirection::Up => Some(domain_ipc::PaneFocusDirection::Prev),
     }
 }
 
@@ -947,9 +941,9 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<(), FocusError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_domain_compat::PaneFocusRequest {
+            let request = domain_ipc::PaneFocusRequest {
                 session: None,
-                target: Some(bmux_plugin_domain_compat::PaneSelector::ById(id)),
+                target: Some(domain_ipc::PaneSelector::ById(id)),
                 direction: None,
             };
             caller
@@ -967,9 +961,9 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<(), CloseError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_domain_compat::PaneCloseRequest {
+            let request = domain_ipc::PaneCloseRequest {
                 session: None,
-                target: Some(bmux_plugin_domain_compat::PaneSelector::ById(id)),
+                target: Some(domain_ipc::PaneSelector::ById(id)),
             };
             caller
                 .pane_close(&request)
@@ -988,7 +982,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
             let pane_selector = selector_to_pane(&target);
-            let request = bmux_plugin_domain_compat::PaneFocusRequest {
+            let request = domain_ipc::PaneFocusRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: Some(pane_selector),
                 direction: None,
@@ -1011,7 +1005,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
             let pane_selector = selector_to_pane(&target);
-            let request = bmux_plugin_domain_compat::PaneCloseRequest {
+            let request = domain_ipc::PaneCloseRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: Some(pane_selector),
             };
@@ -1031,7 +1025,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_domain_compat::PaneCloseRequest {
+            let request = domain_ipc::PaneCloseRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: None,
             };
@@ -1058,7 +1052,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
                         .into(),
                 });
             };
-            let request = bmux_plugin_domain_compat::PaneFocusRequest {
+            let request = domain_ipc::PaneFocusRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: None,
                 direction: Some(focus_dir),
@@ -1082,7 +1076,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_domain_compat::PaneSplitRequest {
+            let request = domain_ipc::PaneSplitRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: target.as_ref().map(selector_to_pane),
                 direction: pane_direction_to_split(direction),
@@ -1108,12 +1102,12 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_domain_compat::PaneLaunchRequest {
+            let request = domain_ipc::PaneLaunchRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: target.as_ref().map(selector_to_pane),
                 direction: pane_direction_to_split(direction),
                 name,
-                command: bmux_plugin_domain_compat::PaneLaunchCommand {
+                command: domain_ipc::PaneLaunchCommand {
                     program,
                     args,
                     cwd: None,
@@ -1138,7 +1132,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_domain_compat::PaneResizeRequest {
+            let request = domain_ipc::PaneResizeRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: target.as_ref().map(selector_to_pane),
                 delta,
@@ -1159,7 +1153,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneZoomAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_domain_compat::PaneZoomRequest {
+            let request = domain_ipc::PaneZoomRequest {
                 session: session.as_ref().and_then(selector_to_session),
             };
             caller
@@ -1265,8 +1259,8 @@ impl WindowsStateService for WindowsStateHandle {
     ) -> Pin<Box<dyn Future<Output = Vec<PaneState>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = bmux_plugin_domain_compat::PaneListRequest {
-                session: Some(bmux_plugin_domain_compat::SessionSelector::ById(session)),
+            let request = domain_ipc::PaneListRequest {
+                session: Some(domain_ipc::SessionSelector::ById(session)),
             };
             let Ok(response) = caller.pane_list(&request) else {
                 return Vec::new();
@@ -1470,15 +1464,15 @@ fn interface_ids_match_bpdl_constants() {
 mod tests {
     use super::*;
     use bmux_plugin::ServiceCaller;
-    use bmux_plugin_domain_compat::{
-        ContextCloseRequest, ContextCreateRequest, ContextListResponse, ContextSelectRequest,
-        ContextSelectResponse, ContextSelector as SessionSelector,
-        ContextSummary as SessionSummary,
-    };
     use bmux_plugin_sdk::{
         ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, HostScope,
         NativeServiceContext, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
         decode_service_message, encode_service_message,
+    };
+    use domain_ipc::{
+        ContextCloseRequest, ContextCreateRequest, ContextListResponse, ContextSelectRequest,
+        ContextSelectResponse, ContextSelector as SessionSelector,
+        ContextSummary as SessionSummary,
     };
     use std::sync::Mutex;
 
@@ -1527,67 +1521,6 @@ mod tests {
                     }],
                 })
             }
-            bmux_ipc::Request::CreateContext {
-                name: Some(name), ..
-            } if name == "deny" => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
-                code: bmux_ipc::ErrorCode::InvalidRequest,
-                message: "session policy denied for this operation".to_string(),
-            }),
-            bmux_ipc::Request::CreateContext { name, attributes } => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextCreated {
-                    context: bmux_ipc::ContextSummary {
-                        id: Uuid::new_v4(),
-                        name,
-                        attributes,
-                    },
-                })
-            }
-            bmux_ipc::Request::ListContexts => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextList {
-                    contexts: vec![bmux_ipc::ContextSummary {
-                        id: Uuid::new_v4(),
-                        name: Some("alpha".to_string()),
-                        attributes: BTreeMap::new(),
-                    }],
-                })
-            }
-            bmux_ipc::Request::CloseContext { selector, .. } => {
-                if matches!(selector, bmux_ipc::ContextSelector::ByName(ref name) if name == "deny")
-                {
-                    bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
-                        code: bmux_ipc::ErrorCode::InvalidRequest,
-                        message: "session policy denied for this operation".to_string(),
-                    })
-                } else {
-                    let id = match selector {
-                        bmux_ipc::ContextSelector::ById(id) => id,
-                        bmux_ipc::ContextSelector::ByName(_) => Uuid::new_v4(),
-                    };
-                    bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextClosed { id })
-                }
-            }
-            bmux_ipc::Request::SelectContext { selector } => {
-                let id = match selector {
-                    bmux_ipc::ContextSelector::ById(id) => id,
-                    bmux_ipc::ContextSelector::ByName(_) => Uuid::new_v4(),
-                };
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextSelected {
-                    context: bmux_ipc::ContextSummary {
-                        id,
-                        name: Some("selected".to_string()),
-                        attributes: BTreeMap::new(),
-                    },
-                })
-            }
-            bmux_ipc::Request::CurrentContext => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::CurrentContext {
-                    context: Some(bmux_ipc::ContextSummary {
-                        id: Uuid::new_v4(),
-                        name: Some("current".to_string()),
-                        attributes: BTreeMap::new(),
-                    }),
-                })
-            }
             _ => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
                 code: bmux_ipc::ErrorCode::InvalidRequest,
                 message: "unsupported request in service bridge test".to_string(),
@@ -1613,6 +1546,137 @@ mod tests {
             *output_len = output.len();
         }
         0
+    }
+
+    /// Install a thread-local router that answers the typed cross-
+    /// plugin service calls windows-plugin makes through
+    /// `DomainCompat`'s context/session helpers. Tests that exercise
+    /// `invoke_service`-style service dispatch keep the returned
+    /// guard alive for the duration of the test.
+    ///
+    /// The router captures `deny_close`/`deny_create` flags the tests
+    /// use to simulate the contexts plugin rejecting a command.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::result_large_err,
+        clippy::items_after_statements,
+        clippy::redundant_clone
+    )]
+    fn install_context_test_router(
+        deny_create: bool,
+        deny_close: bool,
+    ) -> bmux_plugin::test_support::TestServiceRouterGuard {
+        use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
+        let router: TestServiceRouter = std::sync::Arc::new(
+            move |_caller_plugin,
+                  _caller_client,
+                  _capability,
+                  _kind,
+                  interface,
+                  operation,
+                  payload| {
+                match (interface, operation) {
+                    ("contexts-state", "list-contexts") => {
+                        let contexts: Vec<
+                            bmux_contexts_plugin_api::contexts_state::ContextSummary,
+                        > = vec![bmux_contexts_plugin_api::contexts_state::ContextSummary {
+                            id: Uuid::new_v4(),
+                            name: Some("alpha".to_string()),
+                            attributes: BTreeMap::new(),
+                        }];
+                        encode_service_message(&contexts)
+                    }
+                    ("contexts-state", "current-context") => {
+                        let context: Option<
+                            bmux_contexts_plugin_api::contexts_state::ContextSummary,
+                        > = Some(bmux_contexts_plugin_api::contexts_state::ContextSummary {
+                            id: Uuid::new_v4(),
+                            name: Some("current".to_string()),
+                            attributes: BTreeMap::new(),
+                        });
+                        encode_service_message(&context)
+                    }
+                    ("contexts-commands", "create-context") => {
+                        if deny_create {
+                            let err: Result<
+                                bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                                bmux_contexts_plugin_api::contexts_commands::CreateContextError,
+                            > = Err(
+                                bmux_contexts_plugin_api::contexts_commands::CreateContextError::Failed {
+                                    reason: "session policy denied for this operation".to_string(),
+                                },
+                            );
+                            return encode_service_message(&err);
+                        }
+                        #[derive(Deserialize)]
+                        struct Args {
+                            name: Option<String>,
+                            #[serde(default)]
+                            #[allow(dead_code)]
+                            attributes: BTreeMap<String, String>,
+                        }
+                        let request: Args = decode_service_message(&payload)?;
+                        let name_for_deny = request.name.as_deref();
+                        if name_for_deny == Some("deny") {
+                            let err: Result<
+                                bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                                bmux_contexts_plugin_api::contexts_commands::CreateContextError,
+                            > = Err(
+                                bmux_contexts_plugin_api::contexts_commands::CreateContextError::Failed {
+                                    reason: "session policy denied for this operation".to_string(),
+                                },
+                            );
+                            return encode_service_message(&err);
+                        }
+                        let ok: Result<
+                            bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                            bmux_contexts_plugin_api::contexts_commands::CreateContextError,
+                        > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
+                            id: Uuid::new_v4(),
+                        });
+                        encode_service_message(&ok)
+                    }
+                    ("contexts-commands", "close-context") => {
+                        if deny_close {
+                            let err: Result<
+                                bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                                bmux_contexts_plugin_api::contexts_commands::CloseContextError,
+                            > = Err(
+                                bmux_contexts_plugin_api::contexts_commands::CloseContextError::Failed {
+                                    reason: "session policy denied for this operation".to_string(),
+                                },
+                            );
+                            return encode_service_message(&err);
+                        }
+                        let ok: Result<
+                            bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                            bmux_contexts_plugin_api::contexts_commands::CloseContextError,
+                        > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
+                            id: Uuid::new_v4(),
+                        });
+                        encode_service_message(&ok)
+                    }
+                    ("contexts-commands", "select-context") => {
+                        let ok: Result<
+                            bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                            bmux_contexts_plugin_api::contexts_commands::SelectContextError,
+                        > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
+                            id: Uuid::new_v4(),
+                        });
+                        encode_service_message(&ok)
+                    }
+                    // Storage operations for tests.
+                    ("storage-query/v1", "get") => {
+                        encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value: None })
+                    }
+                    ("storage-command/v1", "set") => encode_service_message(&()),
+                    _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "windows_test_router",
+                    }),
+                }
+            },
+        );
+        install_test_service_router(router)
     }
 
     fn service_test_context(
@@ -1702,6 +1766,7 @@ mod tests {
             },
             settings: None,
             plugin_settings_map: std::collections::BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(HostKernelBridge::from_fn(service_test_kernel_bridge)),
         }
     }
@@ -1773,7 +1838,11 @@ mod tests {
     }
 
     impl ServiceCaller for MockHost {
-        #[allow(clippy::too_many_lines)]
+        #[allow(
+            clippy::too_many_lines,
+            clippy::items_after_statements,
+            clippy::redundant_clone
+        )]
         fn call_service_raw(
             &self,
             _capability: &str,
@@ -1783,6 +1852,214 @@ mod tests {
             payload: Vec<u8>,
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
             match (interface_id, operation) {
+                // Typed contexts-plugin-api interfaces (the canonical
+                // cross-plugin dispatch path used by DomainCompat after
+                // the `Request::*Context*` IPC variants were retired).
+                ("contexts-state", "list-contexts") => {
+                    let mru_ids = self
+                        .mru_context_ids
+                        .lock()
+                        .expect("mru context lock should succeed")
+                        .clone();
+                    let mut by_id = self
+                        .sessions
+                        .iter()
+                        .cloned()
+                        .map(|context| (context.id, context))
+                        .collect::<BTreeMap<_, _>>();
+                    let mut contexts = Vec::with_capacity(by_id.len());
+                    for context_id in mru_ids {
+                        if let Some(context) = by_id.remove(&context_id) {
+                            contexts.push(context);
+                        }
+                    }
+                    contexts.extend(by_id.into_values());
+                    let typed: Vec<bmux_contexts_plugin_api::contexts_state::ContextSummary> =
+                        contexts
+                            .into_iter()
+                            .map(
+                                |c| bmux_contexts_plugin_api::contexts_state::ContextSummary {
+                                    id: c.id,
+                                    name: c.name,
+                                    attributes: c.attributes,
+                                },
+                            )
+                            .collect();
+                    encode_service_message(&typed)
+                }
+                ("contexts-state", "current-context") => {
+                    let current_context_id = *self
+                        .selected_session_id
+                        .lock()
+                        .expect("selected context lock should succeed");
+                    let typed: Option<bmux_contexts_plugin_api::contexts_state::ContextSummary> =
+                        current_context_id
+                            .and_then(|id| {
+                                self.sessions.iter().find(|entry| entry.id == id).cloned()
+                            })
+                            .map(
+                                |c| bmux_contexts_plugin_api::contexts_state::ContextSummary {
+                                    id: c.id,
+                                    name: c.name,
+                                    attributes: c.attributes,
+                                },
+                            );
+                    encode_service_message(&typed)
+                }
+                ("contexts-commands", "create-context") => {
+                    if self.fail_create {
+                        let err: Result<
+                            bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                            bmux_contexts_plugin_api::contexts_commands::CreateContextError,
+                        > = Err(
+                            bmux_contexts_plugin_api::contexts_commands::CreateContextError::Failed {
+                                reason: "mock create failure".to_string(),
+                            },
+                        );
+                        return encode_service_message(&err);
+                    }
+                    #[derive(Deserialize)]
+                    struct Args {
+                        name: Option<String>,
+                        #[serde(default)]
+                        #[allow(dead_code)]
+                        attributes: BTreeMap<String, String>,
+                    }
+                    let request: Args = decode_service_message(&payload)?;
+                    self.creates
+                        .lock()
+                        .expect("create log lock should succeed")
+                        .push(request.name.clone());
+                    let ok: Result<
+                        bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                        bmux_contexts_plugin_api::contexts_commands::CreateContextError,
+                    > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
+                        id: Uuid::new_v4(),
+                    });
+                    encode_service_message(&ok)
+                }
+                ("contexts-commands", "close-context") => {
+                    if self.fail_kill {
+                        let err: Result<
+                            bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                            bmux_contexts_plugin_api::contexts_commands::CloseContextError,
+                        > = Err(
+                            bmux_contexts_plugin_api::contexts_commands::CloseContextError::Failed {
+                                reason: "mock kill failure".to_string(),
+                            },
+                        );
+                        return encode_service_message(&err);
+                    }
+                    #[derive(Deserialize)]
+                    struct SelectorPayload {
+                        id: Option<Uuid>,
+                        name: Option<String>,
+                    }
+                    #[derive(Deserialize)]
+                    struct Args {
+                        selector: SelectorPayload,
+                        #[serde(default)]
+                        force: bool,
+                    }
+                    let request: Args = decode_service_message(&payload)?;
+                    let resolved_id = request
+                        .selector
+                        .id
+                        .or_else(|| {
+                            request.selector.name.as_ref().and_then(|name| {
+                                self.sessions
+                                    .iter()
+                                    .find(|session| session.name.as_deref() == Some(name.as_str()))
+                                    .map(|session| session.id)
+                            })
+                        })
+                        .unwrap_or_else(Uuid::new_v4);
+                    self.kills
+                        .lock()
+                        .expect("kill log lock should succeed")
+                        .push(ContextCloseRequest {
+                            selector: request
+                                .selector
+                                .id
+                                .map(ContextSelector::ById)
+                                .or_else(|| {
+                                    request.selector.name.clone().map(ContextSelector::ByName)
+                                })
+                                .unwrap_or(ContextSelector::ById(resolved_id)),
+                            force: request.force,
+                        });
+                    let ok: Result<
+                        bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                        bmux_contexts_plugin_api::contexts_commands::CloseContextError,
+                    > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
+                        id: resolved_id,
+                    });
+                    encode_service_message(&ok)
+                }
+                ("contexts-commands", "select-context") => {
+                    if self.fail_kill {
+                        let err: Result<
+                            bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                            bmux_contexts_plugin_api::contexts_commands::SelectContextError,
+                        > = Err(
+                            bmux_contexts_plugin_api::contexts_commands::SelectContextError::Denied {
+                                reason: "mock select failure".to_string(),
+                            },
+                        );
+                        return encode_service_message(&err);
+                    }
+                    #[derive(Deserialize)]
+                    struct SelectorPayload {
+                        id: Option<Uuid>,
+                        name: Option<String>,
+                    }
+                    #[derive(Deserialize)]
+                    struct Args {
+                        selector: SelectorPayload,
+                    }
+                    let request: Args = decode_service_message(&payload)?;
+                    let selected = match (request.selector.id, request.selector.name.as_ref()) {
+                        (Some(id), _) => id,
+                        (None, Some(name)) => self
+                            .sessions
+                            .iter()
+                            .find(|session| session.name.as_deref() == Some(name.as_str()))
+                            .map(|session| session.id)
+                            .ok_or_else(|| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                                details: "mock select target not found".to_string(),
+                            })?,
+                        (None, None) => {
+                            return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                                details: "mock select missing selector".to_string(),
+                            });
+                        }
+                    };
+                    *self
+                        .selected_session_id
+                        .lock()
+                        .expect("selected session lock should succeed") = Some(selected);
+                    {
+                        let mut mru_context_ids = self
+                            .mru_context_ids
+                            .lock()
+                            .expect("mru context lock should succeed");
+                        mru_context_ids.retain(|id| *id != selected);
+                        mru_context_ids.insert(0, selected);
+                    }
+                    self.selects
+                        .lock()
+                        .expect("select log lock should succeed")
+                        .push(selected);
+                    let ok: Result<
+                        bmux_contexts_plugin_api::contexts_commands::ContextAck,
+                        bmux_contexts_plugin_api::contexts_commands::SelectContextError,
+                    > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
+                        id: selected,
+                    });
+                    encode_service_message(&ok)
+                }
+                // Legacy context-query/v1 + context-command/v1 retained
+                // for tests that still exercise those paths directly.
                 ("context-query/v1", "list") => {
                     let mru_ids = self
                         .mru_context_ids
@@ -1815,7 +2092,7 @@ mod tests {
                         .lock()
                         .expect("create log lock should succeed")
                         .push(request.name.clone());
-                    encode_service_message(&bmux_plugin_domain_compat::ContextCreateResponse {
+                    encode_service_message(&domain_ipc::ContextCreateResponse {
                         context: SessionSummary {
                             id: Uuid::new_v4(),
                             name: request.name,
@@ -1834,7 +2111,7 @@ mod tests {
                         .lock()
                         .expect("kill log lock should succeed")
                         .push(request.clone());
-                    encode_service_message(&bmux_plugin_domain_compat::ContextCloseResponse {
+                    encode_service_message(&domain_ipc::ContextCloseResponse {
                         id: match request.selector {
                             SessionSelector::ById(id) => id,
                             SessionSelector::ByName(_) => Uuid::new_v4(),
@@ -1890,9 +2167,7 @@ mod tests {
                         .expect("selected context lock should succeed");
                     let context = current_context_id
                         .and_then(|id| self.sessions.iter().find(|entry| entry.id == id).cloned());
-                    encode_service_message(&bmux_plugin_domain_compat::ContextCurrentResponse {
-                        context,
-                    })
+                    encode_service_message(&domain_ipc::ContextCurrentResponse { context })
                 }
                 ("client-query/v1", "current") => {
                     if self.fail_current_client {
@@ -1904,7 +2179,7 @@ mod tests {
                         .selected_session_id
                         .lock()
                         .expect("selected session lock should succeed");
-                    encode_service_message(&bmux_plugin_domain_compat::CurrentClientResponse {
+                    encode_service_message(&domain_ipc::CurrentClientResponse {
                         id: self.current_client_id,
                         selected_session_id,
                         following_client_id: None,
@@ -1945,124 +2220,6 @@ mod tests {
             // so tests can keep exercising the mock's existing
             // domain-specific handlers.
             match request {
-                bmux_ipc::Request::ListContexts => {
-                    let bytes = self.call_service_raw(
-                        "bmux.contexts.read",
-                        bmux_plugin_sdk::ServiceKind::Query,
-                        "context-query/v1",
-                        "list",
-                        Vec::new(),
-                    )?;
-                    let response: bmux_plugin_domain_compat::ContextListResponse =
-                        bmux_plugin_sdk::decode_service_message(&bytes)?;
-                    Ok(bmux_ipc::ResponsePayload::ContextList {
-                        contexts: response
-                            .contexts
-                            .into_iter()
-                            .map(|c| bmux_ipc::ContextSummary {
-                                id: c.id,
-                                name: c.name,
-                                attributes: c.attributes,
-                            })
-                            .collect(),
-                    })
-                }
-                bmux_ipc::Request::CurrentContext => {
-                    let bytes = self.call_service_raw(
-                        "bmux.contexts.read",
-                        bmux_plugin_sdk::ServiceKind::Query,
-                        "context-query/v1",
-                        "current",
-                        Vec::new(),
-                    )?;
-                    let response: bmux_plugin_domain_compat::ContextCurrentResponse =
-                        bmux_plugin_sdk::decode_service_message(&bytes)?;
-                    Ok(bmux_ipc::ResponsePayload::CurrentContext {
-                        context: response.context.map(|c| bmux_ipc::ContextSummary {
-                            id: c.id,
-                            name: c.name,
-                            attributes: c.attributes,
-                        }),
-                    })
-                }
-                bmux_ipc::Request::CreateContext { name, attributes } => {
-                    let payload = bmux_plugin_sdk::encode_service_message(
-                        &bmux_plugin_domain_compat::ContextCreateRequest { name, attributes },
-                    )?;
-                    let bytes = self.call_service_raw(
-                        "bmux.contexts.write",
-                        bmux_plugin_sdk::ServiceKind::Command,
-                        "context-command/v1",
-                        "create",
-                        payload,
-                    )?;
-                    let response: bmux_plugin_domain_compat::ContextCreateResponse =
-                        bmux_plugin_sdk::decode_service_message(&bytes)?;
-                    Ok(bmux_ipc::ResponsePayload::ContextCreated {
-                        context: bmux_ipc::ContextSummary {
-                            id: response.context.id,
-                            name: response.context.name,
-                            attributes: response.context.attributes,
-                        },
-                    })
-                }
-                bmux_ipc::Request::SelectContext { selector } => {
-                    let host_selector = match selector {
-                        bmux_ipc::ContextSelector::ById(id) => {
-                            bmux_plugin_domain_compat::ContextSelector::ById(id)
-                        }
-                        bmux_ipc::ContextSelector::ByName(name) => {
-                            bmux_plugin_domain_compat::ContextSelector::ByName(name)
-                        }
-                    };
-                    let payload = bmux_plugin_sdk::encode_service_message(
-                        &bmux_plugin_domain_compat::ContextSelectRequest {
-                            selector: host_selector,
-                        },
-                    )?;
-                    let bytes = self.call_service_raw(
-                        "bmux.contexts.write",
-                        bmux_plugin_sdk::ServiceKind::Command,
-                        "context-command/v1",
-                        "select",
-                        payload,
-                    )?;
-                    let response: bmux_plugin_domain_compat::ContextSelectResponse =
-                        bmux_plugin_sdk::decode_service_message(&bytes)?;
-                    Ok(bmux_ipc::ResponsePayload::ContextSelected {
-                        context: bmux_ipc::ContextSummary {
-                            id: response.context.id,
-                            name: response.context.name,
-                            attributes: response.context.attributes,
-                        },
-                    })
-                }
-                bmux_ipc::Request::CloseContext { selector, force } => {
-                    let host_selector = match selector {
-                        bmux_ipc::ContextSelector::ById(id) => {
-                            bmux_plugin_domain_compat::ContextSelector::ById(id)
-                        }
-                        bmux_ipc::ContextSelector::ByName(name) => {
-                            bmux_plugin_domain_compat::ContextSelector::ByName(name)
-                        }
-                    };
-                    let payload = bmux_plugin_sdk::encode_service_message(
-                        &bmux_plugin_domain_compat::ContextCloseRequest {
-                            selector: host_selector,
-                            force,
-                        },
-                    )?;
-                    let bytes = self.call_service_raw(
-                        "bmux.contexts.write",
-                        bmux_plugin_sdk::ServiceKind::Command,
-                        "context-command/v1",
-                        "close",
-                        payload,
-                    )?;
-                    let response: bmux_plugin_domain_compat::ContextCloseResponse =
-                        bmux_plugin_sdk::decode_service_message(&bytes)?;
-                    Ok(bmux_ipc::ResponsePayload::ContextClosed { id: response.id })
-                }
                 bmux_ipc::Request::WhoAmI => Ok(bmux_ipc::ResponsePayload::ClientIdentity {
                     id: self.current_client_id,
                 }),
@@ -2074,7 +2231,7 @@ mod tests {
                         "current",
                         Vec::new(),
                     )?;
-                    let response: bmux_plugin_domain_compat::CurrentClientResponse =
+                    let response: domain_ipc::CurrentClientResponse =
                         bmux_plugin_sdk::decode_service_message(&bytes)?;
                     Ok(bmux_ipc::ResponsePayload::ClientList {
                         clients: vec![bmux_ipc::ClientSummary {
@@ -2501,7 +2658,7 @@ mod tests {
         let host = MockHost::with_failures(true, false, false);
         let error = create_window(&host, Some("dev".to_string()))
             .expect_err("create should surface host failure");
-        assert!(error.contains("mock create failure"));
+        assert!(error.contains("mock create failure"), "error was: {error}");
     }
 
     #[test]
@@ -2534,11 +2691,12 @@ mod tests {
             &last_selected_by_client,
         )
         .expect_err("switch should fail when select fails");
-        assert!(error.contains("mock select failure"));
+        assert!(error.contains("mock select failure"), "error was: {error}");
     }
 
     #[test]
     fn invoke_service_new_returns_ack_with_id() {
+        let _router = install_context_test_router(false, false);
         let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
             "windows-commands",
@@ -2564,6 +2722,7 @@ mod tests {
 
     #[test]
     fn invoke_service_new_surfaces_denied_error() {
+        let _router = install_context_test_router(false, false);
         let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
             "windows-commands",
@@ -2584,6 +2743,7 @@ mod tests {
 
     #[test]
     fn invoke_service_switch_returns_ack_with_selected_id() {
+        let _router = install_context_test_router(false, false);
         let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
             "windows-commands",
@@ -2625,6 +2785,7 @@ mod tests {
 
     #[test]
     fn invoke_service_kill_surfaces_denied_error() {
+        let _router = install_context_test_router(false, true);
         let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
             "windows-commands",

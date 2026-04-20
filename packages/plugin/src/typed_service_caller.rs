@@ -79,6 +79,7 @@ impl ServiceCaller for TypedServiceCaller {
     ) -> Result<Vec<u8>> {
         call_service_raw(
             &self.plugin_id,
+            None,
             &self.required_capabilities,
             &self.provided_capabilities,
             &self.services,

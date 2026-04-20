@@ -490,20 +490,6 @@ pub enum Request {
     },
     ListSessions,
     ListClients,
-    CreateContext {
-        name: Option<String>,
-        #[serde(default)]
-        attributes: BTreeMap<String, String>,
-    },
-    ListContexts,
-    SelectContext {
-        selector: ContextSelector,
-    },
-    CloseContext {
-        selector: ContextSelector,
-        force: bool,
-    },
-    CurrentContext,
     KillSession {
         selector: SessionSelector,
         force_local: bool,
@@ -1202,21 +1188,6 @@ pub enum ResponsePayload {
     },
     ClientList {
         clients: Vec<ClientSummary>,
-    },
-    ContextCreated {
-        context: ContextSummary,
-    },
-    ContextList {
-        contexts: Vec<ContextSummary>,
-    },
-    ContextSelected {
-        context: ContextSummary,
-    },
-    ContextClosed {
-        id: Uuid,
-    },
-    CurrentContext {
-        context: Option<ContextSummary>,
     },
     SessionKilled {
         id: Uuid,
@@ -2004,30 +1975,6 @@ mod tests {
             Request::NewSession { name: None },
             Request::ListSessions,
             Request::ListClients,
-            Request::CreateContext {
-                name: Some("ctx".into()),
-                attributes: {
-                    let mut m = BTreeMap::new();
-                    m.insert("key".into(), "val".into());
-                    m
-                },
-            },
-            Request::CreateContext {
-                name: None,
-                attributes: BTreeMap::new(),
-            },
-            Request::ListContexts,
-            Request::SelectContext {
-                selector: ContextSelector::ById(id),
-            },
-            Request::SelectContext {
-                selector: ContextSelector::ByName("ctx-name".into()),
-            },
-            Request::CloseContext {
-                selector: ContextSelector::ById(id),
-                force: true,
-            },
-            Request::CurrentContext,
             Request::KillSession {
                 selector: SessionSelector::ById(id),
                 force_local: true,
@@ -2444,40 +2391,6 @@ mod tests {
                     following_global: false,
                 }],
             },
-            ResponsePayload::ContextCreated {
-                context: ContextSummary {
-                    id,
-                    name: Some("default".into()),
-                    attributes: {
-                        let mut m = BTreeMap::new();
-                        m.insert("key".into(), "val".into());
-                        m
-                    },
-                },
-            },
-            ResponsePayload::ContextList {
-                contexts: vec![ContextSummary {
-                    id,
-                    name: None,
-                    attributes: BTreeMap::new(),
-                }],
-            },
-            ResponsePayload::ContextSelected {
-                context: ContextSummary {
-                    id,
-                    name: None,
-                    attributes: BTreeMap::new(),
-                },
-            },
-            ResponsePayload::ContextClosed { id },
-            ResponsePayload::CurrentContext {
-                context: Some(ContextSummary {
-                    id,
-                    name: None,
-                    attributes: BTreeMap::new(),
-                }),
-            },
-            ResponsePayload::CurrentContext { context: None },
             ResponsePayload::SessionKilled { id },
             ResponsePayload::PaneSplit {
                 id: pane_id,

@@ -2,13 +2,152 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::HostRuntimeApi;
-use bmux_plugin_domain_compat::{DomainCompat, SessionSelector};
+use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{StorageGetRequest, StorageSetRequest};
+use bmux_plugin_sdk::{ServiceKind, StorageGetRequest, StorageSetRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
+
+// ── Domain IPC helpers ───────────────────────────────────────────────
+//
+// permissions-plugin is a non-foundational plugin; it consumes domain
+// data (sessions, contexts, clients) through the typed plugin-api
+// dispatch surface. These local wrappers encapsulate the
+// `call_service` / `execute_kernel_request` plumbing so individual
+// permission logic sites call a one-line helper instead of repeating
+// the service lookup.
+
+/// Selector for session-id resolution by either uuid or name.
+#[derive(Debug, Clone)]
+enum SessionSelector {
+    ById(Uuid),
+    ByName(String),
+}
+
+/// Selector for context-id resolution by either uuid or name.
+#[derive(Debug, Clone)]
+enum ContextSelector {
+    ById(Uuid),
+    ByName(String),
+}
+
+/// Minimal session-summary view — only the fields the permissions
+/// plugin examines, plus the legacy fields the test mock constructs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionSummary {
+    id: Uuid,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    client_count: usize,
+}
+
+/// Minimal context-summary view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextSummary {
+    id: Uuid,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    attributes: BTreeMap<String, String>,
+}
+
+/// Legacy `session-query/v1` response envelope (used by test fixtures).
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionListResponse {
+    sessions: Vec<SessionSummary>,
+}
+
+/// Legacy `context-query/v1` response envelope (used by test fixtures).
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextListResponse {
+    contexts: Vec<ContextSummary>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CurrentClientResponse {
+    id: Uuid,
+    #[serde(default)]
+    selected_session_id: Option<Uuid>,
+    #[serde(default)]
+    following_client_id: Option<Uuid>,
+    #[serde(default)]
+    following_global: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextCurrentResponse {
+    context: Option<ContextSummary>,
+}
+
+/// Current-client view reduced to the fields permissions-plugin uses.
+#[derive(Debug, Clone, Copy)]
+struct CurrentClientSnapshot {
+    selected_session_id: Option<Uuid>,
+}
+
+fn list_sessions(caller: &impl ServiceCaller) -> Result<Vec<SessionSummary>, String> {
+    match caller.execute_kernel_request(bmux_ipc::Request::ListSessions) {
+        Ok(bmux_ipc::ResponsePayload::SessionList { sessions }) => Ok(sessions
+            .into_iter()
+            .map(|s| SessionSummary {
+                id: s.id,
+                name: s.name,
+                client_count: s.client_count,
+            })
+            .collect()),
+        Ok(_) => Err("unexpected response for list-sessions".to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn list_contexts(caller: &impl ServiceCaller) -> Result<Vec<ContextSummary>, String> {
+    caller
+        .call_service::<(), Vec<ContextSummary>>(
+            "bmux.contexts.read",
+            ServiceKind::Query,
+            "contexts-state",
+            "list-contexts",
+            &(),
+        )
+        .map_err(|err| err.to_string())
+}
+
+fn current_context_id(caller: &impl ServiceCaller) -> Result<Option<Uuid>, String> {
+    let response: Option<ContextSummary> = caller
+        .call_service(
+            "bmux.contexts.read",
+            ServiceKind::Query,
+            "contexts-state",
+            "current-context",
+            &(),
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(response.map(|c| c.id))
+}
+
+fn current_client_snapshot(caller: &impl ServiceCaller) -> Result<CurrentClientSnapshot, String> {
+    let Ok(bmux_ipc::ResponsePayload::ClientIdentity { id: client_id }) =
+        caller.execute_kernel_request(bmux_ipc::Request::WhoAmI)
+    else {
+        return Err("no current client".to_string());
+    };
+    let bmux_ipc::ResponsePayload::ClientList { clients } = caller
+        .execute_kernel_request(bmux_ipc::Request::ListClients)
+        .map_err(|err| err.to_string())?
+    else {
+        return Err("unexpected response for list-clients".to_string());
+    };
+    let current = clients.into_iter().find(|c| c.id == client_id);
+    Ok(CurrentClientSnapshot {
+        selected_session_id: current.and_then(|c| c.selected_session_id),
+    })
+}
 
 #[derive(Default)]
 pub struct PermissionsPlugin;
@@ -216,14 +355,9 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
     }
 }
 
-fn resolve_current_session(
-    caller: &(impl HostRuntimeApi + DomainCompat),
-) -> Result<String, String> {
-    let current_client = caller.current_client().map_err(|error| error.to_string())?;
-    let sessions = caller
-        .session_list()
-        .map_err(|error| error.to_string())?
-        .sessions;
+fn resolve_current_session(caller: &impl HostRuntimeApi) -> Result<String, String> {
+    let current_client = current_client_snapshot(caller)?;
+    let sessions = list_sessions(caller)?;
     let preferred = current_client.selected_session_id.and_then(|selected_id| {
         sessions
             .iter()
@@ -254,7 +388,7 @@ impl StoredPermissions {
 const PERMISSIONS_STORAGE_KEY: &str = "permissions-v1";
 
 fn list_entries(
-    caller: &(impl HostRuntimeApi + DomainCompat),
+    caller: &impl HostRuntimeApi,
     session: &str,
 ) -> Result<Vec<PermissionEntry>, String> {
     let session_id = resolve_session_id(caller, session)?;
@@ -266,10 +400,7 @@ fn list_entries(
         .unwrap_or_default())
 }
 
-fn grant_entry(
-    caller: &(impl HostRuntimeApi + DomainCompat),
-    request: GrantRequest,
-) -> Result<(), String> {
+fn grant_entry(caller: &impl HostRuntimeApi, request: GrantRequest) -> Result<(), String> {
     validate_role(&request.role)?;
     let session_id = resolve_session_id(caller, &request.session)?;
     let mut state = load_state(caller)?;
@@ -288,10 +419,7 @@ fn grant_entry(
     save_state(caller, &state)
 }
 
-fn revoke_entry(
-    caller: &(impl HostRuntimeApi + DomainCompat),
-    request: &RevokeRequest,
-) -> Result<(), String> {
+fn revoke_entry(caller: &impl HostRuntimeApi, request: &RevokeRequest) -> Result<(), String> {
     let session_id = resolve_session_id(caller, &request.session)?;
     let mut state = load_state(caller)?;
     if let Some(entries) = state.by_session_id.get_mut(&session_id) {
@@ -301,7 +429,7 @@ fn revoke_entry(
 }
 
 fn evaluate_policy(
-    caller: &(impl HostRuntimeApi + DomainCompat),
+    caller: &impl HostRuntimeApi,
     request: &SessionPolicyCheckRequest,
 ) -> Result<SessionPolicyCheckResponse, String> {
     if request.action == "hot_path_execution" {
@@ -330,7 +458,7 @@ fn evaluate_policy(
 }
 
 fn evaluate_hot_path_execution_policy(
-    caller: &(impl HostRuntimeApi + DomainCompat),
+    caller: &impl HostRuntimeApi,
     request: &SessionPolicyCheckRequest,
 ) -> Result<SessionPolicyCheckResponse, String> {
     let Some(execution_class) = request.execution_class.as_deref() else {
@@ -383,7 +511,7 @@ fn evaluate_hot_path_execution_policy(
 }
 
 fn list_hot_path_overrides(
-    caller: &(impl HostRuntimeApi + DomainCompat),
+    caller: &impl HostRuntimeApi,
     request: ListHotPathOverridesRequest,
 ) -> Result<ListHotPathOverridesResponse, String> {
     let session_id = match request.session {
@@ -406,7 +534,7 @@ fn list_hot_path_overrides(
 }
 
 fn grant_hot_path_override(
-    caller: &(impl HostRuntimeApi + DomainCompat),
+    caller: &impl HostRuntimeApi,
     request: GrantHotPathOverrideRequest,
 ) -> Result<(), String> {
     validate_hot_path_override_fields(
@@ -441,7 +569,7 @@ fn grant_hot_path_override(
 }
 
 fn revoke_hot_path_override(
-    caller: &(impl HostRuntimeApi + DomainCompat),
+    caller: &impl HostRuntimeApi,
     request: &RevokeHotPathOverrideRequest,
 ) -> Result<(), String> {
     validate_hot_path_override_fields(
@@ -521,7 +649,7 @@ fn validate_hot_path_override_fields(
 }
 
 fn resolve_override_scope(
-    caller: &(impl HostRuntimeApi + DomainCompat),
+    caller: &impl HostRuntimeApi,
     scope: &str,
     session: Option<&str>,
     context: Option<&str>,
@@ -553,7 +681,7 @@ fn resolve_override_scope(
 }
 
 fn inspect_hot_path_decision(
-    caller: &(impl HostRuntimeApi + DomainCompat),
+    caller: &impl HostRuntimeApi,
     request: &CheckHotPathDecisionRequest,
 ) -> Result<CheckHotPathDecisionResponse, String> {
     if request.plugin_id.trim().is_empty() {
@@ -588,11 +716,7 @@ fn inspect_hot_path_decision(
     let session_id = resolve_session_id(caller, &session_name)?;
     let context_id = match request.context.as_deref() {
         Some(context) => Some(resolve_context_id(caller, context)?),
-        None => caller
-            .context_current()
-            .map_err(|error| error.to_string())?
-            .context
-            .map(|entry| entry.id),
+        None => current_context_id(caller)?,
     };
 
     let state = load_state(caller)?;
@@ -628,7 +752,7 @@ fn inspect_hot_path_decision(
 }
 
 fn watch_hot_path_policy_decision(
-    caller: &(impl HostRuntimeApi + DomainCompat),
+    caller: &impl HostRuntimeApi,
     request: &CheckHotPathDecisionRequest,
     as_json: bool,
     compact: bool,
@@ -821,7 +945,7 @@ fn classify_action(action: &str) -> PolicyActionKind {
     }
 }
 
-fn load_state(caller: &(impl HostRuntimeApi + DomainCompat)) -> Result<StoredPermissions, String> {
+fn load_state(caller: &impl HostRuntimeApi) -> Result<StoredPermissions, String> {
     let response = caller
         .storage_get(&StorageGetRequest {
             key: PERMISSIONS_STORAGE_KEY.to_string(),
@@ -833,10 +957,7 @@ fn load_state(caller: &(impl HostRuntimeApi + DomainCompat)) -> Result<StoredPer
     )
 }
 
-fn save_state(
-    caller: &(impl HostRuntimeApi + DomainCompat),
-    state: &StoredPermissions,
-) -> Result<(), String> {
+fn save_state(caller: &impl HostRuntimeApi, state: &StoredPermissions) -> Result<(), String> {
     let value = encode_service_message(state).map_err(|error| error.to_string())?;
     caller
         .storage_set(&StorageSetRequest {
@@ -847,10 +968,7 @@ fn save_state(
     Ok(())
 }
 
-fn resolve_session_id(
-    caller: &(impl HostRuntimeApi + DomainCompat),
-    session: &str,
-) -> Result<Uuid, String> {
+fn resolve_session_id(caller: &impl HostRuntimeApi, session: &str) -> Result<Uuid, String> {
     let selector = if let Ok(id) = Uuid::parse_str(session) {
         SessionSelector::ById(id)
     } else if session.trim().is_empty() {
@@ -858,10 +976,7 @@ fn resolve_session_id(
     } else {
         SessionSelector::ByName(session.to_string())
     };
-    let sessions = caller
-        .session_list()
-        .map_err(|error| error.to_string())?
-        .sessions;
+    let sessions = list_sessions(caller)?;
     sessions
         .into_iter()
         .find(|entry| match &selector {
@@ -872,28 +987,20 @@ fn resolve_session_id(
         .ok_or_else(|| format!("session '{session}' not found"))
 }
 
-fn resolve_context_id(
-    caller: &(impl HostRuntimeApi + DomainCompat),
-    context: &str,
-) -> Result<Uuid, String> {
+fn resolve_context_id(caller: &impl HostRuntimeApi, context: &str) -> Result<Uuid, String> {
     let selector = if let Ok(id) = Uuid::parse_str(context) {
-        bmux_plugin_domain_compat::ContextSelector::ById(id)
+        ContextSelector::ById(id)
     } else if context.trim().is_empty() {
         return Err("context must not be empty".to_string());
     } else {
-        bmux_plugin_domain_compat::ContextSelector::ByName(context.to_string())
+        ContextSelector::ByName(context.to_string())
     };
-    let contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
+    let contexts = list_contexts(caller)?;
     contexts
         .into_iter()
         .find(|entry| match &selector {
-            bmux_plugin_domain_compat::ContextSelector::ById(id) => entry.id == *id,
-            bmux_plugin_domain_compat::ContextSelector::ByName(name) => {
-                entry.name.as_deref() == Some(name.as_str())
-            }
+            ContextSelector::ById(id) => entry.id == *id,
+            ContextSelector::ByName(name) => entry.name.as_deref() == Some(name.as_str()),
         })
         .map(|entry| entry.id)
         .ok_or_else(|| format!("context '{context}' not found"))
@@ -1060,9 +1167,6 @@ bmux_plugin_sdk::export_plugin!(PermissionsPlugin, include_str!("../plugin.toml"
 mod tests {
     use super::*;
     use bmux_plugin::ServiceCaller;
-    use bmux_plugin_domain_compat::{
-        ContextListResponse, ContextSummary, SessionListResponse, SessionSummary,
-    };
     use bmux_plugin_sdk::{
         ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, HostScope,
         NativeServiceContext, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
@@ -1138,14 +1242,12 @@ mod tests {
                 ("session-query/v1", "list") => encode_service_message(&SessionListResponse {
                     sessions: self.sessions.clone(),
                 }),
-                ("client-query/v1", "current") => {
-                    encode_service_message(&bmux_plugin_domain_compat::CurrentClientResponse {
-                        id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
-                        selected_session_id: self.selected_session_id,
-                        following_client_id: None,
-                        following_global: false,
-                    })
-                }
+                ("client-query/v1", "current") => encode_service_message(&CurrentClientResponse {
+                    id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                    selected_session_id: self.selected_session_id,
+                    following_client_id: None,
+                    following_global: false,
+                }),
                 ("storage-query/v1", "get") => {
                     let request: StorageGetRequest = decode_service_message(&payload)?;
                     let value = self
@@ -1168,9 +1270,16 @@ mod tests {
                     contexts: self.contexts.clone(),
                 }),
                 ("context-query/v1", "current") => {
-                    encode_service_message(&bmux_plugin_domain_compat::ContextCurrentResponse {
+                    encode_service_message(&ContextCurrentResponse {
                         context: self.contexts.first().cloned(),
                     })
+                }
+                // Typed contexts-state surface used by DomainCompat's
+                // rewritten context_list / context_current implementations.
+                ("contexts-state", "list-contexts") => encode_service_message(&self.contexts),
+                ("contexts-state", "current-context") => {
+                    let current = self.contexts.first().cloned();
+                    encode_service_message(&current)
                 }
                 _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",
@@ -1206,26 +1315,6 @@ mod tests {
                         following_global: false,
                     }],
                 }),
-                bmux_ipc::Request::ListContexts => Ok(bmux_ipc::ResponsePayload::ContextList {
-                    contexts: self
-                        .contexts
-                        .iter()
-                        .map(|c| bmux_ipc::ContextSummary {
-                            id: c.id,
-                            name: c.name.clone(),
-                            attributes: c.attributes.clone(),
-                        })
-                        .collect(),
-                }),
-                bmux_ipc::Request::CurrentContext => {
-                    Ok(bmux_ipc::ResponsePayload::CurrentContext {
-                        context: self.contexts.first().map(|c| bmux_ipc::ContextSummary {
-                            id: c.id,
-                            name: c.name.clone(),
-                            attributes: c.attributes.clone(),
-                        }),
-                    })
-                }
                 _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                     operation: "mock_execute_kernel_request",
                 }),
@@ -1398,6 +1487,7 @@ mod tests {
             },
             settings: None,
             plugin_settings_map: std::collections::BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(HostKernelBridge::from_fn(service_test_kernel_bridge)),
         }
     }

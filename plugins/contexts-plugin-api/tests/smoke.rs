@@ -67,7 +67,7 @@ fn context_event_variants_are_tagged() {
         name: Some("work".to_string()),
     };
     let json = serde_json::to_string(&ev).expect("serialize");
-    assert!(json.contains("\"kind\":\"created\""));
+    assert!(json.contains("\"created\""));
 }
 
 #[test]

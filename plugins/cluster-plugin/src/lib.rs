@@ -2,16 +2,18 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod domain_ipc;
+
 use bmux_config::BmuxConfig;
 use bmux_plugin::HostRuntimeApi;
 use bmux_plugin::prompt;
-use bmux_plugin_domain_compat::{
-    DomainCompat, PaneCloseRequest, PaneLaunchCommand, PaneLaunchRequest, PaneListRequest,
-    PaneSelector, PaneSplitDirection, SessionCreateRequest, SessionSelectRequest, SessionSelector,
-};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, NativeCommandContext, StorageGetRequest, StorageSetRequest,
+};
+use domain_ipc::{
+    DomainCompat, PaneCloseRequest, PaneLaunchCommand, PaneLaunchRequest, PaneListRequest,
+    PaneSelector, PaneSplitDirection, SessionCreateRequest, SessionSelectRequest, SessionSelector,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,27 +29,24 @@ trait ClusterRuntimeOps {
         &self,
         request: &CoreCliCommandRequest,
     ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String>;
-    fn session_list(&self) -> Result<bmux_plugin_domain_compat::SessionListResponse, String>;
+    fn session_list(&self) -> Result<domain_ipc::SessionListResponse, String>;
     fn session_create(
         &self,
         request: &SessionCreateRequest,
-    ) -> Result<bmux_plugin_domain_compat::SessionCreateResponse, String>;
+    ) -> Result<domain_ipc::SessionCreateResponse, String>;
     fn session_select(
         &self,
         request: &SessionSelectRequest,
-    ) -> Result<bmux_plugin_domain_compat::SessionSelectResponse, String>;
-    fn pane_list(
-        &self,
-        request: &PaneListRequest,
-    ) -> Result<bmux_plugin_domain_compat::PaneListResponse, String>;
+    ) -> Result<domain_ipc::SessionSelectResponse, String>;
+    fn pane_list(&self, request: &PaneListRequest) -> Result<domain_ipc::PaneListResponse, String>;
     fn pane_launch(
         &self,
         request: &PaneLaunchRequest,
-    ) -> Result<bmux_plugin_domain_compat::PaneLaunchResponse, String>;
+    ) -> Result<domain_ipc::PaneLaunchResponse, String>;
     fn pane_close(
         &self,
         request: &PaneCloseRequest,
-    ) -> Result<bmux_plugin_domain_compat::PaneCloseResponse, String>;
+    ) -> Result<domain_ipc::PaneCloseResponse, String>;
     fn storage_get(
         &self,
         request: &StorageGetRequest,
@@ -63,42 +62,39 @@ impl<T: HostRuntimeApi + DomainCompat + ?Sized> ClusterRuntimeOps for T {
         HostRuntimeApi::core_cli_command_run_path(self, request).map_err(|error| error.to_string())
     }
 
-    fn session_list(&self) -> Result<bmux_plugin_domain_compat::SessionListResponse, String> {
+    fn session_list(&self) -> Result<domain_ipc::SessionListResponse, String> {
         DomainCompat::session_list(self).map_err(|error| error.to_string())
     }
 
     fn session_create(
         &self,
         request: &SessionCreateRequest,
-    ) -> Result<bmux_plugin_domain_compat::SessionCreateResponse, String> {
+    ) -> Result<domain_ipc::SessionCreateResponse, String> {
         DomainCompat::session_create(self, request).map_err(|error| error.to_string())
     }
 
     fn session_select(
         &self,
         request: &SessionSelectRequest,
-    ) -> Result<bmux_plugin_domain_compat::SessionSelectResponse, String> {
+    ) -> Result<domain_ipc::SessionSelectResponse, String> {
         DomainCompat::session_select(self, request).map_err(|error| error.to_string())
     }
 
-    fn pane_list(
-        &self,
-        request: &PaneListRequest,
-    ) -> Result<bmux_plugin_domain_compat::PaneListResponse, String> {
+    fn pane_list(&self, request: &PaneListRequest) -> Result<domain_ipc::PaneListResponse, String> {
         DomainCompat::pane_list(self, request).map_err(|error| error.to_string())
     }
 
     fn pane_launch(
         &self,
         request: &PaneLaunchRequest,
-    ) -> Result<bmux_plugin_domain_compat::PaneLaunchResponse, String> {
+    ) -> Result<domain_ipc::PaneLaunchResponse, String> {
         DomainCompat::pane_launch(self, request).map_err(|error| error.to_string())
     }
 
     fn pane_close(
         &self,
         request: &PaneCloseRequest,
-    ) -> Result<bmux_plugin_domain_compat::PaneCloseResponse, String> {
+    ) -> Result<domain_ipc::PaneCloseResponse, String> {
         DomainCompat::pane_close(self, request).map_err(|error| error.to_string())
     }
 
@@ -2154,9 +2150,9 @@ fn parse_pane_retry_ref(raw: String) -> PaneRetryRef {
 }
 
 fn resolve_retry_pane<'a>(
-    panes: &'a [bmux_plugin_domain_compat::PaneSummary],
+    panes: &'a [domain_ipc::PaneSummary],
     pane_ref: &PaneRetryRef,
-) -> Result<&'a bmux_plugin_domain_compat::PaneSummary, String> {
+) -> Result<&'a domain_ipc::PaneSummary, String> {
     match pane_ref {
         PaneRetryRef::Active => panes
             .iter()
@@ -2319,7 +2315,7 @@ fn append_cluster_connection_event(
 
 fn resolve_cluster_binding_for_pane(
     caller: &impl ClusterRuntimeOps,
-    pane: &bmux_plugin_domain_compat::PaneSummary,
+    pane: &domain_ipc::PaneSummary,
 ) -> Result<ClusterPaneBinding, String> {
     let pane_id = pane.id.to_string();
     match get_cluster_pane_binding(caller, &pane_id) {
@@ -2406,9 +2402,9 @@ mod tests {
     #[derive(Default)]
     struct FakeRuntimeState {
         next_id: u128,
-        sessions: Vec<bmux_plugin_domain_compat::SessionSummary>,
+        sessions: Vec<domain_ipc::SessionSummary>,
         selected_session: Option<Uuid>,
-        panes: Vec<bmux_plugin_domain_compat::PaneSummary>,
+        panes: Vec<domain_ipc::PaneSummary>,
         storage: BTreeMap<String, Vec<u8>>,
         health: BTreeMap<String, bool>,
         health_sequences: BTreeMap<String, Vec<bool>>,
@@ -2446,7 +2442,7 @@ mod tests {
                     pane.focused = false;
                 }
             }
-            guard.panes.push(bmux_plugin_domain_compat::PaneSummary {
+            guard.panes.push(domain_ipc::PaneSummary {
                 id: pane_id,
                 index,
                 name,
@@ -2482,9 +2478,9 @@ mod tests {
             })
         }
 
-        fn session_list(&self) -> Result<bmux_plugin_domain_compat::SessionListResponse, String> {
+        fn session_list(&self) -> Result<domain_ipc::SessionListResponse, String> {
             let guard = self.inner.lock().expect("runtime lock poisoned");
-            Ok(bmux_plugin_domain_compat::SessionListResponse {
+            Ok(domain_ipc::SessionListResponse {
                 sessions: guard.sessions.clone(),
             })
         }
@@ -2492,19 +2488,17 @@ mod tests {
         fn session_create(
             &self,
             request: &SessionCreateRequest,
-        ) -> Result<bmux_plugin_domain_compat::SessionCreateResponse, String> {
+        ) -> Result<domain_ipc::SessionCreateResponse, String> {
             let mut guard = self.inner.lock().expect("runtime lock poisoned");
             let id = next_test_uuid(&mut guard.next_id);
-            guard
-                .sessions
-                .push(bmux_plugin_domain_compat::SessionSummary {
-                    id,
-                    name: request.name.clone(),
-                    client_count: 1,
-                });
+            guard.sessions.push(domain_ipc::SessionSummary {
+                id,
+                name: request.name.clone(),
+                client_count: 1,
+            });
             guard.selected_session = Some(id);
             drop(guard);
-            Ok(bmux_plugin_domain_compat::SessionCreateResponse {
+            Ok(domain_ipc::SessionCreateResponse {
                 id,
                 name: request.name.clone(),
             })
@@ -2513,7 +2507,7 @@ mod tests {
         fn session_select(
             &self,
             request: &SessionSelectRequest,
-        ) -> Result<bmux_plugin_domain_compat::SessionSelectResponse, String> {
+        ) -> Result<domain_ipc::SessionSelectResponse, String> {
             let mut guard = self.inner.lock().expect("runtime lock poisoned");
             let session_id = match &request.selector {
                 SessionSelector::ById(id) => *id,
@@ -2525,7 +2519,7 @@ mod tests {
                     .ok_or_else(|| format!("unknown session '{name}'"))?,
             };
             guard.selected_session = Some(session_id);
-            Ok(bmux_plugin_domain_compat::SessionSelectResponse {
+            Ok(domain_ipc::SessionSelectResponse {
                 session_id,
                 attach_token: next_test_uuid(&mut guard.next_id),
                 expires_at_epoch_ms: 0,
@@ -2535,9 +2529,9 @@ mod tests {
         fn pane_list(
             &self,
             _request: &PaneListRequest,
-        ) -> Result<bmux_plugin_domain_compat::PaneListResponse, String> {
+        ) -> Result<domain_ipc::PaneListResponse, String> {
             let guard = self.inner.lock().expect("runtime lock poisoned");
-            Ok(bmux_plugin_domain_compat::PaneListResponse {
+            Ok(domain_ipc::PaneListResponse {
                 panes: guard.panes.clone(),
             })
         }
@@ -2545,7 +2539,7 @@ mod tests {
         fn pane_launch(
             &self,
             request: &PaneLaunchRequest,
-        ) -> Result<bmux_plugin_domain_compat::PaneLaunchResponse, String> {
+        ) -> Result<domain_ipc::PaneLaunchResponse, String> {
             let mut guard = self.inner.lock().expect("runtime lock poisoned");
             let target = request
                 .command
@@ -2561,7 +2555,7 @@ mod tests {
                 pane.focused = false;
             }
             let index = u32::try_from(guard.panes.len() + 1).expect("pane index should fit u32");
-            guard.panes.push(bmux_plugin_domain_compat::PaneSummary {
+            guard.panes.push(domain_ipc::PaneSummary {
                 id,
                 index,
                 name: request.name.clone(),
@@ -2583,13 +2577,13 @@ mod tests {
             };
             drop(guard);
 
-            Ok(bmux_plugin_domain_compat::PaneLaunchResponse { id, session_id })
+            Ok(domain_ipc::PaneLaunchResponse { id, session_id })
         }
 
         fn pane_close(
             &self,
             request: &PaneCloseRequest,
-        ) -> Result<bmux_plugin_domain_compat::PaneCloseResponse, String> {
+        ) -> Result<domain_ipc::PaneCloseResponse, String> {
             let mut guard = self.inner.lock().expect("runtime lock poisoned");
             let target_id = match request.target.as_ref().unwrap_or(&PaneSelector::Active) {
                 PaneSelector::ById(id) => *id,
@@ -2615,7 +2609,7 @@ mod tests {
             {
                 first.focused = true;
             }
-            Ok(bmux_plugin_domain_compat::PaneCloseResponse {
+            Ok(domain_ipc::PaneCloseResponse {
                 id: target_id,
                 session_id: guard.selected_session.unwrap_or(target_id),
                 session_closed: false,
@@ -2734,6 +2728,7 @@ mod tests {
             },
             settings,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: None,
         }
     }

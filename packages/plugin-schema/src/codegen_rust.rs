@@ -106,7 +106,13 @@ fn emit_record(r: &RecordDef, imports: &ImportMap, out: &mut String) {
 fn emit_variant(v: &VariantDef, imports: &ImportMap, out: &mut String) {
     let name = pascal_case(&v.name);
     out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n");
-    out.push_str("    #[serde(tag = \"kind\", rename_all = \"snake_case\")]\n");
+    // External (default) tagging. Internally-tagged variants
+    // (`#[serde(tag = ...)]`) require `deserialize_any`, which the
+    // non-self-describing `bmux_codec` cannot implement. External
+    // tagging serializes the variant discriminant as a length-
+    // prefixed key for struct/tuple variants and works uniformly
+    // across codec and JSON encodings.
+    out.push_str("    #[serde(rename_all = \"snake_case\")]\n");
     let _ = writeln!(out, "    pub enum {name} {{");
     for c in &v.cases {
         emit_variant_case(c, imports, out);

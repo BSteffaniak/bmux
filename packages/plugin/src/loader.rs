@@ -3,7 +3,7 @@ use crate::{
     DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
     DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL, PluginDeclaration,
     PluginEntrypoint, PluginRegistry, RegisteredPlugin, ServiceCaller,
-    discover_registered_plugins_in_roots,
+    discover_registered_plugins_in_roots, test_support::test_service_router,
 };
 use bmux_ipc::{
     Request as IpcRequest, Response as IpcResponse, ResponsePayload as IpcResponsePayload,
@@ -684,6 +684,7 @@ impl ServiceCaller for NativeCommandContext {
     ) -> Result<Vec<u8>> {
         call_service_raw(
             &self.plugin_id,
+            self.caller_client_id,
             &self.required_capabilities,
             &self.provided_capabilities,
             &self.services,
@@ -721,6 +722,7 @@ impl ServiceCaller for NativeLifecycleContext {
     ) -> Result<Vec<u8>> {
         call_service_raw(
             &self.plugin_id,
+            None,
             &self.required_capabilities,
             &self.provided_capabilities,
             &self.services,
@@ -758,6 +760,7 @@ impl ServiceCaller for NativeServiceContext {
     ) -> Result<Vec<u8>> {
         call_service_raw(
             &self.plugin_id,
+            self.caller_client_id,
             &self.required_capabilities,
             &self.provided_capabilities,
             &self.services,
@@ -803,6 +806,7 @@ impl ServiceCaller for NativeServiceContext {
 /// or the underlying provider plugin.
 pub fn call_service_raw(
     caller_plugin_id: &str,
+    caller_client_id: Option<uuid::Uuid>,
     required_capabilities: &[String],
     provided_capabilities: &[String],
     services: &[RegisteredService],
@@ -819,6 +823,25 @@ pub fn call_service_raw(
     operation: &str,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>> {
+    // Test-only hook: when a `TestServiceRouter` is active on the
+    // current thread (installed via `install_test_service_router`),
+    // route all service calls through it before any capability
+    // checks or plugin-discovery logic. This lets plugin unit tests
+    // construct a `NativeServiceContext` without setting up a real
+    // plugin loader. Production paths never install one, so the
+    // overhead is a single `thread_local!` check.
+    if let Some(router) = test_service_router() {
+        return router(
+            caller_plugin_id,
+            caller_client_id,
+            capability,
+            kind,
+            interface_id,
+            operation,
+            payload,
+        );
+    }
+
     let capability = HostScope::new(capability)?;
     let allowed = required_capabilities
         .iter()
@@ -920,6 +943,7 @@ pub fn call_service_raw(
             .get(registered.declaration.id.as_str())
             .cloned(),
         plugin_settings_map: plugin_settings_map.clone(),
+        caller_client_id,
         host_kernel_bridge,
     })?;
 
@@ -2341,56 +2365,6 @@ sleep 60
                 };
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientList { clients })
             }
-            bmux_ipc::Request::ListContexts => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextList {
-                    contexts: vec![bmux_ipc::ContextSummary {
-                        id: uuid::Uuid::from_u128(0x33333333_3333_3333_3333_333333333333),
-                        name: Some("ctx-alpha".to_string()),
-                        attributes: BTreeMap::from([(
-                            "core.kind".to_string(),
-                            "workspace".to_string(),
-                        )]),
-                    }],
-                })
-            }
-            bmux_ipc::Request::CurrentContext => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::CurrentContext {
-                    context: Some(bmux_ipc::ContextSummary {
-                        id: uuid::Uuid::from_u128(0x33333333_3333_3333_3333_333333333333),
-                        name: Some("ctx-alpha".to_string()),
-                        attributes: BTreeMap::new(),
-                    }),
-                })
-            }
-            bmux_ipc::Request::CreateContext { name, attributes } => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextCreated {
-                    context: bmux_ipc::ContextSummary {
-                        id: uuid::Uuid::new_v4(),
-                        name,
-                        attributes,
-                    },
-                })
-            }
-            bmux_ipc::Request::SelectContext { selector } => {
-                let id = match selector {
-                    bmux_ipc::ContextSelector::ById(id) => id,
-                    bmux_ipc::ContextSelector::ByName(_) => uuid::Uuid::new_v4(),
-                };
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextSelected {
-                    context: bmux_ipc::ContextSummary {
-                        id,
-                        name: Some("ctx-selected".to_string()),
-                        attributes: BTreeMap::new(),
-                    },
-                })
-            }
-            bmux_ipc::Request::CloseContext { selector, .. } => {
-                let id = match selector {
-                    bmux_ipc::ContextSelector::ById(id) => id,
-                    bmux_ipc::ContextSelector::ByName(_) => uuid::Uuid::new_v4(),
-                };
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextClosed { id })
-            }
             bmux_ipc::Request::Attach { selector } => {
                 let session_id = match selector {
                     bmux_ipc::SessionSelector::ById(id) => id,
@@ -2871,6 +2845,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: None,
         };
 
@@ -2913,6 +2888,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: None,
         };
 
@@ -2969,6 +2945,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map,
+            caller_client_id: None,
             host_kernel_bridge: None,
         };
 
@@ -3039,6 +3016,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: None,
         };
 
@@ -3108,6 +3086,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: None,
         };
 
@@ -3162,6 +3141,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3213,6 +3193,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3267,6 +3248,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3328,6 +3310,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3378,6 +3361,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3429,6 +3413,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3487,6 +3472,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3539,6 +3525,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3600,6 +3587,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3668,6 +3656,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3721,6 +3710,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3778,6 +3768,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3829,6 +3820,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3880,6 +3872,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3964,6 +3957,7 @@ minimum = "1.0"
                 "example.native".to_string(),
                 toml::toml! { mode = "service" }.into(),
             )]),
+            caller_client_id: None,
             host_kernel_bridge: None,
         };
 

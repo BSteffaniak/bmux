@@ -17,6 +17,7 @@ bmux_config            = { workspace = true }
 bmux_contexts_plugin   = { workspace = true }
 bmux_image             = { workspace = true, optional = true }
 bmux_ipc               = { workspace = true }
+bmux_plugin            = { workspace = true }
 bmux_session_models    = { workspace = true, features = ["serde"] }
 bmux_sessions_plugin   = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
@@ -46,6 +47,7 @@ fail-on-warnings = [
     "bmux_contexts_plugin/fail-on-warnings",
     "bmux_image?/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
+    "bmux_plugin/fail-on-warnings",
     "bmux_session_models/fail-on-warnings",
     "bmux_sessions_plugin/fail-on-warnings",
     "bmux_terminal_protocol/fail-on-warnings",

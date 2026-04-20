@@ -63,7 +63,7 @@ fn client_event_variants_are_tagged() {
         client_id: uuid::Uuid::nil(),
     };
     let json = serde_json::to_string(&ev).expect("serialize");
-    assert!(json.contains("\"kind\":\"attached\""));
+    assert!(json.contains("\"attached\""));
 }
 
 #[test]

@@ -1,24 +1,13 @@
-//! Opt-in domain-flavored surface for bmux plugins.
+//! Private IPC helpers for cluster-plugin.
 //!
-//! Core plugin infrastructure (`bmux_plugin_sdk` and `bmux_plugin`) is
-//! strictly domain-agnostic. Plugins that want ergonomic access to
-//! session/context/pane/client concepts opt in by depending on this
-//! crate and bringing [`DomainCompat`] into scope:
-//!
-//! ```ignore
-//! use bmux_plugin_domain_compat::DomainCompat;
-//!
-//! let sessions = caller.session_list()?;
-//! ```
-//!
-//! Every method on [`DomainCompat`] is a thin wrapper over
-//! [`bmux_plugin::ServiceCaller::execute_kernel_request`]. The crate
-//! becomes deletable once every IPC variant it wraps is replaced by a
-//! typed plugin service.
+//! cluster-plugin is a non-foundational plugin; in a stricter
+//! architecture it would consume its session/pane data via typed
+//! plugin-api dispatch. For now, this module encapsulates the
+//! direct-IPC bridge that routes through the sessions / windows /
+//! contexts plugins. Once every operation has a typed equivalent the
+//! module shrinks toward zero.
 
-#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
-#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
-#![allow(clippy::multiple_crate_versions)]
+#![allow(dead_code)]
 #![allow(clippy::result_large_err)]
 
 use bmux_plugin::ServiceCaller;

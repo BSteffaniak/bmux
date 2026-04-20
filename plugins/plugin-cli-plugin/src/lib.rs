@@ -299,6 +299,7 @@ mod tests {
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
             host_kernel_bridge: None,
         }
     }

@@ -33,7 +33,7 @@ fn set_style_error_variant_payload_serializes() {
         style: "retro".into(),
     };
     let json = serde_json::to_string(&err).expect("serialize");
-    assert!(json.contains("\"kind\":\"style_unsupported\""));
+    assert!(json.contains("\"style_unsupported\""));
     assert!(json.contains("retro"));
 }
 
@@ -43,5 +43,5 @@ fn decoration_event_is_tagged() {
         pane_id: uuid::Uuid::nil(),
     };
     let json = serde_json::to_string(&ev).expect("serialize");
-    assert!(json.contains("\"kind\":\"pane_restyled\""));
+    assert!(json.contains("\"pane_restyled\""));
 }
