@@ -19,6 +19,7 @@ mod discovery;
 mod host_runtime;
 mod loader;
 mod manifest;
+mod plugin_state;
 pub mod prompt;
 mod registry;
 mod typed_service_caller;
@@ -37,6 +38,8 @@ pub use loader::{LoadedPlugin, NativePluginLoader, load_registered_plugin, load_
 pub use manifest::{
     PluginManifest, PluginManifestCompatibility, PluginManifestKeybindings, PluginRuntime,
 };
+pub use plugin_state::PluginStateRegistry;
+pub use plugin_state::global_registry as global_plugin_state_registry;
 pub use registry::{
     CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
     ServiceProvider,
