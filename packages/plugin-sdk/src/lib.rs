@@ -80,9 +80,8 @@ pub use host_services::{
     PaneResizeRequest, PaneResizeResponse, PaneSelector, PaneSplitDirection, PaneSplitRequest,
     PaneSplitResponse, PaneSummary, PaneZoomRequest, PaneZoomResponse, PluginCommandOutcome,
     RecordingWriteEventRequest, RecordingWriteEventResponse, SessionCreateRequest,
-    SessionCreateResponse, SessionKillRequest, SessionKillResponse, SessionListResponse,
-    SessionSelectRequest, SessionSelectResponse, SessionSelector, SessionSummary,
-    StorageGetRequest, StorageGetResponse, StorageSetRequest,
+    SessionCreateResponse, SessionListResponse, SessionSelectRequest, SessionSelectResponse,
+    SessionSelector, SessionSummary, StorageGetRequest, StorageGetResponse, StorageSetRequest,
 };
 pub use ident::{CapabilityId, InterfaceId, OperationId, PluginEventKind};
 pub use native_exports::{

@@ -69,17 +69,6 @@ pub struct SessionCreateResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionKillRequest {
-    pub selector: SessionSelector,
-    pub force_local: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionKillResponse {
-    pub id: Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionListResponse {
     pub sessions: Vec<SessionSummary>,
 }
