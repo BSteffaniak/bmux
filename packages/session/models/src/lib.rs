@@ -5,7 +5,6 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use thiserror::Error;
 use uuid::Uuid;
 
 // ============================================================================
@@ -37,29 +36,6 @@ impl std::fmt::Display for SessionId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct PaneId(pub Uuid);
-
-impl PaneId {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for PaneId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for PaneId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ClientId(pub Uuid);
 
 impl ClientId {
@@ -79,58 +55,6 @@ impl std::fmt::Display for ClientId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
-}
-
-// ============================================================================
-// Errors
-// ============================================================================
-
-#[derive(Error, Debug)]
-pub enum SessionError {
-    #[error("Session not found: {0}")]
-    NotFound(SessionId),
-    #[error("Client not found: {0}")]
-    ClientNotFound(ClientId),
-    #[error("Session already exists: {0}")]
-    AlreadyExists(SessionId),
-    #[error("Session access denied for client {client}: {reason}")]
-    AccessDenied { client: ClientId, reason: String },
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-#[derive(Error, Debug)]
-pub enum LayoutError {
-    #[error("Pane not found: {0}")]
-    PaneNotFound(PaneId),
-    #[error("Invalid layout configuration: {0}")]
-    InvalidLayout(String),
-    #[error("Cannot split pane: {reason}")]
-    SplitFailed { reason: String },
-}
-
-#[derive(Error, Debug)]
-pub enum PaneError {
-    #[error("Pane not found: {0}")]
-    NotFound(PaneId),
-    #[error("Pane already exists: {0}")]
-    AlreadyExists(PaneId),
-    #[error("Invalid dimensions: width={width}, height={height}")]
-    InvalidDimensions { width: u16, height: u16 },
-    #[error("Pane is busy: {0}")]
-    Busy(PaneId),
-}
-
-#[derive(Error, Debug)]
-pub enum ClientError {
-    #[error("Client not found: {0}")]
-    NotFound(ClientId),
-    #[error("Client already exists: {0}")]
-    AlreadyExists(ClientId),
-    #[error("Client disconnected: {0}")]
-    Disconnected(ClientId),
-    #[error("Authentication failed for client: {0}")]
-    AuthenticationFailed(ClientId),
 }
 
 // ============================================================================
@@ -207,49 +131,5 @@ impl From<&Session> for SessionInfo {
             created_at: session.created_at,
             last_activity: session.last_activity,
         }
-    }
-}
-
-// ============================================================================
-// Client Models
-// ============================================================================
-
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct ClientInfo {
-    pub id: ClientId,
-    pub session_id: Option<SessionId>,
-    pub independent_view: bool,
-    pub following_client: Option<ClientId>,
-    pub connected_at: std::time::SystemTime,
-    pub last_activity: std::time::SystemTime,
-}
-
-impl ClientInfo {
-    #[must_use]
-    pub fn new(independent_view: bool, following_client: Option<ClientId>) -> Self {
-        let now = std::time::SystemTime::now();
-        Self {
-            id: ClientId::new(),
-            session_id: None,
-            independent_view,
-            following_client,
-            connected_at: now,
-            last_activity: now,
-        }
-    }
-
-    pub fn attach_to_session(&mut self, session_id: SessionId) {
-        self.session_id = Some(session_id);
-        self.update_activity();
-    }
-
-    pub fn detach_from_session(&mut self) {
-        self.session_id = None;
-        self.update_activity();
-    }
-
-    pub fn update_activity(&mut self) {
-        self.last_activity = std::time::SystemTime::now();
     }
 }

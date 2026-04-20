@@ -11,14 +11,10 @@
 pub use bmux_session_models as models;
 
 // Re-export commonly used types
-pub use models::{
-    ClientError, ClientId, ClientInfo, LayoutError, PaneError, PaneId, Session, SessionError,
-    SessionId, SessionInfo,
-};
+pub use models::{ClientId, Session, SessionId, SessionInfo};
 
 use anyhow::Result;
 use std::collections::BTreeMap;
-use tracing::warn;
 
 /// Session manager responsible for handling multiple sessions
 #[derive(Debug, Default)]
@@ -89,11 +85,5 @@ impl SessionManager {
         } else {
             Err(anyhow::anyhow!("Session not found: {session_id}"))
         }
-    }
-
-    /// Get the number of active sessions
-    #[must_use]
-    pub fn session_count(&self) -> usize {
-        self.sessions.len()
     }
 }

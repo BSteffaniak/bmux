@@ -11,9 +11,8 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-serde     = { workspace = true, features = ["derive"], optional = true }
-thiserror = { workspace = true }
-uuid      = { workspace = true, features = ["v4"] }
+serde = { workspace = true, features = ["derive"], optional = true }
+uuid  = { workspace = true, features = ["v4"] }
 
 
 [features]

@@ -305,6 +305,32 @@ fn cli_crate_does_not_reexport_domain_types() {
     }
 }
 
+/// M4 Stage 10: verify that `packages/session/models` stays minimal.
+/// Dead types `LayoutError`, `PaneError`, `ClientError`, `ClientInfo`,
+/// `SessionError`, `PaneId` were deleted; this test prevents their
+/// reintroduction.
+#[test]
+fn session_models_is_minimal() {
+    let source = include_str!("../../session/models/src/lib.rs");
+    let denied = [
+        "pub enum LayoutError",
+        "pub enum PaneError",
+        "pub enum ClientError",
+        "pub enum SessionError",
+        "pub struct ClientInfo",
+        "pub struct PaneId",
+    ];
+
+    for marker in denied {
+        assert!(
+            !source.contains(marker),
+            "packages/session/models/src/lib.rs must not reintroduce \
+             dead type {marker}; the session-plugin owns these domain \
+             types via typed dispatch",
+        );
+    }
+}
+
 /// M4 Stage 10: verify that `packages/event/models` doesn't depend on
 /// session/terminal domain model crates. The domain event types were
 /// deleted — the Cargo.toml must not silently regrow those deps.

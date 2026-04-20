@@ -1576,7 +1576,6 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
  "bmux_session_models",
- "tracing",
 ]
 
 [[package]]
@@ -1584,7 +1583,6 @@ name = "bmux_session_models"
 version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
- "thiserror 2.0.18",
  "uuid",
 ]
 
