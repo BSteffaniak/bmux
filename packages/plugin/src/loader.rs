@@ -2146,7 +2146,6 @@ fn ensure_match(
 mod tests {
     use super::{LoadedPlugin, PluginBackend};
     use crate::{PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
-    use bmux_plugin_domain_compat::DomainCompat;
     use bmux_plugin_sdk::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, NativeLifecycleContext,
         NativeServiceContext, PluginEvent, PluginEventKind, PluginEventSubscription,
@@ -3146,9 +3145,13 @@ minimum = "1.0"
         };
 
         let response = context
-            .session_list()
+            .execute_kernel_request(bmux_ipc::Request::ListSessions)
             .expect("core session query should succeed");
-        assert_eq!(response.sessions.len(), 1);
+        let sessions = match response {
+            bmux_ipc::ResponsePayload::SessionList { sessions } => sessions,
+            other => panic!("expected SessionList, got {other:?}"),
+        };
+        assert_eq!(sessions.len(), 1);
 
         let last_is_list_sessions = KERNEL_REQUESTS.with(|log| {
             log.borrow()
@@ -3198,10 +3201,11 @@ minimum = "1.0"
         };
 
         let _response = context
-            .pane_split(&bmux_plugin_domain_compat::PaneSplitRequest {
+            .execute_kernel_request(bmux_ipc::Request::SplitPane {
                 session: None,
                 target: None,
-                direction: bmux_plugin_domain_compat::PaneSplitDirection::Vertical,
+                direction: bmux_ipc::PaneSplitDirection::Vertical,
+                ratio_pct: None,
             })
             .expect("core pane command should succeed");
 
@@ -3253,12 +3257,12 @@ minimum = "1.0"
         };
 
         let _response = context
-            .pane_launch(&bmux_plugin_domain_compat::PaneLaunchRequest {
+            .execute_kernel_request(bmux_ipc::Request::LaunchPane {
                 session: None,
                 target: None,
-                direction: bmux_plugin_domain_compat::PaneSplitDirection::Vertical,
+                direction: bmux_ipc::PaneSplitDirection::Vertical,
                 name: Some("remote-a".to_string()),
-                command: bmux_plugin_domain_compat::PaneLaunchCommand {
+                command: bmux_ipc::PaneLaunchCommand {
                     program: "ssh".to_string(),
                     args: vec!["host-a".to_string()],
                     cwd: Some("/tmp".to_string()),
@@ -3315,7 +3319,7 @@ minimum = "1.0"
         };
 
         let _response = context
-            .session_create(&bmux_plugin_domain_compat::SessionCreateRequest {
+            .execute_kernel_request(bmux_ipc::Request::NewSession {
                 name: Some("created".to_string()),
             })
             .expect("core session command should succeed");
@@ -3591,15 +3595,26 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response = context
-            .current_client()
-            .expect("core client query should succeed");
+        let bmux_ipc::ResponsePayload::ClientIdentity { id: client_id } = context
+            .execute_kernel_request(bmux_ipc::Request::WhoAmI)
+            .expect("whoami should succeed")
+        else {
+            panic!("expected ClientIdentity response from WhoAmI");
+        };
+        let clients = match context
+            .execute_kernel_request(bmux_ipc::Request::ListClients)
+            .expect("core client query should succeed")
+        {
+            bmux_ipc::ResponsePayload::ClientList { clients } => clients,
+            other => panic!("expected ClientList, got {other:?}"),
+        };
+        let current = clients.into_iter().find(|c| c.id == client_id);
         assert_eq!(
-            response.id,
+            client_id,
             uuid::Uuid::from_u128(0x11111111_1111_1111_1111_111111111111)
         );
         assert_eq!(
-            response.selected_session_id,
+            current.as_ref().and_then(|c| c.selected_session_id),
             Some(uuid::Uuid::from_u128(
                 0x22222222_2222_2222_2222_222222222222
             ))
@@ -3660,16 +3675,27 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response = context
-            .current_client()
-            .expect("core client query should succeed when list-clients omits current client");
+        let bmux_ipc::ResponsePayload::ClientIdentity { id: client_id } = context
+            .execute_kernel_request(bmux_ipc::Request::WhoAmI)
+            .expect("whoami should succeed")
+        else {
+            panic!("expected ClientIdentity response from WhoAmI");
+        };
+        let clients = match context
+            .execute_kernel_request(bmux_ipc::Request::ListClients)
+            .expect("core client query should succeed when list-clients omits current client")
+        {
+            bmux_ipc::ResponsePayload::ClientList { clients } => clients,
+            other => panic!("expected ClientList, got {other:?}"),
+        };
+        let current = clients.into_iter().find(|c| c.id == client_id);
         assert_eq!(
-            response.id,
+            client_id,
             uuid::Uuid::from_u128(0x11111111_1111_1111_1111_111111111111)
         );
-        assert_eq!(response.selected_session_id, None);
-        assert_eq!(response.following_client_id, None);
-        assert!(!response.following_global);
+        assert_eq!(current.as_ref().and_then(|c| c.selected_session_id), None);
+        assert_eq!(current.as_ref().and_then(|c| c.following_client_id), None);
+        assert!(!current.as_ref().is_some_and(|c| c.following_global));
 
         OMIT_CURRENT_CLIENT_FROM_LIST.with(|c| c.set(false));
     }
@@ -3715,12 +3741,16 @@ minimum = "1.0"
         };
 
         let response = context
-            .session_select(&bmux_plugin_domain_compat::SessionSelectRequest {
-                selector: bmux_plugin_domain_compat::SessionSelector::ById(target_session_id),
+            .execute_kernel_request(bmux_ipc::Request::Attach {
+                selector: bmux_ipc::SessionSelector::ById(target_session_id),
             })
             .expect("core session select should succeed");
-        assert_eq!(response.session_id, target_session_id);
-        assert_eq!(response.expires_at_epoch_ms, 42);
+        let grant = match response {
+            bmux_ipc::ResponsePayload::Attached { grant } => grant,
+            other => panic!("expected Attached, got {other:?}"),
+        };
+        assert_eq!(grant.session_id, target_session_id);
+        assert_eq!(grant.expires_at_epoch_ms, 42);
 
         let has_attach = KERNEL_REQUESTS.with(|log| {
             log.borrow().iter().any(|request| {
@@ -3773,7 +3803,7 @@ minimum = "1.0"
         };
 
         let error = context
-            .session_create(&bmux_plugin_domain_compat::SessionCreateRequest {
+            .execute_kernel_request(bmux_ipc::Request::NewSession {
                 name: Some("deny".to_string()),
             })
             .expect_err("kernel denial should propagate as service error");
@@ -3825,9 +3855,13 @@ minimum = "1.0"
         };
 
         let response = context
-            .pane_list(&bmux_plugin_domain_compat::PaneListRequest { session: None })
+            .execute_kernel_request(bmux_ipc::Request::ListPanes { session: None })
             .expect("core pane query should succeed");
-        assert_eq!(response.panes.len(), 1);
+        let panes = match response {
+            bmux_ipc::ResponsePayload::PaneList { panes } => panes,
+            other => panic!("expected PaneList, got {other:?}"),
+        };
+        assert_eq!(panes.len(), 1);
 
         let last_is_list_panes = KERNEL_REQUESTS.with(|log| {
             log.borrow()
@@ -3877,25 +3911,25 @@ minimum = "1.0"
         };
 
         let _focused = context
-            .pane_focus(&bmux_plugin_domain_compat::PaneFocusRequest {
+            .execute_kernel_request(bmux_ipc::Request::FocusPane {
                 session: None,
-                target: Some(bmux_plugin_domain_compat::PaneSelector::Active),
-                direction: Some(bmux_plugin_domain_compat::PaneFocusDirection::Next),
+                target: Some(bmux_ipc::PaneSelector::Active),
+                direction: Some(bmux_ipc::PaneFocusDirection::Next),
             })
             .expect("focus command should succeed");
 
         let _resized = context
-            .pane_resize(&bmux_plugin_domain_compat::PaneResizeRequest {
+            .execute_kernel_request(bmux_ipc::Request::ResizePane {
                 session: None,
-                target: Some(bmux_plugin_domain_compat::PaneSelector::Active),
+                target: Some(bmux_ipc::PaneSelector::Active),
                 delta: 1,
             })
             .expect("resize command should succeed");
 
         let _closed = context
-            .pane_close(&bmux_plugin_domain_compat::PaneCloseRequest {
+            .execute_kernel_request(bmux_ipc::Request::ClosePane {
                 session: None,
-                target: Some(bmux_plugin_domain_compat::PaneSelector::Active),
+                target: Some(bmux_ipc::PaneSelector::Active),
             })
             .expect("close command should succeed");
 

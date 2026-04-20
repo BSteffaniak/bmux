@@ -18,7 +18,7 @@ BMUX core must remain domain-agnostic. Windows, sessions, contexts, clients, and
   - `packages/plugin-sdk/**` — shared SDK types, identifier newtypes, typed-dispatch primitives
   - `packages/plugin/**` — host-side plugin loader, registry, and runtime traits
   - `packages/plugin-schema/**` + `packages/plugin-schema-macros/**` — BPDL codegen
-- Core architecture must provide only generic host primitives (`storage`, `log`, `recording`, `call_service`, `execute_kernel_request`). Domain convenience lives in the opt-in `bmux_plugin::DomainCompat` extension trait, which plugins import via `use bmux_plugin::DomainCompat;`.
+- Core architecture must provide only generic host primitives (`storage`, `log`, `recording`, `call_service`, `execute_kernel_request`). Core crates MUST NOT host domain convenience helpers — they live in each plugin as private modules or are reached through typed BPDL services.
 - In core architecture, avoid domain-specific types/fields/events/APIs for any plugin domain.
 - Domain behavior must be implemented through plugins and generic plugin/service invoke paths (`Request::InvokeService` + typed plugin-api crates, or `ServiceCaller::execute_kernel_request` for kernel-level primitives).
 - Core defaults when plugins are missing:
@@ -31,7 +31,7 @@ BMUX core must remain domain-agnostic. Windows, sessions, contexts, clients, and
 - Plugins are first-class and may implement critical product behavior.
 - Prefer extending generic plugin APIs/capabilities over adding core-special-case code.
 - If a feature seems domain-specific, place it in a plugin unless there is a strong, documented reason it must be core-agnostic runtime plumbing.
-- When a plugin needs to reach core kernel state (sessions, contexts, panes), use `ServiceCaller::execute_kernel_request(bmux_ipc::Request::*)` directly rather than adding domain convenience methods to `HostRuntimeApi`. Domain convenience lives in `bmux_plugin::DomainCompat` as an opt-in extension trait.
+- When a plugin needs to reach core kernel state (sessions, contexts, panes), use `ServiceCaller::execute_kernel_request(bmux_ipc::Request::*)` directly. Foundational plugins (sessions, contexts, clients, windows) are allowed to call core IPC this way; other plugins must go through typed BPDL services exposed by the foundational plugins.
 
 ### Review Gate Before Finishing (REQUIRED)
 
@@ -39,7 +39,7 @@ For any non-doc code change, verify no forbidden domain leakage was introduced i
 
 - Run content checks (or equivalent) to confirm no new core references to windows/permissions/sessions/contexts/clients/panes domain concepts.
 - `HostRuntimeApi` must remain domain-agnostic — only `core_cli_command_run_path`, `plugin_command_run`, `storage_get`, `storage_set`, `log_write`, `recording_write_event`.
-- Domain convenience methods belong in `bmux_plugin::DomainCompat` (opt-in extension trait), not `HostRuntimeApi`.
+- Domain convenience helpers belong in plugins (as private modules) or are reached through typed BPDL services, not in `HostRuntimeApi` or any other core crate.
 - If any core-side domain leakage is found, treat as blocking and refactor before finishing.
 
 These boundary rules are strict and take precedence over convenience.

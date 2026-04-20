@@ -4,11 +4,11 @@
 //! (provided via `bmux_ipc`) and are therefore defined here rather than
 //! in the SDK.
 //!
-//! `HostRuntimeApi` carries only truly generic primitives.
-//! Domain-specific conveniences (`session_*`, `context_*`, `pane_*`,
-//! `current_client`) live on a separate opt-in extension trait,
-//! [`DomainCompat`](bmux_plugin_domain_compat::DomainCompat), so the
-//! core plugin runtime stays domain-agnostic.
+//! `HostRuntimeApi` carries only truly generic primitives. Plugins
+//! that speak in session/context/pane/client domain terms either use
+//! [`ServiceCaller::execute_kernel_request`] for foundational access
+//! to core IPC, or typed BPDL services (`call_service`) for
+//! cross-plugin orchestration.
 
 use bmux_plugin_sdk::{
     CORE_CLI_COMMAND_CAPABILITY, CORE_CLI_COMMAND_INTERFACE_V1,
@@ -90,13 +90,10 @@ pub trait ServiceCaller {
 /// Every blanket-implemented method is a thin wrapper over a well-known
 /// host-provided service (`bmux.storage`, `bmux.logs.write`, etc.).
 ///
-/// For convenience methods that speak in session/context/pane/client
-/// domain terms, see
-/// [`DomainCompat`](bmux_plugin_domain_compat::DomainCompat). Those
-/// are opt-in extension-trait methods built on
-/// [`ServiceCaller::execute_kernel_request`] rather than first-class
-/// `HostRuntimeApi` methods — domain concepts don't belong in the
-/// core runtime surface.
+/// Domain-specific conveniences (session/context/pane/client helpers)
+/// are not part of this trait. Foundational plugins reach core IPC via
+/// [`ServiceCaller::execute_kernel_request`]; non-foundational plugins
+/// use typed BPDL services through [`ServiceCaller::call_service`].
 pub trait HostRuntimeApi: ServiceCaller {
     /// Run a core built-in CLI command path in-process.
     ///

@@ -26,9 +26,8 @@ tracing    = { workspace = true, features = ["std"] }
 uuid       = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
-bmux_plugin_domain_compat = { workspace = true }
-serial_test               = { workspace = true }
-tokio                     = { workspace = true, features = ["sync", "macros", "rt"] }
+serial_test = { workspace = true }
+tokio       = { workspace = true, features = ["sync", "macros", "rt"] }
 
 
 [features]

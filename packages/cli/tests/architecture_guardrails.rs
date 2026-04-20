@@ -622,7 +622,138 @@ fn client_core_crate_has_no_domain_convenience_methods() {
     }
 }
 
-// The permissions-plugin DomainCompat migration is tracked as a
-// follow-up workstream. When it lands, add a guardrail here that
-// asserts `bmux_plugin_domain_compat` is absent from permissions-plugin
-// production dependencies and source.
+// Verify that the `bmux_plugin_domain_compat` crate has been fully
+// eliminated. Domain helpers now live inside each plugin's private
+// `domain_ipc` module, or are reached through typed BPDL services.
+#[test]
+fn domain_compat_crate_is_absent() {
+    let compat_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin-domain-compat");
+    assert!(
+        !compat_dir.exists(),
+        "packages/plugin-domain-compat/ must be absent; domain \
+         helpers live in each plugin's private `domain_ipc` module \
+         or are reached through typed BPDL services",
+    );
+
+    let workspace_toml = include_str!("../../../Cargo.toml");
+    assert!(
+        !workspace_toml.contains("packages/plugin-domain-compat"),
+        "workspace Cargo.toml must not reference packages/plugin-domain-compat",
+    );
+    assert!(
+        !workspace_toml.contains("bmux_plugin_domain_compat"),
+        "workspace Cargo.toml must not declare bmux_plugin_domain_compat",
+    );
+}
+
+// No crate anywhere in the workspace may depend on the deleted
+// `bmux_plugin_domain_compat` crate, as a production or dev
+// dependency, or in source code.
+#[test]
+fn no_crate_uses_domain_compat() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let crate_roots = [
+        workspace_root.join("packages"),
+        workspace_root.join("plugins"),
+        workspace_root.join("examples"),
+    ];
+
+    fn walk(
+        dir: &std::path::Path,
+        needle_toml: &str,
+        needle_src: &str,
+        offenders: &mut Vec<String>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if path.is_dir() {
+                if name == "target" || name.starts_with('.') {
+                    continue;
+                }
+                walk(&path, needle_toml, needle_src, offenders);
+            } else if name == "Cargo.toml" {
+                if let Ok(text) = std::fs::read_to_string(&path)
+                    && text.contains(needle_toml)
+                {
+                    offenders.push(path.display().to_string());
+                }
+            } else if name.ends_with(".rs")
+                && name != "architecture_guardrails.rs"
+                && let Ok(text) = std::fs::read_to_string(&path)
+                && text.contains(needle_src)
+            {
+                offenders.push(path.display().to_string());
+            }
+        }
+    }
+
+    let mut offenders = Vec::new();
+    for root in &crate_roots {
+        walk(
+            root,
+            "bmux_plugin_domain_compat",
+            "bmux_plugin_domain_compat",
+            &mut offenders,
+        );
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "no crate may reference bmux_plugin_domain_compat; offenders: \
+         {offenders:#?}",
+    );
+}
+
+// Core architecture crates must not depend on any plugin crate.
+// Plugins → core is allowed; core → plugins is forbidden.
+#[test]
+fn core_architecture_does_not_depend_on_plugins() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let core_crates = [
+        "packages/ipc",
+        "packages/client",
+        "packages/session/models",
+        "packages/event/models",
+        "packages/plugin-sdk",
+        "packages/plugin-schema",
+        "packages/plugin-schema-macros",
+    ];
+
+    let mut offenders = Vec::new();
+    for crate_path in core_crates {
+        let cargo_toml = workspace_root.join(crate_path).join("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&cargo_toml) else {
+            continue;
+        };
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            // Heuristic: any dep name starting with `bmux_` and ending
+            // with `_plugin` (the canonical plugin-crate suffix) is a
+            // violation when declared as a dependency of a core crate.
+            // Plugin-api crates (`bmux_*_plugin_api`) are acceptable —
+            // they are neutral typed-dispatch surfaces.
+            if let Some((name, _)) = trimmed.split_once('=')
+                && let name = name.trim()
+                && name.starts_with("bmux_")
+                && name.ends_with("_plugin")
+            {
+                offenders.push(format!("{}: {name}", crate_path));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "core architecture crates must not depend on plugin crates; \
+         offenders: {offenders:#?}",
+    );
+}

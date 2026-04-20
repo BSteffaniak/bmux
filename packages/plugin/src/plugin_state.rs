@@ -7,9 +7,9 @@
 //! This primitive lets plugins own domain state that the core runtime
 //! (or other plugins) need to access directly, without introducing a
 //! compile-time dependency from core crates on plugin crates. The
-//! shared state type `T` itself must live in a neutral crate so both
-//! owner and consumer can name it; today that crate is
-//! `bmux_plugin_domain_compat`.
+//! shared state type `T` must live in a neutral crate so both the
+//! owner and consumer can name it — typically a plugin's `*-plugin-api`
+//! crate.
 //!
 //! # Lifecycle
 //!

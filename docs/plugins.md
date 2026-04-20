@@ -96,12 +96,14 @@ three plugin context types (`NativeCommandContext`,
   `storage_set`, `log_write`, `recording_write_event`. No domain
   methods (`pane_*`, `session_*`, `context_*`, `current_client`)
   exist on this trait.
-- **`DomainCompat`** — opt-in extension trait providing the former
-  domain convenience methods (`session_list`, `context_create`,
-  `pane_focus`, `current_client`, etc.) as ergonomic wrappers over
-  `execute_kernel_request`. Plugins that want them explicitly import
-  `use bmux_plugin::DomainCompat;`. Core plugin infrastructure never
-  depends on this trait.
+
+Plugins that want domain-level helpers own them locally. Foundational
+plugins (sessions, contexts, clients, windows) reach core IPC through
+`ServiceCaller::execute_kernel_request(bmux_ipc::Request::*)`.
+Non-foundational plugins speak to foundational plugins through typed
+BPDL services (`ServiceCaller::call_service`). Some plugins keep a
+private `domain_ipc` module that wraps common patterns; these modules
+are plugin-local, never a core dependency.
 
 ## Host state registry
 
@@ -171,6 +173,19 @@ Under the hood, calls travel via the existing `ServiceRequest` /
 (`bmux_plugin_sdk::typed_dispatch`) wraps that envelope with
 type-erased handles that generated client/server stubs downcast to the
 interface trait.
+
+### Event bus
+
+In-process event delivery goes through `bmux_plugin::EventBus`, a
+`PluginEventKind`-keyed typemap of
+`tokio::sync::broadcast::Sender<Arc<dyn Any + Send + Sync>>`. Each
+plugin that emits events calls `register_channel::<E>()` in its
+`activate` callback; publishers then call `emit::<E>(event)` and
+subscribers call `subscribe::<E>()` to receive an untagged
+`Receiver<Arc<E>>`. The global singleton is reachable via
+`bmux_plugin::global_event_bus()`. Zero-serialization fanout is used
+for in-process subscribers; cross-process subscribers bridge through
+the existing `bmux_ipc::Event` stream.
 
 ## Context model (canonical)
 

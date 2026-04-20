@@ -307,7 +307,7 @@ fn unexpected(operation: &'static str) -> PluginError {
 /// on top of [`ServiceCaller::execute_kernel_request`].
 ///
 /// Blanket-implemented for all `T: ServiceCaller + ?Sized`; plugins
-/// bring it into scope with `use bmux_plugin_domain_compat::DomainCompat;`.
+/// bring it into scope with `use crate::domain_ipc::DomainCompat;`.
 pub trait DomainCompat: ServiceCaller {
     /// List all sessions.
     ///

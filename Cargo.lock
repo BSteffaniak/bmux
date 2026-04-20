@@ -1416,7 +1416,6 @@ name = "bmux_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_ipc",
- "bmux_plugin_domain_compat",
  "bmux_plugin_sdk",
  "libloading",
  "semver",
@@ -1437,17 +1436,6 @@ dependencies = [
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "bmux_plugin_domain_compat"
-version = "0.0.1-alpha.0"
-dependencies = [
- "bmux_ipc",
- "bmux_plugin",
- "bmux_plugin_sdk",
- "serde",
- "uuid",
 ]
 
 [[package]]
