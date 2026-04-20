@@ -23,7 +23,7 @@
 //! - `sandbox_harness` — integration test harness.
 
 #[cfg(feature = "event")]
-pub use bmux_event as event;
+pub use bmux_event_models as event;
 
 #[cfg(feature = "config")]
 pub use bmux_config as config;

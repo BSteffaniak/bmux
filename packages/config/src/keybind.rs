@@ -4,7 +4,7 @@
 //! for modal keybindings (Normal, Insert, Visual, Command modes).
 
 use bmux_config_doc_derive::ConfigDoc;
-use bmux_event::{KeyCode, KeyEvent};
+use bmux_event_models::{KeyCode, KeyEvent};
 use bmux_keybind::{RuntimeAction, action_to_name, parse_action};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

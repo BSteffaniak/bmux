@@ -8,7 +8,7 @@
 //! for the bmux terminal multiplexer system.
 
 use bmux_config_doc_derive::{ConfigDoc, ConfigDocEnum};
-use bmux_event::Mode;
+use bmux_event_models::Mode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;

@@ -151,10 +151,6 @@ fn core_packages_do_not_reference_domain_plugin_markers() {
             include_str!("../../session/models/src/lib.rs"),
         ),
         (
-            "packages/event/src/lib.rs",
-            include_str!("../../event/src/lib.rs"),
-        ),
-        (
             "packages/event/models/src/lib.rs",
             include_str!("../../event/models/src/lib.rs"),
         ),
@@ -191,21 +187,16 @@ fn plugin_production_code_uses_generic_host_api_only() {
     }
 }
 
-/// M4 Stage 10: verify that `packages/event` is fully domain-agnostic.
-/// The former `Session/Pane/Client/Input` event enums and constructors
-/// were deleted — this test ensures they don't silently reappear.
+/// M4 Stage 10: verify that `packages/event/models` is fully
+/// domain-agnostic. The former `Session/Pane/Client/Input` event
+/// enums and constructors were deleted — this test ensures they
+/// don't silently reappear.
 #[test]
 fn event_core_crate_has_no_domain_event_types() {
-    let sources = [
-        (
-            "packages/event/src/lib.rs",
-            include_str!("../../event/src/lib.rs"),
-        ),
-        (
-            "packages/event/models/src/lib.rs",
-            include_str!("../../event/models/src/lib.rs"),
-        ),
-    ];
+    let sources = [(
+        "packages/event/models/src/lib.rs",
+        include_str!("../../event/models/src/lib.rs"),
+    )];
 
     let denied = [
         "pub enum SessionEvent",

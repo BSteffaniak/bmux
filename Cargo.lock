@@ -970,7 +970,7 @@ dependencies = [
  "bmux_cli",
  "bmux_client",
  "bmux_config",
- "bmux_event",
+ "bmux_event_models",
  "bmux_keybind",
  "bmux_plugin",
  "bmux_plugin_sdk",
@@ -1022,7 +1022,7 @@ dependencies = [
  "bmux_decoration_plugin",
  "bmux_decoration_plugin_api",
  "bmux_env",
- "bmux_event",
+ "bmux_event_models",
  "bmux_fonts",
  "bmux_image",
  "bmux_ipc",
@@ -1174,7 +1174,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_config_doc",
  "bmux_config_doc_derive",
- "bmux_event",
+ "bmux_event_models",
  "bmux_keybind",
  "bmux_slots",
  "dirs",
@@ -1284,13 +1284,6 @@ dependencies = [
  "clap",
  "serde_json",
  "tempfile",
-]
-
-[[package]]
-name = "bmux_event"
-version = "0.0.1-alpha.0"
-dependencies = [
- "bmux_event_models",
 ]
 
 [[package]]

@@ -14,7 +14,7 @@ version     = { workspace = true }
 # Internal bmux packages
 bmux_config_doc        = { workspace = true }
 bmux_config_doc_derive = { workspace = true }
-bmux_event             = { workspace = true, features = ["serde"] }
+bmux_event_models      = { workspace = true, features = ["serde"] }
 bmux_keybind           = { workspace = true }
 bmux_slots             = { workspace = true }
 
@@ -32,7 +32,7 @@ default = []
 # Development features
 fail-on-warnings = [
     "bmux_config_doc_derive/fail-on-warnings",
-    "bmux_event/fail-on-warnings",
+    "bmux_event_models/fail-on-warnings",
     "bmux_keybind/fail-on-warnings",
     "bmux_slots/fail-on-warnings",
 ]
