@@ -203,6 +203,8 @@ fn event_core_crate_has_no_domain_event_types() {
         "pub enum PaneEvent",
         "pub enum ClientEvent",
         "pub enum InputEvent",
+        "pub enum SystemEvent",
+        "pub enum Event",
         "fn session_created",
         "fn pane_created",
         "fn client_connected",

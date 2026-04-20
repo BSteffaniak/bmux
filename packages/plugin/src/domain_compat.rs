@@ -25,8 +25,8 @@ use bmux_plugin_sdk::{
     PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse, PaneSelector,
     PaneSplitDirection, PaneSplitRequest, PaneSplitResponse, PaneSummary, PaneZoomRequest,
     PaneZoomResponse, PluginError, Result, SessionCreateRequest, SessionCreateResponse,
-    SessionKillRequest, SessionKillResponse, SessionListResponse, SessionSelectRequest,
-    SessionSelectResponse, SessionSelector, SessionSummary,
+    SessionListResponse, SessionSelectRequest, SessionSelectResponse, SessionSelector,
+    SessionSummary,
 };
 
 use crate::host_runtime::ServiceCaller;
@@ -115,21 +115,6 @@ pub trait DomainCompat: ServiceCaller {
                 Ok(SessionCreateResponse { id, name })
             }
             _ => Err(unexpected("session_create")),
-        }
-    }
-
-    /// Kill a session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the service call fails.
-    fn session_kill(&self, request: &SessionKillRequest) -> Result<SessionKillResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::KillSession {
-            selector: session_selector_to_ipc(&request.selector),
-            force_local: request.force_local,
-        })? {
-            bmux_ipc::ResponsePayload::SessionKilled { id } => Ok(SessionKillResponse { id }),
-            _ => Err(unexpected("session_kill")),
         }
     }
 

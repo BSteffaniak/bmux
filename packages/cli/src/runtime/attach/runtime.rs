@@ -4650,11 +4650,6 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn attach_scene_visible_pane_id_set(scene: &bmux_ipc::AttachScene) -> BTreeSet<Uuid> {
-    bmux_attach_pipeline::reconcile::attach_scene_visible_pane_id_set(scene)
-}
-
 pub fn attach_scene_revealed_pane_ids(
     previous: &bmux_ipc::AttachScene,
     next: &bmux_ipc::AttachScene,

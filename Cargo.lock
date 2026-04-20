@@ -1290,7 +1290,6 @@ dependencies = [
 name = "bmux_event_models"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_keyboard",
  "serde",
 ]
 
