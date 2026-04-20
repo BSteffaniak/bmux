@@ -150,7 +150,7 @@ recording orchestration struct) remains in `packages/server` for now —
 it is too entangled with server-specific runtime primitives
 (`portable-pty`, tokio channels, recording runtimes) to relocate
 without pulling those dependencies into domain-compat. Migrating it is
-a follow-up milestone.
+tracked as future work.
 
 ## Interaction patterns
 

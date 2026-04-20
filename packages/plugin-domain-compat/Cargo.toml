@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Opt-in domain-compat convenience extension for bmux plugins (temporary migration shim)"
+description = "Opt-in domain-flavored convenience surface for bmux plugins"
 edition     = { workspace = true }
 keywords    = ["bmux", "plugin", "domain", "compat"]
 license     = { workspace = true }

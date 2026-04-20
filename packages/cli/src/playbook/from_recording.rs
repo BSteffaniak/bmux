@@ -604,8 +604,8 @@ fn request_to_dsl(
             if data.is_empty() || !*has_session {
                 return RequestDslResult::Skip;
             }
-            // Use pane_id from the recording envelope if available (Phase 1.1),
-            // otherwise fall back to the tracker's focused pane.
+            // Use pane_id from the recording envelope if available, otherwise
+            // fall back to the tracker's focused pane.
             let pane_id = event.pane_id.or(state.focused_pane_id);
             RequestDslResult::CoalesceInput(data.clone(), pane_id)
         }
