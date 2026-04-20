@@ -6,8 +6,6 @@
 //!
 //! This package provides the command-line interface functionality for bmux.
 
-pub use bmux_config::{BmuxConfig, ConfigPaths};
-
 mod connection;
 mod runtime;
 pub(crate) mod sandbox_meta;
