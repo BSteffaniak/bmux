@@ -151,14 +151,6 @@ fn core_packages_do_not_reference_domain_plugin_markers() {
             include_str!("../../session/models/src/lib.rs"),
         ),
         (
-            "packages/terminal/src/lib.rs",
-            include_str!("../../terminal/src/lib.rs"),
-        ),
-        (
-            "packages/terminal/models/src/lib.rs",
-            include_str!("../../terminal/models/src/lib.rs"),
-        ),
-        (
             "packages/event/src/lib.rs",
             include_str!("../../event/src/lib.rs"),
         ),

@@ -1623,24 +1623,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bmux_terminal"
-version = "0.0.1-alpha.0"
-dependencies = [
- "anyhow",
- "bmux_session",
- "bmux_terminal_models",
- "tracing",
-]
-
-[[package]]
-name = "bmux_terminal_models"
-version = "0.0.1-alpha.0"
-dependencies = [
- "bmux_session_models",
- "serde",
-]
-
-[[package]]
 name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.0"
 dependencies = [
