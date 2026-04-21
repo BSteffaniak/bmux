@@ -25,6 +25,10 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_session_models::{ClientId, Session, SessionId, SessionInfo};
+use bmux_session_state::{
+    SessionManagerHandle, SessionManagerReader, SessionManagerSnapshot, SessionManagerWriter,
+};
 use bmux_sessions_plugin_api::sessions_commands::{
     self, KillSessionError, NewSessionError, ReconcileError, SelectSessionError, SessionAck,
     SessionSelector as CommandSessionSelector, SessionsCommandsService,
@@ -38,6 +42,115 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+
+/// Adapter wrapping the plugin's `Arc<RwLock<SessionManager>>` and
+/// implementing the domain-agnostic [`SessionManagerReader`] +
+/// [`SessionManagerWriter`] traits from `bmux_session_state`.
+///
+/// Registered as a [`SessionManagerHandle`] in the plugin state
+/// registry alongside the concrete `Arc<RwLock<SessionManager>>` so
+/// consumers can reach session-manager state through the trait
+/// surface without naming the concrete plugin-owned type.
+struct SessionManagerAdapter {
+    inner: Arc<RwLock<SessionManager>>,
+}
+
+impl SessionManagerAdapter {
+    fn with_read<T>(&self, f: impl FnOnce(&SessionManager) -> T, fallback: T) -> T {
+        self.inner.read().map_or(fallback, |guard| f(&guard))
+    }
+
+    fn with_write<T>(&self, f: impl FnOnce(&mut SessionManager) -> T, fallback: T) -> T {
+        self.inner
+            .write()
+            .map_or(fallback, |mut guard| f(&mut guard))
+    }
+}
+
+impl SessionManagerReader for SessionManagerAdapter {
+    fn list_sessions(&self) -> Vec<SessionInfo> {
+        self.with_read(SessionManager::list_sessions, Vec::<SessionInfo>::new())
+    }
+
+    fn get_session(&self, session_id: SessionId) -> Option<Session> {
+        self.with_read(|mgr| mgr.get_session(&session_id).cloned(), None)
+    }
+
+    fn contains(&self, session_id: SessionId) -> bool {
+        self.with_read(|mgr| mgr.get_session(&session_id).is_some(), false)
+    }
+}
+
+impl SessionManagerWriter for SessionManagerAdapter {
+    fn create_session(&self, name: Option<String>) -> anyhow::Result<SessionId> {
+        self.inner
+            .write()
+            .map_err(|_| anyhow::anyhow!("session-manager lock poisoned"))?
+            .create_session(name)
+    }
+
+    fn insert_session(&self, session: Session) -> anyhow::Result<()> {
+        self.inner
+            .write()
+            .map_err(|_| anyhow::anyhow!("session-manager lock poisoned"))?
+            .insert_session(session)
+    }
+
+    fn remove_session(&self, session_id: SessionId) -> anyhow::Result<()> {
+        self.inner
+            .write()
+            .map_err(|_| anyhow::anyhow!("session-manager lock poisoned"))?
+            .remove_session(&session_id)
+    }
+
+    fn add_client(&self, session_id: SessionId, client_id: ClientId) {
+        self.with_write(
+            |mgr| {
+                if let Some(session) = mgr.get_session_mut(&session_id) {
+                    session.add_client(client_id);
+                }
+            },
+            (),
+        );
+    }
+
+    fn remove_client(&self, session_id: SessionId, client_id: &ClientId) {
+        self.with_write(
+            |mgr| {
+                if let Some(session) = mgr.get_session_mut(&session_id) {
+                    session.remove_client(client_id);
+                }
+            },
+            (),
+        );
+    }
+
+    fn snapshot(&self) -> SessionManagerSnapshot {
+        self.with_read(
+            |mgr| {
+                let sessions = mgr
+                    .list_sessions()
+                    .into_iter()
+                    .filter_map(|info| mgr.get_session(&info.id).cloned())
+                    .collect();
+                SessionManagerSnapshot(sessions)
+            },
+            SessionManagerSnapshot::default(),
+        )
+    }
+
+    fn restore_snapshot(&self, snapshot: SessionManagerSnapshot) {
+        self.with_write(
+            |mgr| {
+                *mgr = SessionManager::new();
+                for session in snapshot.0 {
+                    let _ = mgr.insert_session(session);
+                }
+            },
+            (),
+        );
+    }
+}
 
 /// Wire-format argument for the typed `new-session` byte-dispatch call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +211,16 @@ impl RustPlugin for SessionsPlugin {
     ) -> std::result::Result<i32, PluginCommandError> {
         let state: Arc<RwLock<SessionManager>> = Arc::new(RwLock::new(SessionManager::new()));
         global_plugin_state_registry().register::<SessionManager>(&state);
+
+        // Register the trait-object handle so consumers can reach
+        // session-manager state through the domain-agnostic reader/writer
+        // surface without naming the concrete plugin-owned type.
+        let adapter = SessionManagerAdapter {
+            inner: Arc::clone(&state),
+        };
+        let handle = Arc::new(RwLock::new(SessionManagerHandle::new(adapter)));
+        global_plugin_state_registry().register::<SessionManagerHandle>(&handle);
+
         global_event_bus().register_channel::<SessionEvent>(sessions_events::EVENT_KIND);
         Ok(bmux_plugin_sdk::EXIT_OK)
     }

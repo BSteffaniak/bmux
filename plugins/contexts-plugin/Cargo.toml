@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bmux_clients_plugin_api  = { workspace = true }
+bmux_context_state       = { workspace = true }
 bmux_contexts_plugin_api = { workspace = true }
 bmux_ipc                 = { workspace = true }
 bmux_plugin              = { workspace = true }

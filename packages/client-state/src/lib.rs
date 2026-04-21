@@ -130,6 +130,18 @@ pub trait FollowStateWriter: FollowStateReader {
     ) -> Result<(Option<Uuid>, Option<SessionId>), &'static str>;
     /// Dissolve a follow relationship. Returns `true` if one existed.
     fn stop_follow(&self, follower_client_id: ClientId) -> bool;
+    /// Clear all follow relationships and every client's selected
+    /// context/session. Used by snapshot-restore paths that replace
+    /// all state in one shot.
+    fn clear_all_follow_state(&self);
+    /// Clear selections for every client whose currently-selected
+    /// session matches `session_id`. For each impacted client,
+    /// synchronize any global followers of that client.
+    ///
+    /// Used by server's `persist_selected_session` path when a
+    /// session is removed and every client tracking it needs to be
+    /// moved off that target.
+    fn clear_selections_for_session(&self, session_id: SessionId);
     /// Capture a full snapshot (for persistence).
     fn snapshot(&self) -> FollowStateSnapshot;
     /// Replace state with a previously-captured snapshot.
@@ -214,6 +226,8 @@ impl FollowStateWriter for NoopFollowState {
     fn stop_follow(&self, _follower_client_id: ClientId) -> bool {
         false
     }
+    fn clear_all_follow_state(&self) {}
+    fn clear_selections_for_session(&self, _session_id: SessionId) {}
     fn snapshot(&self) -> FollowStateSnapshot {
         FollowStateSnapshot::default()
     }

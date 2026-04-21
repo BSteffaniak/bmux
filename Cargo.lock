@@ -1236,6 +1236,7 @@ name = "bmux_contexts_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_clients_plugin_api",
+ "bmux_context_state",
  "bmux_contexts_plugin_api",
  "bmux_ipc",
  "bmux_plugin",
@@ -1725,10 +1726,12 @@ dependencies = [
 name = "bmux_sessions_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "anyhow",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_session_models",
+ "bmux_session_state",
  "bmux_sessions_plugin_api",
  "serde",
  "uuid",

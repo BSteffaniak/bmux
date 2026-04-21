@@ -534,12 +534,14 @@ fn follow_state_is_owned_by_clients_plugin() {
         );
     }
 
-    // Server must import FollowState from the clients plugin-api crate.
-    // Core must not depend on the plugin impl crate.
+    // Server must reach follow-state through the domain-agnostic
+    // `FollowStateHandle` from `bmux_client_state`, not through the
+    // concrete plugin-api type. Core must not depend on the plugin
+    // impl crate.
     assert!(
-        server_source.contains("use bmux_clients_plugin_api::"),
-        "packages/server/src/lib.rs must import FollowState via \
-         `use bmux_clients_plugin_api::...`",
+        server_source.contains("FollowStateHandle"),
+        "packages/server/src/lib.rs must reach follow state through \
+         `bmux_client_state::FollowStateHandle`",
     );
 
     // Clients plugin-api hosts the canonical type.
@@ -588,12 +590,14 @@ fn context_state_is_owned_by_contexts_plugin() {
         );
     }
 
-    // Server must import ContextState from the contexts plugin-api
-    // crate. Core must not depend on the plugin impl crate.
+    // Server must reach context-state through the domain-agnostic
+    // `ContextStateHandle` from `bmux_context_state`, not through the
+    // concrete plugin-api type. Core must not depend on the plugin
+    // impl crate.
     assert!(
-        server_source.contains("use bmux_contexts_plugin_api::"),
-        "packages/server/src/lib.rs must import ContextState via \
-         `use bmux_contexts_plugin_api::...`",
+        server_source.contains("ContextStateHandle"),
+        "packages/server/src/lib.rs must reach context state through \
+         `bmux_context_state::ContextStateHandle`",
     );
 
     // Contexts plugin-api hosts the canonical type.

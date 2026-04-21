@@ -15,10 +15,12 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+anyhow                   = { workspace = true, features = ["std"] }
 bmux_ipc                 = { workspace = true }
 bmux_plugin              = { workspace = true }
 bmux_plugin_sdk          = { workspace = true }
 bmux_session_models      = { workspace = true, features = ["serde"] }
+bmux_session_state       = { workspace = true }
 bmux_sessions_plugin_api = { workspace = true }
 serde                    = { workspace = true, features = ["derive", "std"] }
 uuid                     = { workspace = true, features = ["serde", "std"] }

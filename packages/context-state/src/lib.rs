@@ -96,6 +96,16 @@ pub trait ContextStateWriter: ContextStateReader {
     fn bind_session(&self, context_id: Uuid, session_id: SessionId) -> Result<(), &'static str>;
     /// Forget the client's selected-context.
     fn disconnect_client(&self, client_id: ClientId);
+    /// Remove a context by id, re-selecting replacement contexts for
+    /// impacted clients. `preferred_client` is favoured as the
+    /// destination of the replacement selection (used by close-flows
+    /// where the closer should pick up the next context). Returns
+    /// `(removed_id, removed_session)` when the context existed.
+    fn remove_context_by_id(
+        &self,
+        context_id: Uuid,
+        preferred_client: Option<ClientId>,
+    ) -> Option<(Uuid, Option<SessionId>)>;
     /// Capture a full snapshot for persistence.
     fn snapshot(&self) -> ContextStateSnapshot;
     /// Replace state with a previously-captured snapshot.
@@ -181,6 +191,13 @@ impl ContextStateWriter for NoopContextState {
         Err("contexts plugin not active")
     }
     fn disconnect_client(&self, _client_id: ClientId) {}
+    fn remove_context_by_id(
+        &self,
+        _context_id: Uuid,
+        _preferred_client: Option<ClientId>,
+    ) -> Option<(Uuid, Option<SessionId>)> {
+        None
+    }
     fn snapshot(&self) -> ContextStateSnapshot {
         ContextStateSnapshot::default()
     }

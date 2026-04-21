@@ -14,6 +14,10 @@ pub use bmux_contexts_plugin_api::ContextState;
 use bmux_clients_plugin_api::clients_state::{
     self as clients_state, ClientQueryError, ClientSummary,
 };
+use bmux_context_state::{
+    ContextStateHandle, ContextStateReader, ContextStateSnapshot, ContextStateWriter,
+    RuntimeContext,
+};
 use bmux_contexts_plugin_api::contexts_commands::{
     self, CloseContextError, ContextAck, ContextSelector as CommandContextSelector,
     ContextsCommandsService, CreateContextError, SelectContextError,
@@ -37,6 +41,171 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use uuid::Uuid;
+
+/// Adapter wrapping the plugin's `Arc<RwLock<ContextState>>` and
+/// implementing the domain-agnostic [`ContextStateReader`] +
+/// [`ContextStateWriter`] traits from `bmux_context_state`.
+///
+/// Registered as a [`ContextStateHandle`] in the plugin state registry
+/// alongside the concrete `Arc<RwLock<ContextState>>` so consumers can
+/// read context-state through the trait surface without naming the
+/// concrete plugin-owned type.
+struct ContextStateAdapter {
+    inner: Arc<RwLock<ContextState>>,
+}
+
+impl ContextStateAdapter {
+    fn with_read<T>(&self, f: impl FnOnce(&ContextState) -> T, fallback: T) -> T {
+        self.inner.read().map_or(fallback, |guard| f(&guard))
+    }
+
+    fn with_write<T>(&self, f: impl FnOnce(&mut ContextState) -> T, fallback: T) -> T {
+        self.inner
+            .write()
+            .map_or(fallback, |mut guard| f(&mut guard))
+    }
+}
+
+impl ContextStateReader for ContextStateAdapter {
+    fn list(&self) -> Vec<bmux_ipc::ContextSummary> {
+        self.with_read(ContextState::list, Vec::<bmux_ipc::ContextSummary>::new())
+    }
+
+    fn current_for_client(&self, client_id: ClientId) -> Option<bmux_ipc::ContextSummary> {
+        self.with_read(|state| state.current_for_client(client_id), None)
+    }
+
+    fn current_session_for_client(&self, client_id: ClientId) -> Option<SessionId> {
+        self.with_read(|state| state.current_session_for_client(client_id), None)
+    }
+
+    fn context_for_session(&self, session_id: SessionId) -> Option<Uuid> {
+        self.with_read(|state| state.context_for_session(session_id), None)
+    }
+
+    fn resolve_id(
+        &self,
+        selector: &bmux_ipc::ContextSelector,
+    ) -> std::result::Result<Uuid, &'static str> {
+        self.with_read(
+            |state| state.resolve_id(selector),
+            Err("context-state lock poisoned"),
+        )
+    }
+}
+
+impl ContextStateWriter for ContextStateAdapter {
+    fn create(
+        &self,
+        client_id: ClientId,
+        name: Option<String>,
+        attributes: BTreeMap<String, String>,
+    ) -> bmux_ipc::ContextSummary {
+        let fallback = bmux_ipc::ContextSummary {
+            id: Uuid::nil(),
+            name: name.clone(),
+            attributes: attributes.clone(),
+        };
+        self.with_write(|state| state.create(client_id, name, attributes), fallback)
+    }
+
+    fn select_for_client(
+        &self,
+        client_id: ClientId,
+        selector: &bmux_ipc::ContextSelector,
+    ) -> std::result::Result<bmux_ipc::ContextSummary, &'static str> {
+        self.with_write(
+            |state| state.select_for_client(client_id, selector),
+            Err("context-state lock poisoned"),
+        )
+    }
+
+    fn close(
+        &self,
+        client_id: ClientId,
+        selector: &bmux_ipc::ContextSelector,
+        force: bool,
+    ) -> std::result::Result<(Uuid, Option<SessionId>), &'static str> {
+        self.with_write(
+            |state| state.close(client_id, selector, force),
+            Err("context-state lock poisoned"),
+        )
+    }
+
+    fn remove_contexts_for_session(&self, session_id: SessionId) -> Vec<Uuid> {
+        self.with_write(
+            |state| state.remove_contexts_for_session(session_id),
+            Vec::new(),
+        )
+    }
+
+    fn bind_session(
+        &self,
+        context_id: Uuid,
+        session_id: SessionId,
+    ) -> std::result::Result<(), &'static str> {
+        self.with_write(
+            |state| state.bind_session(context_id, session_id),
+            Err("context-state lock poisoned"),
+        )
+    }
+
+    fn disconnect_client(&self, client_id: ClientId) {
+        self.with_write(|state| state.disconnect_client(client_id), ());
+    }
+
+    fn remove_context_by_id(
+        &self,
+        context_id: Uuid,
+        preferred_client: Option<ClientId>,
+    ) -> Option<(Uuid, Option<SessionId>)> {
+        self.with_write(
+            |state| state.remove_context_by_id(context_id, preferred_client),
+            None,
+        )
+    }
+
+    fn snapshot(&self) -> ContextStateSnapshot {
+        self.with_read(
+            |state| {
+                let contexts = state
+                    .contexts
+                    .iter()
+                    .map(|(id, rc)| {
+                        (
+                            *id,
+                            RuntimeContext {
+                                id: rc.id,
+                                name: rc.name.clone(),
+                                attributes: rc.attributes.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                ContextStateSnapshot {
+                    contexts,
+                    session_by_context: state.session_by_context.clone(),
+                    selected_by_client: state.selected_by_client.clone(),
+                    mru_contexts: state.mru_contexts.clone(),
+                }
+            },
+            ContextStateSnapshot::default(),
+        )
+    }
+
+    fn restore_snapshot(&self, snapshot: ContextStateSnapshot) {
+        self.with_write(
+            |state| {
+                state.contexts = snapshot.contexts;
+                state.session_by_context = snapshot.session_by_context;
+                state.selected_by_client = snapshot.selected_by_client;
+                state.mru_contexts = snapshot.mru_contexts;
+            },
+            (),
+        );
+    }
+}
 
 // ── Argument records (wire) ─────────────────────────────────────────
 
@@ -89,6 +258,16 @@ impl RustPlugin for ContextsPlugin {
     ) -> std::result::Result<i32, PluginCommandError> {
         let state: Arc<RwLock<ContextState>> = Arc::new(RwLock::new(ContextState::default()));
         global_plugin_state_registry().register::<ContextState>(&state);
+
+        // Register the trait-object handle so consumers can reach
+        // context state through the domain-agnostic reader/writer
+        // surface without naming the concrete plugin-owned type.
+        let adapter = ContextStateAdapter {
+            inner: Arc::clone(&state),
+        };
+        let handle = Arc::new(RwLock::new(ContextStateHandle::new(adapter)));
+        global_plugin_state_registry().register::<ContextStateHandle>(&handle);
+
         // Register the typed event channel for `contexts-events`.
         // Consumers subscribe via
         // `global_event_bus().subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)`.

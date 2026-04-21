@@ -161,6 +161,40 @@ impl FollowStateWriter for FollowStateAdapter {
         self.with_write(|state| state.stop_follow(follower_client_id), false)
     }
 
+    fn clear_all_follow_state(&self) {
+        self.with_write(
+            |state| {
+                state.follows.clear();
+                state.selected_contexts.clear();
+                state.selected_sessions.clear();
+            },
+            (),
+        );
+    }
+
+    fn clear_selections_for_session(&self, session_id: SessionId) {
+        self.with_write(
+            |state| {
+                let affected_clients: Vec<ClientId> = state
+                    .selected_sessions
+                    .iter()
+                    .filter_map(|(client_id, selected)| {
+                        (*selected == Some(session_id)).then_some(*client_id)
+                    })
+                    .collect();
+
+                for client_id in &affected_clients {
+                    state.selected_contexts.insert(*client_id, None);
+                    state.selected_sessions.insert(*client_id, None);
+                }
+                for client_id in affected_clients {
+                    let _ = state.sync_followers_from_leader(client_id, None, None);
+                }
+            },
+            (),
+        );
+    }
+
     fn snapshot(&self) -> FollowStateSnapshot {
         self.with_read(
             |state| FollowStateSnapshot {
