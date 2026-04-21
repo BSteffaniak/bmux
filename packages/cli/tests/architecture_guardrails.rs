@@ -840,3 +840,43 @@ fn control_catalog_plugin_exists() {
          cross-process subscribers",
     );
 }
+
+/// Verify that the follow-client IPC variants
+/// (`Request::FollowClient`, `Request::Unfollow`) and their response
+/// payloads (`ResponsePayload::FollowStarted`,
+/// `ResponsePayload::FollowStopped`) have been deleted. Follow
+/// orchestration lives in `clients-plugin`'s typed
+/// `clients-commands::set-following` handler; the server bridges the
+/// plugin's typed `ClientEvent::{FollowStarted, FollowStopped,
+/// FollowTargetChanged}` into the legacy wire
+/// `Event::{FollowStarted, FollowStopped, FollowTargetChanged}`.
+#[test]
+fn follow_ipc_variants_are_absent() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    let denied = [
+        "    FollowClient {",
+        "    Unfollow,",
+        "ResponsePayload::FollowStarted",
+        "ResponsePayload::FollowStopped",
+    ];
+    for marker in denied {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; \
+             follow orchestration goes through typed \
+             `clients-commands::set-following` dispatch",
+        );
+    }
+
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_source = production_section(server_source);
+    assert!(
+        server_source.contains("fn spawn_client_events_bridge"),
+        "packages/server/src/lib.rs must define \
+         `spawn_client_events_bridge` to map the clients plugin's \
+         typed `ClientEvent::{{FollowStarted, FollowStopped, \
+         FollowTargetChanged}}` into the legacy wire \
+         `Event::{{FollowStarted, FollowStopped, \
+         FollowTargetChanged}}` for cross-process subscribers",
+    );
+}

@@ -23,7 +23,7 @@ use bmux_plugin::{
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_sessions_plugin_api::sessions_commands::{
-    self, KillSessionError, NewSessionError, SelectSessionError, SessionAck,
+    self, KillSessionError, NewSessionError, ReconcileError, SelectSessionError, SessionAck,
     SessionSelector as CommandSessionSelector, SessionsCommandsService,
 };
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
@@ -53,6 +53,16 @@ struct KillSessionArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SelectorArgs {
     selector: WireSelector,
+}
+
+/// Wire-format argument for `reconcile-client-membership`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReconcileArgs {
+    client_id: ::uuid::Uuid,
+    #[serde(default)]
+    previous: Option<::uuid::Uuid>,
+    #[serde(default)]
+    next: Option<::uuid::Uuid>,
 }
 
 /// Wire-format selector.
@@ -119,6 +129,11 @@ impl RustPlugin for SessionsPlugin {
             "sessions-commands", "select-session" => |req: SelectorArgs, ctx| {
                 Ok::<Result<SessionAck, SelectSessionError>, ServiceResponse>(
                     select_session_via_ipc(ctx, &req.selector)
+                )
+            },
+            "sessions-commands", "reconcile-client-membership" => |req: ReconcileArgs, _ctx| {
+                Ok::<Result<SessionAck, ReconcileError>, ServiceResponse>(
+                    reconcile_client_membership_local(&req)
                 )
             },
         })
@@ -212,6 +227,38 @@ fn session_info_to_typed(info: bmux_session_models::SessionInfo) -> SessionSumma
         name: info.name,
         client_count: u32::try_from(info.client_count).unwrap_or(u32::MAX),
     }
+}
+
+fn reconcile_client_membership_local(req: &ReconcileArgs) -> Result<SessionAck, ReconcileError> {
+    use bmux_session_models::{ClientId, SessionId};
+
+    let Some(state) = global_plugin_state_registry().get::<SessionManager>() else {
+        return Err(ReconcileError::Failed {
+            reason: "sessions plugin state not registered".to_string(),
+        });
+    };
+    let mut manager = state.write().map_err(|_| ReconcileError::Failed {
+        reason: "session manager lock poisoned".to_string(),
+    })?;
+
+    let client_id = ClientId(req.client_id);
+
+    if let Some(previous_uuid) = req.previous
+        && let Some(session) = manager.get_session_mut(&SessionId(previous_uuid))
+    {
+        session.remove_client(&client_id);
+    }
+
+    if let Some(next_uuid) = req.next
+        && let Some(session) = manager.get_session_mut(&SessionId(next_uuid))
+    {
+        session.add_client(client_id);
+    }
+    drop(manager);
+
+    Ok(SessionAck {
+        id: req.next.unwrap_or_else(::uuid::Uuid::nil),
+    })
 }
 
 // ── IPC helpers ──────────────────────────────────────────────────────
@@ -412,6 +459,22 @@ impl SessionsCommandsService for SessionsCommandsHandle {
                 name: selector.name,
             };
             select_session_via_ipc(self.caller.as_ref(), &wire)
+        })
+    }
+
+    fn reconcile_client_membership<'a>(
+        &'a self,
+        client_id: ::uuid::Uuid,
+        previous: Option<::uuid::Uuid>,
+        next: Option<::uuid::Uuid>,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<SessionAck, ReconcileError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            reconcile_client_membership_local(&ReconcileArgs {
+                client_id,
+                previous,
+                next,
+            })
         })
     }
 }

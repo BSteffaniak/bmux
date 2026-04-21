@@ -69,6 +69,11 @@ interface sessions-commands {
         denied { reason: string },
     }
 
+    // Errors a `reconcile-client-membership` command can produce.
+    variant reconcile-error {
+        failed { reason: string },
+    }
+
     // Acknowledgement returned by mutating session commands. `id`
     // carries the target session id after the operation (the newly
     // created one for `new-session`, or the resolved selector for
@@ -82,6 +87,18 @@ interface sessions-commands {
         -> result<session-ack, kill-session-error>;
     command select-session(selector: session-selector)
         -> result<session-ack, select-session-error>;
+
+    // Update which client is considered attached to which session. When
+    // follow orchestration reroutes a client to a new session, this
+    // command removes the client from the previous session's client set
+    // and adds it to the new one. Passing `none` for either side is a
+    // no-op for that side. Returns a `session-ack` carrying the new
+    // session id when present, else the zero uuid.
+    command reconcile-client-membership(
+        client-id: uuid,
+        previous: uuid?,
+        next: uuid?,
+    ) -> result<session-ack, reconcile-error>;
 }
 
 interface sessions-events {

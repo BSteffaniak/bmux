@@ -171,60 +171,230 @@ fn current_client_local(caller_client_id: Option<Uuid>) -> Result<ClientSummary,
         .ok_or(ClientQueryError::NotFound)
 }
 
+#[allow(clippy::too_many_lines)]
 fn set_following_via_ipc(
     caller: &impl ServiceCaller,
     caller_client_id: Option<Uuid>,
     req: &SetFollowingArgs,
 ) -> Result<ClientAck, SetFollowingError> {
+    use bmux_session_models::{ClientId, SessionId};
+
     // Determine self-id for the returned `ClientAck`.
     let Some(self_id) = caller_client_id else {
         return Err(SetFollowingError::Denied {
             reason: "no current client identity".to_string(),
         });
     };
+    let self_client_id = ClientId(self_id);
 
-    // Route to FollowClient or Unfollow depending on whether the caller
-    // is enabling or disabling follow mode. Passing `target-client-id =
-    // None` and `global = false` disables follow; any other combination
-    // starts a follow relationship with the given target (or the current
-    // leader when `global = true`).
-    let request = match (req.target_client_id, req.global) {
-        (None, false) => bmux_ipc::Request::Unfollow,
-        (Some(target), global) => bmux_ipc::Request::FollowClient {
-            target_client_id: target,
-            global,
-        },
-        (None, true) => {
-            // Global follow with no explicit target is not representable
-            // in today's IPC surface. Surface an actionable error.
-            return Err(SetFollowingError::Denied {
-                reason: "global follow requires an explicit target client id".to_string(),
-            });
-        }
+    // Validate inputs.
+    if (req.target_client_id, req.global) == (None, true) {
+        return Err(SetFollowingError::Denied {
+            reason: "global follow requires an explicit target client id".to_string(),
+        });
+    }
+
+    // Acquire plugin-owned FollowState.
+    let Some(state_handle) = global_plugin_state_registry().get::<FollowState>() else {
+        return Err(SetFollowingError::Denied {
+            reason: "clients plugin state not registered".to_string(),
+        });
     };
 
-    match caller.execute_kernel_request(request) {
-        Ok(
-            bmux_ipc::ResponsePayload::FollowStarted { .. }
-            | bmux_ipc::ResponsePayload::FollowStopped { .. },
-        ) => {
+    // Disable-follow path: target_client_id == None && global == false.
+    if req.target_client_id.is_none() {
+        let removed = {
+            let mut follow_state = state_handle
+                .write()
+                .map_err(|_| SetFollowingError::Denied {
+                    reason: "follow state lock poisoned".to_string(),
+                })?;
+            follow_state.stop_follow(self_client_id)
+        };
+        if removed {
             let _ = global_event_bus().emit(
                 &clients_events::EVENT_KIND,
                 ClientEvent::FollowChanged {
                     client_id: self_id,
-                    target_client_id: req.target_client_id,
-                    global: req.global,
+                    target_client_id: None,
+                    global: false,
                 },
             );
-            Ok(ClientAck { client_id: self_id })
+            let _ = global_event_bus().emit(
+                &clients_events::EVENT_KIND,
+                ClientEvent::FollowStopped {
+                    follower_client_id: self_id,
+                },
+            );
         }
-        Ok(_) => Err(SetFollowingError::Denied {
-            reason: "unexpected response payload for set-following".to_string(),
-        }),
-        Err(err) => Err(SetFollowingError::Denied {
-            reason: err.to_string(),
-        }),
+        return Ok(ClientAck { client_id: self_id });
     }
+
+    // Enable-follow path.
+    let target_client_id = req.target_client_id.expect("validated above");
+    let leader_client_id = ClientId(target_client_id);
+
+    let (initial_target_context, initial_target_session) = {
+        let mut follow_state = state_handle
+            .write()
+            .map_err(|_| SetFollowingError::Denied {
+                reason: "follow state lock poisoned".to_string(),
+            })?;
+        match follow_state.start_follow(self_client_id, leader_client_id, req.global) {
+            Ok(initial) => initial,
+            Err(reason) => {
+                return Err(SetFollowingError::Denied {
+                    reason: reason.to_string(),
+                });
+            }
+        }
+    };
+
+    // For global follow, mirror the leader's selection onto the
+    // follower: select the leader's context and reconcile session
+    // membership. Typed dispatch into contexts-commands +
+    // sessions-commands keeps this plugin ignorant of the other
+    // plugins' internals.
+    if req.global {
+        if let Some(initial_target_context) = initial_target_context {
+            let _ = select_context_via_typed_dispatch(caller, initial_target_context);
+        }
+
+        // Determine the follower's previous session, for session
+        // membership reconciliation.
+        let previous_session: Option<SessionId> = {
+            let follow_state = state_handle.read().map_err(|_| SetFollowingError::Denied {
+                reason: "follow state lock poisoned".to_string(),
+            })?;
+            follow_state
+                .selected_sessions
+                .get(&self_client_id)
+                .copied()
+                .flatten()
+        };
+
+        // Update FollowState to point the follower at the leader's
+        // session. `set_selected_target` writes selected_contexts and
+        // selected_sessions atomically.
+        let _ = {
+            let mut follow_state = state_handle
+                .write()
+                .map_err(|_| SetFollowingError::Denied {
+                    reason: "follow state lock poisoned".to_string(),
+                })?;
+            follow_state.set_selected_target(
+                self_client_id,
+                initial_target_context,
+                initial_target_session,
+            );
+            follow_state.sync_followers_from_leader(
+                leader_client_id,
+                initial_target_context,
+                initial_target_session,
+            )
+        };
+
+        // Reconcile session-manager client membership via typed dispatch.
+        if previous_session != initial_target_session {
+            let _ = reconcile_client_membership_via_typed_dispatch(
+                caller,
+                self_id,
+                previous_session.map(|s| s.0),
+                initial_target_session.map(|s| s.0),
+            );
+        }
+    }
+
+    // Emit event-bus events: generic FollowChanged for plugin
+    // consumers, plus the wire-shape FollowStarted / FollowTargetChanged
+    // events that the server bridges into `bmux_ipc::Event::*`.
+    let _ = global_event_bus().emit(
+        &clients_events::EVENT_KIND,
+        ClientEvent::FollowChanged {
+            client_id: self_id,
+            target_client_id: Some(target_client_id),
+            global: req.global,
+        },
+    );
+    let _ = global_event_bus().emit(
+        &clients_events::EVENT_KIND,
+        ClientEvent::FollowStarted {
+            follower_client_id: self_id,
+            leader_client_id: target_client_id,
+            global: req.global,
+        },
+    );
+    if let Some(session_id) = initial_target_session {
+        let _ = global_event_bus().emit(
+            &clients_events::EVENT_KIND,
+            ClientEvent::FollowTargetChanged {
+                follower_client_id: self_id,
+                leader_client_id: target_client_id,
+                context_id: initial_target_context,
+                session_id: session_id.0,
+            },
+        );
+    }
+
+    Ok(ClientAck { client_id: self_id })
+}
+
+fn select_context_via_typed_dispatch(
+    caller: &impl ServiceCaller,
+    context_id: Uuid,
+) -> Result<(), String> {
+    #[derive(serde::Serialize)]
+    struct Selector {
+        id: Option<Uuid>,
+        name: Option<String>,
+    }
+    #[derive(serde::Serialize)]
+    struct Args {
+        selector: Selector,
+    }
+    let _: serde_json::Value = caller
+        .call_service(
+            "bmux.contexts.write",
+            ServiceKind::Command,
+            "contexts-commands",
+            "select-context",
+            &Args {
+                selector: Selector {
+                    id: Some(context_id),
+                    name: None,
+                },
+            },
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn reconcile_client_membership_via_typed_dispatch(
+    caller: &impl ServiceCaller,
+    client_id: Uuid,
+    previous: Option<Uuid>,
+    next: Option<Uuid>,
+) -> Result<(), String> {
+    #[derive(serde::Serialize)]
+    struct Args {
+        client_id: Uuid,
+        previous: Option<Uuid>,
+        next: Option<Uuid>,
+    }
+    let _: serde_json::Value = caller
+        .call_service(
+            "bmux.sessions.write",
+            ServiceKind::Command,
+            "sessions-commands",
+            "reconcile-client-membership",
+            &Args {
+                client_id,
+                previous,
+                next,
+            },
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 // ── Typed handles ────────────────────────────────────────────────────

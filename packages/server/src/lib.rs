@@ -4881,6 +4881,13 @@ impl BmuxServer {
         // revision counter; server only fans out.
         spawn_control_catalog_bridge(Arc::clone(&self.state));
 
+        // Bridge typed `ClientEvent::{FollowStarted, FollowStopped,
+        // FollowTargetChanged}` from the clients plugin into the
+        // legacy wire `Event::{FollowStarted, FollowStopped,
+        // FollowTargetChanged}` for cross-process attach-UI
+        // subscribers.
+        spawn_client_events_bridge(Arc::clone(&self.state));
+
         // Periodic recording retention enforcement.
         let recording_prune_runtime = Arc::clone(&self.state.manual_recording_runtime);
         let mut prune_shutdown_rx = self.shutdown_tx.subscribe();
@@ -5635,6 +5642,69 @@ fn spawn_control_catalog_bridge(state: Arc<ServerState>) {
                     full_resync,
                 },
             );
+        }
+    });
+}
+
+/// Spawn the clients-plugin event bridge.
+///
+/// Subscribes to the typed `ClientEvent` stream emitted by the
+/// `bmux.clients` plugin and maps the follow-lifecycle variants into
+/// the legacy wire `Event::{FollowStarted, FollowStopped,
+/// FollowTargetChanged}` variants on the server's cross-process event
+/// pipeline. Other `ClientEvent` variants (e.g. `Attached`, `Detached`,
+/// `SessionSelected`, `FollowChanged`) are plugin-only signals and do
+/// not bridge to the wire today.
+fn spawn_client_events_bridge(state: Arc<ServerState>) {
+    use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
+    let Ok(mut rx) =
+        bmux_plugin::global_event_bus().subscribe::<ClientEvent>(&clients_events::EVENT_KIND)
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        while let Ok(event) = rx.recv().await {
+            match (*event).clone() {
+                ClientEvent::FollowStarted {
+                    follower_client_id,
+                    leader_client_id,
+                    global,
+                } => {
+                    let _ = emit_event(
+                        &state,
+                        Event::FollowStarted {
+                            follower_client_id,
+                            leader_client_id,
+                            global,
+                        },
+                    );
+                }
+                ClientEvent::FollowStopped { follower_client_id } => {
+                    let _ = emit_event(&state, Event::FollowStopped { follower_client_id });
+                }
+                ClientEvent::FollowTargetChanged {
+                    follower_client_id,
+                    leader_client_id,
+                    context_id,
+                    session_id,
+                } => {
+                    let _ = emit_event(
+                        &state,
+                        Event::FollowTargetChanged {
+                            follower_client_id,
+                            leader_client_id,
+                            context_id,
+                            session_id,
+                        },
+                    );
+                }
+                ClientEvent::Attached { .. }
+                | ClientEvent::Detached { .. }
+                | ClientEvent::SessionSelected { .. }
+                | ClientEvent::FollowChanged { .. } => {
+                    // Plugin-only signals; no legacy wire equivalent.
+                }
+            }
         }
     });
 }
@@ -7721,99 +7791,6 @@ async fn handle_request(
 
             Response::Ok(ResponsePayload::SessionKilled { id: session_id.0 })
         }
-        Request::FollowClient {
-            target_client_id,
-            global,
-        } => {
-            let leader_client_id = ClientId(target_client_id);
-            let (initial_target_context, initial_target_session) = {
-                let mut follow_state = state
-                    .follow_state
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-                match follow_state.start_follow(client_id, leader_client_id, global) {
-                    Ok(initial) => initial,
-                    Err(reason) => {
-                        return Ok(Response::Err(ErrorResponse {
-                            code: ErrorCode::InvalidRequest,
-                            message: reason.to_string(),
-                        }));
-                    }
-                }
-            };
-
-            if global {
-                let previous_selected = *selected_session;
-                *selected_session = initial_target_session;
-                reconcile_selected_session_membership(
-                    state,
-                    client_id,
-                    previous_selected,
-                    *selected_session,
-                )?;
-
-                if let Some(initial_target_context) = initial_target_context {
-                    let mut context_state = state
-                        .context_state
-                        .write()
-                        .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
-                    let _ = context_state.select_for_client(
-                        client_id,
-                        &ContextSelector::ById(initial_target_context),
-                    );
-                }
-            }
-
-            emit_event(
-                state,
-                Event::FollowStarted {
-                    follower_client_id: client_id.0,
-                    leader_client_id: leader_client_id.0,
-                    global,
-                },
-            )?;
-
-            if let Some(session_id) = initial_target_session {
-                emit_event(
-                    state,
-                    Event::FollowTargetChanged {
-                        follower_client_id: client_id.0,
-                        leader_client_id: leader_client_id.0,
-                        context_id: initial_target_context
-                            .or_else(|| current_context_id_for_client(state, leader_client_id)),
-                        session_id: session_id.0,
-                    },
-                )?;
-            }
-
-            Response::Ok(ResponsePayload::FollowStarted {
-                follower_client_id: client_id.0,
-                leader_client_id: leader_client_id.0,
-                global,
-            })
-        }
-        Request::Unfollow => {
-            let removed = {
-                let mut follow_state = state
-                    .follow_state
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-                follow_state.stop_follow(client_id)
-            };
-
-            if removed {
-                emit_event(
-                    state,
-                    Event::FollowStopped {
-                        follower_client_id: client_id.0,
-                    },
-                )?;
-            }
-
-            Response::Ok(ResponsePayload::FollowStopped {
-                follower_client_id: client_id.0,
-            })
-        }
         Request::Attach { selector } => {
             let mut manager = state
                 .session_manager
@@ -9166,8 +9143,6 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::ClosePane { .. }
             | Request::RestartPane { .. }
             | Request::ZoomPane { .. }
-            | Request::FollowClient { .. }
-            | Request::Unfollow
             | Request::Attach { .. }
             | Request::AttachContext { .. }
             | Request::AttachOpen { .. }
@@ -9201,8 +9176,6 @@ const fn response_requires_snapshot(response: &Response) -> bool {
                 | ResponsePayload::PaneClosed { .. }
                 | ResponsePayload::PaneRestarted { .. }
                 | ResponsePayload::SessionKilled { .. }
-                | ResponsePayload::FollowStarted { .. }
-                | ResponsePayload::FollowStopped { .. }
                 | ResponsePayload::Attached { .. }
                 | ResponsePayload::Detached
         )
@@ -9232,8 +9205,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ClosePane { .. } => "close_pane",
         Request::RestartPane { .. } => "restart_pane",
         Request::ZoomPane { .. } => "zoom_pane",
-        Request::FollowClient { .. } => "follow_client",
-        Request::Unfollow => "unfollow",
         Request::Attach { .. } => "attach",
         Request::AttachContext { .. } => "attach_context",
         Request::AttachOpen { .. } => "attach_open",
@@ -9510,8 +9481,6 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::PaneClosed { .. } => "pane_closed",
         ResponsePayload::PaneRestarted { .. } => "pane_restarted",
         ResponsePayload::PaneZoomed { .. } => "pane_zoomed",
-        ResponsePayload::FollowStarted { .. } => "follow_started",
-        ResponsePayload::FollowStopped { .. } => "follow_stopped",
         ResponsePayload::Attached { .. } => "attached",
         ResponsePayload::AttachReady { .. } => "attach_ready",
         ResponsePayload::AttachInputAccepted { .. } => "attach_input_accepted",

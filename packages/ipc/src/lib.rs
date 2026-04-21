@@ -533,11 +533,6 @@ pub enum Request {
     ListPanes {
         session: Option<SessionSelector>,
     },
-    FollowClient {
-        target_client_id: Uuid,
-        global: bool,
-    },
-    Unfollow,
     Attach {
         selector: SessionSelector,
     },
@@ -1209,14 +1204,6 @@ pub enum ResponsePayload {
     },
     PaneList {
         panes: Vec<PaneSummary>,
-    },
-    FollowStarted {
-        follower_client_id: Uuid,
-        leader_client_id: Uuid,
-        global: bool,
-    },
-    FollowStopped {
-        follower_client_id: Uuid,
     },
     Attached {
         grant: AttachGrant,
@@ -2039,11 +2026,6 @@ mod tests {
                 session: Some(SessionSelector::ById(id)),
             },
             Request::ListPanes { session: None },
-            Request::FollowClient {
-                target_client_id: id,
-                global: true,
-            },
-            Request::Unfollow,
             Request::Attach {
                 selector: SessionSelector::ByName("main".into()),
             },
@@ -2403,14 +2385,6 @@ mod tests {
                         state_reason: Some("process exited".into()),
                     },
                 ],
-            },
-            ResponsePayload::FollowStarted {
-                follower_client_id: id,
-                leader_client_id: id2,
-                global: true,
-            },
-            ResponsePayload::FollowStopped {
-                follower_client_id: id,
             },
             ResponsePayload::Attached {
                 grant: AttachGrant {

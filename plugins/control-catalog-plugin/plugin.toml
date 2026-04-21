@@ -7,6 +7,21 @@ provided_features     = ["bmux.control_catalog"]
 required_capabilities = []
 version               = "0.0.1-alpha.0"
 
+# control-catalog subscribes to typed events from these foundational
+# plugins, so they must activate first so their event channels are
+# registered on the event bus.
+[[dependencies]]
+plugin_id   = "bmux.sessions"
+version_req = ">=0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.contexts"
+version_req = ">=0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.clients"
+version_req = ">=0.0.1-alpha.0"
+
 [[services]]
 capability   = "bmux.control_catalog.read"
 interface_id = "control-catalog-state"

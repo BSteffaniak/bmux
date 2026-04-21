@@ -79,6 +79,27 @@ interface clients-events {
             target-client-id: uuid?,
             global: bool,
         },
+        // A client started following a leader. Carries enough context
+        // for cross-process subscribers to mirror the leader's current
+        // selection.
+        follow-started {
+            follower-client-id: uuid,
+            leader-client-id: uuid,
+            global: bool,
+        },
+        // A client stopped following any leader.
+        follow-stopped {
+            follower-client-id: uuid,
+        },
+        // The follow-target's current selection changed. Emitted when
+        // the leader's selected session (and optionally selected
+        // context) moves, so the follower's UI can retarget.
+        follow-target-changed {
+            follower-client-id: uuid,
+            leader-client-id: uuid,
+            context-id: uuid?,
+            session-id: uuid,
+        },
     }
 
     events client-event;

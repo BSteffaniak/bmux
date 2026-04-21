@@ -164,6 +164,15 @@ spawned during `BmuxServer::run`, so cross-process attach UIs keep
 receiving the same catalog-changed signal they did before the
 migration.
 
+Follow orchestration (client A mirrors client B's selected session)
+lives entirely in `clients-plugin`. The typed `clients-commands:: set-following` handler mutates plugin-owned `FollowState` directly,
+dispatches `contexts-commands::select-context` and
+`sessions-commands::reconcile-client-membership` to the other
+foundational plugins, and emits typed `ClientEvent::{FollowStarted, FollowStopped, FollowTargetChanged}` on the plugin event bus. The
+server's `spawn_client_events_bridge` task maps those typed events to
+the legacy wire `Event::{FollowStarted, FollowStopped, FollowTargetChanged}` for cross-process subscribers, following the
+same pattern as the control-catalog bridge.
+
 `SessionRuntimeManager` (the heavier pane-runtime / snapshot /
 recording orchestration struct) remains in `packages/server` for now —
 it is too entangled with server-specific runtime primitives
