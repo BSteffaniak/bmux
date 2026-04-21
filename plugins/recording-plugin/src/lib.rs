@@ -81,11 +81,25 @@ fn handle_recording_request(req: RecordingRequest) -> RecordingResponse {
         RecordingRequest::Stop { recording_id } => handle_stop(recording_id),
         RecordingRequest::Status => handle_status(),
         RecordingRequest::List => handle_list(),
-        // Operations not yet implemented in the plugin — server still
-        // handles these through the legacy `Request::Recording*` IPC
-        // variants. This arm returns a placeholder response so the
-        // plugin's byte-dispatch surface is discoverable end-to-end.
-        _ => RecordingResponse::CustomEventWritten { accepted: false },
+        RecordingRequest::Delete { recording_id } => handle_delete(recording_id),
+        RecordingRequest::DeleteAll => handle_delete_all(),
+        RecordingRequest::Prune { older_than_days } => handle_prune(older_than_days),
+        // Rolling-* + Cut + CaptureTargets + WriteCustomEvent are not
+        // yet implemented in the plugin — server still handles these
+        // through the legacy `Request::Recording*` IPC variants. These
+        // reach into server-owned config (rolling defaults, segment
+        // size, recordings root) that the plugin cannot currently
+        // access. Full migration is a follow-up once the plugin can
+        // query server config via typed dispatch.
+        RecordingRequest::WriteCustomEvent { .. }
+        | RecordingRequest::Cut { .. }
+        | RecordingRequest::RollingStart { .. }
+        | RecordingRequest::RollingStop
+        | RecordingRequest::RollingStatus
+        | RecordingRequest::RollingClear { .. }
+        | RecordingRequest::CaptureTargets => {
+            RecordingResponse::CustomEventWritten { accepted: false }
+        }
     }
 }
 
@@ -180,6 +194,54 @@ fn handle_list() -> RecordingResponse {
     };
     RecordingResponse::List {
         recordings: runtime.list().unwrap_or_default(),
+    }
+}
+
+fn handle_delete(recording_id: uuid::Uuid) -> RecordingResponse {
+    let Some(handle) = global_plugin_state_registry().get::<ManualRecordingRuntimeHandle>() else {
+        return RecordingResponse::CustomEventWritten { accepted: false };
+    };
+    let Ok(guard) = handle.read() else {
+        return RecordingResponse::CustomEventWritten { accepted: false };
+    };
+    let Ok(mut runtime) = guard.0.lock() else {
+        return RecordingResponse::CustomEventWritten { accepted: false };
+    };
+    match runtime.delete(recording_id) {
+        Ok(summary) => RecordingResponse::Deleted {
+            recording_id: summary.id,
+        },
+        Err(_) => RecordingResponse::CustomEventWritten { accepted: false },
+    }
+}
+
+fn handle_delete_all() -> RecordingResponse {
+    let Some(handle) = global_plugin_state_registry().get::<ManualRecordingRuntimeHandle>() else {
+        return RecordingResponse::DeleteAll { removed_count: 0 };
+    };
+    let Ok(guard) = handle.read() else {
+        return RecordingResponse::DeleteAll { removed_count: 0 };
+    };
+    let Ok(mut runtime) = guard.0.lock() else {
+        return RecordingResponse::DeleteAll { removed_count: 0 };
+    };
+    RecordingResponse::DeleteAll {
+        removed_count: runtime.delete_all().unwrap_or(0),
+    }
+}
+
+fn handle_prune(older_than_days: Option<u64>) -> RecordingResponse {
+    let Some(handle) = global_plugin_state_registry().get::<ManualRecordingRuntimeHandle>() else {
+        return RecordingResponse::Pruned { pruned_count: 0 };
+    };
+    let Ok(guard) = handle.read() else {
+        return RecordingResponse::Pruned { pruned_count: 0 };
+    };
+    let Ok(runtime) = guard.0.lock() else {
+        return RecordingResponse::Pruned { pruned_count: 0 };
+    };
+    RecordingResponse::Pruned {
+        pruned_count: runtime.prune(older_than_days).unwrap_or(0),
     }
 }
 
