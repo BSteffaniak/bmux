@@ -17,6 +17,7 @@ bmux_plugin_schema_macros::schema! {
 }
 
 pub mod follow_state;
+pub mod typed_client;
 pub use follow_state::FollowState;
 
 /// Capability identifiers gating access to this plugin's surfaces.

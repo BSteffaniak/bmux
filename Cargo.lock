@@ -1019,6 +1019,7 @@ dependencies = [
  "bmux_contexts_plugin",
  "bmux_contexts_plugin_api",
  "bmux_control_catalog_plugin",
+ "bmux_control_catalog_plugin_api",
  "bmux_decoration_plugin",
  "bmux_decoration_plugin_api",
  "bmux_env",
@@ -1028,6 +1029,7 @@ dependencies = [
  "bmux_keybind",
  "bmux_keyboard",
  "bmux_performance_plugin",
+ "bmux_performance_plugin_api",
  "bmux_permissions_plugin",
  "bmux_plugin",
  "bmux_plugin_cli_plugin",
@@ -1096,15 +1098,11 @@ dependencies = [
 name = "bmux_client"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_clients_plugin_api",
  "bmux_codec",
  "bmux_config",
- "bmux_control_catalog_plugin_api",
  "bmux_ipc",
- "bmux_performance_plugin_api",
- "bmux_recording_plugin_api",
+ "bmux_plugin_sdk",
  "bmux_server",
- "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1149,6 +1147,7 @@ dependencies = [
  "bmux_session_models",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "uuid",
 ]
 
@@ -1279,9 +1278,11 @@ dependencies = [
 name = "bmux_control_catalog_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
+ "thiserror 2.0.18",
  "uuid",
 ]
 
@@ -1483,6 +1484,7 @@ dependencies = [
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

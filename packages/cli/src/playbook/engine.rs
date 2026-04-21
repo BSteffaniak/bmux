@@ -715,7 +715,9 @@ async fn run_playbook_inner(
                 // Create display track writer for GIF export.
                 if let Some(ref sb) = sandbox {
                     let rec_dir = sb.paths().recordings_dir().join(rid.to_string());
-                    let client_id = client.whoami().await.unwrap_or_else(|_| Uuid::new_v4());
+                    let client_id = bmux_clients_plugin_api::typed_client::whoami(&mut client)
+                        .await
+                        .unwrap_or_else(|_| Uuid::new_v4());
                     match super::display_track::PlaybookDisplayTrackWriter::new(
                         &rec_dir,
                         client_id,
@@ -1048,7 +1050,8 @@ async fn run_playbook_inner(
     let mut recording_path: Option<std::path::PathBuf> = None;
     if let (Some(rid), Some(sb)) = (recording_id, &sandbox) {
         // Stop recording first so the server finalizes the binary files.
-        match client.recording_stop(Some(rid)).await {
+        match bmux_recording_plugin_api::typed_client::recording_stop(&mut client, Some(rid)).await
+        {
             Ok(stopped_id) => {
                 info!("recording stopped: {stopped_id}");
             }
@@ -1563,15 +1566,14 @@ pub(super) async fn start_recording(
     client: &mut BmuxClient,
     session_id: Option<Uuid>,
 ) -> Result<Uuid> {
-    let summary = client
-        .recording_start(
-            session_id, true, // capture_input
-            None, // name
-            None, // profile: server default (Functional)
-            None, // event_kinds: server default
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("recording start failed: {e}"))?;
+    let summary = bmux_recording_plugin_api::typed_client::recording_start(
+        client, session_id, true, // capture_input
+        None, // name
+        None, // profile: server default (Functional)
+        None, // event_kinds: server default
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("recording start failed: {e}"))?;
     Ok(summary.id)
 }
 

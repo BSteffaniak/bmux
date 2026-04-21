@@ -4,7 +4,6 @@ use bmux_ipc::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
 
 use super::{
     ConnectionContext, ConnectionPolicyScope, cleanup_stale_pid_file, connect_with_context,
-    map_cli_client_error,
 };
 
 const fn performance_level_name(level: PerformanceRecordingLevel) -> &'static str {
@@ -48,10 +47,8 @@ pub(super) async fn run_perf_status(
         connection_context,
     )
     .await?;
-    let settings = client
-        .performance_status()
-        .await
-        .map_err(map_cli_client_error)?;
+    let settings =
+        bmux_performance_plugin_api::typed_client::performance_status(&mut client).await?;
 
     if json {
         println!(
@@ -78,15 +75,11 @@ pub(super) async fn run_perf_on(
         connection_context,
     )
     .await?;
-    let mut settings = client
-        .performance_status()
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut settings =
+        bmux_performance_plugin_api::typed_client::performance_status(&mut client).await?;
     settings.recording_level = profile_to_level(profile);
-    let updated = client
-        .performance_set(settings)
-        .await
-        .map_err(map_cli_client_error)?;
+    let updated =
+        bmux_performance_plugin_api::typed_client::performance_set(&mut client, settings).await?;
 
     if json {
         println!(
@@ -116,15 +109,11 @@ pub(super) async fn run_perf_off(
         connection_context,
     )
     .await?;
-    let mut settings = client
-        .performance_status()
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut settings =
+        bmux_performance_plugin_api::typed_client::performance_status(&mut client).await?;
     settings.recording_level = PerformanceRecordingLevel::Off;
-    let updated = client
-        .performance_set(settings)
-        .await
-        .map_err(map_cli_client_error)?;
+    let updated =
+        bmux_performance_plugin_api::typed_client::performance_set(&mut client, settings).await?;
 
     if json {
         println!(

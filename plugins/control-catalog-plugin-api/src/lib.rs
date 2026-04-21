@@ -17,6 +17,8 @@ bmux_plugin_schema_macros::schema! {
     source: "bpdl/control-catalog-plugin.bpdl",
 }
 
+pub mod typed_client;
+
 /// Capability identifiers gating access to this plugin's surfaces.
 ///
 /// Written by hand (not BPDL-generated) until the schema language grows

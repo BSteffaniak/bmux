@@ -28,10 +28,8 @@ pub(super) async fn run_follow(
         connection_context,
     )
     .await?;
-    client
-        .follow_client(target_client_id, global)
-        .await
-        .map_err(map_cli_client_error)?;
+    bmux_clients_plugin_api::typed_client::follow_client(&mut client, target_client_id, global)
+        .await?;
     println!(
         "following client: {}{}",
         target_client_id,
@@ -47,7 +45,7 @@ pub(super) async fn run_unfollow(connection_context: ConnectionContext<'_>) -> R
         connection_context,
     )
     .await?;
-    client.unfollow().await.map_err(map_cli_client_error)?;
+    bmux_clients_plugin_api::typed_client::unfollow(&mut client).await?;
     println!("follow stopped");
     Ok(0)
 }

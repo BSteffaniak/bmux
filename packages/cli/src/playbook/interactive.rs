@@ -807,7 +807,8 @@ async fn run_interactive_session_managed(
 
     // Stop recording if active.
     if let Some(rid) = recording_id {
-        match client.recording_stop(Some(rid)).await {
+        match bmux_recording_plugin_api::typed_client::recording_stop(&mut client, Some(rid)).await
+        {
             Ok(stopped) => info!("recording stopped: {stopped}"),
             Err(e) => warn!("failed to stop recording: {e}"),
         }

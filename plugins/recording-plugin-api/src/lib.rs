@@ -21,6 +21,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod recording_runtime;
+pub mod typed_client;
 
 pub use recording_runtime::{
     RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, prune_old_recordings,

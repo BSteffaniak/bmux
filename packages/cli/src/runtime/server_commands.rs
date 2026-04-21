@@ -384,10 +384,9 @@ pub(super) async fn run_server_recording_start(
         connection_context,
     )
     .await?;
-    let recording = client
-        .recording_rolling_start(options)
-        .await
-        .map_err(map_cli_client_error)?;
+    let recording =
+        bmux_recording_plugin_api::typed_client::recording_rolling_start(&mut client, options)
+            .await?;
     let name_display = recording.name.as_deref().unwrap_or("-");
     println!(
         "server rolling recording started: {} name={} path={}",
@@ -406,10 +405,8 @@ pub(super) async fn run_server_recording_stop(
         connection_context,
     )
     .await?;
-    let recording_id = client
-        .recording_rolling_stop()
-        .await
-        .map_err(map_cli_client_error)?;
+    let recording_id =
+        bmux_recording_plugin_api::typed_client::recording_rolling_stop(&mut client).await?;
     println!("server rolling recording stopped: {recording_id}");
     Ok(0)
 }
@@ -424,10 +421,7 @@ async fn fetch_server_recording_rolling_status(
         connection_context,
     )
     .await?;
-    client
-        .recording_rolling_status()
-        .await
-        .map_err(map_cli_client_error)
+    Ok(bmux_recording_plugin_api::typed_client::recording_rolling_status(&mut client).await?)
 }
 
 pub(super) async fn run_server_recording_status(
@@ -528,10 +522,9 @@ pub(super) async fn run_server_recording_clear(
         connection_context,
     )
     .await?;
-    let report = client
-        .recording_rolling_clear(!no_restart)
-        .await
-        .map_err(map_cli_client_error)?;
+    let report =
+        bmux_recording_plugin_api::typed_client::recording_rolling_clear(&mut client, !no_restart)
+            .await?;
 
     if json {
         println!(

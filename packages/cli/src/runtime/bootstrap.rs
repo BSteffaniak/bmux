@@ -52,20 +52,19 @@ pub(super) async fn run_default_server_attach(
             connection_context,
         )
         .await?;
-        let started = recording_client
-            .recording_start(
-                None,
+        let started = bmux_recording_plugin_api::typed_client::recording_start(
+            &mut recording_client,
+            None,
+            options.capture_input,
+            options.name.clone(),
+            recording::recording_profile_arg_to_ipc(options.profile),
+            recording::resolve_event_kind_override(
+                options.profile,
+                &options.event_kinds,
                 options.capture_input,
-                options.name.clone(),
-                recording::recording_profile_arg_to_ipc(options.profile),
-                recording::resolve_event_kind_override(
-                    options.profile,
-                    &options.event_kinds,
-                    options.capture_input,
-                ),
-            )
-            .await
-            .map_err(map_cli_client_error)?;
+            ),
+        )
+        .await?;
         active_recording_id = Some(started.id);
         let name_display = started.name.as_deref().unwrap_or("-");
         println!(
@@ -98,21 +97,20 @@ pub(super) async fn run_default_server_attach(
             connection_context,
         )
         .await?;
-        let stopped_id = stop_client
-            .recording_stop(Some(recording_id))
-            .await
-            .map_err(map_cli_client_error)
-            .with_context(|| format!("failed stopping recording {recording_id}"))?;
+        let stopped_id = bmux_recording_plugin_api::typed_client::recording_stop(
+            &mut stop_client,
+            Some(recording_id),
+        )
+        .await
+        .with_context(|| format!("failed stopping recording {recording_id}"))?;
         let mut list_client = connect_with_context(
             ConnectionPolicyScope::Normal,
             "bmux-cli-default-attach-recording-list",
             connection_context,
         )
         .await?;
-        let recording = list_client
-            .recording_list()
-            .await
-            .map_err(map_cli_client_error)?
+        let recording = bmux_recording_plugin_api::typed_client::recording_list(&mut list_client)
+            .await?
             .into_iter()
             .find(|summary| summary.id == stopped_id);
         if let Some(recording) = recording {
@@ -181,7 +179,7 @@ pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Re
         return Ok(ack.id);
     }
 
-    let _client_id = client.whoami().await.map_err(map_cli_client_error)?;
+    let _client_id = bmux_clients_plugin_api::typed_client::whoami(client).await?;
     let writable_sessions = sessions.clone();
 
     if writable_sessions.is_empty() {

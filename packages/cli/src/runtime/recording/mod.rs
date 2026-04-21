@@ -9,8 +9,7 @@ use super::{
     RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
     RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
     RecordingStatus, RecordingSummary, Repeat, Result, Uuid, Write, active_runtime_name,
-    cleanup_stale_pid_file, connect_if_running_with_context, io, map_cli_client_error,
-    parse_uuid_value, terminal,
+    cleanup_stale_pid_file, connect_if_running_with_context, io, parse_uuid_value, terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_cli_output::{Table, TableAlign, TableColumn, write_table};
@@ -58,10 +57,15 @@ pub(super) async fn run_recording_start(
     } else {
         Some(default_event_kinds_from_config(capture_input))
     };
-    let summary = client
-        .recording_start(session_id, capture_input, name, profile, event_kinds)
-        .await
-        .map_err(map_cli_client_error)?;
+    let summary = bmux_recording_plugin_api::typed_client::recording_start(
+        &mut client,
+        session_id,
+        capture_input,
+        name,
+        profile,
+        event_kinds,
+    )
+    .await?;
     let name_display = summary.name.as_deref().unwrap_or("-");
     println!(
         "recording started: {} name={} (capture_input={} profile={:?} kinds={})",
@@ -478,16 +482,16 @@ impl PerfEventEmitter {
             return Ok(());
         }
 
-        client
-            .recording_write_custom_event(
-                session_id,
-                pane_id,
-                PERF_RECORDING_SOURCE.to_string(),
-                event_name.to_string(),
-                encoded,
-            )
-            .await
-            .map_err(map_cli_client_error)
+        bmux_recording_plugin_api::typed_client::recording_write_custom_event(
+            client,
+            session_id,
+            pane_id,
+            PERF_RECORDING_SOURCE.to_string(),
+            event_name.to_string(),
+            encoded,
+        )
+        .await
+        .map_err(anyhow::Error::from)
     }
 
     pub(super) async fn emit_with_streaming_client(
@@ -508,16 +512,16 @@ impl PerfEventEmitter {
             return Ok(());
         }
 
-        client
-            .recording_write_custom_event(
-                session_id,
-                pane_id,
-                PERF_RECORDING_SOURCE.to_string(),
-                event_name.to_string(),
-                encoded,
-            )
-            .await
-            .map_err(map_cli_client_error)
+        bmux_recording_plugin_api::typed_client::recording_write_custom_event(
+            client,
+            session_id,
+            pane_id,
+            PERF_RECORDING_SOURCE.to_string(),
+            event_name.to_string(),
+            encoded,
+        )
+        .await
+        .map_err(anyhow::Error::from)
     }
 }
 
@@ -924,10 +928,8 @@ pub(super) async fn run_recording_stop(
         Some(raw) => Some(Uuid::parse_str(raw).context("invalid recording id")?),
         None => None,
     };
-    let stopped_id = client
-        .recording_stop(recording_id)
-        .await
-        .map_err(map_cli_client_error)?;
+    let stopped_id =
+        bmux_recording_plugin_api::typed_client::recording_stop(&mut client, recording_id).await?;
     println!("recording stopped: {stopped_id}");
     maybe_auto_export_recording(stopped_id, None).await;
     Ok(0)
@@ -946,10 +948,9 @@ pub(super) async fn run_recording_status(
     )
     .await?
     {
-        Some(mut client) => client
-            .recording_status()
-            .await
-            .map_err(map_cli_client_error)?,
+        Some(mut client) => {
+            bmux_recording_plugin_api::typed_client::recording_status(&mut client).await?
+        }
         None => offline_recording_status(),
     };
     let (config, root_path) = recording_config_and_root();
@@ -1091,10 +1092,9 @@ pub(super) async fn run_recording_list(
     )
     .await?
     {
-        Some(mut client) => client
-            .recording_list()
-            .await
-            .map_err(map_cli_client_error)?,
+        Some(mut client) => {
+            bmux_recording_plugin_api::typed_client::recording_list(&mut client).await?
+        }
         None => list_recordings_from_disk()?,
     };
 
@@ -1170,14 +1170,9 @@ pub(super) async fn run_recording_delete(
     )
     .await?
     {
-        let status = client
-            .recording_status()
-            .await
-            .map_err(map_cli_client_error)?;
-        let recordings = client
-            .recording_list()
-            .await
-            .map_err(map_cli_client_error)?;
+        let status = bmux_recording_plugin_api::typed_client::recording_status(&mut client).await?;
+        let recordings =
+            bmux_recording_plugin_api::typed_client::recording_list(&mut client).await?;
         let resolved = resolve_recording_id_prefix(recording_id_or_prefix, &recordings)?;
 
         if status
@@ -1185,17 +1180,17 @@ pub(super) async fn run_recording_delete(
             .as_ref()
             .is_some_and(|active| active.id == resolved)
         {
-            let stopped_id = client
-                .recording_stop(Some(resolved))
-                .await
-                .map_err(map_cli_client_error)?;
+            let stopped_id = bmux_recording_plugin_api::typed_client::recording_stop(
+                &mut client,
+                Some(resolved),
+            )
+            .await?;
             println!("stopped active recording {stopped_id} before delete");
         }
 
-        let deleted_id = client
-            .recording_delete(resolved)
-            .await
-            .map_err(map_cli_client_error)?;
+        let deleted_id =
+            bmux_recording_plugin_api::typed_client::recording_delete(&mut client, resolved)
+                .await?;
         println!("deleted recording {deleted_id}");
     } else {
         let recordings = list_recordings_from_disk()?;
@@ -1223,21 +1218,17 @@ pub(super) async fn run_recording_delete_all(
     )
     .await?
     {
-        let status = client
-            .recording_status()
-            .await
-            .map_err(map_cli_client_error)?;
+        let status = bmux_recording_plugin_api::typed_client::recording_status(&mut client).await?;
         if let Some(active) = status.active {
-            let stopped_id = client
-                .recording_stop(Some(active.id))
-                .await
-                .map_err(map_cli_client_error)?;
+            let stopped_id = bmux_recording_plugin_api::typed_client::recording_stop(
+                &mut client,
+                Some(active.id),
+            )
+            .await?;
             println!("stopped active recording {stopped_id} before delete");
         }
-        let deleted_count = client
-            .recording_delete_all()
-            .await
-            .map_err(map_cli_client_error)?;
+        let deleted_count =
+            bmux_recording_plugin_api::typed_client::recording_delete_all(&mut client).await?;
         println!("deleted {deleted_count} recordings");
     } else {
         let deleted_count = delete_all_recordings_from_disk()?;
@@ -1265,10 +1256,9 @@ pub(super) async fn run_recording_cut(
         )
     })?;
 
-    let recording = client
-        .recording_cut(last_seconds, name)
-        .await
-        .map_err(map_cli_client_error)?;
+    let recording =
+        bmux_recording_plugin_api::typed_client::recording_cut(&mut client, last_seconds, name)
+            .await?;
     let name_display = recording.name.as_deref().unwrap_or("-");
     tracing::info!(
         id = %recording.id,
@@ -1300,10 +1290,7 @@ pub(super) async fn run_recording_prune(
     )
     .await?
     {
-        client
-            .recording_prune(older_than)
-            .await
-            .map_err(map_cli_client_error)?
+        bmux_recording_plugin_api::typed_client::recording_prune(&mut client, older_than).await?
     } else {
         let root = recordings_root_dir();
         let config = bmux_config::BmuxConfig::load().unwrap_or_default();

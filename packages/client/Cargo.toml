@@ -12,16 +12,12 @@ version     = { workspace = true }
 
 [dependencies]
 # Internal bmux packages
-bmux_clients_plugin_api         = { workspace = true }
-bmux_config                     = { workspace = true }
-bmux_control_catalog_plugin_api = { workspace = true }
-bmux_ipc                        = { workspace = true }
-bmux_performance_plugin_api     = { workspace = true }
-bmux_recording_plugin_api       = { workspace = true }
+bmux_config     = { workspace = true }
+bmux_ipc        = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
 
 # External dependencies
 bmux_codec = { workspace = true }
-serde      = { workspace = true, features = ["derive", "std"] }
 thiserror  = { workspace = true }
 tokio      = { workspace = true, features = ["time", "sync", "rt"] }
 tracing    = { workspace = true }

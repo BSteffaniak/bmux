@@ -10,6 +10,8 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod typed_client;
+
 use bmux_ipc::PerformanceRuntimeSettings;
 use bmux_performance_state::PerformanceCaptureSettings;
 use bmux_plugin_sdk::{CapabilityId, InterfaceId, PluginEventKind};

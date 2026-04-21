@@ -17,6 +17,7 @@ bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
 bmux_session_models       = { workspace = true, features = ["serde"] }
 serde                     = { workspace = true, features = ["derive", "std"] }
+thiserror                 = { workspace = true }
 uuid                      = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]

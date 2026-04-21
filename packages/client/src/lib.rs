@@ -12,16 +12,13 @@ use bmux_ipc::transport::{
 };
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, AttachPaneImageDelta, AttachPaneInputMode,
-    AttachPaneMouseProtocol, AttachScene, CORE_PROTOCOL_CAPABILITIES, ContextSelector,
-    ControlCatalogSnapshot, Envelope, EnvelopeKind, ErrorCode, IncompatibilityReason,
-    InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, PaneLayoutNode, PaneSummary,
-    PerformanceRuntimeSettings, ProtocolContract, RecordingCaptureTarget, RecordingEventKind,
-    RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
-    RecordingRollingStatus, RecordingStatus, RecordingSummary, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, decode, default_supported_capabilities, encode,
+    AttachPaneMouseProtocol, AttachScene, CORE_PROTOCOL_CAPABILITIES, ContextSelector, Envelope,
+    EnvelopeKind, ErrorCode, IncompatibilityReason, InvokeServiceKind, IpcEndpoint,
+    NegotiatedProtocol, PaneLayoutNode, PaneSummary, ProtocolContract, Request, Response,
+    ResponsePayload, ServerSnapshotStatus, SessionSelector, decode, default_supported_capabilities,
+    encode,
 };
-use bmux_performance_plugin_api::{PerformanceRequest, PerformanceResponse};
-use bmux_recording_plugin_api::{RecordingRequest, RecordingResponse};
+use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -326,34 +323,6 @@ impl BmuxClient {
         }
     }
 
-    /// Return the server-assigned client UUID for this connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn whoami(&mut self) -> Result<Uuid> {
-        let payload = bmux_ipc::encode(&())
-            .map_err(|_| ClientError::UnexpectedResponse("failed to encode whoami request"))?;
-        let response_bytes = self
-            .invoke_service_raw(
-                "bmux.clients.read",
-                InvokeServiceKind::Query,
-                "clients-state",
-                "current-client",
-                payload,
-            )
-            .await?;
-        let result: std::result::Result<
-            bmux_clients_plugin_api::clients_state::ClientSummary,
-            bmux_clients_plugin_api::clients_state::ClientQueryError,
-        > = bmux_ipc::decode(&response_bytes)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to decode current-client"))?;
-        result.map_or(
-            Err(ClientError::UnexpectedResponse("no current client")),
-            |summary| Ok(summary.id),
-        )
-    }
-
     /// Return this connection's profile-scoped principal identity.
     #[must_use]
     pub const fn principal_id(&self) -> Uuid {
@@ -601,355 +570,6 @@ impl BmuxClient {
             ResponsePayload::ServerStopping => Ok(()),
             _ => Err(ClientError::UnexpectedResponse("expected server stopping")),
         }
-    }
-
-    /// Start a new recording session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_start(
-        &mut self,
-        session_id: Option<Uuid>,
-        capture_input: bool,
-        name: Option<String>,
-        profile: Option<RecordingProfile>,
-        event_kinds: Option<Vec<RecordingEventKind>>,
-    ) -> Result<RecordingSummary> {
-        match self
-            .dispatch_recording(RecordingRequest::Start {
-                session_id,
-                capture_input,
-                name,
-                profile,
-                event_kinds,
-            })
-            .await?
-        {
-            RecordingResponse::Started { recording } => Ok(recording),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording started",
-            )),
-        }
-    }
-
-    /// Stop an active recording session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_stop(&mut self, recording_id: Option<Uuid>) -> Result<Uuid> {
-        match self
-            .dispatch_recording(RecordingRequest::Stop { recording_id })
-            .await?
-        {
-            RecordingResponse::Stopped { recording_id } => {
-                recording_id.ok_or(ClientError::UnexpectedResponse("no recording to stop"))
-            }
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording stopped",
-            )),
-        }
-    }
-
-    /// Write a custom event into the active recording.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_write_custom_event(
-        &mut self,
-        session_id: Option<Uuid>,
-        pane_id: Option<Uuid>,
-        source: String,
-        name: String,
-        payload: Vec<u8>,
-    ) -> Result<()> {
-        match self
-            .dispatch_recording(RecordingRequest::WriteCustomEvent {
-                session_id,
-                pane_id,
-                source,
-                name,
-                payload,
-            })
-            .await?
-        {
-            RecordingResponse::CustomEventWritten { .. } => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording custom event written",
-            )),
-        }
-    }
-
-    /// Query recording runtime status.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_status(&mut self) -> Result<RecordingStatus> {
-        match self.dispatch_recording(RecordingRequest::Status).await? {
-            RecordingResponse::Status { status } => Ok(status),
-            _ => Err(ClientError::UnexpectedResponse("expected recording status")),
-        }
-    }
-
-    /// List known recordings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_list(&mut self) -> Result<Vec<RecordingSummary>> {
-        match self.dispatch_recording(RecordingRequest::List).await? {
-            RecordingResponse::List { recordings } => Ok(recordings),
-            _ => Err(ClientError::UnexpectedResponse("expected recording list")),
-        }
-    }
-
-    /// Delete one recording by id.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_delete(&mut self, recording_id: Uuid) -> Result<Uuid> {
-        match self
-            .dispatch_recording(RecordingRequest::Delete { recording_id })
-            .await?
-        {
-            RecordingResponse::Deleted { recording_id } => Ok(recording_id),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording deleted",
-            )),
-        }
-    }
-
-    /// Delete all recordings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_delete_all(&mut self) -> Result<usize> {
-        match self.dispatch_recording(RecordingRequest::DeleteAll).await? {
-            RecordingResponse::DeleteAll { removed_count } => Ok(removed_count),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording delete-all response",
-            )),
-        }
-    }
-
-    /// Create a bounded snapshot from the active rolling recording.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_cut(
-        &mut self,
-        last_seconds: Option<u64>,
-        name: Option<String>,
-    ) -> Result<RecordingSummary> {
-        match self
-            .dispatch_recording(RecordingRequest::Cut { last_seconds, name })
-            .await?
-        {
-            RecordingResponse::Cut { recording } => Ok(recording),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording cut response",
-            )),
-        }
-    }
-
-    /// Start hidden rolling recording on a running server.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_rolling_start(
-        &mut self,
-        options: RecordingRollingStartOptions,
-    ) -> Result<RecordingSummary> {
-        match self
-            .dispatch_recording(RecordingRequest::RollingStart { options })
-            .await?
-        {
-            RecordingResponse::RollingStarted { recording } => Ok(recording),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording started response",
-            )),
-        }
-    }
-
-    /// Stop hidden rolling recording on a running server.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_rolling_stop(&mut self) -> Result<Uuid> {
-        match self
-            .dispatch_recording(RecordingRequest::RollingStop)
-            .await?
-        {
-            RecordingResponse::RollingStopped { recording_id } => recording_id.ok_or(
-                ClientError::UnexpectedResponse("no rolling recording active"),
-            ),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording stopped response",
-            )),
-        }
-    }
-
-    /// Fetch hidden rolling recording status and usage details.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_rolling_status(&mut self) -> Result<RecordingRollingStatus> {
-        match self
-            .dispatch_recording(RecordingRequest::RollingStatus)
-            .await?
-        {
-            RecordingResponse::RollingStatus { status } => Ok(status),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording rolling status response",
-            )),
-        }
-    }
-
-    /// Clear hidden rolling recording data and optionally restart when active.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_rolling_clear(
-        &mut self,
-        restart_if_active: bool,
-    ) -> Result<RecordingRollingClearReport> {
-        match self
-            .dispatch_recording(RecordingRequest::RollingClear { restart_if_active })
-            .await?
-        {
-            RecordingResponse::RollingCleared { report } => Ok(report),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording rolling cleared response",
-            )),
-        }
-    }
-
-    /// Return active recording capture targets for display-track writing.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_capture_targets(&mut self) -> Result<Vec<RecordingCaptureTarget>> {
-        match self
-            .dispatch_recording(RecordingRequest::CaptureTargets)
-            .await?
-        {
-            RecordingResponse::CaptureTargets { targets } => Ok(targets),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording capture targets response",
-            )),
-        }
-    }
-
-    /// Prune completed recordings older than the specified retention period.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_prune(&mut self, older_than_days: Option<u64>) -> Result<usize> {
-        match self
-            .dispatch_recording(RecordingRequest::Prune { older_than_days })
-            .await?
-        {
-            RecordingResponse::Pruned { pruned_count } => Ok(pruned_count),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording pruned response",
-            )),
-        }
-    }
-
-    /// Dispatch a typed `RecordingRequest` to the `bmux.recording`
-    /// plugin's `recording-commands` service and return the typed
-    /// response. Used by the 15 recording convenience methods above.
-    async fn dispatch_recording(&mut self, request: RecordingRequest) -> Result<RecordingResponse> {
-        let payload = bmux_ipc::encode(&request)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to encode recording request"))?;
-        let response_bytes = self
-            .invoke_service_raw(
-                "bmux.recording.read",
-                InvokeServiceKind::Command,
-                "recording-commands",
-                "dispatch",
-                payload,
-            )
-            .await?;
-        bmux_ipc::decode(&response_bytes)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to decode recording response"))
-    }
-    /// Follow another client's active session focus.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn follow_client(&mut self, target_client_id: Uuid, global: bool) -> Result<()> {
-        #[derive(serde::Serialize)]
-        struct SetFollowingArgs {
-            target_client_id: Option<Uuid>,
-            global: bool,
-        }
-        let payload = bmux_ipc::encode(&SetFollowingArgs {
-            target_client_id: Some(target_client_id),
-            global,
-        })
-        .map_err(|_| ClientError::UnexpectedResponse("failed to encode set-following"))?;
-        let response_bytes = self
-            .invoke_service_raw(
-                "bmux.clients.write",
-                InvokeServiceKind::Command,
-                "clients-commands",
-                "set-following",
-                payload,
-            )
-            .await?;
-        let _result: std::result::Result<
-            bmux_clients_plugin_api::clients_commands::ClientAck,
-            bmux_clients_plugin_api::clients_commands::SetFollowingError,
-        > = bmux_ipc::decode(&response_bytes)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to decode set-following"))?;
-        Ok(())
-    }
-
-    /// Stop following any current follow target.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn unfollow(&mut self) -> Result<()> {
-        #[derive(serde::Serialize)]
-        struct SetFollowingArgs {
-            target_client_id: Option<Uuid>,
-            global: bool,
-        }
-        let payload = bmux_ipc::encode(&SetFollowingArgs {
-            target_client_id: None,
-            global: false,
-        })
-        .map_err(|_| ClientError::UnexpectedResponse("failed to encode set-following"))?;
-        let response_bytes = self
-            .invoke_service_raw(
-                "bmux.clients.write",
-                InvokeServiceKind::Command,
-                "clients-commands",
-                "set-following",
-                payload,
-            )
-            .await?;
-        let _result: std::result::Result<
-            bmux_clients_plugin_api::clients_commands::ClientAck,
-            bmux_clients_plugin_api::clients_commands::SetFollowingError,
-        > = bmux_ipc::decode(&response_bytes)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to decode set-following"))?;
-        Ok(())
     }
 
     /// Attach client to a session selected by name or UUID.
@@ -1339,55 +959,6 @@ impl BmuxClient {
         }
     }
 
-    /// Retrieve runtime performance telemetry settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn performance_status(&mut self) -> Result<PerformanceRuntimeSettings> {
-        let PerformanceResponse::Settings { settings } = self
-            .dispatch_performance(PerformanceRequest::GetSettings)
-            .await?;
-        Ok(settings)
-    }
-
-    /// Update runtime performance telemetry settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn performance_set(
-        &mut self,
-        settings: PerformanceRuntimeSettings,
-    ) -> Result<PerformanceRuntimeSettings> {
-        let PerformanceResponse::Settings { settings } = self
-            .dispatch_performance(PerformanceRequest::SetSettings { settings })
-            .await?;
-        Ok(settings)
-    }
-
-    /// Dispatch a typed `PerformanceRequest` to the `bmux.performance`
-    /// plugin's `performance-commands` service and return the typed
-    /// response.
-    async fn dispatch_performance(
-        &mut self,
-        request: PerformanceRequest,
-    ) -> Result<PerformanceResponse> {
-        let payload = bmux_ipc::encode(&request)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to encode performance request"))?;
-        let response_bytes = self
-            .invoke_service_raw(
-                "bmux.performance.read",
-                InvokeServiceKind::Command,
-                "performance-commands",
-                "dispatch",
-                payload,
-            )
-            .await?;
-        bmux_ipc::decode(&response_bytes)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to decode performance response"))
-    }
-
     /// Subscribe this client to server lifecycle events.
     ///
     /// # Errors
@@ -1434,6 +1005,59 @@ impl BmuxClient {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         request_id
+    }
+}
+
+fn map_client_error(
+    interface: &str,
+    operation: &str,
+    err: ClientError,
+) -> TypedDispatchClientError {
+    match err {
+        ClientError::ServerError { code, message } => {
+            TypedDispatchClientError::server(interface, operation, format!("{code:?}: {message}"))
+        }
+        ClientError::UnexpectedResponse(details) => {
+            TypedDispatchClientError::unexpected_response(interface, operation, details)
+        }
+        other => TypedDispatchClientError::transport(interface, operation, other.to_string()),
+    }
+}
+
+impl TypedDispatchClient for BmuxClient {
+    fn invoke_service_raw(
+        &mut self,
+        capability: &str,
+        kind: InvokeServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> impl std::future::Future<Output = TypedDispatchClientResult<Vec<u8>>> + Send {
+        let interface_owned = interface_id.to_string();
+        let op_owned = operation.to_string();
+        let cap_owned = capability.to_string();
+        async move {
+            let iface_for_err = interface_owned.clone();
+            let op_for_err = op_owned.clone();
+            match self
+                .request(Request::InvokeService {
+                    capability: cap_owned,
+                    kind,
+                    interface_id: interface_owned,
+                    operation: op_owned,
+                    payload,
+                })
+                .await
+                .map_err(|err| map_client_error(&iface_for_err, &op_for_err, err))?
+            {
+                ResponsePayload::ServiceInvoked { payload } => Ok(payload),
+                _ => Err(TypedDispatchClientError::unexpected_response(
+                    iface_for_err,
+                    op_for_err,
+                    "expected service invoked",
+                )),
+            }
+        }
     }
 }
 
@@ -1841,34 +1465,6 @@ impl StreamingBmuxClient {
         }
     }
 
-    /// Return the server-assigned client UUID for this connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn whoami(&mut self) -> Result<Uuid> {
-        let payload = bmux_ipc::encode(&())
-            .map_err(|_| ClientError::UnexpectedResponse("failed to encode whoami request"))?;
-        let response_bytes = self
-            .invoke_service_raw(
-                "bmux.clients.read",
-                InvokeServiceKind::Query,
-                "clients-state",
-                "current-client",
-                payload,
-            )
-            .await?;
-        let result: std::result::Result<
-            bmux_clients_plugin_api::clients_state::ClientSummary,
-            bmux_clients_plugin_api::clients_state::ClientQueryError,
-        > = bmux_ipc::decode(&response_bytes)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to decode current-client"))?;
-        result.map_or(
-            Err(ClientError::UnexpectedResponse("no current client")),
-            |summary| Ok(summary.id),
-        )
-    }
-
     /// Return principal identity information for this client and server control principal.
     ///
     /// # Errors
@@ -1921,103 +1517,6 @@ impl StreamingBmuxClient {
 
     /// Fetch the server's control-plane catalog snapshot.
     ///
-    /// Generic cross-cutting primitive (not a domain method) — used by
-    /// attach UIs to synchronize the control-plane command catalog.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn control_catalog_snapshot(
-        &mut self,
-        since_revision: Option<u64>,
-    ) -> Result<ControlCatalogSnapshot> {
-        #[derive(serde::Serialize)]
-        struct Args {
-            since_revision: Option<u64>,
-        }
-        let payload = bmux_ipc::encode(&Args { since_revision })
-            .map_err(|_| ClientError::UnexpectedResponse("failed to encode snapshot request"))?;
-        let response_bytes = self
-            .invoke_service_raw(
-                "bmux.control_catalog.read",
-                InvokeServiceKind::Query,
-                "control-catalog-state",
-                "snapshot",
-                payload,
-            )
-            .await?;
-        let typed: bmux_control_catalog_plugin_api::control_catalog_state::Snapshot =
-            bmux_ipc::decode(&response_bytes)
-                .map_err(|_| ClientError::UnexpectedResponse("failed to decode snapshot"))?;
-        Ok(map_typed_snapshot(typed))
-    }
-
-    /// Follow another client's active session focus.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn follow_client(&mut self, target_client_id: Uuid, global: bool) -> Result<()> {
-        #[derive(serde::Serialize)]
-        struct SetFollowingArgs {
-            target_client_id: Option<Uuid>,
-            global: bool,
-        }
-        let payload = bmux_ipc::encode(&SetFollowingArgs {
-            target_client_id: Some(target_client_id),
-            global,
-        })
-        .map_err(|_| ClientError::UnexpectedResponse("failed to encode set-following"))?;
-        let response_bytes = self
-            .invoke_service_raw(
-                "bmux.clients.write",
-                InvokeServiceKind::Command,
-                "clients-commands",
-                "set-following",
-                payload,
-            )
-            .await?;
-        let _result: std::result::Result<
-            bmux_clients_plugin_api::clients_commands::ClientAck,
-            bmux_clients_plugin_api::clients_commands::SetFollowingError,
-        > = bmux_ipc::decode(&response_bytes)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to decode set-following"))?;
-        Ok(())
-    }
-
-    /// Stop following any current follow target.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn unfollow(&mut self) -> Result<()> {
-        #[derive(serde::Serialize)]
-        struct SetFollowingArgs {
-            target_client_id: Option<Uuid>,
-            global: bool,
-        }
-        let payload = bmux_ipc::encode(&SetFollowingArgs {
-            target_client_id: None,
-            global: false,
-        })
-        .map_err(|_| ClientError::UnexpectedResponse("failed to encode set-following"))?;
-        let response_bytes = self
-            .invoke_service_raw(
-                "bmux.clients.write",
-                InvokeServiceKind::Command,
-                "clients-commands",
-                "set-following",
-                payload,
-            )
-            .await?;
-        let _result: std::result::Result<
-            bmux_clients_plugin_api::clients_commands::ClientAck,
-            bmux_clients_plugin_api::clients_commands::SetFollowingError,
-        > = bmux_ipc::decode(&response_bytes)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to decode set-following"))?;
-        Ok(())
-    }
-
     /// Request attach grant token for a session.
     ///
     /// # Errors
@@ -2376,284 +1875,44 @@ impl StreamingBmuxClient {
         }
     }
 
-    /// Start a new recording session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_start(
-        &mut self,
-        session_id: Option<Uuid>,
-        capture_input: bool,
-        name: Option<String>,
-        profile: Option<RecordingProfile>,
-        event_kinds: Option<Vec<RecordingEventKind>>,
-    ) -> Result<RecordingSummary> {
-        match self
-            .dispatch_recording(RecordingRequest::Start {
-                session_id,
-                capture_input,
-                name,
-                profile,
-                event_kinds,
-            })
-            .await?
-        {
-            RecordingResponse::Started { recording } => Ok(recording),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording started",
-            )),
-        }
-    }
-
-    /// Stop an active recording session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_stop(&mut self, recording_id: Option<Uuid>) -> Result<Uuid> {
-        match self
-            .dispatch_recording(RecordingRequest::Stop { recording_id })
-            .await?
-        {
-            RecordingResponse::Stopped { recording_id } => {
-                recording_id.ok_or(ClientError::UnexpectedResponse("no recording to stop"))
-            }
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording stopped",
-            )),
-        }
-    }
-
-    /// Write a custom event into the active recording.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_write_custom_event(
-        &mut self,
-        session_id: Option<Uuid>,
-        pane_id: Option<Uuid>,
-        source: String,
-        name: String,
-        payload: Vec<u8>,
-    ) -> Result<()> {
-        match self
-            .dispatch_recording(RecordingRequest::WriteCustomEvent {
-                session_id,
-                pane_id,
-                source,
-                name,
-                payload,
-            })
-            .await?
-        {
-            RecordingResponse::CustomEventWritten { .. } => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording custom event written",
-            )),
-        }
-    }
-
-    /// Query recording runtime status.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_status(&mut self) -> Result<RecordingStatus> {
-        match self.dispatch_recording(RecordingRequest::Status).await? {
-            RecordingResponse::Status { status } => Ok(status),
-            _ => Err(ClientError::UnexpectedResponse("expected recording status")),
-        }
-    }
-
-    /// Create a bounded snapshot from the active rolling recording.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_cut(
-        &mut self,
-        last_seconds: Option<u64>,
-        name: Option<String>,
-    ) -> Result<RecordingSummary> {
-        match self
-            .dispatch_recording(RecordingRequest::Cut { last_seconds, name })
-            .await?
-        {
-            RecordingResponse::Cut { recording } => Ok(recording),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording cut response",
-            )),
-        }
-    }
-
-    /// Start hidden rolling recording on a running server.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_rolling_start(
-        &mut self,
-        options: RecordingRollingStartOptions,
-    ) -> Result<RecordingSummary> {
-        match self
-            .dispatch_recording(RecordingRequest::RollingStart { options })
-            .await?
-        {
-            RecordingResponse::RollingStarted { recording } => Ok(recording),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording started response",
-            )),
-        }
-    }
-
-    /// Stop hidden rolling recording on a running server.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_rolling_stop(&mut self) -> Result<Uuid> {
-        match self
-            .dispatch_recording(RecordingRequest::RollingStop)
-            .await?
-        {
-            RecordingResponse::RollingStopped { recording_id } => recording_id.ok_or(
-                ClientError::UnexpectedResponse("no rolling recording active"),
-            ),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording stopped response",
-            )),
-        }
-    }
-
-    /// Fetch hidden rolling recording status and usage details.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_rolling_status(&mut self) -> Result<RecordingRollingStatus> {
-        match self
-            .dispatch_recording(RecordingRequest::RollingStatus)
-            .await?
-        {
-            RecordingResponse::RollingStatus { status } => Ok(status),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording rolling status response",
-            )),
-        }
-    }
-
-    /// Clear hidden rolling recording data and optionally restart when active.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_rolling_clear(
-        &mut self,
-        restart_if_active: bool,
-    ) -> Result<RecordingRollingClearReport> {
-        match self
-            .dispatch_recording(RecordingRequest::RollingClear { restart_if_active })
-            .await?
-        {
-            RecordingResponse::RollingCleared { report } => Ok(report),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording rolling cleared response",
-            )),
-        }
-    }
-
-    /// Return active recording capture targets for display-track writing.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn recording_capture_targets(&mut self) -> Result<Vec<RecordingCaptureTarget>> {
-        match self
-            .dispatch_recording(RecordingRequest::CaptureTargets)
-            .await?
-        {
-            RecordingResponse::CaptureTargets { targets } => Ok(targets),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected recording capture targets response",
-            )),
-        }
-    }
-
-    /// Dispatch a typed `RecordingRequest` to the `bmux.recording`
-    /// plugin's `recording-commands` service and return the typed
-    /// response. Used by the streaming-client recording convenience
-    /// methods above.
-    async fn dispatch_recording(&mut self, request: RecordingRequest) -> Result<RecordingResponse> {
-        let payload = bmux_ipc::encode(&request)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to encode recording request"))?;
-        let response_bytes = self
-            .invoke_service_raw(
-                "bmux.recording.read",
-                InvokeServiceKind::Command,
-                "recording-commands",
-                "dispatch",
-                payload,
-            )
-            .await?;
-        bmux_ipc::decode(&response_bytes)
-            .map_err(|_| ClientError::UnexpectedResponse("failed to decode recording response"))
-    }
+    // Typed recording methods removed from StreamingBmuxClient; callers
+    // migrate to `bmux_recording_plugin_api::typed_client::*` helpers.
 }
 
-fn map_typed_snapshot(
-    snapshot: bmux_control_catalog_plugin_api::control_catalog_state::Snapshot,
-) -> ControlCatalogSnapshot {
-    use bmux_ipc::{ContextSessionBindingSummary, ContextSummary, SessionSummary};
-    use std::collections::BTreeMap;
-
-    let sessions = snapshot
-        .sessions
-        .into_iter()
-        .map(|row| SessionSummary {
-            id: row.id,
-            name: row.name,
-            client_count: row.client_count as usize,
-        })
-        .collect::<Vec<_>>();
-
-    let context_session_bindings = snapshot
-        .context_session_bindings
-        .iter()
-        .map(|b| ContextSessionBindingSummary {
-            context_id: b.context_id,
-            session_id: b.session_id,
-        })
-        .collect::<Vec<_>>();
-
-    let binding_by_context = snapshot
-        .context_session_bindings
-        .iter()
-        .map(|b| (b.context_id, b.session_id))
-        .collect::<BTreeMap<_, _>>();
-
-    let contexts = snapshot
-        .contexts
-        .into_iter()
-        .map(|row| {
-            let mut attributes = BTreeMap::new();
-            if let Some(session_id) = binding_by_context.get(&row.id) {
-                attributes.insert("bmux.session_id".to_string(), session_id.to_string());
+impl TypedDispatchClient for StreamingBmuxClient {
+    fn invoke_service_raw(
+        &mut self,
+        capability: &str,
+        kind: InvokeServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> impl std::future::Future<Output = TypedDispatchClientResult<Vec<u8>>> + Send {
+        let interface_owned = interface_id.to_string();
+        let op_owned = operation.to_string();
+        let cap_owned = capability.to_string();
+        async move {
+            let iface_for_err = interface_owned.clone();
+            let op_for_err = op_owned.clone();
+            match self
+                .request_raw(Request::InvokeService {
+                    capability: cap_owned,
+                    kind,
+                    interface_id: interface_owned,
+                    operation: op_owned,
+                    payload,
+                })
+                .await
+                .map_err(|err| map_client_error(&iface_for_err, &op_for_err, err))?
+            {
+                Response::Ok(ResponsePayload::ServiceInvoked { payload }) => Ok(payload),
+                _ => Err(TypedDispatchClientError::unexpected_response(
+                    iface_for_err,
+                    op_for_err,
+                    "expected service invoked",
+                )),
             }
-            ContextSummary {
-                id: row.id,
-                name: row.name,
-                attributes,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    ControlCatalogSnapshot {
-        revision: snapshot.revision,
-        sessions,
-        contexts,
-        context_session_bindings,
+        }
     }
 }
 

@@ -840,7 +840,9 @@ pub async fn run_session_attach_with_client(
     let mut perf_emitter = recording::PerfEventEmitter::new(
         recording::PerfCaptureSettings::from_config(&attach_config),
     );
-    if let Ok(settings) = client.performance_status().await {
+    if let Ok(settings) =
+        bmux_performance_plugin_api::typed_client::performance_status(&mut client).await
+    {
         perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
             &settings,
         ));
@@ -866,13 +868,11 @@ pub async fn run_session_attach_with_client(
             .subscribe_events()
             .await
             .map_err(map_attach_client_error)?;
-        client
-            .follow_client(leader_client_id, global)
-            .await
-            .map_err(map_attach_client_error)?;
+        bmux_clients_plugin_api::typed_client::follow_client(&mut client, leader_client_id, global)
+            .await?;
     }
 
-    let self_client_id = client.whoami().await.map_err(map_attach_client_error)?;
+    let self_client_id = bmux_clients_plugin_api::typed_client::whoami(&mut client).await?;
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
         // Inline follow target resolution using BmuxClient (before streaming upgrade).
@@ -932,13 +932,15 @@ pub async fn run_session_attach_with_client(
         println!("attached to session: {}", attach_info.session_id);
     }
 
-    let capture_targets = match client.recording_capture_targets().await {
-        Ok(targets) => targets,
-        Err(error) => {
-            tracing::warn!("failed querying recording capture targets on attach: {error}");
-            Vec::new()
-        }
-    };
+    let capture_targets =
+        match bmux_recording_plugin_api::typed_client::recording_capture_targets(&mut client).await
+        {
+            Ok(targets) => targets,
+            Err(error) => {
+                tracing::warn!("failed querying recording capture targets on attach: {error}");
+                Vec::new()
+            }
+        };
 
     // Upgrade to streaming client for event-driven operation.
     // All subsequent operations use the streaming client.
@@ -1681,7 +1683,7 @@ pub async fn run_session_attach_with_client(
         let _ = client.detach().await;
     }
     if follow_target_id.is_some() {
-        let _ = client.unfollow().await;
+        let _ = bmux_clients_plugin_api::typed_client::unfollow(&mut client).await;
     }
     if let Some(message) = attach_exit_message(exit_reason) {
         println!("{message}");
@@ -1872,7 +1874,7 @@ async fn enforce_hot_path_plugin_policy(
     command_name: &str,
     attached_session_id: Uuid,
     attached_context_id: Option<Uuid>,
-) -> std::result::Result<(), ClientError> {
+) -> anyhow::Result<()> {
     let hints = plugin_command_policy_hints(plugin_id, command_name).map_err(|error| {
         ClientError::ServerError {
             code: bmux_ipc::ErrorCode::InvalidRequest,
@@ -1902,7 +1904,7 @@ async fn enforce_hot_path_plugin_policy(
         return Ok(());
     };
 
-    let client_id = client.whoami().await?;
+    let client_id = bmux_clients_plugin_api::typed_client::whoami(client).await?;
     let principal_info = client.whoami_principal().await?;
     let request = HotPathExecutionPolicyCheckRequest {
         session_id: attached_session_id,
@@ -1951,7 +1953,8 @@ async fn enforce_hot_path_plugin_policy(
                     "hot-path plugin execution denied for {plugin_id}:{command_name}; grant scoped override or use execution_class=native_fast"
                 )
             }),
-        })
+        }
+        .into())
     }
 }
 
@@ -2002,10 +2005,7 @@ pub async fn handle_attach_plugin_command_action(
             "attach.plugin_command.policy_denied"
         );
         view_state.set_transient_status(
-            format!(
-                "plugin action denied by policy: {}",
-                map_attach_client_error(error)
-            ),
+            format!("plugin action denied by policy: {error:#}"),
             Instant::now(),
             ATTACH_TRANSIENT_STATUS_TTL,
         );
@@ -4020,10 +4020,12 @@ pub async fn reconcile_attached_session_from_catalog(
 pub async fn refresh_attach_status_catalog(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
-) -> std::result::Result<(), ClientError> {
-    let snapshot = client
-        .control_catalog_snapshot(Some(view_state.control_catalog_revision))
-        .await?;
+) -> anyhow::Result<()> {
+    let snapshot = bmux_control_catalog_plugin_api::typed_client::control_catalog_snapshot(
+        client,
+        Some(view_state.control_catalog_revision),
+    )
+    .await?;
     apply_control_catalog_snapshot(view_state, snapshot);
     Ok(())
 }
@@ -4823,7 +4825,7 @@ pub async fn handle_attach_server_event(
             if full_resync || revision > view_state.control_catalog_revision {
                 if let Err(error) = refresh_attach_status_catalog(client, view_state).await {
                     view_state.set_transient_status(
-                        format!("catalog refresh failed: {}", map_attach_client_error(error)),
+                        format!("catalog refresh failed: {error:#}"),
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
