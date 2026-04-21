@@ -501,12 +501,6 @@ pub(super) fn core_service_descriptors() -> Vec<RegisteredService> {
             interface_id: "pane-command/v1".to_string(),
             provider: bmux_plugin_sdk::ProviderId::Host,
         },
-        RegisteredService {
-            capability: HostScope::new("bmux.recording.write").expect("capability should parse"),
-            kind: ServiceKind::Command,
-            interface_id: "recording-command/v1".to_string(),
-            provider: bmux_plugin_sdk::ProviderId::Host,
-        },
     ]
 }
 

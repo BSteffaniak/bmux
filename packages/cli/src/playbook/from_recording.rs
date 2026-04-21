@@ -631,13 +631,6 @@ fn request_to_dsl(
         | Request::ListPanes { .. }
         | Request::SubscribeEvents
         | Request::PollEvents { .. }
-        | Request::RecordingStart { .. }
-        | Request::RecordingStop { .. }
-        | Request::RecordingStatus
-        | Request::RecordingList
-        | Request::RecordingDelete { .. }
-        | Request::RecordingDeleteAll
-        | Request::RecordingWriteCustomEvent { .. }
         | Request::Attach { .. }
         | Request::AttachContext { .. }
         | Request::AttachOpen { .. }

@@ -185,13 +185,34 @@ pub trait HostRuntimeApi: ServiceCaller {
         &self,
         request: &RecordingWriteEventRequest,
     ) -> Result<RecordingWriteEventResponse> {
-        self.call_service(
-            "bmux.recording.write",
+        use bmux_recording_plugin_api::{RecordingRequest, RecordingResponse};
+
+        let recording_request = RecordingRequest::WriteCustomEvent {
+            session_id: request.session_id,
+            pane_id: request.pane_id,
+            // `HostRuntimeApi` doesn't know which plugin is calling,
+            // so we pass an empty source. The caller-side code that
+            // needs source identity should dispatch directly via
+            // `recording-commands::dispatch` instead.
+            source: String::new(),
+            name: request.name.clone(),
+            payload: serde_json::to_vec(&request.payload).unwrap_or_default(),
+        };
+        let response: RecordingResponse = self.call_service(
+            "bmux.recording.read",
             ServiceKind::Command,
-            "recording-command/v1",
-            "write_event",
-            request,
-        )
+            "recording-commands",
+            "dispatch",
+            &recording_request,
+        )?;
+        match response {
+            RecordingResponse::CustomEventWritten { accepted } => {
+                Ok(RecordingWriteEventResponse { accepted })
+            }
+            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: "unexpected response payload for recording-commands::dispatch".to_string(),
+            }),
+        }
     }
 }
 

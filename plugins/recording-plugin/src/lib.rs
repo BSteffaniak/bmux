@@ -144,9 +144,7 @@ fn handle_start(
     let profile = profile.unwrap_or(RecordingProfile::Full);
     let event_kinds = event_kinds.unwrap_or_else(default_event_kinds);
     match runtime.start(session_id, capture_input, name, profile, event_kinds) {
-        Ok(summary) => RecordingResponse::Started {
-            recording_id: summary.id,
-        },
+        Ok(recording) => RecordingResponse::Started { recording },
         Err(_) => RecordingResponse::CustomEventWritten { accepted: false },
     }
 }
@@ -468,9 +466,7 @@ fn handle_rolling_start(options: RecordingRollingStartOptions) -> RecordingRespo
 
     if let Some(active) = runtime.status().active {
         if options_empty {
-            return RecordingResponse::RollingStarted {
-                recording_id: active.id,
-            };
+            return RecordingResponse::RollingStarted { recording: active };
         }
         return RecordingResponse::CustomEventWritten { accepted: false };
     }
@@ -479,7 +475,7 @@ fn handle_rolling_start(options: RecordingRollingStartOptions) -> RecordingRespo
         *runtime = RecordingRuntime::new_rolling(rolling_dir, segment_mb, resolved.window_secs);
     }
 
-    let Ok(summary) = runtime.start(
+    let Ok(recording) = runtime.start(
         None,
         resolved.capture_input(),
         options.name,
@@ -489,9 +485,7 @@ fn handle_rolling_start(options: RecordingRollingStartOptions) -> RecordingRespo
         return RecordingResponse::CustomEventWritten { accepted: false };
     };
 
-    RecordingResponse::RollingStarted {
-        recording_id: summary.id,
-    }
+    RecordingResponse::RollingStarted { recording }
 }
 
 fn handle_cut(last_seconds: Option<u64>, name: Option<String>) -> RecordingResponse {
@@ -537,21 +531,23 @@ fn handle_rolling_clear(restart_if_active: bool) -> RecordingResponse {
 
     let usage_before = collect_rolling_usage(&root).unwrap_or_default();
 
-    let (was_active, _stopped_id, restart_settings, restart_name) = {
+    // Stop the active rolling recording if any; capture enough state
+    // to restart it after clearing.
+    let (was_active, stopped_recording_id, restart_settings, restart_name) = {
         let Some(handle) = rolling_handle() else {
-            return RecordingResponse::CustomEventWritten { accepted: false };
+            return clear_report_response(&root, false, false, None, None, &usage_before);
         };
         let Ok(guard) = handle.read() else {
-            return RecordingResponse::CustomEventWritten { accepted: false };
+            return clear_report_response(&root, false, false, None, None, &usage_before);
         };
         let Ok(mut rolling) = guard.0.lock() else {
-            return RecordingResponse::CustomEventWritten { accepted: false };
+            return clear_report_response(&root, false, false, None, None, &usage_before);
         };
         let Some(runtime) = rolling.as_mut() else {
-            return rolling_cleared_response(&root, false, false, None, &usage_before);
+            return clear_report_response(&root, false, false, None, None, &usage_before);
         };
         let Some(active) = runtime.status().active else {
-            return rolling_cleared_response(&root, false, false, None, &usage_before);
+            return clear_report_response(&root, false, false, None, None, &usage_before);
         };
         let name = active.name.clone();
         let settings = RollingRecordingSettings {
@@ -560,7 +556,7 @@ fn handle_rolling_clear(restart_if_active: bool) -> RecordingResponse {
                 .unwrap_or(defaults.window_secs),
             event_kinds: active.event_kinds.clone(),
         };
-        let stopped_id = runtime.stop(None).ok().map(|s| s.id);
+        let stopped_id = runtime.stop(None).ok().map(|summary| summary.id);
         (true, stopped_id, Some(settings), name)
     };
 
@@ -583,10 +579,11 @@ fn handle_rolling_clear(restart_if_active: bool) -> RecordingResponse {
         (false, None)
     };
 
-    rolling_cleared_response_with_restart(
+    clear_report_response(
         &root,
         was_active,
         restarted,
+        stopped_recording_id,
         restarted_recording,
         &usage_before,
     )
@@ -723,33 +720,25 @@ fn try_restart_rolling(
         .ok()
 }
 
-fn rolling_cleared_response(
+fn clear_report_response(
     root: &Path,
-    _was_active: bool,
-    _restarted: bool,
-    _restarted_recording: Option<RecordingSummary>,
-    usage_before: &RecordingRollingUsage,
-) -> RecordingResponse {
-    let usage_after = collect_rolling_usage(root).unwrap_or_default();
-    let cleared = usage_before.files.saturating_sub(usage_after.files);
-    RecordingResponse::RollingCleared {
-        cleared_count: usize::try_from(cleared).unwrap_or(usize::MAX),
-        restarted_recording: None,
-    }
-}
-
-fn rolling_cleared_response_with_restart(
-    root: &Path,
-    _was_active: bool,
-    _restarted: bool,
+    was_active: bool,
+    restarted: bool,
+    stopped_recording_id: Option<uuid::Uuid>,
     restarted_recording: Option<RecordingSummary>,
     usage_before: &RecordingRollingUsage,
 ) -> RecordingResponse {
     let usage_after = collect_rolling_usage(root).unwrap_or_default();
-    let cleared = usage_before.files.saturating_sub(usage_after.files);
     RecordingResponse::RollingCleared {
-        cleared_count: usize::try_from(cleared).unwrap_or(usize::MAX),
-        restarted_recording,
+        report: bmux_ipc::RecordingRollingClearReport {
+            root_path: root.display().to_string(),
+            was_active,
+            restarted,
+            stopped_recording_id,
+            restarted_recording,
+            usage_before: usage_before.clone(),
+            usage_after,
+        },
     }
 }
 

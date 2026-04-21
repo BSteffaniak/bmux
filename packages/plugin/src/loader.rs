@@ -17,10 +17,10 @@ use bmux_plugin_sdk::{
     PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
     PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_PROTOCOL_V1, PROCESS_RUNTIME_TRANSPORT_STDIO_V1,
     PluginCliCommandRequest, PluginCliCommandResponse, PluginError, PluginEvent,
-    ProcessInvocationRequest, ProcessInvocationResponse, RecordingWriteEventRequest,
-    RecordingWriteEventResponse, RegisteredService, Result, ServiceEnvelopeKind, ServiceKind,
-    ServiceRequest, ServiceResponse, StaticPluginVtable, decode_process_invocation_response,
-    decode_service_envelope, decode_service_message, encode_host_kernel_bridge_cli_command_payload,
+    ProcessInvocationRequest, ProcessInvocationResponse, RegisteredService, Result,
+    ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse, StaticPluginVtable,
+    decode_process_invocation_response, decode_service_envelope, decode_service_message,
+    encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload, encode_process_invocation_request,
     encode_service_envelope, encode_service_message,
 };
@@ -1020,28 +1020,6 @@ fn handle_core_service_call(
             let request: PluginCliCommandRequest = decode_service_message(payload)?;
             let response = execute_plugin_command_request(host_kernel_bridge, &request)?;
             encode_service_message(&response)
-        }
-        ("recording-command/v1", "write_event") => {
-            let request: RecordingWriteEventRequest = decode_service_message(payload)?;
-            let response = execute_kernel_request(
-                host_kernel_bridge,
-                IpcRequest::RecordingWriteCustomEvent {
-                    session_id: request.session_id,
-                    pane_id: request.pane_id,
-                    source: caller_plugin_id.to_string(),
-                    name: request.name,
-                    payload: serde_json::to_vec(&request.payload).unwrap_or_default(),
-                },
-            )?;
-            match response {
-                IpcResponsePayload::RecordingCustomEventWritten { accepted } => {
-                    encode_service_message(&RecordingWriteEventResponse { accepted })
-                }
-                _ => Err(PluginError::ServiceProtocol {
-                    details: "unexpected response payload for recording-command/v1:write_event"
-                        .to_string(),
-                }),
-            }
         }
         _ => Err(PluginError::UnsupportedHostOperation {
             operation: "call_service",

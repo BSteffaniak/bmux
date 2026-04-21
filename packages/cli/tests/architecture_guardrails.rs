@@ -939,3 +939,60 @@ fn recording_plugin_exists() {
          reach the active recording runtimes",
     );
 }
+
+/// Verify that `Request::Recording*` (15 variants) and
+/// `ResponsePayload::Recording*` variants have been deleted from
+/// `bmux_ipc`. Recording lifecycle operations are served by the
+/// `bmux.recording` plugin's typed `recording-commands::dispatch`
+/// service, which takes a `RecordingRequest` and returns a
+/// `RecordingResponse` (both defined in
+/// `bmux_recording_plugin_api`).
+#[test]
+fn recording_ipc_variants_are_absent() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    // These patterns match only `Request` / `ResponsePayload` variant
+    // definitions. We intentionally do NOT match `Event::RecordingStarted`
+    // or `Event::RecordingStopped` — those remain on the `Event` enum
+    // because attach clients still consume them to coordinate display-
+    // track writes.
+    let denied = [
+        // Request variants (the `Request` enum uses indent = 4 spaces
+        // and always has at least one named field record shape).
+        "Request::RecordingStart",
+        "Request::RecordingStop",
+        "Request::RecordingStatus",
+        "Request::RecordingList",
+        "Request::RecordingDelete",
+        "Request::RecordingWriteCustomEvent",
+        "Request::RecordingDeleteAll",
+        "Request::RecordingCut",
+        "Request::RecordingRollingStart",
+        "Request::RecordingRollingStop",
+        "Request::RecordingRollingStatus",
+        "Request::RecordingRollingClear",
+        "Request::RecordingCaptureTargets",
+        "Request::RecordingPrune",
+        // ResponsePayload variants.
+        "ResponsePayload::RecordingStarted",
+        "ResponsePayload::RecordingStopped",
+        "ResponsePayload::RecordingStatus",
+        "ResponsePayload::RecordingList",
+        "ResponsePayload::RecordingDeleted",
+        "ResponsePayload::RecordingCustomEventWritten",
+        "ResponsePayload::RecordingDeleteAll",
+        "ResponsePayload::RecordingCut",
+        "ResponsePayload::RecordingCaptureTargets",
+        "ResponsePayload::RecordingRollingStatus",
+        "ResponsePayload::RecordingRollingCleared",
+        "ResponsePayload::RecordingPruned",
+    ];
+    for marker in denied {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; \
+             recording lifecycle operations go through \
+             `recording-commands::dispatch` typed dispatch provided \
+             by the `bmux.recording` plugin",
+        );
+    }
+}

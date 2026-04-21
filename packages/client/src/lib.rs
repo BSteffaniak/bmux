@@ -20,6 +20,7 @@ use bmux_ipc::{
     RecordingRollingStatus, RecordingStatus, RecordingSummary, Request, Response, ResponsePayload,
     ServerSnapshotStatus, SessionSelector, decode, default_supported_capabilities, encode,
 };
+use bmux_recording_plugin_api::{RecordingRequest, RecordingResponse};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -615,7 +616,7 @@ impl BmuxClient {
         event_kinds: Option<Vec<RecordingEventKind>>,
     ) -> Result<RecordingSummary> {
         match self
-            .request(Request::RecordingStart {
+            .dispatch_recording(RecordingRequest::Start {
                 session_id,
                 capture_input,
                 name,
@@ -624,7 +625,7 @@ impl BmuxClient {
             })
             .await?
         {
-            ResponsePayload::RecordingStarted { recording } => Ok(recording),
+            RecordingResponse::Started { recording } => Ok(recording),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording started",
             )),
@@ -638,10 +639,12 @@ impl BmuxClient {
     /// Returns an error if request or response validation fails.
     pub async fn recording_stop(&mut self, recording_id: Option<Uuid>) -> Result<Uuid> {
         match self
-            .request(Request::RecordingStop { recording_id })
+            .dispatch_recording(RecordingRequest::Stop { recording_id })
             .await?
         {
-            ResponsePayload::RecordingStopped { recording_id } => Ok(recording_id),
+            RecordingResponse::Stopped { recording_id } => {
+                recording_id.ok_or(ClientError::UnexpectedResponse("no recording to stop"))
+            }
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording stopped",
             )),
@@ -662,7 +665,7 @@ impl BmuxClient {
         payload: Vec<u8>,
     ) -> Result<()> {
         match self
-            .request(Request::RecordingWriteCustomEvent {
+            .dispatch_recording(RecordingRequest::WriteCustomEvent {
                 session_id,
                 pane_id,
                 source,
@@ -671,7 +674,7 @@ impl BmuxClient {
             })
             .await?
         {
-            ResponsePayload::RecordingCustomEventWritten { .. } => Ok(()),
+            RecordingResponse::CustomEventWritten { .. } => Ok(()),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording custom event written",
             )),
@@ -684,8 +687,8 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn recording_status(&mut self) -> Result<RecordingStatus> {
-        match self.request(Request::RecordingStatus).await? {
-            ResponsePayload::RecordingStatus { status } => Ok(status),
+        match self.dispatch_recording(RecordingRequest::Status).await? {
+            RecordingResponse::Status { status } => Ok(status),
             _ => Err(ClientError::UnexpectedResponse("expected recording status")),
         }
     }
@@ -696,8 +699,8 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn recording_list(&mut self) -> Result<Vec<RecordingSummary>> {
-        match self.request(Request::RecordingList).await? {
-            ResponsePayload::RecordingList { recordings } => Ok(recordings),
+        match self.dispatch_recording(RecordingRequest::List).await? {
+            RecordingResponse::List { recordings } => Ok(recordings),
             _ => Err(ClientError::UnexpectedResponse("expected recording list")),
         }
     }
@@ -709,10 +712,10 @@ impl BmuxClient {
     /// Returns an error if request or response validation fails.
     pub async fn recording_delete(&mut self, recording_id: Uuid) -> Result<Uuid> {
         match self
-            .request(Request::RecordingDelete { recording_id })
+            .dispatch_recording(RecordingRequest::Delete { recording_id })
             .await?
         {
-            ResponsePayload::RecordingDeleted { recording_id } => Ok(recording_id),
+            RecordingResponse::Deleted { recording_id } => Ok(recording_id),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording deleted",
             )),
@@ -725,8 +728,8 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn recording_delete_all(&mut self) -> Result<usize> {
-        match self.request(Request::RecordingDeleteAll).await? {
-            ResponsePayload::RecordingDeleteAll { deleted_count } => Ok(deleted_count),
+        match self.dispatch_recording(RecordingRequest::DeleteAll).await? {
+            RecordingResponse::DeleteAll { removed_count } => Ok(removed_count),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording delete-all response",
             )),
@@ -744,10 +747,10 @@ impl BmuxClient {
         name: Option<String>,
     ) -> Result<RecordingSummary> {
         match self
-            .request(Request::RecordingCut { last_seconds, name })
+            .dispatch_recording(RecordingRequest::Cut { last_seconds, name })
             .await?
         {
-            ResponsePayload::RecordingCut { recording } => Ok(recording),
+            RecordingResponse::Cut { recording } => Ok(recording),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording cut response",
             )),
@@ -764,10 +767,10 @@ impl BmuxClient {
         options: RecordingRollingStartOptions,
     ) -> Result<RecordingSummary> {
         match self
-            .request(Request::RecordingRollingStart { options })
+            .dispatch_recording(RecordingRequest::RollingStart { options })
             .await?
         {
-            ResponsePayload::RecordingStarted { recording } => Ok(recording),
+            RecordingResponse::RollingStarted { recording } => Ok(recording),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording started response",
             )),
@@ -780,8 +783,13 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn recording_rolling_stop(&mut self) -> Result<Uuid> {
-        match self.request(Request::RecordingRollingStop).await? {
-            ResponsePayload::RecordingStopped { recording_id } => Ok(recording_id),
+        match self
+            .dispatch_recording(RecordingRequest::RollingStop)
+            .await?
+        {
+            RecordingResponse::RollingStopped { recording_id } => recording_id.ok_or(
+                ClientError::UnexpectedResponse("no rolling recording active"),
+            ),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording stopped response",
             )),
@@ -794,8 +802,11 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn recording_rolling_status(&mut self) -> Result<RecordingRollingStatus> {
-        match self.request(Request::RecordingRollingStatus).await? {
-            ResponsePayload::RecordingRollingStatus { status } => Ok(status),
+        match self
+            .dispatch_recording(RecordingRequest::RollingStatus)
+            .await?
+        {
+            RecordingResponse::RollingStatus { status } => Ok(status),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording rolling status response",
             )),
@@ -812,10 +823,10 @@ impl BmuxClient {
         restart_if_active: bool,
     ) -> Result<RecordingRollingClearReport> {
         match self
-            .request(Request::RecordingRollingClear { restart_if_active })
+            .dispatch_recording(RecordingRequest::RollingClear { restart_if_active })
             .await?
         {
-            ResponsePayload::RecordingRollingCleared { report } => Ok(report),
+            RecordingResponse::RollingCleared { report } => Ok(report),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording rolling cleared response",
             )),
@@ -828,8 +839,11 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn recording_capture_targets(&mut self) -> Result<Vec<RecordingCaptureTarget>> {
-        match self.request(Request::RecordingCaptureTargets).await? {
-            ResponsePayload::RecordingCaptureTargets { targets } => Ok(targets),
+        match self
+            .dispatch_recording(RecordingRequest::CaptureTargets)
+            .await?
+        {
+            RecordingResponse::CaptureTargets { targets } => Ok(targets),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording capture targets response",
             )),
@@ -843,14 +857,33 @@ impl BmuxClient {
     /// Returns an error if request or response validation fails.
     pub async fn recording_prune(&mut self, older_than_days: Option<u64>) -> Result<usize> {
         match self
-            .request(Request::RecordingPrune { older_than_days })
+            .dispatch_recording(RecordingRequest::Prune { older_than_days })
             .await?
         {
-            ResponsePayload::RecordingPruned { deleted_count } => Ok(deleted_count),
+            RecordingResponse::Pruned { pruned_count } => Ok(pruned_count),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording pruned response",
             )),
         }
+    }
+
+    /// Dispatch a typed `RecordingRequest` to the `bmux.recording`
+    /// plugin's `recording-commands` service and return the typed
+    /// response. Used by the 15 recording convenience methods above.
+    async fn dispatch_recording(&mut self, request: RecordingRequest) -> Result<RecordingResponse> {
+        let payload = bmux_ipc::encode(&request)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to encode recording request"))?;
+        let response_bytes = self
+            .invoke_service_raw(
+                "bmux.recording.read",
+                InvokeServiceKind::Command,
+                "recording-commands",
+                "dispatch",
+                payload,
+            )
+            .await?;
+        bmux_ipc::decode(&response_bytes)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to decode recording response"))
     }
     /// Follow another client's active session focus.
     ///
@@ -2338,7 +2371,7 @@ impl StreamingBmuxClient {
         event_kinds: Option<Vec<RecordingEventKind>>,
     ) -> Result<RecordingSummary> {
         match self
-            .request(Request::RecordingStart {
+            .dispatch_recording(RecordingRequest::Start {
                 session_id,
                 capture_input,
                 name,
@@ -2347,7 +2380,7 @@ impl StreamingBmuxClient {
             })
             .await?
         {
-            ResponsePayload::RecordingStarted { recording } => Ok(recording),
+            RecordingResponse::Started { recording } => Ok(recording),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording started",
             )),
@@ -2361,10 +2394,12 @@ impl StreamingBmuxClient {
     /// Returns an error if request or response validation fails.
     pub async fn recording_stop(&mut self, recording_id: Option<Uuid>) -> Result<Uuid> {
         match self
-            .request(Request::RecordingStop { recording_id })
+            .dispatch_recording(RecordingRequest::Stop { recording_id })
             .await?
         {
-            ResponsePayload::RecordingStopped { recording_id } => Ok(recording_id),
+            RecordingResponse::Stopped { recording_id } => {
+                recording_id.ok_or(ClientError::UnexpectedResponse("no recording to stop"))
+            }
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording stopped",
             )),
@@ -2385,7 +2420,7 @@ impl StreamingBmuxClient {
         payload: Vec<u8>,
     ) -> Result<()> {
         match self
-            .request(Request::RecordingWriteCustomEvent {
+            .dispatch_recording(RecordingRequest::WriteCustomEvent {
                 session_id,
                 pane_id,
                 source,
@@ -2394,7 +2429,7 @@ impl StreamingBmuxClient {
             })
             .await?
         {
-            ResponsePayload::RecordingCustomEventWritten { .. } => Ok(()),
+            RecordingResponse::CustomEventWritten { .. } => Ok(()),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording custom event written",
             )),
@@ -2407,8 +2442,8 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn recording_status(&mut self) -> Result<RecordingStatus> {
-        match self.request(Request::RecordingStatus).await? {
-            ResponsePayload::RecordingStatus { status } => Ok(status),
+        match self.dispatch_recording(RecordingRequest::Status).await? {
+            RecordingResponse::Status { status } => Ok(status),
             _ => Err(ClientError::UnexpectedResponse("expected recording status")),
         }
     }
@@ -2424,10 +2459,10 @@ impl StreamingBmuxClient {
         name: Option<String>,
     ) -> Result<RecordingSummary> {
         match self
-            .request(Request::RecordingCut { last_seconds, name })
+            .dispatch_recording(RecordingRequest::Cut { last_seconds, name })
             .await?
         {
-            ResponsePayload::RecordingCut { recording } => Ok(recording),
+            RecordingResponse::Cut { recording } => Ok(recording),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording cut response",
             )),
@@ -2444,10 +2479,10 @@ impl StreamingBmuxClient {
         options: RecordingRollingStartOptions,
     ) -> Result<RecordingSummary> {
         match self
-            .request(Request::RecordingRollingStart { options })
+            .dispatch_recording(RecordingRequest::RollingStart { options })
             .await?
         {
-            ResponsePayload::RecordingStarted { recording } => Ok(recording),
+            RecordingResponse::RollingStarted { recording } => Ok(recording),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording started response",
             )),
@@ -2460,8 +2495,13 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn recording_rolling_stop(&mut self) -> Result<Uuid> {
-        match self.request(Request::RecordingRollingStop).await? {
-            ResponsePayload::RecordingStopped { recording_id } => Ok(recording_id),
+        match self
+            .dispatch_recording(RecordingRequest::RollingStop)
+            .await?
+        {
+            RecordingResponse::RollingStopped { recording_id } => recording_id.ok_or(
+                ClientError::UnexpectedResponse("no rolling recording active"),
+            ),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording stopped response",
             )),
@@ -2474,8 +2514,11 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn recording_rolling_status(&mut self) -> Result<RecordingRollingStatus> {
-        match self.request(Request::RecordingRollingStatus).await? {
-            ResponsePayload::RecordingRollingStatus { status } => Ok(status),
+        match self
+            .dispatch_recording(RecordingRequest::RollingStatus)
+            .await?
+        {
+            RecordingResponse::RollingStatus { status } => Ok(status),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording rolling status response",
             )),
@@ -2492,10 +2535,10 @@ impl StreamingBmuxClient {
         restart_if_active: bool,
     ) -> Result<RecordingRollingClearReport> {
         match self
-            .request(Request::RecordingRollingClear { restart_if_active })
+            .dispatch_recording(RecordingRequest::RollingClear { restart_if_active })
             .await?
         {
-            ResponsePayload::RecordingRollingCleared { report } => Ok(report),
+            RecordingResponse::RollingCleared { report } => Ok(report),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording rolling cleared response",
             )),
@@ -2508,12 +2551,35 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn recording_capture_targets(&mut self) -> Result<Vec<RecordingCaptureTarget>> {
-        match self.request(Request::RecordingCaptureTargets).await? {
-            ResponsePayload::RecordingCaptureTargets { targets } => Ok(targets),
+        match self
+            .dispatch_recording(RecordingRequest::CaptureTargets)
+            .await?
+        {
+            RecordingResponse::CaptureTargets { targets } => Ok(targets),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording capture targets response",
             )),
         }
+    }
+
+    /// Dispatch a typed `RecordingRequest` to the `bmux.recording`
+    /// plugin's `recording-commands` service and return the typed
+    /// response. Used by the streaming-client recording convenience
+    /// methods above.
+    async fn dispatch_recording(&mut self, request: RecordingRequest) -> Result<RecordingResponse> {
+        let payload = bmux_ipc::encode(&request)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to encode recording request"))?;
+        let response_bytes = self
+            .invoke_service_raw(
+                "bmux.recording.read",
+                InvokeServiceKind::Command,
+                "recording-commands",
+                "dispatch",
+                payload,
+            )
+            .await?;
+        bmux_ipc::decode(&response_bytes)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to decode recording response"))
     }
 }
 
@@ -2606,22 +2672,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
         Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
         Request::AttachPaneImages { .. } => "attach_pane_images",
-        Request::RecordingStart { .. } => "recording_start",
-        Request::RecordingStop { .. } => "recording_stop",
-        Request::RecordingStatus => "recording_status",
-        Request::RecordingList => "recording_list",
-        Request::RecordingDelete { .. } => "recording_delete",
-        Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
-        Request::RecordingDeleteAll => "recording_delete_all",
-        Request::RecordingCut { .. } => "recording_cut",
-        Request::RecordingRollingStart { .. } => "recording_rolling_start",
-        Request::RecordingRollingStop => "recording_rolling_stop",
-        Request::RecordingRollingStatus => "recording_rolling_status",
         Request::PerformanceStatus => "performance_status",
         Request::PerformanceSet { .. } => "performance_set",
-        Request::RecordingRollingClear { .. } => "recording_rolling_clear",
-        Request::RecordingCaptureTargets => "recording_capture_targets",
-        Request::RecordingPrune { .. } => "recording_prune",
         Request::SetClientAttachPolicy { .. } => "set_client_attach_policy",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
@@ -2667,20 +2719,8 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
             ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
             ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
-            ResponsePayload::RecordingStarted { .. } => "recording_started",
-            ResponsePayload::RecordingStopped { .. } => "recording_stopped",
-            ResponsePayload::RecordingStatus { .. } => "recording_status",
-            ResponsePayload::RecordingList { .. } => "recording_list",
-            ResponsePayload::RecordingDeleted { .. } => "recording_deleted",
-            ResponsePayload::RecordingCustomEventWritten { .. } => "recording_custom_event_written",
-            ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
-            ResponsePayload::RecordingCut { .. } => "recording_cut",
-            ResponsePayload::RecordingCaptureTargets { .. } => "recording_capture_targets",
-            ResponsePayload::RecordingRollingStatus { .. } => "recording_rolling_status",
             ResponsePayload::PerformanceStatus { .. } => "performance_status",
             ResponsePayload::PerformanceUpdated { .. } => "performance_updated",
-            ResponsePayload::RecordingRollingCleared { .. } => "recording_rolling_cleared",
-            ResponsePayload::RecordingPruned { .. } => "recording_pruned",
             ResponsePayload::ClientAttachPolicySet { .. } => "client_attach_policy_set",
             ResponsePayload::Detached => "detached",
             ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",

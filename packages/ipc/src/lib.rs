@@ -601,61 +601,9 @@ pub enum Request {
     /// clients (which split the socket into read/write halves and demux
     /// incoming frames) should send this request.
     EnableEventPush,
-    RecordingStart {
-        #[serde(default)]
-        session_id: Option<Uuid>,
-        capture_input: bool,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        profile: Option<RecordingProfile>,
-        #[serde(default)]
-        event_kinds: Option<Vec<RecordingEventKind>>,
-    },
-    RecordingStop {
-        #[serde(default)]
-        recording_id: Option<Uuid>,
-    },
-    RecordingStatus,
-    RecordingList,
-    RecordingDelete {
-        recording_id: Uuid,
-    },
-    RecordingWriteCustomEvent {
-        #[serde(default)]
-        session_id: Option<Uuid>,
-        #[serde(default)]
-        pane_id: Option<Uuid>,
-        source: String,
-        name: String,
-        /// Pre-serialized JSON payload bytes.
-        payload: Vec<u8>,
-    },
-    RecordingDeleteAll,
-    RecordingCut {
-        #[serde(default)]
-        last_seconds: Option<u64>,
-        #[serde(default)]
-        name: Option<String>,
-    },
-    RecordingRollingStart {
-        #[serde(default)]
-        options: RecordingRollingStartOptions,
-    },
-    RecordingRollingStop,
-    RecordingRollingStatus,
     PerformanceStatus,
     PerformanceSet {
         settings: PerformanceRuntimeSettings,
-    },
-    RecordingRollingClear {
-        restart_if_active: bool,
-    },
-    RecordingCaptureTargets,
-    /// Prune completed recordings older than the specified retention period.
-    RecordingPrune {
-        /// Override retention period in days. If `None`, uses the server config.
-        older_than_days: Option<u64>,
     },
     SetClientAttachPolicy {
         allow_detach: bool,
@@ -1282,47 +1230,11 @@ pub enum ResponsePayload {
     },
     /// Acknowledgement that server-push event delivery has been enabled.
     EventPushEnabled,
-    RecordingStarted {
-        recording: RecordingSummary,
-    },
-    RecordingStopped {
-        recording_id: Uuid,
-    },
-    RecordingStatus {
-        status: RecordingStatus,
-    },
-    RecordingList {
-        recordings: Vec<RecordingSummary>,
-    },
-    RecordingDeleted {
-        recording_id: Uuid,
-    },
-    RecordingCustomEventWritten {
-        accepted: bool,
-    },
-    RecordingDeleteAll {
-        deleted_count: usize,
-    },
-    RecordingCut {
-        recording: RecordingSummary,
-    },
-    RecordingCaptureTargets {
-        targets: Vec<RecordingCaptureTarget>,
-    },
-    RecordingRollingStatus {
-        status: RecordingRollingStatus,
-    },
     PerformanceStatus {
         settings: PerformanceRuntimeSettings,
     },
     PerformanceUpdated {
         settings: PerformanceRuntimeSettings,
-    },
-    RecordingRollingCleared {
-        report: RecordingRollingClearReport,
-    },
-    RecordingPruned {
-        deleted_count: usize,
     },
     ClientAttachPolicySet {
         allow_detach: bool,
@@ -2070,84 +1982,6 @@ mod tests {
             },
             Request::SubscribeEvents,
             Request::PollEvents { max_events: 100 },
-            Request::RecordingStart {
-                session_id: Some(id),
-                capture_input: true,
-                name: Some("manual-demo".into()),
-                profile: Some(RecordingProfile::Visual),
-                event_kinds: Some(vec![
-                    RecordingEventKind::PaneOutputRaw,
-                    RecordingEventKind::Custom,
-                ]),
-            },
-            Request::RecordingStart {
-                session_id: None,
-                capture_input: false,
-                name: None,
-                profile: None,
-                event_kinds: None,
-            },
-            Request::RecordingStop {
-                recording_id: Some(id),
-            },
-            Request::RecordingStop { recording_id: None },
-            Request::RecordingStatus,
-            Request::RecordingList,
-            Request::RecordingDelete { recording_id: id },
-            Request::RecordingWriteCustomEvent {
-                session_id: Some(id),
-                pane_id: Some(id2),
-                source: "test-plugin".into(),
-                name: "my-event".into(),
-                payload: b"{\"key\":\"value\"}".to_vec(),
-            },
-            Request::RecordingWriteCustomEvent {
-                session_id: None,
-                pane_id: None,
-                source: "s".into(),
-                name: "n".into(),
-                payload: vec![],
-            },
-            Request::RecordingDeleteAll,
-            Request::RecordingCut {
-                last_seconds: Some(120),
-                name: Some("cut-demo".into()),
-            },
-            Request::RecordingCut {
-                last_seconds: None,
-                name: None,
-            },
-            Request::RecordingRollingStart {
-                options: RecordingRollingStartOptions::default(),
-            },
-            Request::RecordingRollingStart {
-                options: RecordingRollingStartOptions {
-                    window_secs: Some(90),
-                    name: Some("rolling-demo".into()),
-                    event_kinds: Some(vec![
-                        RecordingEventKind::PaneOutputRaw,
-                        RecordingEventKind::ProtocolReplyRaw,
-                    ]),
-                    capture_input: Some(false),
-                    capture_output: Some(true),
-                    capture_events: Some(false),
-                    capture_protocol_replies: Some(true),
-                    capture_images: Some(false),
-                },
-            },
-            Request::RecordingRollingStop,
-            Request::RecordingRollingStatus,
-            Request::PerformanceStatus,
-            Request::PerformanceSet {
-                settings: sample_performance_runtime_settings(),
-            },
-            Request::RecordingRollingClear {
-                restart_if_active: true,
-            },
-            Request::RecordingRollingClear {
-                restart_if_active: false,
-            },
-            Request::RecordingCaptureTargets,
             Request::Detach,
             Request::PaneDirectInput {
                 session_id: id,
@@ -2525,86 +2359,12 @@ mod tests {
                     },
                 ],
             },
-            ResponsePayload::RecordingStarted {
-                recording: sample_recording_summary(),
-            },
-            ResponsePayload::RecordingStopped { recording_id: id },
-            ResponsePayload::RecordingStatus {
-                status: RecordingStatus {
-                    active: Some(sample_recording_summary()),
-                    queue_len: 5,
-                },
-            },
-            ResponsePayload::RecordingStatus {
-                status: RecordingStatus {
-                    active: None,
-                    queue_len: 0,
-                },
-            },
-            ResponsePayload::RecordingList {
-                recordings: vec![sample_recording_summary()],
-            },
-            ResponsePayload::RecordingDeleted { recording_id: id },
-            ResponsePayload::RecordingCustomEventWritten { accepted: true },
-            ResponsePayload::RecordingDeleteAll { deleted_count: 7 },
-            ResponsePayload::RecordingCut {
-                recording: sample_recording_summary(),
-            },
-            ResponsePayload::RecordingCaptureTargets {
-                targets: vec![RecordingCaptureTarget {
-                    recording_id: id,
-                    path: "/tmp/recordings/.rolling/active".into(),
-                    rolling_window_secs: Some(300),
-                }],
-            },
-            ResponsePayload::RecordingRollingStatus {
-                status: RecordingRollingStatus {
-                    root_path: "/tmp/recordings/.rolling".into(),
-                    auto_start: true,
-                    available: true,
-                    active: Some(sample_recording_summary()),
-                    rolling_window_secs: Some(300),
-                    event_kinds: vec![
-                        RecordingEventKind::PaneOutputRaw,
-                        RecordingEventKind::ProtocolReplyRaw,
-                        RecordingEventKind::ServerEvent,
-                    ],
-                    usage: RecordingRollingUsage {
-                        bytes: 2048,
-                        files: 7,
-                        directories: 3,
-                        recording_dirs: 2,
-                    },
-                },
-            },
             ResponsePayload::PerformanceStatus {
                 settings: sample_performance_runtime_settings(),
             },
             ResponsePayload::PerformanceUpdated {
                 settings: sample_performance_runtime_settings(),
             },
-            ResponsePayload::RecordingRollingCleared {
-                report: RecordingRollingClearReport {
-                    root_path: "/tmp/recordings/.rolling".into(),
-                    was_active: true,
-                    restarted: true,
-                    stopped_recording_id: Some(id),
-                    restarted_recording: Some(sample_recording_summary()),
-                    usage_before: RecordingRollingUsage {
-                        bytes: 8192,
-                        files: 17,
-                        directories: 5,
-                        recording_dirs: 4,
-                    },
-                    usage_after: RecordingRollingUsage {
-                        bytes: 1024,
-                        files: 4,
-                        directories: 2,
-                        recording_dirs: 1,
-                    },
-                },
-            },
-            ResponsePayload::RecordingPruned { deleted_count: 3 },
             ResponsePayload::Detached,
             ResponsePayload::PaneDirectInputAccepted { bytes: 5, pane_id },
             ResponsePayload::ServerStopping,

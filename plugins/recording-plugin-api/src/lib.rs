@@ -165,8 +165,9 @@ impl RecordingSink for DualRuntimeSink {
 }
 
 /// Typed request variants for the recording plugin's typed service
-/// dispatch surface. Mirrors `Request::Recording*` variants that used
-/// to live on `bmux_ipc::Request` before Slice 10.
+/// dispatch surface. Replaces the former `Request::Recording*`
+/// variants that used to live on `bmux_ipc::Request` before the
+/// recording plugin migration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RecordingRequest {
@@ -223,13 +224,13 @@ pub enum RecordingRequest {
 }
 
 /// Typed response variants for the recording plugin's typed service
-/// dispatch surface. Mirrors the pre-Slice-10 `ResponsePayload::Recording*`
-/// variants.
+/// dispatch surface. Replaces the former
+/// `ResponsePayload::Recording*` variants.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RecordingResponse {
     Started {
-        recording_id: Uuid,
+        recording: RecordingSummary,
     },
     Stopped {
         recording_id: Option<Uuid>,
@@ -253,7 +254,7 @@ pub enum RecordingResponse {
         recording: RecordingSummary,
     },
     RollingStarted {
-        recording_id: Uuid,
+        recording: RecordingSummary,
     },
     RollingStopped {
         recording_id: Option<Uuid>,
@@ -262,8 +263,7 @@ pub enum RecordingResponse {
         status: bmux_ipc::RecordingRollingStatus,
     },
     RollingCleared {
-        cleared_count: usize,
-        restarted_recording: Option<RecordingSummary>,
+        report: bmux_ipc::RecordingRollingClearReport,
     },
     CaptureTargets {
         targets: Vec<bmux_ipc::RecordingCaptureTarget>,
