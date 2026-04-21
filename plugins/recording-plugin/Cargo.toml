@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shipped recording plugin for bmux (owns RecordingRuntime and lifecycle operations)"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "recording"]
+license     = { workspace = true }
+name        = "bmux_recording_plugin"
+publish     = false
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmux_ipc                  = { workspace = true }
+bmux_recording_plugin_api = { workspace = true }
+
+[features]
+fail-on-warnings = []
+static-bundled   = []

@@ -32,6 +32,7 @@ bmux_keybind               = { workspace = true }
 bmux_keyboard              = { workspace = true }
 bmux_plugin                = { workspace = true }
 bmux_plugin_sdk            = { workspace = true }
+bmux_recording_plugin_api  = { workspace = true }
 bmux_server                = { workspace = true }
 bmux_sessions_plugin_api   = { workspace = true }
 bmux_slots                 = { workspace = true }

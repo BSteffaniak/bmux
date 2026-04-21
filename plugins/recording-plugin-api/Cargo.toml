@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Typed public API of the bmux recording plugin (RecordingRuntime type + RecordingSink trait + typed request/response enums)"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "api", "recording"]
+license     = { workspace = true }
+name        = "bmux_recording_plugin_api"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+anyhow          = { workspace = true, features = ["std"] }
+bmux_ipc        = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
+serde           = { workspace = true, features = ["derive", "std"] }
+serde_json      = { workspace = true, features = ["std"] }
+thiserror       = { workspace = true }
+tracing         = { workspace = true, features = ["std"] }
+uuid            = { workspace = true, features = ["serde", "std", "v4"] }
+
+[features]
+default          = []
+fail-on-warnings = []

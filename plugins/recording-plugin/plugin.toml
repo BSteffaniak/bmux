@@ -1,0 +1,13 @@
+execution_class       = "native_fast"
+id                    = "bmux.recording"
+name                  = "bmux Recording"
+owns_namespaces       = []
+provided_capabilities = ["bmux.recording.read", "bmux.recording.write"]
+provided_features     = ["bmux.recording"]
+required_capabilities = []
+version               = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.recording.read"
+interface_id = "recording-commands"
+kind         = "command"

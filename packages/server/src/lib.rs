@@ -5,7 +5,6 @@
 //! Server component for bmux terminal multiplexer.
 
 mod persistence;
-pub mod recording;
 
 use anyhow::{Context, Result};
 use bmux_clients_plugin_api::{FollowEntry, FollowState};
@@ -51,7 +50,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
-use crate::recording::{RecordMeta, RecordingRuntime};
+use bmux_recording_plugin_api::{RecordMeta, RecordingRuntime};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
@@ -8672,7 +8671,7 @@ async fn handle_request(
             let result = match rt.cut(&output_root, last_seconds, name) {
                 Ok(recording) => Ok(recording),
                 Err(error) => {
-                    recording::cut_missing_active_recording_dir(&error).map_or_else(
+                    bmux_recording_plugin_api::cut_missing_active_recording_dir(&error).map_or_else(
                         || Err(error),
                         |missing_path| {
                             let message = match recover_rolling_runtime_after_missing_cut_path(

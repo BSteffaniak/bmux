@@ -19,6 +19,7 @@ bmux_control_catalog_plugin_api = { workspace = true }
 bmux_image                      = { workspace = true, optional = true }
 bmux_ipc                        = { workspace = true }
 bmux_plugin                     = { workspace = true }
+bmux_recording_plugin_api       = { workspace = true }
 bmux_session_models             = { workspace = true, features = ["serde"] }
 bmux_sessions_plugin_api        = { workspace = true }
 bmux_terminal_protocol          = { workspace = true }

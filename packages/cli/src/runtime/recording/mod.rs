@@ -1308,7 +1308,7 @@ pub(super) async fn run_recording_prune(
         let root = recordings_root_dir();
         let config = bmux_config::BmuxConfig::load().unwrap_or_default();
         let retention = older_than.unwrap_or(config.recording.retention_days);
-        bmux_server::recording::prune_old_recordings(&root, retention)?
+        bmux_recording_plugin_api::prune_old_recordings(&root, retention)?
     };
 
     if json {

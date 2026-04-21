@@ -1032,6 +1032,7 @@ dependencies = [
  "bmux_plugin_cli_plugin",
  "bmux_plugin_sdk",
  "bmux_prompted_actions_plugin",
+ "bmux_recording_plugin_api",
  "bmux_server",
  "bmux_sessions_plugin",
  "bmux_sessions_plugin_api",
@@ -1553,6 +1554,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_recording_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_ipc",
+ "bmux_recording_plugin_api",
+]
+
+[[package]]
+name = "bmux_recording_plugin_api"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "bmux_ipc",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_sandbox_harness"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1588,6 +1611,7 @@ dependencies = [
  "bmux_image",
  "bmux_ipc",
  "bmux_plugin",
+ "bmux_recording_plugin_api",
  "bmux_session_models",
  "bmux_sessions_plugin_api",
  "bmux_terminal_protocol",
