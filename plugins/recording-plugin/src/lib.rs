@@ -1,58 +1,223 @@
-//! bmux recording plugin — owns `RecordingRuntime` handles and
-//! recording lifecycle operations.
+//! bmux recording plugin — typed recording lifecycle handlers.
 //!
-//! Two responsibilities:
+//! The plugin implements a typed byte-dispatch service for
+//! `recording-commands` that accepts [`RecordingRequest`] payloads and
+//! returns [`RecordingResponse`] payloads. Each operation reads the
+//! `ManualRecordingRuntimeHandle` / `RollingRecordingRuntimeHandle`
+//! out of `PluginStateRegistry`, performs the lifecycle operation
+//! (start/stop/list/etc.), and returns the typed response.
 //!
-//! - Fast-path writes: implements [`RecordingSink`] and registers the
-//!   handle into the plugin state registry. Server reads the handle on
-//!   every pane-output event and writes via the sink. This keeps the
-//!   hot path allocation-free and free of service-dispatch overhead,
-//!   without forcing `packages/server` to depend on this crate.
+//! Server constructs the runtime handles at `BmuxServer::new` time
+//! (with config-derived paths) and registers them; the plugin does
+//! not own construction.
 //!
-//! - Control plane: typed service dispatch for the recording
-//!   operations (start, stop, status, list, delete, cut, rolling-*,
-//!   prune, write-custom-event, capture-targets, delete-all). The
-//!   service interface and wire types live in
-//!   `bmux_recording_plugin_api`.
+//! This is a partial implementation — the core operations (start, stop,
+//! status, list) are wired end-to-end; the rolling / cut / prune /
+//! write-custom-event operations return a placeholder response and
+//! will be filled in as Stage A continues.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use bmux_recording_plugin_api::{RecordMeta, RecordingRuntime, RecordingSink};
-use std::sync::{Arc, Mutex};
+use bmux_ipc::{RecordingProfile, RecordingStatus};
+use bmux_plugin::global_plugin_state_registry;
+use bmux_plugin_sdk::prelude::*;
+use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_recording_plugin_api::{
+    ManualRecordingRuntimeHandle, RECORDING_COMMANDS_INTERFACE, RECORDING_READ, RECORDING_WRITE,
+    RecordingRequest, RecordingResponse, RollingRecordingRuntimeHandle,
+};
 
-/// `RecordingSink` impl that fans out each record to both the manual
-/// and rolling `RecordingRuntime` handles.
-pub struct DualRuntimeSink {
-    manual: Arc<Mutex<RecordingRuntime>>,
-    rolling: Arc<Mutex<Option<RecordingRuntime>>>,
-}
+#[derive(Default)]
+pub struct RecordingPlugin;
 
-impl DualRuntimeSink {
-    #[must_use]
-    pub const fn new(
-        manual: Arc<Mutex<RecordingRuntime>>,
-        rolling: Arc<Mutex<Option<RecordingRuntime>>>,
-    ) -> Self {
-        Self { manual, rolling }
+impl RustPlugin for RecordingPlugin {
+    fn activate(
+        &mut self,
+        _context: NativeLifecycleContext,
+    ) -> std::result::Result<i32, PluginCommandError> {
+        // Runtimes are constructed by `BmuxServer::new` and registered
+        // into `PluginStateRegistry` there; nothing to do here today.
+        // In a future migration the plugin will own construction and
+        // register the handles itself.
+        Ok(bmux_plugin_sdk::EXIT_OK)
     }
-}
 
-impl RecordingSink for DualRuntimeSink {
-    fn record(
+    fn run_command(
+        &mut self,
+        _context: NativeCommandContext,
+    ) -> std::result::Result<i32, PluginCommandError> {
+        Err(PluginCommandError::unknown_command(""))
+    }
+
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        bmux_plugin_sdk::route_service!(context, {
+            "recording-commands", "dispatch" => |req: RecordingRequest, _ctx| {
+                Ok::<RecordingResponse, ServiceResponse>(handle_recording_request(req))
+            },
+        })
+    }
+
+    fn register_typed_services(
         &self,
-        kind: bmux_ipc::RecordingEventKind,
-        payload: bmux_ipc::RecordingPayload,
-        meta: RecordMeta,
+        _context: TypedServiceRegistrationContext<'_>,
+        _registry: &mut TypedServiceRegistry,
     ) {
-        if let Ok(runtime) = self.manual.lock() {
-            let _ = runtime.record(kind, payload.clone(), meta);
-        }
-        if let Ok(runtime) = self.rolling.lock()
-            && let Some(runtime) = runtime.as_ref()
-        {
-            let _ = runtime.record(kind, payload, meta);
-        }
+        // No typed Arc<dyn Trait> surface today — recording operations
+        // dispatch exclusively through the byte-service path.
     }
 }
+
+fn handle_recording_request(req: RecordingRequest) -> RecordingResponse {
+    match req {
+        RecordingRequest::Start {
+            session_id,
+            capture_input,
+            name,
+            profile,
+            event_kinds,
+        } => handle_start(session_id, capture_input, name, profile, event_kinds),
+        RecordingRequest::Stop { recording_id } => handle_stop(recording_id),
+        RecordingRequest::Status => handle_status(),
+        RecordingRequest::List => handle_list(),
+        // Operations not yet implemented in the plugin — server still
+        // handles these through the legacy `Request::Recording*` IPC
+        // variants. This arm returns a placeholder response so the
+        // plugin's byte-dispatch surface is discoverable end-to-end.
+        _ => RecordingResponse::CustomEventWritten { accepted: false },
+    }
+}
+
+fn handle_start(
+    session_id: Option<uuid::Uuid>,
+    capture_input: bool,
+    name: Option<String>,
+    profile: Option<RecordingProfile>,
+    event_kinds: Option<Vec<bmux_ipc::RecordingEventKind>>,
+) -> RecordingResponse {
+    let Some(handle) = global_plugin_state_registry().get::<ManualRecordingRuntimeHandle>() else {
+        return RecordingResponse::CustomEventWritten { accepted: false };
+    };
+    let Ok(guard) = handle.read() else {
+        return RecordingResponse::CustomEventWritten { accepted: false };
+    };
+    let Ok(mut runtime) = guard.0.lock() else {
+        return RecordingResponse::CustomEventWritten { accepted: false };
+    };
+
+    let profile = profile.unwrap_or(RecordingProfile::Full);
+    let event_kinds = event_kinds.unwrap_or_else(default_event_kinds);
+    match runtime.start(session_id, capture_input, name, profile, event_kinds) {
+        Ok(summary) => RecordingResponse::Started {
+            recording_id: summary.id,
+        },
+        Err(_) => RecordingResponse::CustomEventWritten { accepted: false },
+    }
+}
+
+fn handle_stop(recording_id: Option<uuid::Uuid>) -> RecordingResponse {
+    let Some(handle) = global_plugin_state_registry().get::<ManualRecordingRuntimeHandle>() else {
+        return RecordingResponse::Stopped { recording_id: None };
+    };
+    let Ok(guard) = handle.read() else {
+        return RecordingResponse::Stopped { recording_id: None };
+    };
+    let Ok(mut runtime) = guard.0.lock() else {
+        return RecordingResponse::Stopped { recording_id: None };
+    };
+    match runtime.stop(recording_id) {
+        Ok(summary) => RecordingResponse::Stopped {
+            recording_id: Some(summary.id),
+        },
+        Err(_) => RecordingResponse::Stopped { recording_id: None },
+    }
+}
+
+fn empty_status() -> RecordingStatus {
+    RecordingStatus {
+        active: None,
+        queue_len: 0,
+    }
+}
+
+fn handle_status() -> RecordingResponse {
+    let Some(handle) = global_plugin_state_registry().get::<ManualRecordingRuntimeHandle>() else {
+        return RecordingResponse::Status {
+            status: empty_status(),
+        };
+    };
+    let Ok(guard) = handle.read() else {
+        return RecordingResponse::Status {
+            status: empty_status(),
+        };
+    };
+    let Ok(runtime) = guard.0.lock() else {
+        return RecordingResponse::Status {
+            status: empty_status(),
+        };
+    };
+    RecordingResponse::Status {
+        status: runtime.status(),
+    }
+}
+
+fn handle_list() -> RecordingResponse {
+    let Some(handle) = global_plugin_state_registry().get::<ManualRecordingRuntimeHandle>() else {
+        return RecordingResponse::List {
+            recordings: Vec::new(),
+        };
+    };
+    let Ok(guard) = handle.read() else {
+        return RecordingResponse::List {
+            recordings: Vec::new(),
+        };
+    };
+    let Ok(runtime) = guard.0.lock() else {
+        return RecordingResponse::List {
+            recordings: Vec::new(),
+        };
+    };
+    RecordingResponse::List {
+        recordings: runtime.list().unwrap_or_default(),
+    }
+}
+
+fn default_event_kinds() -> Vec<bmux_ipc::RecordingEventKind> {
+    use bmux_ipc::RecordingEventKind::{
+        PaneImage, PaneInputRaw, PaneOutputRaw, ProtocolReplyRaw, RequestDone, RequestError,
+        RequestStart, ServerEvent,
+    };
+    vec![
+        PaneInputRaw,
+        PaneOutputRaw,
+        ProtocolReplyRaw,
+        PaneImage,
+        ServerEvent,
+        RequestStart,
+        RequestDone,
+        RequestError,
+    ]
+}
+
+// Silence unused-variable warnings on the constants until the full
+// handler set lands.
+const _KEEPS_CONSTS_ALIVE: (
+    bmux_plugin_sdk::CapabilityId,
+    bmux_plugin_sdk::CapabilityId,
+    bmux_plugin_sdk::InterfaceId,
+) = (
+    RECORDING_READ,
+    RECORDING_WRITE,
+    RECORDING_COMMANDS_INTERFACE,
+);
+
+// Placeholder to silence the unused-import lint on the rolling runtime
+// handle type until the rolling-specific handlers are implemented.
+#[allow(dead_code)]
+fn _keep_rolling_handle_alive()
+-> Option<std::sync::Arc<std::sync::RwLock<RollingRecordingRuntimeHandle>>> {
+    global_plugin_state_registry().get::<RollingRecordingRuntimeHandle>()
+}
+
+bmux_plugin_sdk::export_plugin!(RecordingPlugin, include_str!("../plugin.toml"));

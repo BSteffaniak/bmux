@@ -890,3 +890,52 @@ fn follow_ipc_variants_are_absent() {
          FollowTargetChanged}}` for cross-process subscribers",
     );
 }
+
+/// Verify that the recording-plugin crates exist and that core does
+/// not define the `RecordingRuntime` type. The type was relocated from
+/// `packages/server/src/recording.rs` to
+/// `plugins/recording-plugin-api/src/recording_runtime.rs` in Slice 10;
+/// server imports it via `use bmux_recording_plugin_api::RecordingRuntime`
+/// without depending on the plugin impl crate.
+#[test]
+fn recording_plugin_exists() {
+    let api_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/recording-plugin-api");
+    let plugin_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/recording-plugin");
+    assert!(
+        api_dir.join("Cargo.toml").exists(),
+        "plugins/recording-plugin-api/Cargo.toml must exist",
+    );
+    assert!(
+        plugin_dir.join("Cargo.toml").exists(),
+        "plugins/recording-plugin/Cargo.toml must exist",
+    );
+
+    let plugin_api_source =
+        include_str!("../../../plugins/recording-plugin-api/src/recording_runtime.rs");
+    assert!(
+        plugin_api_source.contains("pub struct RecordingRuntime"),
+        "plugins/recording-plugin-api/src/recording_runtime.rs must \
+         export the canonical `RecordingRuntime` struct",
+    );
+
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_source = production_section(server_source);
+    assert!(
+        !server_source.contains("pub struct RecordingRuntime"),
+        "packages/server/src/lib.rs must not define `RecordingRuntime`; \
+         the type lives in bmux_recording_plugin_api",
+    );
+    assert!(
+        server_source.contains("use bmux_recording_plugin_api::"),
+        "packages/server/src/lib.rs must import recording types via \
+         `use bmux_recording_plugin_api::...`",
+    );
+    assert!(
+        server_source.contains("register::<RecordingSinkHandle>"),
+        "packages/server/src/lib.rs must register a `RecordingSinkHandle` \
+         into the plugin state registry so the recording plugin can \
+         reach the active recording runtimes",
+    );
+}

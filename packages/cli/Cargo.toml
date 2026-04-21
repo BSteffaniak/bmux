@@ -67,6 +67,9 @@ bmux_plugin_cli_plugin = { workspace = true, optional = true, features = [
 bmux_prompted_actions_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
+bmux_recording_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
 bmux_sessions_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -182,6 +185,7 @@ bundled-plugins = [
     "bundled-plugin-permissions",
     "bundled-plugin-cli",
     "bundled-plugin-prompted-actions",
+    "bundled-plugin-recording",
     "bundled-plugin-sessions",
     "bundled-plugin-windows",
     "bundled-plugin-decoration",
@@ -197,6 +201,7 @@ bundled-plugin-control-catalog  = ["dep:bmux_control_catalog_plugin"]
 bundled-plugin-decoration       = ["dep:bmux_decoration_plugin"]
 bundled-plugin-permissions      = ["dep:bmux_permissions_plugin"]
 bundled-plugin-prompted-actions = ["dep:bmux_prompted_actions_plugin"]
+bundled-plugin-recording        = ["dep:bmux_recording_plugin"]
 bundled-plugin-sessions         = ["dep:bmux_sessions_plugin"]
 bundled-plugin-windows          = ["dep:bmux_windows_plugin"]
 

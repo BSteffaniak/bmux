@@ -1032,6 +1032,7 @@ dependencies = [
  "bmux_plugin_cli_plugin",
  "bmux_plugin_sdk",
  "bmux_prompted_actions_plugin",
+ "bmux_recording_plugin",
  "bmux_recording_plugin_api",
  "bmux_server",
  "bmux_sessions_plugin",
@@ -1558,7 +1559,10 @@ name = "bmux_recording_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_ipc",
+ "bmux_plugin",
+ "bmux_plugin_sdk",
  "bmux_recording_plugin_api",
+ "uuid",
 ]
 
 [[package]]

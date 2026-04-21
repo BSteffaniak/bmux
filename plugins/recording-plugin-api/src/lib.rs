@@ -79,6 +79,54 @@ pub trait RecordingSink: Send + Sync {
 /// concrete type; this wrapper gives us a concrete name to look up.
 pub struct RecordingSinkHandle(pub std::sync::Arc<dyn RecordingSink>);
 
+/// Newtype wrapper for registering the manual recording runtime handle
+/// in [`bmux_plugin::PluginStateRegistry`]. Used by the recording
+/// plugin's typed service handlers to perform lifecycle operations
+/// (start/stop/list/etc.) on the manual recording runtime.
+pub struct ManualRecordingRuntimeHandle(pub std::sync::Arc<std::sync::Mutex<RecordingRuntime>>);
+
+/// Newtype wrapper for registering the rolling recording runtime
+/// handle in [`bmux_plugin::PluginStateRegistry`]. The inner option
+/// is `None` when rolling recording is disabled in config.
+pub struct RollingRecordingRuntimeHandle(
+    pub std::sync::Arc<std::sync::Mutex<Option<RecordingRuntime>>>,
+);
+
+/// `RecordingSink` impl that fans out each record to both a manual
+/// and a rolling `RecordingRuntime` handle.
+///
+/// Lives here (in `bmux_recording_plugin_api`) rather than in the
+/// plugin impl crate so that `packages/server` can construct the sink
+/// at server-construction time (when it has the config it needs to
+/// create the runtimes) without depending on the plugin impl crate.
+pub struct DualRuntimeSink {
+    manual: std::sync::Arc<std::sync::Mutex<RecordingRuntime>>,
+    rolling: std::sync::Arc<std::sync::Mutex<Option<RecordingRuntime>>>,
+}
+
+impl DualRuntimeSink {
+    #[must_use]
+    pub const fn new(
+        manual: std::sync::Arc<std::sync::Mutex<RecordingRuntime>>,
+        rolling: std::sync::Arc<std::sync::Mutex<Option<RecordingRuntime>>>,
+    ) -> Self {
+        Self { manual, rolling }
+    }
+}
+
+impl RecordingSink for DualRuntimeSink {
+    fn record(&self, kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta) {
+        if let Ok(runtime) = self.manual.lock() {
+            let _ = runtime.record(kind, payload.clone(), meta);
+        }
+        if let Ok(runtime) = self.rolling.lock()
+            && let Some(runtime) = runtime.as_ref()
+        {
+            let _ = runtime.record(kind, payload, meta);
+        }
+    }
+}
+
 /// Typed request variants for the recording plugin's typed service
 /// dispatch surface. Mirrors `Request::Recording*` variants that used
 /// to live on `bmux_ipc::Request` before Slice 10.

@@ -50,7 +50,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
-use bmux_recording_plugin_api::{RecordMeta, RecordingRuntime};
+use bmux_recording_plugin_api::{
+    DualRuntimeSink, ManualRecordingRuntimeHandle, RecordMeta, RecordingRuntime, RecordingSink,
+    RecordingSinkHandle, RollingRecordingRuntimeHandle,
+};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
@@ -4609,6 +4612,36 @@ impl BmuxServer {
         } else {
             None
         }));
+
+        // Register the recording sink + runtime handles into the
+        // plugin state registry so the recording-plugin (and other
+        // observers) can reach the active recording runtimes without
+        // depending on the plugin impl crate. Server still drives the
+        // runtimes directly today; the registry entries are the hook
+        // for the Stage A migration that moves recording lifecycle
+        // handlers into the plugin.
+        {
+            let sink: Arc<dyn RecordingSink> = Arc::new(DualRuntimeSink::new(
+                Arc::clone(&manual_recording_runtime),
+                Arc::clone(&rolling_recording_runtime),
+            ));
+            let sink_handle = Arc::new(std::sync::RwLock::new(RecordingSinkHandle(sink)));
+            bmux_plugin::global_plugin_state_registry()
+                .register::<RecordingSinkHandle>(&sink_handle);
+
+            let manual_handle = Arc::new(std::sync::RwLock::new(ManualRecordingRuntimeHandle(
+                Arc::clone(&manual_recording_runtime),
+            )));
+            bmux_plugin::global_plugin_state_registry()
+                .register::<ManualRecordingRuntimeHandle>(&manual_handle);
+
+            let rolling_handle = Arc::new(std::sync::RwLock::new(RollingRecordingRuntimeHandle(
+                Arc::clone(&rolling_recording_runtime),
+            )));
+            bmux_plugin::global_plugin_state_registry()
+                .register::<RollingRecordingRuntimeHandle>(&rolling_handle);
+        }
+
         let (event_broadcast_tx, _) =
             tokio::sync::broadcast::channel::<Event>(EVENT_PUSH_CHANNEL_CAPACITY);
         Self {

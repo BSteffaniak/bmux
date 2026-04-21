@@ -152,6 +152,10 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/prompted-actions-plugin/plugin.toml"),
     plugin_type = bmux_prompted_actions_plugin::PromptedActionsPlugin;
 
+    feature = "bundled-plugin-recording",
+    manifest = include_str!("../../../../plugins/recording-plugin/plugin.toml"),
+    plugin_type = bmux_recording_plugin::RecordingPlugin;
+
     feature = "bundled-plugin-sessions",
     manifest = include_str!("../../../../plugins/sessions-plugin/plugin.toml"),
     plugin_type = bmux_sessions_plugin::SessionsPlugin;

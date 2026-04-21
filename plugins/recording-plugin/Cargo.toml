@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Shipped recording plugin for bmux (owns RecordingRuntime and lifecycle operations)"
+description = "Shipped recording plugin for bmux (typed recording lifecycle handlers)"
 edition     = { workspace = true }
 keywords    = ["bmux", "plugin", "recording"]
 license     = { workspace = true }
@@ -16,8 +16,14 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bmux_ipc                  = { workspace = true }
+bmux_plugin               = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
 bmux_recording_plugin_api = { workspace = true }
+uuid                      = { workspace = true, features = ["std"] }
 
 [features]
-fail-on-warnings = []
-static-bundled   = []
+fail-on-warnings = [
+    "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]
+static-bundled = []
