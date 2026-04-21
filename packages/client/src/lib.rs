@@ -1879,15 +1879,25 @@ impl StreamingBmuxClient {
         &mut self,
         since_revision: Option<u64>,
     ) -> Result<ControlCatalogSnapshot> {
-        match self
-            .request(Request::ControlCatalogSnapshot { since_revision })
-            .await?
-        {
-            ResponsePayload::ControlCatalogSnapshot { snapshot } => Ok(snapshot),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected control catalog snapshot response",
-            )),
+        #[derive(serde::Serialize)]
+        struct Args {
+            since_revision: Option<u64>,
         }
+        let payload = bmux_ipc::encode(&Args { since_revision })
+            .map_err(|_| ClientError::UnexpectedResponse("failed to encode snapshot request"))?;
+        let response_bytes = self
+            .invoke_service_raw(
+                "bmux.control_catalog.read",
+                InvokeServiceKind::Query,
+                "control-catalog-state",
+                "snapshot",
+                payload,
+            )
+            .await?;
+        let typed: bmux_control_catalog_plugin_api::control_catalog_state::Snapshot =
+            bmux_ipc::decode(&response_bytes)
+                .map_err(|_| ClientError::UnexpectedResponse("failed to decode snapshot"))?;
+        Ok(map_typed_snapshot(typed))
     }
 
     /// Follow another client's active session focus.
@@ -2507,6 +2517,61 @@ impl StreamingBmuxClient {
     }
 }
 
+fn map_typed_snapshot(
+    snapshot: bmux_control_catalog_plugin_api::control_catalog_state::Snapshot,
+) -> ControlCatalogSnapshot {
+    use bmux_ipc::{ContextSessionBindingSummary, ContextSummary, SessionSummary};
+    use std::collections::BTreeMap;
+
+    let sessions = snapshot
+        .sessions
+        .into_iter()
+        .map(|row| SessionSummary {
+            id: row.id,
+            name: row.name,
+            client_count: row.client_count as usize,
+        })
+        .collect::<Vec<_>>();
+
+    let context_session_bindings = snapshot
+        .context_session_bindings
+        .iter()
+        .map(|b| ContextSessionBindingSummary {
+            context_id: b.context_id,
+            session_id: b.session_id,
+        })
+        .collect::<Vec<_>>();
+
+    let binding_by_context = snapshot
+        .context_session_bindings
+        .iter()
+        .map(|b| (b.context_id, b.session_id))
+        .collect::<BTreeMap<_, _>>();
+
+    let contexts = snapshot
+        .contexts
+        .into_iter()
+        .map(|row| {
+            let mut attributes = BTreeMap::new();
+            if let Some(session_id) = binding_by_context.get(&row.id) {
+                attributes.insert("bmux.session_id".to_string(), session_id.to_string());
+            }
+            ContextSummary {
+                id: row.id,
+                name: row.name,
+                attributes,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    ControlCatalogSnapshot {
+        revision: snapshot.revision,
+        sessions,
+        contexts,
+        context_session_bindings,
+    }
+}
+
 const fn request_kind_name(request: &Request) -> &'static str {
     match request {
         Request::Hello { .. } => "hello",
@@ -2565,7 +2630,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
         Request::PaneDirectInput { .. } => "pane_direct_input",
-        Request::ControlCatalogSnapshot { .. } => "control_catalog_snapshot",
     }
 }
 
@@ -2627,7 +2691,6 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::EventsSubscribed => "events_subscribed",
             ResponsePayload::EventBatch { .. } => "event_batch",
             ResponsePayload::EventPushEnabled => "event_push_enabled",
-            ResponsePayload::ControlCatalogSnapshot { .. } => "control_catalog_snapshot",
         },
         Response::Err(_) => "error",
     }

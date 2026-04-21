@@ -142,11 +142,27 @@ The server's authoritative handle flows through its request pipeline.
 
 Plugin-owned state type locations:
 
-| Type             | Owner plugin      | Location                                         |
-| ---------------- | ----------------- | ------------------------------------------------ |
-| `FollowState`    | `clients-plugin`  | `plugins/clients-plugin/src/follow_state.rs`     |
-| `ContextState`   | `contexts-plugin` | `plugins/contexts-plugin/src/context_state.rs`   |
-| `SessionManager` | `sessions-plugin` | `plugins/sessions-plugin/src/session_manager.rs` |
+| Type                                | Owner plugin             | Location                                         |
+| ----------------------------------- | ------------------------ | ------------------------------------------------ |
+| `FollowState`                       | `clients-plugin`         | `plugins/clients-plugin/src/follow_state.rs`     |
+| `ContextState`                      | `contexts-plugin`        | `plugins/contexts-plugin/src/context_state.rs`   |
+| `SessionManager`                    | `sessions-plugin`        | `plugins/sessions-plugin/src/session_manager.rs` |
+| Catalog revision counter + snapshot | `control-catalog-plugin` | `plugins/control-catalog-plugin/src/lib.rs`      |
+
+The control-catalog plugin is a cross-cutting aggregator: it doesn't
+own a dedicated state struct registered in
+`PluginStateRegistry`; instead it holds a process-wide `AtomicU64`
+revision and reads sessions/contexts/bindings from the other plugins'
+registered state on demand. It subscribes to `SessionEvent`,
+`ContextEvent`, and `ClientEvent` on the plugin event bus and ticks
+its revision whenever any of those domains change, emitting a typed
+`CatalogEvent::Changed` on its own bus channel.
+
+The server bridges that typed `CatalogEvent` into the existing
+`bmux_ipc::Event::ControlCatalogChanged` wire event via a tokio task
+spawned during `BmuxServer::run`, so cross-process attach UIs keep
+receiving the same catalog-changed signal they did before the
+migration.
 
 `SessionRuntimeManager` (the heavier pane-runtime / snapshot /
 recording orchestration struct) remains in `packages/server` for now —

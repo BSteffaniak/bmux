@@ -1,0 +1,18 @@
+execution_class       = "native_fast"
+id                    = "bmux.control_catalog"
+name                  = "bmux Control Catalog"
+owns_namespaces       = []
+provided_capabilities = ["bmux.control_catalog.read"]
+provided_features     = ["bmux.control_catalog"]
+required_capabilities = []
+version               = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.control_catalog.read"
+interface_id = "control-catalog-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.control_catalog.read"
+interface_id = "control-catalog-events"
+kind         = "event"

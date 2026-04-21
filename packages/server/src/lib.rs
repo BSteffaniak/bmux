@@ -18,12 +18,12 @@ use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
     AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneInputMode,
     AttachPaneMouseProtocol, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-    AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector, ContextSessionBindingSummary,
-    ControlCatalogScope, ControlCatalogSnapshot, Envelope, EnvelopeKind, ErrorCode, ErrorResponse,
-    Event, InteractiveRegion, IpcEndpoint, PaneFocusDirection, PaneLaunchCommand,
-    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
-    PerformanceRecordingLevel, PerformanceRuntimeSettings, ProtocolContract, RecordingEventKind,
-    RecordingPayload, RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
+    AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector, ControlCatalogScope,
+    Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, InteractiveRegion, IpcEndpoint,
+    PaneFocusDirection, PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
+    PaneSplitDirection, PaneState, PaneSummary, PerformanceRecordingLevel,
+    PerformanceRuntimeSettings, ProtocolContract, RecordingEventKind, RecordingPayload,
+    RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
     RecordingRollingStatus, RecordingRollingUsage, RecordingSummary, Request, Response,
     ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
     default_supported_capabilities, encode, negotiate_protocol,
@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
@@ -302,7 +302,6 @@ struct ServerState {
     event_hub: Mutex<EventHub>,
     /// Broadcast channel for pushing events to streaming clients.
     event_broadcast: tokio::sync::broadcast::Sender<Event>,
-    control_catalog_revision: AtomicU64,
     client_principals: Mutex<BTreeMap<ClientId, Uuid>>,
     server_control_principal_id: Uuid,
     handshake_timeout: Duration,
@@ -4645,7 +4644,6 @@ impl BmuxServer {
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 event_broadcast: event_broadcast_tx,
-                control_catalog_revision: AtomicU64::new(1),
                 client_principals: Mutex::new(BTreeMap::new()),
                 server_control_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -4875,6 +4873,13 @@ impl BmuxServer {
         let pane_exit_task = tokio::spawn(async move {
             process_pane_exit_events(pane_exit_state, pane_exit_shutdown_rx).await;
         });
+
+        // Bridge typed `CatalogEvent` from the control-catalog plugin
+        // into `Event::ControlCatalogChanged` on the server's cross-
+        // process event pipeline (streaming clients, event hub,
+        // recording runtimes). The control-catalog plugin owns the
+        // revision counter; server only fans out.
+        spawn_control_catalog_bridge(Arc::clone(&self.state));
 
         // Periodic recording retention enforcement.
         let recording_prune_runtime = Arc::clone(&self.state.manual_recording_runtime);
@@ -5591,6 +5596,49 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
     Ok(())
 }
 
+/// Spawn the control-catalog event bridge.
+///
+/// Subscribes to the typed `CatalogEvent` stream emitted by the
+/// `bmux.control_catalog` plugin and maps each event into
+/// `Event::ControlCatalogChanged` on the server's cross-process event
+/// pipeline. This is how pre-existing attach-UI subscribers keep
+/// receiving catalog-changed events after the migration.
+fn spawn_control_catalog_bridge(state: Arc<ServerState>) {
+    use bmux_control_catalog_plugin_api::control_catalog_events::{
+        self, CatalogEvent, CatalogScope,
+    };
+    let Ok(mut rx) = bmux_plugin::global_event_bus()
+        .subscribe::<CatalogEvent>(&control_catalog_events::EVENT_KIND)
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        while let Ok(event) = rx.recv().await {
+            let CatalogEvent::Changed {
+                revision,
+                scopes,
+                full_resync,
+            } = (*event).clone();
+            let mapped_scopes = scopes
+                .into_iter()
+                .map(|scope| match scope {
+                    CatalogScope::Sessions => ControlCatalogScope::Sessions,
+                    CatalogScope::Contexts => ControlCatalogScope::Contexts,
+                    CatalogScope::Bindings => ControlCatalogScope::Bindings,
+                })
+                .collect();
+            let _ = emit_event(
+                &state,
+                Event::ControlCatalogChanged {
+                    revision,
+                    scopes: mapped_scopes,
+                    full_resync,
+                },
+            );
+        }
+    });
+}
+
 fn encode_event_frame(
     event: &Event,
     frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
@@ -5602,100 +5650,6 @@ fn encode_event_frame(
     } else {
         bmux_ipc::frame::encode_frame(&envelope).ok()
     }
-}
-
-fn normalize_control_catalog_scopes(scopes: &[ControlCatalogScope]) -> Vec<ControlCatalogScope> {
-    let mut normalized = Vec::new();
-    for scope in [
-        ControlCatalogScope::Sessions,
-        ControlCatalogScope::Contexts,
-        ControlCatalogScope::Bindings,
-    ] {
-        if scopes.contains(&scope) {
-            normalized.push(scope);
-        }
-    }
-    normalized
-}
-
-fn current_control_catalog_revision(state: &Arc<ServerState>) -> u64 {
-    state.control_catalog_revision.load(Ordering::SeqCst)
-}
-
-fn emit_control_catalog_changed(
-    state: &Arc<ServerState>,
-    scopes: &[ControlCatalogScope],
-    full_resync: bool,
-) -> Result<()> {
-    let scopes = normalize_control_catalog_scopes(scopes);
-    if scopes.is_empty() {
-        return Ok(());
-    }
-    let revision = state
-        .control_catalog_revision
-        .fetch_add(1, Ordering::SeqCst)
-        .saturating_add(1);
-    emit_event(
-        state,
-        Event::ControlCatalogChanged {
-            revision,
-            scopes,
-            full_resync,
-        },
-    )
-}
-
-fn build_control_catalog_snapshot(state: &Arc<ServerState>) -> Result<ControlCatalogSnapshot> {
-    let revision = current_control_catalog_revision(state);
-    let sessions = state
-        .session_manager
-        .read()
-        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?
-        .list_sessions()
-        .into_iter()
-        .map(|session| SessionSummary {
-            id: session.id.0,
-            name: session.name,
-            client_count: session.client_count,
-        })
-        .collect::<Vec<_>>();
-
-    let (contexts, context_session_bindings) = {
-        let context_state = state
-            .context_state
-            .read()
-            .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
-        let mut contexts = context_state.list();
-        let context_session_bindings = context_state
-            .session_by_context
-            .iter()
-            .map(|(context_id, session_id)| ContextSessionBindingSummary {
-                context_id: *context_id,
-                session_id: session_id.0,
-            })
-            .collect::<Vec<_>>();
-        drop(context_state);
-        let binding_by_context = context_session_bindings
-            .iter()
-            .map(|binding| (binding.context_id, binding.session_id))
-            .collect::<BTreeMap<_, _>>();
-        for context in &mut contexts {
-            if let Some(session_id) = binding_by_context.get(&context.id) {
-                context.attributes.insert(
-                    CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
-                    session_id.to_string(),
-                );
-            }
-        }
-        (contexts, context_session_bindings)
-    };
-
-    Ok(ControlCatalogSnapshot {
-        revision,
-        sessions,
-        contexts,
-        context_session_bindings,
-    })
 }
 
 fn lag_recovery_attach_view_events_for_client(
@@ -5724,7 +5678,7 @@ fn lag_recovery_attach_view_events_for_client(
         return Vec::new();
     }
 
-    let mut events = revisions
+    let events: Vec<Event> = revisions
         .into_iter()
         .map(|(session_id, revision)| Event::AttachViewChanged {
             context_id: current_context_id_for_session(state, session_id),
@@ -5737,17 +5691,14 @@ fn lag_recovery_attach_view_events_for_client(
                 AttachViewComponent::Status,
             ],
         })
-        .collect::<Vec<_>>();
+        .collect();
 
-    events.push(Event::ControlCatalogChanged {
-        revision: current_control_catalog_revision(state),
-        scopes: vec![
-            ControlCatalogScope::Sessions,
-            ControlCatalogScope::Contexts,
-            ControlCatalogScope::Bindings,
-        ],
-        full_resync: true,
-    });
+    // NOTE: previously, lag-recovery also pushed a full-resync
+    // `Event::ControlCatalogChanged` here. The catalog revision counter
+    // now lives in the control-catalog plugin, so the server no longer
+    // has access to the authoritative revision. Clients reconnecting
+    // after lag should poll the catalog via the typed
+    // `control-catalog-state::snapshot` query to reconcile.
 
     events
 }
@@ -6971,13 +6922,8 @@ async fn ensure_attach_session_exists(
     }
 
     let removed_context_ids = prune_context_mappings_for_session(state, session_id)?;
-    if !removed_context_ids.is_empty() {
-        emit_control_catalog_changed(
-            state,
-            &[ControlCatalogScope::Contexts, ControlCatalogScope::Bindings],
-            false,
-        )?;
-    }
+    let _ = removed_context_ids; // Catalog-changed event is now fired by the
+    // control-catalog plugin in response to ContextEvent emissions.
 
     Ok(false)
 }
@@ -7680,10 +7626,6 @@ async fn handle_request(
                 .collect::<Vec<_>>();
             Response::Ok(ResponsePayload::SessionList { sessions })
         }
-        Request::ControlCatalogSnapshot { since_revision: _ } => {
-            let snapshot = build_control_catalog_snapshot(state)?;
-            Response::Ok(ResponsePayload::ControlCatalogSnapshot { snapshot })
-        }
         Request::KillSession {
             selector,
             force_local,
@@ -7914,13 +7856,8 @@ async fn handle_request(
                 drop(manager);
                 let removed_context_ids =
                     prune_context_mappings_for_session(state, next_session_id)?;
-                if !removed_context_ids.is_empty() {
-                    emit_control_catalog_changed(
-                        state,
-                        &[ControlCatalogScope::Contexts, ControlCatalogScope::Bindings],
-                        false,
-                    )?;
-                }
+                let _ = removed_context_ids; // Catalog-changed is fired by the
+                // control-catalog plugin in response to ContextEvent emissions.
                 Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("session not found: {}", next_session_id.0),
@@ -7982,13 +7919,8 @@ async fn handle_request(
                 drop(manager);
                 let removed_context_ids =
                     prune_context_mappings_for_session(state, next_session_id)?;
-                if !removed_context_ids.is_empty() {
-                    emit_control_catalog_changed(
-                        state,
-                        &[ControlCatalogScope::Contexts, ControlCatalogScope::Bindings],
-                        false,
-                    )?;
-                }
+                let _ = removed_context_ids; // Catalog-changed is fired by the
+                // control-catalog plugin in response to ContextEvent emissions.
                 Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("session not found: {}", next_session_id.0),
@@ -9207,38 +9139,9 @@ async fn handle_request(
     if let Response::Ok(ResponsePayload::AttachReady { session_id, .. }) = &response {
         emit_event(state, Event::ClientAttached { id: *session_id })?;
     }
-    if let Response::Ok(payload) = &response {
-        match payload {
-            ResponsePayload::SessionCreated { .. }
-            | ResponsePayload::SessionKilled { .. }
-            | ResponsePayload::PaneClosed {
-                session_closed: true,
-                ..
-            } => {
-                emit_control_catalog_changed(
-                    state,
-                    &[
-                        ControlCatalogScope::Sessions,
-                        ControlCatalogScope::Contexts,
-                        ControlCatalogScope::Bindings,
-                    ],
-                    false,
-                )?;
-            }
-            ResponsePayload::ServerSnapshotRestored { .. } => {
-                emit_control_catalog_changed(
-                    state,
-                    &[
-                        ControlCatalogScope::Sessions,
-                        ControlCatalogScope::Contexts,
-                        ControlCatalogScope::Bindings,
-                    ],
-                    true,
-                )?;
-            }
-            _ => {}
-        }
-    }
+    // Catalog-changed events are fired by the control-catalog plugin
+    // in response to session/context/client events on the event bus.
+    // Server no longer emits catalog-changed directly.
 
     if response_requires_snapshot(&response) {
         mark_snapshot_dirty(state);
@@ -9364,7 +9267,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
         Request::PaneDirectInput { .. } => "pane_direct_input",
-        Request::ControlCatalogSnapshot { .. } => "control_catalog_snapshot",
     }
 }
 
@@ -9640,7 +9542,6 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::EventsSubscribed => "events_subscribed",
         ResponsePayload::EventBatch { .. } => "event_batch",
         ResponsePayload::EventPushEnabled => "event_push_enabled",
-        ResponsePayload::ControlCatalogSnapshot { .. } => "control_catalog_snapshot",
     }
 }
 

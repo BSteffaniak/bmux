@@ -136,6 +136,10 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/contexts-plugin/plugin.toml"),
     plugin_type = bmux_contexts_plugin::ContextsPlugin;
 
+    feature = "bundled-plugin-control-catalog",
+    manifest = include_str!("../../../../plugins/control-catalog-plugin/plugin.toml"),
+    plugin_type = bmux_control_catalog_plugin::ControlCatalogPlugin;
+
     feature = "bundled-plugin-permissions",
     manifest = include_str!("../../../../plugins/permissions-plugin/plugin.toml"),
     plugin_type = bmux_permissions_plugin::PermissionsPlugin;

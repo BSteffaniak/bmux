@@ -757,3 +757,86 @@ fn core_architecture_does_not_depend_on_plugins() {
          offenders: {offenders:#?}",
     );
 }
+
+/// Verify that the client-domain IPC variants
+/// (`Request::WhoAmI`, `Request::ListClients`) have been deleted from
+/// `bmux_ipc` and replaced with typed dispatch through the clients
+/// plugin's `clients-state::current-client` / `list-clients` surface.
+#[test]
+fn client_ipc_variants_are_absent() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    let denied = [
+        "    WhoAmI,",
+        "    ListClients,",
+        "ResponsePayload::ClientIdentity",
+        "ResponsePayload::ClientList {",
+    ];
+    for marker in denied {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; \
+             client identity and list operations go through typed \
+             `clients-state` dispatch",
+        );
+    }
+}
+
+/// Verify that `Request::ControlCatalogSnapshot` has been deleted from
+/// `bmux_ipc` and that catalog snapshots are served by the new
+/// `bmux.control_catalog` plugin via typed dispatch.
+#[test]
+fn control_catalog_snapshot_ipc_variant_is_absent() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    assert!(
+        !ipc_source.contains("    ControlCatalogSnapshot {\n        /// Optional"),
+        "packages/ipc/src/lib.rs must not reintroduce `Request::ControlCatalogSnapshot`; \
+         catalog snapshots go through `control-catalog-state::snapshot` typed dispatch",
+    );
+    assert!(
+        !ipc_source.contains("ResponsePayload::ControlCatalogSnapshot"),
+        "packages/ipc/src/lib.rs must not reintroduce \
+         `ResponsePayload::ControlCatalogSnapshot`",
+    );
+}
+
+/// Verify that the `bmux.control_catalog` plugin crate exists and
+/// owns the catalog revision counter. The counter used to live in
+/// `ServerState.control_catalog_revision`; after the migration the
+/// plugin owns it and server only bridges the typed `CatalogEvent`
+/// into `Event::ControlCatalogChanged` for cross-process subscribers.
+#[test]
+fn control_catalog_plugin_exists() {
+    let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/control-catalog-plugin-api");
+    let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/control-catalog-plugin");
+    assert!(
+        api_dir.join("Cargo.toml").exists(),
+        "plugins/control-catalog-plugin-api/Cargo.toml must exist",
+    );
+    assert!(
+        plugin_dir.join("Cargo.toml").exists(),
+        "plugins/control-catalog-plugin/Cargo.toml must exist",
+    );
+
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_source = production_section(server_source);
+    assert!(
+        !server_source.contains("control_catalog_revision: AtomicU64"),
+        "packages/server/src/lib.rs must not own the control-catalog \
+         revision counter; that state lives in the control-catalog plugin",
+    );
+    assert!(
+        !server_source.contains("fn emit_control_catalog_changed("),
+        "packages/server/src/lib.rs must not define \
+         `emit_control_catalog_changed`; the control-catalog plugin \
+         emits `Event::ControlCatalogChanged` via the event bus bridge",
+    );
+    assert!(
+        server_source.contains("fn spawn_control_catalog_bridge"),
+        "packages/server/src/lib.rs must define \
+         `spawn_control_catalog_bridge` to map the plugin's typed \
+         `CatalogEvent` into `Event::ControlCatalogChanged` for \
+         cross-process subscribers",
+    );
+}

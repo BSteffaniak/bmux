@@ -12,9 +12,10 @@ version     = { workspace = true }
 
 [dependencies]
 # Internal bmux packages
-bmux_clients_plugin_api = { workspace = true }
-bmux_config             = { workspace = true }
-bmux_ipc                = { workspace = true }
+bmux_clients_plugin_api         = { workspace = true }
+bmux_config                     = { workspace = true }
+bmux_control_catalog_plugin_api = { workspace = true }
+bmux_ipc                        = { workspace = true }
 
 # External dependencies
 bmux_codec = { workspace = true }

@@ -1,0 +1,27 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Typed public API of the bmux control-catalog plugin (BPDL-generated bindings)"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "api", "catalog"]
+license     = { workspace = true }
+name        = "bmux_control_catalog_plugin_api"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_plugin_schema_macros = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+uuid                      = { workspace = true, features = ["serde", "std"] }
+
+[package.metadata.cargo-machete]
+# These deps are consumed by code generated from the BPDL schema via
+# the `bmux_plugin_schema_macros::schema!` proc macro; cargo-machete
+# cannot see into proc-macro-generated source.
+ignored = ["serde", "uuid"]
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -677,12 +677,6 @@ pub enum Request {
         client_name: String,
         principal_id: Uuid,
     },
-    /// Return a snapshot of control-plane catalog state used by attach UIs.
-    ControlCatalogSnapshot {
-        /// Optional last-known revision for future incremental semantics.
-        #[serde(default)]
-        since_revision: Option<u64>,
-    },
 }
 
 /// Attach grant returned by attach control-plane request.
@@ -1360,9 +1354,6 @@ pub enum ResponsePayload {
     },
     HelloIncompatible {
         reason: IncompatibilityReason,
-    },
-    ControlCatalogSnapshot {
-        snapshot: ControlCatalogSnapshot,
     },
 }
 
@@ -2181,12 +2172,6 @@ mod tests {
                 pane_id: id2,
                 data: vec![104, 101, 108, 108, 111],
             },
-            Request::ControlCatalogSnapshot {
-                since_revision: Some(7),
-            },
-            Request::ControlCatalogSnapshot {
-                since_revision: None,
-            },
         ];
 
         for (i, variant) in variants.iter().enumerate() {
@@ -2651,25 +2636,6 @@ mod tests {
             ResponsePayload::ServerStopping,
             ResponsePayload::ServiceInvoked {
                 payload: vec![9, 8, 7],
-            },
-            ResponsePayload::ControlCatalogSnapshot {
-                snapshot: ControlCatalogSnapshot {
-                    revision: 11,
-                    sessions: vec![SessionSummary {
-                        id,
-                        name: Some("dev".into()),
-                        client_count: 2,
-                    }],
-                    contexts: vec![ContextSummary {
-                        id: id2,
-                        name: Some("workspace".into()),
-                        attributes: BTreeMap::new(),
-                    }],
-                    context_session_bindings: vec![ContextSessionBindingSummary {
-                        context_id: id2,
-                        session_id: id,
-                    }],
-                },
             },
         ];
 

@@ -1,0 +1,72 @@
+// Public, typed contract of the control-catalog plugin. The catalog
+// aggregates cross-cutting state from the sessions, contexts, and
+// clients plugins into a single snapshot, and tracks a monotonic
+// revision counter that ticks whenever any of those domains change.
+//
+// Two interfaces:
+// - `control-catalog-state` — read-only snapshot query.
+// - `control-catalog-events` — revision-change event stream.
+
+plugin bmux.control_catalog version 1;
+
+interface control-catalog-state {
+    // Snapshot of a single session row in the catalog.
+    record session-row {
+        id: uuid,
+        name: string?,
+        client_count: u32,
+    }
+
+    // Snapshot of a single context row in the catalog.
+    record context-row {
+        id: uuid,
+        name: string?,
+    }
+
+    // Snapshot of a single context-to-session binding in the catalog.
+    record context-session-binding {
+        context_id: uuid,
+        session_id: uuid,
+    }
+
+    // Which scopes a catalog-changed event applies to. Consumers can
+    // filter refresh work based on which scopes actually changed.
+    variant catalog-scope {
+        sessions,
+        contexts,
+        bindings,
+    }
+
+    // Aggregate snapshot of control-plane state.
+    record snapshot {
+        revision: u64,
+        sessions: list<session-row>,
+        contexts: list<context-row>,
+        context_session_bindings: list<context-session-binding>,
+    }
+
+    // Return an aggregate snapshot of the current catalog. The optional
+    // `since_revision` is carried through for future incremental
+    // semantics; today the plugin always returns a full snapshot.
+    query snapshot(since_revision: u64?) -> snapshot;
+}
+
+interface control-catalog-events {
+    // Scope set carried on a catalog-changed event.
+    variant catalog-scope {
+        sessions,
+        contexts,
+        bindings,
+    }
+
+    // Emitted whenever the catalog's revision ticks.
+    variant catalog-event {
+        changed {
+            revision: u64,
+            scopes: list<catalog-scope>,
+            full_resync: bool,
+        },
+    }
+
+    events catalog-event;
+}

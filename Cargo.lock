@@ -1018,6 +1018,7 @@ dependencies = [
  "bmux_config",
  "bmux_contexts_plugin",
  "bmux_contexts_plugin_api",
+ "bmux_control_catalog_plugin",
  "bmux_decoration_plugin",
  "bmux_decoration_plugin_api",
  "bmux_env",
@@ -1095,6 +1096,7 @@ dependencies = [
  "bmux_clients_plugin_api",
  "bmux_codec",
  "bmux_config",
+ "bmux_control_catalog_plugin_api",
  "bmux_ipc",
  "bmux_server",
  "serde",
@@ -1222,6 +1224,31 @@ dependencies = [
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_control_catalog_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_clients_plugin_api",
+ "bmux_contexts_plugin",
+ "bmux_contexts_plugin_api",
+ "bmux_control_catalog_plugin_api",
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "bmux_sessions_plugin",
+ "bmux_sessions_plugin_api",
+ "serde",
+]
+
+[[package]]
+name = "bmux_control_catalog_plugin_api"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
  "uuid",
 ]
 
@@ -1554,6 +1581,7 @@ dependencies = [
  "bmux_codec",
  "bmux_config",
  "bmux_contexts_plugin",
+ "bmux_control_catalog_plugin_api",
  "bmux_image",
  "bmux_ipc",
  "bmux_plugin",
