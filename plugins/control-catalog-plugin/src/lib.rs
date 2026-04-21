@@ -24,7 +24,9 @@ use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
 };
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_plugin_sdk::{
+    HostScope, TypedServiceRegistrationContext, TypedServiceRegistry, WireEventSinkHandle,
+};
 use bmux_sessions_plugin_api::SessionManager;
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use serde::{Deserialize, Serialize};
@@ -53,10 +55,41 @@ fn bump_revision_and_emit(scopes: Vec<CatalogScope>, full_resync: bool) {
         &control_catalog_events::EVENT_KIND,
         CatalogEvent::Changed {
             revision: new_rev,
-            scopes,
+            scopes: scopes.clone(),
             full_resync,
         },
     );
+
+    // Publish the wire-event form directly through the registered
+    // sink. Server used to run a typed-event bridge that did this
+    // mapping; that bridge is gone now — publishing here keeps the
+    // wire contract intact.
+    let wire_scopes = scopes
+        .into_iter()
+        .map(|scope| match scope {
+            CatalogScope::Sessions => bmux_ipc::ControlCatalogScope::Sessions,
+            CatalogScope::Contexts => bmux_ipc::ControlCatalogScope::Contexts,
+            CatalogScope::Bindings => bmux_ipc::ControlCatalogScope::Bindings,
+        })
+        .collect();
+    publish_wire_event(bmux_ipc::Event::ControlCatalogChanged {
+        revision: new_rev,
+        scopes: wire_scopes,
+        full_resync,
+    });
+}
+
+/// Look up the server-registered `WireEventSinkHandle` from the plugin
+/// state registry and publish the given wire event through it. Silent
+/// no-op when no server is attached (tests / headless tooling).
+fn publish_wire_event(event: bmux_ipc::Event) {
+    let Some(handle) = global_plugin_state_registry().get::<WireEventSinkHandle>() else {
+        return;
+    };
+    let Ok(guard) = handle.read() else {
+        return;
+    };
+    let _ = guard.0.publish(event);
 }
 
 /// Argument record for the `snapshot` query.

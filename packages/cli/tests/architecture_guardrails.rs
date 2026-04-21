@@ -304,12 +304,11 @@ fn performance_plugin_exists() {
          the performance plugin can reach the active settings",
     );
     assert!(
-        server_source.contains("fn spawn_performance_events_bridge"),
-        "packages/server/src/lib.rs must define \
-         `spawn_performance_events_bridge` to map the performance \
-         plugin's typed `PerformanceEvent::SettingsUpdated` into the \
-         legacy wire `Event::PerformanceSettingsUpdated` for \
-         cross-process subscribers",
+        !server_source.contains("fn spawn_performance_events_bridge"),
+        "packages/server/src/lib.rs must not define \
+         `spawn_performance_events_bridge`; the performance plugin \
+         now publishes `Event::PerformanceSettingsUpdated` directly \
+         through the registered `WireEventSinkHandle`",
     );
 }
 
@@ -660,12 +659,14 @@ fn session_manager_is_owned_by_sessions_plugin() {
         );
     }
 
-    // Server must import SessionManager from the sessions plugin-api
-    // crate. Core must not depend on the plugin impl crate.
+    // Server must reach session-manager state through the
+    // domain-agnostic `SessionManagerHandle` from `bmux_session_state`,
+    // not through the concrete plugin-api type. Core must not depend
+    // on the plugin impl crate.
     assert!(
-        server_source.contains("use bmux_sessions_plugin_api::"),
-        "packages/server/src/lib.rs must import SessionManager via \
-         `use bmux_sessions_plugin_api::...`",
+        server_source.contains("SessionManagerHandle"),
+        "packages/server/src/lib.rs must reach session-manager state \
+         through `bmux_session_state::SessionManagerHandle`",
     );
 
     // Sessions plugin-api hosts the canonical type.
@@ -944,14 +945,15 @@ fn control_catalog_plugin_exists() {
         !server_source.contains("fn emit_control_catalog_changed("),
         "packages/server/src/lib.rs must not define \
          `emit_control_catalog_changed`; the control-catalog plugin \
-         emits `Event::ControlCatalogChanged` via the event bus bridge",
+         now publishes `Event::ControlCatalogChanged` directly \
+         through the registered `WireEventSinkHandle`",
     );
     assert!(
-        server_source.contains("fn spawn_control_catalog_bridge"),
-        "packages/server/src/lib.rs must define \
-         `spawn_control_catalog_bridge` to map the plugin's typed \
-         `CatalogEvent` into `Event::ControlCatalogChanged` for \
-         cross-process subscribers",
+        server_source.contains("register_wire_event_sink"),
+        "packages/server/src/lib.rs must register a \
+         `WireEventSinkHandle` into the plugin state registry so \
+         plugins can publish wire events directly (replacing the \
+         former per-plugin event bridges)",
     );
 }
 
@@ -985,13 +987,12 @@ fn follow_ipc_variants_are_absent() {
     let server_source = include_str!("../../server/src/lib.rs");
     let server_source = production_section(server_source);
     assert!(
-        server_source.contains("fn spawn_client_events_bridge"),
-        "packages/server/src/lib.rs must define \
-         `spawn_client_events_bridge` to map the clients plugin's \
-         typed `ClientEvent::{{FollowStarted, FollowStopped, \
-         FollowTargetChanged}}` into the legacy wire \
-         `Event::{{FollowStarted, FollowStopped, \
-         FollowTargetChanged}}` for cross-process subscribers",
+        !server_source.contains("fn spawn_client_events_bridge"),
+        "packages/server/src/lib.rs must not define \
+         `spawn_client_events_bridge`; the clients plugin now \
+         publishes `Event::{{FollowStarted, FollowStopped, \
+         FollowTargetChanged}}` directly through the registered \
+         `WireEventSinkHandle`",
     );
 }
 

@@ -20,7 +20,20 @@ use bmux_performance_plugin_api::{
 use bmux_performance_state::{PerformanceCaptureSettings, PerformanceSettingsHandle};
 use bmux_plugin::{global_event_bus, global_plugin_state_registry};
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry, WireEventSinkHandle};
+
+/// Look up the server-registered `WireEventSinkHandle` from the plugin
+/// state registry and publish the given wire event through it. Silent
+/// no-op when no server is attached (tests / headless tooling).
+fn publish_wire_event(event: bmux_ipc::Event) {
+    let Some(handle) = global_plugin_state_registry().get::<WireEventSinkHandle>() else {
+        return;
+    };
+    let Ok(guard) = handle.read() else {
+        return;
+    };
+    let _ = guard.0.publish(event);
+}
 
 #[derive(Default)]
 pub struct PerformancePlugin;
@@ -98,14 +111,18 @@ fn handle_set_settings(requested: &bmux_ipc::PerformanceRuntimeSettings) -> Perf
     };
     guard.0.set(normalized_capture);
 
-    // Emit the typed event; server's `spawn_performance_events_bridge`
-    // translates this to the wire `Event::PerformanceSettingsUpdated`.
+    // Emit the typed event for plugin-local consumers, then publish
+    // the wire-shape event directly through the registered
+    // `WireEventSinkHandle` for cross-process subscribers.
     let _ = global_event_bus().emit(
         &EVENT_KIND,
         PerformanceEvent::SettingsUpdated {
             settings: normalized.clone(),
         },
     );
+    publish_wire_event(bmux_ipc::Event::PerformanceSettingsUpdated {
+        settings: normalized.clone(),
+    });
 
     PerformanceResponse::Settings {
         settings: normalized,

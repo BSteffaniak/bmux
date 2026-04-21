@@ -15,16 +15,17 @@ use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
     AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneInputMode,
     AttachPaneMouseProtocol, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-    AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector, ControlCatalogScope,
-    Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, InteractiveRegion, IpcEndpoint,
-    PaneFocusDirection, PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
-    PaneSplitDirection, PaneState, PaneSummary, PerformanceRecordingLevel, ProtocolContract,
-    RecordingEventKind, RecordingPayload, RecordingProfile, RecordingRollingStartOptions,
-    RecordingSummary, Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector,
-    SessionSummary, decode, default_supported_capabilities, encode, negotiate_protocol,
+    AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector, Envelope, EnvelopeKind,
+    ErrorCode, ErrorResponse, Event, InteractiveRegion, IpcEndpoint, PaneFocusDirection,
+    PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection,
+    PaneState, PaneSummary, PerformanceRecordingLevel, ProtocolContract, RecordingEventKind,
+    RecordingPayload, RecordingProfile, RecordingRollingStartOptions, RecordingSummary, Request,
+    Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
+    default_supported_capabilities, encode, negotiate_protocol,
 };
+use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
 use bmux_session_models::{ClientId, Session, SessionId};
-use bmux_sessions_plugin_api::SessionManager;
+use bmux_session_state::{SessionManagerHandle, SessionManagerReader, SessionManagerSnapshot};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
     ClientSelectedContextSnapshotV1, ClientSelectedSessionSnapshotV2,
@@ -97,7 +98,6 @@ pub struct BmuxServer {
 }
 
 struct ServerState {
-    session_manager: Arc<std::sync::RwLock<SessionManager>>,
     session_runtimes: Mutex<SessionRuntimeManager>,
     attach_tokens: Mutex<AttachTokenManager>,
     snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
@@ -434,6 +434,13 @@ fn context_handle() -> ContextStateHandle {
         .unwrap_or_else(ContextStateHandle::noop)
 }
 
+fn session_handle() -> SessionManagerHandle {
+    bmux_plugin::global_plugin_state_registry()
+        .get::<SessionManagerHandle>()
+        .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
+        .unwrap_or_else(SessionManagerHandle::noop)
+}
+
 // `ContextState` / `RuntimeContext` are owned by the contexts plugin.
 // The types live in
 // `bmux_contexts_plugin::context_state`; the runtime handle is
@@ -474,12 +481,10 @@ fn prune_context_mappings_for_session(
 }
 
 fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Result<SessionId> {
-    let mut manager = state
-        .session_manager
-        .write()
-        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+    let manager = session_handle();
     if let Some(requested_name) = name.as_deref()
         && manager
+            .0
             .list_sessions()
             .iter()
             .any(|session| session.name.as_deref() == Some(requested_name))
@@ -488,9 +493,9 @@ fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Res
     }
 
     let session_id = manager
+        .0
         .create_session(name)
         .map_err(|error| anyhow::anyhow!("failed creating session: {error:#}"))?;
-    drop(manager);
 
     let mut runtime_manager = state
         .session_runtimes
@@ -498,11 +503,7 @@ fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Res
         .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
     if let Err(error) = runtime_manager.start_runtime(session_id) {
         drop(runtime_manager);
-        let _ = state
-            .session_manager
-            .write()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?
-            .remove_session(&session_id);
+        let _ = session_handle().0.remove_session(session_id);
         anyhow::bail!("failed creating session runtime: {error:#}");
     }
     drop(runtime_manager);
@@ -4334,25 +4335,6 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
         .and_then(|reason| reason.clone())
 }
 
-/// Install a fresh canonical state handle into the process-wide plugin
-/// state registry, replacing any previous entry and returning the new
-/// handle.
-///
-/// All plugin-owned state types — `SessionManager`, `FollowState`,
-/// `ContextState` — flow through this function during `BmuxServer::new`
-/// so the server reads/writes the same `Arc<RwLock<T>>` handle the
-/// owning plugin later mutates. Plugins that call
-/// `global_plugin_state_registry().register::<T>` during `activate`
-/// will overwrite this handle with their own canonical instance.
-///
-/// Using a replacement pattern here gives each server instance
-/// isolated state even within a single test process.
-fn reset_plugin_owned_state<T: Default + Send + Sync + 'static>() -> Arc<std::sync::RwLock<T>> {
-    let fresh = Arc::new(std::sync::RwLock::new(T::default()));
-    bmux_plugin::global_plugin_state_registry().register::<T>(&fresh);
-    fresh
-}
-
 /// Register a no-op `FollowStateHandle` in the plugin state registry
 /// **only if** one hasn't already been registered. The clients plugin
 /// typically registers its real adapter during `activate` (which
@@ -4380,6 +4362,19 @@ fn register_noop_context_state_handle() {
     }
     let handle = Arc::new(std::sync::RwLock::new(ContextStateHandle::noop()));
     bmux_plugin::global_plugin_state_registry().register::<ContextStateHandle>(&handle);
+}
+
+/// Register a no-op `SessionManagerHandle` in the plugin state registry
+/// only if the sessions plugin hasn't already registered its adapter.
+fn register_noop_session_manager_handle() {
+    if bmux_plugin::global_plugin_state_registry()
+        .get::<SessionManagerHandle>()
+        .is_some()
+    {
+        return;
+    }
+    let handle = Arc::new(std::sync::RwLock::new(SessionManagerHandle::noop()));
+    bmux_plugin::global_plugin_state_registry().register::<SessionManagerHandle>(&handle);
 }
 
 /// Register the recording plugin's state into the global plugin state
@@ -4513,13 +4508,13 @@ impl BmuxServer {
         // during `activate`.
         register_noop_follow_state_handle();
         register_noop_context_state_handle();
+        register_noop_session_manager_handle();
 
         let (event_broadcast_tx, _) =
             tokio::sync::broadcast::channel::<Event>(EVENT_PUSH_CHANNEL_CAPACITY);
         Self {
             endpoint,
             state: Arc::new(ServerState {
-                session_manager: reset_plugin_owned_state::<SessionManager>(),
                 session_runtimes: Mutex::new(SessionRuntimeManager::new(
                     shell,
                     pane_term,
@@ -4772,25 +4767,10 @@ impl BmuxServer {
             process_pane_exit_events(pane_exit_state, pane_exit_shutdown_rx).await;
         });
 
-        // Bridge typed `CatalogEvent` from the control-catalog plugin
-        // into `Event::ControlCatalogChanged` on the server's cross-
-        // process event pipeline (streaming clients, event hub,
-        // recording runtimes). The control-catalog plugin owns the
-        // revision counter; server only fans out.
-        spawn_control_catalog_bridge(Arc::clone(&self.state));
-
-        // Bridge typed `ClientEvent::{FollowStarted, FollowStopped,
-        // FollowTargetChanged}` from the clients plugin into the
-        // legacy wire `Event::{FollowStarted, FollowStopped,
-        // FollowTargetChanged}` for cross-process attach-UI
-        // subscribers.
-        spawn_client_events_bridge(Arc::clone(&self.state));
-
-        // Bridge typed `PerformanceEvent::SettingsUpdated` from the
-        // performance plugin into the legacy wire
-        // `Event::PerformanceSettingsUpdated` for cross-process
-        // subscribers (attach UIs, telemetry collectors).
-        spawn_performance_events_bridge(Arc::clone(&self.state));
+        // Register the wire-event sink so plugins can publish wire
+        // events through the `WireEventSinkHandle` trait object in the
+        // plugin state registry, without depending on `packages/server`.
+        register_wire_event_sink(&self.state);
 
         // Periodic recording retention enforcement.
         let recording_prune_runtime = Arc::clone(&self.state.manual_recording_runtime);
@@ -4912,9 +4892,9 @@ impl BmuxServer {
             }
             shutdown_runtime_handle(removed_runtime).await;
         }
-        if let Ok(mut session_manager) = self.state.session_manager.write() {
-            *session_manager = SessionManager::new();
-        }
+        session_handle()
+            .0
+            .restore_snapshot(SessionManagerSnapshot::default());
         let _ = emit_event(&self.state, Event::ServerStopping);
         if let Ok(mut attach_tokens) = self.state.attach_tokens.lock() {
             attach_tokens.clear();
@@ -5487,121 +5467,33 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
     Ok(())
 }
 
-/// Spawn the control-catalog event bridge.
-///
-/// Subscribes to the typed `CatalogEvent` stream emitted by the
-/// `bmux.control_catalog` plugin and maps each event into
-/// `Event::ControlCatalogChanged` on the server's cross-process event
-/// pipeline. This is how pre-existing attach-UI subscribers keep
-/// receiving catalog-changed events after the migration.
-/// Generic event-bridge helper: subscribe to a typed plugin event on
-/// the plugin event bus, map each event through `mapper` to an
-/// optional wire `Event`, and fan out via `emit_event` on the server's
-/// cross-process pipeline.
-///
-/// Returning `None` from `mapper` skips emission for events that have
-/// no wire equivalent (e.g. plugin-internal signals).
-fn spawn_event_bridge<E, F>(
+/// Concrete `WireEventSink` impl that pipes plugin-published wire
+/// events into the server's `emit_event` pipeline (recording fan-out +
+/// streaming broadcast + event-hub fan-out). The sink holds an
+/// `Arc<ServerState>` so plugins can publish wire events through the
+/// registered handle without knowing about `ServerState` at all.
+struct ServerWireEventSink {
     state: Arc<ServerState>,
-    kind: &bmux_plugin::PluginEventKind,
-    mut mapper: F,
-) where
-    E: Clone + Send + Sync + 'static,
-    F: FnMut(E) -> Option<Event> + Send + 'static,
-{
-    let Ok(mut rx) = bmux_plugin::global_event_bus().subscribe::<E>(kind) else {
-        return;
-    };
-    tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
-            if let Some(wire_event) = mapper((*event).clone()) {
-                let _ = emit_event(&state, wire_event);
-            }
-        }
-    });
 }
 
-fn spawn_control_catalog_bridge(state: Arc<ServerState>) {
-    use bmux_control_catalog_plugin_api::control_catalog_events::{
-        self, CatalogEvent, CatalogScope,
-    };
-    spawn_event_bridge::<CatalogEvent, _>(state, &control_catalog_events::EVENT_KIND, |event| {
-        let CatalogEvent::Changed {
-            revision,
-            scopes,
-            full_resync,
-        } = event;
-        let mapped_scopes = scopes
-            .into_iter()
-            .map(|scope| match scope {
-                CatalogScope::Sessions => ControlCatalogScope::Sessions,
-                CatalogScope::Contexts => ControlCatalogScope::Contexts,
-                CatalogScope::Bindings => ControlCatalogScope::Bindings,
-            })
-            .collect();
-        Some(Event::ControlCatalogChanged {
-            revision,
-            scopes: mapped_scopes,
-            full_resync,
-        })
-    });
+impl WireEventSink for ServerWireEventSink {
+    fn publish(&self, event: Event) -> std::result::Result<(), WireEventSinkError> {
+        emit_event(&self.state, event)
+            .map_err(|error| WireEventSinkError::PublishFailed(error.to_string()))
+    }
 }
 
-/// Spawn the clients-plugin event bridge.
-///
-/// Subscribes to the typed `ClientEvent` stream emitted by the
-/// `bmux.clients` plugin and maps the follow-lifecycle variants into
-/// the legacy wire `Event::{FollowStarted, FollowStopped,
-/// FollowTargetChanged}` variants on the server's cross-process event
-/// pipeline. Other `ClientEvent` variants (e.g. `Attached`, `Detached`,
-/// `SessionSelected`, `FollowChanged`) are plugin-only signals and do
-/// not bridge to the wire today.
-fn spawn_client_events_bridge(state: Arc<ServerState>) {
-    use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
-    spawn_event_bridge::<ClientEvent, _>(state, &clients_events::EVENT_KIND, |event| match event {
-        ClientEvent::FollowStarted {
-            follower_client_id,
-            leader_client_id,
-            global,
-        } => Some(Event::FollowStarted {
-            follower_client_id,
-            leader_client_id,
-            global,
-        }),
-        ClientEvent::FollowStopped { follower_client_id } => {
-            Some(Event::FollowStopped { follower_client_id })
-        }
-        ClientEvent::FollowTargetChanged {
-            follower_client_id,
-            leader_client_id,
-            context_id,
-            session_id,
-        } => Some(Event::FollowTargetChanged {
-            follower_client_id,
-            leader_client_id,
-            context_id,
-            session_id,
-        }),
-        ClientEvent::Attached { .. }
-        | ClientEvent::Detached { .. }
-        | ClientEvent::SessionSelected { .. }
-        | ClientEvent::FollowChanged { .. } => None,
-    });
-}
-
-/// Spawn the performance-plugin event bridge.
-///
-/// Subscribes to the typed `PerformanceEvent` stream emitted by the
-/// `bmux.performance` plugin and maps `SettingsUpdated` into the
-/// legacy wire `Event::PerformanceSettingsUpdated` for cross-process
-/// subscribers.
-fn spawn_performance_events_bridge(state: Arc<ServerState>) {
-    use bmux_performance_plugin_api::{EVENT_KIND, PerformanceEvent};
-    spawn_event_bridge::<PerformanceEvent, _>(state, &EVENT_KIND, |event| match event {
-        PerformanceEvent::SettingsUpdated { settings } => {
-            Some(Event::PerformanceSettingsUpdated { settings })
-        }
-    });
+/// Register the server's wire-event sink into the plugin state
+/// registry. Plugins look up `WireEventSinkHandle` from the registry
+/// and call `publish(event)` to emit cross-process wire events
+/// without depending on the server at all.
+fn register_wire_event_sink(state: &Arc<ServerState>) {
+    let sink = Arc::new(std::sync::RwLock::new(WireEventSinkHandle::new(
+        ServerWireEventSink {
+            state: Arc::clone(state),
+        },
+    )));
+    bmux_plugin::global_plugin_state_registry().register::<WireEventSinkHandle>(&sink);
 }
 
 fn encode_event_frame(
@@ -5769,8 +5661,9 @@ fn sync_selected_target_from_follow_state(
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn reconcile_selected_session_membership(
-    state: &Arc<ServerState>,
+    _state: &Arc<ServerState>,
     client_id: ClientId,
     previous: Option<SessionId>,
     next: Option<SessionId>,
@@ -5779,23 +5672,15 @@ fn reconcile_selected_session_membership(
         return Ok(());
     }
 
-    let mut manager = state
-        .session_manager
-        .write()
-        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+    let manager = session_handle();
 
-    if let Some(previous_session) = previous
-        && let Some(session) = manager.get_session_mut(&previous_session)
-    {
-        session.remove_client(&client_id);
+    if let Some(previous_session) = previous {
+        manager.0.remove_client(previous_session, &client_id);
     }
 
-    if let Some(next_session) = next
-        && let Some(session) = manager.get_session_mut(&next_session)
-    {
-        session.add_client(client_id);
+    if let Some(next_session) = next {
+        manager.0.add_client(next_session, client_id);
     }
-    drop(manager);
 
     Ok(())
 }
@@ -5953,19 +5838,9 @@ fn snapshot_status(state: &Arc<ServerState>) -> Result<ServerSnapshotStatus> {
 
 #[allow(clippy::too_many_lines)]
 fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
-    let sessions = {
-        let manager = state
-            .session_manager
-            .read()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-        manager.list_sessions()
-    };
+    let sessions = session_handle().0.list_sessions();
 
     let session_snapshots = {
-        let manager = state
-            .session_manager
-            .read()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
         let runtime_manager = state
             .session_runtimes
             .lock()
@@ -6089,9 +5964,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
                     .transpose()?
                     .unwrap_or_default();
 
-                let name = manager
-                    .get_session(&session_info.id)
-                    .and_then(|session| session.name.clone());
+                let name = session_info.name.clone();
                 let (focused_pane_id, layout_root, floating_surfaces) = runtime_manager
                     .runtimes
                     .get(&session_info.id)
@@ -6317,10 +6190,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
     let mut summary = RestoreSummary::default();
 
     {
-        let mut session_manager = state
-            .session_manager
-            .write()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        let session_manager = session_handle();
         let mut runtime_manager = state
             .session_runtimes
             .lock()
@@ -6339,7 +6209,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
             let mut session = Session::new(session_snapshot.name.clone());
             session.id = session_id;
 
-            if let Err(error) = session_manager.insert_session(session) {
+            if let Err(error) = session_manager.0.insert_session(session) {
                 warn!(
                     "skipping snapshot session {} insertion failure: {error}",
                     session_snapshot.id
@@ -6405,13 +6275,12 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
                     "failed restoring runtime for session {}: {error}",
                     session_snapshot.id
                 );
-                let _ = session_manager.remove_session(&session_id);
+                let _ = session_manager.0.remove_session(session_id);
                 continue;
             }
 
             summary.sessions += 1;
         }
-        drop(session_manager);
         drop(runtime_manager);
     }
 
@@ -6419,17 +6288,12 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
         use bmux_context_state::ContextStateSnapshot;
         use std::collections::VecDeque;
 
-        let session_catalog = {
-            let session_manager = state
-                .session_manager
-                .read()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            session_manager
-                .list_sessions()
-                .into_iter()
-                .map(|session| (session.id.0, session.name))
-                .collect::<BTreeMap<_, _>>()
-        };
+        let session_catalog = session_handle()
+            .0
+            .list_sessions()
+            .into_iter()
+            .map(|session| (session.id.0, session.name))
+            .collect::<BTreeMap<_, _>>();
 
         let binding_by_context = snapshot
             .context_session_bindings
@@ -6523,18 +6387,13 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
         use bmux_client_state::{FollowEntrySnapshot, FollowStateSnapshot};
         use std::collections::BTreeMap;
 
-        let session_manager = state
-            .session_manager
-            .read()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        let session_manager = session_handle();
 
         let mut new_selected_contexts: BTreeMap<ClientId, Option<Uuid>> = BTreeMap::new();
         let mut new_selected_sessions: BTreeMap<ClientId, Option<SessionId>> = BTreeMap::new();
         for selected in &snapshot.selected_sessions {
             let selected_session = selected.session_id.map(SessionId);
-            if selected_session
-                .is_none_or(|session_id| session_manager.get_session(&session_id).is_some())
-            {
+            if selected_session.is_none_or(|session_id| session_manager.0.contains(session_id)) {
                 let selected_context = selected_contexts
                     .get(&ClientId(selected.client_id))
                     .copied()
@@ -6560,8 +6419,6 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
             );
             summary.follows += 1;
         }
-
-        drop(session_manager);
 
         // Preserve the currently-connected client set across the
         // snapshot restore; only follow relationships and selected
@@ -6594,13 +6451,9 @@ async fn restore_snapshot_replace(
         shutdown_runtime_handle(removed_runtime).await;
     }
 
-    {
-        let mut session_manager = state
-            .session_manager
-            .write()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-        *session_manager = SessionManager::new();
-    }
+    session_handle()
+        .0
+        .restore_snapshot(SessionManagerSnapshot::default());
     follow_handle().0.clear_all_follow_state();
     {
         let mut attach_tokens = state
@@ -6671,13 +6524,7 @@ async fn ensure_attach_session_exists(
     state: &Arc<ServerState>,
     session_id: SessionId,
 ) -> Result<bool> {
-    let exists = {
-        let manager = state
-            .session_manager
-            .read()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-        manager.get_session(&session_id).is_some()
-    };
+    let exists = session_handle().0.contains(session_id);
 
     if exists {
         let mut runtime_manager = state
@@ -6931,12 +6778,7 @@ async fn handle_request(
 
             if let Err(message) = context_bind_result {
                 let removed_runtime = {
-                    let mut manager = state
-                        .session_manager
-                        .write()
-                        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                    let _ = manager.remove_session(&session_id);
-                    drop(manager);
+                    let _ = session_handle().0.remove_session(session_id);
 
                     let mut runtime_manager = state
                         .session_runtimes
@@ -6959,12 +6801,9 @@ async fn handle_request(
             })
         }
         Request::ListPanes { session } => {
-            let manager = state
-                .session_manager
-                .read()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let manager = session_handle();
             let session_id = match resolve_session_request_session_id(
-                &manager,
+                &*manager.0,
                 session.as_ref(),
                 selected_session.as_ref(),
             ) {
@@ -6996,12 +6835,9 @@ async fn handle_request(
             ratio_pct: _, // TODO: pass to layout system when supported
         } => {
             let session_id = {
-                let manager = state
-                    .session_manager
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                let manager = session_handle();
                 match resolve_session_request_session_id(
-                    &manager,
+                    &*manager.0,
                     session.as_ref(),
                     selected_session.as_ref(),
                 ) {
@@ -7049,12 +6885,9 @@ async fn handle_request(
             command,
         } => {
             let session_id = {
-                let manager = state
-                    .session_manager
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                let manager = session_handle();
                 match resolve_session_request_session_id(
-                    &manager,
+                    &*manager.0,
                     session.as_ref(),
                     selected_session.as_ref(),
                 ) {
@@ -7101,12 +6934,9 @@ async fn handle_request(
             direction,
         } => {
             let session_id = {
-                let manager = state
-                    .session_manager
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                let manager = session_handle();
                 match resolve_session_request_session_id(
-                    &manager,
+                    &*manager.0,
                     session.as_ref(),
                     selected_session.as_ref(),
                 ) {
@@ -7165,12 +6995,9 @@ async fn handle_request(
             delta,
         } => {
             let session_id = {
-                let manager = state
-                    .session_manager
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                let manager = session_handle();
                 match resolve_session_request_session_id(
-                    &manager,
+                    &*manager.0,
                     session.as_ref(),
                     selected_session.as_ref(),
                 ) {
@@ -7208,12 +7035,9 @@ async fn handle_request(
         }
         Request::ClosePane { session, target } => {
             let session_id = {
-                let manager = state
-                    .session_manager
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                let manager = session_handle();
                 match resolve_session_request_session_id(
-                    &manager,
+                    &*manager.0,
                     session.as_ref(),
                     selected_session.as_ref(),
                 ) {
@@ -7254,12 +7078,7 @@ async fn handle_request(
                     )?;
                 }
                 shutdown_runtime_handle(removed_session).await;
-                let mut manager = state
-                    .session_manager
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                let _ = manager.remove_session(&removed_session_id);
-                drop(manager);
+                let _ = session_handle().0.remove_session(removed_session_id);
                 let _ = prune_context_mappings_for_session(state, removed_session_id)?;
                 if *selected_session == Some(removed_session_id) {
                     *selected_session = None;
@@ -7296,12 +7115,9 @@ async fn handle_request(
         }
         Request::RestartPane { session, target } => {
             let session_id = {
-                let manager = state
-                    .session_manager
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                let manager = session_handle();
                 match resolve_session_request_session_id(
-                    &manager,
+                    &*manager.0,
                     session.as_ref(),
                     selected_session.as_ref(),
                 ) {
@@ -7347,12 +7163,9 @@ async fn handle_request(
         }
         Request::ZoomPane { session } => {
             let session_id = {
-                let manager = state
-                    .session_manager
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                let manager = session_handle();
                 match resolve_session_request_session_id(
-                    &manager,
+                    &*manager.0,
                     session.as_ref(),
                     selected_session.as_ref(),
                 ) {
@@ -7394,10 +7207,8 @@ async fn handle_request(
             })
         }
         Request::ListSessions => {
-            let sessions = state
-                .session_manager
-                .read()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?
+            let sessions = session_handle()
+                .0
                 .list_sessions()
                 .into_iter()
                 .map(|session| SessionSummary {
@@ -7413,11 +7224,8 @@ async fn handle_request(
             force_local,
         } => {
             let session_id = {
-                let manager = state
-                    .session_manager
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                let Some(session_id) = resolve_session_id(&manager, &selector) else {
+                let manager = session_handle();
+                let Some(session_id) = resolve_session_id(&*manager.0, &selector) else {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::NotFound,
                         message: session_not_found_message(&selector),
@@ -7450,17 +7258,12 @@ async fn handle_request(
             }
 
             let removed_runtime = {
-                let mut manager = state
-                    .session_manager
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                if manager.remove_session(&session_id).is_err() {
+                if session_handle().0.remove_session(session_id).is_err() {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::Internal,
                         message: format!("failed removing session {}", session_id.0),
                     }));
                 }
-                drop(manager);
                 let _ = prune_context_mappings_for_session(state, session_id)?;
                 if *selected_session == Some(session_id) {
                     *selected_session = None;
@@ -7504,11 +7307,8 @@ async fn handle_request(
             Response::Ok(ResponsePayload::SessionKilled { id: session_id.0 })
         }
         Request::Attach { selector } => {
-            let mut manager = state
-                .session_manager
-                .write()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let Some(next_session_id) = resolve_session_id(&manager, &selector) else {
+            let manager = session_handle();
+            let Some(next_session_id) = resolve_session_id(&*manager.0, &selector) else {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: session_not_found_message(&selector),
@@ -7517,13 +7317,12 @@ async fn handle_request(
 
             if let Some(previous_session_id) = selected_session.take()
                 && previous_session_id != next_session_id
-                && let Some(previous) = manager.get_session_mut(&previous_session_id)
             {
-                previous.remove_client(&client_id);
+                manager.0.remove_client(previous_session_id, &client_id);
             }
 
-            if let Some(session) = manager.get_session_mut(&next_session_id) {
-                session.add_client(client_id);
+            if manager.0.contains(next_session_id) {
+                manager.0.add_client(next_session_id, client_id);
                 *selected_session = Some(next_session_id);
                 persist_selected_session(state, client_id, *selected_session)?;
                 drop(manager);
@@ -7576,19 +7375,15 @@ async fn handle_request(
                 (context.id, session_id)
             };
 
-            let mut manager = state
-                .session_manager
-                .write()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let manager = session_handle();
             if let Some(previous_session_id) = selected_session.take()
                 && previous_session_id != next_session_id
-                && let Some(previous) = manager.get_session_mut(&previous_session_id)
             {
-                previous.remove_client(&client_id);
+                manager.0.remove_client(previous_session_id, &client_id);
             }
 
-            if let Some(session) = manager.get_session_mut(&next_session_id) {
-                session.add_client(client_id);
+            if manager.0.contains(next_session_id) {
+                manager.0.add_client(next_session_id, client_id);
                 *selected_session = Some(next_session_id);
                 persist_selected_session(state, client_id, *selected_session)?;
                 drop(manager);
@@ -8127,15 +7922,12 @@ async fn handle_request(
                     message: "detach is disabled for this connection".to_string(),
                 }));
             }
-            let mut manager = state
-                .session_manager
-                .write()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let manager = session_handle();
             let previous_selected_session = selected_session.take();
-            if let Some(current_selected_session) = previous_selected_session
-                && let Some(session) = manager.get_session_mut(&current_selected_session)
-            {
-                session.remove_client(&client_id);
+            if let Some(current_selected_session) = previous_selected_session {
+                manager
+                    .0
+                    .remove_client(current_selected_session, &client_id);
             }
             drop(manager);
 
@@ -8595,16 +8387,9 @@ fn detach_client_state_on_disconnect(
         return Ok(());
     }
 
-    let mut manager = state
-        .session_manager
-        .write()
-        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-    if let Some(session_id) = previous_selected
-        && let Some(session) = manager.get_session_mut(&session_id)
-    {
-        session.remove_client(&client_id);
+    if let Some(session_id) = previous_selected {
+        session_handle().0.remove_client(session_id, &client_id);
     }
-    drop(manager);
 
     if let Some(stream_session_id) = previous_stream {
         let mut runtime_manager = state
@@ -8625,11 +8410,14 @@ fn detach_client_state_on_disconnect(
     Ok(())
 }
 
-fn resolve_session_id(manager: &SessionManager, selector: &SessionSelector) -> Option<SessionId> {
+fn resolve_session_id(
+    manager: &dyn SessionManagerReader,
+    selector: &SessionSelector,
+) -> Option<SessionId> {
     match selector {
         SessionSelector::ById(raw_id) => {
             let session_id = SessionId(*raw_id);
-            manager.get_session(&session_id).map(|_| session_id)
+            manager.contains(session_id).then_some(session_id)
         }
         SessionSelector::ByName(value) => {
             let sessions = manager.list_sessions();
@@ -9224,7 +9012,7 @@ fn session_not_found_message(selector: &SessionSelector) -> String {
 }
 
 fn resolve_session_request_session_id(
-    manager: &SessionManager,
+    manager: &dyn SessionManagerReader,
     selector: Option<&SessionSelector>,
     selected_session: Option<&SessionId>,
 ) -> std::result::Result<SessionId, ErrorResponse> {

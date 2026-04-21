@@ -26,7 +26,9 @@ use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
 };
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_plugin_sdk::{
+    HostScope, TypedServiceRegistrationContext, TypedServiceRegistry, WireEventSinkHandle,
+};
 use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -233,6 +235,19 @@ struct SetCurrentSessionArgs {
     session_id: Uuid,
 }
 
+/// Look up the server-registered `WireEventSinkHandle` from the plugin
+/// state registry and publish the given wire event through it. Silent
+/// no-op when no server is attached (tests / headless tooling).
+fn publish_wire_event(event: bmux_ipc::Event) {
+    let Some(handle) = global_plugin_state_registry().get::<WireEventSinkHandle>() else {
+        return;
+    };
+    let Ok(guard) = handle.read() else {
+        return;
+    };
+    let _ = guard.0.publish(event);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SetFollowingArgs {
     #[serde(default)]
@@ -434,6 +449,9 @@ fn set_following_via_ipc(
                     follower_client_id: self_id,
                 },
             );
+            publish_wire_event(bmux_ipc::Event::FollowStopped {
+                follower_client_id: self_id,
+            });
         }
         return Ok(ClientAck { client_id: self_id });
     }
@@ -515,7 +533,8 @@ fn set_following_via_ipc(
 
     // Emit event-bus events: generic FollowChanged for plugin
     // consumers, plus the wire-shape FollowStarted / FollowTargetChanged
-    // events that the server bridges into `bmux_ipc::Event::*`.
+    // events that server's registered WireEventSinkHandle fans out to
+    // cross-process attach-UI subscribers.
     let _ = global_event_bus().emit(
         &clients_events::EVENT_KIND,
         ClientEvent::FollowChanged {
@@ -532,6 +551,11 @@ fn set_following_via_ipc(
             global: req.global,
         },
     );
+    publish_wire_event(bmux_ipc::Event::FollowStarted {
+        follower_client_id: self_id,
+        leader_client_id: target_client_id,
+        global: req.global,
+    });
     if let Some(session_id) = initial_target_session {
         let _ = global_event_bus().emit(
             &clients_events::EVENT_KIND,
@@ -542,6 +566,12 @@ fn set_following_via_ipc(
                 session_id: session_id.0,
             },
         );
+        publish_wire_event(bmux_ipc::Event::FollowTargetChanged {
+            follower_client_id: self_id,
+            leader_client_id: target_client_id,
+            context_id: initial_target_context,
+            session_id: session_id.0,
+        });
     }
 
     Ok(ClientAck { client_id: self_id })
