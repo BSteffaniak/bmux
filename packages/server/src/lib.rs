@@ -51,8 +51,9 @@ use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use bmux_recording_plugin_api::{
-    DualRuntimeSink, ManualRecordingRuntimeHandle, RecordMeta, RecordingRuntime, RecordingSink,
-    RecordingSinkHandle, RollingRecordingRuntimeHandle,
+    DualRuntimeSink, ManualRecordingRuntimeHandle, RecordMeta, RecordingPluginConfig,
+    RecordingRuntime, RecordingSink, RecordingSinkHandle, RollingRecordingRuntimeHandle,
+    RollingRecordingSettings,
 };
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -314,22 +315,6 @@ struct ServerState {
     /// Stored here so `handle_connection` can pass it to `delta.to_ipc()`.
     #[cfg(feature = "image-registry")]
     payload_codec: Option<Arc<dyn bmux_ipc::compression::CompressionCodec>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RollingRecordingSettings {
-    pub window_secs: u64,
-    pub event_kinds: Vec<RecordingEventKind>,
-}
-
-impl RollingRecordingSettings {
-    const fn is_available(&self) -> bool {
-        self.window_secs > 0 && !self.event_kinds.is_empty()
-    }
-
-    fn capture_input(&self) -> bool {
-        self.event_kinds.contains(&RecordingEventKind::PaneInputRaw)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -4564,6 +4549,47 @@ fn reset_plugin_owned_state<T: Default + Send + Sync + 'static>() -> Arc<std::sy
     fresh
 }
 
+/// Register the recording plugin's state into the global plugin state
+/// registry so the `bmux.recording` plugin's typed handlers (and the
+/// fast-path sink) can reach the runtimes + config without depending
+/// on `packages/server`.
+fn register_recording_plugin_state(
+    manual_recording_runtime: &Arc<Mutex<RecordingRuntime>>,
+    rolling_recording_runtime: &Arc<Mutex<Option<RecordingRuntime>>>,
+    recordings_dir: &std::path::Path,
+    rolling_recordings_dir: &std::path::Path,
+    rolling_segment_mb: usize,
+    rolling_defaults: &RollingRecordingSettings,
+) {
+    let sink: Arc<dyn RecordingSink> = Arc::new(DualRuntimeSink::new(
+        Arc::clone(manual_recording_runtime),
+        Arc::clone(rolling_recording_runtime),
+    ));
+    let sink_handle = Arc::new(std::sync::RwLock::new(RecordingSinkHandle(sink)));
+    bmux_plugin::global_plugin_state_registry().register::<RecordingSinkHandle>(&sink_handle);
+
+    let manual_handle = Arc::new(std::sync::RwLock::new(ManualRecordingRuntimeHandle(
+        Arc::clone(manual_recording_runtime),
+    )));
+    bmux_plugin::global_plugin_state_registry()
+        .register::<ManualRecordingRuntimeHandle>(&manual_handle);
+
+    let rolling_handle = Arc::new(std::sync::RwLock::new(RollingRecordingRuntimeHandle(
+        Arc::clone(rolling_recording_runtime),
+    )));
+    bmux_plugin::global_plugin_state_registry()
+        .register::<RollingRecordingRuntimeHandle>(&rolling_handle);
+
+    let plugin_config = RecordingPluginConfig {
+        recordings_dir: recordings_dir.to_path_buf(),
+        rolling_recordings_dir: rolling_recordings_dir.to_path_buf(),
+        rolling_segment_mb,
+        rolling_defaults: rolling_defaults.clone(),
+    };
+    let config_handle = Arc::new(std::sync::RwLock::new(plugin_config));
+    bmux_plugin::global_plugin_state_registry().register::<RecordingPluginConfig>(&config_handle);
+}
+
 impl BmuxServer {
     #[allow(clippy::too_many_arguments)]
     fn new_with_snapshot(
@@ -4571,7 +4597,7 @@ impl BmuxServer {
         snapshot_manager: Option<SnapshotManager>,
         shell_integration_root: Option<std::path::PathBuf>,
         server_control_principal_id: Uuid,
-        recordings_dir: std::path::PathBuf,
+        recordings_dir: &std::path::Path,
         rolling_recordings_dir: std::path::PathBuf,
         segment_mb: usize,
         retention_days: u64,
@@ -4599,7 +4625,7 @@ impl BmuxServer {
         let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
         let rolling_runtime_available = rolling_recording_defaults.is_available();
         let manual_recording_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
-            recordings_dir,
+            recordings_dir.to_path_buf(),
             segment_mb,
             retention_days,
         )));
@@ -4613,34 +4639,18 @@ impl BmuxServer {
             None
         }));
 
-        // Register the recording sink + runtime handles into the
-        // plugin state registry so the recording-plugin (and other
+        // Register the recording sink + runtime handles + config into
+        // the plugin state registry so the recording-plugin (and other
         // observers) can reach the active recording runtimes without
-        // depending on the plugin impl crate. Server still drives the
-        // runtimes directly today; the registry entries are the hook
-        // for the Stage A migration that moves recording lifecycle
-        // handlers into the plugin.
-        {
-            let sink: Arc<dyn RecordingSink> = Arc::new(DualRuntimeSink::new(
-                Arc::clone(&manual_recording_runtime),
-                Arc::clone(&rolling_recording_runtime),
-            ));
-            let sink_handle = Arc::new(std::sync::RwLock::new(RecordingSinkHandle(sink)));
-            bmux_plugin::global_plugin_state_registry()
-                .register::<RecordingSinkHandle>(&sink_handle);
-
-            let manual_handle = Arc::new(std::sync::RwLock::new(ManualRecordingRuntimeHandle(
-                Arc::clone(&manual_recording_runtime),
-            )));
-            bmux_plugin::global_plugin_state_registry()
-                .register::<ManualRecordingRuntimeHandle>(&manual_handle);
-
-            let rolling_handle = Arc::new(std::sync::RwLock::new(RollingRecordingRuntimeHandle(
-                Arc::clone(&rolling_recording_runtime),
-            )));
-            bmux_plugin::global_plugin_state_registry()
-                .register::<RollingRecordingRuntimeHandle>(&rolling_handle);
-        }
+        // depending on the plugin impl crate.
+        register_recording_plugin_state(
+            &manual_recording_runtime,
+            &rolling_recording_runtime,
+            recordings_dir,
+            rolling_recordings_dir.as_path(),
+            segment_mb,
+            &rolling_recording_defaults,
+        );
 
         let (event_broadcast_tx, _) =
             tokio::sync::broadcast::channel::<Event>(EVENT_PUSH_CHANNEL_CAPACITY);
@@ -4700,7 +4710,7 @@ impl BmuxServer {
             None,
             None,
             Uuid::new_v4(),
-            config.recordings_dir(&paths),
+            &config.recordings_dir(&paths),
             paths.rolling_recordings_dir(),
             config.recording.segment_mb,
             config.recording.retention_days,
@@ -4775,7 +4785,7 @@ impl BmuxServer {
             Some(snapshot_manager),
             shell_integration_root,
             server_control_principal_id,
-            config.recordings_dir(paths),
+            &config.recordings_dir(paths),
             paths.rolling_recordings_dir(),
             config.recording.segment_mb,
             config.recording.retention_days,

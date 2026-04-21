@@ -92,6 +92,43 @@ pub struct RollingRecordingRuntimeHandle(
     pub std::sync::Arc<std::sync::Mutex<Option<RecordingRuntime>>>,
 );
 
+/// Default rolling-recording configuration (window seconds + enabled
+/// event kinds). Relocated from `packages/server` so plugin handlers
+/// can use the same settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollingRecordingSettings {
+    pub window_secs: u64,
+    pub event_kinds: Vec<RecordingEventKind>,
+}
+
+impl RollingRecordingSettings {
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        self.window_secs > 0 && !self.event_kinds.is_empty()
+    }
+
+    #[must_use]
+    pub fn capture_input(&self) -> bool {
+        self.event_kinds.contains(&RecordingEventKind::PaneInputRaw)
+    }
+}
+
+/// Server-provided configuration values needed by the recording
+/// plugin's rolling/cut/write handlers. Registered into
+/// `PluginStateRegistry` by `BmuxServer::new` so the plugin can reach
+/// them without depending on `packages/server`.
+#[derive(Debug, Clone)]
+pub struct RecordingPluginConfig {
+    /// Root directory for the (non-rolling) manual recordings.
+    pub recordings_dir: std::path::PathBuf,
+    /// Root directory for rolling-recording buffers.
+    pub rolling_recordings_dir: std::path::PathBuf,
+    /// Segment size in MB for rolling recording buffers.
+    pub rolling_segment_mb: usize,
+    /// Default rolling-recording settings (window + event kinds).
+    pub rolling_defaults: RollingRecordingSettings,
+}
+
 /// `RecordingSink` impl that fans out each record to both a manual
 /// and a rolling `RecordingRuntime` handle.
 ///
