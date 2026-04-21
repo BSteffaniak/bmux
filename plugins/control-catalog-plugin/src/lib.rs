@@ -14,7 +14,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
-use bmux_contexts_plugin::ContextState;
+use bmux_contexts_plugin_api::ContextState;
 use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
 use bmux_control_catalog_plugin_api::control_catalog_events::{self, CatalogEvent, CatalogScope};
 use bmux_control_catalog_plugin_api::control_catalog_state::{
@@ -25,7 +25,7 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
-use bmux_sessions_plugin::SessionManager;
+use bmux_sessions_plugin_api::SessionManager;
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use serde::{Deserialize, Serialize};
 use std::future::Future;

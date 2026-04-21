@@ -407,12 +407,11 @@ fn event_models_crate_has_no_domain_dependencies() {
     }
 }
 
-/// Verify that `FollowState` is defined in `bmux_clients_plugin` and
-/// not in `packages/server`. The clients plugin owns the type; server
-/// imports it via `use bmux_clients_plugin::FollowState` and
-/// constructs a locally-owned `Arc<RwLock<FollowState>>` per server
-/// instance (so multi-server tests don't share state). The plugin also
-/// registers a canonical handle into
+/// Verify that `FollowState` is defined in `bmux_clients_plugin_api`
+/// and not in `packages/server`. The clients plugin owns the type; it
+/// lives in the plugin-api crate so server imports it via
+/// `use bmux_clients_plugin_api::FollowState` without depending on the
+/// plugin impl crate. The plugin registers a canonical handle into
 /// [`bmux_plugin::PluginStateRegistry`] on `activate` for other
 /// observers.
 #[test]
@@ -431,22 +430,23 @@ fn follow_state_is_owned_by_clients_plugin() {
         assert!(
             !server_source.contains(marker),
             "packages/server/src/lib.rs must not define {marker}; \
-             FollowState lives in bmux_clients_plugin",
+             FollowState lives in bmux_clients_plugin_api",
         );
     }
 
-    // Server must import FollowState from the clients plugin.
+    // Server must import FollowState from the clients plugin-api crate.
+    // Core must not depend on the plugin impl crate.
     assert!(
-        server_source.contains("use bmux_clients_plugin::"),
+        server_source.contains("use bmux_clients_plugin_api::"),
         "packages/server/src/lib.rs must import FollowState via \
-         `use bmux_clients_plugin::...`",
+         `use bmux_clients_plugin_api::...`",
     );
 
-    // Clients plugin hosts the canonical type.
-    let plugin_source = include_str!("../../../plugins/clients-plugin/src/follow_state.rs");
+    // Clients plugin-api hosts the canonical type.
+    let plugin_source = include_str!("../../../plugins/clients-plugin-api/src/follow_state.rs");
     assert!(
         plugin_source.contains("pub struct FollowState"),
-        "plugins/clients-plugin/src/follow_state.rs must export \
+        "plugins/clients-plugin-api/src/follow_state.rs must export \
          the canonical `FollowState` struct",
     );
 
@@ -464,11 +464,11 @@ fn follow_state_is_owned_by_clients_plugin() {
     );
 }
 
-/// Verify that `ContextState` is defined in `bmux_contexts_plugin`
-/// and not in `packages/server`. The contexts plugin owns the type;
-/// server imports it via `use bmux_contexts_plugin::ContextState` and
-/// uses a locally-owned `Arc<RwLock<ContextState>>` per server
-/// instance.
+/// Verify that `ContextState` is defined in `bmux_contexts_plugin_api`
+/// and not in `packages/server`. The contexts plugin owns the type; it
+/// lives in the plugin-api crate so server imports it via
+/// `use bmux_contexts_plugin_api::ContextState` without depending on
+/// the plugin impl crate.
 #[test]
 fn context_state_is_owned_by_contexts_plugin() {
     let server_source = include_str!("../../server/src/lib.rs");
@@ -484,22 +484,23 @@ fn context_state_is_owned_by_contexts_plugin() {
         assert!(
             !server_source.contains(marker),
             "packages/server/src/lib.rs must not define {marker}; \
-             ContextState lives in bmux_contexts_plugin",
+             ContextState lives in bmux_contexts_plugin_api",
         );
     }
 
-    // Server must import ContextState from the contexts plugin.
+    // Server must import ContextState from the contexts plugin-api
+    // crate. Core must not depend on the plugin impl crate.
     assert!(
-        server_source.contains("use bmux_contexts_plugin::"),
+        server_source.contains("use bmux_contexts_plugin_api::"),
         "packages/server/src/lib.rs must import ContextState via \
-         `use bmux_contexts_plugin::...`",
+         `use bmux_contexts_plugin_api::...`",
     );
 
-    // Contexts plugin hosts the canonical type.
-    let plugin_source = include_str!("../../../plugins/contexts-plugin/src/context_state.rs");
+    // Contexts plugin-api hosts the canonical type.
+    let plugin_source = include_str!("../../../plugins/contexts-plugin-api/src/context_state.rs");
     assert!(
         plugin_source.contains("pub struct ContextState"),
-        "plugins/contexts-plugin/src/context_state.rs must export \
+        "plugins/contexts-plugin-api/src/context_state.rs must export \
          the canonical `ContextState` struct",
     );
 
@@ -517,10 +518,11 @@ fn context_state_is_owned_by_contexts_plugin() {
     );
 }
 
-/// Verify that `SessionManager` is defined in `bmux_sessions_plugin`
+/// Verify that `SessionManager` is defined in `bmux_sessions_plugin_api`
 /// and not in `packages/session` or `packages/server`. The sessions
-/// plugin owns the type; server imports it via
-/// `use bmux_sessions_plugin::SessionManager`.
+/// plugin owns the type; it lives in the plugin-api crate so server
+/// imports it via `use bmux_sessions_plugin_api::SessionManager`
+/// without depending on the plugin impl crate.
 #[test]
 fn session_manager_is_owned_by_sessions_plugin() {
     // `packages/session` is absent; SessionManager lives in
@@ -550,22 +552,23 @@ fn session_manager_is_owned_by_sessions_plugin() {
         assert!(
             !server_source.contains(marker),
             "packages/server/src/lib.rs must not define {marker}; \
-             SessionManager lives in bmux_sessions_plugin",
+             SessionManager lives in bmux_sessions_plugin_api",
         );
     }
 
-    // Server must import SessionManager from the sessions plugin.
+    // Server must import SessionManager from the sessions plugin-api
+    // crate. Core must not depend on the plugin impl crate.
     assert!(
-        server_source.contains("use bmux_sessions_plugin::"),
+        server_source.contains("use bmux_sessions_plugin_api::"),
         "packages/server/src/lib.rs must import SessionManager via \
-         `use bmux_sessions_plugin::...`",
+         `use bmux_sessions_plugin_api::...`",
     );
 
-    // Sessions plugin hosts the canonical type.
-    let plugin_source = include_str!("../../../plugins/sessions-plugin/src/session_manager.rs");
+    // Sessions plugin-api hosts the canonical type.
+    let plugin_source = include_str!("../../../plugins/sessions-plugin-api/src/session_manager.rs");
     assert!(
         plugin_source.contains("pub struct SessionManager"),
-        "plugins/sessions-plugin/src/session_manager.rs must export \
+        "plugins/sessions-plugin-api/src/session_manager.rs must export \
          the canonical `SessionManager` struct",
     );
 
@@ -718,6 +721,7 @@ fn core_architecture_does_not_depend_on_plugins() {
     let core_crates = [
         "packages/ipc",
         "packages/client",
+        "packages/server",
         "packages/session/models",
         "packages/event/models",
         "packages/plugin-sdk",
@@ -741,10 +745,16 @@ fn core_architecture_does_not_depend_on_plugins() {
             // violation when declared as a dependency of a core crate.
             // Plugin-api crates (`bmux_*_plugin_api`) are acceptable —
             // they are neutral typed-dispatch surfaces.
+            //
+            // Exceptions: `bmux_plugin` (core plugin infrastructure),
+            // `bmux_plugin_sdk` (core plugin SDK), and
+            // `bmux_plugin_schema*` (core BPDL codegen) are core
+            // primitives, not plugin impls.
             if let Some((name, _)) = trimmed.split_once('=')
                 && let name = name.trim()
                 && name.starts_with("bmux_")
                 && name.ends_with("_plugin")
+                && name != "bmux_plugin"
             {
                 offenders.push(format!("{}: {name}", crate_path));
             }

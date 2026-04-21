@@ -9,9 +9,7 @@
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::result_large_err)]
 
-pub mod context_state;
-
-pub use context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
+pub use bmux_contexts_plugin_api::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
 
 use bmux_clients_plugin_api::clients_state::{
     self as clients_state, ClientQueryError, ClientSummary,

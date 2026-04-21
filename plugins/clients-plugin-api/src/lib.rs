@@ -16,6 +16,9 @@ bmux_plugin_schema_macros::schema! {
     source: "bpdl/clients-plugin.bpdl",
 }
 
+pub mod follow_state;
+pub use follow_state::{FollowEntry, FollowState, FollowTargetUpdate};
+
 /// Capability identifiers gating access to this plugin's surfaces.
 ///
 /// Written by hand (not BPDL-generated) until the schema language grows

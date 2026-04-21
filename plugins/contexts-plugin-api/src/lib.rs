@@ -17,6 +17,9 @@ bmux_plugin_schema_macros::schema! {
     source: "bpdl/contexts-plugin.bpdl",
 }
 
+pub mod context_state;
+pub use context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
+
 /// Capability identifiers gating access to this plugin's surfaces.
 ///
 /// Written by hand (not BPDL-generated) until the schema language grows

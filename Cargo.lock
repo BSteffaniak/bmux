@@ -1126,8 +1126,10 @@ dependencies = [
 name = "bmux_clients_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
+ "bmux_session_models",
  "serde",
  "serde_json",
  "uuid",
@@ -1221,8 +1223,10 @@ dependencies = [
 name = "bmux_contexts_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
+ "bmux_session_models",
  "serde",
  "serde_json",
  "uuid",
@@ -1233,12 +1237,10 @@ name = "bmux_control_catalog_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_clients_plugin_api",
- "bmux_contexts_plugin",
  "bmux_contexts_plugin_api",
  "bmux_control_catalog_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",
- "bmux_sessions_plugin",
  "bmux_sessions_plugin_api",
  "serde",
 ]
@@ -1578,17 +1580,16 @@ name = "bmux_server"
 version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
- "bmux_clients_plugin",
  "bmux_clients_plugin_api",
  "bmux_codec",
  "bmux_config",
- "bmux_contexts_plugin",
+ "bmux_contexts_plugin_api",
  "bmux_control_catalog_plugin_api",
  "bmux_image",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_session_models",
- "bmux_sessions_plugin",
+ "bmux_sessions_plugin_api",
  "bmux_terminal_protocol",
  "portable-pty",
  "serde",
@@ -1612,7 +1613,6 @@ dependencies = [
 name = "bmux_sessions_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "anyhow",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
@@ -1626,8 +1626,10 @@ dependencies = [
 name = "bmux_sessions_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "anyhow",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
+ "bmux_session_models",
  "serde",
  "serde_json",
  "uuid",

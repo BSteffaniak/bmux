@@ -142,12 +142,25 @@ The server's authoritative handle flows through its request pipeline.
 
 Plugin-owned state type locations:
 
-| Type                                | Owner plugin             | Location                                         |
-| ----------------------------------- | ------------------------ | ------------------------------------------------ |
-| `FollowState`                       | `clients-plugin`         | `plugins/clients-plugin/src/follow_state.rs`     |
-| `ContextState`                      | `contexts-plugin`        | `plugins/contexts-plugin/src/context_state.rs`   |
-| `SessionManager`                    | `sessions-plugin`        | `plugins/sessions-plugin/src/session_manager.rs` |
-| Catalog revision counter + snapshot | `control-catalog-plugin` | `plugins/control-catalog-plugin/src/lib.rs`      |
+| Type                                | Owner plugin             | Location                                             |
+| ----------------------------------- | ------------------------ | ---------------------------------------------------- |
+| `FollowState`                       | `clients-plugin`         | `plugins/clients-plugin-api/src/follow_state.rs`     |
+| `ContextState`                      | `contexts-plugin`        | `plugins/contexts-plugin-api/src/context_state.rs`   |
+| `SessionManager`                    | `sessions-plugin`        | `plugins/sessions-plugin-api/src/session_manager.rs` |
+| Catalog revision counter + snapshot | `control-catalog-plugin` | `plugins/control-catalog-plugin/src/lib.rs`          |
+
+The authoritative state types (`FollowState`, `ContextState`,
+`SessionManager`) live in the corresponding `*-plugin-api` crates, not
+in the plugin impl crates. This lets `packages/server` and other
+consumers name the types without depending on the plugin impl crates
+— the "core must not depend on plugin impl crates" rule is enforced
+uniformly by the `core_architecture_does_not_depend_on_plugins`
+guardrail, which includes `packages/server` in its core-crate list.
+Plugins register canonical handles into the process-wide
+\[`bmux_plugin::PluginStateRegistry`\] during `activate`; server reads
+those handles via `reset_plugin_owned_state` at construction time so
+server + plugin share a single `Arc<RwLock<T>>` instance per state
+type.
 
 The control-catalog plugin is a cross-cutting aggregator: it doesn't
 own a dedicated state struct registered in

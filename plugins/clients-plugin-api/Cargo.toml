@@ -11,8 +11,10 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_ipc                  = { workspace = true }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
+bmux_session_models       = { workspace = true, features = ["serde"] }
 serde                     = { workspace = true, features = ["derive", "std"] }
 uuid                      = { workspace = true, features = ["serde", "std"] }
 

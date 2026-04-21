@@ -15,7 +15,6 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-anyhow                   = { workspace = true, features = ["std"] }
 bmux_ipc                 = { workspace = true }
 bmux_plugin              = { workspace = true }
 bmux_plugin_sdk          = { workspace = true }

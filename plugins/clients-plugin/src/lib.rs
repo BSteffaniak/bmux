@@ -8,9 +8,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-pub mod follow_state;
-
-pub use follow_state::{FollowEntry, FollowState, FollowTargetUpdate};
+pub use bmux_clients_plugin_api::{FollowEntry, FollowState, FollowTargetUpdate};
 
 use bmux_clients_plugin_api::clients_commands::{
     self, ClientAck, ClientsCommandsService, SetCurrentSessionError, SetFollowingError,

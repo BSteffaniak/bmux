@@ -8,11 +8,11 @@ mod persistence;
 pub mod recording;
 
 use anyhow::{Context, Result};
-use bmux_clients_plugin::{FollowEntry, FollowState};
+use bmux_clients_plugin_api::{FollowEntry, FollowState};
 use bmux_config::{
     BmuxConfig, ConfigPaths, PerformanceRecordingLevel as ConfigPerformanceRecordingLevel,
 };
-use bmux_contexts_plugin::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
+use bmux_contexts_plugin_api::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
@@ -29,7 +29,7 @@ use bmux_ipc::{
     default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_session_models::{ClientId, Session, SessionId};
-use bmux_sessions_plugin::SessionManager;
+use bmux_sessions_plugin_api::SessionManager;
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
     ClientSelectedContextSnapshotV1, ClientSelectedSessionSnapshotV2,
