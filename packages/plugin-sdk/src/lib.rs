@@ -49,8 +49,11 @@ mod process_runtime;
 pub mod prompt;
 mod ready;
 mod service;
+mod stateful_plugin;
 pub mod typed_dispatch;
+mod typed_dispatch_client;
 mod version;
+mod wire_event_sink;
 
 pub use capability::{HostScope, PluginFeature};
 pub use command::{
@@ -94,11 +97,21 @@ pub use service::{
     ServiceRequest, ServiceResponse, decode_service_envelope, decode_service_message,
     encode_service_envelope, encode_service_message,
 };
+pub use stateful_plugin::{
+    StatefulPlugin, StatefulPluginError, StatefulPluginHandle, StatefulPluginResult,
+    StatefulPluginSnapshot,
+};
 pub use typed_dispatch::{
     InProcessTypedDispatch, TypedDispatchError, TypedProviderCell, TypedServiceHandle,
     TypedServiceKey, TypedServiceRegistry,
 };
+pub use typed_dispatch_client::{
+    TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult,
+};
 pub use version::{ApiVersion, VersionRange};
+pub use wire_event_sink::{
+    NoopWireEventSink, WireEventSink, WireEventSinkError, WireEventSinkHandle,
+};
 
 // Prompt types — re-exported at the crate root for convenience.
 pub use prompt::{
