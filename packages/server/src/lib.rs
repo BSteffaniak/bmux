@@ -19,9 +19,9 @@ use bmux_ipc::{
     ErrorCode, ErrorResponse, Event, InteractiveRegion, IpcEndpoint, PaneFocusDirection,
     PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection,
     PaneState, PaneSummary, PerformanceRecordingLevel, ProtocolContract, RecordingEventKind,
-    RecordingPayload, RecordingProfile, RecordingRollingStartOptions, RecordingSummary, Request,
-    Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
-    default_supported_capabilities, encode, negotiate_protocol,
+    RecordingPayload, RecordingRollingStartOptions, Request, Response, ResponsePayload,
+    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
+    encode, negotiate_protocol,
 };
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
 use bmux_session_models::{ClientId, Session, SessionId};
@@ -51,11 +51,8 @@ use bmux_performance_plugin_api::PerformanceEventRateLimiter;
 use bmux_performance_state::{
     PerformanceSettingsHandle, PerformanceSettingsReader, PerformanceSettingsStore,
 };
-use bmux_recording_plugin_api::{
-    DualRuntimeSink, ManualRecordingRuntimeHandle, RecordingPluginConfig, RecordingRuntime,
-    RollingRecordingRuntimeHandle, RollingRecordingSettings,
-};
-use bmux_recording_runtime::{RecordMeta, RecordingSink, RecordingSinkHandle};
+use bmux_recording_plugin_api::RollingRecordingSettings;
+use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
@@ -101,13 +98,7 @@ struct ServerState {
     session_runtimes: Mutex<SessionRuntimeManager>,
     attach_tokens: Mutex<AttachTokenManager>,
     snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
-    manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
-    rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
-    rolling_recording_auto_start: bool,
-    rolling_recording_defaults: RollingRecordingSettings,
     performance_settings: PerformanceSettingsStore,
-    rolling_recordings_dir: std::path::PathBuf,
-    rolling_recording_segment_mb: usize,
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
     /// Broadcast channel for pushing events to streaming clients.
@@ -4377,47 +4368,6 @@ fn register_noop_session_manager_handle() {
     bmux_plugin::global_plugin_state_registry().register::<SessionManagerHandle>(&handle);
 }
 
-/// Register the recording plugin's state into the global plugin state
-/// registry so the `bmux.recording` plugin's typed handlers (and the
-/// fast-path sink) can reach the runtimes + config without depending
-/// on `packages/server`.
-fn register_recording_plugin_state(
-    manual_recording_runtime: &Arc<Mutex<RecordingRuntime>>,
-    rolling_recording_runtime: &Arc<Mutex<Option<RecordingRuntime>>>,
-    recordings_dir: &std::path::Path,
-    rolling_recordings_dir: &std::path::Path,
-    rolling_segment_mb: usize,
-    rolling_defaults: &RollingRecordingSettings,
-) {
-    let sink: Arc<dyn RecordingSink> = Arc::new(DualRuntimeSink::new(
-        Arc::clone(manual_recording_runtime),
-        Arc::clone(rolling_recording_runtime),
-    ));
-    let sink_handle = Arc::new(std::sync::RwLock::new(RecordingSinkHandle(sink)));
-    bmux_plugin::global_plugin_state_registry().register::<RecordingSinkHandle>(&sink_handle);
-
-    let manual_handle = Arc::new(std::sync::RwLock::new(ManualRecordingRuntimeHandle(
-        Arc::clone(manual_recording_runtime),
-    )));
-    bmux_plugin::global_plugin_state_registry()
-        .register::<ManualRecordingRuntimeHandle>(&manual_handle);
-
-    let rolling_handle = Arc::new(std::sync::RwLock::new(RollingRecordingRuntimeHandle(
-        Arc::clone(rolling_recording_runtime),
-    )));
-    bmux_plugin::global_plugin_state_registry()
-        .register::<RollingRecordingRuntimeHandle>(&rolling_handle);
-
-    let plugin_config = RecordingPluginConfig {
-        recordings_dir: recordings_dir.to_path_buf(),
-        rolling_recordings_dir: rolling_recordings_dir.to_path_buf(),
-        rolling_segment_mb,
-        rolling_defaults: rolling_defaults.clone(),
-    };
-    let config_handle = Arc::new(std::sync::RwLock::new(plugin_config));
-    bmux_plugin::global_plugin_state_registry().register::<RecordingPluginConfig>(&config_handle);
-}
-
 /// Register the performance plugin's settings handle into the global
 /// plugin state registry. Server constructs the initial settings from
 /// the static config and shares a `PerformanceSettingsStore` with the
@@ -4436,18 +4386,11 @@ fn register_performance_plugin_state(config: &BmuxConfig) -> PerformanceSettings
 }
 
 impl BmuxServer {
-    #[allow(clippy::too_many_arguments)]
     fn new_with_snapshot(
         endpoint: IpcEndpoint,
         snapshot_manager: Option<SnapshotManager>,
         shell_integration_root: Option<std::path::PathBuf>,
         server_control_principal_id: Uuid,
-        recordings_dir: &std::path::Path,
-        rolling_recordings_dir: std::path::PathBuf,
-        segment_mb: usize,
-        retention_days: u64,
-        rolling_recording_auto_start: bool,
-        rolling_recording_defaults: RollingRecordingSettings,
     ) -> Self {
         let snapshot_runtime = Arc::new(Mutex::new(
             snapshot_manager.map_or_else(SnapshotRuntime::disabled, SnapshotRuntime::with_manager),
@@ -4468,34 +4411,12 @@ impl BmuxServer {
             };
         let (shutdown_tx, _) = watch::channel(false);
         let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
-        let rolling_runtime_available = rolling_recording_defaults.is_available();
-        let manual_recording_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
-            recordings_dir.to_path_buf(),
-            segment_mb,
-            retention_days,
-        )));
-        let rolling_recording_runtime = Arc::new(Mutex::new(if rolling_runtime_available {
-            Some(RecordingRuntime::new_rolling(
-                rolling_recordings_dir.clone(),
-                segment_mb,
-                rolling_recording_defaults.window_secs,
-            ))
-        } else {
-            None
-        }));
 
-        // Register the recording sink + runtime handles + config into
-        // the plugin state registry so the recording-plugin (and other
-        // observers) can reach the active recording runtimes without
-        // depending on the plugin impl crate.
-        register_recording_plugin_state(
-            &manual_recording_runtime,
-            &rolling_recording_runtime,
-            recordings_dir,
-            rolling_recordings_dir.as_path(),
-            segment_mb,
-            &rolling_recording_defaults,
-        );
+        // The recording plugin owns construction of `RecordingRuntime`
+        // instances and registers its own sink / runtime handles /
+        // config during its `activate` callback. CLI bootstrap
+        // registered `RecordingPluginConfig` before plugin activation
+        // so the plugin has the config paths it needs at that time.
 
         // Register the performance plugin's settings handle into the
         // plugin state registry. Server's event-push rate limiter
@@ -4526,14 +4447,7 @@ impl BmuxServer {
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 snapshot_runtime,
-                manual_recording_runtime,
-                rolling_recording_runtime,
-                rolling_recording_auto_start: rolling_recording_auto_start
-                    && rolling_runtime_available,
-                rolling_recording_defaults,
                 performance_settings,
-                rolling_recordings_dir,
-                rolling_recording_segment_mb: segment_mb,
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 event_broadcast: event_broadcast_tx,
@@ -4553,21 +4467,7 @@ impl BmuxServer {
     /// Create a server with an explicit endpoint.
     #[must_use]
     pub fn new(endpoint: IpcEndpoint) -> Self {
-        let paths = ConfigPaths::default();
-        let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
-        let rolling_defaults = rolling_recording_settings_from_config(&config);
-        Self::new_with_snapshot(
-            endpoint,
-            None,
-            None,
-            Uuid::new_v4(),
-            &config.recordings_dir(&paths),
-            paths.rolling_recordings_dir(),
-            config.recording.segment_mb,
-            config.recording.retention_days,
-            config.recording.enabled,
-            rolling_defaults,
-        )
+        Self::new_with_snapshot(endpoint, None, None, Uuid::new_v4())
     }
 
     /// Create a server with endpoint derived from config paths.
@@ -4601,14 +4501,18 @@ impl BmuxServer {
         )
     }
 
-    /// Create a server with endpoint derived from config paths, explicit
-    /// rolling-recording boot options, and optional shell integration override.
+    /// Create a server with endpoint derived from config paths and
+    /// optional shell integration override.
+    ///
+    /// Rolling-recording auto-start and related options are consumed
+    /// by the recording plugin during its `activate` callback; server
+    /// no longer owns recording-domain startup.
     #[must_use]
     pub fn from_config_paths_with_start_options(
         paths: &ConfigPaths,
-        rolling_recording_auto_start: bool,
-        rolling_window_secs: u64,
-        rolling_event_kinds: &[RecordingEventKind],
+        _rolling_recording_auto_start: bool,
+        _rolling_window_secs: u64,
+        _rolling_event_kinds: &[RecordingEventKind],
         pane_shell_integration_override: Option<bool>,
     ) -> Self {
         let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
@@ -4624,10 +4528,6 @@ impl BmuxServer {
                 warn!("failed loading server control principal id: {error}");
                 Uuid::new_v4()
             });
-        let rolling_defaults = RollingRecordingSettings {
-            window_secs: rolling_window_secs,
-            event_kinds: normalize_recording_event_kinds(rolling_event_kinds),
-        };
         let shell_integration_root = pane_shell_integration_override
             .unwrap_or(config.behavior.pane_shell_integration)
             .then(|| paths.state_dir().join("runtime").join("shell-integration"));
@@ -4636,12 +4536,6 @@ impl BmuxServer {
             Some(snapshot_manager),
             shell_integration_root,
             server_control_principal_id,
-            &config.recordings_dir(paths),
-            paths.rolling_recordings_dir(),
-            config.recording.segment_mb,
-            config.recording.retention_days,
-            rolling_recording_auto_start,
-            rolling_defaults,
         )
     }
 
@@ -4751,9 +4645,10 @@ impl BmuxServer {
             return Err(error);
         }
 
-        if let Err(error) = ensure_rolling_recording_started(&self.state) {
-            warn!("failed to initialize rolling recording runtime: {error:#}");
-        }
+        // Rolling-recording auto-start and hourly prune loop both
+        // moved into the recording plugin's `activate` callback;
+        // server no longer constructs `RecordingRuntime` or schedules
+        // recording-domain background tasks.
 
         info!("bmux server listening on {:?}", self.endpoint);
         emit_event(&self.state, Event::ServerStarted)?;
@@ -4771,44 +4666,6 @@ impl BmuxServer {
         // events through the `WireEventSinkHandle` trait object in the
         // plugin state registry, without depending on `packages/server`.
         register_wire_event_sink(&self.state);
-
-        // Periodic recording retention enforcement.
-        let recording_prune_runtime = Arc::clone(&self.state.manual_recording_runtime);
-        let mut prune_shutdown_rx = self.shutdown_tx.subscribe();
-        let _prune_task = tokio::spawn(async move {
-            // Initial prune on startup.
-            if let Ok(runtime) = recording_prune_runtime.lock() {
-                match runtime.prune(None) {
-                    Ok(0) => {}
-                    Ok(n) => info!("startup recording prune: deleted {n} recording(s)"),
-                    Err(e) => warn!("startup recording prune failed: {e:#}"),
-                }
-            }
-            // Periodic prune every hour.
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            interval.tick().await; // skip the immediate first tick
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if let Ok(runtime) = recording_prune_runtime.lock() {
-                            match runtime.prune(None) {
-                                Ok(0) => {}
-                                Ok(n) => info!("periodic recording prune: deleted {n} recording(s)"),
-                                Err(e) => warn!("periodic recording prune failed: {e:#}"),
-                            }
-                        }
-                    }
-                    changed = prune_shutdown_rx.changed() => {
-                        if changed.is_ok() && *prune_shutdown_rx.borrow() {
-                            break;
-                        }
-                        if changed.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
 
         let snapshot_flush_state = Arc::clone(&self.state);
         let mut snapshot_flush_shutdown_rx = self.shutdown_tx.subscribe();
@@ -6078,62 +5935,6 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
         selected_contexts,
         mru_contexts,
     })
-}
-
-fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
-    if !state.rolling_recording_auto_start {
-        return Ok(());
-    }
-    if !state.rolling_recording_defaults.is_available() {
-        return Ok(());
-    }
-
-    let mut guard = state
-        .rolling_recording_runtime
-        .lock()
-        .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
-    if guard.is_none() {
-        *guard = Some(RecordingRuntime::new_rolling(
-            state.rolling_recordings_dir.clone(),
-            state.rolling_recording_segment_mb,
-            state.rolling_recording_defaults.window_secs,
-        ));
-    }
-    let runtime = guard
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("rolling recording runtime missing after init"))?;
-    if runtime.status().active.is_some() {
-        return Ok(());
-    }
-
-    let summary =
-        start_rolling_recording_runtime(state, runtime, &state.rolling_recording_defaults, None)?;
-    let window_secs = runtime.rolling_window_secs().unwrap_or(0);
-    drop(guard);
-    info!(
-        "rolling recording started: {} path={} window_secs={}",
-        summary.id, summary.path, window_secs
-    );
-    Ok(())
-}
-
-fn start_rolling_recording_runtime(
-    _state: &Arc<ServerState>,
-    runtime: &mut RecordingRuntime,
-    settings: &RollingRecordingSettings,
-    name: Option<String>,
-) -> Result<RecordingSummary> {
-    if let Err(error) = runtime.delete_all() {
-        warn!("failed cleaning hidden rolling recordings root: {error:#}");
-    }
-
-    runtime.start(
-        None,
-        settings.capture_input(),
-        name,
-        RecordingProfile::Functional,
-        settings.event_kinds.clone(),
-    )
 }
 
 fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
@@ -9393,7 +9194,6 @@ fn record_to_all_runtimes(kind: RecordingEventKind, payload: RecordingPayload, m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_contexts_plugin_api::ContextState;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -9515,53 +9315,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn rolling_recordings_root_is_isolated_across_runtime_dirs() {
-        let root = std::env::temp_dir().join(format!(
-            "bmux-server-rolling-root-isolation-{}",
-            Uuid::new_v4().as_simple()
-        ));
-        let shared_config_dir = root.join("config");
-        let shared_data_dir = root.join("data");
-        let shared_state_dir = root.join("state");
-        std::fs::create_dir_all(&shared_config_dir).expect("shared config dir should be created");
-        std::fs::create_dir_all(&shared_data_dir).expect("shared data dir should be created");
-        std::fs::create_dir_all(&shared_state_dir).expect("shared state dir should be created");
-
-        let paths_left = ConfigPaths::new(
-            shared_config_dir.clone(),
-            root.join("runtime-left"),
-            shared_data_dir.clone(),
-            shared_state_dir.clone(),
-        );
-        let paths_right = ConfigPaths::new(
-            shared_config_dir,
-            root.join("runtime-right"),
-            shared_data_dir,
-            shared_state_dir,
-        );
-        let rolling_event_kinds = vec![RecordingEventKind::PaneOutputRaw];
-
-        let server_left = BmuxServer::from_config_paths_with_rolling_options(
-            &paths_left,
-            true,
-            120,
-            &rolling_event_kinds,
-        );
-        let server_right = BmuxServer::from_config_paths_with_rolling_options(
-            &paths_right,
-            true,
-            120,
-            &rolling_event_kinds,
-        );
-
-        assert_ne!(
-            server_left.state.rolling_recordings_dir, server_right.state.rolling_recordings_dir,
-            "rolling recording root should be runtime-scoped"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
+    // Rolling-recording root isolation is now enforced by the
+    // recording plugin's `activate` callback (it reads
+    // `paths.rolling_recordings_dir()` through the CLI-registered
+    // `RecordingPluginConfig`). Test lives in `plugins/recording-plugin`.
 
     #[test]
     fn pane_mouse_protocol_tracker_tracks_dec_private_modes() {
@@ -10335,79 +10092,10 @@ mod tests {
     // CloseContext, CurrentContext, AttachContext} handlers were
     // removed along with the Request variants themselves. The
     // contexts-plugin now owns context lifecycle; corresponding
-    // tests live in `plugins/contexts-plugin`.
-
-    #[test]
-    fn remove_contexts_for_session_clears_mapping_and_reselects_client() {
-        let client_id = ClientId::new();
-        let mut context_state = ContextState::default();
-
-        let first = context_state.create(client_id, Some("first".to_string()), BTreeMap::new());
-        let first_session_id = SessionId::new();
-        context_state
-            .bind_session(first.id, first_session_id)
-            .expect("first context should bind to session");
-
-        let second = context_state.create(client_id, Some("second".to_string()), BTreeMap::new());
-        let second_session_id = SessionId::new();
-        context_state
-            .bind_session(second.id, second_session_id)
-            .expect("second context should bind to session");
-
-        let _ = context_state
-            .select_for_client(client_id, &ContextSelector::ById(first.id))
-            .expect("selecting first context should succeed");
-
-        let removed = context_state.remove_contexts_for_session(first_session_id);
-        assert_eq!(removed, vec![first.id]);
-        assert!(
-            context_state
-                .context_for_session(first_session_id)
-                .is_none()
-        );
-        assert_eq!(
-            context_state
-                .current_for_client(client_id)
-                .map(|context| context.id),
-            Some(second.id)
-        );
-        assert_eq!(
-            context_state.current_session_for_client(client_id),
-            Some(second_session_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn close_active_context_promotes_most_recent_active_context() {
-        let client_id = ClientId::new();
-        let mut context_state = ContextState::default();
-
-        let first = context_state.create(client_id, Some("first".to_string()), BTreeMap::new());
-        let first_id = first.id;
-        context_state
-            .bind_session(first_id, SessionId::new())
-            .expect("first context should bind to session");
-
-        let second = context_state.create(client_id, Some("second".to_string()), BTreeMap::new());
-        let second_id = second.id;
-        context_state
-            .bind_session(second_id, SessionId::new())
-            .expect("second context should bind to session");
-
-        let _ = context_state
-            .select_for_client(client_id, &ContextSelector::ById(first_id))
-            .expect("selecting first context should succeed");
-
-        let (closed_id, _closed_session) = context_state
-            .close(client_id, &ContextSelector::ById(first_id), true)
-            .expect("closing first context should succeed");
-        assert_eq!(closed_id, first_id);
-
-        let current = context_state
-            .current_for_client(client_id)
-            .expect("current context should exist after close");
-        assert_eq!(current.id, second_id);
-    }
+    // Domain tests for `ContextState` itself live in
+    // `plugins/contexts-plugin`. Server's tests focus on integration
+    // behaviour (snapshot, policy, runtime) that actually depends on
+    // `ServerState`.
 
     #[tokio::test]
     async fn session_policy_denial_blocks_mutation() {

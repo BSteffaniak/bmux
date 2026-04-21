@@ -14,7 +14,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
-use bmux_contexts_plugin_api::ContextState;
+use bmux_context_state::ContextStateHandle;
 use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
 use bmux_control_catalog_plugin_api::control_catalog_events::{self, CatalogEvent, CatalogScope};
 use bmux_control_catalog_plugin_api::control_catalog_state::{
@@ -27,7 +27,7 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     HostScope, TypedServiceRegistrationContext, TypedServiceRegistry, WireEventSinkHandle,
 };
-use bmux_sessions_plugin_api::SessionManager;
+use bmux_session_state::SessionManagerHandle;
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -219,13 +219,14 @@ fn build_snapshot(_since_revision: Option<u64>) -> Result<Snapshot, String> {
 }
 
 fn read_sessions() -> Result<Vec<SessionRow>, String> {
-    let Some(state) = global_plugin_state_registry().get::<SessionManager>() else {
+    let Some(handle) = global_plugin_state_registry().get::<SessionManagerHandle>() else {
         return Ok(Vec::new());
     };
-    let manager = state
+    let guard = handle
         .read()
-        .map_err(|_| "session manager lock poisoned".to_string())?;
-    Ok(manager
+        .map_err(|_| "session manager handle lock poisoned".to_string())?;
+    Ok(guard
+        .0
         .list_sessions()
         .into_iter()
         .map(|info| SessionRow {
@@ -237,13 +238,14 @@ fn read_sessions() -> Result<Vec<SessionRow>, String> {
 }
 
 fn read_contexts() -> Result<Vec<ContextRow>, String> {
-    let Some(state) = global_plugin_state_registry().get::<ContextState>() else {
+    let Some(handle) = global_plugin_state_registry().get::<ContextStateHandle>() else {
         return Ok(Vec::new());
     };
-    let guard = state
+    let guard = handle
         .read()
-        .map_err(|_| "context state lock poisoned".to_string())?;
+        .map_err(|_| "context state handle lock poisoned".to_string())?;
     Ok(guard
+        .0
         .list()
         .into_iter()
         .map(|ctx| ContextRow {
@@ -254,17 +256,19 @@ fn read_contexts() -> Result<Vec<ContextRow>, String> {
 }
 
 fn read_bindings() -> Result<Vec<ContextSessionBinding>, String> {
-    let Some(state) = global_plugin_state_registry().get::<ContextState>() else {
+    let Some(handle) = global_plugin_state_registry().get::<ContextStateHandle>() else {
         return Ok(Vec::new());
     };
-    let guard = state
+    let guard = handle
         .read()
-        .map_err(|_| "context state lock poisoned".to_string())?;
+        .map_err(|_| "context state handle lock poisoned".to_string())?;
     Ok(guard
+        .0
+        .snapshot()
         .session_by_context
-        .iter()
+        .into_iter()
         .map(|(context_id, session_id)| ContextSessionBinding {
-            context_id: *context_id,
+            context_id,
             session_id: session_id.0,
         })
         .collect())

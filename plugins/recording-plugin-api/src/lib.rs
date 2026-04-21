@@ -6,33 +6,39 @@
 //! already live in `bmux_ipc`, and duplicating them into a BPDL schema
 //! would be noise. Instead this crate exposes:
 //!
-//! - [`RecordingRuntime`] — the runtime type owned by the recording
-//!   plugin; declared here so that `packages/server` can name the
-//!   type for fast-path writes without depending on the plugin impl
-//!   crate.
-//! - [`DualRuntimeSink`] — [`bmux_recording_runtime::RecordingSink`]
-//!   impl that fans out to both manual and rolling runtimes.
 //! - [`RecordingRequest`] / [`RecordingResponse`] — hand-written wire
 //!   enums the recording plugin's typed service dispatches over.
+//! - [`RollingRecordingSettings`] — normalized rolling-recording
+//!   configuration (window-secs + event kinds); registered into the
+//!   plugin state registry by CLI startup so the recording plugin can
+//!   read it during `activate`.
+//! - [`RecordingPluginConfig`] — recordings/rolling-recordings
+//!   directory paths + segment size; registered by CLI startup.
 //! - Constants for the interface id and capability ids.
+//! - [`typed_client`] helpers for downstream callers (CLI, tests) that
+//!   want to invoke recording operations through any
+//!   `TypedDispatchClient` transport.
+//!
+//! The `RecordingRuntime` concrete type + the `DualRuntimeSink`
+//! fan-out impl + `ManualRecordingRuntimeHandle` /
+//! `RollingRecordingRuntimeHandle` registry newtypes all live in the
+//! plugin impl crate (`bmux_recording_plugin`) so the server never
+//! names the concrete runtime type.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-pub mod recording_runtime;
+pub mod offline_prune;
 pub mod typed_client;
 
-pub use recording_runtime::{
-    RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, prune_old_recordings,
-};
+pub use offline_prune::prune_old_recordings;
 
 use bmux_ipc::{
-    RecordingEventKind, RecordingPayload, RecordingProfile, RecordingRollingStartOptions,
-    RecordingStatus, RecordingSummary,
+    RecordingEventKind, RecordingProfile, RecordingRollingStartOptions, RecordingStatus,
+    RecordingSummary,
 };
 use bmux_plugin_sdk::{CapabilityId, InterfaceId};
-use bmux_recording_runtime::{RecordMeta, RecordingSink};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -46,22 +52,8 @@ pub const RECORDING_WRITE: CapabilityId = CapabilityId::from_static("bmux.record
 pub const RECORDING_COMMANDS_INTERFACE: InterfaceId =
     InterfaceId::from_static("recording-commands");
 
-/// Newtype wrapper for registering the manual recording runtime handle
-/// in [`bmux_plugin::PluginStateRegistry`]. Used by the recording
-/// plugin's typed service handlers to perform lifecycle operations
-/// (start/stop/list/etc.) on the manual recording runtime.
-pub struct ManualRecordingRuntimeHandle(pub std::sync::Arc<std::sync::Mutex<RecordingRuntime>>);
-
-/// Newtype wrapper for registering the rolling recording runtime
-/// handle in [`bmux_plugin::PluginStateRegistry`]. The inner option
-/// is `None` when rolling recording is disabled in config.
-pub struct RollingRecordingRuntimeHandle(
-    pub std::sync::Arc<std::sync::Mutex<Option<RecordingRuntime>>>,
-);
-
 /// Default rolling-recording configuration (window seconds + enabled
-/// event kinds). Relocated from `packages/server` so plugin handlers
-/// can use the same settings.
+/// event kinds).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollingRecordingSettings {
     pub window_secs: u64,
@@ -80,10 +72,11 @@ impl RollingRecordingSettings {
     }
 }
 
-/// Server-provided configuration values needed by the recording
-/// plugin's rolling/cut/write handlers. Registered into
-/// `PluginStateRegistry` by `BmuxServer::new` so the plugin can reach
-/// them without depending on `packages/server`.
+/// CLI-provided configuration values needed by the recording plugin's
+/// `activate` callback to construct manual + rolling runtimes.
+/// Registered into `PluginStateRegistry` by CLI bootstrap (before
+/// plugin activation) so the plugin can reach startup config without
+/// depending on `packages/server` or CLI internals.
 #[derive(Debug, Clone)]
 pub struct RecordingPluginConfig {
     /// Root directory for the (non-rolling) manual recordings.
@@ -92,43 +85,13 @@ pub struct RecordingPluginConfig {
     pub rolling_recordings_dir: std::path::PathBuf,
     /// Segment size in MB for rolling recording buffers.
     pub rolling_segment_mb: usize,
+    /// Retention cutoff in days for completed recordings (hourly prune
+    /// loop owned by the recording plugin reads this).
+    pub retention_days: u64,
     /// Default rolling-recording settings (window + event kinds).
     pub rolling_defaults: RollingRecordingSettings,
-}
-
-/// `RecordingSink` impl that fans out each record to both a manual
-/// and a rolling `RecordingRuntime` handle.
-///
-/// Lives here (in `bmux_recording_plugin_api`) rather than in the
-/// plugin impl crate so that `packages/server` can construct the sink
-/// at server-construction time (when it has the config it needs to
-/// create the runtimes) without depending on the plugin impl crate.
-pub struct DualRuntimeSink {
-    manual: std::sync::Arc<std::sync::Mutex<RecordingRuntime>>,
-    rolling: std::sync::Arc<std::sync::Mutex<Option<RecordingRuntime>>>,
-}
-
-impl DualRuntimeSink {
-    #[must_use]
-    pub const fn new(
-        manual: std::sync::Arc<std::sync::Mutex<RecordingRuntime>>,
-        rolling: std::sync::Arc<std::sync::Mutex<Option<RecordingRuntime>>>,
-    ) -> Self {
-        Self { manual, rolling }
-    }
-}
-
-impl RecordingSink for DualRuntimeSink {
-    fn record(&self, kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta) {
-        if let Ok(runtime) = self.manual.lock() {
-            let _ = runtime.record(kind, payload.clone(), meta);
-        }
-        if let Ok(runtime) = self.rolling.lock()
-            && let Some(runtime) = runtime.as_ref()
-        {
-            let _ = runtime.record(kind, payload, meta);
-        }
-    }
+    /// Whether to auto-start a rolling recording on plugin activation.
+    pub rolling_auto_start: bool,
 }
 
 /// Typed request variants for the recording plugin's typed service

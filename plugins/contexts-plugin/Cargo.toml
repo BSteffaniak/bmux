@@ -26,6 +26,9 @@ bmux_sessions_plugin_api = { workspace = true }
 serde                    = { workspace = true, features = ["derive", "std"] }
 uuid                     = { workspace = true, features = ["serde", "std"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [features]
 fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",

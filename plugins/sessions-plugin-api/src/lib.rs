@@ -25,9 +25,6 @@ bmux_plugin_schema_macros::schema! {
     source: "bpdl/sessions-plugin.bpdl",
 }
 
-pub mod session_manager;
-pub use session_manager::SessionManager;
-
 /// Capability identifiers gating access to this plugin's surfaces.
 ///
 /// Written by hand (not BPDL-generated) until the schema language grows

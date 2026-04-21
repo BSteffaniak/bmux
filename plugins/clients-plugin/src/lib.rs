@@ -8,7 +8,8 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-pub use bmux_clients_plugin_api::FollowState;
+pub mod follow_state;
+pub use follow_state::FollowState;
 
 use bmux_client_state::{
     FollowEntry, FollowStateHandle, FollowStateReader, FollowStateSnapshot, FollowStateWriter,

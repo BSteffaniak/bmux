@@ -13,12 +13,12 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-// `SessionManager` now lives in `bmux_sessions_plugin_api` so the
-// server and other crates can name the type without depending on the
-// plugin impl crate. Re-exported here for backward compatibility with
-// the existing bundled-plugin entrypoint pattern (the plugin crate
-// still owns registration of the canonical instance via `activate`).
-pub use bmux_sessions_plugin_api::SessionManager;
+// `SessionManager` is owned and constructed by this plugin. Other
+// plugins and the server reach it through the domain-agnostic
+// `bmux_session_state::SessionManagerHandle` trait object registered
+// into the plugin state registry during `activate`.
+pub mod session_manager;
+pub use session_manager::SessionManager;
 
 use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,

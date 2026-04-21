@@ -9,7 +9,8 @@
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::result_large_err)]
 
-pub use bmux_contexts_plugin_api::ContextState;
+pub mod context_state;
+pub use context_state::ContextState;
 
 use bmux_clients_plugin_api::clients_state::{
     self as clients_state, ClientQueryError, ClientSummary,
@@ -822,3 +823,81 @@ fn ipc_summary_to_typed(summary: bmux_ipc::ContextSummary) -> ContextSummary {
 }
 
 bmux_plugin_sdk::export_plugin!(ContextsPlugin, include_str!("../plugin.toml"));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn remove_contexts_for_session_clears_mapping_and_reselects_client() {
+        let client_id = ClientId::new();
+        let mut context_state = ContextState::default();
+
+        let first = context_state.create(client_id, Some("first".to_string()), BTreeMap::new());
+        let first_session_id = SessionId::new();
+        context_state
+            .bind_session(first.id, first_session_id)
+            .expect("first context should bind to session");
+
+        let second = context_state.create(client_id, Some("second".to_string()), BTreeMap::new());
+        let second_session_id = SessionId::new();
+        context_state
+            .bind_session(second.id, second_session_id)
+            .expect("second context should bind to session");
+
+        let _ = context_state
+            .select_for_client(client_id, &bmux_ipc::ContextSelector::ById(first.id))
+            .expect("selecting first context should succeed");
+
+        let removed = context_state.remove_contexts_for_session(first_session_id);
+        assert_eq!(removed, vec![first.id]);
+        assert!(
+            context_state
+                .context_for_session(first_session_id)
+                .is_none()
+        );
+        assert_eq!(
+            context_state
+                .current_for_client(client_id)
+                .map(|context| context.id),
+            Some(second.id)
+        );
+        assert_eq!(
+            context_state.current_session_for_client(client_id),
+            Some(second_session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn close_active_context_promotes_most_recent_active_context() {
+        let client_id = ClientId::new();
+        let mut context_state = ContextState::default();
+
+        let first = context_state.create(client_id, Some("first".to_string()), BTreeMap::new());
+        let first_id = first.id;
+        context_state
+            .bind_session(first_id, SessionId::new())
+            .expect("first context should bind to session");
+
+        let second = context_state.create(client_id, Some("second".to_string()), BTreeMap::new());
+        let second_id = second.id;
+        context_state
+            .bind_session(second_id, SessionId::new())
+            .expect("second context should bind to session");
+
+        let _ = context_state
+            .select_for_client(client_id, &bmux_ipc::ContextSelector::ById(first_id))
+            .expect("selecting first context should succeed");
+
+        let (closed_id, _closed_session) = context_state
+            .close(client_id, &bmux_ipc::ContextSelector::ById(first_id), true)
+            .expect("closing first context should succeed");
+        assert_eq!(closed_id, first_id);
+
+        let current = context_state
+            .current_for_client(client_id)
+            .expect("current context should exist after close");
+        assert_eq!(current.id, second_id);
+    }
+}

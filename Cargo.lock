@@ -1140,11 +1140,9 @@ dependencies = [
 name = "bmux_clients_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_client_state",
  "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
- "bmux_session_models",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1243,6 +1241,7 @@ dependencies = [
  "bmux_session_models",
  "bmux_sessions_plugin_api",
  "serde",
+ "tokio",
  "uuid",
 ]
 
@@ -1250,11 +1249,8 @@ dependencies = [
 name = "bmux_contexts_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_context_state",
- "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
- "bmux_session_models",
  "serde",
  "serde_json",
  "uuid",
@@ -1265,11 +1261,13 @@ name = "bmux_control_catalog_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_clients_plugin_api",
+ "bmux_context_state",
  "bmux_contexts_plugin_api",
  "bmux_control_catalog_plugin_api",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_session_state",
  "bmux_sessions_plugin_api",
  "serde",
 ]
@@ -1621,11 +1619,16 @@ dependencies = [
 name = "bmux_recording_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "anyhow",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_recording_plugin_api",
  "bmux_recording_runtime",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
  "uuid",
 ]
 
@@ -1636,7 +1639,6 @@ dependencies = [
  "anyhow",
  "bmux_ipc",
  "bmux_plugin_sdk",
- "bmux_recording_runtime",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1685,7 +1687,6 @@ dependencies = [
  "bmux_codec",
  "bmux_config",
  "bmux_context_state",
- "bmux_contexts_plugin_api",
  "bmux_image",
  "bmux_ipc",
  "bmux_performance_plugin_api",
@@ -1743,10 +1744,8 @@ dependencies = [
 name = "bmux_sessions_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
- "anyhow",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
- "bmux_session_models",
  "serde",
  "serde_json",
  "uuid",

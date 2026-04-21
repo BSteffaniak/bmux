@@ -543,32 +543,29 @@ fn follow_state_is_owned_by_clients_plugin() {
          `bmux_client_state::FollowStateHandle`",
     );
 
-    // Clients plugin-api hosts the canonical type.
-    let plugin_source = include_str!("../../../plugins/clients-plugin-api/src/follow_state.rs");
+    // Clients plugin impl crate hosts the canonical `FollowState` type.
+    let plugin_source = include_str!("../../../plugins/clients-plugin/src/follow_state.rs");
     assert!(
         plugin_source.contains("pub struct FollowState"),
-        "plugins/clients-plugin-api/src/follow_state.rs must export \
+        "plugins/clients-plugin/src/follow_state.rs must export \
          the canonical `FollowState` struct",
     );
 
-    // Clients plugin must register it on activate.
-    let clients_source = include_str!("../../../plugins/clients-plugin/src/lib.rs");
+    // Clients-plugin-api crate must NOT define the concrete
+    // `FollowState` (that would violate the one-way rule — plugin-api
+    // crates host stable wire contracts, plugin impl crates host
+    // concrete state).
+    let plugin_api_source = include_str!("../../../plugins/clients-plugin-api/src/lib.rs");
     assert!(
-        clients_source.contains("global_plugin_state_registry()"),
-        "plugins/clients-plugin/src/lib.rs must register FollowState \
-         into the global plugin state registry on activate",
-    );
-    assert!(
-        clients_source.contains("register::<FollowState>"),
-        "plugins/clients-plugin/src/lib.rs must call `register::<FollowState>` \
-         to install the state handle",
+        !plugin_api_source.contains("pub struct FollowState"),
+        "plugins/clients-plugin-api/src/lib.rs must not define \
+         `FollowState`; the concrete type lives in \
+         `plugins/clients-plugin/src/follow_state.rs`",
     );
 }
 
-/// Verify that `ContextState` is defined in `bmux_contexts_plugin_api`
-/// and not in `packages/server`. The contexts plugin owns the type; it
-/// lives in the plugin-api crate so server imports it via
-/// `use bmux_contexts_plugin_api::ContextState` without depending on
+/// Verify that `ContextState` is defined in the contexts plugin impl
+/// crate and not in `packages/server`.
 /// the plugin impl crate.
 #[test]
 fn context_state_is_owned_by_contexts_plugin() {
@@ -599,25 +596,22 @@ fn context_state_is_owned_by_contexts_plugin() {
          `bmux_context_state::ContextStateHandle`",
     );
 
-    // Contexts plugin-api hosts the canonical type.
-    let plugin_source = include_str!("../../../plugins/contexts-plugin-api/src/context_state.rs");
+    // Contexts plugin impl crate hosts the canonical `ContextState` type.
+    let plugin_source = include_str!("../../../plugins/contexts-plugin/src/context_state.rs");
     assert!(
         plugin_source.contains("pub struct ContextState"),
-        "plugins/contexts-plugin-api/src/context_state.rs must export \
+        "plugins/contexts-plugin/src/context_state.rs must export \
          the canonical `ContextState` struct",
     );
 
-    // Contexts plugin must register it on activate.
-    let contexts_source = include_str!("../../../plugins/contexts-plugin/src/lib.rs");
+    // Contexts-plugin-api crate must NOT define the concrete
+    // `ContextState`.
+    let plugin_api_source = include_str!("../../../plugins/contexts-plugin-api/src/lib.rs");
     assert!(
-        contexts_source.contains("global_plugin_state_registry()"),
-        "plugins/contexts-plugin/src/lib.rs must register ContextState \
-         into the global plugin state registry on activate",
-    );
-    assert!(
-        contexts_source.contains("register::<ContextState>"),
-        "plugins/contexts-plugin/src/lib.rs must call `register::<ContextState>` \
-         to install the state handle",
+        !plugin_api_source.contains("pub struct ContextState"),
+        "plugins/contexts-plugin-api/src/lib.rs must not define \
+         `ContextState`; the concrete type lives in \
+         `plugins/contexts-plugin/src/context_state.rs`",
     );
 }
 
@@ -669,25 +663,22 @@ fn session_manager_is_owned_by_sessions_plugin() {
          through `bmux_session_state::SessionManagerHandle`",
     );
 
-    // Sessions plugin-api hosts the canonical type.
-    let plugin_source = include_str!("../../../plugins/sessions-plugin-api/src/session_manager.rs");
+    // Sessions plugin impl crate hosts the canonical `SessionManager` type.
+    let plugin_source = include_str!("../../../plugins/sessions-plugin/src/session_manager.rs");
     assert!(
         plugin_source.contains("pub struct SessionManager"),
-        "plugins/sessions-plugin-api/src/session_manager.rs must export \
+        "plugins/sessions-plugin/src/session_manager.rs must export \
          the canonical `SessionManager` struct",
     );
 
-    // Sessions plugin must register it on activate.
-    let sessions_source = include_str!("../../../plugins/sessions-plugin/src/lib.rs");
+    // Sessions-plugin-api crate must NOT define the concrete
+    // `SessionManager`.
+    let plugin_api_source = include_str!("../../../plugins/sessions-plugin-api/src/lib.rs");
     assert!(
-        sessions_source.contains("global_plugin_state_registry()"),
-        "plugins/sessions-plugin/src/lib.rs must register SessionManager \
-         into the global plugin state registry on activate",
-    );
-    assert!(
-        sessions_source.contains("register::<SessionManager>"),
-        "plugins/sessions-plugin/src/lib.rs must call `register::<SessionManager>` \
-         to install the state handle",
+        !plugin_api_source.contains("pub struct SessionManager"),
+        "plugins/sessions-plugin-api/src/lib.rs must not define \
+         `SessionManager`; the concrete type lives in \
+         `plugins/sessions-plugin/src/session_manager.rs`",
     );
 }
 
@@ -1017,11 +1008,10 @@ fn recording_plugin_exists() {
         "plugins/recording-plugin/Cargo.toml must exist",
     );
 
-    let plugin_api_source =
-        include_str!("../../../plugins/recording-plugin-api/src/recording_runtime.rs");
+    let plugin_source = include_str!("../../../plugins/recording-plugin/src/recording_runtime.rs");
     assert!(
-        plugin_api_source.contains("pub struct RecordingRuntime"),
-        "plugins/recording-plugin-api/src/recording_runtime.rs must \
+        plugin_source.contains("pub struct RecordingRuntime"),
+        "plugins/recording-plugin/src/recording_runtime.rs must \
          export the canonical `RecordingRuntime` struct",
     );
 
@@ -1029,19 +1019,39 @@ fn recording_plugin_exists() {
     let server_source = production_section(server_source);
     assert!(
         !server_source.contains("pub struct RecordingRuntime"),
-        "packages/server/src/lib.rs must not define `RecordingRuntime`; \
-         the type lives in bmux_recording_plugin_api",
+        "packages/server/src/lib.rs must not define `RecordingRuntime`",
     );
     assert!(
-        server_source.contains("use bmux_recording_plugin_api::"),
-        "packages/server/src/lib.rs must import recording types via \
-         `use bmux_recording_plugin_api::...`",
+        !server_source.contains("RecordingRuntime::new"),
+        "packages/server/src/lib.rs must not construct \
+         `RecordingRuntime`; the recording plugin owns construction \
+         during its `activate` callback",
     );
     assert!(
-        server_source.contains("register::<RecordingSinkHandle>"),
-        "packages/server/src/lib.rs must register a `RecordingSinkHandle` \
-         into the plugin state registry so the recording plugin can \
-         reach the active recording runtimes",
+        !server_source.contains("manual_recording_runtime:"),
+        "packages/server/src/lib.rs must not hold a \
+         `manual_recording_runtime` field on `ServerState`; the \
+         recording plugin owns runtime instances",
+    );
+
+    // Plugin impl crate must register the sink + runtime handles
+    // on `activate`.
+    let plugin_lib = include_str!("../../../plugins/recording-plugin/src/lib.rs");
+    assert!(
+        plugin_lib.contains("register::<RecordingSinkHandle>"),
+        "plugins/recording-plugin/src/lib.rs must register a \
+         `RecordingSinkHandle` into the plugin state registry on \
+         `activate`",
+    );
+    assert!(
+        plugin_lib.contains("register::<ManualRecordingRuntimeHandle>"),
+        "plugins/recording-plugin/src/lib.rs must register a \
+         `ManualRecordingRuntimeHandle` on `activate`",
+    );
+    assert!(
+        plugin_lib.contains("register::<RollingRecordingRuntimeHandle>"),
+        "plugins/recording-plugin/src/lib.rs must register a \
+         `RollingRecordingRuntimeHandle` on `activate`",
     );
 }
 
@@ -1098,6 +1108,129 @@ fn recording_ipc_variants_are_absent() {
              recording lifecycle operations go through \
              `recording-commands::dispatch` typed dispatch provided \
              by the `bmux.recording` plugin",
+        );
+    }
+}
+
+/// Verify `bmux_client` is pure protocol primitives — it depends only
+/// on protocol/transport primitives (`bmux_ipc`, `bmux_config`,
+/// `bmux_codec`, `bmux_plugin_sdk`) and carries zero plugin-api or
+/// plugin-impl deps. Typed domain helpers live in `_plugin_api`
+/// crates as free functions accepting `C: TypedDispatchClient`.
+#[test]
+fn bmux_client_is_pure_protocol() {
+    let cargo_toml = include_str!("../../client/Cargo.toml");
+    let denied_patterns = [
+        "bmux_clients_plugin_api",
+        "bmux_contexts_plugin_api",
+        "bmux_sessions_plugin_api",
+        "bmux_recording_plugin_api",
+        "bmux_performance_plugin_api",
+        "bmux_control_catalog_plugin_api",
+        "bmux_windows_plugin_api",
+        "bmux_decoration_plugin_api",
+    ];
+    for pattern in denied_patterns {
+        assert!(
+            !cargo_toml.contains(pattern),
+            "packages/client/Cargo.toml must not depend on `{pattern}`; \
+             typed-domain helpers live in `*_plugin_api::typed_client` \
+             modules, not in `bmux_client`",
+        );
+    }
+}
+
+/// Verify that `ServerState` doesn't hold concrete plugin-owned state
+/// types as fields. Server reaches domain state exclusively through
+/// the domain-agnostic `*Handle` trait objects registered in the
+/// plugin state registry.
+#[test]
+fn server_state_holds_no_concrete_domain_state() {
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_source = production_section(server_source);
+    let denied = [
+        "follow_state: Arc<std::sync::RwLock<FollowState>>",
+        "context_state: Arc<std::sync::RwLock<ContextState>>",
+        "session_manager: Arc<std::sync::RwLock<SessionManager>>",
+        "manual_recording_runtime: Arc<Mutex<RecordingRuntime>>",
+        "rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>",
+    ];
+    for pattern in denied {
+        assert!(
+            !server_source.contains(pattern),
+            "packages/server/src/lib.rs must not hold `{pattern}` on \
+             `ServerState`; plugin-owned state is reached through \
+             domain-agnostic `*Handle` trait objects from the plugin \
+             state registry",
+        );
+    }
+}
+
+/// Verify that plugin-api crates don't define concrete state types.
+/// Plugin-api crates host stable wire contracts (BPDL-generated types,
+/// typed request/response enums, typed-client helpers). Concrete
+/// state types live in plugin impl crates so the plugin owns
+/// construction and the server never names them.
+#[test]
+fn plugin_api_crates_have_no_concrete_state() {
+    let clients_api = include_str!("../../../plugins/clients-plugin-api/src/lib.rs");
+    assert!(
+        !clients_api.contains("pub struct FollowState"),
+        "plugins/clients-plugin-api must not define `FollowState`",
+    );
+
+    let contexts_api = include_str!("../../../plugins/contexts-plugin-api/src/lib.rs");
+    assert!(
+        !contexts_api.contains("pub struct ContextState"),
+        "plugins/contexts-plugin-api must not define `ContextState`",
+    );
+
+    let sessions_api = include_str!("../../../plugins/sessions-plugin-api/src/lib.rs");
+    assert!(
+        !sessions_api.contains("pub struct SessionManager"),
+        "plugins/sessions-plugin-api must not define `SessionManager`",
+    );
+
+    let recording_api = include_str!("../../../plugins/recording-plugin-api/src/lib.rs");
+    assert!(
+        !recording_api.contains("pub struct RecordingRuntime"),
+        "plugins/recording-plugin-api must not define `RecordingRuntime`",
+    );
+}
+
+/// Verify that the typed-client helper modules exist in each
+/// plugin-api crate that exposes a typed-service surface.
+#[test]
+fn plugin_api_crates_expose_typed_client_helpers() {
+    let crates = [
+        (
+            "plugins/clients-plugin-api",
+            include_str!("../../../plugins/clients-plugin-api/src/typed_client.rs"),
+        ),
+        (
+            "plugins/recording-plugin-api",
+            include_str!("../../../plugins/recording-plugin-api/src/typed_client.rs"),
+        ),
+        (
+            "plugins/performance-plugin-api",
+            include_str!("../../../plugins/performance-plugin-api/src/typed_client.rs"),
+        ),
+        (
+            "plugins/control-catalog-plugin-api",
+            include_str!("../../../plugins/control-catalog-plugin-api/src/typed_client.rs"),
+        ),
+    ];
+    for (path, src) in crates {
+        assert!(
+            src.contains("TypedDispatchClient"),
+            "{path}/src/typed_client.rs must reference \
+             `TypedDispatchClient` so callers can drive the helpers \
+             through any transport",
+        );
+        assert!(
+            src.contains("pub async fn "),
+            "{path}/src/typed_client.rs must expose at least one \
+             `pub async fn` helper",
         );
     }
 }

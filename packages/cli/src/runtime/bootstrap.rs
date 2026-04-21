@@ -363,6 +363,12 @@ pub(super) async fn run_server_start(
     }
 
     let loaded_plugins = load_enabled_plugins(&config, &registry)?;
+    register_recording_plugin_config(
+        &config,
+        &paths,
+        effective_rolling_enabled,
+        &effective_rolling_settings,
+    );
     activate_loaded_plugins(&loaded_plugins, &config, &paths)?;
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;
     let server = BmuxServer::from_config_paths_with_start_options(
@@ -406,6 +412,31 @@ pub(super) async fn run_server_start(
     let _ = remove_server_pid_file();
     run_result?;
     Ok(0)
+}
+
+/// Register the recording plugin's startup config (paths + rolling
+/// defaults + auto-start flag) into the plugin state registry. Called
+/// between `load_enabled_plugins` and `activate_loaded_plugins` so the
+/// recording plugin's `activate` callback can read it and construct
+/// its own `RecordingRuntime` instances without depending on
+/// `packages/server`.
+fn register_recording_plugin_config(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    rolling_auto_start: bool,
+    rolling_settings: &bmux_recording_plugin_api::RollingRecordingSettings,
+) {
+    use bmux_recording_plugin_api::RecordingPluginConfig;
+    let plugin_config = RecordingPluginConfig {
+        recordings_dir: config.recordings_dir(paths),
+        rolling_recordings_dir: paths.rolling_recordings_dir(),
+        rolling_segment_mb: config.recording.segment_mb,
+        retention_days: config.recording.retention_days,
+        rolling_defaults: rolling_settings.clone(),
+        rolling_auto_start,
+    };
+    let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
+    bmux_plugin::global_plugin_state_registry().register::<RecordingPluginConfig>(&handle);
 }
 
 fn rolling_start_override_args(

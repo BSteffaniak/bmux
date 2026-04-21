@@ -3,18 +3,23 @@
 //! The plugin implements a typed byte-dispatch service for
 //! `recording-commands` that accepts [`RecordingRequest`] payloads and
 //! returns [`RecordingResponse`] payloads. Each operation reads the
-//! `ManualRecordingRuntimeHandle` / `RollingRecordingRuntimeHandle` /
-//! `RecordingPluginConfig` out of `PluginStateRegistry`, performs the
-//! lifecycle operation, and returns the typed response.
+//! manual / rolling runtime handles out of `PluginStateRegistry`,
+//! performs the lifecycle operation, and returns the typed response.
 //!
-//! Server constructs the runtime handles + config at `BmuxServer::new`
-//! time (with config-derived paths) and registers them; the plugin does
-//! not own construction today, but it does own every lifecycle
-//! operation end-to-end.
+//! The plugin itself owns construction of both runtimes. During
+//! `activate` it reads the CLI-provided [`RecordingPluginConfig`] from
+//! the plugin state registry, constructs manual + rolling runtimes,
+//! registers them + the fan-out sink, spawns the hourly prune loop,
+//! and optionally auto-starts the rolling recording.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+
+pub mod recording_runtime;
+pub use recording_runtime::{
+    RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, prune_old_recordings,
+};
 
 use bmux_ipc::{
     RecordingCaptureTarget, RecordingEventKind, RecordingPayload, RecordingProfile,
@@ -25,13 +30,45 @@ use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_recording_plugin_api::{
-    ManualRecordingRuntimeHandle, RECORDING_COMMANDS_INTERFACE, RECORDING_READ, RECORDING_WRITE,
-    RecordingPluginConfig, RecordingRequest, RecordingResponse, RecordingRuntime,
-    RollingRecordingRuntimeHandle, RollingRecordingSettings,
+    RECORDING_COMMANDS_INTERFACE, RECORDING_READ, RECORDING_WRITE, RecordingPluginConfig,
+    RecordingRequest, RecordingResponse, RollingRecordingSettings,
 };
-use bmux_recording_runtime::RecordMeta;
+use bmux_recording_runtime::{RecordMeta, RecordingSink, RecordingSinkHandle};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Newtype wrapper for registering the manual recording runtime handle
+/// in [`bmux_plugin::PluginStateRegistry`]. Plugin-local domain type;
+/// server never names it.
+pub struct ManualRecordingRuntimeHandle(pub Arc<Mutex<RecordingRuntime>>);
+
+/// Newtype wrapper for registering the rolling recording runtime
+/// handle in [`bmux_plugin::PluginStateRegistry`]. The inner option
+/// is `None` when rolling recording is disabled in config.
+pub struct RollingRecordingRuntimeHandle(pub Arc<Mutex<Option<RecordingRuntime>>>);
+
+/// `RecordingSink` impl that fans out each record to both the manual
+/// and rolling runtimes. Registered behind a
+/// `bmux_recording_runtime::RecordingSinkHandle` in the plugin state
+/// registry so server's hot-path pane-output writes reach both
+/// runtimes without naming this plugin impl crate.
+struct DualRuntimeSink {
+    manual: Arc<Mutex<RecordingRuntime>>,
+    rolling: Arc<Mutex<Option<RecordingRuntime>>>,
+}
+
+impl RecordingSink for DualRuntimeSink {
+    fn record(&self, kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta) {
+        if let Ok(runtime) = self.manual.lock() {
+            let _ = runtime.record(kind, payload.clone(), meta);
+        }
+        if let Ok(runtime) = self.rolling.lock()
+            && let Some(runtime) = runtime.as_ref()
+        {
+            let _ = runtime.record(kind, payload, meta);
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct RecordingPlugin;
@@ -41,8 +78,73 @@ impl RustPlugin for RecordingPlugin {
         &mut self,
         _context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        // Runtimes are constructed by `BmuxServer::new` and registered
-        // into `PluginStateRegistry` there.
+        // Read CLI-provided plugin config; silently succeed without
+        // constructing runtimes when missing so headless / test
+        // deployments still load the plugin.
+        let Some(config_handle) = global_plugin_state_registry().get::<RecordingPluginConfig>()
+        else {
+            return Ok(bmux_plugin_sdk::EXIT_OK);
+        };
+        let Ok(config) = config_handle.read() else {
+            return Ok(bmux_plugin_sdk::EXIT_OK);
+        };
+
+        let recordings_dir = config.recordings_dir.clone();
+        let rolling_recordings_dir = config.rolling_recordings_dir.clone();
+        let rolling_segment_mb = config.rolling_segment_mb;
+        let retention_days = config.retention_days;
+        let rolling_defaults = config.rolling_defaults.clone();
+        let rolling_auto_start = config.rolling_auto_start;
+        drop(config);
+
+        let manual_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
+            recordings_dir,
+            rolling_segment_mb,
+            retention_days,
+        )));
+
+        let rolling_runtime_available = rolling_defaults.is_available();
+        let rolling_runtime = Arc::new(Mutex::new(if rolling_runtime_available {
+            Some(RecordingRuntime::new_rolling(
+                rolling_recordings_dir.clone(),
+                rolling_segment_mb,
+                rolling_defaults.window_secs,
+            ))
+        } else {
+            None
+        }));
+
+        // Register the fan-out sink first so server can hot-path
+        // record as soon as its first pane event fires.
+        let sink: Arc<dyn RecordingSink> = Arc::new(DualRuntimeSink {
+            manual: Arc::clone(&manual_runtime),
+            rolling: Arc::clone(&rolling_runtime),
+        });
+        let sink_handle = Arc::new(RwLock::new(RecordingSinkHandle::from_arc(sink)));
+        global_plugin_state_registry().register::<RecordingSinkHandle>(&sink_handle);
+
+        // Register the lifecycle handles the plugin's own typed
+        // handlers read on every request.
+        let manual_handle = Arc::new(RwLock::new(ManualRecordingRuntimeHandle(Arc::clone(
+            &manual_runtime,
+        ))));
+        global_plugin_state_registry().register::<ManualRecordingRuntimeHandle>(&manual_handle);
+
+        let rolling_handle = Arc::new(RwLock::new(RollingRecordingRuntimeHandle(Arc::clone(
+            &rolling_runtime,
+        ))));
+        global_plugin_state_registry().register::<RollingRecordingRuntimeHandle>(&rolling_handle);
+
+        // Hourly prune loop. Runs on a bare OS thread (plugin
+        // activation can't assume a tokio runtime; bundled-rlib and
+        // dynamic-cdylib hosts both spawn threads the same way).
+        spawn_prune_loop(Arc::clone(&manual_runtime));
+
+        // Optional auto-start of the rolling recording.
+        if rolling_auto_start && rolling_runtime_available {
+            auto_start_rolling(&rolling_runtime, &rolling_defaults);
+        }
+
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -69,6 +171,43 @@ impl RustPlugin for RecordingPlugin {
         // No typed Arc<dyn Trait> surface today — recording operations
         // dispatch exclusively through the byte-service path.
     }
+}
+
+fn spawn_prune_loop(manual_runtime: Arc<Mutex<RecordingRuntime>>) {
+    std::thread::spawn(move || {
+        // Initial prune on startup.
+        if let Ok(runtime) = manual_runtime.lock() {
+            let _ = runtime.prune(None);
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+            if let Ok(runtime) = manual_runtime.lock() {
+                let _ = runtime.prune(None);
+            }
+        }
+    });
+}
+
+fn auto_start_rolling(
+    rolling_runtime: &Arc<Mutex<Option<RecordingRuntime>>>,
+    settings: &RollingRecordingSettings,
+) {
+    let Ok(mut guard) = rolling_runtime.lock() else {
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return;
+    };
+    if runtime.status().active.is_some() {
+        return;
+    }
+    let _ = runtime.start(
+        None,
+        settings.capture_input(),
+        None,
+        RecordingProfile::Full,
+        settings.event_kinds.clone(),
+    );
 }
 
 #[allow(clippy::too_many_lines)]

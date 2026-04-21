@@ -15,12 +15,17 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+anyhow                    = { workspace = true, features = ["std"] }
 bmux_ipc                  = { workspace = true }
 bmux_plugin               = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
 bmux_recording_plugin_api = { workspace = true }
 bmux_recording_runtime    = { workspace = true }
-uuid                      = { workspace = true, features = ["std"] }
+serde                     = { workspace = true, features = ["derive", "std"] }
+serde_json                = { workspace = true, features = ["std"] }
+thiserror                 = { workspace = true }
+tracing                   = { workspace = true, features = ["std"] }
+uuid                      = { workspace = true, features = ["serde", "std", "v4"] }
 
 [features]
 fail-on-warnings = [
