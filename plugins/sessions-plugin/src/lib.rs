@@ -17,13 +17,16 @@ pub mod session_manager;
 
 pub use session_manager::SessionManager;
 
-use bmux_plugin::{ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
+use bmux_plugin::{
+    ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
+};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_sessions_plugin_api::sessions_commands::{
     self, KillSessionError, NewSessionError, SelectSessionError, SessionAck,
     SessionSelector as CommandSessionSelector, SessionsCommandsService,
 };
+use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use bmux_sessions_plugin_api::sessions_state::{
     self, SessionQueryError, SessionSelector as StateSessionSelector, SessionSummary,
     SessionsStateService,
@@ -82,6 +85,7 @@ impl RustPlugin for SessionsPlugin {
     ) -> std::result::Result<i32, PluginCommandError> {
         let state: Arc<RwLock<SessionManager>> = Arc::new(RwLock::new(SessionManager::new()));
         global_plugin_state_registry().register::<SessionManager>(&state);
+        global_event_bus().register_channel::<SessionEvent>(sessions_events::EVENT_KIND);
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -94,12 +98,12 @@ impl RustPlugin for SessionsPlugin {
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
-            "sessions-state", "list-sessions" => |_req: (), ctx| {
-                list_sessions_via_ipc(ctx)
+            "sessions-state", "list-sessions" => |_req: (), _ctx| {
+                list_sessions_local()
                     .map_err(|e| ServiceResponse::error("list_failed", e))
             },
-            "sessions-state", "get-session" => |req: SelectorArgs, ctx| {
-                get_session_via_ipc(ctx, &req.selector)
+            "sessions-state", "get-session" => |req: SelectorArgs, _ctx| {
+                get_session_local(&req.selector)
                     .map_err(|e| ServiceResponse::error("get_failed", e))
             },
             "sessions-commands", "new-session" => |req: NewSessionArgs, ctx| {
@@ -154,22 +158,23 @@ impl RustPlugin for SessionsPlugin {
     }
 }
 
-// ── IPC helpers ──────────────────────────────────────────────────────
+// ── State-local helpers ──────────────────────────────────────────────
 
-fn list_sessions_via_ipc(caller: &impl ServiceCaller) -> Result<Vec<SessionSummary>, String> {
-    let response = caller
-        .execute_kernel_request(bmux_ipc::Request::ListSessions)
-        .map_err(|err| err.to_string())?;
-    match response {
-        bmux_ipc::ResponsePayload::SessionList { sessions } => {
-            Ok(sessions.into_iter().map(ipc_summary_to_typed).collect())
-        }
-        _ => Err("unexpected response payload for list-sessions".to_string()),
-    }
+fn list_sessions_local() -> Result<Vec<SessionSummary>, String> {
+    let Some(state) = global_plugin_state_registry().get::<SessionManager>() else {
+        return Err("sessions plugin state not registered".to_string());
+    };
+    let manager = state
+        .read()
+        .map_err(|_| "session manager lock poisoned".to_string())?;
+    Ok(manager
+        .list_sessions()
+        .into_iter()
+        .map(session_info_to_typed)
+        .collect())
 }
 
-fn get_session_via_ipc(
-    caller: &impl ServiceCaller,
+fn get_session_local(
     selector: &WireSelector,
 ) -> Result<Result<SessionSummary, SessionQueryError>, String> {
     let Some(ipc_selector) = selector.to_ipc() else {
@@ -177,25 +182,58 @@ fn get_session_via_ipc(
             reason: "selector must specify either id or name".to_string(),
         }));
     };
-    let response = caller
-        .execute_kernel_request(bmux_ipc::Request::ListSessions)
-        .map_err(|err| err.to_string())?;
-    match response {
-        bmux_ipc::ResponsePayload::SessionList { sessions } => Ok(sessions
-            .into_iter()
-            .find(|summary| matches_selector(summary, &ipc_selector))
-            .map(ipc_summary_to_typed)
-            .ok_or(SessionQueryError::NotFound)),
-        _ => Err("unexpected response payload for list-sessions".to_string()),
+    let Some(state) = global_plugin_state_registry().get::<SessionManager>() else {
+        return Err("sessions plugin state not registered".to_string());
+    };
+    let manager = state
+        .read()
+        .map_err(|_| "session manager lock poisoned".to_string())?;
+    Ok(manager
+        .list_sessions()
+        .into_iter()
+        .find(|info| matches_session_info(info, &ipc_selector))
+        .map(session_info_to_typed)
+        .ok_or(SessionQueryError::NotFound))
+}
+
+fn matches_session_info(
+    info: &bmux_session_models::SessionInfo,
+    selector: &bmux_ipc::SessionSelector,
+) -> bool {
+    match selector {
+        bmux_ipc::SessionSelector::ById(id) => info.id.0 == *id,
+        bmux_ipc::SessionSelector::ByName(name) => info.name.as_deref() == Some(name.as_str()),
     }
 }
+
+fn session_info_to_typed(info: bmux_session_models::SessionInfo) -> SessionSummary {
+    SessionSummary {
+        id: info.id.0,
+        name: info.name,
+        client_count: u32::try_from(info.client_count).unwrap_or(u32::MAX),
+    }
+}
+
+// ── IPC helpers ──────────────────────────────────────────────────────
 
 fn new_session_via_ipc(
     caller: &impl ServiceCaller,
     name: Option<String>,
 ) -> Result<SessionAck, NewSessionError> {
-    match caller.execute_kernel_request(bmux_ipc::Request::NewSession { name }) {
-        Ok(bmux_ipc::ResponsePayload::SessionCreated { id, .. }) => Ok(SessionAck { id }),
+    match caller.execute_kernel_request(bmux_ipc::Request::NewSession { name: name.clone() }) {
+        Ok(bmux_ipc::ResponsePayload::SessionCreated {
+            id,
+            name: created_name,
+        }) => {
+            let _ = global_event_bus().emit(
+                &sessions_events::EVENT_KIND,
+                SessionEvent::Created {
+                    session_id: id,
+                    name: created_name.or(name),
+                },
+            );
+            Ok(SessionAck { id })
+        }
         Ok(_) => Err(NewSessionError::Failed {
             reason: "unexpected response payload for new-session".to_string(),
         }),
@@ -219,7 +257,13 @@ fn kill_session_via_ipc(
         selector: ipc_selector,
         force_local,
     }) {
-        Ok(bmux_ipc::ResponsePayload::SessionKilled { id }) => Ok(SessionAck { id }),
+        Ok(bmux_ipc::ResponsePayload::SessionKilled { id }) => {
+            let _ = global_event_bus().emit(
+                &sessions_events::EVENT_KIND,
+                SessionEvent::Removed { session_id: id },
+            );
+            Ok(SessionAck { id })
+        }
         Ok(_) => Err(KillSessionError::Failed {
             reason: "unexpected response payload for kill-session".to_string(),
         }),
@@ -241,9 +285,17 @@ fn select_session_via_ipc(
     match caller.execute_kernel_request(bmux_ipc::Request::Attach {
         selector: ipc_selector,
     }) {
-        Ok(bmux_ipc::ResponsePayload::Attached { grant }) => Ok(SessionAck {
-            id: grant.session_id,
-        }),
+        Ok(bmux_ipc::ResponsePayload::Attached { grant }) => {
+            let _ = global_event_bus().emit(
+                &sessions_events::EVENT_KIND,
+                SessionEvent::Selected {
+                    session_id: grant.session_id,
+                },
+            );
+            Ok(SessionAck {
+                id: grant.session_id,
+            })
+        }
         Ok(_) => Err(SelectSessionError::Denied {
             reason: "unexpected response payload for select-session".to_string(),
         }),
@@ -269,7 +321,17 @@ impl SessionsStateService for SessionsStateHandle {
     fn list_sessions<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Vec<SessionSummary>> + Send + 'a>> {
-        Box::pin(async move { list_sessions_via_ipc(self.caller.as_ref()).unwrap_or_default() })
+        Box::pin(async move {
+            self.caller
+                .call_service::<(), Vec<SessionSummary>>(
+                    bmux_sessions_plugin_api::capabilities::SESSIONS_READ.as_str(),
+                    ServiceKind::Query,
+                    sessions_state::INTERFACE_ID.as_str(),
+                    "list-sessions",
+                    &(),
+                )
+                .unwrap_or_default()
+        })
     }
 
     fn get_session<'a>(
@@ -281,14 +343,23 @@ impl SessionsStateService for SessionsStateHandle {
         >,
     > {
         Box::pin(async move {
-            let wire = WireSelector {
-                id: selector.id,
-                name: selector.name,
-            };
-            match get_session_via_ipc(self.caller.as_ref(), &wire) {
-                Ok(result) => result,
-                Err(reason) => Err(SessionQueryError::InvalidSelector { reason }),
+            #[derive(serde::Serialize)]
+            struct Args {
+                selector: StateSessionSelector,
             }
+            self.caller
+                .call_service::<Args, Result<SessionSummary, SessionQueryError>>(
+                    bmux_sessions_plugin_api::capabilities::SESSIONS_READ.as_str(),
+                    ServiceKind::Query,
+                    sessions_state::INTERFACE_ID.as_str(),
+                    "get-session",
+                    &Args { selector },
+                )
+                .unwrap_or_else(|err| {
+                    Err(SessionQueryError::InvalidSelector {
+                        reason: err.to_string(),
+                    })
+                })
         })
     }
 }
@@ -346,23 +417,5 @@ impl SessionsCommandsService for SessionsCommandsHandle {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
-
-fn matches_selector(
-    summary: &bmux_ipc::SessionSummary,
-    selector: &bmux_ipc::SessionSelector,
-) -> bool {
-    match selector {
-        bmux_ipc::SessionSelector::ById(id) => summary.id == *id,
-        bmux_ipc::SessionSelector::ByName(name) => summary.name.as_deref() == Some(name.as_str()),
-    }
-}
-
-fn ipc_summary_to_typed(summary: bmux_ipc::SessionSummary) -> SessionSummary {
-    SessionSummary {
-        id: summary.id,
-        name: summary.name,
-        client_count: u32::try_from(summary.client_count).unwrap_or(u32::MAX),
-    }
-}
 
 bmux_plugin_sdk::export_plugin!(SessionsPlugin, include_str!("../plugin.toml"));

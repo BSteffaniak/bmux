@@ -391,7 +391,11 @@ mod tests {
             .connect("bmux-sandbox-harness-test")
             .await
             .expect("sandbox client should connect");
-        let _client_id = client.whoami().await.expect("whoami should succeed");
+        // Use `ping` as the round-trip check: it's a server-native
+        // handler that doesn't depend on plugin activation. The
+        // sandbox-harness intentionally runs a bare `BmuxServer`
+        // without bundled-plugin activation.
+        client.ping().await.expect("ping should succeed");
         sandbox
             .shutdown(false)
             .await

@@ -626,11 +626,9 @@ fn request_to_dsl(
         | Request::Ping
         | Request::Hello { .. }
         | Request::HelloV2 { .. }
-        | Request::WhoAmI
         | Request::WhoAmIPrincipal
         | Request::ListSessions
         | Request::ListPanes { .. }
-        | Request::ListClients
         | Request::SubscribeEvents
         | Request::PollEvents { .. }
         | Request::RecordingStart { .. }

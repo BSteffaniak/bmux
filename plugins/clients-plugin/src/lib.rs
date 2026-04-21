@@ -15,10 +15,13 @@ pub use follow_state::{FollowEntry, FollowState, FollowTargetUpdate};
 use bmux_clients_plugin_api::clients_commands::{
     self, ClientAck, ClientsCommandsService, SetCurrentSessionError, SetFollowingError,
 };
+use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
 use bmux_clients_plugin_api::clients_state::{
     self, ClientQueryError, ClientSummary, ClientsStateService,
 };
-use bmux_plugin::{ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
+use bmux_plugin::{
+    ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
+};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use serde::{Deserialize, Serialize};
@@ -56,6 +59,7 @@ impl RustPlugin for ClientsPlugin {
         // and there is exactly one bundled clients plugin per host).
         let state: Arc<RwLock<FollowState>> = Arc::new(RwLock::new(FollowState::default()));
         global_plugin_state_registry().register::<FollowState>(&state);
+        global_event_bus().register_channel::<ClientEvent>(clients_events::EVENT_KIND);
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -68,13 +72,13 @@ impl RustPlugin for ClientsPlugin {
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
-            "clients-state", "list-clients" => |_req: (), ctx| {
-                list_clients_via_ipc(ctx)
+            "clients-state", "list-clients" => |_req: (), _ctx| {
+                list_clients_local()
                     .map_err(|e| ServiceResponse::error("list_failed", e))
             },
             "clients-state", "current-client" => |_req: (), ctx| {
                 Ok::<Result<ClientSummary, ClientQueryError>, ServiceResponse>(
-                    current_client_via_ipc(ctx)
+                    current_client_local(ctx.caller_client_id)
                 )
             },
             "clients-commands", "set-current-session" => |_req: SetCurrentSessionArgs, _ctx| {
@@ -93,7 +97,7 @@ impl RustPlugin for ClientsPlugin {
             },
             "clients-commands", "set-following" => |req: SetFollowingArgs, ctx| {
                 Ok::<Result<ClientAck, SetFollowingError>, ServiceResponse>(
-                    set_following_via_ipc(ctx, &req)
+                    set_following_via_ipc(ctx, ctx.caller_client_id, &req)
                 )
             },
         })
@@ -135,28 +139,32 @@ impl RustPlugin for ClientsPlugin {
 
 // ── IPC helpers ──────────────────────────────────────────────────────
 
-fn list_clients_via_ipc(caller: &impl ServiceCaller) -> Result<Vec<ClientSummary>, String> {
-    match caller.execute_kernel_request(bmux_ipc::Request::ListClients) {
-        Ok(bmux_ipc::ResponsePayload::ClientList { clients }) => {
-            Ok(clients.iter().map(ipc_summary_to_typed).collect())
-        }
-        Ok(_) => Err("unexpected response payload for list-clients".to_string()),
-        Err(err) => Err(err.to_string()),
-    }
+fn list_clients_local() -> Result<Vec<ClientSummary>, String> {
+    let Some(state) = global_plugin_state_registry().get::<FollowState>() else {
+        return Err("clients plugin state not registered".to_string());
+    };
+    let follow_state = state
+        .read()
+        .map_err(|_| "follow state lock poisoned".to_string())?;
+    Ok(follow_state
+        .list_clients()
+        .iter()
+        .map(ipc_summary_to_typed)
+        .collect())
 }
 
-fn current_client_via_ipc(caller: &impl ServiceCaller) -> Result<ClientSummary, ClientQueryError> {
-    let Ok(bmux_ipc::ResponsePayload::ClientIdentity { id: self_id }) =
-        caller.execute_kernel_request(bmux_ipc::Request::WhoAmI)
-    else {
+fn current_client_local(caller_client_id: Option<Uuid>) -> Result<ClientSummary, ClientQueryError> {
+    let Some(self_id) = caller_client_id else {
         return Err(ClientQueryError::NoCurrentClient);
     };
-    let Ok(bmux_ipc::ResponsePayload::ClientList { clients }) =
-        caller.execute_kernel_request(bmux_ipc::Request::ListClients)
-    else {
+    let Some(state) = global_plugin_state_registry().get::<FollowState>() else {
         return Err(ClientQueryError::NoCurrentClient);
     };
-    clients
+    let follow_state = state
+        .read()
+        .map_err(|_| ClientQueryError::NoCurrentClient)?;
+    follow_state
+        .list_clients()
         .iter()
         .find(|entry| entry.id == self_id)
         .map(ipc_summary_to_typed)
@@ -165,12 +173,11 @@ fn current_client_via_ipc(caller: &impl ServiceCaller) -> Result<ClientSummary, 
 
 fn set_following_via_ipc(
     caller: &impl ServiceCaller,
+    caller_client_id: Option<Uuid>,
     req: &SetFollowingArgs,
 ) -> Result<ClientAck, SetFollowingError> {
-    // Determine self-id first for the returned `ClientAck`.
-    let Ok(bmux_ipc::ResponsePayload::ClientIdentity { id: self_id }) =
-        caller.execute_kernel_request(bmux_ipc::Request::WhoAmI)
-    else {
+    // Determine self-id for the returned `ClientAck`.
+    let Some(self_id) = caller_client_id else {
         return Err(SetFollowingError::Denied {
             reason: "no current client identity".to_string(),
         });
@@ -200,7 +207,17 @@ fn set_following_via_ipc(
         Ok(
             bmux_ipc::ResponsePayload::FollowStarted { .. }
             | bmux_ipc::ResponsePayload::FollowStopped { .. },
-        ) => Ok(ClientAck { client_id: self_id }),
+        ) => {
+            let _ = global_event_bus().emit(
+                &clients_events::EVENT_KIND,
+                ClientEvent::FollowChanged {
+                    client_id: self_id,
+                    target_client_id: req.target_client_id,
+                    global: req.global,
+                },
+            );
+            Ok(ClientAck { client_id: self_id })
+        }
         Ok(_) => Err(SetFollowingError::Denied {
             reason: "unexpected response payload for set-following".to_string(),
         }),
@@ -224,7 +241,17 @@ impl ClientsStateHandle {
 
 impl ClientsStateService for ClientsStateHandle {
     fn list_clients<'a>(&'a self) -> Pin<Box<dyn Future<Output = Vec<ClientSummary>> + Send + 'a>> {
-        Box::pin(async move { list_clients_via_ipc(self.caller.as_ref()).unwrap_or_default() })
+        Box::pin(async move {
+            self.caller
+                .call_service::<(), Vec<ClientSummary>>(
+                    bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(),
+                    ServiceKind::Query,
+                    clients_state::INTERFACE_ID.as_str(),
+                    "list-clients",
+                    &(),
+                )
+                .unwrap_or_default()
+        })
     }
 
     fn current_client<'a>(
@@ -232,7 +259,17 @@ impl ClientsStateService for ClientsStateHandle {
     ) -> Pin<
         Box<dyn Future<Output = std::result::Result<ClientSummary, ClientQueryError>> + Send + 'a>,
     > {
-        Box::pin(async move { current_client_via_ipc(self.caller.as_ref()) })
+        Box::pin(async move {
+            self.caller
+                .call_service::<(), Result<ClientSummary, ClientQueryError>>(
+                    bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(),
+                    ServiceKind::Query,
+                    clients_state::INTERFACE_ID.as_str(),
+                    "current-client",
+                    &(),
+                )
+                .map_or(Err(ClientQueryError::NoCurrentClient), |result| result)
+        })
     }
 }
 
@@ -269,8 +306,25 @@ impl ClientsCommandsService for ClientsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = std::result::Result<ClientAck, SetFollowingError>> + Send + 'a>>
     {
         Box::pin(async move {
+            // Handle callers don't have `caller_client_id` threaded
+            // through (TypedServiceCaller doesn't carry it), so fall
+            // back to a typed `current-client` lookup to obtain it.
+            let caller_client_id = match self.caller.call_service::<(), std::result::Result<
+                ClientSummary,
+                ClientQueryError,
+            >>(
+                bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(),
+                ServiceKind::Query,
+                clients_state::INTERFACE_ID.as_str(),
+                "current-client",
+                &(),
+            ) {
+                Ok(Ok(summary)) => Some(summary.id),
+                _ => None,
+            };
             set_following_via_ipc(
                 self.caller.as_ref(),
+                caller_client_id,
                 &SetFollowingArgs {
                     target_client_id,
                     global,

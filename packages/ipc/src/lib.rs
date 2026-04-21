@@ -471,7 +471,6 @@ pub enum Request {
         principal_id: Uuid,
     },
     Ping,
-    WhoAmI,
     WhoAmIPrincipal,
     ServerStatus,
     ServerSave,
@@ -489,7 +488,6 @@ pub enum Request {
         name: Option<String>,
     },
     ListSessions,
-    ListClients,
     KillSession {
         selector: SessionSelector,
         force_local: bool,
@@ -1153,9 +1151,6 @@ pub struct RecordingEventEnvelope {
 #[serde(rename_all = "snake_case")]
 pub enum ResponsePayload {
     Pong,
-    ClientIdentity {
-        id: Uuid,
-    },
     PrincipalIdentity {
         principal_id: Uuid,
         server_control_principal_id: Uuid,
@@ -1185,9 +1180,6 @@ pub enum ResponsePayload {
     },
     SessionList {
         sessions: Vec<SessionSummary>,
-    },
-    ClientList {
-        clients: Vec<ClientSummary>,
     },
     SessionKilled {
         id: Uuid,
@@ -1955,7 +1947,6 @@ mod tests {
                 principal_id: id,
             },
             Request::Ping,
-            Request::WhoAmI,
             Request::WhoAmIPrincipal,
             Request::ServerStatus,
             Request::ServerSave,
@@ -1974,7 +1965,6 @@ mod tests {
             },
             Request::NewSession { name: None },
             Request::ListSessions,
-            Request::ListClients,
             Request::KillSession {
                 selector: SessionSelector::ById(id),
                 force_local: true,
@@ -2332,7 +2322,6 @@ mod tests {
 
         let variants: Vec<ResponsePayload> = vec![
             ResponsePayload::Pong,
-            ResponsePayload::ClientIdentity { id },
             ResponsePayload::PrincipalIdentity {
                 principal_id: id,
                 server_control_principal_id: id2,
@@ -2381,15 +2370,6 @@ mod tests {
                         client_count: 0,
                     },
                 ],
-            },
-            ResponsePayload::ClientList {
-                clients: vec![ClientSummary {
-                    id,
-                    selected_context_id: Some(id2),
-                    selected_session_id: Some(id),
-                    following_client_id: None,
-                    following_global: false,
-                }],
             },
             ResponsePayload::SessionKilled { id },
             ResponsePayload::PaneSplit {

@@ -1092,10 +1092,12 @@ dependencies = [
 name = "bmux_client"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_clients_plugin_api",
  "bmux_codec",
  "bmux_config",
  "bmux_ipc",
  "bmux_server",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1148,6 +1150,7 @@ dependencies = [
 name = "bmux_cluster_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_clients_plugin_api",
  "bmux_config",
  "bmux_ipc",
  "bmux_plugin",
@@ -1200,6 +1203,7 @@ dependencies = [
 name = "bmux_contexts_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_clients_plugin_api",
  "bmux_contexts_plugin_api",
  "bmux_ipc",
  "bmux_plugin",
@@ -1403,6 +1407,7 @@ dependencies = [
 name = "bmux_permissions_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_clients_plugin_api",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
@@ -1620,6 +1625,7 @@ dependencies = [
 name = "bmux_windows_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_clients_plugin_api",
  "bmux_contexts_plugin_api",
  "bmux_ipc",
  "bmux_plugin",

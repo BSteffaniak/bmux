@@ -371,23 +371,25 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn current_client(&self) -> Result<CurrentClientResponse> {
-        let bmux_ipc::ResponsePayload::ClientIdentity { id: client_id } =
-            self.execute_kernel_request(bmux_ipc::Request::WhoAmI)?
-        else {
-            return Err(unexpected("whoami"));
-        };
-        match self.execute_kernel_request(bmux_ipc::Request::ListClients)? {
-            bmux_ipc::ResponsePayload::ClientList { clients } => {
-                let current = clients.into_iter().find(|c| c.id == client_id);
+        use bmux_clients_plugin_api::clients_state::{self, ClientQueryError, ClientSummary};
+        self.call_service::<(), std::result::Result<ClientSummary, ClientQueryError>>(
+            bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(),
+            bmux_plugin_sdk::ServiceKind::Query,
+            clients_state::INTERFACE_ID.as_str(),
+            "current-client",
+            &(),
+        )?
+        .map_or_else(
+            |_| Err(unexpected("current_client")),
+            |summary| {
                 Ok(CurrentClientResponse {
-                    id: client_id,
-                    selected_session_id: current.as_ref().and_then(|c| c.selected_session_id),
-                    following_client_id: current.as_ref().and_then(|c| c.following_client_id),
-                    following_global: current.as_ref().is_some_and(|c| c.following_global),
+                    id: summary.id,
+                    selected_session_id: summary.selected_session_id,
+                    following_client_id: summary.following_client_id,
+                    following_global: summary.following_global,
                 })
-            }
-            _ => Err(unexpected("current_client")),
-        }
+            },
+        )
     }
 
     /// List all contexts.

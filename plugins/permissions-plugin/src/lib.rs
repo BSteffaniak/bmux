@@ -132,21 +132,20 @@ fn current_context_id(caller: &impl ServiceCaller) -> Result<Option<Uuid>, Strin
 }
 
 fn current_client_snapshot(caller: &impl ServiceCaller) -> Result<CurrentClientSnapshot, String> {
-    let Ok(bmux_ipc::ResponsePayload::ClientIdentity { id: client_id }) =
-        caller.execute_kernel_request(bmux_ipc::Request::WhoAmI)
-    else {
-        return Err("no current client".to_string());
-    };
-    let bmux_ipc::ResponsePayload::ClientList { clients } = caller
-        .execute_kernel_request(bmux_ipc::Request::ListClients)
-        .map_err(|err| err.to_string())?
-    else {
-        return Err("unexpected response for list-clients".to_string());
-    };
-    let current = clients.into_iter().find(|c| c.id == client_id);
-    Ok(CurrentClientSnapshot {
-        selected_session_id: current.and_then(|c| c.selected_session_id),
-    })
+    use bmux_clients_plugin_api::clients_state::{self, ClientQueryError, ClientSummary};
+    match caller.call_service::<(), std::result::Result<ClientSummary, ClientQueryError>>(
+        bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(),
+        ServiceKind::Query,
+        clients_state::INTERFACE_ID.as_str(),
+        "current-client",
+        &(),
+    ) {
+        Ok(Ok(summary)) => Ok(CurrentClientSnapshot {
+            selected_session_id: summary.selected_session_id,
+        }),
+        Ok(Err(_)) => Err("no current client".to_string()),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[derive(Default)]
@@ -1281,6 +1280,21 @@ mod tests {
                     let current = self.contexts.first().cloned();
                     encode_service_message(&current)
                 }
+                // Typed clients-state surface used by `current_client_snapshot`.
+                ("clients-state", "current-client") => {
+                    let summary = bmux_clients_plugin_api::clients_state::ClientSummary {
+                        id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                        selected_session_id: self.selected_session_id,
+                        selected_context_id: None,
+                        following_client_id: None,
+                        following_global: false,
+                    };
+                    let result: std::result::Result<
+                        bmux_clients_plugin_api::clients_state::ClientSummary,
+                        bmux_clients_plugin_api::clients_state::ClientQueryError,
+                    > = Ok(summary);
+                    encode_service_message(&result)
+                }
                 _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",
                 }),
@@ -1302,18 +1316,6 @@ mod tests {
                             client_count: s.client_count,
                         })
                         .collect(),
-                }),
-                bmux_ipc::Request::WhoAmI => Ok(bmux_ipc::ResponsePayload::ClientIdentity {
-                    id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
-                }),
-                bmux_ipc::Request::ListClients => Ok(bmux_ipc::ResponsePayload::ClientList {
-                    clients: vec![bmux_ipc::ClientSummary {
-                        id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
-                        selected_session_id: self.selected_session_id,
-                        selected_context_id: None,
-                        following_client_id: None,
-                        following_global: false,
-                    }],
                 }),
                 _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                     operation: "mock_execute_kernel_request",
@@ -1350,22 +1352,6 @@ mod tests {
         };
 
         let response = match kernel_request {
-            bmux_ipc::Request::WhoAmI => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientIdentity {
-                    id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
-                })
-            }
-            bmux_ipc::Request::ListClients => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientList {
-                    clients: vec![bmux_ipc::ClientSummary {
-                        id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
-                        selected_context_id: None,
-                        selected_session_id: Some(service_test_session_id()),
-                        following_client_id: None,
-                        following_global: false,
-                    }],
-                })
-            }
             bmux_ipc::Request::ListSessions => {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
                     sessions: vec![bmux_ipc::SessionSummary {

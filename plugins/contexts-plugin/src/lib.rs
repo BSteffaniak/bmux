@@ -13,6 +13,9 @@ pub mod context_state;
 
 pub use context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
 
+use bmux_clients_plugin_api::clients_state::{
+    self as clients_state, ClientQueryError, ClientSummary,
+};
 use bmux_contexts_plugin_api::contexts_commands::{
     self, CloseContextError, ContextAck, ContextSelector as CommandContextSelector,
     ContextsCommandsService, CreateContextError, SelectContextError,
@@ -113,22 +116,22 @@ impl RustPlugin for ContextsPlugin {
                     .map_err(|e| ServiceResponse::error("get_failed", e))
             },
             "contexts-state", "current-context" => |_req: (), ctx| {
-                current_context_local(ctx)
+                current_context_local(ctx, ctx.caller_client_id)
                     .map_err(|e| ServiceResponse::error("current_failed", e))
             },
             "contexts-commands", "create-context" => |req: CreateContextArgs, ctx| {
                 Ok::<Result<ContextAck, CreateContextError>, ServiceResponse>(
-                    create_context_local(ctx, req.name, req.attributes)
+                    create_context_local(ctx, ctx.caller_client_id, req.name, req.attributes)
                 )
             },
             "contexts-commands", "select-context" => |req: SelectorArgs, ctx| {
                 Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(
-                    select_context_local(ctx, &req.selector)
+                    select_context_local(ctx, ctx.caller_client_id, &req.selector)
                 )
             },
             "contexts-commands", "close-context" => |req: CloseContextArgs, ctx| {
                 Ok::<Result<ContextAck, CloseContextError>, ServiceResponse>(
-                    close_context_local(ctx, &req.selector, req.force)
+                    close_context_local(ctx, ctx.caller_client_id, &req.selector, req.force)
                 )
             },
         })
@@ -178,29 +181,27 @@ fn local_state() -> Arc<RwLock<ContextState>> {
 }
 
 /// Resolve the caller's `ClientId` from the `NativeServiceContext`.
-/// Falls back to `Request::WhoAmI` when the context did not carry a
-/// client id (e.g. legacy IPC paths that haven't been updated yet).
-fn resolve_caller_client_id(caller: &impl ServiceCaller) -> Result<ClientId, String> {
-    if let Some(id) = caller_client_id_from_thread_local() {
+/// Falls back to a typed `clients-state::current-client` query when
+/// the context did not carry a client id (e.g. legacy IPC paths that
+/// haven't been updated yet).
+fn resolve_caller_client_id(
+    caller: &impl ServiceCaller,
+    caller_client_id: Option<::uuid::Uuid>,
+) -> Result<ClientId, String> {
+    if let Some(id) = caller_client_id {
         return Ok(ClientId(id));
     }
-    match caller.execute_kernel_request(bmux_ipc::Request::WhoAmI) {
-        Ok(bmux_ipc::ResponsePayload::ClientIdentity { id }) => Ok(ClientId(id)),
-        Ok(_) => Err("unexpected response payload for whoami".to_string()),
+    match caller.call_service::<(), std::result::Result<ClientSummary, ClientQueryError>>(
+        bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(),
+        ServiceKind::Query,
+        clients_state::INTERFACE_ID.as_str(),
+        "current-client",
+        &(),
+    ) {
+        Ok(Ok(summary)) => Ok(ClientId(summary.id)),
+        Ok(Err(err)) => Err(format!("current-client query failed: {err:?}")),
         Err(err) => Err(err.to_string()),
     }
-}
-
-/// Look up the caller's client id from the `NativeServiceContext` that
-/// is currently in scope, if the handler was dispatched via the
-/// `route_service!` macro. The macro doesn't currently expose the
-/// context's `caller_client_id` field to handler closures, so this
-/// helper returns `None` and the fallback uses `WhoAmI`.
-const fn caller_client_id_from_thread_local() -> Option<::uuid::Uuid> {
-    // Future: read from a thread-local populated by the dispatch
-    // machinery so handlers don't need the `WhoAmI` round-trip. For
-    // now, always fall back.
-    None
 }
 
 // ── Read handlers (state-local) ──────────────────────────────────────
@@ -238,8 +239,11 @@ fn get_context_local(
     }))
 }
 
-fn current_context_local(caller: &impl ServiceCaller) -> Result<Option<ContextSummary>, String> {
-    let client_id = resolve_caller_client_id(caller)?;
+fn current_context_local(
+    caller: &impl ServiceCaller,
+    caller_client_id: Option<::uuid::Uuid>,
+) -> Result<Option<ContextSummary>, String> {
+    let client_id = resolve_caller_client_id(caller, caller_client_id)?;
     let state = local_state();
     let guard = state
         .read()
@@ -253,11 +257,12 @@ fn current_context_local(caller: &impl ServiceCaller) -> Result<Option<ContextSu
 
 fn create_context_local(
     caller: &impl ServiceCaller,
+    caller_client_id: Option<::uuid::Uuid>,
     name: Option<String>,
     attributes: BTreeMap<String, String>,
 ) -> Result<ContextAck, CreateContextError> {
-    let client_id =
-        resolve_caller_client_id(caller).map_err(|reason| CreateContextError::Failed { reason })?;
+    let client_id = resolve_caller_client_id(caller, caller_client_id)
+        .map_err(|reason| CreateContextError::Failed { reason })?;
 
     // Cross-plugin orchestration: ask the sessions plugin to allocate
     // a session runtime for this context. We go via typed dispatch so
@@ -312,6 +317,7 @@ fn mutate_state_create(
 
 fn select_context_local(
     caller: &impl ServiceCaller,
+    caller_client_id: Option<::uuid::Uuid>,
     selector: &WireSelector,
 ) -> Result<ContextAck, SelectContextError> {
     let Some(ipc_selector) = selector.to_ipc() else {
@@ -319,8 +325,8 @@ fn select_context_local(
             reason: "selector must specify either id or name".to_string(),
         });
     };
-    let client_id =
-        resolve_caller_client_id(caller).map_err(|reason| SelectContextError::Denied { reason })?;
+    let client_id = resolve_caller_client_id(caller, caller_client_id)
+        .map_err(|reason| SelectContextError::Denied { reason })?;
 
     let (context, session_after_select) = mutate_state_select(client_id, &ipc_selector)?;
 
@@ -360,6 +366,7 @@ fn mutate_state_select(
 
 fn close_context_local(
     caller: &impl ServiceCaller,
+    caller_client_id: Option<::uuid::Uuid>,
     selector: &WireSelector,
     force: bool,
 ) -> Result<ContextAck, CloseContextError> {
@@ -368,8 +375,8 @@ fn close_context_local(
             reason: "selector must specify either id or name".to_string(),
         });
     };
-    let client_id =
-        resolve_caller_client_id(caller).map_err(|reason| CloseContextError::Failed { reason })?;
+    let client_id = resolve_caller_client_id(caller, caller_client_id)
+        .map_err(|reason| CloseContextError::Failed { reason })?;
 
     let (removed_id, bound_session_id) = mutate_state_close(client_id, &ipc_selector, force)?;
 
@@ -565,7 +572,11 @@ impl ContextsStateService for ContextsStateHandle {
     fn current_context<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Option<ContextSummary>> + Send + 'a>> {
-        Box::pin(async move { current_context_local(self.caller.as_ref()).ok().flatten() })
+        Box::pin(async move {
+            current_context_local(self.caller.as_ref(), None)
+                .ok()
+                .flatten()
+        })
     }
 }
 
@@ -589,7 +600,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
     ) -> Pin<
         Box<dyn Future<Output = std::result::Result<ContextAck, CreateContextError>> + Send + 'a>,
     > {
-        Box::pin(async move { create_context_local(self.caller.as_ref(), name, attributes) })
+        Box::pin(async move { create_context_local(self.caller.as_ref(), None, name, attributes) })
     }
 
     fn select_context<'a>(
@@ -603,7 +614,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
                 id: selector.id,
                 name: selector.name,
             };
-            select_context_local(self.caller.as_ref(), &wire)
+            select_context_local(self.caller.as_ref(), None, &wire)
         })
     }
 
@@ -618,7 +629,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
                 id: selector.id,
                 name: selector.name,
             };
-            close_context_local(self.caller.as_ref(), &wire, force)
+            close_context_local(self.caller.as_ref(), None, &wire, force)
         })
     }
 }

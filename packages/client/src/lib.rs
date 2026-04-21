@@ -330,10 +330,26 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn whoami(&mut self) -> Result<Uuid> {
-        match self.request(Request::WhoAmI).await? {
-            ResponsePayload::ClientIdentity { id } => Ok(id),
-            _ => Err(ClientError::UnexpectedResponse("expected client identity")),
-        }
+        let payload = bmux_ipc::encode(&())
+            .map_err(|_| ClientError::UnexpectedResponse("failed to encode whoami request"))?;
+        let response_bytes = self
+            .invoke_service_raw(
+                "bmux.clients.read",
+                InvokeServiceKind::Query,
+                "clients-state",
+                "current-client",
+                payload,
+            )
+            .await?;
+        let result: std::result::Result<
+            bmux_clients_plugin_api::clients_state::ClientSummary,
+            bmux_clients_plugin_api::clients_state::ClientQueryError,
+        > = bmux_ipc::decode(&response_bytes)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to decode current-client"))?;
+        result.map_or(
+            Err(ClientError::UnexpectedResponse("no current client")),
+            |summary| Ok(summary.id),
+        )
     }
 
     /// Return this connection's profile-scoped principal identity.
@@ -842,16 +858,31 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn follow_client(&mut self, target_client_id: Uuid, global: bool) -> Result<()> {
-        match self
-            .request(Request::FollowClient {
-                target_client_id,
-                global,
-            })
-            .await?
-        {
-            ResponsePayload::FollowStarted { .. } => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse("expected follow started")),
+        #[derive(serde::Serialize)]
+        struct SetFollowingArgs {
+            target_client_id: Option<Uuid>,
+            global: bool,
         }
+        let payload = bmux_ipc::encode(&SetFollowingArgs {
+            target_client_id: Some(target_client_id),
+            global,
+        })
+        .map_err(|_| ClientError::UnexpectedResponse("failed to encode set-following"))?;
+        let response_bytes = self
+            .invoke_service_raw(
+                "bmux.clients.write",
+                InvokeServiceKind::Command,
+                "clients-commands",
+                "set-following",
+                payload,
+            )
+            .await?;
+        let _result: std::result::Result<
+            bmux_clients_plugin_api::clients_commands::ClientAck,
+            bmux_clients_plugin_api::clients_commands::SetFollowingError,
+        > = bmux_ipc::decode(&response_bytes)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to decode set-following"))?;
+        Ok(())
     }
 
     /// Stop following any current follow target.
@@ -860,10 +891,31 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn unfollow(&mut self) -> Result<()> {
-        match self.request(Request::Unfollow).await? {
-            ResponsePayload::FollowStopped { .. } => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse("expected follow stopped")),
+        #[derive(serde::Serialize)]
+        struct SetFollowingArgs {
+            target_client_id: Option<Uuid>,
+            global: bool,
         }
+        let payload = bmux_ipc::encode(&SetFollowingArgs {
+            target_client_id: None,
+            global: false,
+        })
+        .map_err(|_| ClientError::UnexpectedResponse("failed to encode set-following"))?;
+        let response_bytes = self
+            .invoke_service_raw(
+                "bmux.clients.write",
+                InvokeServiceKind::Command,
+                "clients-commands",
+                "set-following",
+                payload,
+            )
+            .await?;
+        let _result: std::result::Result<
+            bmux_clients_plugin_api::clients_commands::ClientAck,
+            bmux_clients_plugin_api::clients_commands::SetFollowingError,
+        > = bmux_ipc::decode(&response_bytes)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to decode set-following"))?;
+        Ok(())
     }
 
     /// Attach client to a session selected by name or UUID.
@@ -1743,10 +1795,26 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn whoami(&mut self) -> Result<Uuid> {
-        match self.request(Request::WhoAmI).await? {
-            ResponsePayload::ClientIdentity { id } => Ok(id),
-            _ => Err(ClientError::UnexpectedResponse("expected client identity")),
-        }
+        let payload = bmux_ipc::encode(&())
+            .map_err(|_| ClientError::UnexpectedResponse("failed to encode whoami request"))?;
+        let response_bytes = self
+            .invoke_service_raw(
+                "bmux.clients.read",
+                InvokeServiceKind::Query,
+                "clients-state",
+                "current-client",
+                payload,
+            )
+            .await?;
+        let result: std::result::Result<
+            bmux_clients_plugin_api::clients_state::ClientSummary,
+            bmux_clients_plugin_api::clients_state::ClientQueryError,
+        > = bmux_ipc::decode(&response_bytes)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to decode current-client"))?;
+        result.map_or(
+            Err(ClientError::UnexpectedResponse("no current client")),
+            |summary| Ok(summary.id),
+        )
     }
 
     /// Return principal identity information for this client and server control principal.
@@ -1828,16 +1896,31 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn follow_client(&mut self, target_client_id: Uuid, global: bool) -> Result<()> {
-        match self
-            .request(Request::FollowClient {
-                target_client_id,
-                global,
-            })
-            .await?
-        {
-            ResponsePayload::FollowStarted { .. } => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse("expected follow started")),
+        #[derive(serde::Serialize)]
+        struct SetFollowingArgs {
+            target_client_id: Option<Uuid>,
+            global: bool,
         }
+        let payload = bmux_ipc::encode(&SetFollowingArgs {
+            target_client_id: Some(target_client_id),
+            global,
+        })
+        .map_err(|_| ClientError::UnexpectedResponse("failed to encode set-following"))?;
+        let response_bytes = self
+            .invoke_service_raw(
+                "bmux.clients.write",
+                InvokeServiceKind::Command,
+                "clients-commands",
+                "set-following",
+                payload,
+            )
+            .await?;
+        let _result: std::result::Result<
+            bmux_clients_plugin_api::clients_commands::ClientAck,
+            bmux_clients_plugin_api::clients_commands::SetFollowingError,
+        > = bmux_ipc::decode(&response_bytes)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to decode set-following"))?;
+        Ok(())
     }
 
     /// Stop following any current follow target.
@@ -1846,10 +1929,31 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn unfollow(&mut self) -> Result<()> {
-        match self.request(Request::Unfollow).await? {
-            ResponsePayload::FollowStopped { .. } => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse("expected follow stopped")),
+        #[derive(serde::Serialize)]
+        struct SetFollowingArgs {
+            target_client_id: Option<Uuid>,
+            global: bool,
         }
+        let payload = bmux_ipc::encode(&SetFollowingArgs {
+            target_client_id: None,
+            global: false,
+        })
+        .map_err(|_| ClientError::UnexpectedResponse("failed to encode set-following"))?;
+        let response_bytes = self
+            .invoke_service_raw(
+                "bmux.clients.write",
+                InvokeServiceKind::Command,
+                "clients-commands",
+                "set-following",
+                payload,
+            )
+            .await?;
+        let _result: std::result::Result<
+            bmux_clients_plugin_api::clients_commands::ClientAck,
+            bmux_clients_plugin_api::clients_commands::SetFollowingError,
+        > = bmux_ipc::decode(&response_bytes)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to decode set-following"))?;
+        Ok(())
     }
 
     /// Request attach grant token for a session.
@@ -2408,7 +2512,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::Hello { .. } => "hello",
         Request::HelloV2 { .. } => "hello_v2",
         Request::Ping => "ping",
-        Request::WhoAmI => "whoami",
         Request::WhoAmIPrincipal => "whoami_principal",
         Request::ServerStatus => "server_status",
         Request::ServerSave => "server_save",
@@ -2418,7 +2521,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::InvokeService { .. } => "invoke_service",
         Request::NewSession { .. } => "new_session",
         Request::ListSessions => "list_sessions",
-        Request::ListClients => "list_clients",
         Request::KillSession { .. } => "kill_session",
         Request::ListPanes { .. } => "list_panes",
         Request::SplitPane { .. } => "split_pane",
@@ -2471,7 +2573,6 @@ const fn response_kind_name(response: &Response) -> &'static str {
     match response {
         Response::Ok(payload) => match payload {
             ResponsePayload::Pong => "pong",
-            ResponsePayload::ClientIdentity { .. } => "client_identity",
             ResponsePayload::PrincipalIdentity { .. } => "principal_identity",
             ResponsePayload::HelloNegotiated { .. } => "hello_negotiated",
             ResponsePayload::HelloIncompatible { .. } => "hello_incompatible",
@@ -2485,7 +2586,6 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::ServiceInvoked { .. } => "service_invoked",
             ResponsePayload::SessionCreated { .. } => "session_created",
             ResponsePayload::SessionList { .. } => "session_list",
-            ResponsePayload::ClientList { .. } => "client_list",
             ResponsePayload::SessionKilled { .. } => "session_killed",
             ResponsePayload::PaneList { .. } => "pane_list",
             ResponsePayload::PaneSplit { .. } => "pane_split",

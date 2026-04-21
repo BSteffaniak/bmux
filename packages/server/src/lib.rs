@@ -4544,40 +4544,22 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
         .and_then(|reason| reason.clone())
 }
 
-/// Construct a fresh `Arc<RwLock<T>>` state handle for the server.
+/// Install a fresh canonical state handle into the process-wide plugin
+/// state registry, replacing any previous entry and returning the new
+/// handle.
 ///
-/// The plugin state types (`FollowState`, `SessionManager`) are
-/// owned-at-the-type-level by their respective plugins and exported
-/// from the plugin crates themselves (`bmux_clients_plugin::FollowState`,
-/// `bmux_sessions_plugin::SessionManager`). Plugins also register
-/// canonical instances into the global [`PluginStateRegistry`] on
-/// `activate` so other plugins and observers can reach them. The
-/// server constructs its own canonical instance per-server so that
-/// multiple `BmuxServer` instances (tests especially) don't
-/// accidentally share state. The server-owned handle is what flows
-/// through the request pipeline.
+/// All plugin-owned state types — `SessionManager`, `FollowState`,
+/// `ContextState` — flow through this function during `BmuxServer::new`
+/// so the server reads/writes the same `Arc<RwLock<T>>` handle the
+/// owning plugin later mutates. Plugins that call
+/// `global_plugin_state_registry().register::<T>` during `activate`
+/// will overwrite this handle with their own canonical instance.
 ///
-/// `ContextState` is exceptional: it is owned exclusively by
-/// `bmux_contexts_plugin`. Server uses
-/// [`plugin_owned_state::<ContextState>`] to read from the plugin's
-/// canonical registered handle; any reads/writes must go through the
-/// plugin's typed API. `make_server_state` is NOT used for
-/// `ContextState`.
-fn make_server_state<T: Default + Send + Sync + 'static>() -> Arc<std::sync::RwLock<T>> {
-    Arc::new(std::sync::RwLock::new(T::default()))
-}
-
-/// Obtain the plugin-registered state handle for `T`, falling back to
-/// a freshly-constructed default if no plugin has registered yet (for
-/// tests that spin up `BmuxServer` without activating the owning
-/// plugin).
-fn plugin_owned_state<T: Default + Send + Sync + 'static>() -> Arc<std::sync::RwLock<T>> {
-    let registry = bmux_plugin::global_plugin_state_registry();
-    if let Some(existing) = registry.get::<T>() {
-        return existing;
-    }
+/// Using a replacement pattern here gives each server instance
+/// isolated state even within a single test process.
+fn reset_plugin_owned_state<T: Default + Send + Sync + 'static>() -> Arc<std::sync::RwLock<T>> {
     let fresh = Arc::new(std::sync::RwLock::new(T::default()));
-    registry.register::<T>(&fresh);
+    bmux_plugin::global_plugin_state_registry().register::<T>(&fresh);
     fresh
 }
 
@@ -4634,7 +4616,7 @@ impl BmuxServer {
         Self {
             endpoint,
             state: Arc::new(ServerState {
-                session_manager: make_server_state::<SessionManager>(),
+                session_manager: reset_plugin_owned_state::<SessionManager>(),
                 session_runtimes: Mutex::new(SessionRuntimeManager::new(
                     shell,
                     pane_term,
@@ -4647,8 +4629,8 @@ impl BmuxServer {
                     event_broadcast_tx.clone(),
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
-                follow_state: make_server_state::<FollowState>(),
-                context_state: plugin_owned_state::<ContextState>(),
+                follow_state: reset_plugin_owned_state::<FollowState>(),
+                context_state: reset_plugin_owned_state::<ContextState>(),
                 snapshot_runtime,
                 manual_recording_runtime,
                 rolling_recording_runtime,
@@ -7035,7 +7017,6 @@ async fn handle_request(
             message: "hello request is only valid during handshake".to_string(),
         }),
         Request::Ping => Response::Ok(ResponsePayload::Pong),
-        Request::WhoAmI => Response::Ok(ResponsePayload::ClientIdentity { id: client_id.0 }),
         Request::WhoAmIPrincipal => Response::Ok(ResponsePayload::PrincipalIdentity {
             principal_id: client_principal_id,
             server_control_principal_id: state.server_control_principal_id,
@@ -7698,19 +7679,6 @@ async fn handle_request(
                 })
                 .collect::<Vec<_>>();
             Response::Ok(ResponsePayload::SessionList { sessions })
-        }
-        Request::ListClients => {
-            let follow_state = state
-                .follow_state
-                .read()
-                .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-            let mut clients = follow_state.list_clients();
-            drop(follow_state);
-            for client in &mut clients {
-                client.selected_context_id =
-                    current_context_id_for_client(state, ClientId(client.id));
-            }
-            Response::Ok(ResponsePayload::ClientList { clients })
         }
         Request::ControlCatalogSnapshot { since_revision: _ } => {
             let snapshot = build_control_catalog_snapshot(state)?;
@@ -9343,7 +9311,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::Hello { .. } => "hello",
         Request::HelloV2 { .. } => "hello_v2",
         Request::Ping => "ping",
-        Request::WhoAmI => "whoami",
         Request::WhoAmIPrincipal => "whoami_principal",
         Request::ServerStatus => "server_status",
         Request::ServerSave => "server_save",
@@ -9353,7 +9320,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::InvokeService { .. } => "invoke_service",
         Request::NewSession { .. } => "new_session",
         Request::ListSessions => "list_sessions",
-        Request::ListClients => "list_clients",
         Request::KillSession { .. } => "kill_session",
         Request::ListPanes { .. } => "list_panes",
         Request::SplitPane { .. } => "split_pane",
@@ -9622,7 +9588,6 @@ const fn rolling_start_options_is_empty(options: &RecordingRollingStartOptions) 
 const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
     match payload {
         ResponsePayload::Pong => "pong",
-        ResponsePayload::ClientIdentity { .. } => "client_identity",
         ResponsePayload::PrincipalIdentity { .. } => "principal_identity",
         ResponsePayload::HelloNegotiated { .. } => "hello_negotiated",
         ResponsePayload::HelloIncompatible { .. } => "hello_incompatible",
@@ -9634,7 +9599,6 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::ServiceInvoked { .. } => "service_invoked",
         ResponsePayload::SessionCreated { .. } => "session_created",
         ResponsePayload::SessionList { .. } => "session_list",
-        ResponsePayload::ClientList { .. } => "client_list",
         ResponsePayload::SessionKilled { .. } => "session_killed",
         ResponsePayload::PaneList { .. } => "pane_list",
         ResponsePayload::PaneSplit { .. } => "pane_split",

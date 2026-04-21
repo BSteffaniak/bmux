@@ -1499,33 +1499,15 @@ mod tests {
             Ok(request) => request,
             Err(_) => return 1,
         };
-        let request: bmux_ipc::Request = match bmux_ipc::decode(&bridge_request.payload) {
+        let _request: bmux_ipc::Request = match bmux_ipc::decode(&bridge_request.payload) {
             Ok(request) => request,
             Err(_) => return 1,
         };
 
-        let response = match request {
-            bmux_ipc::Request::WhoAmI => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientIdentity {
-                    id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
-                })
-            }
-            bmux_ipc::Request::ListClients => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientList {
-                    clients: vec![bmux_ipc::ClientSummary {
-                        id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
-                        selected_context_id: None,
-                        selected_session_id: None,
-                        following_client_id: None,
-                        following_global: false,
-                    }],
-                })
-            }
-            _ => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
-                code: bmux_ipc::ErrorCode::InvalidRequest,
-                message: "unsupported request in service bridge test".to_string(),
-            }),
-        };
+        let response = bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
+            code: bmux_ipc::ErrorCode::InvalidRequest,
+            message: "unsupported request in service bridge test".to_string(),
+        });
 
         let Ok(encoded) = bmux_ipc::encode(&response) else {
             return 1;
@@ -2210,43 +2192,13 @@ mod tests {
             }
         }
 
-        #[allow(clippy::too_many_lines)]
         fn execute_kernel_request(
             &self,
-            request: bmux_ipc::Request,
+            _request: bmux_ipc::Request,
         ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
-            // Translate the IPC `Request` to the mock's legacy
-            // `call_service_raw` interface_id/operation/payload shape
-            // so tests can keep exercising the mock's existing
-            // domain-specific handlers.
-            match request {
-                bmux_ipc::Request::WhoAmI => Ok(bmux_ipc::ResponsePayload::ClientIdentity {
-                    id: self.current_client_id,
-                }),
-                bmux_ipc::Request::ListClients => {
-                    let bytes = self.call_service_raw(
-                        "bmux.clients.read",
-                        bmux_plugin_sdk::ServiceKind::Query,
-                        "client-query/v1",
-                        "current",
-                        Vec::new(),
-                    )?;
-                    let response: domain_ipc::CurrentClientResponse =
-                        bmux_plugin_sdk::decode_service_message(&bytes)?;
-                    Ok(bmux_ipc::ResponsePayload::ClientList {
-                        clients: vec![bmux_ipc::ClientSummary {
-                            id: response.id,
-                            selected_session_id: response.selected_session_id,
-                            selected_context_id: None,
-                            following_client_id: response.following_client_id,
-                            following_global: response.following_global,
-                        }],
-                    })
-                }
-                _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-                    operation: "mock_execute_kernel_request",
-                }),
-            }
+            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                operation: "mock_execute_kernel_request",
+            })
         }
     }
 
