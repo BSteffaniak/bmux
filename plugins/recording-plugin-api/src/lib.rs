@@ -10,9 +10,8 @@
 //!   plugin; declared here so that `packages/server` can name the
 //!   type for fast-path writes without depending on the plugin impl
 //!   crate.
-//! - [`RecordingSink`] — trait implemented by the recording plugin and
-//!   used by `packages/server` for fast-path pane-output writes
-//!   without depending on the plugin impl crate.
+//! - [`DualRuntimeSink`] — [`bmux_recording_runtime::RecordingSink`]
+//!   impl that fans out to both manual and rolling runtimes.
 //! - [`RecordingRequest`] / [`RecordingResponse`] — hand-written wire
 //!   enums the recording plugin's typed service dispatches over.
 //! - Constants for the interface id and capability ids.
@@ -32,6 +31,7 @@ use bmux_ipc::{
     RecordingStatus, RecordingSummary,
 };
 use bmux_plugin_sdk::{CapabilityId, InterfaceId};
+use bmux_recording_runtime::{RecordMeta, RecordingSink};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -44,40 +44,6 @@ pub const RECORDING_WRITE: CapabilityId = CapabilityId::from_static("bmux.record
 /// Interface id for recording control operations (typed dispatch).
 pub const RECORDING_COMMANDS_INTERFACE: InterfaceId =
     InterfaceId::from_static("recording-commands");
-
-/// Per-event metadata that accompanies each record into the sink.
-///
-/// Lives here (not in `bmux_ipc`) because it is shared between server's
-/// write-path and the recording plugin's runtime; neither side needs
-/// to wire-serialize it.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RecordMeta {
-    #[serde(default)]
-    pub session_id: Option<Uuid>,
-    #[serde(default)]
-    pub pane_id: Option<Uuid>,
-    #[serde(default)]
-    pub client_id: Option<Uuid>,
-}
-
-/// Fast-path recording write contract, implemented by the recording
-/// plugin and stored in the plugin state registry so server can look
-/// it up and write to it without depending on the plugin impl crate.
-///
-/// The trait is intentionally narrow — a single `record` method — so
-/// the implementation can mutex-guard internal runtimes without
-/// forcing the contract to leak runtime handles.
-pub trait RecordingSink: Send + Sync {
-    /// Write a single record into whatever runtimes are active. The
-    /// call is expected to be cheap (lock a mutex, append an event to
-    /// a channel) and must not block on disk I/O.
-    fn record(&self, kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta);
-}
-
-/// Newtype wrapper for registering an `Arc<dyn RecordingSink>` in
-/// [`bmux_plugin::PluginStateRegistry`]. The registry is typed by
-/// concrete type; this wrapper gives us a concrete name to look up.
-pub struct RecordingSinkHandle(pub std::sync::Arc<dyn RecordingSink>);
 
 /// Newtype wrapper for registering the manual recording runtime handle
 /// in [`bmux_plugin::PluginStateRegistry`]. Used by the recording

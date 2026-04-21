@@ -261,9 +261,10 @@ fn performance_plugin_exists() {
     );
 
     let plugin_api_source = include_str!("../../../plugins/performance-plugin-api/src/lib.rs");
+    let state_source = include_str!("../../../packages/performance-state/src/lib.rs");
     assert!(
-        plugin_api_source.contains("pub struct PerformanceCaptureSettings"),
-        "plugins/performance-plugin-api/src/lib.rs must export the \
+        state_source.contains("pub struct PerformanceCaptureSettings"),
+        "packages/performance-state/src/lib.rs must export the \
          canonical `PerformanceCaptureSettings` struct",
     );
     assert!(
@@ -272,8 +273,8 @@ fn performance_plugin_exists() {
          canonical `PerformanceEventRateLimiter` struct",
     );
     assert!(
-        plugin_api_source.contains("pub struct PerformanceSettingsHandle"),
-        "plugins/performance-plugin-api/src/lib.rs must export the \
+        state_source.contains("pub struct PerformanceSettingsHandle"),
+        "packages/performance-state/src/lib.rs must export the \
          `PerformanceSettingsHandle` registry wrapper",
     );
 

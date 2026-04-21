@@ -10,7 +10,7 @@
 
 use bmux_config::{BmuxConfig, PerformanceRecordingLevel as ConfigPerformanceRecordingLevel};
 use bmux_ipc::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Normalized performance capture settings.
 ///
@@ -100,6 +100,52 @@ impl PerformanceCaptureSettings {
             PerformanceRecordingLevel::Basic => "basic",
             PerformanceRecordingLevel::Detailed => "detailed",
             PerformanceRecordingLevel::Trace => "trace",
+        }
+    }
+}
+
+/// Canonical in-process storage for performance capture settings.
+///
+/// Wraps an `Arc<RwLock<PerformanceCaptureSettings>>` and implements
+/// both [`PerformanceSettingsReader`] and [`PerformanceSettingsWriter`].
+/// Used by both the server (during startup, to seed the registry from
+/// config) and the performance plugin (to mutate settings in response
+/// to client commands) without either side naming the other's domain.
+///
+/// This type is cheap to clone (internally `Arc`); clones share storage.
+#[derive(Debug, Clone, Default)]
+pub struct PerformanceSettingsStore {
+    inner: Arc<RwLock<PerformanceCaptureSettings>>,
+}
+
+impl PerformanceSettingsStore {
+    #[must_use]
+    pub fn new(initial: PerformanceCaptureSettings) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(initial)),
+        }
+    }
+
+    /// Construct from the current [`BmuxConfig`] performance section.
+    #[must_use]
+    pub fn from_config(config: &BmuxConfig) -> Self {
+        Self::new(PerformanceCaptureSettings::from_config(config))
+    }
+}
+
+impl PerformanceSettingsReader for PerformanceSettingsStore {
+    fn current(&self) -> PerformanceCaptureSettings {
+        self.inner
+            .read()
+            .map_or_else(|poisoned| *poisoned.into_inner(), |guard| *guard)
+    }
+}
+
+impl PerformanceSettingsWriter for PerformanceSettingsStore {
+    fn set(&self, settings: PerformanceCaptureSettings) {
+        match self.inner.write() {
+            Ok(mut guard) => *guard = settings,
+            Err(poisoned) => *poisoned.into_inner() = settings,
         }
     }
 }

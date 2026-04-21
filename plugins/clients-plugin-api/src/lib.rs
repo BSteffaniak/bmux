@@ -17,7 +17,7 @@ bmux_plugin_schema_macros::schema! {
 }
 
 pub mod follow_state;
-pub use follow_state::{FollowEntry, FollowState, FollowTargetUpdate};
+pub use follow_state::FollowState;
 
 /// Capability identifiers gating access to this plugin's surfaces.
 ///

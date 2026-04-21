@@ -18,7 +18,7 @@ bmux_plugin_schema_macros::schema! {
 }
 
 pub mod context_state;
-pub use context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
+pub use context_state::ContextState;
 
 /// Capability identifiers gating access to this plugin's surfaces.
 ///

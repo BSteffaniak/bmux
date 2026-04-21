@@ -7,9 +7,11 @@
 mod persistence;
 
 use anyhow::{Context, Result};
-use bmux_clients_plugin_api::{FollowEntry, FollowState};
+use bmux_client_state::FollowEntry;
+use bmux_clients_plugin_api::FollowState;
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_contexts_plugin_api::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
+use bmux_context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, RuntimeContext};
+use bmux_contexts_plugin_api::ContextState;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
@@ -46,14 +48,15 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
-use bmux_performance_plugin_api::{
-    PerformanceCaptureSettings, PerformanceEventRateLimiter, PerformanceSettingsHandle,
+use bmux_performance_plugin_api::PerformanceEventRateLimiter;
+use bmux_performance_state::{
+    PerformanceSettingsHandle, PerformanceSettingsReader, PerformanceSettingsStore,
 };
 use bmux_recording_plugin_api::{
-    DualRuntimeSink, ManualRecordingRuntimeHandle, RecordMeta, RecordingPluginConfig,
-    RecordingRuntime, RecordingSink, RecordingSinkHandle, RollingRecordingRuntimeHandle,
-    RollingRecordingSettings,
+    DualRuntimeSink, ManualRecordingRuntimeHandle, RecordingPluginConfig, RecordingRuntime,
+    RollingRecordingRuntimeHandle, RollingRecordingSettings,
 };
+use bmux_recording_runtime::{RecordMeta, RecordingSink, RecordingSinkHandle};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
@@ -106,7 +109,7 @@ struct ServerState {
     rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
     rolling_recording_auto_start: bool,
     rolling_recording_defaults: RollingRecordingSettings,
-    performance_settings: Arc<std::sync::RwLock<PerformanceCaptureSettings>>,
+    performance_settings: PerformanceSettingsStore,
     rolling_recordings_dir: std::path::PathBuf,
     rolling_recording_segment_mb: usize,
     operation_lock: AsyncMutex<()>,
@@ -4386,23 +4389,19 @@ fn register_recording_plugin_state(
 
 /// Register the performance plugin's settings handle into the global
 /// plugin state registry. Server constructs the initial settings from
-/// the static config and shares the same `Arc<RwLock<_>>` with the
+/// the static config and shares a `PerformanceSettingsStore` with the
 /// plugin so the plugin's typed `SetSettings` handler mutates the
 /// record server's event-push rate limiter reads.
 ///
-/// Returns the `Arc<RwLock<PerformanceCaptureSettings>>` so `ServerState`
-/// can hold it directly for hot-path reads.
-fn register_performance_plugin_state(
-    config: &BmuxConfig,
-) -> Arc<std::sync::RwLock<PerformanceCaptureSettings>> {
-    let settings = Arc::new(std::sync::RwLock::new(
-        PerformanceCaptureSettings::from_config(config),
-    ));
-    let handle = Arc::new(std::sync::RwLock::new(PerformanceSettingsHandle(
-        Arc::clone(&settings),
+/// Returns the `PerformanceSettingsStore` so `ServerState` can hold a
+/// clone directly for hot-path reads.
+fn register_performance_plugin_state(config: &BmuxConfig) -> PerformanceSettingsStore {
+    let store = PerformanceSettingsStore::from_config(config);
+    let handle = Arc::new(std::sync::RwLock::new(PerformanceSettingsHandle::from_arc(
+        Arc::new(store.clone()),
     )));
     bmux_plugin::global_plugin_state_registry().register::<PerformanceSettingsHandle>(&handle);
-    settings
+    store
 }
 
 impl BmuxServer {
@@ -5178,10 +5177,8 @@ async fn handle_connection(
             let push_state = Arc::clone(&state);
             let push_client_id = client_id;
             event_push_task = Some(tokio::spawn(async move {
-                let push_perf_settings_state = Arc::clone(&push_state.performance_settings);
-                let mut push_perf_settings = push_perf_settings_state
-                    .read()
-                    .map_or_else(|_| PerformanceCaptureSettings::default(), |guard| *guard);
+                let push_perf_settings_store = push_state.performance_settings.clone();
+                let mut push_perf_settings = push_perf_settings_store.current();
                 let mut push_perf_rate_limiter =
                     PerformanceEventRateLimiter::new(push_perf_settings);
                 let mut push_perf_window = Duration::from_millis(push_perf_settings.window_ms);
@@ -5191,9 +5188,7 @@ async fn handle_connection(
                 let mut push_window_lagged_events = 0_u64;
                 let mut push_window_lagged_receives = 0_u64;
                 loop {
-                    let latest_push_perf_settings = push_perf_settings_state
-                        .read()
-                        .map_or(push_perf_settings, |guard| *guard);
+                    let latest_push_perf_settings = push_perf_settings_store.current();
                     if latest_push_perf_settings != push_perf_settings {
                         push_perf_settings = latest_push_perf_settings;
                         push_perf_rate_limiter =

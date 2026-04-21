@@ -8,8 +8,12 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-pub use bmux_clients_plugin_api::{FollowEntry, FollowState, FollowTargetUpdate};
+pub use bmux_clients_plugin_api::FollowState;
 
+use bmux_client_state::{
+    FollowEntry, FollowStateHandle, FollowStateReader, FollowStateSnapshot, FollowStateWriter,
+    FollowTargetUpdate,
+};
 use bmux_clients_plugin_api::clients_commands::{
     self, ClientAck, ClientsCommandsService, SetCurrentSessionError, SetFollowingError,
 };
@@ -17,16 +21,178 @@ use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
 use bmux_clients_plugin_api::clients_state::{
     self, ClientQueryError, ClientSummary, ClientsStateService,
 };
+use bmux_ipc::Event;
 use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
+
+/// Adapter wrapping the plugin's `Arc<RwLock<FollowState>>` and
+/// implementing the domain-agnostic [`FollowStateReader`] +
+/// [`FollowStateWriter`] traits from `bmux_client_state`.
+///
+/// Registered as a [`FollowStateHandle`] in the plugin state registry
+/// alongside the concrete `Arc<RwLock<FollowState>>` so consumers can
+/// read follow-state through the trait surface without naming the
+/// concrete plugin-owned type.
+struct FollowStateAdapter {
+    inner: Arc<RwLock<FollowState>>,
+}
+
+impl FollowStateAdapter {
+    fn with_read<T>(&self, f: impl FnOnce(&FollowState) -> T, fallback: T) -> T {
+        self.inner.read().map_or(fallback, |guard| f(&guard))
+    }
+
+    fn with_write<T>(&self, f: impl FnOnce(&mut FollowState) -> T, fallback: T) -> T {
+        self.inner
+            .write()
+            .map_or(fallback, |mut guard| f(&mut guard))
+    }
+}
+
+impl FollowStateReader for FollowStateAdapter {
+    fn selected_session(&self, client_id: ClientId) -> Option<SessionId> {
+        self.with_read(
+            |state| state.selected_sessions.get(&client_id).copied().flatten(),
+            None,
+        )
+    }
+
+    fn selected_context(&self, client_id: ClientId) -> Option<Uuid> {
+        self.with_read(
+            |state| state.selected_contexts.get(&client_id).copied().flatten(),
+            None,
+        )
+    }
+
+    fn follow_target(&self, client_id: ClientId) -> Option<FollowEntry> {
+        self.with_read(|state| state.follows.get(&client_id).copied(), None)
+    }
+
+    fn list_clients(&self) -> Vec<bmux_ipc::ClientSummary> {
+        self.with_read(
+            FollowState::list_clients,
+            Vec::<bmux_ipc::ClientSummary>::new(),
+        )
+    }
+
+    fn selected_target(&self, client_id: ClientId) -> Option<(Option<Uuid>, Option<SessionId>)> {
+        self.with_read(|state| state.selected_target(client_id), None)
+    }
+
+    fn is_connected(&self, client_id: ClientId) -> bool {
+        self.with_read(|state| state.connected_clients.contains(&client_id), false)
+    }
+}
+
+impl FollowStateWriter for FollowStateAdapter {
+    fn connect_client(&self, client_id: ClientId) {
+        self.with_write(|state| state.connect_client(client_id), ());
+    }
+
+    fn disconnect_client(&self, client_id: ClientId) -> Vec<Event> {
+        self.with_write(|state| state.disconnect_client(client_id), Vec::new())
+    }
+
+    fn set_selected_target(
+        &self,
+        client_id: ClientId,
+        context_id: Option<Uuid>,
+        session_id: Option<SessionId>,
+    ) {
+        self.with_write(
+            |state| state.set_selected_target(client_id, context_id, session_id),
+            (),
+        );
+    }
+
+    fn clear_all_selections(&self) {
+        self.with_write(
+            |state| {
+                let clients: Vec<ClientId> = state.connected_clients.iter().copied().collect();
+                for client_id in clients {
+                    state.selected_contexts.insert(client_id, None);
+                    state.selected_sessions.insert(client_id, None);
+                }
+            },
+            (),
+        );
+    }
+
+    fn sync_followers_from_leader(
+        &self,
+        leader_client_id: ClientId,
+        selected_context: Option<Uuid>,
+        selected_session: Option<SessionId>,
+    ) -> Vec<FollowTargetUpdate> {
+        self.with_write(
+            |state| {
+                state.sync_followers_from_leader(
+                    leader_client_id,
+                    selected_context,
+                    selected_session,
+                )
+            },
+            Vec::new(),
+        )
+    }
+
+    fn start_follow(
+        &self,
+        follower_client_id: ClientId,
+        leader_client_id: ClientId,
+        global: bool,
+    ) -> Result<(Option<Uuid>, Option<SessionId>), &'static str> {
+        self.with_write(
+            |state| state.start_follow(follower_client_id, leader_client_id, global),
+            Err("follow-state lock poisoned"),
+        )
+    }
+
+    fn stop_follow(&self, follower_client_id: ClientId) -> bool {
+        self.with_write(|state| state.stop_follow(follower_client_id), false)
+    }
+
+    fn snapshot(&self) -> FollowStateSnapshot {
+        self.with_read(
+            |state| FollowStateSnapshot {
+                connected_clients: state.connected_clients.clone(),
+                selected_contexts: state.selected_contexts.clone(),
+                selected_sessions: state.selected_sessions.clone(),
+                follows: state
+                    .follows
+                    .iter()
+                    .map(|(id, entry)| (*id, (*entry).into()))
+                    .collect(),
+            },
+            FollowStateSnapshot::default(),
+        )
+    }
+
+    fn restore_snapshot(&self, snapshot: FollowStateSnapshot) {
+        self.with_write(
+            |state| {
+                state.connected_clients = snapshot.connected_clients;
+                state.selected_contexts = snapshot.selected_contexts;
+                state.selected_sessions = snapshot.selected_sessions;
+                state.follows = snapshot
+                    .follows
+                    .into_iter()
+                    .map(|(id, entry)| (id, entry.into()))
+                    .collect();
+            },
+            (),
+        );
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SetCurrentSessionArgs {
@@ -57,6 +223,16 @@ impl RustPlugin for ClientsPlugin {
         // and there is exactly one bundled clients plugin per host).
         let state: Arc<RwLock<FollowState>> = Arc::new(RwLock::new(FollowState::default()));
         global_plugin_state_registry().register::<FollowState>(&state);
+
+        // Register the trait-object handle so consumers can reach
+        // follow state through the domain-agnostic reader/writer
+        // surface without naming the concrete plugin-owned type.
+        let adapter = FollowStateAdapter {
+            inner: Arc::clone(&state),
+        };
+        let handle = Arc::new(RwLock::new(FollowStateHandle::new(adapter)));
+        global_plugin_state_registry().register::<FollowStateHandle>(&handle);
+
         global_event_bus().register_channel::<ClientEvent>(clients_events::EVENT_KIND);
         Ok(bmux_plugin_sdk::EXIT_OK)
     }

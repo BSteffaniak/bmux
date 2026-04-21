@@ -9,7 +9,28 @@
 
 use anyhow::Result;
 use bmux_session_models::{ClientId, Session, SessionId, SessionInfo};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Snapshot of session-manager state suitable for persistence.
+///
+/// Wraps a `Vec<Session>` for symmetry with `FollowStateSnapshot` and
+/// `ContextStateSnapshot`. On restore, every session is inserted via
+/// [`SessionManagerWriter::insert_session`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionManagerSnapshot(pub Vec<Session>);
+
+impl SessionManagerSnapshot {
+    #[must_use]
+    pub fn new(sessions: Vec<Session>) -> Self {
+        Self(sessions)
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> Vec<Session> {
+        self.0
+    }
+}
 
 /// Read-only view over session-manager state.
 pub trait SessionManagerReader: Send + Sync {
@@ -46,9 +67,9 @@ pub trait SessionManagerWriter: SessionManagerReader {
     /// Remove a client from a session's client set.
     fn remove_client(&self, session_id: SessionId, client_id: &ClientId);
     /// Capture a full snapshot for persistence.
-    fn snapshot(&self) -> Vec<Session>;
+    fn snapshot(&self) -> SessionManagerSnapshot;
     /// Replace state with a previously-captured snapshot.
-    fn restore_snapshot(&self, sessions: Vec<Session>);
+    fn restore_snapshot(&self, snapshot: SessionManagerSnapshot);
 }
 
 /// Registry newtype wrapping an `Arc<dyn SessionManagerWriter>`.
@@ -101,8 +122,8 @@ impl SessionManagerWriter for NoopSessionManager {
     }
     fn add_client(&self, _session_id: SessionId, _client_id: ClientId) {}
     fn remove_client(&self, _session_id: SessionId, _client_id: &ClientId) {}
-    fn snapshot(&self) -> Vec<Session> {
-        Vec::new()
+    fn snapshot(&self) -> SessionManagerSnapshot {
+        SessionManagerSnapshot::default()
     }
-    fn restore_snapshot(&self, _sessions: Vec<Session>) {}
+    fn restore_snapshot(&self, _snapshot: SessionManagerSnapshot) {}
 }

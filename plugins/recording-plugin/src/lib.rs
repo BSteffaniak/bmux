@@ -26,9 +26,10 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_recording_plugin_api::{
     ManualRecordingRuntimeHandle, RECORDING_COMMANDS_INTERFACE, RECORDING_READ, RECORDING_WRITE,
-    RecordMeta, RecordingPluginConfig, RecordingRequest, RecordingResponse, RecordingRuntime,
+    RecordingPluginConfig, RecordingRequest, RecordingResponse, RecordingRuntime,
     RollingRecordingRuntimeHandle, RollingRecordingSettings,
 };
+use bmux_recording_runtime::RecordMeta;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 

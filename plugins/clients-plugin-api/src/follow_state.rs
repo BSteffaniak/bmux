@@ -18,28 +18,11 @@
 //! stop follow, update selected target) ultimately route through the
 //! clients plugin's typed dispatch surface.
 
+use bmux_client_state::{FollowEntry, FollowTargetUpdate};
 use bmux_ipc::{ClientSummary, Event};
 use bmux_session_models::{ClientId, SessionId};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
-
-/// A single follow relationship: `follower -> { leader, global }`.
-#[derive(Debug, Clone, Copy)]
-pub struct FollowEntry {
-    pub leader_client_id: ClientId,
-    pub global: bool,
-}
-
-/// A follow-relationship update emitted when a leader's selection
-/// changes and a global follower needs to be re-synced.
-#[allow(clippy::struct_field_names)]
-#[derive(Debug, Clone, Copy)]
-pub struct FollowTargetUpdate {
-    pub follower_client_id: ClientId,
-    pub leader_client_id: ClientId,
-    pub context_id: Option<Uuid>,
-    pub session_id: Option<SessionId>,
-}
 
 /// Authoritative tracking of connected clients, their selected
 /// context/session, and follow relationships between clients.

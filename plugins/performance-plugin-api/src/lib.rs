@@ -10,11 +10,10 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use bmux_config::{BmuxConfig, PerformanceRecordingLevel as ConfigPerformanceRecordingLevel};
-use bmux_ipc::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
+use bmux_ipc::PerformanceRuntimeSettings;
+use bmux_performance_state::PerformanceCaptureSettings;
 use bmux_plugin_sdk::{CapabilityId, InterfaceId, PluginEventKind};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Capability gating read access to the performance plugin's query
@@ -37,101 +36,6 @@ pub const PERFORMANCE_EVENTS_INTERFACE: InterfaceId =
 /// stream.
 pub const EVENT_KIND: PluginEventKind =
     PluginEventKind::from_static("bmux.performance/performance-events");
-
-// ── Canonical settings record ────────────────────────────────────────
-
-/// Normalized performance capture settings.
-///
-/// Server imports this type from the plugin-api crate and stores it in
-/// an `Arc<RwLock<_>>` behind a `PerformanceSettingsHandle` in the
-/// plugin state registry. The plugin's typed handlers read/write this
-/// record; server's event-push pump reads it for rate-limiting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PerformanceCaptureSettings {
-    pub level: PerformanceRecordingLevel,
-    pub window_ms: u64,
-    pub max_events_per_sec: u32,
-    pub max_payload_bytes_per_sec: usize,
-}
-
-impl Default for PerformanceCaptureSettings {
-    fn default() -> Self {
-        Self::from_config(&BmuxConfig::default())
-    }
-}
-
-impl PerformanceCaptureSettings {
-    const fn from_config_level(
-        level: ConfigPerformanceRecordingLevel,
-    ) -> PerformanceRecordingLevel {
-        match level {
-            ConfigPerformanceRecordingLevel::Off => PerformanceRecordingLevel::Off,
-            ConfigPerformanceRecordingLevel::Basic => PerformanceRecordingLevel::Basic,
-            ConfigPerformanceRecordingLevel::Detailed => PerformanceRecordingLevel::Detailed,
-            ConfigPerformanceRecordingLevel::Trace => PerformanceRecordingLevel::Trace,
-        }
-    }
-
-    #[must_use]
-    pub fn from_config(config: &BmuxConfig) -> Self {
-        let perf = &config.performance;
-        Self {
-            level: Self::from_config_level(perf.recording_level),
-            window_ms: perf.window_ms.max(1),
-            max_events_per_sec: perf.max_events_per_sec.max(1),
-            max_payload_bytes_per_sec: perf.max_payload_bytes_per_sec.max(1),
-        }
-    }
-
-    #[must_use]
-    pub fn from_runtime_settings(settings: &PerformanceRuntimeSettings) -> Self {
-        Self {
-            level: settings.recording_level,
-            window_ms: settings.window_ms.max(1),
-            max_events_per_sec: settings.max_events_per_sec.max(1),
-            max_payload_bytes_per_sec: settings.max_payload_bytes_per_sec.max(1),
-        }
-    }
-
-    #[must_use]
-    pub const fn to_runtime_settings(self) -> PerformanceRuntimeSettings {
-        PerformanceRuntimeSettings {
-            recording_level: self.level,
-            window_ms: self.window_ms,
-            max_events_per_sec: self.max_events_per_sec,
-            max_payload_bytes_per_sec: self.max_payload_bytes_per_sec,
-        }
-    }
-
-    const fn level_rank(level: PerformanceRecordingLevel) -> u8 {
-        match level {
-            PerformanceRecordingLevel::Off => 0,
-            PerformanceRecordingLevel::Basic => 1,
-            PerformanceRecordingLevel::Detailed => 2,
-            PerformanceRecordingLevel::Trace => 3,
-        }
-    }
-
-    #[must_use]
-    pub const fn level_at_least(self, level: PerformanceRecordingLevel) -> bool {
-        Self::level_rank(self.level) >= Self::level_rank(level)
-    }
-
-    #[must_use]
-    pub const fn enabled(self) -> bool {
-        !matches!(self.level, PerformanceRecordingLevel::Off)
-    }
-
-    #[must_use]
-    pub const fn level_label(self) -> &'static str {
-        match self.level {
-            PerformanceRecordingLevel::Off => "off",
-            PerformanceRecordingLevel::Basic => "basic",
-            PerformanceRecordingLevel::Detailed => "detailed",
-            PerformanceRecordingLevel::Trace => "trace",
-        }
-    }
-}
 
 // ── Rate limiter ─────────────────────────────────────────────────────
 
@@ -259,13 +163,6 @@ fn epoch_millis_now() -> u64 {
         .unwrap_or_default();
     now.as_millis() as u64
 }
-
-// ── Registry handle ──────────────────────────────────────────────────
-
-/// Newtype wrapper for registering an `Arc<RwLock<PerformanceCaptureSettings>>`
-/// in [`bmux_plugin::PluginStateRegistry`]. The registry is typed by
-/// concrete type; this wrapper gives us a concrete name to look up.
-pub struct PerformanceSettingsHandle(pub Arc<RwLock<PerformanceCaptureSettings>>);
 
 // ── Wire enums ───────────────────────────────────────────────────────
 

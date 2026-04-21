@@ -11,21 +11,11 @@
 //! `bmux_contexts_plugin_api` so core server code and other plugins
 //! can name it without depending on the plugin impl crate.
 
+use bmux_context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, RuntimeContext};
 use bmux_ipc::{ContextSelector, ContextSummary};
 use bmux_session_models::{ClientId, SessionId};
 use std::collections::{BTreeMap, VecDeque};
 use uuid::Uuid;
-
-/// Attribute name used to stamp a bound session id onto a context.
-pub const CONTEXT_SESSION_ID_ATTRIBUTE: &str = "bmux.session_id";
-
-/// A single context: id, optional display name, arbitrary attributes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeContext {
-    pub id: Uuid,
-    pub name: Option<String>,
-    pub attributes: BTreeMap<String, String>,
-}
 
 /// Authoritative tracking of runtime contexts, their session bindings,
 /// and per-client selections.

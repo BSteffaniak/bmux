@@ -15,9 +15,9 @@
 
 use bmux_performance_plugin_api::{
     EVENT_KIND, PERFORMANCE_COMMANDS_INTERFACE, PERFORMANCE_READ, PERFORMANCE_WRITE,
-    PerformanceCaptureSettings, PerformanceEvent, PerformanceRequest, PerformanceResponse,
-    PerformanceSettingsHandle,
+    PerformanceEvent, PerformanceRequest, PerformanceResponse,
 };
+use bmux_performance_state::{PerformanceCaptureSettings, PerformanceSettingsHandle};
 use bmux_plugin::{global_event_bus, global_plugin_state_registry};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
@@ -77,13 +77,8 @@ fn handle_get_settings() -> PerformanceResponse {
             settings: PerformanceCaptureSettings::default().to_runtime_settings(),
         };
     };
-    let Ok(settings_guard) = guard.0.read() else {
-        return PerformanceResponse::Settings {
-            settings: PerformanceCaptureSettings::default().to_runtime_settings(),
-        };
-    };
     PerformanceResponse::Settings {
-        settings: settings_guard.to_runtime_settings(),
+        settings: guard.0.current().to_runtime_settings(),
     }
 }
 
@@ -101,9 +96,7 @@ fn handle_set_settings(requested: &bmux_ipc::PerformanceRuntimeSettings) -> Perf
             settings: normalized,
         };
     };
-    if let Ok(mut settings_guard) = guard.0.write() {
-        *settings_guard = normalized_capture;
-    }
+    guard.0.set(normalized_capture);
 
     // Emit the typed event; server's `spawn_performance_events_bridge`
     // translates this to the wire `Event::PerformanceSettingsUpdated`.

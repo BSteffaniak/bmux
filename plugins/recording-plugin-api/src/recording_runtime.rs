@@ -1,9 +1,9 @@
-use crate::RecordMeta;
 use anyhow::{Context, Result};
 use bmux_ipc::{
     DisplayTrackEnvelope, DisplayTrackEvent, RecordingEventEnvelope, RecordingEventKind,
     RecordingPayload, RecordingProfile, RecordingStatus, RecordingSummary,
 };
+use bmux_recording_runtime::RecordMeta;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
