@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Typed public API of the bmux performance plugin (settings + rate limiter + typed request/response enums)"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "api", "performance"]
+license     = { workspace = true }
+name        = "bmux_performance_plugin_api"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_config     = { workspace = true }
+bmux_ipc        = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
+serde           = { workspace = true, features = ["derive", "std"] }
+serde_json      = { workspace = true, features = ["std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

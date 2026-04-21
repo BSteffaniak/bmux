@@ -50,6 +50,8 @@ members = [
     "plugins/decoration-plugin-api",
     "plugins/plugin-cli-plugin",
     "plugins/permissions-plugin",
+    "plugins/performance-plugin",
+    "plugins/performance-plugin-api",
     "plugins/prompted-actions-plugin",
     "plugins/recording-plugin",
     "plugins/recording-plugin-api",
@@ -143,6 +145,8 @@ bmux_control_catalog_plugin     = { version = "0.0.1-alpha.0", default-features 
 bmux_control_catalog_plugin_api = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/control-catalog-plugin-api" }
 bmux_decoration_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/decoration-plugin" }
 bmux_decoration_plugin_api      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/decoration-plugin-api" }
+bmux_performance_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/performance-plugin" }
+bmux_performance_plugin_api     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/performance-plugin-api" }
 bmux_permissions_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/permissions-plugin" }
 bmux_plugin_cli_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/plugin-cli-plugin" }
 bmux_prompted_actions_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/prompted-actions-plugin" }

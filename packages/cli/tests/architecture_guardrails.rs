@@ -238,6 +238,105 @@ fn event_core_crate_has_no_domain_event_types() {
     }
 }
 
+/// Verify that the performance-plugin crates exist and that core does
+/// not define the `PerformanceCaptureSettings` or
+/// `PerformanceEventRateLimiter` types. Both were relocated from
+/// `packages/server/src/lib.rs` to
+/// `plugins/performance-plugin-api/src/lib.rs`; server imports them
+/// via `use bmux_performance_plugin_api::...` without depending on
+/// the plugin impl crate.
+#[test]
+fn performance_plugin_exists() {
+    let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/performance-plugin-api");
+    let plugin_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/performance-plugin");
+    assert!(
+        api_dir.join("Cargo.toml").exists(),
+        "plugins/performance-plugin-api/Cargo.toml must exist",
+    );
+    assert!(
+        plugin_dir.join("Cargo.toml").exists(),
+        "plugins/performance-plugin/Cargo.toml must exist",
+    );
+
+    let plugin_api_source = include_str!("../../../plugins/performance-plugin-api/src/lib.rs");
+    assert!(
+        plugin_api_source.contains("pub struct PerformanceCaptureSettings"),
+        "plugins/performance-plugin-api/src/lib.rs must export the \
+         canonical `PerformanceCaptureSettings` struct",
+    );
+    assert!(
+        plugin_api_source.contains("pub struct PerformanceEventRateLimiter"),
+        "plugins/performance-plugin-api/src/lib.rs must export the \
+         canonical `PerformanceEventRateLimiter` struct",
+    );
+    assert!(
+        plugin_api_source.contains("pub struct PerformanceSettingsHandle"),
+        "plugins/performance-plugin-api/src/lib.rs must export the \
+         `PerformanceSettingsHandle` registry wrapper",
+    );
+
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_source = production_section(server_source);
+    assert!(
+        !server_source.contains("struct PerformanceCaptureSettings {"),
+        "packages/server/src/lib.rs must not define \
+         `PerformanceCaptureSettings`; the type lives in \
+         bmux_performance_plugin_api",
+    );
+    assert!(
+        !server_source.contains("struct PerformanceEventRateLimiter {"),
+        "packages/server/src/lib.rs must not define \
+         `PerformanceEventRateLimiter`; the type lives in \
+         bmux_performance_plugin_api",
+    );
+    assert!(
+        server_source.contains("use bmux_performance_plugin_api::"),
+        "packages/server/src/lib.rs must import performance types via \
+         `use bmux_performance_plugin_api::...`",
+    );
+    assert!(
+        server_source.contains("register::<PerformanceSettingsHandle>"),
+        "packages/server/src/lib.rs must register a \
+         `PerformanceSettingsHandle` into the plugin state registry so \
+         the performance plugin can reach the active settings",
+    );
+    assert!(
+        server_source.contains("fn spawn_performance_events_bridge"),
+        "packages/server/src/lib.rs must define \
+         `spawn_performance_events_bridge` to map the performance \
+         plugin's typed `PerformanceEvent::SettingsUpdated` into the \
+         legacy wire `Event::PerformanceSettingsUpdated` for \
+         cross-process subscribers",
+    );
+}
+
+/// Verify that `Request::{PerformanceStatus, PerformanceSet}` and
+/// `ResponsePayload::{PerformanceStatus, PerformanceUpdated}` have
+/// been deleted from `bmux_ipc`. Performance settings queries and
+/// mutations go through the `bmux.performance` plugin's typed
+/// `performance-commands::dispatch` service.
+#[test]
+fn performance_ipc_variants_are_absent() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    let denied = [
+        "Request::PerformanceStatus",
+        "Request::PerformanceSet",
+        "ResponsePayload::PerformanceStatus",
+        "ResponsePayload::PerformanceUpdated",
+    ];
+    for marker in denied {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; \
+             performance settings go through \
+             `performance-commands::dispatch` typed dispatch provided \
+             by the `bmux.performance` plugin",
+        );
+    }
+}
+
 /// Verify that the `bmux` umbrella crate doesn't re-export domain
 /// crates. Only domain-agnostic building blocks should be exposed;
 /// `session` and `terminal` features are not present.

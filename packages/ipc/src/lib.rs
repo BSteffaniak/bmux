@@ -601,10 +601,6 @@ pub enum Request {
     /// clients (which split the socket into read/write halves and demux
     /// incoming frames) should send this request.
     EnableEventPush,
-    PerformanceStatus,
-    PerformanceSet {
-        settings: PerformanceRuntimeSettings,
-    },
     SetClientAttachPolicy {
         allow_detach: bool,
     },
@@ -1230,12 +1226,6 @@ pub enum ResponsePayload {
     },
     /// Acknowledgement that server-push event delivery has been enabled.
     EventPushEnabled,
-    PerformanceStatus {
-        settings: PerformanceRuntimeSettings,
-    },
-    PerformanceUpdated {
-        settings: PerformanceRuntimeSettings,
-    },
     ClientAttachPolicySet {
         allow_detach: bool,
     },
@@ -2358,12 +2348,6 @@ mod tests {
                         name: Some("test".into()),
                     },
                 ],
-            },
-            ResponsePayload::PerformanceStatus {
-                settings: sample_performance_runtime_settings(),
-            },
-            ResponsePayload::PerformanceUpdated {
-                settings: sample_performance_runtime_settings(),
             },
             ResponsePayload::Detached,
             ResponsePayload::PaneDirectInputAccepted { bytes: 5, pane_id },

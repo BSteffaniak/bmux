@@ -58,6 +58,9 @@ bmux_control_catalog_plugin = { workspace = true, optional = true, features = [
 bmux_decoration_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
+bmux_performance_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
 bmux_permissions_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -158,6 +161,7 @@ fail-on-warnings = [
     "bmux_keybind/fail-on-warnings",
     "bmux_keyboard/fail-on-warnings",
     "bmux_permissions_plugin?/fail-on-warnings",
+    "bmux_performance_plugin?/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_cli_plugin?/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
@@ -182,6 +186,7 @@ bundled-plugins = [
     "bundled-plugin-cluster",
     "bundled-plugin-contexts",
     "bundled-plugin-control-catalog",
+    "bundled-plugin-performance",
     "bundled-plugin-permissions",
     "bundled-plugin-cli",
     "bundled-plugin-prompted-actions",
@@ -199,6 +204,7 @@ bundled-plugin-cluster          = ["dep:bmux_cluster_plugin"]
 bundled-plugin-contexts         = ["dep:bmux_contexts_plugin"]
 bundled-plugin-control-catalog  = ["dep:bmux_control_catalog_plugin"]
 bundled-plugin-decoration       = ["dep:bmux_decoration_plugin"]
+bundled-plugin-performance      = ["dep:bmux_performance_plugin"]
 bundled-plugin-permissions      = ["dep:bmux_permissions_plugin"]
 bundled-plugin-prompted-actions = ["dep:bmux_prompted_actions_plugin"]
 bundled-plugin-recording        = ["dep:bmux_recording_plugin"]

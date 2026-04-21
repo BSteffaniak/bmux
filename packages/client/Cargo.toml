@@ -16,6 +16,7 @@ bmux_clients_plugin_api         = { workspace = true }
 bmux_config                     = { workspace = true }
 bmux_control_catalog_plugin_api = { workspace = true }
 bmux_ipc                        = { workspace = true }
+bmux_performance_plugin_api     = { workspace = true }
 bmux_recording_plugin_api       = { workspace = true }
 
 # External dependencies

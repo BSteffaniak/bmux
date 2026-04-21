@@ -140,6 +140,10 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/control-catalog-plugin/plugin.toml"),
     plugin_type = bmux_control_catalog_plugin::ControlCatalogPlugin;
 
+    feature = "bundled-plugin-performance",
+    manifest = include_str!("../../../../plugins/performance-plugin/plugin.toml"),
+    plugin_type = bmux_performance_plugin::PerformancePlugin;
+
     feature = "bundled-plugin-permissions",
     manifest = include_str!("../../../../plugins/permissions-plugin/plugin.toml"),
     plugin_type = bmux_permissions_plugin::PermissionsPlugin;

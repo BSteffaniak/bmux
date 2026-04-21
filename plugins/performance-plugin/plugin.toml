@@ -1,0 +1,13 @@
+execution_class       = "native_fast"
+id                    = "bmux.performance"
+name                  = "bmux Performance"
+owns_namespaces       = []
+provided_capabilities = ["bmux.performance.read", "bmux.performance.write"]
+provided_features     = ["bmux.performance"]
+required_capabilities = []
+version               = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.performance.read"
+interface_id = "performance-commands"
+kind         = "command"

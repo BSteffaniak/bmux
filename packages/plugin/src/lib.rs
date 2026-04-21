@@ -26,6 +26,7 @@ mod registry;
 pub mod test_support;
 mod typed_service_caller;
 
+pub use bmux_plugin_sdk::PluginEventKind;
 pub use declaration::{
     NativePlugin, PluginDeclaration, PluginDependency, PluginEntrypoint, PluginExecutionClass,
     PluginId, PluginLifecycle, PluginOwnedPath,

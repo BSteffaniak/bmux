@@ -142,12 +142,14 @@ The server's authoritative handle flows through its request pipeline.
 
 Plugin-owned state type locations:
 
-| Type                                | Owner plugin             | Location                                             |
-| ----------------------------------- | ------------------------ | ---------------------------------------------------- |
-| `FollowState`                       | `clients-plugin`         | `plugins/clients-plugin-api/src/follow_state.rs`     |
-| `ContextState`                      | `contexts-plugin`        | `plugins/contexts-plugin-api/src/context_state.rs`   |
-| `SessionManager`                    | `sessions-plugin`        | `plugins/sessions-plugin-api/src/session_manager.rs` |
-| Catalog revision counter + snapshot | `control-catalog-plugin` | `plugins/control-catalog-plugin/src/lib.rs`          |
+| Type                                        | Owner plugin             | Location                                                                                            |
+| ------------------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------- |
+| `FollowState`                               | `clients-plugin`         | `plugins/clients-plugin-api/src/follow_state.rs`                                                    |
+| `ContextState`                              | `contexts-plugin`        | `plugins/contexts-plugin-api/src/context_state.rs`                                                  |
+| `SessionManager`                            | `sessions-plugin`        | `plugins/sessions-plugin-api/src/session_manager.rs`                                                |
+| `RecordingRuntime` + sink trait             | `recording-plugin`       | `plugins/recording-plugin-api/src/recording_runtime.rs` + `plugins/recording-plugin-api/src/lib.rs` |
+| `PerformanceCaptureSettings` + rate limiter | `performance-plugin`     | `plugins/performance-plugin-api/src/lib.rs`                                                         |
+| Catalog revision counter + snapshot         | `control-catalog-plugin` | `plugins/control-catalog-plugin/src/lib.rs`                                                         |
 
 The authoritative state types (`FollowState`, `ContextState`,
 `SessionManager`) live in the corresponding `*-plugin-api` crates, not

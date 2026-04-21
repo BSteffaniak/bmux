@@ -20,6 +20,7 @@ use bmux_ipc::{
     RecordingRollingStatus, RecordingStatus, RecordingSummary, Request, Response, ResponsePayload,
     ServerSnapshotStatus, SessionSelector, decode, default_supported_capabilities, encode,
 };
+use bmux_performance_plugin_api::{PerformanceRequest, PerformanceResponse};
 use bmux_recording_plugin_api::{RecordingRequest, RecordingResponse};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -1344,12 +1345,10 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn performance_status(&mut self) -> Result<PerformanceRuntimeSettings> {
-        match self.request(Request::PerformanceStatus).await? {
-            ResponsePayload::PerformanceStatus { settings } => Ok(settings),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected performance status",
-            )),
-        }
+        let PerformanceResponse::Settings { settings } = self
+            .dispatch_performance(PerformanceRequest::GetSettings)
+            .await?;
+        Ok(settings)
     }
 
     /// Update runtime performance telemetry settings.
@@ -1361,12 +1360,32 @@ impl BmuxClient {
         &mut self,
         settings: PerformanceRuntimeSettings,
     ) -> Result<PerformanceRuntimeSettings> {
-        match self.request(Request::PerformanceSet { settings }).await? {
-            ResponsePayload::PerformanceUpdated { settings } => Ok(settings),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected performance updated",
-            )),
-        }
+        let PerformanceResponse::Settings { settings } = self
+            .dispatch_performance(PerformanceRequest::SetSettings { settings })
+            .await?;
+        Ok(settings)
+    }
+
+    /// Dispatch a typed `PerformanceRequest` to the `bmux.performance`
+    /// plugin's `performance-commands` service and return the typed
+    /// response.
+    async fn dispatch_performance(
+        &mut self,
+        request: PerformanceRequest,
+    ) -> Result<PerformanceResponse> {
+        let payload = bmux_ipc::encode(&request)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to encode performance request"))?;
+        let response_bytes = self
+            .invoke_service_raw(
+                "bmux.performance.read",
+                InvokeServiceKind::Command,
+                "performance-commands",
+                "dispatch",
+                payload,
+            )
+            .await?;
+        bmux_ipc::decode(&response_bytes)
+            .map_err(|_| ClientError::UnexpectedResponse("failed to decode performance response"))
     }
 
     /// Subscribe this client to server lifecycle events.
@@ -2672,8 +2691,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
         Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
         Request::AttachPaneImages { .. } => "attach_pane_images",
-        Request::PerformanceStatus => "performance_status",
-        Request::PerformanceSet { .. } => "performance_set",
         Request::SetClientAttachPolicy { .. } => "set_client_attach_policy",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
@@ -2719,8 +2736,6 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
             ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
             ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
-            ResponsePayload::PerformanceStatus { .. } => "performance_status",
-            ResponsePayload::PerformanceUpdated { .. } => "performance_updated",
             ResponsePayload::ClientAttachPolicySet { .. } => "client_attach_policy_set",
             ResponsePayload::Detached => "detached",
             ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",

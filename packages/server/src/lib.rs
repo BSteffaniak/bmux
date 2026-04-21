@@ -8,9 +8,7 @@ mod persistence;
 
 use anyhow::{Context, Result};
 use bmux_clients_plugin_api::{FollowEntry, FollowState};
-use bmux_config::{
-    BmuxConfig, ConfigPaths, PerformanceRecordingLevel as ConfigPerformanceRecordingLevel,
-};
+use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_contexts_plugin_api::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextState, RuntimeContext};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
@@ -20,11 +18,10 @@ use bmux_ipc::{
     AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector, ControlCatalogScope,
     Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, InteractiveRegion, IpcEndpoint,
     PaneFocusDirection, PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
-    PaneSplitDirection, PaneState, PaneSummary, PerformanceRecordingLevel,
-    PerformanceRuntimeSettings, ProtocolContract, RecordingEventKind, RecordingPayload,
-    RecordingProfile, RecordingRollingStartOptions, RecordingSummary, Request, Response,
-    ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
-    default_supported_capabilities, encode, negotiate_protocol,
+    PaneSplitDirection, PaneState, PaneSummary, PerformanceRecordingLevel, ProtocolContract,
+    RecordingEventKind, RecordingPayload, RecordingProfile, RecordingRollingStartOptions,
+    RecordingSummary, Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector,
+    SessionSummary, decode, default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_session_models::{ClientId, Session, SessionId};
 use bmux_sessions_plugin_api::SessionManager;
@@ -49,6 +46,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
+use bmux_performance_plugin_api::{
+    PerformanceCaptureSettings, PerformanceEventRateLimiter, PerformanceSettingsHandle,
+};
 use bmux_recording_plugin_api::{
     DualRuntimeSink, ManualRecordingRuntimeHandle, RecordMeta, RecordingPluginConfig,
     RecordingRuntime, RecordingSink, RecordingSinkHandle, RollingRecordingRuntimeHandle,
@@ -73,197 +73,6 @@ const SNAPSHOT_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(300);
 const OFFLINE_SNAPSHOT_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const OFFLINE_SNAPSHOT_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const EVENT_PUSH_CHANNEL_CAPACITY: usize = 256;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PerformanceCaptureSettings {
-    level: PerformanceRecordingLevel,
-    window_ms: u64,
-    max_events_per_sec: u32,
-    max_payload_bytes_per_sec: usize,
-}
-
-impl Default for PerformanceCaptureSettings {
-    fn default() -> Self {
-        Self::from_config(&BmuxConfig::default())
-    }
-}
-
-impl PerformanceCaptureSettings {
-    const fn from_config_level(
-        level: ConfigPerformanceRecordingLevel,
-    ) -> PerformanceRecordingLevel {
-        match level {
-            ConfigPerformanceRecordingLevel::Off => PerformanceRecordingLevel::Off,
-            ConfigPerformanceRecordingLevel::Basic => PerformanceRecordingLevel::Basic,
-            ConfigPerformanceRecordingLevel::Detailed => PerformanceRecordingLevel::Detailed,
-            ConfigPerformanceRecordingLevel::Trace => PerformanceRecordingLevel::Trace,
-        }
-    }
-
-    fn from_config(config: &BmuxConfig) -> Self {
-        let perf = &config.performance;
-        Self {
-            level: Self::from_config_level(perf.recording_level),
-            window_ms: perf.window_ms.max(1),
-            max_events_per_sec: perf.max_events_per_sec.max(1),
-            max_payload_bytes_per_sec: perf.max_payload_bytes_per_sec.max(1),
-        }
-    }
-
-    fn from_runtime_settings(settings: &PerformanceRuntimeSettings) -> Self {
-        Self {
-            level: settings.recording_level,
-            window_ms: settings.window_ms.max(1),
-            max_events_per_sec: settings.max_events_per_sec.max(1),
-            max_payload_bytes_per_sec: settings.max_payload_bytes_per_sec.max(1),
-        }
-    }
-
-    const fn to_runtime_settings(self) -> PerformanceRuntimeSettings {
-        PerformanceRuntimeSettings {
-            recording_level: self.level,
-            window_ms: self.window_ms,
-            max_events_per_sec: self.max_events_per_sec,
-            max_payload_bytes_per_sec: self.max_payload_bytes_per_sec,
-        }
-    }
-
-    const fn level_rank(level: PerformanceRecordingLevel) -> u8 {
-        match level {
-            PerformanceRecordingLevel::Off => 0,
-            PerformanceRecordingLevel::Basic => 1,
-            PerformanceRecordingLevel::Detailed => 2,
-            PerformanceRecordingLevel::Trace => 3,
-        }
-    }
-
-    const fn level_at_least(self, level: PerformanceRecordingLevel) -> bool {
-        Self::level_rank(self.level) >= Self::level_rank(level)
-    }
-
-    const fn enabled(self) -> bool {
-        !matches!(self.level, PerformanceRecordingLevel::Off)
-    }
-
-    const fn level_label(self) -> &'static str {
-        match self.level {
-            PerformanceRecordingLevel::Off => "off",
-            PerformanceRecordingLevel::Basic => "basic",
-            PerformanceRecordingLevel::Detailed => "detailed",
-            PerformanceRecordingLevel::Trace => "trace",
-        }
-    }
-}
-
-#[derive(Debug)]
-struct PerformanceEventRateLimiter {
-    settings: PerformanceCaptureSettings,
-    rate_window_started_at: Instant,
-    emitted_events_in_window: u32,
-    emitted_payload_bytes_in_window: usize,
-    dropped_events_since_emit: u64,
-    dropped_payload_bytes_since_emit: u64,
-}
-
-impl PerformanceEventRateLimiter {
-    fn new(settings: PerformanceCaptureSettings) -> Self {
-        Self {
-            settings,
-            rate_window_started_at: Instant::now(),
-            emitted_events_in_window: 0,
-            emitted_payload_bytes_in_window: 0,
-            dropped_events_since_emit: 0,
-            dropped_payload_bytes_since_emit: 0,
-        }
-    }
-
-    fn reset_rate_window_if_needed(&mut self) {
-        if self.rate_window_started_at.elapsed() >= Duration::from_secs(1) {
-            self.rate_window_started_at = Instant::now();
-            self.emitted_events_in_window = 0;
-            self.emitted_payload_bytes_in_window = 0;
-        }
-    }
-
-    fn can_emit_payload(&mut self, payload_len: usize) -> bool {
-        if !self.settings.enabled() {
-            return false;
-        }
-
-        self.reset_rate_window_if_needed();
-
-        let event_limit_hit = self.emitted_events_in_window >= self.settings.max_events_per_sec;
-        let payload_limit_hit = self
-            .emitted_payload_bytes_in_window
-            .saturating_add(payload_len)
-            > self.settings.max_payload_bytes_per_sec;
-        if event_limit_hit || payload_limit_hit {
-            self.dropped_events_since_emit = self.dropped_events_since_emit.saturating_add(1);
-            self.dropped_payload_bytes_since_emit = self
-                .dropped_payload_bytes_since_emit
-                .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
-            return false;
-        }
-
-        self.emitted_events_in_window = self.emitted_events_in_window.saturating_add(1);
-        self.emitted_payload_bytes_in_window = self
-            .emitted_payload_bytes_in_window
-            .saturating_add(payload_len);
-        true
-    }
-
-    fn encode_payload(&mut self, payload: serde_json::Value) -> Option<Vec<u8>> {
-        if !self.settings.enabled() {
-            return None;
-        }
-
-        let mut object = match payload {
-            serde_json::Value::Object(map) => map,
-            other => {
-                let mut map = serde_json::Map::new();
-                map.insert("value".to_string(), other);
-                map
-            }
-        };
-
-        object.insert(
-            "schema_version".to_string(),
-            serde_json::Value::from(bmux_ipc::PERF_RECORDING_SCHEMA_VERSION),
-        );
-        object.insert(
-            "level".to_string(),
-            serde_json::Value::String(self.settings.level_label().to_string()),
-        );
-        object.insert(
-            "runtime".to_string(),
-            serde_json::Value::String("server".to_string()),
-        );
-        object.insert(
-            "ts_epoch_ms".to_string(),
-            serde_json::Value::from(epoch_millis_now()),
-        );
-
-        if self.dropped_events_since_emit > 0 || self.dropped_payload_bytes_since_emit > 0 {
-            object.insert(
-                "dropped_events_since_emit".to_string(),
-                serde_json::Value::from(self.dropped_events_since_emit),
-            );
-            object.insert(
-                "dropped_payload_bytes_since_emit".to_string(),
-                serde_json::Value::from(self.dropped_payload_bytes_since_emit),
-            );
-            self.dropped_events_since_emit = 0;
-            self.dropped_payload_bytes_since_emit = 0;
-        }
-
-        let encoded = serde_json::to_vec(&serde_json::Value::Object(object)).ok()?;
-        if self.can_emit_payload(encoded.len()) {
-            Some(encoded)
-        } else {
-            None
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfflineSessionKillTarget {
@@ -297,7 +106,7 @@ struct ServerState {
     rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
     rolling_recording_auto_start: bool,
     rolling_recording_defaults: RollingRecordingSettings,
-    performance_settings: Arc<Mutex<PerformanceCaptureSettings>>,
+    performance_settings: Arc<std::sync::RwLock<PerformanceCaptureSettings>>,
     rolling_recordings_dir: std::path::PathBuf,
     rolling_recording_segment_mb: usize,
     operation_lock: AsyncMutex<()>,
@@ -4575,6 +4384,27 @@ fn register_recording_plugin_state(
     bmux_plugin::global_plugin_state_registry().register::<RecordingPluginConfig>(&config_handle);
 }
 
+/// Register the performance plugin's settings handle into the global
+/// plugin state registry. Server constructs the initial settings from
+/// the static config and shares the same `Arc<RwLock<_>>` with the
+/// plugin so the plugin's typed `SetSettings` handler mutates the
+/// record server's event-push rate limiter reads.
+///
+/// Returns the `Arc<RwLock<PerformanceCaptureSettings>>` so `ServerState`
+/// can hold it directly for hot-path reads.
+fn register_performance_plugin_state(
+    config: &BmuxConfig,
+) -> Arc<std::sync::RwLock<PerformanceCaptureSettings>> {
+    let settings = Arc::new(std::sync::RwLock::new(
+        PerformanceCaptureSettings::from_config(config),
+    ));
+    let handle = Arc::new(std::sync::RwLock::new(PerformanceSettingsHandle(
+        Arc::clone(&settings),
+    )));
+    bmux_plugin::global_plugin_state_registry().register::<PerformanceSettingsHandle>(&handle);
+    settings
+}
+
 impl BmuxServer {
     #[allow(clippy::too_many_arguments)]
     fn new_with_snapshot(
@@ -4637,6 +4467,12 @@ impl BmuxServer {
             &rolling_recording_defaults,
         );
 
+        // Register the performance plugin's settings handle into the
+        // plugin state registry. Server's event-push rate limiter
+        // reads the registered handle, and the performance plugin's
+        // `SetSettings` handler writes into it.
+        let performance_settings = register_performance_plugin_state(&config);
+
         let (event_broadcast_tx, _) =
             tokio::sync::broadcast::channel::<Event>(EVENT_PUSH_CHANNEL_CAPACITY);
         Self {
@@ -4661,9 +4497,7 @@ impl BmuxServer {
                 rolling_recording_auto_start: rolling_recording_auto_start
                     && rolling_runtime_available,
                 rolling_recording_defaults,
-                performance_settings: Arc::new(Mutex::new(
-                    PerformanceCaptureSettings::from_config(&config),
-                )),
+                performance_settings,
                 rolling_recordings_dir,
                 rolling_recording_segment_mb: segment_mb,
                 operation_lock: AsyncMutex::new(()),
@@ -4912,6 +4746,12 @@ impl BmuxServer {
         // FollowTargetChanged}` for cross-process attach-UI
         // subscribers.
         spawn_client_events_bridge(Arc::clone(&self.state));
+
+        // Bridge typed `PerformanceEvent::SettingsUpdated` from the
+        // performance plugin into the legacy wire
+        // `Event::PerformanceSettingsUpdated` for cross-process
+        // subscribers (attach UIs, telemetry collectors).
+        spawn_performance_events_bridge(Arc::clone(&self.state));
 
         // Periodic recording retention enforcement.
         let recording_prune_runtime = Arc::clone(&self.state.manual_recording_runtime);
@@ -5340,7 +5180,7 @@ async fn handle_connection(
             event_push_task = Some(tokio::spawn(async move {
                 let push_perf_settings_state = Arc::clone(&push_state.performance_settings);
                 let mut push_perf_settings = push_perf_settings_state
-                    .lock()
+                    .read()
                     .map_or_else(|_| PerformanceCaptureSettings::default(), |guard| *guard);
                 let mut push_perf_rate_limiter =
                     PerformanceEventRateLimiter::new(push_perf_settings);
@@ -5352,7 +5192,7 @@ async fn handle_connection(
                 let mut push_window_lagged_receives = 0_u64;
                 loop {
                     let latest_push_perf_settings = push_perf_settings_state
-                        .lock()
+                        .read()
                         .map_or(push_perf_settings, |guard| *guard);
                     if latest_push_perf_settings != push_perf_settings {
                         push_perf_settings = latest_push_perf_settings;
@@ -5625,39 +5465,56 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
 /// `Event::ControlCatalogChanged` on the server's cross-process event
 /// pipeline. This is how pre-existing attach-UI subscribers keep
 /// receiving catalog-changed events after the migration.
-fn spawn_control_catalog_bridge(state: Arc<ServerState>) {
-    use bmux_control_catalog_plugin_api::control_catalog_events::{
-        self, CatalogEvent, CatalogScope,
-    };
-    let Ok(mut rx) = bmux_plugin::global_event_bus()
-        .subscribe::<CatalogEvent>(&control_catalog_events::EVENT_KIND)
-    else {
+/// Generic event-bridge helper: subscribe to a typed plugin event on
+/// the plugin event bus, map each event through `mapper` to an
+/// optional wire `Event`, and fan out via `emit_event` on the server's
+/// cross-process pipeline.
+///
+/// Returning `None` from `mapper` skips emission for events that have
+/// no wire equivalent (e.g. plugin-internal signals).
+fn spawn_event_bridge<E, F>(
+    state: Arc<ServerState>,
+    kind: &bmux_plugin::PluginEventKind,
+    mut mapper: F,
+) where
+    E: Clone + Send + Sync + 'static,
+    F: FnMut(E) -> Option<Event> + Send + 'static,
+{
+    let Ok(mut rx) = bmux_plugin::global_event_bus().subscribe::<E>(kind) else {
         return;
     };
     tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
-            let CatalogEvent::Changed {
-                revision,
-                scopes,
-                full_resync,
-            } = (*event).clone();
-            let mapped_scopes = scopes
-                .into_iter()
-                .map(|scope| match scope {
-                    CatalogScope::Sessions => ControlCatalogScope::Sessions,
-                    CatalogScope::Contexts => ControlCatalogScope::Contexts,
-                    CatalogScope::Bindings => ControlCatalogScope::Bindings,
-                })
-                .collect();
-            let _ = emit_event(
-                &state,
-                Event::ControlCatalogChanged {
-                    revision,
-                    scopes: mapped_scopes,
-                    full_resync,
-                },
-            );
+            if let Some(wire_event) = mapper((*event).clone()) {
+                let _ = emit_event(&state, wire_event);
+            }
         }
+    });
+}
+
+fn spawn_control_catalog_bridge(state: Arc<ServerState>) {
+    use bmux_control_catalog_plugin_api::control_catalog_events::{
+        self, CatalogEvent, CatalogScope,
+    };
+    spawn_event_bridge::<CatalogEvent, _>(state, &control_catalog_events::EVENT_KIND, |event| {
+        let CatalogEvent::Changed {
+            revision,
+            scopes,
+            full_resync,
+        } = event;
+        let mapped_scopes = scopes
+            .into_iter()
+            .map(|scope| match scope {
+                CatalogScope::Sessions => ControlCatalogScope::Sessions,
+                CatalogScope::Contexts => ControlCatalogScope::Contexts,
+                CatalogScope::Bindings => ControlCatalogScope::Bindings,
+            })
+            .collect();
+        Some(Event::ControlCatalogChanged {
+            revision,
+            scopes: mapped_scopes,
+            full_resync,
+        })
     });
 }
 
@@ -5672,54 +5529,48 @@ fn spawn_control_catalog_bridge(state: Arc<ServerState>) {
 /// not bridge to the wire today.
 fn spawn_client_events_bridge(state: Arc<ServerState>) {
     use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
-    let Ok(mut rx) =
-        bmux_plugin::global_event_bus().subscribe::<ClientEvent>(&clients_events::EVENT_KIND)
-    else {
-        return;
-    };
-    tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
-            match (*event).clone() {
-                ClientEvent::FollowStarted {
-                    follower_client_id,
-                    leader_client_id,
-                    global,
-                } => {
-                    let _ = emit_event(
-                        &state,
-                        Event::FollowStarted {
-                            follower_client_id,
-                            leader_client_id,
-                            global,
-                        },
-                    );
-                }
-                ClientEvent::FollowStopped { follower_client_id } => {
-                    let _ = emit_event(&state, Event::FollowStopped { follower_client_id });
-                }
-                ClientEvent::FollowTargetChanged {
-                    follower_client_id,
-                    leader_client_id,
-                    context_id,
-                    session_id,
-                } => {
-                    let _ = emit_event(
-                        &state,
-                        Event::FollowTargetChanged {
-                            follower_client_id,
-                            leader_client_id,
-                            context_id,
-                            session_id,
-                        },
-                    );
-                }
-                ClientEvent::Attached { .. }
-                | ClientEvent::Detached { .. }
-                | ClientEvent::SessionSelected { .. }
-                | ClientEvent::FollowChanged { .. } => {
-                    // Plugin-only signals; no legacy wire equivalent.
-                }
-            }
+    spawn_event_bridge::<ClientEvent, _>(state, &clients_events::EVENT_KIND, |event| match event {
+        ClientEvent::FollowStarted {
+            follower_client_id,
+            leader_client_id,
+            global,
+        } => Some(Event::FollowStarted {
+            follower_client_id,
+            leader_client_id,
+            global,
+        }),
+        ClientEvent::FollowStopped { follower_client_id } => {
+            Some(Event::FollowStopped { follower_client_id })
+        }
+        ClientEvent::FollowTargetChanged {
+            follower_client_id,
+            leader_client_id,
+            context_id,
+            session_id,
+        } => Some(Event::FollowTargetChanged {
+            follower_client_id,
+            leader_client_id,
+            context_id,
+            session_id,
+        }),
+        ClientEvent::Attached { .. }
+        | ClientEvent::Detached { .. }
+        | ClientEvent::SessionSelected { .. }
+        | ClientEvent::FollowChanged { .. } => None,
+    });
+}
+
+/// Spawn the performance-plugin event bridge.
+///
+/// Subscribes to the typed `PerformanceEvent` stream emitted by the
+/// `bmux.performance` plugin and maps `SettingsUpdated` into the
+/// legacy wire `Event::PerformanceSettingsUpdated` for cross-process
+/// subscribers.
+fn spawn_performance_events_bridge(state: Arc<ServerState>) {
+    use bmux_performance_plugin_api::{EVENT_KIND, PerformanceEvent};
+    spawn_event_bridge::<PerformanceEvent, _>(state, &EVENT_KIND, |event| match event {
+        PerformanceEvent::SettingsUpdated { settings } => {
+            Some(Event::PerformanceSettingsUpdated { settings })
         }
     });
 }
@@ -8346,37 +8197,6 @@ async fn handle_request(
         // is sent — the actual push task spawning happens there. Here we just
         // acknowledge the request.
         Request::EnableEventPush => Response::Ok(ResponsePayload::EventPushEnabled),
-        Request::PerformanceStatus => {
-            let settings = state
-                .performance_settings
-                .lock()
-                .map_err(|_| anyhow::anyhow!("performance settings lock poisoned"))?
-                .to_runtime_settings();
-            Response::Ok(ResponsePayload::PerformanceStatus { settings })
-        }
-        Request::PerformanceSet { settings } => {
-            let normalized_capture_settings =
-                PerformanceCaptureSettings::from_runtime_settings(&settings);
-            let normalized_settings = normalized_capture_settings.to_runtime_settings();
-            {
-                let mut guard = state
-                    .performance_settings
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("performance settings lock poisoned"))?;
-                *guard = normalized_capture_settings;
-            }
-            if let Err(error) = emit_event(
-                state,
-                Event::PerformanceSettingsUpdated {
-                    settings: normalized_settings.clone(),
-                },
-            ) {
-                warn!("failed emitting performance settings update event: {error}");
-            }
-            Response::Ok(ResponsePayload::PerformanceUpdated {
-                settings: normalized_settings,
-            })
-        }
         Request::PaneDirectInput {
             session_id,
             pane_id,
@@ -8494,7 +8314,6 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::AttachInput { .. }
             | Request::AttachSetViewport { .. }
             | Request::PaneDirectInput { .. }
-            | Request::PerformanceSet { .. }
             | Request::Detach
     )
 }
@@ -8551,8 +8370,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
         Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
         Request::AttachPaneImages { .. } => "attach_pane_images",
-        Request::PerformanceStatus => "performance_status",
-        Request::PerformanceSet { .. } => "performance_set",
         Request::SetClientAttachPolicy { .. } => "set_client_attach_policy",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
@@ -8769,8 +8586,6 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
         ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
         ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
-        ResponsePayload::PerformanceStatus { .. } => "performance_status",
-        ResponsePayload::PerformanceUpdated { .. } => "performance_updated",
         ResponsePayload::ClientAttachPolicySet { .. } => "client_attach_policy_set",
         ResponsePayload::Detached => "detached",
         ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
