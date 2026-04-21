@@ -13,19 +13,24 @@ members = [
     "packages/cli",
     "packages/cli-schema",
     "packages/client",
+    "packages/client-state",
     "packages/clipboard",
     "packages/config",
     "packages/config-doc",
     "packages/config-doc-derive",
+    "packages/context-state",
     "packages/event/models",
     "packages/ipc",
     "packages/keybind",
+    "packages/performance-state",
     "packages/plugin",
     "packages/plugin-schema",
     "packages/plugin-schema-macros",
     "packages/plugin-sdk",
     "packages/perf-tools",
+    "packages/recording-runtime",
     "packages/server",
+    "packages/session-state",
     "packages/session/models",
     "packages/sandbox-harness",
     "packages/scene-protocol",
@@ -109,11 +114,13 @@ bmux_cli                    = { version = "0.0.1-alpha.0", default-features = fa
 bmux_cli_output             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli_output" }
 bmux_cli_schema             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli-schema" }
 bmux_client                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
+bmux_client_state           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client-state" }
 bmux_clipboard              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/clipboard" }
 bmux_codec                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/codec" }
 bmux_config                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
 bmux_config_doc             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config-doc" }
 bmux_config_doc_derive      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config-doc-derive" }
+bmux_context_state          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/context-state" }
 bmux_env                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux-env" }
 bmux_event_models           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
 bmux_fonts                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/fonts" }
@@ -123,14 +130,17 @@ bmux_keybind                = { version = "0.0.1-alpha.0", default-features = fa
 bmux_keyboard               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keyboard" }
 bmux_mobile_core            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-core" }
 bmux_mobile_ffi             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-ffi" }
+bmux_performance_state      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/performance-state" }
 bmux_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bmux_plugin_schema          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-schema" }
 bmux_plugin_schema_macros   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-schema-macros" }
 bmux_plugin_sdk             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
+bmux_recording_runtime      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/recording-runtime" }
 bmux_sandbox_harness        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/sandbox-harness" }
 bmux_scene_protocol         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/scene-protocol" }
 bmux_server                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bmux_session_models         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
+bmux_session_state          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-state" }
 bmux_slots                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/slots" }
 bmux_terminal_protocol      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }
 

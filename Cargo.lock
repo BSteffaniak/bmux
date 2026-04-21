@@ -1114,6 +1114,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_client_state"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_ipc",
+ "bmux_session_models",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_clients_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1207,6 +1217,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "bmux_context_state"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_ipc",
+ "bmux_session_models",
+ "serde",
+ "uuid",
 ]
 
 [[package]]
@@ -1460,6 +1480,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_performance_state"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_config",
+ "bmux_ipc",
+]
+
+[[package]]
 name = "bmux_permissions_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1605,6 +1633,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_recording_runtime"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_ipc",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_sandbox_harness"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1661,6 +1698,14 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
  "uuid",
+]
+
+[[package]]
+name = "bmux_session_state"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "bmux_session_models",
 ]
 
 [[package]]

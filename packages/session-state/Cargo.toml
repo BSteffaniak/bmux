@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral primitive crate: SessionManager reader/writer traits + registry handle for the sessions plugin surface"
+edition     = { workspace = true }
+keywords    = ["bmux", "session", "state", "primitive"]
+license     = { workspace = true }
+name        = "bmux_session_state"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+anyhow              = { workspace = true, features = ["std"] }
+bmux_session_models = { workspace = true, features = ["serde"] }
+
+[features]
+default          = []
+fail-on-warnings = []

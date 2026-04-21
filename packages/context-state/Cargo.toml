@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral primitive crate: ContextState reader/writer traits + registry handle for the contexts plugin surface"
+edition     = { workspace = true }
+keywords    = ["bmux", "context", "state", "primitive"]
+license     = { workspace = true }
+name        = "bmux_context_state"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_ipc            = { workspace = true }
+bmux_session_models = { workspace = true, features = ["serde"] }
+serde               = { workspace = true, features = ["derive", "std"] }
+uuid                = { workspace = true, features = ["serde", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

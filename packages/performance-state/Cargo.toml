@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral primitive crate: PerformanceCaptureSettings reader/writer traits + registry handle for the performance plugin surface"
+edition     = { workspace = true }
+keywords    = ["bmux", "performance", "state", "primitive"]
+license     = { workspace = true }
+name        = "bmux_performance_state"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_config = { workspace = true }
+bmux_ipc    = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral primitive crate: RecordingSink trait + registry handle for the recording plugin surface"
+edition     = { workspace = true }
+keywords    = ["bmux", "recording", "runtime", "primitive"]
+license     = { workspace = true }
+name        = "bmux_recording_runtime"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_ipc = { workspace = true }
+serde    = { workspace = true, features = ["derive", "std"] }
+uuid     = { workspace = true, features = ["serde", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

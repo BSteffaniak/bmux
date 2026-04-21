@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral primitive crate: FollowState reader/writer traits + registry handle for the clients plugin surface"
+edition     = { workspace = true }
+keywords    = ["bmux", "client", "state", "primitive"]
+license     = { workspace = true }
+name        = "bmux_client_state"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_ipc            = { workspace = true }
+bmux_session_models = { workspace = true, features = ["serde"] }
+serde               = { workspace = true, features = ["derive", "std"] }
+uuid                = { workspace = true, features = ["serde", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []
