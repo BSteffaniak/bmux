@@ -801,8 +801,6 @@ struct SessionRuntimeManager {
     snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
     shell_integration_root: Option<std::path::PathBuf>,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
-    manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
-    rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
     /// Broadcast sender for pushing pane output notifications to streaming clients.
     event_broadcast: tokio::sync::broadcast::Sender<Event>,
 }
@@ -3001,8 +2999,6 @@ impl SessionRuntimeManager {
         snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
         shell_integration_root: Option<std::path::PathBuf>,
         pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
-        manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
-        rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
         event_broadcast: tokio::sync::broadcast::Sender<Event>,
     ) -> Self {
         Self {
@@ -3013,8 +3009,6 @@ impl SessionRuntimeManager {
             snapshot_runtime,
             shell_integration_root,
             pane_exit_tx,
-            manual_recording_runtime,
-            rolling_recording_runtime,
             event_broadcast,
         }
     }
@@ -3120,8 +3114,6 @@ impl SessionRuntimeManager {
         let replay_command = pane_meta.resurrection.active_command.clone();
         let initial_cwd = pane_meta.resurrection.last_known_cwd.clone();
         let pane_exit_tx = self.pane_exit_tx.clone();
-        let manual_recording_runtime = Arc::clone(&self.manual_recording_runtime);
-        let rolling_recording_runtime = Arc::clone(&self.rolling_recording_runtime);
         let snapshot_runtime_for_reader = Arc::clone(&self.snapshot_runtime);
         let shell_integration_root = self.shell_integration_root.clone();
         let output_buffer_for_reader = Arc::clone(&output_buffer);
@@ -3422,8 +3414,6 @@ impl SessionRuntimeManager {
                                         for event in &result.events {
                                             let payload = image_event_to_recording_payload(event);
                                             record_to_all_runtimes(
-                                                &manual_recording_runtime,
-                                                &rolling_recording_runtime,
                                                 RecordingEventKind::PaneImage,
                                                 payload,
                                                 RecordMeta {
@@ -3520,8 +3510,6 @@ impl SessionRuntimeManager {
                                     );
                                 }
                                 record_to_all_runtimes(
-                                    &manual_recording_runtime,
-                                    &rolling_recording_runtime,
                                     RecordingEventKind::PaneOutputRaw,
                                     RecordingPayload::Bytes {
                                         data: chunk.to_vec(),
@@ -3566,8 +3554,6 @@ impl SessionRuntimeManager {
                                 }
                                 if !reply.is_empty() {
                                     record_to_all_runtimes(
-                                        &manual_recording_runtime,
-                                        &rolling_recording_runtime,
                                         RecordingEventKind::ProtocolReplyRaw,
                                         RecordingPayload::Bytes {
                                             data: reply.clone(),
@@ -4664,8 +4650,6 @@ impl BmuxServer {
                     Arc::clone(&snapshot_runtime),
                     shell_integration_root,
                     pane_exit_tx,
-                    Arc::clone(&manual_recording_runtime),
-                    Arc::clone(&rolling_recording_runtime),
                     event_broadcast_tx.clone(),
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
@@ -5228,8 +5212,6 @@ async fn handle_connection(
             "server.request.start"
         );
         record_to_all_runtimes(
-            &state.manual_recording_runtime,
-            &state.rolling_recording_runtime,
             RecordingEventKind::RequestStart,
             RecordingPayload::RequestStart {
                 request_id: envelope.request_id,
@@ -5271,8 +5253,6 @@ async fn handle_connection(
                     "server.request.done"
                 );
                 record_to_all_runtimes(
-                    &state.manual_recording_runtime,
-                    &state.rolling_recording_runtime,
                     RecordingEventKind::RequestDone,
                     RecordingPayload::RequestDone {
                         request_id: envelope.request_id,
@@ -5301,8 +5281,6 @@ async fn handle_connection(
                     "server.request.error"
                 );
                 record_to_all_runtimes(
-                    &state.manual_recording_runtime,
-                    &state.rolling_recording_runtime,
                     RecordingEventKind::RequestError,
                     RecordingPayload::RequestError {
                         request_id: envelope.request_id,
@@ -5498,8 +5476,6 @@ async fn handle_connection(
                                         push_perf_rate_limiter.encode_payload(payload)
                                     {
                                         record_to_all_runtimes(
-                                            &push_state.manual_recording_runtime,
-                                            &push_state.rolling_recording_runtime,
                                             RecordingEventKind::Custom,
                                             RecordingPayload::Custom {
                                                 source: bmux_ipc::PERF_RECORDING_SOURCE.to_string(),
@@ -5622,8 +5598,6 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         | Event::ControlCatalogChanged { .. } => None,
     };
     record_to_all_runtimes(
-        &state.manual_recording_runtime,
-        &state.rolling_recording_runtime,
         RecordingEventKind::ServerEvent,
         RecordingPayload::ServerEvent {
             event: event.clone(),
@@ -7940,8 +7914,6 @@ async fn handle_request(
                         mark_snapshot_dirty(state);
                     }
                     record_to_all_runtimes(
-                        &state.manual_recording_runtime,
-                        &state.rolling_recording_runtime,
                         RecordingEventKind::PaneInputRaw,
                         RecordingPayload::Bytes {
                             data: captured_input,
@@ -8446,8 +8418,6 @@ async fn handle_request(
                         mark_snapshot_dirty(state);
                     }
                     record_to_all_runtimes(
-                        &state.manual_recording_runtime,
-                        &state.rolling_recording_runtime,
                         RecordingEventKind::PaneInputRaw,
                         RecordingPayload::Bytes {
                             data: captured_input,
@@ -9821,21 +9791,21 @@ fn is_frame_too_large_error(err: &anyhow::Error) -> bool {
     false
 }
 
-fn record_to_all_runtimes(
-    manual_runtime: &Arc<Mutex<RecordingRuntime>>,
-    rolling_runtime: &Arc<Mutex<Option<RecordingRuntime>>>,
-    kind: RecordingEventKind,
-    payload: RecordingPayload,
-    meta: RecordMeta,
-) {
-    if let Ok(runtime) = manual_runtime.lock() {
-        let _ = runtime.record(kind, payload.clone(), meta);
-    }
-    if let Ok(runtime) = rolling_runtime.lock()
-        && let Some(runtime) = runtime.as_ref()
-    {
-        let _ = runtime.record(kind, payload, meta);
-    }
+/// Fan out a recording event to both the manual and rolling recording
+/// runtimes by looking up the registered `RecordingSinkHandle` in the
+/// plugin state registry. Server code no longer holds `RecordingRuntime`
+/// references directly; the recording plugin installs the sink at
+/// server construction, and every hot-path write goes through the
+/// registered trait object.
+fn record_to_all_runtimes(kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta) {
+    let Some(handle) = bmux_plugin::global_plugin_state_registry().get::<RecordingSinkHandle>()
+    else {
+        return;
+    };
+    let Ok(guard) = handle.read() else {
+        return;
+    };
+    guard.0.record(kind, payload, meta);
 }
 
 #[cfg(test)]
