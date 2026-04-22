@@ -604,21 +604,56 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_list(&self, request: &PaneListRequest) -> Result<PaneListResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::ListPanes {
-            session: request.session.as_ref().map(session_selector_to_ipc),
-        })? {
-            bmux_ipc::ResponsePayload::PaneList { panes } => Ok(PaneListResponse {
+        // Dispatch through the pane-runtime plugin's typed
+        // `pane-runtime-state::list-panes` service rather than the
+        // legacy `Request::ListPanes` IPC variant.
+        #[derive(Serialize)]
+        struct Args {
+            session_id: Uuid,
+        }
+        #[derive(Deserialize)]
+        struct Panes {
+            panes: Vec<PaneEntry>,
+        }
+        #[derive(Deserialize)]
+        struct PaneEntry {
+            id: Uuid,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            focused: bool,
+        }
+
+        let Some(SessionSelector::ById(session_id)) = request.session.clone() else {
+            return Err(PluginError::ServiceProtocol {
+                details: "pane_list requires a by-id session selector in typed dispatch"
+                    .to_string(),
+            });
+        };
+        let result: std::result::Result<Panes, serde_json::Value> = self.call_service(
+            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_READ.as_str(),
+            bmux_plugin_sdk::ServiceKind::Query,
+            bmux_pane_runtime_plugin_api::pane_runtime_state::INTERFACE_ID.as_str(),
+            "list-panes",
+            &Args { session_id },
+        )?;
+        match result {
+            Ok(panes) => Ok(PaneListResponse {
                 panes: panes
+                    .panes
                     .into_iter()
-                    .map(|p| PaneSummary {
+                    .enumerate()
+                    .map(|(idx, p)| PaneSummary {
                         id: p.id,
-                        index: p.index,
+                        index: u32::try_from(idx).unwrap_or(0),
                         name: p.name,
                         focused: p.focused,
                     })
                     .collect(),
             }),
-            _ => Err(unexpected("pane_list")),
+            Err(err) => Err(PluginError::ServiceProtocol {
+                details: format!("list-panes typed dispatch returned error: {err}"),
+            }),
         }
     }
 
