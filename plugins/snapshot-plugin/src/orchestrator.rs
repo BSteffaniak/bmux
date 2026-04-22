@@ -443,4 +443,114 @@ mod tests {
         orchestrator.save_now().await.expect("save");
         assert!(!dirty.is_dirty());
     }
+
+    /// The orchestrator must tolerate snapshot envelopes that
+    /// reference participant ids no plugin has registered (e.g. an
+    /// older bmux version wrote a section whose owning plugin has
+    /// since been removed, or a user disabled one of the bundled
+    /// plugins). It should also survive sections whose opaque bytes
+    /// are corrupt — that participant's `restore_snapshot` returns
+    /// `Err`, but the orchestrator must continue restoring the rest
+    /// of the envelope.
+    ///
+    /// Replaces the deleted
+    /// `persistence::tests::decode_rejects_invalid_references` test.
+    /// The old schema validated cross-section references at decode
+    /// time (monolithic `validate_snapshot_v4`); the new envelope is
+    /// decoded per-section, and reference integrity is the
+    /// participant's responsibility. This test documents the new
+    /// "graceful degradation" contract: unknown + malformed sections
+    /// are logged + skipped, they never panic or abort the restore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_gracefully_skips_unknown_and_malformed_sections() {
+        use bmux_snapshot_plugin_api::envelope::{CombinedSnapshotEnvelope, SectionV1};
+        use std::io::Write;
+
+        // A participant that always fails to restore, used to
+        // exercise the orchestrator's "malformed payload" path
+        // without panicking.
+        const FAILING_ID: PluginEventKind = PluginEventKind::from_static("bmux.test/failing");
+        struct FailingRestorer;
+        impl StatefulPlugin for FailingRestorer {
+            fn id(&self) -> PluginEventKind {
+                FAILING_ID
+            }
+            fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
+                Ok(StatefulPluginSnapshot::new(FAILING_ID, 1, vec![]))
+            }
+            fn restore_snapshot(
+                &self,
+                _snapshot: StatefulPluginSnapshot,
+            ) -> StatefulPluginResult<()> {
+                Err(bmux_plugin_sdk::StatefulPluginError::RestoreFailed {
+                    plugin: FAILING_ID.as_str().to_string(),
+                    details: "simulated malformed payload".into(),
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(DEFAULT_SNAPSHOT_FILENAME);
+        let (registry, counter) = new_registry_with_counter(5);
+        let dirty = Arc::new(SnapshotDirtyFlag::new());
+
+        // Register FailingRestorer into the shared registry alongside
+        // the existing Counter participant.
+        registry
+            .write()
+            .unwrap()
+            .push(StatefulPluginHandle::new(FailingRestorer));
+
+        // Construct an envelope by hand with three sections:
+        //   1. TEST_ID (known id, valid payload: u32::7 little-endian).
+        //   2. "bmux.missing/ghost" (no matching participant registered).
+        //   3. FAILING_ID (matching participant but its
+        //      `restore_snapshot` returns `Err`).
+        let envelope = CombinedSnapshotEnvelope::build(vec![
+            SectionV1 {
+                id: TEST_ID.as_str().to_string(),
+                version: 1,
+                bytes: 7u32.to_le_bytes().to_vec(),
+            },
+            SectionV1 {
+                id: "bmux.missing/ghost".to_string(),
+                version: 42,
+                bytes: b"arbitrary-bytes".to_vec(),
+            },
+            SectionV1 {
+                id: FAILING_ID.as_str().to_string(),
+                version: 1,
+                bytes: b"anything".to_vec(),
+            },
+        ])
+        .expect("envelope builds");
+
+        // Write the envelope to disk directly (bypass the
+        // orchestrator's atomic save so we fully control the file
+        // contents).
+        let bytes = serde_json::to_vec_pretty(&envelope).expect("encode");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+
+        let orchestrator =
+            BmuxSnapshotOrchestrator::new(Some(path), Arc::clone(&dirty), Arc::clone(&registry));
+
+        let summary = orchestrator
+            .restore_if_present()
+            .await
+            .expect("restore does not error")
+            .expect("envelope present");
+
+        // Counter restored cleanly; FailingRestorer counted as
+        // failed; ghost section silently skipped with no increment.
+        assert_eq!(summary.restored_plugins, 1, "counter restored");
+        assert_eq!(summary.failed_plugins, 1, "failing restorer counted");
+        assert_eq!(
+            *counter.value.lock().unwrap(),
+            7,
+            "counter got the new value"
+        );
+    }
 }

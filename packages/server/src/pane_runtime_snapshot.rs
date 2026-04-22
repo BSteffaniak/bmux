@@ -515,6 +515,9 @@ mod tests {
         PaneRuntimeSnapshotV1Layout, PaneRuntimeSnapshotV1Pane,
         PaneRuntimeSnapshotV1SplitDirection,
     };
+    use crate::PaneCommandSource;
+    use bmux_ipc::PaneLaunchCommand;
+    use std::collections::BTreeMap;
     use uuid::Uuid;
 
     #[test]
@@ -566,5 +569,109 @@ mod tests {
         let bytes = serde_json::to_vec(&snap).expect("encode");
         let decoded: PaneRuntimeSnapshotV1 = serde_json::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, snap);
+    }
+
+    /// Launch-command fields (program + args + cwd + env) round-trip
+    /// losslessly through a JSON encode/decode of the pane-runtime
+    /// snapshot. Replaces the deleted
+    /// `persistence::tests::snapshot_roundtrip_persists_launch_command`
+    /// test — same invariant, new schema (pane-runtime only, sessions
+    /// live in the sessions-plugin section).
+    #[test]
+    fn schema_round_trips_launch_command_fields() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let launch = PaneLaunchCommand {
+            program: "ssh".to_string(),
+            args: vec!["host-a".to_string(), "-p".to_string(), "2222".to_string()],
+            cwd: Some("/srv/work".to_string()),
+            env: BTreeMap::from([
+                ("FOO".to_string(), "bar".to_string()),
+                ("NESTED_VAR".to_string(), "value with spaces".to_string()),
+            ]),
+        };
+        let snap = PaneRuntimeSnapshotV1 {
+            sessions: vec![PaneRuntimeSessionSnapshotV1 {
+                session_id,
+                panes: vec![PaneRuntimeSnapshotV1Pane {
+                    id: pane_id,
+                    name: Some("remote-a".into()),
+                    shell: "/bin/sh".into(),
+                    launch_command: Some(launch.clone()),
+                    process_group_id: Some(4242),
+                    active_command: None,
+                    active_command_source: None,
+                    last_known_cwd: None,
+                }],
+                focused_pane_id: Some(pane_id),
+                layout_root: Some(PaneRuntimeSnapshotV1Layout::Leaf { pane_id }),
+                floating_surfaces: vec![],
+            }],
+        };
+        let bytes = serde_json::to_vec(&snap).expect("encode");
+        let decoded: PaneRuntimeSnapshotV1 = serde_json::from_slice(&bytes).expect("decode");
+        let restored_launch = decoded.sessions[0].panes[0]
+            .launch_command
+            .as_ref()
+            .expect("launch_command present after round-trip");
+        assert_eq!(restored_launch.program, launch.program);
+        assert_eq!(restored_launch.args, launch.args);
+        assert_eq!(restored_launch.cwd, launch.cwd);
+        assert_eq!(restored_launch.env, launch.env);
+        assert_eq!(
+            decoded.sessions[0].panes[0].process_group_id,
+            Some(4242),
+            "process_group_id survives round-trip"
+        );
+    }
+
+    /// The pre-Slice-13 `SnapshotV4` schema had a cross-field
+    /// invariant — `active_command_source` was required to be `None`
+    /// when `active_command` was `None`, and vice versa — enforced at
+    /// encode time by `validate_snapshot_v4`. The new
+    /// `PaneRuntimeSnapshotV1` schema relaxes that invariant:
+    /// encode/decode is purely structural, and downstream restore
+    /// logic in `SessionRuntimeManager::restore_runtime` treats an
+    /// orphaned command source as a harmless no-op (the pane spawns
+    /// with the shell's default command).
+    ///
+    /// This test documents the relaxation: a pane with
+    /// `active_command_source = Some(Verbatim)` and `active_command
+    /// = None` must round-trip cleanly through JSON without rejection.
+    /// Replaces the deleted
+    /// `persistence::tests::encode_rejects_command_source_without_command`
+    /// test, flipping the assertion from "must reject" to "must
+    /// accept".
+    #[test]
+    fn schema_permits_command_source_without_command() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let snap = PaneRuntimeSnapshotV1 {
+            sessions: vec![PaneRuntimeSessionSnapshotV1 {
+                session_id,
+                panes: vec![PaneRuntimeSnapshotV1Pane {
+                    id: pane_id,
+                    name: Some("pane-1".into()),
+                    shell: "/bin/sh".into(),
+                    launch_command: None,
+                    process_group_id: None,
+                    active_command: None,
+                    active_command_source: Some(PaneCommandSource::Verbatim),
+                    last_known_cwd: Some("/tmp".into()),
+                }],
+                focused_pane_id: Some(pane_id),
+                layout_root: Some(PaneRuntimeSnapshotV1Layout::Leaf { pane_id }),
+                floating_surfaces: vec![],
+            }],
+        };
+        let bytes = serde_json::to_vec(&snap).expect("encode accepts orphan command source");
+        let decoded: PaneRuntimeSnapshotV1 =
+            serde_json::from_slice(&bytes).expect("decode accepts orphan command source");
+        assert_eq!(decoded, snap, "orphan command source round-trips verbatim");
+        assert_eq!(
+            decoded.sessions[0].panes[0].active_command_source,
+            Some(PaneCommandSource::Verbatim)
+        );
+        assert!(decoded.sessions[0].panes[0].active_command.is_none());
     }
 }
