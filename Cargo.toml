@@ -63,6 +63,8 @@ members = [
     "plugins/recording-plugin-api",
     "plugins/sessions-plugin",
     "plugins/sessions-plugin-api",
+    "plugins/snapshot-plugin",
+    "plugins/snapshot-plugin-api",
     "plugins/windows-plugin",
     "plugins/windows-plugin-api",
 ]
@@ -166,6 +168,8 @@ bmux_recording_plugin           = { version = "0.0.1-alpha.0", default-features 
 bmux_recording_plugin_api       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/recording-plugin-api" }
 bmux_sessions_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/sessions-plugin" }
 bmux_sessions_plugin_api        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/sessions-plugin-api" }
+bmux_snapshot_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/snapshot-plugin" }
+bmux_snapshot_plugin_api        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/snapshot-plugin-api" }
 bmux_windows_plugin             = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/windows-plugin" }
 bmux_windows_plugin_api         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/windows-plugin-api" }
 

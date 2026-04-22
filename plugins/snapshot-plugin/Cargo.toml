@@ -1,0 +1,36 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shipped snapshot orchestration plugin for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "snapshot"]
+license     = { workspace = true }
+name        = "bmux_snapshot_plugin"
+publish     = false
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmux_plugin              = { workspace = true }
+bmux_plugin_sdk          = { workspace = true }
+bmux_snapshot_plugin_api = { workspace = true }
+bmux_snapshot_runtime    = { workspace = true }
+serde                    = { workspace = true, features = ["derive", "std"] }
+serde_json               = { workspace = true }
+tokio                    = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tracing                  = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[features]
+fail-on-warnings = [
+    "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]
+static-bundled = []

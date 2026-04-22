@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Typed public API of the bmux snapshot plugin (config + wire enums + typed-client helpers + offline_snapshot utility)"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "api", "snapshot"]
+license     = { workspace = true }
+name        = "bmux_snapshot_plugin_api"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_ipc        = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
+serde           = { workspace = true, features = ["derive", "std"] }
+thiserror       = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -1041,6 +1041,7 @@ dependencies = [
  "bmux_sessions_plugin",
  "bmux_sessions_plugin_api",
  "bmux_slots",
+ "bmux_snapshot_plugin",
  "bmux_terminal_protocol",
  "bmux_windows_plugin",
  "bmux_windows_plugin_api",
@@ -1766,6 +1767,31 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "bmux_snapshot_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "bmux_snapshot_plugin_api",
+ "bmux_snapshot_runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bmux_snapshot_plugin_api"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_sdk",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -1,0 +1,25 @@
+execution_class       = "native_fast"
+id                    = "bmux.snapshot"
+name                  = "bmux Snapshot"
+owns_namespaces       = []
+provided_capabilities = ["bmux.snapshot.read", "bmux.snapshot.write"]
+provided_features     = ["bmux.snapshot"]
+required_capabilities = []
+version               = "0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.clients"
+version_req = ">=0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.contexts"
+version_req = ">=0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.sessions"
+version_req = ">=0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.snapshot.write"
+interface_id = "snapshot-commands"
+kind         = "command"

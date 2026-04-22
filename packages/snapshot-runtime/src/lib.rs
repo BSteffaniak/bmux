@@ -113,6 +113,29 @@ where
     fresh
 }
 
+/// Idempotent helper: return the shared
+/// `Arc<RwLock<SnapshotDirtyFlagHandle>>` registered in the plugin
+/// state registry, creating and registering a new one if absent.
+///
+/// Like [`get_or_init_stateful_registry`], callers pass closures for
+/// the actual get/register so this primitive crate stays
+/// `bmux_plugin`-independent.
+pub fn get_or_init_stateful_dirty_flag<G, R>(
+    get: G,
+    register: R,
+) -> std::sync::Arc<std::sync::RwLock<SnapshotDirtyFlagHandle>>
+where
+    G: FnOnce() -> Option<std::sync::Arc<std::sync::RwLock<SnapshotDirtyFlagHandle>>>,
+    R: FnOnce(&std::sync::Arc<std::sync::RwLock<SnapshotDirtyFlagHandle>>),
+{
+    if let Some(existing) = get() {
+        return existing;
+    }
+    let fresh = std::sync::Arc::new(std::sync::RwLock::new(SnapshotDirtyFlagHandle::new()));
+    register(&fresh);
+    fresh
+}
+
 // ── Dirty flag ──────────────────────────────────────────────────────
 
 /// Atomic dirty-mark + last-marked timestamp.
@@ -373,6 +396,20 @@ impl SnapshotOrchestratorHandle {
         }))
     }
 
+    /// Wrap an `Arc`-shared concrete orchestrator. Useful when the
+    /// plugin needs to retain the concrete type (e.g. to drive a
+    /// background debounce thread) while simultaneously exposing the
+    /// trait-object façade to the rest of the host.
+    #[must_use]
+    pub fn from_shared<O>(orchestrator: Arc<O>) -> Self
+    where
+        O: SnapshotOrchestrator + 'static,
+    {
+        Self(Arc::new(SharedOrchestratorAdapter {
+            inner: orchestrator,
+        }))
+    }
+
     /// Borrow the underlying dyn-safe API surface.
     #[must_use]
     pub fn as_dyn(&self) -> &(dyn SnapshotOrchestratorApi + 'static) {
@@ -427,6 +464,47 @@ struct OrchestratorAdapter<O: SnapshotOrchestrator> {
 }
 
 impl<O: SnapshotOrchestrator> SnapshotOrchestratorApi for OrchestratorAdapter<O> {
+    fn restore_if_present_boxed(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = SnapshotOrchestratorResult<Option<RestoreSummary>>> + Send + '_>,
+    > {
+        Box::pin(self.inner.restore_if_present())
+    }
+
+    fn save_now_boxed(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = SnapshotOrchestratorResult<Option<PathBuf>>> + Send + '_>,
+    > {
+        Box::pin(self.inner.save_now())
+    }
+
+    fn dry_run_boxed(
+        &self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = SnapshotOrchestratorResult<DryRunReport>> + Send + '_>>
+    {
+        Box::pin(self.inner.dry_run())
+    }
+
+    fn restore_apply_boxed(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = SnapshotOrchestratorResult<RestoreSummary>> + Send + '_>,
+    > {
+        Box::pin(self.inner.restore_apply())
+    }
+
+    fn status(&self) -> SnapshotStatusReport {
+        self.inner.status()
+    }
+}
+
+struct SharedOrchestratorAdapter<O: SnapshotOrchestrator> {
+    inner: Arc<O>,
+}
+
+impl<O: SnapshotOrchestrator> SnapshotOrchestratorApi for SharedOrchestratorAdapter<O> {
     fn restore_if_present_boxed(
         &self,
     ) -> std::pin::Pin<

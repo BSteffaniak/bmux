@@ -164,6 +164,10 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/sessions-plugin/plugin.toml"),
     plugin_type = bmux_sessions_plugin::SessionsPlugin;
 
+    feature = "bundled-plugin-snapshot",
+    manifest = include_str!("../../../../plugins/snapshot-plugin/plugin.toml"),
+    plugin_type = bmux_snapshot_plugin::SnapshotPlugin;
+
     feature = "bundled-plugin-windows",
     manifest = include_str!("../../../../plugins/windows-plugin/plugin.toml"),
     plugin_type = bmux_windows_plugin::WindowsPlugin;
