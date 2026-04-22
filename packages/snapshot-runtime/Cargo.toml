@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral primitive crate: snapshot-orchestration traits + registry + dirty flag for the bmux.snapshot plugin surface"
+edition     = { workspace = true }
+keywords    = ["bmux", "snapshot", "runtime", "primitive"]
+license     = { workspace = true }
+name        = "bmux_snapshot_runtime"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_plugin_sdk = { workspace = true }
+thiserror       = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[features]
+default          = []
+fail-on-warnings = []
