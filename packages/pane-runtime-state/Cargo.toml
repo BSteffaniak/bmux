@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral primitive crate: pane-runtime pure-data types + reader trait abstraction"
+edition     = { workspace = true }
+keywords    = ["bmux", "pane", "runtime", "primitive"]
+license     = { workspace = true }
+name        = "bmux_pane_runtime_state"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_ipc            = { workspace = true }
+bmux_session_models = { workspace = true, features = ["serde"] }
+serde               = { workspace = true, features = ["derive", "std"] }
+thiserror           = { workspace = true }
+uuid                = { workspace = true, features = ["serde", "std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

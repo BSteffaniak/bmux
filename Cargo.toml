@@ -28,6 +28,7 @@ members = [
     "packages/plugin-schema-macros",
     "packages/plugin-sdk",
     "packages/perf-tools",
+    "packages/pane-runtime-state",
     "packages/recording-runtime",
     "packages/server",
     "packages/session-state",
@@ -133,6 +134,7 @@ bmux_keybind                = { version = "0.0.1-alpha.0", default-features = fa
 bmux_keyboard               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keyboard" }
 bmux_mobile_core            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-core" }
 bmux_mobile_ffi             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-ffi" }
+bmux_pane_runtime_state     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/pane-runtime-state" }
 bmux_performance_state      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/performance-state" }
 bmux_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bmux_plugin_schema          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-schema" }
