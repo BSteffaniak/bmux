@@ -1,0 +1,335 @@
+// Public, typed contract of the pane-runtime plugin.
+//
+// The pane-runtime plugin owns every PTY handle + layout tree in the
+// bmux process; core server code dispatches through the typed
+// services declared here.
+//
+// Interfaces:
+// - `pane-runtime-state`  — read queries over pane + session runtime.
+// - `pane-runtime-commands` — mutating commands (split / launch /
+//   focus / resize / close / restart / zoom / direct-input / create /
+//   destroy sessions with runtime, restore from snapshot).
+// - `attach-runtime-commands` — per-client attach lifecycle (attach
+//   session, attach context, open, send input, request output batch,
+//   set viewport, detach).
+// - `attach-runtime-state` — attach-view queries (layout, snapshot,
+//   pane-snapshot, pane-images, pane-output-batch).
+// - `pane-runtime-events`  — pane + attach lifecycle event stream.
+
+plugin bmux.pane_runtime version 1;
+
+interface pane-runtime-state {
+    record pane-summary {
+        id: uuid,
+        name: string?,
+        shell: string,
+        focused: bool,
+    }
+
+    record session-pane-list {
+        session_id: uuid,
+        panes: list<pane-summary>,
+    }
+
+    variant pane-state-error {
+        session-not-found,
+        pane-not-found,
+    }
+
+    query list-panes(session_id: uuid) -> result<session-pane-list, pane-state-error>;
+    query get-pane(session_id: uuid, pane_id: uuid)
+        -> result<pane-summary, pane-state-error>;
+}
+
+interface pane-runtime-commands {
+    // Shared acknowledgement carrying the target pane + session id
+    // after a mutating command completes. All mutation commands return
+    // a result of this or a command-specific error.
+    record pane-ack {
+        session_id: uuid,
+        pane_id: uuid,
+    }
+
+    record session-ack {
+        session_id: uuid,
+    }
+
+    variant pane-command-error {
+        session-not-found,
+        pane-not-found,
+        denied { reason: string },
+        failed { reason: string },
+    }
+
+    variant session-runtime-command-error {
+        session-not-found,
+        name-already-exists { name: string },
+        failed { reason: string },
+    }
+
+    // Split an existing pane along the given direction at the given
+    // ratio (0.1..=0.9, clamped). Creates a new pane beside the target.
+    command split-pane(
+        session_id: uuid,
+        target: uuid?,
+        direction: string,    // "horizontal" | "vertical"
+        ratio_percent: u8,    // 10..=90
+    ) -> result<pane-ack, pane-command-error>;
+
+    // Launch a new pane with an explicit program + args + cwd + env,
+    // splitting from `target` along `direction`.
+    command launch-pane(
+        session_id: uuid,
+        target: uuid?,
+        direction: string,    // "horizontal" | "vertical"
+        ratio_percent: u8,
+        name: string?,
+        program: string,
+        args: list<string>,
+        cwd: string?,
+    ) -> result<pane-ack, pane-command-error>;
+
+    // Focus a pane. `target` may be a pane id; when `target` is none,
+    // focus moves in `direction` (up/down/left/right/next/prev).
+    command focus-pane(
+        session_id: uuid,
+        target: uuid?,
+        direction: string,
+    ) -> result<pane-ack, pane-command-error>;
+
+    command resize-pane(
+        session_id: uuid,
+        target: uuid?,
+        delta_percent: i8,    // signed: negative shrinks, positive grows
+    ) -> result<session-ack, pane-command-error>;
+
+    command close-pane(
+        session_id: uuid,
+        target: uuid?,
+    ) -> result<pane-ack, pane-command-error>;
+
+    command restart-pane(
+        session_id: uuid,
+        target: uuid?,
+    ) -> result<pane-ack, pane-command-error>;
+
+    command zoom-pane(
+        session_id: uuid,
+    ) -> result<pane-ack, pane-command-error>;
+
+    // Send raw input bytes directly to a pane. Used for unattached
+    // programmatic input (e.g. playbook-driven tests).
+    command pane-direct-input(
+        session_id: uuid,
+        pane_id: uuid,
+        data: list<u8>,
+    ) -> result<pane-ack, pane-command-error>;
+
+    // Spin up a brand-new session runtime (session manager entry +
+    // initial pane PTY). Sessions-plugin bridges `new-session` into
+    // this operation.
+    command new-session-with-runtime(
+        name: string?,
+    ) -> result<session-ack, session-runtime-command-error>;
+
+    // Tear down a session's runtime (shut down all pane PTYs, flush
+    // recording sinks, release attach tokens). Sessions-plugin bridges
+    // `kill-session` into this operation.
+    command kill-session-runtime(
+        session_id: uuid,
+        force_local: bool,
+    ) -> result<session-ack, session-runtime-command-error>;
+
+    // Restore a session runtime from a snapshot payload. Invoked by
+    // the snapshot orchestrator on server startup. Payload is the
+    // opaque bytes from `PaneRuntimeSnapshotV1` (deserialized inside
+    // the plugin).
+    command restore-session-runtime(
+        session_id: uuid,
+        snapshot_payload: list<u8>,
+    ) -> result<session-ack, session-runtime-command-error>;
+}
+
+interface attach-runtime-commands {
+    // Response from `attach-session` / `attach-context`. Carries the
+    // attach grant issued by the AttachTokenManager; client re-presents
+    // it on `attach-open`.
+    record attach-grant {
+        token: uuid,
+        session_id: uuid,
+        context_id: uuid?,
+        expires_epoch_ms: u64,
+    }
+
+    // Response from `attach-open`. Indicates the open succeeded and
+    // describes the stream's terminal capabilities.
+    record attach-ready {
+        session_id: uuid,
+        context_id: uuid?,
+        can_write: bool,
+    }
+
+    record attach-output {
+        data: list<u8>,
+    }
+
+    record attach-viewport-set {
+        session_id: uuid,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+        context_id: uuid?,
+    }
+
+    record attach-input-accepted {
+        bytes: u32,
+    }
+
+    variant attach-command-error {
+        session-not-found,
+        invalid-grant,
+        expired-grant,
+        denied { reason: string },
+        failed { reason: string },
+    }
+
+    command attach-session(
+        session_id: uuid,
+        can_write: bool,
+    ) -> result<attach-grant, attach-command-error>;
+
+    command attach-context(
+        context_id: uuid,
+        can_write: bool,
+    ) -> result<attach-grant, attach-command-error>;
+
+    command attach-open(
+        grant_token: uuid,
+    ) -> result<attach-ready, attach-command-error>;
+
+    command attach-input(
+        session_id: uuid,
+        data: list<u8>,
+    ) -> result<attach-input-accepted, attach-command-error>;
+
+    command attach-output(
+        session_id: uuid,
+        max_bytes: u32,
+    ) -> result<attach-output, attach-command-error>;
+
+    command attach-set-viewport(
+        session_id: uuid,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+        cell_pixel_w: u16,
+        cell_pixel_h: u16,
+    ) -> result<attach-viewport-set, attach-command-error>;
+
+    command detach() -> result<u8, attach-command-error>;
+}
+
+interface attach-runtime-state {
+    record pane-chunk {
+        pane_id: uuid,
+        data: list<u8>,
+        stream_start: u64,
+        stream_end: u64,
+        stream_gap: bool,
+    }
+
+    record pane-mouse-protocol {
+        pane_id: uuid,
+        // JSON-encoded `AttachMouseProtocolState` (schema is server-internal).
+        encoded: list<u8>,
+    }
+
+    record pane-input-mode {
+        pane_id: uuid,
+        // JSON-encoded `AttachInputModeState`.
+        encoded: list<u8>,
+    }
+
+    record attach-layout {
+        session_id: uuid,
+        context_id: uuid?,
+        focused_pane_id: uuid,
+        // JSON-encoded layout payload (panes + layout_root + scene + zoomed).
+        encoded: list<u8>,
+    }
+
+    record attach-snapshot {
+        session_id: uuid,
+        context_id: uuid?,
+        focused_pane_id: uuid,
+        zoomed: bool,
+        // JSON-encoded layout payload (panes + layout_root + scene).
+        layout_encoded: list<u8>,
+        chunks: list<pane-chunk>,
+        pane_mouse_protocols: list<pane-mouse-protocol>,
+        pane_input_modes: list<pane-input-mode>,
+    }
+
+    record attach-pane-snapshot {
+        chunks: list<pane-chunk>,
+        pane_mouse_protocols: list<pane-mouse-protocol>,
+        pane_input_modes: list<pane-input-mode>,
+    }
+
+    record attach-pane-output-batch {
+        chunks: list<pane-chunk>,
+        output_still_pending: bool,
+    }
+
+    record attach-pane-images {
+        // JSON-encoded `Vec<AttachPaneImageDelta>`.
+        encoded: list<u8>,
+    }
+
+    variant attach-state-error {
+        not-attached,
+        session-not-found,
+        failed { reason: string },
+    }
+
+    query attach-layout-state(
+        session_id: uuid,
+    ) -> result<attach-layout, attach-state-error>;
+
+    query attach-snapshot-state(
+        session_id: uuid,
+        max_bytes_per_pane: u32,
+    ) -> result<attach-snapshot, attach-state-error>;
+
+    query attach-pane-snapshot-state(
+        session_id: uuid,
+        pane_ids: list<uuid>,
+        max_bytes_per_pane: u32,
+    ) -> result<attach-pane-snapshot, attach-state-error>;
+
+    query attach-pane-output-batch(
+        session_id: uuid,
+        pane_ids: list<uuid>,
+        max_bytes: u32,
+    ) -> result<attach-pane-output-batch, attach-state-error>;
+
+    query attach-pane-images(
+        session_id: uuid,
+        pane_id: uuid,
+        since_version: u64,
+    ) -> result<attach-pane-images, attach-state-error>;
+}
+
+interface pane-runtime-events {
+    variant pane-event {
+        exited { session_id: uuid, pane_id: uuid, reason: string? },
+        restarted { session_id: uuid, pane_id: uuid },
+        output-available { session_id: uuid, pane_id: uuid },
+        image-available { session_id: uuid, pane_id: uuid },
+        attach-view-changed { session_id: uuid, revision: u64 },
+    }
+
+    events pane-event;
+}
