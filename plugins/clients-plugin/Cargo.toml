@@ -21,6 +21,7 @@ bmux_ipc                = { workspace = true }
 bmux_plugin             = { workspace = true }
 bmux_plugin_sdk         = { workspace = true }
 bmux_session_models     = { workspace = true, features = ["serde"] }
+bmux_snapshot_runtime   = { workspace = true }
 serde                   = { workspace = true, features = ["derive", "std"] }
 serde_json              = { workspace = true }
 uuid                    = { workspace = true, features = ["serde", "std"] }

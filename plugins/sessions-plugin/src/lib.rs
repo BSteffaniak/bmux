@@ -24,7 +24,11 @@ use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
 };
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_plugin_sdk::{
+    HostScope, PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
+    StatefulPluginResult, StatefulPluginSnapshot, TypedServiceRegistrationContext,
+    TypedServiceRegistry,
+};
 use bmux_session_models::{ClientId, Session, SessionId, SessionInfo};
 use bmux_session_state::{
     SessionManagerHandle, SessionManagerReader, SessionManagerSnapshot, SessionManagerWriter,
@@ -38,6 +42,7 @@ use bmux_sessions_plugin_api::sessions_state::{
     self, SessionQueryError, SessionSelector as StateSessionSelector, SessionSummary,
     SessionsStateService,
 };
+use bmux_snapshot_runtime::StatefulPluginRegistry;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -152,6 +157,61 @@ impl SessionManagerWriter for SessionManagerAdapter {
     }
 }
 
+// ── StatefulPlugin participant for persistence ─────────────────────
+
+/// Stable id for the session-manager snapshot surface.
+const SESSIONS_STATEFUL_ID: PluginEventKind =
+    PluginEventKind::from_static("bmux.sessions/session-manager");
+
+/// Current snapshot schema version for session-manager state.
+const SESSIONS_STATEFUL_VERSION: u32 = 1;
+
+/// Snapshot participant that serializes the plugin's [`SessionManager`]
+/// via the domain-agnostic [`SessionManagerWriter::snapshot`] /
+/// [`SessionManagerWriter::restore_snapshot`] hooks.
+struct SessionsStatefulPlugin {
+    writer: Arc<dyn SessionManagerWriter>,
+}
+
+impl StatefulPlugin for SessionsStatefulPlugin {
+    fn id(&self) -> PluginEventKind {
+        SESSIONS_STATEFUL_ID
+    }
+
+    fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
+        let snap = self.writer.snapshot();
+        let bytes =
+            serde_json::to_vec(&snap).map_err(|err| StatefulPluginError::SnapshotFailed {
+                plugin: SESSIONS_STATEFUL_ID.as_str().to_string(),
+                details: err.to_string(),
+            })?;
+        Ok(StatefulPluginSnapshot::new(
+            SESSIONS_STATEFUL_ID,
+            SESSIONS_STATEFUL_VERSION,
+            bytes,
+        ))
+    }
+
+    fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+        if snapshot.version != SESSIONS_STATEFUL_VERSION {
+            return Err(StatefulPluginError::UnsupportedVersion {
+                plugin: SESSIONS_STATEFUL_ID.as_str().to_string(),
+                version: snapshot.version,
+                expected: vec![SESSIONS_STATEFUL_VERSION],
+            });
+        }
+        let decoded: SessionManagerSnapshot =
+            serde_json::from_slice(&snapshot.bytes).map_err(|err| {
+                StatefulPluginError::RestoreFailed {
+                    plugin: SESSIONS_STATEFUL_ID.as_str().to_string(),
+                    details: err.to_string(),
+                }
+            })?;
+        self.writer.restore_snapshot(decoded);
+        Ok(())
+    }
+}
+
 /// Wire-format argument for the typed `new-session` byte-dispatch call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NewSessionArgs {
@@ -220,6 +280,30 @@ impl RustPlugin for SessionsPlugin {
         };
         let handle = Arc::new(RwLock::new(SessionManagerHandle::new(adapter)));
         global_plugin_state_registry().register::<SessionManagerHandle>(&handle);
+
+        // Register this plugin as a persistence participant so the
+        // snapshot-orchestration plugin can drive save/restore over
+        // session-manager state on its schedule.
+        let writer_for_snapshot: Arc<dyn SessionManagerWriter> = {
+            let guard = handle
+                .read()
+                .expect("freshly-created SessionManagerHandle lock is poisoned");
+            Arc::clone(&guard.0)
+        };
+        let stateful = StatefulPluginHandle::new(SessionsStatefulPlugin {
+            writer: writer_for_snapshot,
+        });
+        let registry = global_plugin_state_registry();
+        let stateful_registry = bmux_snapshot_runtime::get_or_init_stateful_registry(
+            || registry.get::<StatefulPluginRegistry>(),
+            |fresh| {
+                registry.register::<StatefulPluginRegistry>(fresh);
+            },
+        );
+        stateful_registry
+            .write()
+            .expect("stateful plugin registry lock poisoned")
+            .push(stateful);
 
         global_event_bus().register_channel::<SessionEvent>(sessions_events::EVENT_KIND);
         Ok(bmux_plugin_sdk::EXIT_OK)

@@ -28,9 +28,12 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    HostScope, TypedServiceRegistrationContext, TypedServiceRegistry, WireEventSinkHandle,
+    HostScope, PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
+    StatefulPluginResult, StatefulPluginSnapshot, TypedServiceRegistrationContext,
+    TypedServiceRegistry, WireEventSinkHandle,
 };
 use bmux_session_models::{ClientId, SessionId};
+use bmux_snapshot_runtime::StatefulPluginRegistry;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -231,6 +234,63 @@ impl FollowStateWriter for FollowStateAdapter {
     }
 }
 
+// ── StatefulPlugin participant for persistence ─────────────────────
+
+/// Stable id for the follow-state snapshot surface.
+const CLIENTS_STATEFUL_ID: PluginEventKind =
+    PluginEventKind::from_static("bmux.clients/follow-state");
+
+/// Current snapshot schema version for follow-state. Increment when
+/// the on-disk shape of [`FollowStateSnapshot`] changes in a way that
+/// requires restore-path branching.
+const CLIENTS_STATEFUL_VERSION: u32 = 1;
+
+/// Snapshot participant that serializes the plugin's [`FollowState`]
+/// via the domain-agnostic [`FollowStateWriter::snapshot`] /
+/// [`FollowStateWriter::restore_snapshot`] hooks.
+struct ClientsStatefulPlugin {
+    writer: Arc<dyn FollowStateWriter>,
+}
+
+impl StatefulPlugin for ClientsStatefulPlugin {
+    fn id(&self) -> PluginEventKind {
+        CLIENTS_STATEFUL_ID
+    }
+
+    fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
+        let snap = self.writer.snapshot();
+        let bytes =
+            serde_json::to_vec(&snap).map_err(|err| StatefulPluginError::SnapshotFailed {
+                plugin: CLIENTS_STATEFUL_ID.as_str().to_string(),
+                details: err.to_string(),
+            })?;
+        Ok(StatefulPluginSnapshot::new(
+            CLIENTS_STATEFUL_ID,
+            CLIENTS_STATEFUL_VERSION,
+            bytes,
+        ))
+    }
+
+    fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+        if snapshot.version != CLIENTS_STATEFUL_VERSION {
+            return Err(StatefulPluginError::UnsupportedVersion {
+                plugin: CLIENTS_STATEFUL_ID.as_str().to_string(),
+                version: snapshot.version,
+                expected: vec![CLIENTS_STATEFUL_VERSION],
+            });
+        }
+        let decoded: FollowStateSnapshot =
+            serde_json::from_slice(&snapshot.bytes).map_err(|err| {
+                StatefulPluginError::RestoreFailed {
+                    plugin: CLIENTS_STATEFUL_ID.as_str().to_string(),
+                    details: err.to_string(),
+                }
+            })?;
+        self.writer.restore_snapshot(decoded);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SetCurrentSessionArgs {
     session_id: Uuid,
@@ -282,6 +342,30 @@ impl RustPlugin for ClientsPlugin {
         };
         let handle = Arc::new(RwLock::new(FollowStateHandle::new(adapter)));
         global_plugin_state_registry().register::<FollowStateHandle>(&handle);
+
+        // Register this plugin as a persistence participant so the
+        // snapshot-orchestration plugin can drive save/restore over
+        // follow-state on its schedule.
+        let writer_for_snapshot: Arc<dyn FollowStateWriter> = {
+            let guard = handle
+                .read()
+                .expect("freshly-created FollowStateHandle lock is poisoned");
+            Arc::clone(&guard.0)
+        };
+        let stateful = StatefulPluginHandle::new(ClientsStatefulPlugin {
+            writer: writer_for_snapshot,
+        });
+        let registry = global_plugin_state_registry();
+        let stateful_registry = bmux_snapshot_runtime::get_or_init_stateful_registry(
+            || registry.get::<StatefulPluginRegistry>(),
+            |fresh| {
+                registry.register::<StatefulPluginRegistry>(fresh);
+            },
+        );
+        stateful_registry
+            .write()
+            .expect("stateful plugin registry lock poisoned")
+            .push(stateful);
 
         global_event_bus().register_channel::<ClientEvent>(clients_events::EVENT_KIND);
         Ok(bmux_plugin_sdk::EXIT_OK)

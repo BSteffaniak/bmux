@@ -25,6 +25,7 @@ bmux_recording_plugin_api   = { workspace = true }
 bmux_recording_runtime      = { workspace = true }
 bmux_session_models         = { workspace = true, features = ["serde"] }
 bmux_session_state          = { workspace = true }
+bmux_snapshot_runtime       = { workspace = true }
 bmux_terminal_protocol      = { workspace = true }
 
 # External dependencies

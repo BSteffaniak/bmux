@@ -1131,6 +1131,7 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_session_models",
+ "bmux_snapshot_runtime",
  "serde",
  "serde_json",
  "uuid",
@@ -1240,7 +1241,9 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_session_models",
  "bmux_sessions_plugin_api",
+ "bmux_snapshot_runtime",
  "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]
@@ -1697,6 +1700,7 @@ dependencies = [
  "bmux_recording_runtime",
  "bmux_session_models",
  "bmux_session_state",
+ "bmux_snapshot_runtime",
  "bmux_terminal_protocol",
  "portable-pty",
  "serde",
@@ -1736,7 +1740,9 @@ dependencies = [
  "bmux_session_models",
  "bmux_session_state",
  "bmux_sessions_plugin_api",
+ "bmux_snapshot_runtime",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -1760,6 +1766,15 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "bmux_snapshot_runtime"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_sdk",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

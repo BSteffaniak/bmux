@@ -4,6 +4,7 @@
 
 //! Server component for bmux terminal multiplexer.
 
+mod pane_runtime_snapshot;
 mod persistence;
 
 use anyhow::{Context, Result};
@@ -4666,6 +4667,14 @@ impl BmuxServer {
         // events through the `WireEventSinkHandle` trait object in the
         // plugin state registry, without depending on `packages/server`.
         register_wire_event_sink(&self.state);
+
+        // Register server's pane-runtime as a `StatefulPlugin`
+        // participant so the snapshot-orchestration plugin (Slice 13)
+        // includes it in the combined envelope alongside the three
+        // foundational plugin participants. Safe to call here because
+        // `BmuxServer::new` has already built `SessionRuntimeManager`
+        // and bundled plugin `activate` callbacks have already run.
+        pane_runtime_snapshot::ServerPaneRuntimeStateful::register(&self.state);
 
         let snapshot_flush_state = Arc::clone(&self.state);
         let mut snapshot_flush_shutdown_rx = self.shutdown_tx.subscribe();

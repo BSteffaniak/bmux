@@ -33,10 +33,13 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    HostScope, ServiceKind as SdkServiceKind, TypedServiceRegistrationContext,
-    TypedServiceRegistry, decode_service_message, encode_service_message,
+    HostScope, PluginEventKind, ServiceKind as SdkServiceKind, StatefulPlugin, StatefulPluginError,
+    StatefulPluginHandle, StatefulPluginResult, StatefulPluginSnapshot,
+    TypedServiceRegistrationContext, TypedServiceRegistry, decode_service_message,
+    encode_service_message,
 };
 use bmux_session_models::{ClientId, SessionId};
+use bmux_snapshot_runtime::StatefulPluginRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -208,6 +211,61 @@ impl ContextStateWriter for ContextStateAdapter {
     }
 }
 
+// ── StatefulPlugin participant for persistence ─────────────────────
+
+/// Stable id for the context-state snapshot surface.
+const CONTEXTS_STATEFUL_ID: PluginEventKind =
+    PluginEventKind::from_static("bmux.contexts/context-state");
+
+/// Current snapshot schema version for context-state.
+const CONTEXTS_STATEFUL_VERSION: u32 = 1;
+
+/// Snapshot participant that serializes the plugin's [`ContextState`]
+/// via the domain-agnostic [`ContextStateWriter::snapshot`] /
+/// [`ContextStateWriter::restore_snapshot`] hooks.
+struct ContextsStatefulPlugin {
+    writer: Arc<dyn ContextStateWriter>,
+}
+
+impl StatefulPlugin for ContextsStatefulPlugin {
+    fn id(&self) -> PluginEventKind {
+        CONTEXTS_STATEFUL_ID
+    }
+
+    fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
+        let snap = self.writer.snapshot();
+        let bytes =
+            serde_json::to_vec(&snap).map_err(|err| StatefulPluginError::SnapshotFailed {
+                plugin: CONTEXTS_STATEFUL_ID.as_str().to_string(),
+                details: err.to_string(),
+            })?;
+        Ok(StatefulPluginSnapshot::new(
+            CONTEXTS_STATEFUL_ID,
+            CONTEXTS_STATEFUL_VERSION,
+            bytes,
+        ))
+    }
+
+    fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+        if snapshot.version != CONTEXTS_STATEFUL_VERSION {
+            return Err(StatefulPluginError::UnsupportedVersion {
+                plugin: CONTEXTS_STATEFUL_ID.as_str().to_string(),
+                version: snapshot.version,
+                expected: vec![CONTEXTS_STATEFUL_VERSION],
+            });
+        }
+        let decoded: ContextStateSnapshot =
+            serde_json::from_slice(&snapshot.bytes).map_err(|err| {
+                StatefulPluginError::RestoreFailed {
+                    plugin: CONTEXTS_STATEFUL_ID.as_str().to_string(),
+                    details: err.to_string(),
+                }
+            })?;
+        self.writer.restore_snapshot(decoded);
+        Ok(())
+    }
+}
+
 // ── Argument records (wire) ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +326,30 @@ impl RustPlugin for ContextsPlugin {
         };
         let handle = Arc::new(RwLock::new(ContextStateHandle::new(adapter)));
         global_plugin_state_registry().register::<ContextStateHandle>(&handle);
+
+        // Register this plugin as a persistence participant so the
+        // snapshot-orchestration plugin can drive save/restore over
+        // context-state on its schedule.
+        let writer_for_snapshot: Arc<dyn ContextStateWriter> = {
+            let guard = handle
+                .read()
+                .expect("freshly-created ContextStateHandle lock is poisoned");
+            Arc::clone(&guard.0)
+        };
+        let stateful = StatefulPluginHandle::new(ContextsStatefulPlugin {
+            writer: writer_for_snapshot,
+        });
+        let registry = global_plugin_state_registry();
+        let stateful_registry = bmux_snapshot_runtime::get_or_init_stateful_registry(
+            || registry.get::<StatefulPluginRegistry>(),
+            |fresh| {
+                registry.register::<StatefulPluginRegistry>(fresh);
+            },
+        );
+        stateful_registry
+            .write()
+            .expect("stateful plugin registry lock poisoned")
+            .push(stateful);
 
         // Register the typed event channel for `contexts-events`.
         // Consumers subscribe via
