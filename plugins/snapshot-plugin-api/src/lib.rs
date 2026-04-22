@@ -2,9 +2,8 @@
 //!
 //! Hand-written (no BPDL). Hosts the shared config type,
 //! capability/interface ids, typed request/response wire enums, the
-//! `typed_client` helper module, and a placeholder `offline_snapshot`
-//! module for the offline snapshot-mutation utility that relocates
-//! here in Slice 13 Stage 6.
+//! `typed_client` helper module, and the `offline_snapshot` module
+//! that backs CLI fallbacks when the server is down.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]

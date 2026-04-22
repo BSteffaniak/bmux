@@ -143,8 +143,7 @@ crates (`packages/client-state`, `packages/context-state`,
 `packages/performance-state`, `packages/snapshot-runtime`).
 
 This keeps a strict one-way dependency direction: plugin → core is
-allowed, core → plugin is not. See Slice 12 of `.phase1-scratch.md`
-for the full boundary-closure history.
+allowed, core → plugin is not.
 
 Plugin-owned state type locations:
 
@@ -223,7 +222,7 @@ CombinedSnapshotEnvelope {
 The file lives at
 `paths.data_dir/runtime/bmux-snapshot-v1.json`. The filename is
 versioned (`v1`) so the envelope format never silently overwrites a
-legacy monolithic `server-snapshot-v2.json` from before Slice 13.
+legacy monolithic `server-snapshot-v2.json`.
 
 ### `StatefulPlugin` participants
 
@@ -300,7 +299,7 @@ timeout + 50ms retry backoff) serializes concurrent mutations.
 
 ### Boundary properties
 
-After Slice 13, the persistence boundary is closed:
+The persistence boundary is closed:
 
 - `packages/server` carries zero snapshot-schema types. Every
   persistence interaction is one trait-object dispatch through

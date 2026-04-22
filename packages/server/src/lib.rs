@@ -4431,10 +4431,10 @@ impl BmuxServer {
         #[cfg(windows)]
         let endpoint = IpcEndpoint::windows_named_pipe(paths.server_named_pipe());
 
-        // `snapshot_manager` was removed in Slice 13 Stage 5 — the
-        // snapshot plugin owns persistence now. Pass `None` to preserve
-        // the `new_with_snapshot` signature until callers are
-        // migrated.
+        // `snapshot_manager` is no longer used by server — the
+        // snapshot plugin owns persistence now. The parameter is
+        // retained on the API for backward compatibility until
+        // callers are migrated; pass `None` here.
         let snapshot_manager: Option<()> = None;
         let server_control_principal_id =
             load_or_create_principal_id(paths).unwrap_or_else(|error| {
@@ -4578,9 +4578,9 @@ impl BmuxServer {
         register_wire_event_sink(&self.state);
 
         // Register server's pane-runtime as a `StatefulPlugin`
-        // participant so the snapshot-orchestration plugin (Slice 13)
-        // includes it in the combined envelope alongside the three
-        // foundational plugin participants. Safe to call here because
+        // participant so the snapshot-orchestration plugin includes
+        // it in the combined envelope alongside the three foundational
+        // plugin participants. Safe to call here because
         // `BmuxServer::new` has already built `SessionRuntimeManager`
         // and bundled plugin `activate` callbacks have already run.
         pane_runtime_snapshot::ServerPaneRuntimeStateful::register(&self.state);
@@ -5534,8 +5534,8 @@ fn mark_snapshot_dirty_flag() {
     snapshot_dirty_flag().mark_dirty();
 }
 
-/// Opportunistic snapshot flush. Post-Slice-13, the plugin's
-/// debounce thread does the real flushing; this function retains the
+/// Opportunistic snapshot flush. The snapshot plugin's debounce
+/// thread does the real flushing; this function retains the
 /// original signature so call-sites don't churn, but for `force=false`
 /// it's a no-op (the dirty flag is already set by the caller's
 /// `mark_snapshot_dirty`, and the plugin picks it up). For `force=true`

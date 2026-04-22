@@ -3,9 +3,9 @@
 //! Panes, layouts, floating surfaces and per-pane resurrection fields
 //! are server runtime — they live inside the process managing PTYs,
 //! not inside any plugin domain. The snapshot-orchestration plugin
-//! (Slice 13) iterates every registered `StatefulPlugin` participant
-//! when building/restoring a combined envelope; this module registers
-//! the server-side participant so the pane runtime ends up in that
+//! iterates every registered `StatefulPlugin` participant when
+//! building/restoring a combined envelope; this module registers the
+//! server-side participant so the pane runtime ends up in that
 //! envelope alongside the plugin-owned slices.
 
 use std::sync::atomic::Ordering;
@@ -625,7 +625,7 @@ mod tests {
         );
     }
 
-    /// The pre-Slice-13 `SnapshotV4` schema had a cross-field
+    /// The legacy monolithic `SnapshotV4` schema had a cross-field
     /// invariant — `active_command_source` was required to be `None`
     /// when `active_command` was `None`, and vice versa — enforced at
     /// encode time by `validate_snapshot_v4`. The new
@@ -638,10 +638,6 @@ mod tests {
     /// This test documents the relaxation: a pane with
     /// `active_command_source = Some(Verbatim)` and `active_command
     /// = None` must round-trip cleanly through JSON without rejection.
-    /// Replaces the deleted
-    /// `persistence::tests::encode_rejects_command_source_without_command`
-    /// test, flipping the assertion from "must reject" to "must
-    /// accept".
     #[test]
     fn schema_permits_command_source_without_command() {
         let session_id = Uuid::new_v4();

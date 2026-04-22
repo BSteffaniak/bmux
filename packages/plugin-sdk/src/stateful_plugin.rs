@@ -1,24 +1,18 @@
-//! `StatefulPlugin` — forward-looking trait declaring per-plugin snapshot
-//! and restore hooks.
+//! `StatefulPlugin` — per-plugin snapshot and restore hooks.
 //!
-//! Today the server owns a monolithic snapshot writer that knows about
-//! every plugin domain (follow state, context state, session manager,
-//! recording runtime, performance settings). That coupling is what the
-//! Slice 12 core/plugin split exists to eliminate.
+//! Plugins that participate in server-level persistence implement
+//! this trait + push a `StatefulPluginHandle` into a shared
+//! `StatefulPluginRegistry`. A dedicated snapshot-orchestration
+//! plugin walks every handle in the registry and drives the
+//! save/restore cycle.
 //!
-//! This trait declares the surface a plugin needs to own its own
-//! persistence: produce opaque bytes representing "everything this
-//! plugin needs to restore itself" and consume those bytes on server
-//! restart. The opaque-bytes shape keeps the orchestration (which
-//! plugins get snapshotted, in what order, with what storage backend)
-//! out of core. A dedicated snapshot-orchestration plugin (tracked as
-//! Slice 13) walks every `StatefulPlugin` handle registered in the
-//! plugin state registry and drives the save/restore cycle.
-//!
-//! Slice 12 **declares** the trait in the SDK so plugin-impl crates can
-//! implement it alongside their state writer traits. Slice 12 does not
-//! reroute the server's existing snapshot pipeline through it — that
-//! happens in Slice 13.
+//! The trait produces opaque bytes representing "everything this
+//! plugin needs to restore itself" and consumes those bytes on
+//! server restart. The opaque-bytes shape keeps the orchestration
+//! (which plugins get snapshotted, in what order, with what storage
+//! backend) out of core — the server only names
+//! `SnapshotOrchestratorHandle` (from `bmux_snapshot_runtime`), not
+//! any participant's concrete schema.
 
 use std::sync::Arc;
 

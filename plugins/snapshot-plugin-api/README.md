@@ -11,5 +11,5 @@ Hand-written (no BPDL). Hosts:
 - `typed_client` module — async helpers over any
   `bmux_plugin_sdk::TypedDispatchClient` (`save_now`, `status`,
   `restore_dry_run`, `restore_apply`).
-- `offline_snapshot` module — placeholder for the `offline_kill_sessions`
-  utility that relocates here in Slice 13 Stage 6.
+- `offline_snapshot` module — the `offline_kill_sessions` utility
+  CLI subcommands call when the server is down.

@@ -986,7 +986,7 @@ fn follow_ipc_variants_are_absent() {
 /// Verify that the recording-plugin crates exist and that core does
 /// not define the `RecordingRuntime` type. The type was relocated from
 /// `packages/server/src/recording.rs` to
-/// `plugins/recording-plugin-api/src/recording_runtime.rs` in Slice 10;
+/// `plugins/recording-plugin-api/src/recording_runtime.rs`;
 /// server imports it via `use bmux_recording_plugin_api::RecordingRuntime`
 /// without depending on the plugin impl crate.
 #[test]
@@ -1231,10 +1231,10 @@ fn plugin_api_crates_expose_typed_client_helpers() {
     }
 }
 
-/// Slice 13 deleted the monolithic `SnapshotV4` schema plus the
-/// `SnapshotManager` + `SnapshotRuntime` machinery and the entire
-/// `packages/server/src/persistence.rs` file. Persistence now flows
-/// through the `bmux.snapshot` plugin via
+/// The monolithic `SnapshotV4` schema plus the `SnapshotManager` +
+/// `SnapshotRuntime` machinery and the entire
+/// `packages/server/src/persistence.rs` file have been deleted.
+/// Persistence flows through the `bmux.snapshot` plugin via
 /// `SnapshotOrchestratorHandle` (trait object registered in the
 /// plugin state registry); server must not reintroduce any of the
 /// legacy schema or functions.
@@ -1246,7 +1246,7 @@ fn server_does_not_define_snapshot_schema() {
         !persistence_path.exists(),
         "packages/server/src/persistence.rs must remain deleted; the \
          monolithic snapshot schema was replaced by the `bmux.snapshot` \
-         plugin in Slice 13",
+         plugin",
     );
 
     let server_source = include_str!("../../server/src/lib.rs");
@@ -1273,8 +1273,7 @@ fn server_does_not_define_snapshot_schema() {
         assert!(
             !server_source.contains(ty),
             "packages/server/src/lib.rs must not define `{ty}`; the \
-             legacy monolithic snapshot schema was deleted in Slice 13 \
-             Stage 5",
+             legacy monolithic snapshot schema has been deleted",
         );
     }
 
@@ -1292,8 +1291,8 @@ fn server_does_not_define_snapshot_schema() {
         assert!(
             !server_source.contains(function),
             "packages/server/src/lib.rs must not define `{function}`; \
-             the legacy snapshot pipeline was replaced by \
-             `SnapshotOrchestratorHandle` dispatch in Slice 13 Stage 5",
+             the legacy snapshot pipeline has been replaced by \
+             `SnapshotOrchestratorHandle` dispatch",
         );
     }
 
