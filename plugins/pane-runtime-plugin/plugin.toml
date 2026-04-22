@@ -1,0 +1,42 @@
+execution_class = "native_fast"
+id = "bmux.pane_runtime"
+name = "bmux Pane Runtime"
+owns_namespaces = []
+provided_capabilities = [
+    "bmux.pane_runtime.read",
+    "bmux.pane_runtime.write",
+    "bmux.attach_runtime.read",
+    "bmux.attach_runtime.write",
+]
+provided_features = ["bmux.pane_runtime"]
+required_capabilities = []
+version = "0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.sessions"
+version_req = ">=0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.pane_runtime.read"
+interface_id = "pane-runtime-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.pane_runtime.write"
+interface_id = "pane-runtime-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.attach_runtime.write"
+interface_id = "attach-runtime-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.attach_runtime.read"
+interface_id = "attach-runtime-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.pane_runtime.read"
+interface_id = "pane-runtime-events"
+kind         = "event"

@@ -1,0 +1,65 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shipped pane-runtime plugin for bmux (owns PTY handles + layout tree + pane output fanout)"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "pane", "runtime"]
+license     = { workspace = true }
+name        = "bmux_pane_runtime_plugin"
+publish     = false
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+bmux_image = { workspace = true, optional = true }
+bmux_ipc = { workspace = true }
+bmux_pane_runtime_plugin_api = { workspace = true }
+bmux_pane_runtime_state = { workspace = true }
+bmux_plugin = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
+bmux_recording_runtime = { workspace = true }
+bmux_session_models = { workspace = true, features = ["serde"] }
+bmux_session_state = { workspace = true }
+bmux_terminal_protocol = { workspace = true }
+portable-pty = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tracing = { workspace = true, features = ["std"] }
+uuid = { workspace = true, features = ["serde", "std"] }
+vt100 = { workspace = true }
+
+[package.metadata.cargo-machete]
+# `anyhow`, `bmux_ipc`, and `bmux_image` are declared ahead of use
+# because the plugin's state + handler modules will consume them as
+# the pane-runtime implementation grows. Dropping them now just
+# means re-adding in a few edits.
+ignored = ["anyhow", "bmux_image", "bmux_ipc"]
+
+[features]
+default = []
+fail-on-warnings = [
+    "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]
+static-bundled = []
+
+# Terminal image protocol support (feature-gated, optional). Matches
+# the feature flag on `bmux_server`.
+image-registry = [
+    "dep:bmux_image",
+    "bmux_image/sixel",
+    "bmux_image/kitty",
+    "bmux_image/iterm2",
+]

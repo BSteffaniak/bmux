@@ -1461,6 +1461,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_pane_runtime_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "bmux_image",
+ "bmux_ipc",
+ "bmux_pane_runtime_plugin_api",
+ "bmux_pane_runtime_state",
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "bmux_recording_runtime",
+ "bmux_session_models",
+ "bmux_session_state",
+ "bmux_terminal_protocol",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+ "vt100",
+]
+
+[[package]]
 name = "bmux_pane_runtime_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
