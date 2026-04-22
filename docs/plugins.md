@@ -129,40 +129,42 @@ The registry is a `TypeId`-keyed typemap holding
 `Arc<dyn Any + Send + Sync>` entries. Consumers resolve by concrete
 type: `global_plugin_state_registry().get::<FollowState>()`.
 
-**Server state ownership model.** Server core constructs a fresh
-`Arc<RwLock<T>>` per `BmuxServer` instance (via `make_server_state::<T>()`
-in `packages/server/src/lib.rs`) so that multiple servers running in the
-same process don't share state. Server imports the state types directly
-from the owning plugin crates (`use bmux_clients_plugin::FollowState`,
-`use bmux_contexts_plugin::ContextState`,
-`use bmux_sessions_plugin::SessionManager`). The plugin registration is
-canonical at the process level and available to other plugins or tooling
-that want to peek at a live handle outside a specific server instance.
-The server's authoritative handle flows through its request pipeline.
+**Server state ownership model.** Each plugin's `activate` constructs
+an `Arc<RwLock<T>>` holding its concrete state (`FollowState`,
+`ContextState`, `SessionManager`, etc.) and registers a trait-object
+handle into the process-wide \[`bmux_plugin::PluginStateRegistry`\].
+Server code never names the concrete plugin-owned types — it reads +
+writes through the registered `*Handle` trait objects
+(`FollowStateHandle`, `ContextStateHandle`, `SessionManagerHandle`,
+`PerformanceSettingsHandle`, `RecordingSinkHandle`,
+`SnapshotOrchestratorHandle`, etc.) defined in neutral primitive
+crates (`packages/client-state`, `packages/context-state`,
+`packages/session-state`, `packages/recording-runtime`,
+`packages/performance-state`, `packages/snapshot-runtime`).
+
+This keeps a strict one-way dependency direction: plugin → core is
+allowed, core → plugin is not. See Slice 12 of `.phase1-scratch.md`
+for the full boundary-closure history.
 
 Plugin-owned state type locations:
 
-| Type                                        | Owner plugin             | Location                                                                                            |
-| ------------------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------- |
-| `FollowState`                               | `clients-plugin`         | `plugins/clients-plugin-api/src/follow_state.rs`                                                    |
-| `ContextState`                              | `contexts-plugin`        | `plugins/contexts-plugin-api/src/context_state.rs`                                                  |
-| `SessionManager`                            | `sessions-plugin`        | `plugins/sessions-plugin-api/src/session_manager.rs`                                                |
-| `RecordingRuntime` + sink trait             | `recording-plugin`       | `plugins/recording-plugin-api/src/recording_runtime.rs` + `plugins/recording-plugin-api/src/lib.rs` |
-| `PerformanceCaptureSettings` + rate limiter | `performance-plugin`     | `plugins/performance-plugin-api/src/lib.rs`                                                         |
-| Catalog revision counter + snapshot         | `control-catalog-plugin` | `plugins/control-catalog-plugin/src/lib.rs`                                                         |
+| Type                                        | Owner plugin             | Location                                                                                      |
+| ------------------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------- |
+| `FollowState`                               | `clients-plugin`         | `plugins/clients-plugin/src/follow_state.rs`                                                  |
+| `ContextState`                              | `contexts-plugin`        | `plugins/contexts-plugin/src/context_state.rs`                                                |
+| `SessionManager`                            | `sessions-plugin`        | `plugins/sessions-plugin/src/session_manager.rs`                                              |
+| `RecordingRuntime` + sink trait             | `recording-plugin`       | `plugins/recording-plugin/src/recording_runtime.rs` + `packages/recording-runtime/src/lib.rs` |
+| `PerformanceCaptureSettings` + rate limiter | `performance-plugin`     | `packages/performance-state/src/lib.rs` + `plugins/performance-plugin-api/src/lib.rs`         |
+| Catalog revision counter + snapshot         | `control-catalog-plugin` | `plugins/control-catalog-plugin/src/lib.rs`                                                   |
 
-The authoritative state types (`FollowState`, `ContextState`,
-`SessionManager`) live in the corresponding `*-plugin-api` crates, not
-in the plugin impl crates. This lets `packages/server` and other
-consumers name the types without depending on the plugin impl crates
-— the "core must not depend on plugin impl crates" rule is enforced
+Concrete state types live in each plugin's impl crate; the matching
+`*-plugin-api` / `*-state` crates expose only the reader/writer traits
+and handle newtypes used by core. Core crates (`packages/server`,
+`packages/client`) reach domain state exclusively through those trait
+objects registered in \[`bmux_plugin::PluginStateRegistry`\] — the
+"core must not depend on plugin impl crates" rule is enforced
 uniformly by the `core_architecture_does_not_depend_on_plugins`
 guardrail, which includes `packages/server` in its core-crate list.
-Plugins register canonical handles into the process-wide
-\[`bmux_plugin::PluginStateRegistry`\] during `activate`; server reads
-those handles via `reset_plugin_owned_state` at construction time so
-server + plugin share a single `Arc<RwLock<T>>` instance per state
-type.
 
 The control-catalog plugin is a cross-cutting aggregator: it doesn't
 own a dedicated state struct registered in
@@ -188,12 +190,133 @@ server's `spawn_client_events_bridge` task maps those typed events to
 the legacy wire `Event::{FollowStarted, FollowStopped, FollowTargetChanged}` for cross-process subscribers, following the
 same pattern as the control-catalog bridge.
 
-`SessionRuntimeManager` (the heavier pane-runtime / snapshot /
-recording orchestration struct) remains in `packages/server` for now —
-it is too entangled with server-specific runtime primitives
-(`portable-pty`, tokio channels, recording runtimes) to relocate
-without pulling those dependencies into a plugin crate. Migrating it is
+`SessionRuntimeManager` (the heavier pane-runtime struct that owns
+PTY handles, layout tree, and floating surfaces) remains in
+`packages/server` — it is too entangled with server-specific runtime
+primitives (`portable-pty`, tokio channels) to relocate without
+pulling those dependencies into a plugin crate. Migrating it is
 tracked as future work.
+
+## Persistence
+
+Snapshot persistence (save/restore across server restarts) is owned
+by the `bmux.snapshot` plugin. Core crates never name the snapshot
+schema — they dispatch through a `SnapshotOrchestratorHandle` trait
+object registered in the plugin state registry.
+
+### Combined envelope format
+
+The on-disk format is a `CombinedSnapshotEnvelope` (defined in
+`plugins/snapshot-plugin-api/src/envelope.rs`): a monotonic version,
+a FNV-1a-64 checksum over the sections, and a `Vec<SectionV1>` where
+each section is one participant's opaque payload plus its schema
+metadata:
+
+```text
+CombinedSnapshotEnvelope {
+  version: 1,
+  checksum: u64,
+  sections: Vec<SectionV1 { id: String, version: u32, bytes: Vec<u8> }>,
+}
+```
+
+The file lives at
+`paths.data_dir/runtime/bmux-snapshot-v1.json`. The filename is
+versioned (`v1`) so the envelope format never silently overwrites a
+legacy monolithic `server-snapshot-v2.json` from before Slice 13.
+
+### `StatefulPlugin` participants
+
+Each participant implements
+\[`bmux_plugin_sdk::StatefulPlugin`\] and pushes its
+`StatefulPluginHandle` into a shared
+`bmux_snapshot_runtime::StatefulPluginRegistry` during `activate`:
+
+| Participant id                  | Owner                               | Payload type             |
+| ------------------------------- | ----------------------------------- | ------------------------ |
+| `bmux.clients/follow-state`     | `clients-plugin`                    | `FollowStateSnapshot`    |
+| `bmux.contexts/context-state`   | `contexts-plugin`                   | `ContextStateSnapshot`   |
+| `bmux.sessions/session-manager` | `sessions-plugin`                   | `SessionManagerSnapshot` |
+| `bmux.server/pane-runtime`      | server (`pane_runtime_snapshot.rs`) | `PaneRuntimeSnapshotV1`  |
+
+Each participant serializes its own section independently (serde-JSON
+inside the opaque `bytes` field). Sections are decoded + routed back
+by `id` on restore. Unknown ids are logged + skipped; sections whose
+`restore_snapshot` returns `Err` are counted as failures but never
+abort the rest of the restore (see `restore_gracefully_skips_*` test).
+
+### Orchestrator
+
+`BmuxSnapshotOrchestrator` in `plugins/snapshot-plugin/src/orchestrator.rs`
+implements the `bmux_snapshot_runtime::SnapshotOrchestrator` trait.
+It owns:
+
+- `path: Option<PathBuf>` — snapshot file location (None = disabled).
+- `dirty_flag: Arc<SnapshotDirtyFlag>` — atomic bit flipped by server
+  on every state change.
+- `stateful_registry: Arc<RwLock<StatefulPluginRegistry>>` — the
+  process-wide registry of participants.
+
+On `activate`, the snapshot plugin spawns a dedicated OS thread that
+polls the dirty flag every 200ms. When the flag has been set for at
+least `debounce_ms` (1000ms by default), the thread calls
+`save_now_blocking()` to atomically rewrite the envelope file.
+
+Server marks dirty via `snapshot_dirty_flag().mark_dirty()` at every
+persistence-worthy state change (7 call sites). Server does not
+spawn its own flush task — the plugin's debounce thread replaces it.
+
+### IPC wiring
+
+Four IPC variants (`Request::{ServerStatus, ServerSave, ServerRestoreDryRun, ServerRestoreApply}`)
+stay on the wire for CLI-facing operations. Their server handlers
+delegate to the orchestrator through
+`snapshot_orchestrator_handle().as_dyn().save_now_boxed().await`
+(and similar for the other three). Server never names the snapshot
+schema, never reads or writes the envelope file directly.
+
+On `BmuxServer::run_impl`, after every plugin has activated and the
+server's own `ServerPaneRuntimeStateful` participant has registered,
+server awaits `restore_if_present_boxed()` to populate the four
+participant slices from the on-disk envelope in a single pass.
+
+### Offline path (`offline_kill_sessions`)
+
+When the server is not running, CLI subcommands like `bmux kill-session`
+still need to prune killed sessions from the persisted snapshot so
+they don't resurrect on the next server start. The
+`bmux_snapshot_plugin_api::offline_snapshot::offline_kill_sessions`
+utility handles this path — it reads the combined envelope,
+decodes each relevant section through the matching neutral primitive
+crate (`SessionManagerSnapshot` from `bmux_session_state`,
+`ContextStateSnapshot` from `bmux_context_state`,
+`FollowStateSnapshot` from `bmux_client_state`, pane-runtime via
+`serde_json::Value` since its schema is server-internal), mutates
+the in-memory structures, rebuilds the envelope checksum, and writes
+atomically.
+
+A file-level `.lock` sidecar (acquired via `O_CREATE|O_EXCL` with 3s
+timeout + 50ms retry backoff) serializes concurrent mutations.
+
+### Boundary properties
+
+After Slice 13, the persistence boundary is closed:
+
+- `packages/server` carries zero snapshot-schema types. Every
+  persistence interaction is one trait-object dispatch through
+  `SnapshotOrchestratorHandle`.
+- `packages/server/src/persistence.rs` does not exist; the whole
+  legacy `SnapshotV4` + `SnapshotManager` pipeline was deleted.
+- Plugin-api crates own the wire format (envelope + sections) and
+  the offline utility. Plugin impl crates own the orchestrator, the
+  debounce thread, and the atomic file I/O.
+- CLI drives both paths: online via the `SnapshotOrchestratorHandle`
+  IPC dispatch, offline via the `offline_snapshot` module.
+
+Enforced at test time by four architecture guardrails
+(`server_does_not_define_snapshot_schema`, `snapshot_plugin_exists`,
+`state_plugins_implement_stateful_plugin`,
+`server_implements_pane_runtime_stateful`).
 
 ## Interaction patterns
 
