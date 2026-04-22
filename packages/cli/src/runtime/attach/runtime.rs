@@ -5044,10 +5044,7 @@ pub async fn handle_attach_terminal_event(
                     // responses.  Only transport-level send failures are
                     // treated as fatal here.
                     if let Err(error) = client
-                        .send_one_way(bmux_ipc::Request::AttachInput {
-                            session_id: view_state.attached_id,
-                            data: bytes,
-                        })
+                        .send_one_way_attach_input(view_state.attached_id, bytes)
                         .await
                     {
                         return Err(map_attach_client_error(error));
@@ -5309,10 +5306,7 @@ async fn handle_attach_action_dispatch(
         AttachEventAction::Send(bytes) => {
             if view_state.can_write
                 && let Err(error) = client
-                    .send_one_way(bmux_ipc::Request::AttachInput {
-                        session_id: view_state.attached_id,
-                        data: bytes,
-                    })
+                    .send_one_way_attach_input(view_state.attached_id, bytes)
                     .await
             {
                 return Err(map_attach_client_error(error));

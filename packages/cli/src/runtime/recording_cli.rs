@@ -979,10 +979,16 @@ pub(super) fn input_timeline(events: &[RecordingEventEnvelope]) -> Vec<ReplayInp
 }
 
 /// Extract viewport dimensions from recording events by finding the first
-/// `AttachSetViewport` request. Returns `None` if no viewport was recorded.
+/// `attach-set-viewport` typed-dispatch invocation. Returns `None` if no
+/// viewport was recorded.
 pub(super) fn extract_viewport_from_events(
     events: &[RecordingEventEnvelope],
 ) -> Option<(u16, u16)> {
+    #[derive(serde::Deserialize)]
+    struct ViewportArgs {
+        cols: u16,
+        rows: u16,
+    }
     for event in events {
         if let (
             RecordingEventKind::RequestStart,
@@ -992,10 +998,23 @@ pub(super) fn extract_viewport_from_events(
             if request_data.is_empty() {
                 continue;
             }
-            if let Ok(request) = bmux_ipc::decode::<bmux_ipc::Request>(request_data)
-                && let bmux_ipc::Request::AttachSetViewport { cols, rows, .. } = request
-            {
-                return Some((cols, rows));
+            let Ok(request) = bmux_ipc::decode::<bmux_ipc::Request>(request_data) else {
+                continue;
+            };
+            let bmux_ipc::Request::InvokeService {
+                interface_id,
+                operation,
+                payload,
+                ..
+            } = request
+            else {
+                continue;
+            };
+            if interface_id != "attach-runtime-commands" || operation != "attach-set-viewport" {
+                continue;
+            }
+            if let Ok(args) = bmux_codec::from_bytes::<ViewportArgs>(&payload) {
+                return Some((args.cols, args.rows));
             }
         }
     }

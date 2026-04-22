@@ -1116,6 +1116,8 @@ dependencies = [
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin_sdk",
  "bmux_server",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

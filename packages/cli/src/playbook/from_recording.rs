@@ -24,10 +24,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use bmux_ipc::{
-    PaneSplitDirection, RecordingEventEnvelope, RecordingEventKind, RecordingPayload, Request,
-    ResponsePayload,
-};
+use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingPayload, Request};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -57,6 +54,7 @@ struct RecordingStateTracker {
     /// Terminal viewport dimensions (cols, rows).
     viewport: (u16, u16),
     /// Number of panes created so far (used for index assignment).
+    #[cfg(test)]
     next_pane_index: u32,
 }
 
@@ -66,11 +64,13 @@ impl RecordingStateTracker {
             pane_uuid_to_index: BTreeMap::new(),
             focused_pane_id: None,
             viewport: (80, 24),
+            #[cfg(test)]
             next_pane_index: 0,
         }
     }
 
     /// Register a new pane with a UUID, assigning the next sequential index.
+    #[cfg(test)]
     fn add_pane(&mut self, pane_id: Uuid) {
         if !self.pane_uuid_to_index.contains_key(&pane_id) {
             self.pane_uuid_to_index
@@ -79,14 +79,16 @@ impl RecordingStateTracker {
         }
     }
 
-    /// Remove a pane (on close).
-    fn remove_pane(&mut self, pane_id: &Uuid) {
-        self.pane_uuid_to_index.remove(pane_id);
-    }
-
     /// Set the focused pane.
+    #[cfg(test)]
     const fn set_focus(&mut self, pane_id: Uuid) {
         self.focused_pane_id = Some(pane_id);
+    }
+
+    /// Remove a pane (on close). Currently only used by the tests.
+    #[cfg(test)]
+    fn remove_pane(&mut self, pane_id: &Uuid) {
+        self.pane_uuid_to_index.remove(pane_id);
     }
 
     /// Get the index for a pane UUID, if known.
@@ -99,41 +101,6 @@ impl RecordingStateTracker {
         self.focused_pane_id
             .as_ref()
             .and_then(|id| self.pane_index(id))
-    }
-
-    /// Update state from a decoded Request.
-    const fn process_request(&mut self, request: &Request) {
-        if let Request::AttachSetViewport { cols, rows, .. } = request {
-            self.viewport = (*cols, *rows);
-        }
-    }
-
-    /// Update state from a decoded `ResponsePayload`.
-    fn process_response(&mut self, response: &ResponsePayload) {
-        match response {
-            ResponsePayload::AttachSnapshot {
-                focused_pane_id,
-                panes,
-                ..
-            } => {
-                // Snapshot responses give us authoritative pane state.
-                for pane in panes {
-                    self.add_pane(pane.id);
-                }
-                self.set_focus(*focused_pane_id);
-            }
-            ResponsePayload::AttachLayout {
-                focused_pane_id,
-                panes,
-                ..
-            } => {
-                for pane in panes {
-                    self.add_pane(pane.id);
-                }
-                self.set_focus(*focused_pane_id);
-            }
-            _ => {}
-        }
     }
 }
 
@@ -153,13 +120,14 @@ struct PaneOutputAccumulator {
 
 /// Convert a list of recording events into a DSL playbook string with assertions.
 ///
+#[must_use]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push("# Auto-generated from recording".to_string());
     lines.push(String::new());
 
-    let mut state = RecordingStateTracker::new();
+    let state = RecordingStateTracker::new();
     let mut last_mono_ns: u64 = 0;
     let mut has_session = false;
 
@@ -173,30 +141,12 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> String {
     // Output accumulator: collects PaneOutputRaw bytes between input events.
     let mut output_accum: Vec<PaneOutputAccumulator> = Vec::new();
     let mut last_output_mono_ns: u64 = 0;
-    let mut viewport_set = false;
 
     for event in events {
-        // ---- Update state from RequestDone events ----
-        if let (
-            RecordingEventKind::RequestDone,
-            RecordingPayload::RequestDone {
-                request_data,
-                response_data,
-                ..
-            },
-        ) = (&event.kind, &event.payload)
-        {
-            if !request_data.is_empty()
-                && let Ok(request) = bmux_ipc::decode::<Request>(request_data)
-            {
-                state.process_request(&request);
-            }
-            if !response_data.is_empty()
-                && let Ok(response) = bmux_ipc::decode::<ResponsePayload>(response_data)
-            {
-                state.process_response(&response);
-            }
-        }
+        // `RequestDone`-driven state updates were removed along with
+        // the attach-family top-level IPC variants. Pane tracker state
+        // is populated by the DSL emitter below using observed input
+        // events only.
 
         // ---- Detect input events ----
         let is_input_event = matches!(
@@ -283,20 +233,6 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> String {
                 continue;
             }
             if let Ok(request) = bmux_ipc::decode::<Request>(request_data) {
-                // Emit viewport directive on first AttachSetViewport.
-                if let Request::AttachSetViewport { cols, rows, .. } = &request
-                    && !viewport_set
-                {
-                    // Insert viewport as the first directive after the header.
-                    let insert_pos = lines
-                        .iter()
-                        .position(std::string::String::is_empty)
-                        .unwrap_or(1)
-                        + 1;
-                    lines.insert(insert_pos, format!("@viewport cols={cols} rows={rows}"));
-                    viewport_set = true;
-                }
-
                 match request_to_dsl(&request, &mut has_session, request_kind, &state, event) {
                     RequestDslResult::Line(line) => lines.push(line),
                     RequestDslResult::CoalesceInput(data, pane_id) => {
@@ -550,40 +486,59 @@ fn request_to_dsl(
                     return RequestDslResult::Line(format!("kill-session name='{name}'"));
                 }
             }
+            // Attach-family commands on pane-runtime plugin.
+            if interface_id == "attach-runtime-commands" {
+                match operation.as_str() {
+                    "attach-set-viewport" => {
+                        #[derive(serde::Deserialize)]
+                        struct ViewportArgs {
+                            cols: u16,
+                            rows: u16,
+                        }
+                        if let Ok(args) = bmux_codec::from_bytes::<ViewportArgs>(payload) {
+                            return RequestDslResult::Line(format!(
+                                "resize-viewport cols={} rows={}",
+                                args.cols, args.rows
+                            ));
+                        }
+                    }
+                    "attach-input" => {
+                        #[derive(serde::Deserialize)]
+                        struct InputArgs {
+                            data: Vec<u8>,
+                        }
+                        if let Ok(args) = bmux_codec::from_bytes::<InputArgs>(payload) {
+                            if args.data.is_empty() || !*has_session {
+                                return RequestDslResult::Skip;
+                            }
+                            let pane_id = event.pane_id.or(state.focused_pane_id);
+                            return RequestDslResult::CoalesceInput(args.data, pane_id);
+                        }
+                    }
+                    // Attach lifecycle / query operations aren't playbook actions.
+                    "attach-session"
+                    | "attach-context"
+                    | "attach-open"
+                    | "attach-output"
+                    | "detach"
+                    | "set-client-attach-policy" => return RequestDslResult::Skip,
+                    _ => {}
+                }
+            }
+            if interface_id == "attach-runtime-state" {
+                return RequestDslResult::Skip;
+            }
             RequestDslResult::Line(format!(
                 "# unhandled invoke-service {interface_id}:{operation}"
             ))
         }
-        Request::AttachSetViewport { cols, rows, .. } => {
-            RequestDslResult::Line(format!("resize-viewport cols={cols} rows={rows}"))
-        }
-        Request::AttachInput { data, .. } => {
-            if data.is_empty() || !*has_session {
-                return RequestDslResult::Skip;
-            }
-            // Use pane_id from the recording envelope if available, otherwise
-            // fall back to the tracker's focused pane.
-            let pane_id = event.pane_id.or(state.focused_pane_id);
-            RequestDslResult::CoalesceInput(data.clone(), pane_id)
-        }
         // Skip high-frequency / non-structural requests.
-        // Recording-related requests aren't playbook actions.
-        // Attach lifecycle is handled implicitly by the playbook engine.
-        Request::AttachOutput { .. }
-        | Request::AttachSnapshot { .. }
-        | Request::AttachPaneSnapshot { .. }
-        | Request::AttachLayout { .. }
-        | Request::AttachPaneOutputBatch { .. }
-        | Request::Ping
+        Request::Ping
         | Request::Hello { .. }
         | Request::HelloV2 { .. }
         | Request::WhoAmIPrincipal
         | Request::SubscribeEvents
-        | Request::PollEvents { .. }
-        | Request::Attach { .. }
-        | Request::AttachContext { .. }
-        | Request::AttachOpen { .. }
-        | Request::Detach => RequestDslResult::Skip,
+        | Request::PollEvents { .. } => RequestDslResult::Skip,
         // Everything else gets a comment for manual review.
         _ => RequestDslResult::Line(format!("# unhandled request: {request_kind}")),
     }

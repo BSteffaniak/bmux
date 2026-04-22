@@ -68,26 +68,29 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         },
 
         // attach-runtime-commands.
-        "attach-runtime-commands", "attach-session" => |_req: attach_commands::AttachSessionArgs, _ctx| {
-            Ok::<_, ServiceResponse>(attach_commands::not_implemented("attach-session"))
+        "attach-runtime-commands", "attach-session" => |req: attach_commands::AttachSessionArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::attach_session(&req, ctx))
         },
-        "attach-runtime-commands", "attach-context" => |_req: attach_commands::AttachContextArgs, _ctx| {
-            Ok::<_, ServiceResponse>(attach_commands::not_implemented("attach-context"))
+        "attach-runtime-commands", "attach-context" => |req: attach_commands::AttachContextArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::attach_context(&req, ctx))
         },
-        "attach-runtime-commands", "attach-open" => |_req: attach_commands::AttachOpenArgs, _ctx| {
-            Ok::<_, ServiceResponse>(attach_commands::not_implemented("attach-open"))
+        "attach-runtime-commands", "attach-open" => |req: attach_commands::AttachOpenArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::attach_open(&req, ctx))
         },
-        "attach-runtime-commands", "attach-input" => |_req: attach_commands::AttachInputArgs, _ctx| {
-            Ok::<_, ServiceResponse>(attach_commands::not_implemented("attach-input"))
+        "attach-runtime-commands", "attach-input" => |req: attach_commands::AttachInputArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::attach_input(req, ctx))
         },
-        "attach-runtime-commands", "attach-output" => |_req: attach_commands::AttachOutputArgs, _ctx| {
-            Ok::<_, ServiceResponse>(attach_commands::not_implemented("attach-output"))
+        "attach-runtime-commands", "attach-output" => |req: attach_commands::AttachOutputArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::attach_output(&req, ctx))
         },
-        "attach-runtime-commands", "attach-set-viewport" => |req: attach_commands::AttachSetViewportArgs, _ctx| {
-            Ok::<_, ServiceResponse>(attach_commands::attach_set_viewport(&req))
+        "attach-runtime-commands", "attach-set-viewport" => |req: attach_commands::AttachSetViewportArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::attach_set_viewport(&req, ctx))
         },
-        "attach-runtime-commands", "detach" => |_req: attach_commands::DetachArgs, _ctx| {
-            Ok::<_, ServiceResponse>(attach_commands::not_implemented("detach"))
+        "attach-runtime-commands", "set-client-attach-policy" => |req: attach_commands::SetClientAttachPolicyArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::set_client_attach_policy(req, ctx))
+        },
+        "attach-runtime-commands", "detach" => |_req: attach_commands::DetachArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::detach(ctx))
         },
 
         // attach-runtime-state queries.
@@ -103,8 +106,8 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "attach-runtime-state", "attach-pane-output-batch" => |req: attach_state::AttachPaneOutputBatchArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_output_batch(&req, ctx))
         },
-        "attach-runtime-state", "attach-pane-images" => |_req: attach_state::AttachPaneImagesArgs, _ctx| {
-            Ok::<_, ServiceResponse>(attach_state::not_implemented_pane_images())
+        "attach-runtime-state", "attach-pane-images" => |req: attach_state::AttachPaneImagesArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_images(&req, ctx))
         },
     })
 }

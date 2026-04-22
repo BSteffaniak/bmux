@@ -487,6 +487,44 @@ pub async fn kill_session_runtime<C: TypedDispatchClient>(
 // ── attach-runtime-commands ──────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachSessionArgs {
+    selector: bmux_ipc::SessionSelector,
+    can_write: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachContextArgs {
+    selector: bmux_ipc::ContextSelector,
+    can_write: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachOpenArgs {
+    session_id: Uuid,
+    attach_token: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachInputArgs {
+    session_id: Uuid,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachOutputArgs {
+    session_id: Uuid,
+    max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct SetClientAttachPolicyArgs {
+    allow_detach: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+struct DetachArgs;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AttachSetViewportArgs {
     session_id: Uuid,
     cols: u16,
@@ -495,6 +533,187 @@ struct AttachSetViewportArgs {
     status_bottom_inset: u16,
     cell_pixel_w: u16,
     cell_pixel_h: u16,
+}
+
+/// Request an attach grant for a session.
+///
+/// # Errors
+///
+/// Returns an error if transport, encoding, or server-side operation fails.
+pub async fn attach_session<C: TypedDispatchClient>(
+    client: &mut C,
+    selector: bmux_ipc::SessionSelector,
+    can_write: bool,
+) -> Result<
+    core::result::Result<
+        attach_runtime_commands::AttachGrant,
+        attach_runtime_commands::AttachCommandError,
+    >,
+> {
+    invoke(
+        client,
+        ATTACH_RUNTIME_WRITE.as_str(),
+        InvokeServiceKind::Command,
+        attach_runtime_commands::INTERFACE_ID.as_str(),
+        "attach-session",
+        &AttachSessionArgs {
+            selector,
+            can_write,
+        },
+    )
+    .await
+}
+
+/// Request an attach grant for a context.
+///
+/// # Errors
+///
+/// Returns an error if transport, encoding, or server-side operation fails.
+pub async fn attach_context<C: TypedDispatchClient>(
+    client: &mut C,
+    selector: bmux_ipc::ContextSelector,
+    can_write: bool,
+) -> Result<
+    core::result::Result<
+        attach_runtime_commands::AttachGrant,
+        attach_runtime_commands::AttachCommandError,
+    >,
+> {
+    invoke(
+        client,
+        ATTACH_RUNTIME_WRITE.as_str(),
+        InvokeServiceKind::Command,
+        attach_runtime_commands::INTERFACE_ID.as_str(),
+        "attach-context",
+        &AttachContextArgs {
+            selector,
+            can_write,
+        },
+    )
+    .await
+}
+
+/// Open an attach stream using a previously-issued grant token.
+///
+/// # Errors
+///
+/// Returns an error if transport, encoding, or server-side operation fails.
+pub async fn attach_open<C: TypedDispatchClient>(
+    client: &mut C,
+    session_id: Uuid,
+    attach_token: Uuid,
+) -> Result<
+    core::result::Result<
+        attach_runtime_commands::AttachReady,
+        attach_runtime_commands::AttachCommandError,
+    >,
+> {
+    invoke(
+        client,
+        ATTACH_RUNTIME_WRITE.as_str(),
+        InvokeServiceKind::Command,
+        attach_runtime_commands::INTERFACE_ID.as_str(),
+        "attach-open",
+        &AttachOpenArgs {
+            session_id,
+            attach_token,
+        },
+    )
+    .await
+}
+
+/// Write attach input bytes into a session's active runtime.
+///
+/// # Errors
+///
+/// Returns an error if transport, encoding, or server-side operation fails.
+pub async fn attach_input<C: TypedDispatchClient>(
+    client: &mut C,
+    session_id: Uuid,
+    data: Vec<u8>,
+) -> Result<
+    core::result::Result<
+        attach_runtime_commands::AttachInputAccepted,
+        attach_runtime_commands::AttachCommandError,
+    >,
+> {
+    invoke(
+        client,
+        ATTACH_RUNTIME_WRITE.as_str(),
+        InvokeServiceKind::Command,
+        attach_runtime_commands::INTERFACE_ID.as_str(),
+        "attach-input",
+        &AttachInputArgs { session_id, data },
+    )
+    .await
+}
+
+/// Drain attach output for the calling client.
+///
+/// # Errors
+///
+/// Returns an error if transport, encoding, or server-side operation fails.
+pub async fn attach_output<C: TypedDispatchClient>(
+    client: &mut C,
+    session_id: Uuid,
+    max_bytes: u32,
+) -> Result<
+    core::result::Result<
+        attach_runtime_commands::AttachOutput,
+        attach_runtime_commands::AttachCommandError,
+    >,
+> {
+    invoke(
+        client,
+        ATTACH_RUNTIME_WRITE.as_str(),
+        InvokeServiceKind::Command,
+        attach_runtime_commands::INTERFACE_ID.as_str(),
+        "attach-output",
+        &AttachOutputArgs {
+            session_id,
+            max_bytes,
+        },
+    )
+    .await
+}
+
+/// Update the calling client's attach policy (whether server may detach it).
+///
+/// # Errors
+///
+/// Returns an error if transport, encoding, or server-side operation fails.
+pub async fn set_client_attach_policy<C: TypedDispatchClient>(
+    client: &mut C,
+    allow_detach: bool,
+) -> Result<core::result::Result<u8, attach_runtime_commands::AttachCommandError>> {
+    invoke(
+        client,
+        ATTACH_RUNTIME_WRITE.as_str(),
+        InvokeServiceKind::Command,
+        attach_runtime_commands::INTERFACE_ID.as_str(),
+        "set-client-attach-policy",
+        &SetClientAttachPolicyArgs { allow_detach },
+    )
+    .await
+}
+
+/// Detach the calling client from its current attach (if any).
+///
+/// # Errors
+///
+/// Returns an error if transport, encoding, or server-side operation fails.
+pub async fn detach<C: TypedDispatchClient>(
+    client: &mut C,
+) -> Result<core::result::Result<u8, attach_runtime_commands::AttachCommandError>> {
+    invoke(
+        client,
+        ATTACH_RUNTIME_WRITE.as_str(),
+        InvokeServiceKind::Command,
+        attach_runtime_commands::INTERFACE_ID.as_str(),
+        "detach",
+        &DetachArgs,
+    )
+    .await
 }
 
 /// Publish an updated client viewport to the pane runtime.
@@ -676,6 +895,44 @@ pub async fn attach_pane_output_batch<C: TypedDispatchClient>(
             session_id,
             pane_ids,
             max_bytes,
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachPaneImagesArgs {
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+    since_sequences: Vec<u64>,
+}
+
+/// Fetch per-pane image deltas for the calling client.
+///
+/// # Errors
+///
+/// Returns an error if transport, encoding, or server-side operation fails.
+pub async fn attach_pane_images<C: TypedDispatchClient>(
+    client: &mut C,
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+    since_sequences: Vec<u64>,
+) -> Result<
+    core::result::Result<
+        attach_runtime_state::AttachPaneImages,
+        attach_runtime_state::AttachStateError,
+    >,
+> {
+    invoke(
+        client,
+        ATTACH_RUNTIME_READ.as_str(),
+        InvokeServiceKind::Query,
+        attach_runtime_state::INTERFACE_ID.as_str(),
+        "attach-pane-images",
+        &AttachPaneImagesArgs {
+            session_id,
+            pane_ids,
+            since_sequences,
         },
     )
     .await

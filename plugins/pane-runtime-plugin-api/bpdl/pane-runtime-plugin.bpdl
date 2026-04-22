@@ -228,6 +228,10 @@ interface attach-runtime-commands {
         cell_pixel_h: u16,
     ) -> result<attach-viewport-set, attach-command-error>;
 
+    command set-client-attach-policy(
+        allow_detach: bool,
+    ) -> result<u8, attach-command-error>;
+
     command detach() -> result<u8, attach-command-error>;
 }
 
@@ -238,6 +242,7 @@ interface attach-runtime-state {
         stream_start: u64,
         stream_end: u64,
         stream_gap: bool,
+        sync_update_active: bool,
     }
 
     record pane-mouse-protocol {
@@ -317,8 +322,8 @@ interface attach-runtime-state {
 
     query attach-pane-images(
         session_id: uuid,
-        pane_id: uuid,
-        since_version: u64,
+        pane_ids: list<uuid>,
+        since_sequences: list<u64>,
     ) -> result<attach-pane-images, attach-state-error>;
 }
 

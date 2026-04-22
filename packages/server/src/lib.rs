@@ -20,8 +20,7 @@ use bmux_ipc::{
     PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection,
     PaneState, PaneSummary, PerformanceRecordingLevel, ProtocolContract, RecordingEventKind,
     RecordingPayload, RecordingRollingStartOptions, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, decode, default_supported_capabilities, encode,
-    negotiate_protocol,
+    ServerSnapshotStatus, decode, default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
@@ -29,10 +28,9 @@ use bmux_pane_runtime_state::{
 };
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
-use bmux_session_state::{SessionManagerHandle, SessionManagerReader, SessionManagerSnapshot};
+use bmux_session_state::{SessionManagerHandle, SessionManagerSnapshot};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io::{Read, Write};
@@ -90,10 +88,6 @@ struct ServerState {
     pane_exit_rx: AsyncMutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
     service_registry: Mutex<ServiceRegistry>,
     service_resolver: Mutex<Option<Arc<ServiceResolverHandler>>>,
-    /// Resolved image payload compression codec from config.
-    /// Stored here so `handle_connection` can pass it to `delta.to_ipc()`.
-    #[cfg(feature = "image-registry")]
-    payload_codec: Option<Arc<dyn bmux_ipc::compression::CompressionCodec>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -139,7 +133,6 @@ pub struct ServiceInvokeContext {
     shutdown_tx: watch::Sender<bool>,
     client_id: ClientId,
     client_principal_id: Uuid,
-    selection: Arc<AsyncMutex<(Option<SessionId>, Option<SessionId>)>>,
 }
 
 impl ServiceInvokeContext {
@@ -154,25 +147,22 @@ impl ServiceInvokeContext {
 
 impl ServiceInvokeContext {
     async fn execute_request(&self, request: Request) -> Result<Response> {
-        let mut selection = self.selection.lock().await;
-        let mut selected_session = selection.0;
-        let mut attached_stream_session = selection.1;
-        let mut attach_policy = ConnectionAttachPolicy::default();
-        let response = handle_request(
+        // Selection state is owned by the clients-plugin's FollowState now;
+        // plugins that need the caller's selected session should query it
+        // through the FollowStateHandle rather than relying on
+        // per-invocation locals. We pass an empty selection local here —
+        // any handler that still reads it falls back to FollowState via
+        // sync_selected_target_from_follow_state.
+        let mut selected_session: Option<SessionId> = None;
+        handle_request(
             &self.state,
             &self.shutdown_tx,
             self.client_id,
             self.client_principal_id,
             &mut selected_session,
-            &mut attached_stream_session,
-            &mut attach_policy,
             request,
         )
-        .await?;
-        selection.0 = selected_session;
-        selection.1 = attached_stream_session;
-        drop(selection);
-        Ok(response)
+        .await
     }
 
     /// Execute a raw request payload.
@@ -514,14 +504,6 @@ fn snapshot_dirty_flag() -> std::sync::Arc<bmux_snapshot_runtime::SnapshotDirtyF
 // which is an `Arc<RwLock<ContextState>>` obtained from the plugin
 // state registry.
 
-fn current_context_id_for_client(state: &Arc<ServerState>, client_id: ClientId) -> Option<Uuid> {
-    let _ = state;
-    context_handle()
-        .0
-        .current_for_client(client_id)
-        .map(|context| context.id)
-}
-
 fn current_context_id_for_session(state: &Arc<ServerState>, session_id: SessionId) -> Option<Uuid> {
     let _ = state;
     context_handle().0.context_for_session(session_id)
@@ -533,15 +515,6 @@ fn current_context_session_for_client(
 ) -> Option<SessionId> {
     let _ = state;
     context_handle().0.current_session_for_client(client_id)
-}
-
-#[allow(clippy::unnecessary_wraps)]
-fn prune_context_mappings_for_session(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
-) -> Result<Vec<Uuid>> {
-    let _ = state;
-    Ok(context_handle().0.remove_contexts_for_session(session_id))
 }
 
 fn resolve_server_shell(config: &BmuxConfig) -> String {
@@ -4241,14 +4214,6 @@ impl BmuxServer {
         let pane_term = resolve_server_pane_term(&config);
         let protocol_profile = protocol_profile_for_term(&pane_term);
 
-        // Resolve image payload compression codec from config.
-        #[cfg(feature = "image-registry")]
-        let payload_codec: Option<Arc<dyn bmux_ipc::compression::CompressionCodec>> =
-            if config.behavior.compression.enabled {
-                resolve_payload_codec_from_config(&config.behavior.compression)
-            } else {
-                None
-            };
         let (shutdown_tx, _) = watch::channel(false);
         let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
 
@@ -4337,8 +4302,6 @@ impl BmuxServer {
                 pane_exit_rx: AsyncMutex::new(pane_exit_rx),
                 service_registry: Mutex::new(ServiceRegistry::default()),
                 service_resolver: Mutex::new(None),
-                #[cfg(feature = "image-registry")]
-                payload_codec,
             }),
             shutdown_tx,
         }
@@ -4648,17 +4611,6 @@ impl BmuxServer {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ConnectionAttachPolicy {
-    allow_detach: bool,
-}
-
-impl Default for ConnectionAttachPolicy {
-    fn default() -> Self {
-        Self { allow_detach: true }
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 async fn handle_connection(
     state: Arc<ServerState>,
@@ -4669,7 +4621,6 @@ async fn handle_connection(
     let client_principal_id: Uuid;
     let mut selected_session: Option<SessionId> = None;
     let mut attached_stream_session: Option<SessionId> = None;
-    let mut attach_policy = ConnectionAttachPolicy::default();
     let negotiated_frame_codec: Option<
         std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>,
     >;
@@ -4827,8 +4778,6 @@ async fn handle_connection(
             client_id,
             client_principal_id,
             &mut selected_session,
-            &mut attached_stream_session,
-            &mut attach_policy,
             request,
         )
         .await?;
@@ -5319,17 +5268,6 @@ fn normalize_attach_view_components(
     normalized
 }
 
-fn emit_attach_view_changed_for_pane_close(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
-    session_closed: bool,
-) -> Result<()> {
-    if session_closed {
-        return Ok(());
-    }
-    emit_attach_view_changed(state, session_id, &[AttachViewComponent::Scene])
-}
-
 fn emit_attach_view_changed_for_layout(
     state: &Arc<ServerState>,
     session_id: SessionId,
@@ -5391,42 +5329,6 @@ fn reconcile_selected_session_membership(
     Ok(())
 }
 
-fn persist_selected_session(
-    state: &Arc<ServerState>,
-    client_id: ClientId,
-    selected_session: Option<SessionId>,
-) -> Result<()> {
-    let selected_context = current_context_id_for_client(state, client_id);
-    let updates = {
-        let handle = follow_handle();
-        handle
-            .0
-            .set_selected_target(client_id, selected_context, selected_session);
-        handle
-            .0
-            .sync_followers_from_leader(client_id, selected_context, selected_session)
-    };
-
-    for update in updates {
-        let Some(session_id) = update.session_id else {
-            continue;
-        };
-        emit_event(
-            state,
-            Event::FollowTargetChanged {
-                follower_client_id: update.follower_client_id.0,
-                leader_client_id: update.leader_client_id.0,
-                context_id: update
-                    .context_id
-                    .or_else(|| current_context_id_for_client(state, update.leader_client_id)),
-                session_id: session_id.0,
-            },
-        )?;
-    }
-
-    Ok(())
-}
-
 fn disconnect_follow_state(state: &Arc<ServerState>, client_id: ClientId) -> Result<()> {
     let events = follow_handle().0.disconnect_client(client_id);
 
@@ -5434,22 +5336,6 @@ fn disconnect_follow_state(state: &Arc<ServerState>, client_id: ClientId) -> Res
         emit_event(state, event)?;
     }
 
-    Ok(())
-}
-
-// The function keeps its `Result<()>` return type to preserve call-site
-// ergonomics (callers use `?` and may gain fallible steps in the future
-// when the trait surface widens). The current implementation is
-// infallible because the handle writer trait swallows lock errors.
-#[allow(clippy::unnecessary_wraps)]
-fn clear_selected_session_for_all(
-    state: &Arc<ServerState>,
-    removed_session_id: SessionId,
-) -> Result<()> {
-    let _ = state;
-    follow_handle()
-        .0
-        .clear_selections_for_session(removed_session_id);
     Ok(())
 }
 
@@ -5540,51 +5426,13 @@ async fn process_pane_exit_events(state: Arc<ServerState>, mut shutdown_rx: watc
     }
 }
 
-#[allow(
-    clippy::unused_async,
-    reason = "Keeps signature async to match other IPC-handler helpers; may re-acquire lock contention resolution asynchronously in future."
-)]
-async fn ensure_attach_session_exists(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
-) -> Result<bool> {
-    let exists = session_handle().0.contains(session_id);
-    let handle = session_runtime_handle();
-
-    if exists {
-        if !handle.0.session_exists(session_id) {
-            handle.0.start_runtime(session_id).with_context(|| {
-                format!(
-                    "failed starting missing session runtime for existing session {}",
-                    session_id.0
-                )
-            })?;
-        }
-        return Ok(true);
-    }
-
-    if let Some(removed_runtime) = handle.0.remove_runtime(session_id) {
-        shutdown_runtime_info(removed_runtime);
-    }
-
-    let removed_context_ids = prune_context_mappings_for_session(state, session_id)?;
-    let _ = removed_context_ids;
-
-    Ok(false)
-}
-
 #[allow(clippy::too_many_lines)]
-// Central request dispatcher needs explicit per-connection state parameters.
-// Bundling these into an ad-hoc struct would hide ownership/mutation flow.
-#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
     client_id: ClientId,
     client_principal_id: Uuid,
     selected_session: &mut Option<SessionId>,
-    attached_stream_session: &mut Option<SessionId>,
-    attach_policy: &mut ConnectionAttachPolicy,
     request: Request,
 ) -> Result<Response> {
     let _operation_guard = if request_requires_exclusive(&request) {
@@ -5718,10 +5566,6 @@ async fn handle_request(
                 shutdown_tx: shutdown_tx.clone(),
                 client_id,
                 client_principal_id,
-                selection: Arc::new(AsyncMutex::new((
-                    *selected_session,
-                    *attached_stream_session,
-                ))),
             };
             let dispatch = {
                 let registry = state
@@ -5758,568 +5602,6 @@ async fn handle_request(
                 })
             }
         }
-        Request::Attach { selector } => {
-            let manager = session_handle();
-            let Some(next_session_id) = resolve_session_id(&*manager.0, &selector) else {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: session_not_found_message(&selector),
-                }));
-            };
-
-            if let Some(previous_session_id) = selected_session.take()
-                && previous_session_id != next_session_id
-            {
-                manager.0.remove_client(previous_session_id, &client_id);
-            }
-
-            if manager.0.contains(next_session_id) {
-                manager.0.add_client(next_session_id, client_id);
-                *selected_session = Some(next_session_id);
-                persist_selected_session(state, client_id, *selected_session)?;
-                drop(manager);
-
-                let mut grant = state
-                    .attach_tokens
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?
-                    .issue(next_session_id);
-                // Prefer the context that maps to the target session so that
-                // the client's first `refresh_attached_session_from_context`
-                // does not resolve a stale MRU context belonging to a
-                // different session (which would cause a session-id mismatch
-                // and "client is not attached to session runtime" errors).
-                grant.context_id = current_context_id_for_session(state, next_session_id)
-                    .or_else(|| current_context_id_for_client(state, client_id));
-                Response::Ok(ResponsePayload::Attached { grant })
-            } else {
-                drop(manager);
-                let removed_context_ids =
-                    prune_context_mappings_for_session(state, next_session_id)?;
-                let _ = removed_context_ids; // Catalog-changed is fired by the
-                // control-catalog plugin in response to ContextEvent emissions.
-                Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session not found: {}", next_session_id.0),
-                })
-            }
-        }
-        Request::AttachContext { selector } => {
-            let (selected_context_id, next_session_id) = {
-                let handle = context_handle();
-                let context = match handle.0.select_for_client(client_id, &selector) {
-                    Ok(context) => context,
-                    Err(message) => {
-                        return Ok(Response::Err(ErrorResponse {
-                            code: ErrorCode::NotFound,
-                            message: message.to_string(),
-                        }));
-                    }
-                };
-
-                let Some(session_id) = handle.0.current_session_for_client(client_id) else {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: "context has no attached runtime".to_string(),
-                    }));
-                };
-
-                (context.id, session_id)
-            };
-
-            let manager = session_handle();
-            if let Some(previous_session_id) = selected_session.take()
-                && previous_session_id != next_session_id
-            {
-                manager.0.remove_client(previous_session_id, &client_id);
-            }
-
-            if manager.0.contains(next_session_id) {
-                manager.0.add_client(next_session_id, client_id);
-                *selected_session = Some(next_session_id);
-                persist_selected_session(state, client_id, *selected_session)?;
-                drop(manager);
-
-                let mut grant = state
-                    .attach_tokens
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?
-                    .issue(next_session_id);
-                grant.context_id = Some(selected_context_id);
-                Response::Ok(ResponsePayload::Attached { grant })
-            } else {
-                drop(manager);
-                let removed_context_ids =
-                    prune_context_mappings_for_session(state, next_session_id)?;
-                let _ = removed_context_ids; // Catalog-changed is fired by the
-                // control-catalog plugin in response to ContextEvent emissions.
-                Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session not found: {}", next_session_id.0),
-                })
-            }
-        }
-        Request::AttachOpen {
-            session_id,
-            attach_token,
-        } => {
-            let session_id = SessionId(session_id);
-
-            if !ensure_attach_session_exists(state, session_id).await? {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session not found: {}", session_id.0),
-                }));
-            }
-
-            let consumed = {
-                let mut attach_tokens = state
-                    .attach_tokens
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-                attach_tokens.consume(session_id, attach_token)
-            };
-
-            match consumed {
-                Ok(()) => {
-                    let can_write = true;
-
-                    let begin_result = {
-                        let handle = session_runtime_handle();
-                        if let Some(previous_stream_session) = *attached_stream_session
-                            && previous_stream_session != session_id
-                        {
-                            handle.0.end_attach(previous_stream_session, client_id);
-                            emit_event(
-                                state,
-                                Event::ClientDetached {
-                                    id: previous_stream_session.0,
-                                },
-                            )?;
-                        }
-                        match handle.0.begin_attach(session_id, client_id) {
-                            Ok(()) => Ok(()),
-                            Err(SessionRuntimeError::NotFound) => {
-                                if let Err(error) = handle.0.start_runtime(session_id) {
-                                    warn!(
-                                        "failed restarting missing session runtime {} before attach-open: {error:#}",
-                                        session_id.0
-                                    );
-                                }
-                                handle.0.begin_attach(session_id, client_id)
-                            }
-                            Err(SessionRuntimeError::Closed) => {
-                                if let Some(removed) = handle.0.remove_runtime(session_id) {
-                                    shutdown_runtime_info(removed);
-                                }
-                                if let Err(error) = handle.0.start_runtime(session_id) {
-                                    warn!(
-                                        "failed restarting closed session runtime {} before attach-open: {error:#}",
-                                        session_id.0
-                                    );
-                                }
-                                handle.0.begin_attach(session_id, client_id)
-                            }
-                            Err(error) => Err(error),
-                        }
-                    };
-
-                    match begin_result {
-                        Ok(()) => {
-                            *attached_stream_session = Some(session_id);
-                            let context_id = current_context_id_for_client(state, client_id);
-                            Response::Ok(ResponsePayload::AttachReady {
-                                context_id,
-                                session_id: session_id.0,
-                                can_write,
-                            })
-                        }
-                        Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
-                            Response::Err(ErrorResponse {
-                                code: ErrorCode::NotFound,
-                                message: format!("session runtime not found: {}", session_id.0),
-                            })
-                        }
-                        Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
-                            code: ErrorCode::Internal,
-                            message: "failed opening attach stream".to_string(),
-                        }),
-                    }
-                }
-                Err(AttachTokenValidationError::NotFound) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: "attach token not found".to_string(),
-                }),
-                Err(AttachTokenValidationError::Expired) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "attach token expired".to_string(),
-                }),
-                Err(AttachTokenValidationError::SessionMismatch) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "attach token does not match requested session".to_string(),
-                }),
-            }
-        }
-        Request::AttachInput { session_id, data } => {
-            let session_id = SessionId(session_id);
-            if !ensure_attach_session_exists(state, session_id).await? {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }));
-            }
-            if let Err(response) = ensure_session_mutation_allowed(
-                state,
-                shutdown_tx,
-                session_id,
-                client_id,
-                client_principal_id,
-                "attach.input",
-            )
-            .await
-            {
-                return Ok(Response::Err(response));
-            }
-            let captured_input = data.clone();
-            let write_result = session_runtime_handle()
-                .0
-                .write_input(session_id, client_id, data);
-            match write_result {
-                Ok((bytes, focused_pane_id)) => {
-                    if captured_input
-                        .iter()
-                        .any(|byte| *byte == b'\n' || *byte == b'\r')
-                    {
-                        mark_snapshot_dirty(state);
-                    }
-                    record_to_all_runtimes(
-                        RecordingEventKind::PaneInputRaw,
-                        RecordingPayload::Bytes {
-                            data: captured_input,
-                        },
-                        RecordMeta {
-                            session_id: Some(session_id.0),
-                            pane_id: Some(focused_pane_id),
-                            client_id: Some(client_id.0),
-                        },
-                    );
-                    Response::Ok(ResponsePayload::AttachInputAccepted { bytes })
-                }
-                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }),
-                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "client is not attached to session runtime".to_string(),
-                }),
-                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: "active pane is closed".to_string(),
-                }),
-            }
-        }
-        Request::AttachSetViewport {
-            session_id,
-            cols,
-            rows,
-            status_top_inset,
-            status_bottom_inset,
-            cell_pixel_width,
-            cell_pixel_height,
-        } => {
-            let session_id = SessionId(session_id);
-            if !ensure_attach_session_exists(state, session_id).await? {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }));
-            }
-
-            let update_result = session_runtime_handle().0.set_attach_viewport(
-                session_id,
-                client_id,
-                cols,
-                rows,
-                status_top_inset,
-                status_bottom_inset,
-                cell_pixel_width,
-                cell_pixel_height,
-            );
-
-            match update_result {
-                Ok((cols, rows, status_top_inset, status_bottom_inset)) => {
-                    Response::Ok(ResponsePayload::AttachViewportSet {
-                        context_id: current_context_id_for_client(state, client_id),
-                        session_id: session_id.0,
-                        cols,
-                        rows,
-                        status_top_inset,
-                        status_bottom_inset,
-                    })
-                }
-                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }),
-                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "client is not attached to session runtime".to_string(),
-                }),
-                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: "active pane is closed".to_string(),
-                }),
-            }
-        }
-        Request::AttachOutput {
-            session_id,
-            max_bytes,
-        } => {
-            let session_id = SessionId(session_id);
-            if !ensure_attach_session_exists(state, session_id).await? {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }));
-            }
-            let read_result = session_runtime_handle()
-                .0
-                .read_output(session_id, client_id, max_bytes);
-            match read_result {
-                Ok(data) => Response::Ok(ResponsePayload::AttachOutput { data }),
-                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }),
-                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "client is not attached to session runtime".to_string(),
-                }),
-                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: "active pane is closed".to_string(),
-                }),
-            }
-        }
-        Request::AttachLayout { session_id } => {
-            let session_id = SessionId(session_id);
-            if !ensure_attach_session_exists(state, session_id).await? {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }));
-            }
-            let state_snapshot = session_runtime_handle()
-                .0
-                .attach_layout_state(session_id, client_id);
-            match state_snapshot {
-                Ok(snapshot) => Response::Ok(ResponsePayload::AttachLayout {
-                    context_id: current_context_id_for_client(state, client_id),
-                    session_id: session_id.0,
-                    focused_pane_id: snapshot.focused_pane_id,
-                    panes: snapshot.panes,
-                    layout_root: snapshot.layout_root,
-                    scene: snapshot.scene,
-                    zoomed: snapshot.zoomed,
-                }),
-                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }),
-                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "client is not attached to session runtime".to_string(),
-                }),
-                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: "active pane is closed".to_string(),
-                }),
-            }
-        }
-        Request::AttachSnapshot {
-            session_id,
-            max_bytes_per_pane,
-        } => {
-            let session_id = SessionId(session_id);
-            if !ensure_attach_session_exists(state, session_id).await? {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }));
-            }
-
-            let snapshot = session_runtime_handle().0.attach_snapshot_state(
-                session_id,
-                client_id,
-                max_bytes_per_pane,
-            );
-
-            match snapshot {
-                Ok(snapshot) => Response::Ok(ResponsePayload::AttachSnapshot {
-                    context_id: current_context_id_for_client(state, client_id),
-                    session_id: session_id.0,
-                    focused_pane_id: snapshot.focused_pane_id,
-                    panes: snapshot.panes,
-                    layout_root: snapshot.layout_root,
-                    scene: snapshot.scene,
-                    chunks: snapshot.chunks,
-                    pane_mouse_protocols: snapshot.pane_mouse_protocols,
-                    pane_input_modes: snapshot.pane_input_modes,
-                    zoomed: snapshot.zoomed,
-                }),
-                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }),
-                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "client is not attached to session runtime".to_string(),
-                }),
-                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: "active pane is closed".to_string(),
-                }),
-            }
-        }
-        Request::AttachPaneSnapshot {
-            session_id,
-            pane_ids,
-            max_bytes_per_pane,
-        } => {
-            let session_id = SessionId(session_id);
-            if !ensure_attach_session_exists(state, session_id).await? {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }));
-            }
-
-            let pane_snapshot = session_runtime_handle().0.attach_pane_snapshot_state(
-                session_id,
-                client_id,
-                &pane_ids,
-                max_bytes_per_pane,
-            );
-
-            match pane_snapshot {
-                Ok(snapshot) => Response::Ok(ResponsePayload::AttachPaneSnapshot {
-                    chunks: snapshot.chunks,
-                    pane_mouse_protocols: snapshot.pane_mouse_protocols,
-                    pane_input_modes: snapshot.pane_input_modes,
-                }),
-                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }),
-                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "client is not attached to session runtime".to_string(),
-                }),
-                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: "active pane is closed".to_string(),
-                }),
-            }
-        }
-        Request::AttachPaneOutputBatch {
-            session_id,
-            pane_ids,
-            max_bytes,
-        } => {
-            let session_id = SessionId(session_id);
-            if !ensure_attach_session_exists(state, session_id).await? {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }));
-            }
-            let (chunks, output_still_pending) = session_runtime_handle()
-                .0
-                .attach_pane_output_batch_with_dirty_check(
-                    session_id, client_id, &pane_ids, max_bytes,
-                );
-            match chunks {
-                Ok(chunks) => Response::Ok(ResponsePayload::AttachPaneOutputBatch {
-                    chunks,
-                    output_still_pending,
-                }),
-                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }),
-                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "client is not attached to session runtime".to_string(),
-                }),
-                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: "active pane is closed".to_string(),
-                }),
-            }
-        }
-        Request::AttachPaneImages {
-            session_id,
-            pane_ids,
-            since_sequences,
-        } => {
-            let session_id = SessionId(session_id);
-            if !ensure_attach_session_exists(state, session_id).await? {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }));
-            }
-            #[cfg(feature = "image-registry")]
-            let deltas = session_runtime_handle().0.attach_pane_image_deltas(
-                session_id,
-                &pane_ids,
-                &since_sequences,
-                state.payload_codec.as_deref(),
-            );
-            #[cfg(not(feature = "image-registry"))]
-            let deltas = session_runtime_handle().0.attach_pane_image_deltas(
-                session_id,
-                &pane_ids,
-                &since_sequences,
-                None,
-            );
-            Response::Ok(ResponsePayload::AttachPaneImages { deltas })
-        }
-        Request::SetClientAttachPolicy { allow_detach } => {
-            attach_policy.allow_detach = allow_detach;
-            Response::Ok(ResponsePayload::ClientAttachPolicySet { allow_detach })
-        }
-        Request::Detach => {
-            if !attach_policy.allow_detach {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "detach is disabled for this connection".to_string(),
-                }));
-            }
-            let manager = session_handle();
-            let previous_selected_session = selected_session.take();
-            if let Some(current_selected_session) = previous_selected_session {
-                manager
-                    .0
-                    .remove_client(current_selected_session, &client_id);
-            }
-            drop(manager);
-
-            if let Some(current_stream_session) = attached_stream_session.take() {
-                session_runtime_handle()
-                    .0
-                    .end_attach(current_stream_session, client_id);
-                emit_event(
-                    state,
-                    Event::ClientDetached {
-                        id: current_stream_session.0,
-                    },
-                )?;
-            }
-            persist_selected_session(state, client_id, None)?;
-            Response::Ok(ResponsePayload::Detached)
-        }
         Request::SubscribeEvents => {
             state
                 .event_hub
@@ -6349,12 +5631,11 @@ async fn handle_request(
         Request::EnableEventPush => Response::Ok(ResponsePayload::EventPushEnabled),
     };
 
-    if let Response::Ok(ResponsePayload::AttachReady { session_id, .. }) = &response {
-        emit_event(state, Event::ClientAttached { id: *session_id })?;
-    }
     // Catalog-changed events are fired by the control-catalog plugin
     // in response to session/context/client events on the event bus.
-    // Server no longer emits catalog-changed directly.
+    // Server no longer emits catalog-changed directly. Attach-side
+    // `ClientAttached` events are emitted by the pane-runtime plugin's
+    // attach-open handler.
 
     if response_requires_snapshot(&response) {
         mark_snapshot_dirty(state);
@@ -6367,23 +5648,12 @@ async fn handle_request(
 const fn request_requires_exclusive(request: &Request) -> bool {
     matches!(
         request,
-        Request::ServerSave
-            | Request::ServerStop
-            | Request::ServerRestoreApply
-            | Request::Attach { .. }
-            | Request::AttachContext { .. }
-            | Request::AttachOpen { .. }
-            | Request::AttachInput { .. }
-            | Request::AttachSetViewport { .. }
-            | Request::Detach
+        Request::ServerSave | Request::ServerStop | Request::ServerRestoreApply
     )
 }
 
-const fn response_requires_snapshot(response: &Response) -> bool {
-    matches!(
-        response,
-        Response::Ok(ResponsePayload::Attached { .. } | ResponsePayload::Detached)
-    )
+const fn response_requires_snapshot(_response: &Response) -> bool {
+    false
 }
 
 const fn request_kind_name(request: &Request) -> &'static str {
@@ -6398,22 +5668,9 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
-        Request::Attach { .. } => "attach",
-        Request::AttachContext { .. } => "attach_context",
-        Request::AttachOpen { .. } => "attach_open",
-        Request::AttachInput { .. } => "attach_input",
-        Request::AttachSetViewport { .. } => "attach_set_viewport",
-        Request::AttachOutput { .. } => "attach_output",
-        Request::AttachLayout { .. } => "attach_layout",
-        Request::AttachSnapshot { .. } => "attach_snapshot",
-        Request::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
-        Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
-        Request::AttachPaneImages { .. } => "attach_pane_images",
-        Request::SetClientAttachPolicy { .. } => "set_client_attach_policy",
-        Request::Detach => "detach",
-        Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
+        Request::SubscribeEvents => "subscribe_events",
     }
 }
 
@@ -6603,18 +5860,6 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::ServerSnapshotRestored { .. } => "server_snapshot_restored",
         ResponsePayload::ServerStopping => "server_stopping",
         ResponsePayload::ServiceInvoked { .. } => "service_invoked",
-        ResponsePayload::Attached { .. } => "attached",
-        ResponsePayload::AttachReady { .. } => "attach_ready",
-        ResponsePayload::AttachInputAccepted { .. } => "attach_input_accepted",
-        ResponsePayload::AttachViewportSet { .. } => "attach_viewport_set",
-        ResponsePayload::AttachOutput { .. } => "attach_output",
-        ResponsePayload::AttachLayout { .. } => "attach_layout",
-        ResponsePayload::AttachSnapshot { .. } => "attach_snapshot",
-        ResponsePayload::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
-        ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
-        ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
-        ResponsePayload::ClientAttachPolicySet { .. } => "client_attach_policy_set",
-        ResponsePayload::Detached => "detached",
         ResponsePayload::EventsSubscribed => "events_subscribed",
         ResponsePayload::EventBatch { .. } => "event_batch",
         ResponsePayload::EventPushEnabled => "event_push_enabled",
@@ -6654,47 +5899,6 @@ fn detach_client_state_on_disconnect(
     }
 
     Ok(())
-}
-
-fn resolve_session_id(
-    manager: &dyn SessionManagerReader,
-    selector: &SessionSelector,
-) -> Option<SessionId> {
-    match selector {
-        SessionSelector::ById(raw_id) => {
-            let session_id = SessionId(*raw_id);
-            manager.contains(session_id).then_some(session_id)
-        }
-        SessionSelector::ByName(value) => {
-            let sessions = manager.list_sessions();
-
-            if let Some(session) = sessions
-                .iter()
-                .find(|session| session.name.as_deref() == Some(value.as_str()))
-            {
-                return Some(session.id);
-            }
-
-            if let Some(session) = sessions
-                .iter()
-                .find(|session| session.id.to_string().eq_ignore_ascii_case(value))
-            {
-                return Some(session.id);
-            }
-
-            let value_lower = value.to_ascii_lowercase();
-            sessions
-                .iter()
-                .find(|session| {
-                    session
-                        .id
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .starts_with(&value_lower)
-                })
-                .map(|session| session.id)
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -6934,164 +6138,6 @@ fn resolve_process_group_id_for_pid(_pid: u32) -> Option<i32> {
     None
 }
 
-fn session_not_found_message(selector: &SessionSelector) -> String {
-    format!(
-        "session not found for selector {selector:?} (lookup order: exact name -> exact UUID -> UUID prefix)"
-    )
-}
-
-fn resolve_session_request_session_id(
-    manager: &dyn SessionManagerReader,
-    selector: Option<&SessionSelector>,
-    selected_session: Option<&SessionId>,
-) -> std::result::Result<SessionId, ErrorResponse> {
-    if let Some(selector) = selector {
-        return resolve_session_id(manager, selector).ok_or_else(|| ErrorResponse {
-            code: ErrorCode::NotFound,
-            message: session_not_found_message(selector),
-        });
-    }
-
-    if let Some(selected) = selected_session {
-        return Ok(*selected);
-    }
-
-    let sessions = manager.list_sessions();
-    if sessions.len() == 1 {
-        return Ok(sessions[0].id);
-    }
-
-    Err(ErrorResponse {
-        code: ErrorCode::InvalidRequest,
-        message: "session selector is required when no attached session is active".to_string(),
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SessionPolicyCheckRequest {
-    session_id: Uuid,
-    #[serde(default)]
-    context_id: Option<Uuid>,
-    client_id: Uuid,
-    principal_id: Uuid,
-    action: String,
-    #[serde(default)]
-    plugin_id: Option<String>,
-    #[serde(default)]
-    capability: Option<String>,
-    #[serde(default)]
-    execution_class: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SessionPolicyCheckResponse {
-    allowed: bool,
-    reason: Option<String>,
-}
-
-async fn check_session_policy(
-    state: &Arc<ServerState>,
-    shutdown_tx: &watch::Sender<bool>,
-    session_id: SessionId,
-    client_id: ClientId,
-    client_principal_id: Uuid,
-    action: &str,
-) -> std::result::Result<Option<SessionPolicyCheckResponse>, ErrorResponse> {
-    let route = ServiceRoute {
-        capability: "bmux.sessions.policy".to_string(),
-        kind: bmux_ipc::InvokeServiceKind::Query,
-        interface_id: "session-policy-query/v1".to_string(),
-        operation: "check".to_string(),
-    };
-    let payload = encode(&SessionPolicyCheckRequest {
-        session_id: session_id.0,
-        context_id: None,
-        client_id: client_id.0,
-        principal_id: client_principal_id,
-        action: action.to_string(),
-        plugin_id: None,
-        capability: None,
-        execution_class: None,
-    })
-    .map_err(|error| ErrorResponse {
-        code: ErrorCode::Internal,
-        message: format!("failed encoding session policy request: {error}"),
-    })?;
-
-    let invoke_context = ServiceInvokeContext {
-        state: Arc::clone(state),
-        shutdown_tx: shutdown_tx.clone(),
-        client_id,
-        client_principal_id,
-        selection: Arc::new(AsyncMutex::new((Some(session_id), None))),
-    };
-
-    let dispatch = {
-        let registry = state.service_registry.lock().map_err(|_| ErrorResponse {
-            code: ErrorCode::Internal,
-            message: "service registry lock poisoned".to_string(),
-        })?;
-        registry.dispatch(&route, invoke_context.clone(), payload.clone())
-    };
-    let invocation = if let Some(invocation) = dispatch {
-        Some(invocation)
-    } else {
-        let resolver = state
-            .service_resolver
-            .lock()
-            .map_err(|_| ErrorResponse {
-                code: ErrorCode::Internal,
-                message: "service resolver lock poisoned".to_string(),
-            })?
-            .clone();
-        resolver.map(|resolver| resolver(route, payload))
-    };
-
-    let Some(invocation) = invocation else {
-        return Ok(None);
-    };
-    let payload = invocation.await.map_err(|error| ErrorResponse {
-        code: ErrorCode::Internal,
-        message: format!("session policy invocation failed: {error:#}"),
-    })?;
-    let response =
-        decode::<SessionPolicyCheckResponse>(&payload).map_err(|error| ErrorResponse {
-            code: ErrorCode::Internal,
-            message: format!("failed decoding session policy response: {error}"),
-        })?;
-    Ok(Some(response))
-}
-
-async fn ensure_session_mutation_allowed(
-    state: &Arc<ServerState>,
-    shutdown_tx: &watch::Sender<bool>,
-    session_id: SessionId,
-    client_id: ClientId,
-    client_principal_id: Uuid,
-    action: &str,
-) -> std::result::Result<(), ErrorResponse> {
-    let decision = check_session_policy(
-        state,
-        shutdown_tx,
-        session_id,
-        client_id,
-        client_principal_id,
-        action,
-    )
-    .await?;
-    if let Some(decision) = decision
-        && !decision.allowed
-    {
-        return Err(ErrorResponse {
-            code: ErrorCode::InvalidRequest,
-            message: decision
-                .reason
-                .unwrap_or_else(|| "session policy denied for this operation".to_string()),
-        });
-    }
-    Ok(())
-}
-
 fn parse_request(envelope: &Envelope) -> Result<Request> {
     if envelope.kind != EnvelopeKind::Request {
         anyhow::bail!("expected request envelope kind")
@@ -7205,55 +6251,6 @@ fn resolve_frame_codec_from_capabilities(
         compression::resolve_codec(compression::CompressionId::Zstd).map(std::sync::Arc::from)
     } else {
         None
-    }
-}
-
-/// Resolve a payload compression codec from the user's compression config.
-#[cfg(feature = "image-registry")]
-fn resolve_payload_codec_from_config(
-    config: &bmux_config::CompressionConfig,
-) -> Option<std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>> {
-    #[cfg(feature = "compression")]
-    use bmux_ipc::compression;
-    match config.images {
-        bmux_config::CompressionMode::None => None,
-        bmux_config::CompressionMode::Auto => {
-            // Prefer zstd for image payloads, fall back to lz4.
-            #[cfg(feature = "compression")]
-            {
-                compression::default_payload_codec().map(|codec| {
-                    // Apply user-configured level if zstd.
-                    let boxed: Box<dyn compression::CompressionCodec> =
-                        if codec.id() == compression::CompressionId::Zstd {
-                            Box::new(compression::ZstdCodec::with_level(config.level))
-                        } else {
-                            codec
-                        };
-                    std::sync::Arc::from(boxed)
-                })
-            }
-            #[cfg(not(feature = "compression"))]
-            None
-        }
-        bmux_config::CompressionMode::Zstd => {
-            #[cfg(feature = "compression")]
-            {
-                Some(std::sync::Arc::new(compression::ZstdCodec::with_level(
-                    config.level,
-                )))
-            }
-            #[cfg(not(feature = "compression"))]
-            None
-        }
-        bmux_config::CompressionMode::Lz4 => {
-            #[cfg(feature = "compression")]
-            {
-                compression::resolve_codec(compression::CompressionId::Lz4)
-                    .map(std::sync::Arc::from)
-            }
-            #[cfg(not(feature = "compression"))]
-            None
-        }
     }
 }
 
@@ -7910,479 +6907,104 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
 )]
 mod tests {
     use super::*;
-    use bmux_context_state::{
-        CONTEXT_SESSION_ID_ATTRIBUTE, ContextStateReader, ContextStateSnapshot, ContextStateWriter,
-        RuntimeContext,
-    };
-    use bmux_ipc::{ContextSelector, ContextSummary};
-    use bmux_session_models::{Session, SessionInfo};
-    use bmux_session_state::SessionManagerWriter;
-    use std::collections::{BTreeMap, VecDeque};
+    use serde::{Deserialize, Serialize};
     use std::path::PathBuf;
-    use std::sync::Mutex as StdMutex;
 
-    /// In-memory [`SessionManagerWriter`] for tests.
-    ///
-    /// Mirrors the sessions plugin's real writer surface without
-    /// pulling in the plugin crate as a test dependency. Tests install
-    /// one of these into the plugin state registry so requests that
-    /// reach `create_session` / `remove_session` don't hit the
-    /// `NoopSessionManager` fallback that [`BmuxServer::new`] registers
-    /// when no sessions plugin is active.
-    #[derive(Default)]
-    struct TestSessionManager {
-        sessions: StdMutex<BTreeMap<SessionId, Session>>,
-    }
-
-    impl SessionManagerReader for TestSessionManager {
-        fn list_sessions(&self) -> Vec<SessionInfo> {
-            self.sessions
-                .lock()
-                .expect("test session manager lock poisoned")
-                .values()
-                .map(SessionInfo::from)
-                .collect()
-        }
-
-        fn get_session(&self, session_id: SessionId) -> Option<Session> {
-            self.sessions
-                .lock()
-                .expect("test session manager lock poisoned")
-                .get(&session_id)
-                .cloned()
-        }
-
-        fn contains(&self, session_id: SessionId) -> bool {
-            self.sessions
-                .lock()
-                .expect("test session manager lock poisoned")
-                .contains_key(&session_id)
-        }
-    }
-
-    impl SessionManagerWriter for TestSessionManager {
-        fn create_session(&self, name: Option<String>) -> anyhow::Result<SessionId> {
-            let session = Session::new(name);
-            let id = session.id;
-            self.sessions
-                .lock()
-                .map_err(|_| anyhow::anyhow!("test session manager lock poisoned"))?
-                .insert(id, session);
-            Ok(id)
-        }
-
-        fn insert_session(&self, session: Session) -> anyhow::Result<()> {
-            let id = session.id;
-            let mut guard = self
-                .sessions
-                .lock()
-                .map_err(|_| anyhow::anyhow!("test session manager lock poisoned"))?;
-            if guard.contains_key(&id) {
-                anyhow::bail!("session already exists: {id}");
-            }
-            guard.insert(id, session);
-            Ok(())
-        }
-
-        fn remove_session(&self, session_id: SessionId) -> anyhow::Result<()> {
-            self.sessions
-                .lock()
-                .map_err(|_| anyhow::anyhow!("test session manager lock poisoned"))?
-                .remove(&session_id)
-                .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))
-                .map(|_| ())
-        }
-
-        fn add_client(&self, session_id: SessionId, client_id: ClientId) {
-            if let Ok(mut guard) = self.sessions.lock()
-                && let Some(session) = guard.get_mut(&session_id)
-            {
-                session.add_client(client_id);
-            }
-        }
-
-        fn remove_client(&self, session_id: SessionId, client_id: &ClientId) {
-            if let Ok(mut guard) = self.sessions.lock()
-                && let Some(session) = guard.get_mut(&session_id)
-            {
-                session.remove_client(client_id);
-            }
-        }
-
-        fn snapshot(&self) -> SessionManagerSnapshot {
-            self.sessions.lock().map_or_else(
-                |_| SessionManagerSnapshot::default(),
-                |guard| SessionManagerSnapshot(guard.values().cloned().collect()),
-            )
-        }
-
-        fn restore_snapshot(&self, snapshot: SessionManagerSnapshot) {
-            if let Ok(mut guard) = self.sessions.lock() {
-                guard.clear();
-                for session in snapshot.0 {
-                    guard.insert(session.id, session);
-                }
-            }
-        }
-    }
-
-    /// Install a fresh [`TestSessionManager`] into the plugin state
-    /// registry, replacing any previously-registered
-    /// [`SessionManagerHandle`] (including the no-op that
-    /// [`BmuxServer::new`] registers at construction time).
-    ///
-    /// Call this after constructing a `BmuxServer` in tests that
-    /// exercise request paths reaching `create_session`,
-    /// `remove_session`, etc.
-    fn install_test_session_manager_handle() {
-        let handle = SessionManagerHandle::new(TestSessionManager::default());
-        let slot = Arc::new(std::sync::RwLock::new(handle));
-        let _previous =
-            bmux_plugin::global_plugin_state_registry().register::<SessionManagerHandle>(&slot);
-    }
-
-    /// Inner mutable state for [`TestContextState`].
-    ///
-    /// Mirrors the subset of the real contexts-plugin state that server
-    /// request paths exercise (create, bind, remove, query) without
-    /// pulling in the contexts plugin as a test dep.
-    #[derive(Default)]
-    struct TestContextStateInner {
-        contexts: BTreeMap<Uuid, RuntimeContext>,
-        session_by_context: BTreeMap<Uuid, SessionId>,
-        selected_by_client: BTreeMap<ClientId, Uuid>,
-        mru_contexts: VecDeque<Uuid>,
-    }
-
-    impl TestContextStateInner {
-        fn to_summary(context: &RuntimeContext) -> ContextSummary {
-            ContextSummary {
-                id: context.id,
-                name: context.name.clone(),
-                attributes: context.attributes.clone(),
-            }
-        }
-
-        fn touch_mru(&mut self, id: Uuid) {
-            self.mru_contexts.retain(|existing| *existing != id);
-            self.mru_contexts.push_front(id);
-        }
-    }
-
-    /// In-memory [`ContextStateWriter`] for tests.
-    #[derive(Default)]
-    struct TestContextState {
-        inner: StdMutex<TestContextStateInner>,
-    }
-
-    impl ContextStateReader for TestContextState {
-        fn list(&self) -> Vec<ContextSummary> {
-            let guard = self.inner.lock().expect("test context state lock poisoned");
-            guard
-                .mru_contexts
-                .iter()
-                .filter_map(|id| guard.contexts.get(id))
-                .map(TestContextStateInner::to_summary)
-                .collect()
-        }
-
-        fn current_for_client(&self, client_id: ClientId) -> Option<ContextSummary> {
-            let guard = self.inner.lock().ok()?;
-            let selected = guard
-                .selected_by_client
-                .get(&client_id)
-                .copied()
-                .filter(|id| guard.contexts.contains_key(id))
-                .or_else(|| {
-                    guard
-                        .mru_contexts
-                        .iter()
-                        .copied()
-                        .find(|id| guard.contexts.contains_key(id))
-                })?;
-            guard
-                .contexts
-                .get(&selected)
-                .map(TestContextStateInner::to_summary)
-        }
-
-        fn current_session_for_client(&self, client_id: ClientId) -> Option<SessionId> {
-            let guard = self.inner.lock().ok()?;
-            let selected = guard
-                .selected_by_client
-                .get(&client_id)
-                .copied()
-                .filter(|id| guard.contexts.contains_key(id))
-                .or_else(|| {
-                    guard
-                        .mru_contexts
-                        .iter()
-                        .copied()
-                        .find(|id| guard.contexts.contains_key(id))
-                })?;
-            guard.session_by_context.get(&selected).copied()
-        }
-
-        fn context_for_session(&self, session_id: SessionId) -> Option<Uuid> {
-            let guard = self.inner.lock().ok()?;
-            guard
-                .session_by_context
-                .iter()
-                .find_map(|(context_id, mapped)| (*mapped == session_id).then_some(*context_id))
-        }
-
-        fn resolve_id(&self, selector: &ContextSelector) -> Result<Uuid, &'static str> {
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|_| "test context state lock poisoned")?;
-            match selector {
-                ContextSelector::ById(id) => {
-                    if guard.contexts.contains_key(id) {
-                        Ok(*id)
-                    } else {
-                        Err("context not found")
-                    }
-                }
-                ContextSelector::ByName(name) => {
-                    let matches: Vec<Uuid> = guard
-                        .contexts
-                        .values()
-                        .filter(|context| context.name.as_deref() == Some(name.as_str()))
-                        .map(|context| context.id)
-                        .collect();
-                    match matches.len() {
-                        0 => Err("context not found"),
-                        1 => Ok(matches[0]),
-                        _ => Err("context selector is ambiguous"),
-                    }
-                }
-            }
-        }
-    }
-
-    impl ContextStateWriter for TestContextState {
-        fn create(
-            &self,
-            client_id: ClientId,
-            name: Option<String>,
-            attributes: BTreeMap<String, String>,
-        ) -> ContextSummary {
-            let mut guard = self.inner.lock().expect("test context state lock poisoned");
-            let context = RuntimeContext {
-                id: Uuid::new_v4(),
-                name,
-                attributes,
-            };
-            let id = context.id;
-            guard.contexts.insert(id, context.clone());
-            guard.selected_by_client.insert(client_id, id);
-            guard.touch_mru(id);
-            TestContextStateInner::to_summary(&context)
-        }
-
-        fn select_for_client(
-            &self,
-            client_id: ClientId,
-            selector: &ContextSelector,
-        ) -> Result<ContextSummary, &'static str> {
-            let id = self.resolve_id(selector)?;
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| "test context state lock poisoned")?;
-            guard.selected_by_client.insert(client_id, id);
-            guard.touch_mru(id);
-            guard
-                .contexts
-                .get(&id)
-                .map(TestContextStateInner::to_summary)
-                .ok_or("context not found")
-        }
-
-        fn close(
-            &self,
-            _client_id: ClientId,
-            selector: &ContextSelector,
-            _force: bool,
-        ) -> Result<(Uuid, Option<SessionId>), &'static str> {
-            let id = self.resolve_id(selector)?;
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| "test context state lock poisoned")?;
-            let removed_session = guard.session_by_context.remove(&id);
-            guard.contexts.remove(&id);
-            guard.mru_contexts.retain(|existing| *existing != id);
-            guard
-                .selected_by_client
-                .retain(|_client, selected| *selected != id);
-            Ok((id, removed_session))
-        }
-
-        fn remove_contexts_for_session(&self, session_id: SessionId) -> Vec<Uuid> {
-            let Ok(mut guard) = self.inner.lock() else {
-                return Vec::new();
-            };
-            let to_remove: Vec<Uuid> = guard
-                .session_by_context
-                .iter()
-                .filter_map(|(context_id, mapped)| (*mapped == session_id).then_some(*context_id))
-                .collect();
-            for context_id in &to_remove {
-                guard.session_by_context.remove(context_id);
-                guard.contexts.remove(context_id);
-                guard.mru_contexts.retain(|existing| existing != context_id);
-                guard
-                    .selected_by_client
-                    .retain(|_client, selected| selected != context_id);
-            }
-            to_remove
-        }
-
-        fn bind_session(
-            &self,
-            context_id: Uuid,
-            session_id: SessionId,
-        ) -> Result<(), &'static str> {
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| "test context state lock poisoned")?;
-            let Some(context) = guard.contexts.get_mut(&context_id) else {
-                return Err("context not found");
-            };
-            context.attributes.insert(
-                CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
-                session_id.0.to_string(),
-            );
-            guard.session_by_context.insert(context_id, session_id);
-            Ok(())
-        }
-
-        fn disconnect_client(&self, client_id: ClientId) {
-            if let Ok(mut guard) = self.inner.lock() {
-                guard.selected_by_client.remove(&client_id);
-            }
-        }
-
-        fn remove_context_by_id(
-            &self,
-            context_id: Uuid,
-            _preferred_client: Option<ClientId>,
-        ) -> Option<(Uuid, Option<SessionId>)> {
-            let mut guard = self.inner.lock().ok()?;
-            if !guard.contexts.contains_key(&context_id) {
-                return None;
-            }
-            let removed_session = guard.session_by_context.remove(&context_id);
-            guard.contexts.remove(&context_id);
-            guard
-                .mru_contexts
-                .retain(|existing| *existing != context_id);
-            guard
-                .selected_by_client
-                .retain(|_client, selected| *selected != context_id);
-            Some((context_id, removed_session))
-        }
-
-        fn snapshot(&self) -> ContextStateSnapshot {
-            self.inner.lock().map_or_else(
-                |_| ContextStateSnapshot::default(),
-                |guard| ContextStateSnapshot {
-                    contexts: guard.contexts.clone(),
-                    session_by_context: guard.session_by_context.clone(),
-                    selected_by_client: guard.selected_by_client.clone(),
-                    mru_contexts: guard.mru_contexts.clone(),
-                },
-            )
-        }
-
-        fn restore_snapshot(&self, snapshot: ContextStateSnapshot) {
-            if let Ok(mut guard) = self.inner.lock() {
-                guard.contexts = snapshot.contexts;
-                guard.session_by_context = snapshot.session_by_context;
-                guard.selected_by_client = snapshot.selected_by_client;
-                guard.mru_contexts = snapshot.mru_contexts;
-            }
-        }
-    }
-
-    /// Install a fresh [`TestContextState`] into the plugin state
-    /// registry, replacing any previously-registered
-    /// [`ContextStateHandle`] (including the no-op that
-    /// [`BmuxServer::new`] registers at construction time).
-    fn install_test_context_state_handle() {
-        let handle = ContextStateHandle::new(TestContextState::default());
-        let slot = Arc::new(std::sync::RwLock::new(handle));
-        let _previous =
-            bmux_plugin::global_plugin_state_registry().register::<ContextStateHandle>(&slot);
-    }
-
-    /// Install fresh test-mode session and context handles. Call this
-    /// immediately after `BmuxServer::new(...)` in tests that exercise
-    /// request paths reaching `create_session` / context binding.
-    fn install_test_state_handles() {
-        install_test_session_manager_handle();
-        install_test_context_state_handle();
-    }
-
-    async fn execute_request(
-        server: &BmuxServer,
-        client_id: ClientId,
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct SessionPolicyCheckRequest {
+        session_id: Uuid,
+        #[serde(default)]
+        context_id: Option<Uuid>,
+        client_id: Uuid,
         principal_id: Uuid,
-        selected_session: &mut Option<SessionId>,
-        attached_stream_session: &mut Option<SessionId>,
-        request: Request,
-    ) -> Response {
-        let mut attach_policy = ConnectionAttachPolicy::default();
-        handle_request(
-            &server.state,
-            &server.shutdown_tx,
+        action: String,
+        #[serde(default)]
+        plugin_id: Option<String>,
+        #[serde(default)]
+        capability: Option<String>,
+        #[serde(default)]
+        execution_class: Option<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct SessionPolicyCheckResponse {
+        allowed: bool,
+        reason: Option<String>,
+    }
+
+    async fn check_session_policy(
+        state: &Arc<ServerState>,
+        shutdown_tx: &watch::Sender<bool>,
+        session_id: SessionId,
+        client_id: ClientId,
+        client_principal_id: Uuid,
+        action: &str,
+    ) -> std::result::Result<Option<SessionPolicyCheckResponse>, ErrorResponse> {
+        let route = ServiceRoute {
+            capability: "bmux.sessions.policy".to_string(),
+            kind: bmux_ipc::InvokeServiceKind::Query,
+            interface_id: "session-policy-query/v1".to_string(),
+            operation: "check".to_string(),
+        };
+        let payload = encode(&SessionPolicyCheckRequest {
+            session_id: session_id.0,
+            context_id: None,
+            client_id: client_id.0,
+            principal_id: client_principal_id,
+            action: action.to_string(),
+            plugin_id: None,
+            capability: None,
+            execution_class: None,
+        })
+        .map_err(|error| ErrorResponse {
+            code: ErrorCode::Internal,
+            message: format!("failed encoding session policy request: {error}"),
+        })?;
+
+        let invoke_context = ServiceInvokeContext {
+            state: Arc::clone(state),
+            shutdown_tx: shutdown_tx.clone(),
             client_id,
-            principal_id,
-            selected_session,
-            attached_stream_session,
-            &mut attach_policy,
-            request,
-        )
-        .await
-        .expect("request should complete")
+            client_principal_id,
+        };
+
+        let dispatch = {
+            let registry = state.service_registry.lock().map_err(|_| ErrorResponse {
+                code: ErrorCode::Internal,
+                message: "service registry lock poisoned".to_string(),
+            })?;
+            registry.dispatch(&route, invoke_context.clone(), payload.clone())
+        };
+        let invocation = if let Some(invocation) = dispatch {
+            Some(invocation)
+        } else {
+            let resolver = state
+                .service_resolver
+                .lock()
+                .map_err(|_| ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: "service resolver lock poisoned".to_string(),
+                })?
+                .clone();
+            resolver.map(|resolver| resolver(route, payload))
+        };
+
+        let Some(invocation) = invocation else {
+            return Ok(None);
+        };
+        let payload = invocation.await.map_err(|error| ErrorResponse {
+            code: ErrorCode::Internal,
+            message: format!("session policy invocation failed: {error:#}"),
+        })?;
+        let response =
+            decode::<SessionPolicyCheckResponse>(&payload).map_err(|error| ErrorResponse {
+                code: ErrorCode::Internal,
+                message: format!("failed decoding session policy response: {error}"),
+            })?;
+        Ok(Some(response))
     }
 
-    /// Test helper: create a session runtime and register it with
-    /// the session manager. Mirrors the orchestration that the
-    /// deleted `Request::NewSession` IPC handler used to perform.
-    fn create_session_runtime(name: Option<String>) -> Result<SessionId> {
-        let manager = session_handle();
-        if let Some(requested_name) = name.as_deref()
-            && manager
-                .0
-                .list_sessions()
-                .iter()
-                .any(|session| session.name.as_deref() == Some(requested_name))
-        {
-            anyhow::bail!("session already exists with name '{requested_name}'");
-        }
-
-        let session_id = manager
-            .0
-            .create_session(name)
-            .map_err(|error| anyhow::anyhow!("failed creating session: {error:#}"))?;
-
-        if let Err(error) = session_runtime_handle().0.start_runtime(session_id) {
-            let _ = session_handle().0.remove_session(session_id);
-            anyhow::bail!("failed creating session runtime: {error:#}");
-        }
-
-        Ok(session_id)
-    }
-
-    /// Test helper: run the admin-policy check that the deleted
-    /// `Request::KillSession` IPC handler used to perform. Kept in
-    /// the test module so server tests can verify policy-denial
-    /// plumbing without resurrecting the legacy IPC variant.
-    async fn ensure_session_admin_allowed(
+    async fn ensure_session_mutation_allowed(
         state: &Arc<ServerState>,
         shutdown_tx: &watch::Sender<bool>,
         session_id: SessionId,
@@ -8410,32 +7032,6 @@ mod tests {
             });
         }
         Ok(())
-    }
-
-    /// Test helper that replicates the server-side orchestration
-    /// which `Request::NewSession` used to perform. Creates a
-    /// session runtime and binds a fresh context. Returns the
-    /// created session id.
-    fn test_new_session_runtime(_server: &BmuxServer, client_id: ClientId) -> SessionId {
-        let session_id = create_session_runtime(None).expect("new session runtime should succeed");
-        let handle = context_handle();
-        let context = handle
-            .0
-            .create(client_id, None, std::collections::BTreeMap::new());
-        handle
-            .0
-            .bind_session(context.id, session_id)
-            .expect("test context bind should succeed");
-        session_id
-    }
-
-    /// Test helper: list panes via the typed runtime handle rather
-    /// than the deleted `Request::ListPanes` IPC variant.
-    fn test_list_panes(session_id: SessionId) -> Vec<PaneSummary> {
-        session_runtime_handle()
-            .0
-            .list_panes(session_id)
-            .expect("pane listing should succeed")
     }
 
     fn test_endpoint() -> IpcEndpoint {
@@ -8874,7 +7470,7 @@ mod tests {
     #[tokio::test]
     async fn session_admin_policy_fallback_is_permissive_without_provider() {
         let server = BmuxServer::new(test_endpoint());
-        let result = ensure_session_admin_allowed(
+        let result = ensure_session_mutation_allowed(
             &server.state,
             &server.shutdown_tx,
             SessionId::new(),
@@ -8884,90 +7480,6 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn attach_policy_blocks_detach_until_reenabled() {
-        let server = BmuxServer::new(test_endpoint());
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-        let mut attach_policy = ConnectionAttachPolicy::default();
-
-        let policy_disabled = handle_request(
-            &server.state,
-            &server.shutdown_tx,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            &mut attach_policy,
-            Request::SetClientAttachPolicy {
-                allow_detach: false,
-            },
-        )
-        .await
-        .expect("set attach policy should complete");
-        assert_eq!(
-            policy_disabled,
-            Response::Ok(ResponsePayload::ClientAttachPolicySet {
-                allow_detach: false,
-            })
-        );
-
-        let blocked_detach = handle_request(
-            &server.state,
-            &server.shutdown_tx,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            &mut attach_policy,
-            Request::Detach,
-        )
-        .await
-        .expect("detach request should complete");
-        match blocked_detach {
-            Response::Err(ErrorResponse { code, message }) => {
-                assert_eq!(code, ErrorCode::InvalidRequest);
-                assert_eq!(message, "detach is disabled for this connection");
-            }
-            response @ Response::Ok(_) => {
-                panic!("expected detach to be blocked, got {response:?}")
-            }
-        }
-
-        let policy_enabled = handle_request(
-            &server.state,
-            &server.shutdown_tx,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            &mut attach_policy,
-            Request::SetClientAttachPolicy { allow_detach: true },
-        )
-        .await
-        .expect("set attach policy should complete");
-        assert_eq!(
-            policy_enabled,
-            Response::Ok(ResponsePayload::ClientAttachPolicySet { allow_detach: true })
-        );
-
-        let detached = handle_request(
-            &server.state,
-            &server.shutdown_tx,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            &mut attach_policy,
-            Request::Detach,
-        )
-        .await
-        .expect("detach request should complete");
-        assert_eq!(detached, Response::Ok(ResponsePayload::Detached));
     }
 
     // Tests for deleted Request::{CreateContext, SelectContext,
@@ -9030,7 +7542,7 @@ mod tests {
             })
             .expect("resolver registration should succeed");
 
-        let result = ensure_session_admin_allowed(
+        let result = ensure_session_mutation_allowed(
             &server.state,
             &server.shutdown_tx,
             SessionId::new(),

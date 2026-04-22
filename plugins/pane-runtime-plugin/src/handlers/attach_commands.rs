@@ -1,35 +1,46 @@
 //! Typed handlers for the `attach-runtime-commands` interface.
 //!
-//! Only `attach-set-viewport` dispatches through the registered
-//! `SessionRuntimeManagerHandle`. The other six commands
-//! (`attach-session`, `attach-context`, `attach-open`, `attach-input`,
-//! `attach-output`, `detach`) are stateful protocol operations that
-//! currently live on the server's IPC dispatcher; those handlers
-//! return `AttachCommandError::Failed` with a clear "not yet routed"
-//! reason so clients stick to `Request::*` for now.
+//! Port of the server's former `Request::Attach`, `Request::AttachContext`,
+//! `Request::AttachOpen`, `Request::AttachInput`, `Request::AttachOutput`,
+//! `Request::AttachSetViewport`, `Request::SetClientAttachPolicy`, and
+//! `Request::Detach` IPC handlers. The plugin owns the full
+//! orchestration: session-manager membership updates, follow-state
+//! selection sync, attach-token lifecycle, runtime begin/end attach,
+//! and wire-event emission.
 
+use bmux_attach_token_state::AttachTokenValidationError;
+use bmux_ipc::{AttachGrant, ContextSelector, Event, SessionSelector};
 use bmux_pane_runtime_plugin_api::attach_runtime_commands::{
-    AttachCommandError, AttachViewportSet,
+    AttachCommandError, AttachGrant as AttachGrantRecord, AttachOutput as AttachOutputRecord,
+    AttachReady, AttachViewportSet,
 };
+use bmux_pane_runtime_state::SessionRuntimeError;
+use bmux_plugin::global_plugin_state_registry;
+use bmux_plugin_sdk::{NativeServiceContext, WireEventSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// ── Wire-format argument structs ─────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachSessionArgs {
-    pub session_id: Uuid,
+    pub selector: SessionSelector,
+    #[serde(default)]
     pub can_write: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachContextArgs {
-    pub context_id: Uuid,
+    pub selector: ContextSelector,
+    #[serde(default)]
     pub can_write: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachOpenArgs {
-    pub grant_token: Uuid,
+    pub session_id: Uuid,
+    pub attach_token: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,61 +62,391 @@ pub struct AttachSetViewportArgs {
     pub rows: u16,
     pub status_top_inset: u16,
     pub status_bottom_inset: u16,
-    pub cell_pixel_w: u16,
-    pub cell_pixel_h: u16,
+    pub cell_pixel_width: u16,
+    pub cell_pixel_height: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SetClientAttachPolicyArgs {
+    pub allow_detach: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct DetachArgs;
 
-/// Placeholder for commands whose orchestration hasn't migrated yet.
-/// Returns an `AttachCommandError::Failed` with a reason string that
-/// points clients at the legacy IPC path.
-pub fn not_implemented(op: &str) -> Result<(), AttachCommandError> {
-    Err(AttachCommandError::Failed {
-        reason: format!(
-            "attach-runtime-commands::{op} not yet routed through typed dispatch; \
-             callers should use Request::* IPC for the time being"
-        ),
-    })
+// ── Helpers ──────────────────────────────────────────────────────
+
+fn failed(reason: impl Into<String>) -> AttachCommandError {
+    AttachCommandError::Failed {
+        reason: reason.into(),
+    }
 }
 
-/// Typed handler for `attach-set-viewport`. The plugin-api contract
-/// takes a per-client viewport; the plugin extracts the caller's
-/// client id from the invocation context.
+fn caller_client_id(ctx: &NativeServiceContext) -> Result<ClientId, AttachCommandError> {
+    ctx.caller_client_id
+        .map(ClientId)
+        .ok_or_else(|| failed("attach operation requires a caller client id"))
+}
+
+fn publish_event(event: Event) {
+    if let Some(sink) = global_plugin_state_registry()
+        .get::<WireEventSinkHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+    {
+        let _ = sink.0.publish(event);
+    }
+}
+
+fn session_manager() -> Result<bmux_session_state::SessionManagerHandle, AttachCommandError> {
+    global_plugin_state_registry()
+        .get::<bmux_session_state::SessionManagerHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .ok_or_else(|| failed("session manager handle not registered"))
+}
+
+fn context_state() -> Result<bmux_context_state::ContextStateHandle, AttachCommandError> {
+    global_plugin_state_registry()
+        .get::<bmux_context_state::ContextStateHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .ok_or_else(|| failed("context state handle not registered"))
+}
+
+fn follow_state() -> Result<bmux_client_state::FollowStateHandle, AttachCommandError> {
+    global_plugin_state_registry()
+        .get::<bmux_client_state::FollowStateHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .ok_or_else(|| failed("follow state handle not registered"))
+}
+
+fn attach_token_handle()
+-> Result<bmux_attach_token_state::AttachTokenManagerHandle, AttachCommandError> {
+    global_plugin_state_registry()
+        .get::<bmux_attach_token_state::AttachTokenManagerHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .ok_or_else(|| failed("attach-token manager handle not registered"))
+}
+
+fn resolve_session_by_selector(
+    manager: &dyn bmux_session_state::SessionManagerReader,
+    selector: &SessionSelector,
+) -> Option<SessionId> {
+    match selector {
+        SessionSelector::ById(id) => {
+            let sid = SessionId(*id);
+            if manager.contains(sid) {
+                Some(sid)
+            } else {
+                None
+            }
+        }
+        SessionSelector::ByName(name) => manager
+            .list_sessions()
+            .into_iter()
+            .find(|info| info.name.as_deref() == Some(name.as_str()))
+            .map(|info| info.id),
+    }
+}
+
+fn to_api_grant(grant: &AttachGrant) -> AttachGrantRecord {
+    AttachGrantRecord {
+        token: grant.attach_token,
+        session_id: grant.session_id,
+        context_id: grant.context_id,
+        expires_epoch_ms: grant.expires_at_epoch_ms,
+    }
+}
+
+// ── Handler bodies ───────────────────────────────────────────────
+
+pub fn attach_session(
+    req: &AttachSessionArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachGrantRecord, AttachCommandError> {
+    let client_id = caller_client_id(ctx)?;
+    let manager = session_manager()?;
+    let follow = follow_state()?;
+
+    let Some(next_session_id) = resolve_session_by_selector(&*manager.0, &req.selector) else {
+        return Err(AttachCommandError::SessionNotFound);
+    };
+
+    // Transition client membership off the old session if changing.
+    let previous_session = follow.0.selected_session(client_id);
+    if let Some(prev) = previous_session
+        && prev != next_session_id
+    {
+        manager.0.remove_client(prev, &client_id);
+    }
+
+    if !manager.0.contains(next_session_id) {
+        // Session vanished between selector resolution and the add
+        // attempt; prune any stale context mappings.
+        let _ = context_state()?
+            .0
+            .remove_contexts_for_session(next_session_id);
+        return Err(AttachCommandError::SessionNotFound);
+    }
+
+    manager.0.add_client(next_session_id, client_id);
+
+    // Update FollowState. Preserve any existing selected context
+    // unless one maps to the chosen session.
+    let selected_context = context_state()?
+        .0
+        .context_for_session(next_session_id)
+        .or_else(|| follow.0.selected_context(client_id));
+    follow
+        .0
+        .set_selected_target(client_id, selected_context, Some(next_session_id));
+
+    // Issue the grant with context decoration.
+    let mut grant = attach_token_handle()?.0.issue(next_session_id);
+    grant.context_id = selected_context;
+    Ok(to_api_grant(&grant))
+}
+
+pub fn attach_context(
+    req: &AttachContextArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachGrantRecord, AttachCommandError> {
+    let client_id = caller_client_id(ctx)?;
+    let manager = session_manager()?;
+    let contexts = context_state()?;
+    let follow = follow_state()?;
+
+    let context = contexts
+        .0
+        .select_for_client(client_id, &req.selector)
+        .map_err(|m| failed(m.to_string()))?;
+
+    let Some(next_session_id) = contexts.0.current_session_for_client(client_id) else {
+        return Err(failed("context has no attached runtime"));
+    };
+
+    let previous_session = follow.0.selected_session(client_id);
+    if let Some(prev) = previous_session
+        && prev != next_session_id
+    {
+        manager.0.remove_client(prev, &client_id);
+    }
+
+    if !manager.0.contains(next_session_id) {
+        let _ = contexts.0.remove_contexts_for_session(next_session_id);
+        return Err(AttachCommandError::SessionNotFound);
+    }
+
+    manager.0.add_client(next_session_id, client_id);
+    follow
+        .0
+        .set_selected_target(client_id, Some(context.id), Some(next_session_id));
+
+    let mut grant = attach_token_handle()?.0.issue(next_session_id);
+    grant.context_id = Some(context.id);
+    Ok(to_api_grant(&grant))
+}
+
+pub fn attach_open(
+    req: &AttachOpenArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachReady, AttachCommandError> {
+    let client_id = caller_client_id(ctx)?;
+    let session_id = SessionId(req.session_id);
+    let runtime = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let tokens = attach_token_handle()?;
+    let follow = follow_state()?;
+
+    // Ensure the session runtime exists (start it if the session
+    // manager has the entry but the runtime is missing).
+    let manager = session_manager()?;
+    if !manager.0.contains(session_id) {
+        return Err(AttachCommandError::SessionNotFound);
+    }
+    if !runtime.0.session_exists(session_id)
+        && let Err(err) = runtime.0.start_runtime(session_id)
+    {
+        return Err(failed(format!(
+            "failed restarting missing session runtime {}: {err:#}",
+            session_id.0
+        )));
+    }
+
+    match tokens.0.consume(session_id, req.attach_token) {
+        Ok(()) => {}
+        Err(AttachTokenValidationError::NotFound | AttachTokenValidationError::SessionMismatch) => {
+            return Err(AttachCommandError::InvalidGrant);
+        }
+        Err(AttachTokenValidationError::Expired) => {
+            return Err(AttachCommandError::ExpiredGrant);
+        }
+    }
+
+    // End any previous attach stream for this client.
+    let previous_stream = follow.0.attached_stream_session(client_id);
+    if let Some(prev) = previous_stream
+        && prev != session_id
+    {
+        runtime.0.end_attach(prev, client_id);
+        publish_event(Event::ClientDetached { id: prev.0 });
+    }
+
+    // Begin attach with restart-on-NotFound/Closed semantics.
+    let begin_result = match runtime.0.begin_attach(session_id, client_id) {
+        Ok(()) => Ok(()),
+        Err(SessionRuntimeError::NotFound) => {
+            let _ = runtime.0.start_runtime(session_id);
+            runtime.0.begin_attach(session_id, client_id)
+        }
+        Err(SessionRuntimeError::Closed) => {
+            if let Some(removed) = runtime.0.remove_runtime(session_id) {
+                runtime.0.shutdown_removed_runtime(removed);
+            }
+            let _ = runtime.0.start_runtime(session_id);
+            runtime.0.begin_attach(session_id, client_id)
+        }
+        Err(err) => Err(err),
+    };
+
+    match begin_result {
+        Ok(()) => {
+            follow
+                .0
+                .set_attached_stream_session(client_id, Some(session_id));
+            let context_id = context_state()?
+                .0
+                .current_for_client(client_id)
+                .map(|c| c.id);
+            publish_event(Event::ClientAttached { id: session_id.0 });
+            Ok(AttachReady {
+                session_id: session_id.0,
+                context_id,
+                can_write: true,
+            })
+        }
+        Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
+            Err(AttachCommandError::SessionNotFound)
+        }
+        Err(SessionRuntimeError::NotAttached) => Err(failed("failed opening attach stream")),
+    }
+}
+
+pub fn attach_input(
+    req: AttachInputArgs,
+    ctx: &NativeServiceContext,
+) -> Result<
+    bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachInputAccepted,
+    AttachCommandError,
+> {
+    let client_id = caller_client_id(ctx)?;
+    let session_id = SessionId(req.session_id);
+    let runtime = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let data_len = req.data.len();
+    match runtime.0.write_input(session_id, client_id, req.data) {
+        Ok((bytes, _pane_id)) => Ok(
+            bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachInputAccepted {
+                bytes: u32::try_from(bytes)
+                    .unwrap_or_else(|_| u32::try_from(data_len).unwrap_or(u32::MAX)),
+            },
+        ),
+        Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
+            Err(AttachCommandError::SessionNotFound)
+        }
+        Err(SessionRuntimeError::NotAttached) => {
+            Err(failed("client is not attached to session runtime"))
+        }
+    }
+}
+
+pub fn attach_output(
+    req: &AttachOutputArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachOutputRecord, AttachCommandError> {
+    let client_id = caller_client_id(ctx)?;
+    let session_id = SessionId(req.session_id);
+    let runtime = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    match runtime
+        .0
+        .read_output(session_id, client_id, req.max_bytes as usize)
+    {
+        Ok(data) => Ok(AttachOutputRecord { data }),
+        Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
+            Err(AttachCommandError::SessionNotFound)
+        }
+        Err(SessionRuntimeError::NotAttached) => {
+            Err(failed("client is not attached to session runtime"))
+        }
+    }
+}
+
 pub fn attach_set_viewport(
     req: &AttachSetViewportArgs,
+    ctx: &NativeServiceContext,
 ) -> Result<AttachViewportSet, AttachCommandError> {
-    let handle = super::session_runtime_handle().ok_or_else(|| AttachCommandError::Failed {
-        reason: "pane-runtime manager handle not registered".to_string(),
-    })?;
-    // The set-viewport trait method returns the clamped viewport
-    // rectangle; propagate it into the BPDL record. client_id comes
-    // from the NativeServiceContext caller; if absent (synthetic
-    // caller in tests), use Uuid::nil which the manager treats as an
-    // unattached call and returns `SessionRuntimeError::Closed`.
-    let client_id = ClientId(Uuid::nil());
-    let (cols, rows, top, bottom) = handle
+    let client_id = caller_client_id(ctx)?;
+    let session_id = SessionId(req.session_id);
+    let runtime = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let (cols, rows, top, bottom) = runtime
         .0
         .set_attach_viewport(
-            SessionId(req.session_id),
+            session_id,
             client_id,
             req.cols,
             req.rows,
             req.status_top_inset,
             req.status_bottom_inset,
-            req.cell_pixel_w,
-            req.cell_pixel_h,
+            req.cell_pixel_width,
+            req.cell_pixel_height,
         )
-        .map_err(|e| AttachCommandError::Failed {
-            reason: format!("failed setting attach viewport: {e:?}"),
-        })?;
+        .map_err(|e| failed(format!("failed setting attach viewport: {e:?}")))?;
+    let context_id = context_state()?
+        .0
+        .current_for_client(client_id)
+        .map(|c| c.id);
     Ok(AttachViewportSet {
         session_id: req.session_id,
         cols,
         rows,
         status_top_inset: top,
         status_bottom_inset: bottom,
-        context_id: None,
+        context_id,
     })
+}
+
+pub fn set_client_attach_policy(
+    req: SetClientAttachPolicyArgs,
+    ctx: &NativeServiceContext,
+) -> Result<u8, AttachCommandError> {
+    let client_id = caller_client_id(ctx)?;
+    follow_state()?
+        .0
+        .set_attach_detach_allowed(client_id, req.allow_detach);
+    Ok(u8::from(req.allow_detach))
+}
+
+pub fn detach(ctx: &NativeServiceContext) -> Result<u8, AttachCommandError> {
+    let client_id = caller_client_id(ctx)?;
+    let follow = follow_state()?;
+    if !follow.0.attach_detach_allowed(client_id) {
+        return Err(failed("detach is disabled for this connection"));
+    }
+    let runtime = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    if let Some(stream_session) = follow.0.attached_stream_session(client_id) {
+        runtime.0.end_attach(stream_session, client_id);
+        follow.0.set_attached_stream_session(client_id, None);
+        publish_event(Event::ClientDetached {
+            id: stream_session.0,
+        });
+    }
+    // Clear the selected session so future follow-state lookups see
+    // the detach.
+    if let Some(selected) = follow.0.selected_session(client_id) {
+        let manager = session_manager()?;
+        manager.0.remove_client(selected, &client_id);
+        follow.0.set_selected_target(client_id, None, None);
+    }
+    Ok(0)
 }

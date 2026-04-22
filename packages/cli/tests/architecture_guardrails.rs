@@ -1523,3 +1523,202 @@ fn server_implements_pane_runtime_stateful() {
          `restore_if_present` runs",
     );
 }
+
+/// Stage 11 / Wave B: `Request::NewSession` / `Request::KillSession` /
+/// `Request::ListSessions` / `Request::ListPanes` have been deleted
+/// from `bmux_ipc`. Session lifecycle and listing now flow through
+/// typed-dispatch services owned by the sessions-plugin and the
+/// pane-runtime-plugin.
+#[test]
+fn session_lifecycle_ipc_variants_are_absent() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    let denied = [
+        "    NewSession {",
+        "    KillSession {",
+        "    ListSessions,",
+        "    ListPanes {",
+        "ResponsePayload::SessionCreated {",
+        "ResponsePayload::SessionKilled {",
+        "ResponsePayload::SessionList {",
+        "ResponsePayload::PaneList {",
+    ];
+    for marker in denied {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; \
+             session lifecycle + listing go through typed dispatch \
+             (sessions-commands / pane-runtime-commands)",
+        );
+    }
+}
+
+/// Stage 11 / Wave C: the 8 pane-mutation IPC variants have been
+/// deleted. Every mutation is now a typed `pane-runtime-commands`
+/// invocation whose handler lives in the pane-runtime-plugin.
+#[test]
+fn pane_mutation_ipc_variants_are_absent() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    let denied = [
+        "    SplitPane {",
+        "    LaunchPane {",
+        "    FocusPane {",
+        "    ResizePane {",
+        "    ClosePane {",
+        "    RestartPane {",
+        "    ZoomPane {",
+        "    PaneDirectInput {",
+    ];
+    for marker in denied {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; \
+             pane mutations go through `pane-runtime-commands` typed \
+             dispatch (plugin owns permission checks + event emission)",
+        );
+    }
+}
+
+/// Stage 11 / Wave D: the 13 attach-family IPC variants have been
+/// deleted. Attach lifecycle (grant/open/input/output/viewport/detach/
+/// policy/layout/snapshot/pane-snapshot/pane-output-batch/pane-images)
+/// flows through typed `attach-runtime-commands` and
+/// `attach-runtime-state` on the pane-runtime-plugin.
+#[test]
+fn attach_ipc_variants_are_absent() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    let denied_requests = [
+        "    Attach {",
+        "    AttachContext {",
+        "    AttachOpen {",
+        "    AttachInput {",
+        "    AttachOutput {",
+        "    AttachSetViewport {",
+        "    AttachLayout {",
+        "    AttachSnapshot {",
+        "    AttachPaneSnapshot {",
+        "    AttachPaneOutputBatch {",
+        "    AttachPaneImages {",
+        "    Detach,",
+        "    SetClientAttachPolicy {",
+    ];
+    for marker in denied_requests {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; \
+             attach lifecycle lives in `attach-runtime-commands` / \
+             `attach-runtime-state` on the pane-runtime-plugin",
+        );
+    }
+    let denied_responses = [
+        "ResponsePayload::Attached {",
+        "ResponsePayload::AttachReady {",
+        "ResponsePayload::AttachInputAccepted {",
+        "ResponsePayload::AttachViewportSet {",
+        "ResponsePayload::AttachOutput {",
+        "ResponsePayload::AttachLayout {",
+        "ResponsePayload::AttachSnapshot {",
+        "ResponsePayload::AttachPaneSnapshot {",
+        "ResponsePayload::AttachPaneOutputBatch {",
+        "ResponsePayload::AttachPaneImages {",
+        "ResponsePayload::ClientAttachPolicySet {",
+        "ResponsePayload::Detached",
+    ];
+    for marker in denied_responses {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}",
+        );
+    }
+}
+
+/// Stage 11 closeout: the pane-runtime-plugin is the sole owner of
+/// session/pane/attach orchestration after the 6th boundary migration.
+/// Concretely:
+///
+/// - Its handlers own the runtime manager, attach-token manager, and
+///   follow-state writers for every mutation and attach lifecycle
+///   event. The server no longer has code paths that decode
+///   `Request::{Split,Launch,Focus,Resize,Close,Restart,Zoom,PaneDirectInput,
+///   Attach,AttachContext,AttachOpen,AttachInput,AttachOutput,
+///   AttachSetViewport,AttachLayout,AttachSnapshot,AttachPaneSnapshot,
+///   AttachPaneOutputBatch,AttachPaneImages,SetClientAttachPolicy,
+///   Detach,NewSession,KillSession,ListSessions,ListPanes}`.
+/// - The server's `ServiceInvokeContext` no longer carries a
+///   per-invocation `selection` tuple — plugins read selection state
+///   through `FollowStateHandle` when they need it.
+#[test]
+fn pane_runtime_plugin_owns_orchestration() {
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_prod = production_section(server_source);
+
+    // ServiceInvokeContext::selection has been removed.
+    assert!(
+        !server_prod.contains("selection: Arc<AsyncMutex<(Option<SessionId>"),
+        "packages/server/src/lib.rs must not reintroduce a per-invocation \
+         `selection` tuple on `ServiceInvokeContext`; selection state \
+         lives in `FollowStateHandle` owned by the clients-plugin",
+    );
+
+    // handle_connection no longer maintains a per-connection
+    // ConnectionAttachPolicy — detach policy is on FollowState.
+    assert!(
+        !server_prod.contains("struct ConnectionAttachPolicy"),
+        "packages/server/src/lib.rs must not reintroduce \
+         `ConnectionAttachPolicy`; attach-detach policy is per-client \
+         state owned by `FollowState` in the clients-plugin",
+    );
+
+    // Pane-runtime-plugin typed handlers exist for all former
+    // IPC-handled operations.
+    let attach_commands_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/pane-runtime-plugin/src/handlers/attach_commands.rs");
+    assert!(
+        attach_commands_path.exists(),
+        "plugins/pane-runtime-plugin/src/handlers/attach_commands.rs must exist",
+    );
+    let attach_src = std::fs::read_to_string(&attach_commands_path)
+        .expect("attach_commands.rs should be readable");
+    for handler in [
+        "pub fn attach_session(",
+        "pub fn attach_context(",
+        "pub fn attach_open(",
+        "pub fn attach_input(",
+        "pub fn attach_output(",
+        "pub fn attach_set_viewport(",
+        "pub fn set_client_attach_policy(",
+        "pub fn detach(",
+    ] {
+        assert!(
+            attach_src.contains(handler),
+            "plugins/pane-runtime-plugin/src/handlers/attach_commands.rs \
+             must define {handler} — the plugin owns attach orchestration",
+        );
+    }
+
+    let pane_commands_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/pane-runtime-plugin/src/handlers/pane_commands.rs");
+    assert!(
+        pane_commands_path.exists(),
+        "plugins/pane-runtime-plugin/src/handlers/pane_commands.rs must exist",
+    );
+    let pane_src =
+        std::fs::read_to_string(&pane_commands_path).expect("pane_commands.rs should be readable");
+    for handler in [
+        "pub fn split_pane(",
+        "pub fn launch_pane(",
+        "pub fn focus_pane(",
+        "pub fn resize_pane(",
+        "pub fn close_pane(",
+        "pub fn restart_pane(",
+        "pub fn zoom_pane(",
+        "pub fn pane_direct_input(",
+        "pub fn new_session_with_runtime(",
+        "pub fn kill_session_runtime(",
+    ] {
+        assert!(
+            pane_src.contains(handler),
+            "plugins/pane-runtime-plugin/src/handlers/pane_commands.rs \
+             must define {handler} — the plugin owns pane/session mutation",
+        );
+    }
+}

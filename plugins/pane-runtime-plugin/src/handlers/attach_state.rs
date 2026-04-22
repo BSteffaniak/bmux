@@ -44,8 +44,8 @@ pub struct AttachPaneOutputBatchArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachPaneImagesArgs {
     pub session_id: Uuid,
-    pub pane_id: Uuid,
-    pub since_version: u64,
+    pub pane_ids: Vec<Uuid>,
+    pub since_sequences: Vec<u64>,
 }
 
 fn failed(reason: impl Into<String>) -> AttachStateError {
@@ -190,16 +190,23 @@ pub fn attach_pane_output_batch(
     })
 }
 
-/// `attach-pane-images` delivers image-registry deltas. The typed
-/// dispatch path isn't plumbed end-to-end yet because the image
-/// encoder + payload codec live on the server. Until the full
-/// pipeline migrates, this handler returns an error pointing clients
-/// at `Request::AttachPaneImages`.
-pub fn not_implemented_pane_images() -> Result<AttachPaneImages, AttachStateError> {
-    Err(failed(
-        "attach-pane-images not yet routed through typed dispatch; \
-         callers should use Request::AttachPaneImages",
-    ))
+/// `attach-pane-images` delivers image-registry deltas serialized as
+/// JSON (`Vec<AttachPaneImageDelta>`).
+pub fn attach_pane_images(
+    req: &AttachPaneImagesArgs,
+    _ctx: &NativeServiceContext,
+) -> Result<AttachPaneImages, AttachStateError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let deltas = handle.0.attach_pane_image_deltas(
+        SessionId(req.session_id),
+        &req.pane_ids,
+        &req.since_sequences,
+        None,
+    );
+    let encoded = serde_json::to_vec(&deltas)
+        .map_err(|e| failed(format!("encode pane-images deltas: {e}")))?;
+    Ok(AttachPaneImages { encoded })
 }
 
 fn chunk_to_record(chunk: bmux_ipc::AttachPaneChunk) -> PaneChunk {
@@ -209,6 +216,7 @@ fn chunk_to_record(chunk: bmux_ipc::AttachPaneChunk) -> PaneChunk {
         stream_start: chunk.stream_start,
         stream_end: chunk.stream_end,
         stream_gap: chunk.stream_gap,
+        sync_update_active: chunk.sync_update_active,
     }
 }
 

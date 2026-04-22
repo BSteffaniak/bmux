@@ -386,15 +386,33 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn session_select(&self, request: &SessionSelectRequest) -> Result<SessionSelectResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::Attach {
-            selector: session_selector_to_ipc(&request.selector),
-        })? {
-            bmux_ipc::ResponsePayload::Attached { grant } => Ok(SessionSelectResponse {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Args {
+            selector: bmux_ipc::SessionSelector,
+            can_write: bool,
+        }
+        let result = self.call_service::<Args, std::result::Result<
+            bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachGrant,
+            bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachCommandError,
+        >>(
+            bmux_pane_runtime_plugin_api::capabilities::ATTACH_RUNTIME_WRITE.as_str(),
+            bmux_plugin_sdk::ServiceKind::Command,
+            bmux_pane_runtime_plugin_api::attach_runtime_commands::INTERFACE_ID.as_str(),
+            "attach-session",
+            &Args {
+                selector: session_selector_to_ipc(&request.selector),
+                can_write: true,
+            },
+        )?;
+        match result {
+            Ok(grant) => Ok(SessionSelectResponse {
                 session_id: grant.session_id,
-                attach_token: grant.attach_token,
-                expires_at_epoch_ms: grant.expires_at_epoch_ms,
+                attach_token: grant.token,
+                expires_at_epoch_ms: grant.expires_epoch_ms,
             }),
-            _ => Err(unexpected("session_select")),
+            Err(err) => Err(PluginError::ServiceProtocol {
+                details: format!("attach-session failed: {err:?}"),
+            }),
         }
     }
 
@@ -788,6 +806,10 @@ pub trait KernelOps: ServiceCaller {
     /// Returns an error when the service call fails.
     fn pane_launch(&self, request: &PaneLaunchRequest) -> Result<PaneLaunchResponse> {
         #[derive(Serialize)]
+        #[allow(
+            clippy::struct_field_names,
+            reason = "Args field names mirror the BPDL contract fields"
+        )]
         struct Args {
             session_id: Uuid,
             target: Option<Uuid>,

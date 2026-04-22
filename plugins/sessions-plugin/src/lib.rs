@@ -595,6 +595,12 @@ fn kill_session_via_ipc(
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct AttachSessionArgs {
+    selector: bmux_ipc::SessionSelector,
+    can_write: bool,
+}
+
 fn select_session_via_ipc(
     caller: &impl ServiceCaller,
     selector: &WireSelector,
@@ -604,10 +610,21 @@ fn select_session_via_ipc(
             reason: "selector must specify either id or name".to_string(),
         });
     };
-    match caller.execute_kernel_request(bmux_ipc::Request::Attach {
-        selector: ipc_selector,
-    }) {
-        Ok(bmux_ipc::ResponsePayload::Attached { grant }) => {
+    let result = caller.call_service::<AttachSessionArgs, Result<
+        bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachGrant,
+        bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachCommandError,
+    >>(
+        bmux_pane_runtime_plugin_api::capabilities::ATTACH_RUNTIME_WRITE.as_str(),
+        ServiceKind::Command,
+        bmux_pane_runtime_plugin_api::attach_runtime_commands::INTERFACE_ID.as_str(),
+        "attach-session",
+        &AttachSessionArgs {
+            selector: ipc_selector,
+            can_write: true,
+        },
+    );
+    match result {
+        Ok(Ok(grant)) => {
             let _ = global_event_bus().emit(
                 &sessions_events::EVENT_KIND,
                 SessionEvent::Selected {
@@ -618,8 +635,8 @@ fn select_session_via_ipc(
                 id: grant.session_id,
             })
         }
-        Ok(_) => Err(SelectSessionError::Denied {
-            reason: "unexpected response payload for select-session".to_string(),
+        Ok(Err(err)) => Err(SelectSessionError::Denied {
+            reason: format!("{err:?}"),
         }),
         Err(err) => Err(SelectSessionError::Denied {
             reason: err.to_string(),

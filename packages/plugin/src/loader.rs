@@ -2320,26 +2320,10 @@ sleep 60
 
         KERNEL_REQUESTS.with(|log| log.borrow_mut().push(kernel_request.clone()));
 
-        let kernel_response = match kernel_request {
-            bmux_ipc::Request::Attach { selector } => {
-                let session_id = match selector {
-                    bmux_ipc::SessionSelector::ById(id) => id,
-                    bmux_ipc::SessionSelector::ByName(_) => uuid::Uuid::new_v4(),
-                };
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::Attached {
-                    grant: bmux_ipc::AttachGrant {
-                        context_id: None,
-                        session_id,
-                        attach_token: uuid::Uuid::new_v4(),
-                        expires_at_epoch_ms: 42,
-                    },
-                })
-            }
-            _ => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
-                code: bmux_ipc::ErrorCode::InvalidRequest,
-                message: "unsupported kernel request in test bridge".to_string(),
-            }),
-        };
+        let kernel_response = bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
+            code: bmux_ipc::ErrorCode::InvalidRequest,
+            message: "unsupported kernel request in test bridge".to_string(),
+        });
         let Ok(encoded_kernel_response) = bmux_ipc::encode(&kernel_response) else {
             return 1;
         };
@@ -3242,71 +3226,6 @@ minimum = "1.0"
                 .to_string()
                 .contains("unsupported plugin CLI bridge request protocol version")
         );
-    }
-
-    #[test]
-    fn command_context_calls_core_session_select_via_kernel_bridge() {
-        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
-
-        let target_session_id = uuid::Uuid::new_v4();
-        let context = super::NativeCommandContext {
-            plugin_id: "caller.plugin".to_string(),
-            command: "select-session".to_string(),
-            arguments: Vec::new(),
-            required_capabilities: vec!["bmux.sessions.write".to_string()],
-            provided_capabilities: Vec::new(),
-            services: vec![bmux_plugin_sdk::RegisteredService {
-                capability: bmux_plugin_sdk::HostScope::new("bmux.sessions.write")
-                    .expect("capability should parse"),
-                kind: bmux_plugin_sdk::ServiceKind::Command,
-                interface_id: "session-command/v1".to_string(),
-                provider: bmux_plugin_sdk::ProviderId::Host,
-            }],
-            available_capabilities: vec!["bmux.sessions.write".to_string()],
-            enabled_plugins: Vec::new(),
-            plugin_search_roots: Vec::new(),
-            registered_plugins: Vec::new(),
-            host: HostMetadata {
-                product_name: "bmux".to_string(),
-                product_version: "0.1.0".to_string(),
-                plugin_api_version: ApiVersion::new(1, 0),
-                plugin_abi_version: ApiVersion::new(1, 0),
-            },
-            connection: bmux_plugin_sdk::HostConnectionInfo {
-                config_dir: "/config".to_string(),
-                runtime_dir: "/runtime".to_string(),
-                data_dir: "/data".to_string(),
-                state_dir: "/state".to_string(),
-            },
-            settings: None,
-            plugin_settings_map: BTreeMap::new(),
-            caller_client_id: None,
-            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
-        };
-
-        let response = context
-            .execute_kernel_request(bmux_ipc::Request::Attach {
-                selector: bmux_ipc::SessionSelector::ById(target_session_id),
-            })
-            .expect("core session select should succeed");
-        let grant = match response {
-            bmux_ipc::ResponsePayload::Attached { grant } => grant,
-            other => panic!("expected Attached, got {other:?}"),
-        };
-        assert_eq!(grant.session_id, target_session_id);
-        assert_eq!(grant.expires_at_epoch_ms, 42);
-
-        let has_attach = KERNEL_REQUESTS.with(|log| {
-            log.borrow().iter().any(|request| {
-                matches!(
-                    request,
-                    bmux_ipc::Request::Attach {
-                        selector: bmux_ipc::SessionSelector::ById(id)
-                    } if *id == target_session_id
-                )
-            })
-        });
-        assert!(has_attach);
     }
 
     #[test]

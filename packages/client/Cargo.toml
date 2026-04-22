@@ -19,6 +19,8 @@ bmux_plugin_sdk              = { workspace = true }
 
 # External dependencies
 bmux_codec = { workspace = true }
+serde      = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror  = { workspace = true }
 tokio      = { workspace = true, features = ["time", "sync", "rt"] }
 tracing    = { workspace = true }

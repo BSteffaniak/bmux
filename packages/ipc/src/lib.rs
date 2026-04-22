@@ -484,63 +484,6 @@ pub enum Request {
         operation: String,
         payload: Vec<u8>,
     },
-    Attach {
-        selector: SessionSelector,
-    },
-    AttachContext {
-        selector: ContextSelector,
-    },
-    AttachOpen {
-        session_id: Uuid,
-        attach_token: Uuid,
-    },
-    AttachInput {
-        session_id: Uuid,
-        data: Vec<u8>,
-    },
-    AttachSetViewport {
-        session_id: Uuid,
-        cols: u16,
-        rows: u16,
-        #[serde(default)]
-        status_top_inset: u16,
-        #[serde(default)]
-        status_bottom_inset: u16,
-        /// Cell width in pixels (0 = unknown). Used for image placement sizing.
-        #[serde(default)]
-        cell_pixel_width: u16,
-        /// Cell height in pixels (0 = unknown). Used for image placement sizing.
-        #[serde(default)]
-        cell_pixel_height: u16,
-    },
-    AttachOutput {
-        session_id: Uuid,
-        max_bytes: usize,
-    },
-    AttachLayout {
-        session_id: Uuid,
-    },
-    AttachPaneOutputBatch {
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes: usize,
-    },
-    AttachPaneImages {
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        /// Per-pane sequence numbers from the last delta received.
-        /// Parallel to `pane_ids`.  Use 0 for a full snapshot.
-        since_sequences: Vec<u64>,
-    },
-    AttachSnapshot {
-        session_id: Uuid,
-        max_bytes_per_pane: usize,
-    },
-    AttachPaneSnapshot {
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes_per_pane: usize,
-    },
     SubscribeEvents,
     PollEvents {
         max_events: usize,
@@ -552,10 +495,6 @@ pub enum Request {
     /// clients (which split the socket into read/write halves and demux
     /// incoming frames) should send this request.
     EnableEventPush,
-    SetClientAttachPolicy {
-        allow_detach: bool,
-    },
-    Detach,
     HelloV2 {
         contract: ProtocolContract,
         client_name: String,
@@ -1052,87 +991,12 @@ pub enum ResponsePayload {
         follows: usize,
         selected_sessions: usize,
     },
-    Attached {
-        grant: AttachGrant,
-    },
-    AttachReady {
-        #[serde(default)]
-        context_id: Option<Uuid>,
-        session_id: Uuid,
-        can_write: bool,
-    },
-    AttachInputAccepted {
-        bytes: usize,
-    },
-    AttachViewportSet {
-        #[serde(default)]
-        context_id: Option<Uuid>,
-        session_id: Uuid,
-        cols: u16,
-        rows: u16,
-        #[serde(default)]
-        status_top_inset: u16,
-        #[serde(default)]
-        status_bottom_inset: u16,
-    },
-    AttachOutput {
-        data: Vec<u8>,
-    },
-    AttachLayout {
-        #[serde(default)]
-        context_id: Option<Uuid>,
-        session_id: Uuid,
-        focused_pane_id: Uuid,
-        panes: Vec<PaneSummary>,
-        layout_root: PaneLayoutNode,
-        scene: AttachScene,
-        #[serde(default)]
-        zoomed: bool,
-    },
-    AttachPaneOutputBatch {
-        chunks: Vec<AttachPaneChunk>,
-        /// True when at least one requested pane's PTY reader has flagged
-        /// new output that was not included in this batch.  The client
-        /// should continue draining instead of proceeding to render.
-        #[serde(default)]
-        output_still_pending: bool,
-    },
-    AttachPaneImages {
-        deltas: Vec<AttachPaneImageDelta>,
-    },
-    AttachSnapshot {
-        #[serde(default)]
-        context_id: Option<Uuid>,
-        session_id: Uuid,
-        focused_pane_id: Uuid,
-        panes: Vec<PaneSummary>,
-        layout_root: PaneLayoutNode,
-        scene: AttachScene,
-        chunks: Vec<AttachPaneChunk>,
-        #[serde(default)]
-        pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
-        #[serde(default)]
-        pane_input_modes: Vec<AttachPaneInputMode>,
-        #[serde(default)]
-        zoomed: bool,
-    },
-    AttachPaneSnapshot {
-        chunks: Vec<AttachPaneChunk>,
-        #[serde(default)]
-        pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
-        #[serde(default)]
-        pane_input_modes: Vec<AttachPaneInputMode>,
-    },
     EventsSubscribed,
     EventBatch {
         events: Vec<Event>,
     },
     /// Acknowledgement that server-push event delivery has been enabled.
     EventPushEnabled,
-    ClientAttachPolicySet {
-        allow_detach: bool,
-    },
-    Detached,
     ServerStopping,
     ServiceInvoked {
         payload: Vec<u8>,
@@ -1473,51 +1337,6 @@ mod tests {
     }
 
     #[test]
-    fn serializes_attach_scene_response_roundtrip() {
-        let pane_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let response = Response::Ok(ResponsePayload::AttachLayout {
-            context_id: None,
-            session_id,
-            focused_pane_id: pane_id,
-            panes: vec![],
-            layout_root: super::PaneLayoutNode::Leaf { pane_id },
-            scene: AttachScene {
-                session_id,
-                focus: AttachFocusTarget::Pane { pane_id },
-                surfaces: vec![AttachSurface {
-                    id: pane_id,
-                    kind: AttachSurfaceKind::Pane,
-                    layer: AttachLayer::Pane,
-                    z: 0,
-                    rect: AttachRect {
-                        x: 0,
-                        y: 1,
-                        w: 80,
-                        h: 24,
-                    },
-                    content_rect: AttachRect {
-                        x: 0,
-                        y: 1,
-                        w: 80,
-                        h: 24,
-                    },
-                    interactive_regions: Vec::new(),
-                    opaque: true,
-                    visible: true,
-                    accepts_input: true,
-                    cursor_owner: true,
-                    pane_id: Some(pane_id),
-                }],
-            },
-            zoomed: false,
-        });
-        let bytes = encode(&response).expect("response should encode");
-        let decoded: Response = decode(&bytes).expect("response should decode");
-        assert_eq!(decoded, response);
-    }
-
-    #[test]
     fn serializes_event_roundtrip() {
         let event = Event::SessionCreated {
             id: Uuid::new_v4(),
@@ -1703,7 +1522,6 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn request_all_variants_roundtrip() {
         let id = Uuid::from_u128(1);
-        let id2 = Uuid::from_u128(2);
 
         let variants: Vec<Request> = vec![
             Request::Hello {
@@ -1730,51 +1548,8 @@ mod tests {
                 operation: "list".into(),
                 payload: vec![1, 2, 3],
             },
-            Request::Attach {
-                selector: SessionSelector::ByName("main".into()),
-            },
-            Request::AttachContext {
-                selector: ContextSelector::ByName("default".into()),
-            },
-            Request::AttachOpen {
-                session_id: id,
-                attach_token: id2,
-            },
-            Request::AttachInput {
-                session_id: id,
-                data: vec![27, 91, 65], // ESC [ A
-            },
-            Request::AttachSetViewport {
-                session_id: id,
-                cols: 120,
-                rows: 40,
-                status_top_inset: 1,
-                status_bottom_inset: 0,
-                cell_pixel_width: 8,
-                cell_pixel_height: 16,
-            },
-            Request::AttachOutput {
-                session_id: id,
-                max_bytes: 65536,
-            },
-            Request::AttachLayout { session_id: id },
-            Request::AttachPaneOutputBatch {
-                session_id: id,
-                pane_ids: vec![id, id2],
-                max_bytes: 4096,
-            },
-            Request::AttachSnapshot {
-                session_id: id,
-                max_bytes_per_pane: 8192,
-            },
-            Request::AttachPaneSnapshot {
-                session_id: id,
-                pane_ids: vec![id, id2],
-                max_bytes_per_pane: 8192,
-            },
             Request::SubscribeEvents,
             Request::PollEvents { max_events: 100 },
-            Request::Detach,
         ];
 
         for (i, variant) in variants.iter().enumerate() {
@@ -1820,66 +1595,6 @@ mod tests {
         }
     }
 
-    fn sample_attach_scene() -> (AttachScene, Uuid) {
-        let pane_id = Uuid::from_u128(10);
-        let session_id = Uuid::from_u128(1);
-        let scene = AttachScene {
-            session_id,
-            focus: AttachFocusTarget::Pane { pane_id },
-            surfaces: vec![
-                AttachSurface {
-                    id: pane_id,
-                    kind: AttachSurfaceKind::Pane,
-                    layer: AttachLayer::Pane,
-                    z: 0,
-                    rect: AttachRect {
-                        x: 0,
-                        y: 1,
-                        w: 80,
-                        h: 24,
-                    },
-                    content_rect: AttachRect {
-                        x: 1,
-                        y: 2,
-                        w: 78,
-                        h: 22,
-                    },
-                    interactive_regions: Vec::new(),
-                    opaque: true,
-                    visible: true,
-                    accepts_input: true,
-                    cursor_owner: true,
-                    pane_id: Some(pane_id),
-                },
-                AttachSurface {
-                    id: Uuid::from_u128(20),
-                    kind: AttachSurfaceKind::FloatingPane,
-                    layer: AttachLayer::FloatingPane,
-                    z: 10,
-                    rect: AttachRect {
-                        x: 5,
-                        y: 5,
-                        w: 40,
-                        h: 10,
-                    },
-                    content_rect: AttachRect {
-                        x: 6,
-                        y: 6,
-                        w: 38,
-                        h: 8,
-                    },
-                    interactive_regions: Vec::new(),
-                    opaque: false,
-                    visible: true,
-                    accepts_input: true,
-                    cursor_owner: false,
-                    pane_id: None,
-                },
-            ],
-        };
-        (scene, pane_id)
-    }
-
     fn sample_layout_tree() -> PaneLayoutNode {
         PaneLayoutNode::Split {
             direction: PaneSplitDirection::Horizontal,
@@ -1905,8 +1620,6 @@ mod tests {
     fn response_payload_all_variants_roundtrip() {
         let id = Uuid::from_u128(1);
         let id2 = Uuid::from_u128(2);
-        let (scene, pane_id) = sample_attach_scene();
-        let layout = sample_layout_tree();
 
         let variants: Vec<ResponsePayload> = vec![
             ResponsePayload::Pong,
@@ -1941,135 +1654,6 @@ mod tests {
                 follows: 1,
                 selected_sessions: 2,
             },
-            ResponsePayload::Attached {
-                grant: AttachGrant {
-                    context_id: Some(id2),
-                    session_id: id,
-                    attach_token: Uuid::from_u128(99),
-                    expires_at_epoch_ms: 1_700_000_060_000,
-                },
-            },
-            ResponsePayload::AttachReady {
-                context_id: Some(id2),
-                session_id: id,
-                can_write: true,
-            },
-            ResponsePayload::AttachReady {
-                context_id: None,
-                session_id: id,
-                can_write: false,
-            },
-            ResponsePayload::AttachInputAccepted { bytes: 256 },
-            ResponsePayload::AttachViewportSet {
-                context_id: None,
-                session_id: id,
-                cols: 120,
-                rows: 40,
-                status_top_inset: 1,
-                status_bottom_inset: 0,
-            },
-            ResponsePayload::AttachOutput {
-                data: vec![27, 91, 72, 27, 91, 50, 74], // ESC[H ESC[2J
-            },
-            ResponsePayload::AttachLayout {
-                context_id: Some(id2),
-                session_id: id,
-                focused_pane_id: pane_id,
-                panes: vec![PaneSummary {
-                    id: pane_id,
-                    index: 0,
-                    name: None,
-                    focused: true,
-                    state: PaneState::Running,
-                    state_reason: None,
-                }],
-                layout_root: layout.clone(),
-                scene: scene.clone(),
-                zoomed: false,
-            },
-            ResponsePayload::AttachPaneOutputBatch {
-                chunks: vec![
-                    AttachPaneChunk {
-                        pane_id,
-                        data: vec![65, 66, 67],
-                        stream_start: 0,
-                        stream_end: 3,
-                        stream_gap: false,
-                        sync_update_active: false,
-                    },
-                    AttachPaneChunk {
-                        pane_id: id2,
-                        data: vec![],
-                        stream_start: 0,
-                        stream_end: 0,
-                        stream_gap: false,
-                        sync_update_active: false,
-                    },
-                ],
-                output_still_pending: false,
-            },
-            ResponsePayload::AttachSnapshot {
-                context_id: None,
-                session_id: id,
-                focused_pane_id: pane_id,
-                panes: vec![PaneSummary {
-                    id: pane_id,
-                    index: 0,
-                    name: None,
-                    focused: true,
-                    state: PaneState::Running,
-                    state_reason: None,
-                }],
-                layout_root: layout,
-                scene,
-                chunks: vec![AttachPaneChunk {
-                    pane_id,
-                    data: vec![0; 100],
-                    stream_start: 0,
-                    stream_end: 100,
-                    stream_gap: false,
-                    sync_update_active: false,
-                }],
-                pane_mouse_protocols: vec![AttachPaneMouseProtocol {
-                    pane_id,
-                    protocol: AttachMouseProtocolState {
-                        mode: AttachMouseProtocolMode::AnyMotion,
-                        encoding: AttachMouseProtocolEncoding::Sgr,
-                    },
-                }],
-                pane_input_modes: vec![AttachPaneInputMode {
-                    pane_id,
-                    mode: AttachInputModeState {
-                        application_cursor: true,
-                        application_keypad: false,
-                    },
-                }],
-                zoomed: false,
-            },
-            ResponsePayload::AttachPaneSnapshot {
-                chunks: vec![AttachPaneChunk {
-                    pane_id,
-                    data: vec![65, 66, 67],
-                    stream_start: 50,
-                    stream_end: 53,
-                    stream_gap: false,
-                    sync_update_active: false,
-                }],
-                pane_mouse_protocols: vec![AttachPaneMouseProtocol {
-                    pane_id,
-                    protocol: AttachMouseProtocolState {
-                        mode: AttachMouseProtocolMode::PressRelease,
-                        encoding: AttachMouseProtocolEncoding::Sgr,
-                    },
-                }],
-                pane_input_modes: vec![AttachPaneInputMode {
-                    pane_id,
-                    mode: AttachInputModeState {
-                        application_cursor: false,
-                        application_keypad: true,
-                    },
-                }],
-            },
             ResponsePayload::EventsSubscribed,
             ResponsePayload::EventBatch {
                 events: vec![
@@ -2080,7 +1664,6 @@ mod tests {
                     },
                 ],
             },
-            ResponsePayload::Detached,
             ResponsePayload::ServerStopping,
             ResponsePayload::ServiceInvoked {
                 payload: vec![9, 8, 7],

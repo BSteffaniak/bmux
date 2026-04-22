@@ -153,6 +153,114 @@ pub struct BmuxClient {
     negotiated_protocol: Option<NegotiatedProtocol>,
 }
 
+#[derive(serde::Deserialize)]
+struct LayoutPayload {
+    panes: Vec<PaneSummary>,
+    layout_root: PaneLayoutNode,
+    scene: AttachScene,
+    zoomed: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SnapshotLayoutPayload {
+    panes: Vec<PaneSummary>,
+    layout_root: PaneLayoutNode,
+    scene: AttachScene,
+}
+
+fn decode_attach_layout(
+    layout: &bmux_pane_runtime_plugin_api::attach_runtime_state::AttachLayout,
+) -> Result<AttachLayoutState> {
+    let payload: LayoutPayload =
+        serde_json::from_slice(&layout.encoded).map_err(|e| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("decode attach-layout payload: {e}"),
+        })?;
+    Ok(AttachLayoutState {
+        context_id: layout.context_id,
+        session_id: layout.session_id,
+        focused_pane_id: layout.focused_pane_id,
+        panes: payload.panes,
+        layout_root: payload.layout_root,
+        scene: payload.scene,
+        zoomed: payload.zoomed,
+    })
+}
+
+fn decode_attach_snapshot(
+    snap: bmux_pane_runtime_plugin_api::attach_runtime_state::AttachSnapshot,
+) -> Result<AttachSnapshotState> {
+    let layout: SnapshotLayoutPayload =
+        serde_json::from_slice(&snap.layout_encoded).map_err(|e| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("decode attach-snapshot layout payload: {e}"),
+        })?;
+    Ok(AttachSnapshotState {
+        context_id: snap.context_id,
+        session_id: snap.session_id,
+        focused_pane_id: snap.focused_pane_id,
+        panes: layout.panes,
+        layout_root: layout.layout_root,
+        scene: layout.scene,
+        chunks: snap
+            .chunks
+            .into_iter()
+            .map(pane_chunk_from_record)
+            .collect(),
+        pane_mouse_protocols: snap
+            .pane_mouse_protocols
+            .iter()
+            .map(pane_mouse_from_record)
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        pane_input_modes: snap
+            .pane_input_modes
+            .iter()
+            .map(pane_input_mode_from_record)
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        zoomed: snap.zoomed,
+    })
+}
+
+fn pane_chunk_from_record(
+    chunk: bmux_pane_runtime_plugin_api::attach_runtime_state::PaneChunk,
+) -> AttachPaneChunk {
+    AttachPaneChunk {
+        pane_id: chunk.pane_id,
+        data: chunk.data,
+        stream_start: chunk.stream_start,
+        stream_end: chunk.stream_end,
+        stream_gap: chunk.stream_gap,
+        sync_update_active: chunk.sync_update_active,
+    }
+}
+
+fn pane_mouse_from_record(
+    mouse: &bmux_pane_runtime_plugin_api::attach_runtime_state::PaneMouseProtocol,
+) -> Result<AttachPaneMouseProtocol> {
+    let protocol =
+        serde_json::from_slice(&mouse.encoded).map_err(|e| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("decode pane mouse-protocol record: {e}"),
+        })?;
+    Ok(AttachPaneMouseProtocol {
+        pane_id: mouse.pane_id,
+        protocol,
+    })
+}
+
+fn pane_input_mode_from_record(
+    mode: &bmux_pane_runtime_plugin_api::attach_runtime_state::PaneInputMode,
+) -> Result<AttachPaneInputMode> {
+    let decoded = serde_json::from_slice(&mode.encoded).map_err(|e| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decode pane input-mode record: {e}"),
+    })?;
+    Ok(AttachPaneInputMode {
+        pane_id: mode.pane_id,
+        mode: decoded,
+    })
+}
+
 #[derive(Debug)]
 enum ClientStream {
     Local(LocalIpcStream),
@@ -588,11 +696,22 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_grant(&mut self, selector: SessionSelector) -> Result<AttachGrant> {
-        match self.request(Request::Attach { selector }).await? {
-            ResponsePayload::Attached { grant } => Ok(grant),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attached response",
-            )),
+        match bmux_pane_runtime_plugin_api::typed_client::attach_session(self, selector, true).await
+        {
+            Ok(Ok(grant)) => Ok(AttachGrant {
+                attach_token: grant.token,
+                session_id: grant.session_id,
+                context_id: grant.context_id,
+                expires_at_epoch_ms: grant.expires_epoch_ms,
+            }),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-session failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-session typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -602,11 +721,22 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_context_grant(&mut self, selector: ContextSelector) -> Result<AttachGrant> {
-        match self.request(Request::AttachContext { selector }).await? {
-            ResponsePayload::Attached { grant } => Ok(grant),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attached response",
-            )),
+        match bmux_pane_runtime_plugin_api::typed_client::attach_context(self, selector, true).await
+        {
+            Ok(Ok(grant)) => Ok(AttachGrant {
+                attach_token: grant.token,
+                session_id: grant.session_id,
+                context_id: grant.context_id,
+                expires_at_epoch_ms: grant.expires_epoch_ms,
+            }),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-context failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-context typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -626,25 +756,26 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn open_attach_stream_info(&mut self, grant: &AttachGrant) -> Result<AttachOpenInfo> {
-        match self
-            .request(Request::AttachOpen {
-                session_id: grant.session_id,
-                attach_token: grant.attach_token,
-            })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::attach_open(
+            self,
+            grant.session_id,
+            grant.attach_token,
+        )
+        .await
         {
-            ResponsePayload::AttachReady {
-                context_id,
-                session_id,
-                can_write,
-            } => Ok(AttachOpenInfo {
-                context_id,
-                session_id,
-                can_write,
+            Ok(Ok(ready)) => Ok(AttachOpenInfo {
+                context_id: ready.context_id,
+                session_id: ready.session_id,
+                can_write: ready.can_write,
             }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach ready response",
-            )),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-open failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-open typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -654,11 +785,16 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn detach(&mut self) -> Result<()> {
-        match self.request(Request::Detach).await? {
-            ResponsePayload::Detached => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected detached response",
-            )),
+        match bmux_pane_runtime_plugin_api::typed_client::detach(self).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("detach failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("detach typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -668,16 +804,21 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn set_attach_policy(&mut self, allow_detach: bool) -> Result<()> {
-        match self
-            .request(Request::SetClientAttachPolicy { allow_detach })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::set_client_attach_policy(
+            self,
+            allow_detach,
+        )
+        .await
         {
-            ResponsePayload::ClientAttachPolicySet {
-                allow_detach: applied,
-            } if applied == allow_detach => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected client attach policy set response",
-            )),
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("set-client-attach-policy failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("set-client-attach-policy typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -687,14 +828,17 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> Result<usize> {
-        match self
-            .request(Request::AttachInput { session_id, data })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::attach_input(self, session_id, data).await
         {
-            ResponsePayload::AttachInputAccepted { bytes } => Ok(bytes),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach input accepted response",
-            )),
+            Ok(Ok(accepted)) => Ok(accepted.bytes as usize),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-input failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-input typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -755,22 +899,27 @@ impl BmuxClient {
         status_top_inset: u16,
         status_bottom_inset: u16,
     ) -> Result<(u16, u16)> {
-        match self
-            .request(Request::AttachSetViewport {
-                session_id,
-                cols,
-                rows,
-                status_top_inset,
-                status_bottom_inset,
-                cell_pixel_width: cell_pixel_width(),
-                cell_pixel_height: cell_pixel_height(),
-            })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::attach_set_viewport(
+            self,
+            session_id,
+            cols,
+            rows,
+            status_top_inset,
+            status_bottom_inset,
+            cell_pixel_width(),
+            cell_pixel_height(),
+        )
+        .await
         {
-            ResponsePayload::AttachViewportSet { cols, rows, .. } => Ok((cols, rows)),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach viewport set response",
-            )),
+            Ok(Ok(set)) => Ok((set.cols, set.rows)),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-set-viewport failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-set-viewport typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -780,17 +929,23 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_output(&mut self, session_id: Uuid, max_bytes: usize) -> Result<Vec<u8>> {
-        match self
-            .request(Request::AttachOutput {
-                session_id,
-                max_bytes,
-            })
-            .await?
+        let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
+        match bmux_pane_runtime_plugin_api::typed_client::attach_output(
+            self,
+            session_id,
+            max_bytes_u32,
+        )
+        .await
         {
-            ResponsePayload::AttachOutput { data } => Ok(data),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach output response",
-            )),
+            Ok(Ok(out)) => Ok(out.data),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-output failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-output typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -800,27 +955,18 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_layout(&mut self, session_id: Uuid) -> Result<AttachLayoutState> {
-        match self.request(Request::AttachLayout { session_id }).await? {
-            ResponsePayload::AttachLayout {
-                context_id,
-                session_id,
-                focused_pane_id,
-                panes,
-                layout_root,
-                scene,
-                zoomed,
-            } => Ok(AttachLayoutState {
-                context_id,
-                session_id,
-                focused_pane_id,
-                panes,
-                layout_root,
-                scene,
-                zoomed,
+        match bmux_pane_runtime_plugin_api::typed_client::attach_layout_state(self, session_id)
+            .await
+        {
+            Ok(Ok(layout)) => decode_attach_layout(&layout),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-layout-state failed: {err:?}"),
             }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach layout response",
-            )),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-layout-state typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -835,24 +981,31 @@ impl BmuxClient {
         pane_ids: Vec<Uuid>,
         max_bytes: usize,
     ) -> Result<PaneOutputBatchResult> {
-        match self
-            .request(Request::AttachPaneOutputBatch {
-                session_id,
-                pane_ids,
-                max_bytes,
-            })
-            .await?
+        let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
+        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_output_batch(
+            self,
+            session_id,
+            pane_ids,
+            max_bytes_u32,
+        )
+        .await
         {
-            ResponsePayload::AttachPaneOutputBatch {
-                chunks,
-                output_still_pending,
-            } => Ok(PaneOutputBatchResult {
-                chunks,
-                output_still_pending,
+            Ok(Ok(batch)) => Ok(PaneOutputBatchResult {
+                chunks: batch
+                    .chunks
+                    .into_iter()
+                    .map(pane_chunk_from_record)
+                    .collect(),
+                output_still_pending: batch.output_still_pending,
             }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach pane output batch response",
-            )),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-output-batch failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-output-batch typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -867,18 +1020,27 @@ impl BmuxClient {
         pane_ids: Vec<Uuid>,
         since_sequences: Vec<u64>,
     ) -> Result<Vec<AttachPaneImageDelta>> {
-        match self
-            .request(Request::AttachPaneImages {
-                session_id,
-                pane_ids,
-                since_sequences,
-            })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_images(
+            self,
+            session_id,
+            pane_ids,
+            since_sequences,
+        )
+        .await
         {
-            ResponsePayload::AttachPaneImages { deltas } => Ok(deltas),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach pane images response",
-            )),
+            Ok(Ok(images)) => serde_json::from_slice::<Vec<AttachPaneImageDelta>>(&images.encoded)
+                .map_err(|e| ClientError::ServerError {
+                    code: bmux_ipc::ErrorCode::Internal,
+                    message: format!("decode pane-images deltas: {e}"),
+                }),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-images failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-images typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -892,39 +1054,23 @@ impl BmuxClient {
         session_id: Uuid,
         max_bytes_per_pane: usize,
     ) -> Result<AttachSnapshotState> {
-        match self
-            .request(Request::AttachSnapshot {
-                session_id,
-                max_bytes_per_pane,
-            })
-            .await?
+        let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
+        match bmux_pane_runtime_plugin_api::typed_client::attach_snapshot_state(
+            self,
+            session_id,
+            max_bytes_u32,
+        )
+        .await
         {
-            ResponsePayload::AttachSnapshot {
-                context_id,
-                session_id,
-                focused_pane_id,
-                panes,
-                layout_root,
-                scene,
-                chunks,
-                pane_mouse_protocols,
-                pane_input_modes,
-                zoomed,
-            } => Ok(AttachSnapshotState {
-                context_id,
-                session_id,
-                focused_pane_id,
-                panes,
-                layout_root,
-                scene,
-                chunks,
-                pane_mouse_protocols,
-                pane_input_modes,
-                zoomed,
+            Ok(Ok(snap)) => decode_attach_snapshot(snap),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-snapshot-state failed: {err:?}"),
             }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach snapshot response",
-            )),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-snapshot-state typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -939,26 +1085,40 @@ impl BmuxClient {
         pane_ids: Vec<Uuid>,
         max_bytes_per_pane: usize,
     ) -> Result<AttachPaneSnapshotState> {
-        match self
-            .request(Request::AttachPaneSnapshot {
-                session_id,
-                pane_ids,
-                max_bytes_per_pane,
-            })
-            .await?
+        let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
+        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_snapshot_state(
+            self,
+            session_id,
+            pane_ids,
+            max_bytes_u32,
+        )
+        .await
         {
-            ResponsePayload::AttachPaneSnapshot {
-                chunks,
-                pane_mouse_protocols,
-                pane_input_modes,
-            } => Ok(AttachPaneSnapshotState {
-                chunks,
-                pane_mouse_protocols,
-                pane_input_modes,
+            Ok(Ok(snap)) => Ok(AttachPaneSnapshotState {
+                chunks: snap
+                    .chunks
+                    .into_iter()
+                    .map(pane_chunk_from_record)
+                    .collect(),
+                pane_mouse_protocols: snap
+                    .pane_mouse_protocols
+                    .iter()
+                    .map(pane_mouse_from_record)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+                pane_input_modes: snap
+                    .pane_input_modes
+                    .iter()
+                    .map(pane_input_mode_from_record)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
             }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach pane snapshot response",
-            )),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-snapshot-state failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-snapshot-state typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1411,8 +1571,7 @@ impl StreamingBmuxClient {
     ///
     /// The server may still send a response, but the client will silently
     /// discard it.  Use this for latency-sensitive operations where the
-    /// response carries no essential information (e.g. `AttachInput` where
-    /// the normal response is just `AttachInputAccepted`).
+    /// response carries no essential information.
     ///
     /// # Errors
     ///
@@ -1433,6 +1592,41 @@ impl StreamingBmuxClient {
             .send_envelope(&envelope)
             .await
             .map_err(ClientError::Transport)
+    }
+
+    /// Send attach input bytes without waiting for the round-trip ack.
+    ///
+    /// Fire-and-forget variant of `attach_input` used by the attach PTY
+    /// write loop: the normal response carries no information beyond
+    /// byte count, and the network round-trip is the dominant latency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frame cannot be written to the transport.
+    pub async fn send_one_way_attach_input(
+        &mut self,
+        session_id: Uuid,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct AttachInputArgs {
+            session_id: Uuid,
+            data: Vec<u8>,
+        }
+        let typed_payload =
+            bmux_ipc::encode(&AttachInputArgs { session_id, data }).map_err(ClientError::from)?;
+        self.send_one_way(Request::InvokeService {
+            capability: bmux_pane_runtime_plugin_api::capabilities::ATTACH_RUNTIME_WRITE
+                .as_str()
+                .to_string(),
+            kind: InvokeServiceKind::Command,
+            interface_id: bmux_pane_runtime_plugin_api::attach_runtime_commands::INTERFACE_ID
+                .as_str()
+                .to_string(),
+            operation: "attach-input".to_string(),
+            payload: typed_payload,
+        })
+        .await
     }
 
     // ── Event push control ───────────────────────────────────────────────
@@ -1526,11 +1720,22 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_grant(&mut self, selector: SessionSelector) -> Result<AttachGrant> {
-        match self.request(Request::Attach { selector }).await? {
-            ResponsePayload::Attached { grant } => Ok(grant),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attached response",
-            )),
+        match bmux_pane_runtime_plugin_api::typed_client::attach_session(self, selector, true).await
+        {
+            Ok(Ok(grant)) => Ok(AttachGrant {
+                attach_token: grant.token,
+                session_id: grant.session_id,
+                context_id: grant.context_id,
+                expires_at_epoch_ms: grant.expires_epoch_ms,
+            }),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-session failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-session typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1540,11 +1745,22 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_context_grant(&mut self, selector: ContextSelector) -> Result<AttachGrant> {
-        match self.request(Request::AttachContext { selector }).await? {
-            ResponsePayload::Attached { grant } => Ok(grant),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attached response",
-            )),
+        match bmux_pane_runtime_plugin_api::typed_client::attach_context(self, selector, true).await
+        {
+            Ok(Ok(grant)) => Ok(AttachGrant {
+                attach_token: grant.token,
+                session_id: grant.session_id,
+                context_id: grant.context_id,
+                expires_at_epoch_ms: grant.expires_epoch_ms,
+            }),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-context failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-context typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1554,25 +1770,26 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn open_attach_stream_info(&mut self, grant: &AttachGrant) -> Result<AttachOpenInfo> {
-        match self
-            .request(Request::AttachOpen {
-                session_id: grant.session_id,
-                attach_token: grant.attach_token,
-            })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::attach_open(
+            self,
+            grant.session_id,
+            grant.attach_token,
+        )
+        .await
         {
-            ResponsePayload::AttachReady {
-                context_id,
-                session_id,
-                can_write,
-            } => Ok(AttachOpenInfo {
-                context_id,
-                session_id,
-                can_write,
+            Ok(Ok(ready)) => Ok(AttachOpenInfo {
+                context_id: ready.context_id,
+                session_id: ready.session_id,
+                can_write: ready.can_write,
             }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach ready response",
-            )),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-open failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-open typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1589,22 +1806,27 @@ impl StreamingBmuxClient {
         status_top_inset: u16,
         status_bottom_inset: u16,
     ) -> Result<(u16, u16)> {
-        match self
-            .request(Request::AttachSetViewport {
-                session_id,
-                cols,
-                rows,
-                status_top_inset,
-                status_bottom_inset,
-                cell_pixel_width: cell_pixel_width(),
-                cell_pixel_height: cell_pixel_height(),
-            })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::attach_set_viewport(
+            self,
+            session_id,
+            cols,
+            rows,
+            status_top_inset,
+            status_bottom_inset,
+            cell_pixel_width(),
+            cell_pixel_height(),
+        )
+        .await
         {
-            ResponsePayload::AttachViewportSet { cols, rows, .. } => Ok((cols, rows)),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach viewport set response",
-            )),
+            Ok(Ok(set)) => Ok((set.cols, set.rows)),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-set-viewport failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-set-viewport typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1614,14 +1836,17 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> Result<()> {
-        match self
-            .request(Request::AttachInput { session_id, data })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::attach_input(self, session_id, data).await
         {
-            ResponsePayload::AttachInputAccepted { .. } => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach input accepted response",
-            )),
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-input failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-input typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1631,27 +1856,18 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_layout(&mut self, session_id: Uuid) -> Result<AttachLayoutState> {
-        match self.request(Request::AttachLayout { session_id }).await? {
-            ResponsePayload::AttachLayout {
-                context_id,
-                session_id,
-                focused_pane_id,
-                panes,
-                layout_root,
-                scene,
-                zoomed,
-            } => Ok(AttachLayoutState {
-                context_id,
-                session_id,
-                focused_pane_id,
-                panes,
-                layout_root,
-                scene,
-                zoomed,
+        match bmux_pane_runtime_plugin_api::typed_client::attach_layout_state(self, session_id)
+            .await
+        {
+            Ok(Ok(layout)) => decode_attach_layout(&layout),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-layout-state failed: {err:?}"),
             }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach layout response",
-            )),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-layout-state typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1666,24 +1882,31 @@ impl StreamingBmuxClient {
         pane_ids: Vec<Uuid>,
         max_bytes: usize,
     ) -> Result<PaneOutputBatchResult> {
-        match self
-            .request(Request::AttachPaneOutputBatch {
-                session_id,
-                pane_ids,
-                max_bytes,
-            })
-            .await?
+        let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
+        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_output_batch(
+            self,
+            session_id,
+            pane_ids,
+            max_bytes_u32,
+        )
+        .await
         {
-            ResponsePayload::AttachPaneOutputBatch {
-                chunks,
-                output_still_pending,
-            } => Ok(PaneOutputBatchResult {
-                chunks,
-                output_still_pending,
+            Ok(Ok(batch)) => Ok(PaneOutputBatchResult {
+                chunks: batch
+                    .chunks
+                    .into_iter()
+                    .map(pane_chunk_from_record)
+                    .collect(),
+                output_still_pending: batch.output_still_pending,
             }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach pane output batch response",
-            )),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-output-batch failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-output-batch typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1698,18 +1921,27 @@ impl StreamingBmuxClient {
         pane_ids: Vec<Uuid>,
         since_sequences: Vec<u64>,
     ) -> Result<Vec<AttachPaneImageDelta>> {
-        match self
-            .request(Request::AttachPaneImages {
-                session_id,
-                pane_ids,
-                since_sequences,
-            })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_images(
+            self,
+            session_id,
+            pane_ids,
+            since_sequences,
+        )
+        .await
         {
-            ResponsePayload::AttachPaneImages { deltas } => Ok(deltas),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach pane images response",
-            )),
+            Ok(Ok(images)) => serde_json::from_slice::<Vec<AttachPaneImageDelta>>(&images.encoded)
+                .map_err(|e| ClientError::ServerError {
+                    code: bmux_ipc::ErrorCode::Internal,
+                    message: format!("decode pane-images deltas: {e}"),
+                }),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-images failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-images typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1723,39 +1955,23 @@ impl StreamingBmuxClient {
         session_id: Uuid,
         max_bytes_per_pane: usize,
     ) -> Result<AttachSnapshotState> {
-        match self
-            .request(Request::AttachSnapshot {
-                session_id,
-                max_bytes_per_pane,
-            })
-            .await?
+        let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
+        match bmux_pane_runtime_plugin_api::typed_client::attach_snapshot_state(
+            self,
+            session_id,
+            max_bytes_u32,
+        )
+        .await
         {
-            ResponsePayload::AttachSnapshot {
-                context_id,
-                session_id,
-                focused_pane_id,
-                panes,
-                layout_root,
-                scene,
-                chunks,
-                pane_mouse_protocols,
-                pane_input_modes,
-                zoomed,
-            } => Ok(AttachSnapshotState {
-                context_id,
-                session_id,
-                focused_pane_id,
-                panes,
-                layout_root,
-                scene,
-                chunks,
-                pane_mouse_protocols,
-                pane_input_modes,
-                zoomed,
+            Ok(Ok(snap)) => decode_attach_snapshot(snap),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-snapshot-state failed: {err:?}"),
             }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach snapshot response",
-            )),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-snapshot-state typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1770,26 +1986,40 @@ impl StreamingBmuxClient {
         pane_ids: Vec<Uuid>,
         max_bytes_per_pane: usize,
     ) -> Result<AttachPaneSnapshotState> {
-        match self
-            .request(Request::AttachPaneSnapshot {
-                session_id,
-                pane_ids,
-                max_bytes_per_pane,
-            })
-            .await?
+        let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
+        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_snapshot_state(
+            self,
+            session_id,
+            pane_ids,
+            max_bytes_u32,
+        )
+        .await
         {
-            ResponsePayload::AttachPaneSnapshot {
-                chunks,
-                pane_mouse_protocols,
-                pane_input_modes,
-            } => Ok(AttachPaneSnapshotState {
-                chunks,
-                pane_mouse_protocols,
-                pane_input_modes,
+            Ok(Ok(snap)) => Ok(AttachPaneSnapshotState {
+                chunks: snap
+                    .chunks
+                    .into_iter()
+                    .map(pane_chunk_from_record)
+                    .collect(),
+                pane_mouse_protocols: snap
+                    .pane_mouse_protocols
+                    .iter()
+                    .map(pane_mouse_from_record)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+                pane_input_modes: snap
+                    .pane_input_modes
+                    .iter()
+                    .map(pane_input_mode_from_record)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
             }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected attach pane snapshot response",
-            )),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-snapshot-state failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-pane-snapshot-state typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1799,9 +2029,16 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn detach(&mut self) -> Result<()> {
-        match self.request(Request::Detach).await? {
-            ResponsePayload::Detached => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse("expected detached")),
+        match bmux_pane_runtime_plugin_api::typed_client::detach(self).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("detach failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("detach typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1811,16 +2048,21 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn set_attach_policy(&mut self, allow_detach: bool) -> Result<()> {
-        match self
-            .request(Request::SetClientAttachPolicy { allow_detach })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::set_client_attach_policy(
+            self,
+            allow_detach,
+        )
+        .await
         {
-            ResponsePayload::ClientAttachPolicySet {
-                allow_detach: applied,
-            } if applied == allow_detach => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected client attach policy set",
-            )),
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("set-client-attach-policy failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("set-client-attach-policy typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1933,19 +2175,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
-        Request::Attach { .. } => "attach",
-        Request::AttachContext { .. } => "attach_context",
-        Request::AttachOpen { .. } => "attach_open",
-        Request::AttachInput { .. } => "attach_input",
-        Request::AttachSetViewport { .. } => "attach_set_viewport",
-        Request::AttachOutput { .. } => "attach_output",
-        Request::AttachLayout { .. } => "attach_layout",
-        Request::AttachSnapshot { .. } => "attach_snapshot",
-        Request::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
-        Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
-        Request::AttachPaneImages { .. } => "attach_pane_images",
-        Request::SetClientAttachPolicy { .. } => "set_client_attach_policy",
-        Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
@@ -1967,18 +2196,6 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::ServerSnapshotRestored { .. } => "server_snapshot_restored",
             ResponsePayload::ServerStopping => "server_stopping",
             ResponsePayload::ServiceInvoked { .. } => "service_invoked",
-            ResponsePayload::Attached { .. } => "attached",
-            ResponsePayload::AttachReady { .. } => "attach_ready",
-            ResponsePayload::AttachInputAccepted { .. } => "attach_input_accepted",
-            ResponsePayload::AttachViewportSet { .. } => "attach_viewport_set",
-            ResponsePayload::AttachOutput { .. } => "attach_output",
-            ResponsePayload::AttachLayout { .. } => "attach_layout",
-            ResponsePayload::AttachSnapshot { .. } => "attach_snapshot",
-            ResponsePayload::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
-            ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
-            ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
-            ResponsePayload::ClientAttachPolicySet { .. } => "client_attach_policy_set",
-            ResponsePayload::Detached => "detached",
             ResponsePayload::EventsSubscribed => "events_subscribed",
             ResponsePayload::EventBatch { .. } => "event_batch",
             ResponsePayload::EventPushEnabled => "event_push_enabled",

@@ -77,8 +77,56 @@ Examples currently in tree:
   window / tab lifecycle; exposes state queries, commands, events).
 - `plugins/decoration-plugin-api` + `plugins/decoration-plugin` (owns
   pane visual styling; depends on `windows-plugin-api`).
+- `plugins/pane-runtime-plugin-api` + `plugins/pane-runtime-plugin`
+  (owns pane/session runtime orchestration, attach lifecycle, and
+  attach-view queries — see "Pane-runtime ownership" below).
 - `plugins/permissions-plugin` (owns role/permission policy).
 - `plugins/cluster-plugin` (owns multi-session input broadcasting).
+
+#### Pane-runtime ownership (Stage 11 closeout)
+
+The pane-runtime-plugin is the sole owner of session/pane lifecycle,
+pane mutation, and attach orchestration after the 6th architectural
+boundary (Slice 14 / Stage 11) closed. It exposes four BPDL interfaces:
+
+- **`pane-runtime-commands`** — `split-pane`, `launch-pane`,
+  `focus-pane`, `resize-pane`, `close-pane`, `restart-pane`,
+  `zoom-pane`, `pane-direct-input`, `new-session-with-runtime`,
+  `kill-session-runtime`, `restore-session-runtime`. Each handler
+  performs its own permission check through the sessions-plugin's
+  `session-policy-query/v1::check` typed service, runs the
+  `SessionRuntimeManagerHandle` operation, and publishes the
+  corresponding `Event::*` through the registered `WireEventSinkHandle`.
+- **`pane-runtime-state`** — `list-panes` (session_id is optional;
+  unset resolves via `FollowState::selected_session(caller_client_id)`)
+  and `get-pane`.
+- **`attach-runtime-commands`** — `attach-session`, `attach-context`,
+  `attach-open`, `attach-input`, `attach-output`, `attach-set-viewport`,
+  `detach`, `set-client-attach-policy`. The plugin owns attach-token
+  issuance, runtime begin/end attach, `FollowState::attached_stream_session`,
+  and per-client `attach_detach_allowed` policy.
+- **`attach-runtime-state`** — `attach-layout-state`,
+  `attach-snapshot-state`, `attach-pane-snapshot-state`,
+  `attach-pane-output-batch`, `attach-pane-images` (serialized as
+  JSON-encoded `Vec<AttachPaneImageDelta>`).
+
+The 24+ former IPC variants (`Request::NewSession`, `KillSession`,
+`ListSessions`, `ListPanes`, `SplitPane`, `LaunchPane`, `FocusPane`,
+`ResizePane`, `ClosePane`, `RestartPane`, `ZoomPane`, `PaneDirectInput`,
+`Attach`, `AttachContext`, `AttachOpen`, `AttachInput`, `AttachOutput`,
+`AttachSetViewport`, `AttachLayout`, `AttachSnapshot`,
+`AttachPaneSnapshot`, `AttachPaneOutputBatch`, `AttachPaneImages`,
+`Detach`, `SetClientAttachPolicy`) have been deleted from
+`bmux_ipc`. Reintroducing them is blocked by the
+`session_lifecycle_ipc_variants_are_absent`,
+`pane_mutation_ipc_variants_are_absent`, and
+`attach_ipc_variants_are_absent` guardrails.
+
+The attach-input fast path is preserved through
+`BmuxClient::send_one_way_attach_input` (and its streaming
+counterpart), which sends a fire-and-forget
+`Request::InvokeService { operation: "attach-input", ... }` envelope
+without waiting for the round-trip ack.
 
 ### Host runtime surface for plugins
 
