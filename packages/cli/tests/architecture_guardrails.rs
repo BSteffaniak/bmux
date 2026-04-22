@@ -1524,9 +1524,9 @@ fn server_implements_pane_runtime_stateful() {
     );
 }
 
-/// Stage 11 / Wave B: `Request::NewSession` / `Request::KillSession` /
-/// `Request::ListSessions` / `Request::ListPanes` have been deleted
-/// from `bmux_ipc`. Session lifecycle and listing now flow through
+/// `Request::NewSession` / `Request::KillSession` /
+/// `Request::ListSessions` / `Request::ListPanes` are absent from
+/// `bmux_ipc`. Session lifecycle and listing flow through
 /// typed-dispatch services owned by the sessions-plugin and the
 /// pane-runtime-plugin.
 #[test]
@@ -1552,9 +1552,9 @@ fn session_lifecycle_ipc_variants_are_absent() {
     }
 }
 
-/// Stage 11 / Wave C: the 8 pane-mutation IPC variants have been
-/// deleted. Every mutation is now a typed `pane-runtime-commands`
-/// invocation whose handler lives in the pane-runtime-plugin.
+/// The 8 pane-mutation IPC variants are absent. Every pane mutation
+/// is a typed `pane-runtime-commands` invocation whose handler lives
+/// in the pane-runtime-plugin.
 #[test]
 fn pane_mutation_ipc_variants_are_absent() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
@@ -1578,11 +1578,11 @@ fn pane_mutation_ipc_variants_are_absent() {
     }
 }
 
-/// Stage 11 / Wave D: the 13 attach-family IPC variants have been
-/// deleted. Attach lifecycle (grant/open/input/output/viewport/detach/
-/// policy/layout/snapshot/pane-snapshot/pane-output-batch/pane-images)
-/// flows through typed `attach-runtime-commands` and
-/// `attach-runtime-state` on the pane-runtime-plugin.
+/// The 13 attach-family IPC variants are absent. Attach lifecycle
+/// (grant/open/input/output/viewport/detach/policy/layout/snapshot/
+/// pane-snapshot/pane-output-batch/pane-images) flows through typed
+/// `attach-runtime-commands` and `attach-runtime-state` on the
+/// pane-runtime-plugin.
 #[test]
 fn attach_ipc_variants_are_absent() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
@@ -1631,9 +1631,8 @@ fn attach_ipc_variants_are_absent() {
     }
 }
 
-/// Stage 11 closeout: the pane-runtime-plugin is the sole owner of
-/// session/pane/attach orchestration after the 6th boundary migration.
-/// Concretely:
+/// The pane-runtime-plugin is the sole owner of session/pane/attach
+/// orchestration. Concretely:
 ///
 /// - Its handlers own the runtime manager, attach-token manager, and
 ///   follow-state writers for every mutation and attach lifecycle

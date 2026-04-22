@@ -83,11 +83,10 @@ Examples currently in tree:
 - `plugins/permissions-plugin` (owns role/permission policy).
 - `plugins/cluster-plugin` (owns multi-session input broadcasting).
 
-#### Pane-runtime ownership (Stage 11 closeout)
+#### Pane-runtime ownership
 
 The pane-runtime-plugin is the sole owner of session/pane lifecycle,
-pane mutation, and attach orchestration after the 6th architectural
-boundary (Slice 14 / Stage 11) closed. It exposes four BPDL interfaces:
+pane mutation, and attach orchestration. It exposes four BPDL interfaces:
 
 - **`pane-runtime-commands`** — `split-pane`, `launch-pane`,
   `focus-pane`, `resize-pane`, `close-pane`, `restart-pane`,
