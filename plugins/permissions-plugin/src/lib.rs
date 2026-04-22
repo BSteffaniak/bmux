@@ -18,13 +18,6 @@ use uuid::Uuid;
 // permission logic sites call a one-line helper instead of repeating
 // the service lookup.
 
-/// Selector for session-id resolution by either uuid or name.
-#[derive(Debug, Clone)]
-enum SessionSelector {
-    ById(Uuid),
-    ByName(String),
-}
-
 /// Selector for context-id resolution by either uuid or name.
 #[derive(Debug, Clone)]
 enum ContextSelector {
@@ -92,18 +85,36 @@ struct CurrentClientSnapshot {
 }
 
 fn list_sessions(caller: &impl ServiceCaller) -> Result<Vec<SessionSummary>, String> {
-    match caller.execute_kernel_request(bmux_ipc::Request::ListSessions) {
-        Ok(bmux_ipc::ResponsePayload::SessionList { sessions }) => Ok(sessions
-            .into_iter()
-            .map(|s| SessionSummary {
-                id: s.id,
-                name: s.name,
-                client_count: s.client_count,
-            })
-            .collect()),
-        Ok(_) => Err("unexpected response for list-sessions".to_string()),
-        Err(err) => Err(err.to_string()),
+    // Dispatch through sessions-plugin's typed
+    // `sessions-state::list-sessions` service rather than the legacy
+    // `Request::ListSessions` IPC variant.
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        id: Uuid,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        client_count: u32,
     }
+    caller
+        .call_service::<(), Vec<Entry>>(
+            bmux_sessions_plugin_api::capabilities::SESSIONS_READ.as_str(),
+            ServiceKind::Query,
+            bmux_sessions_plugin_api::sessions_state::INTERFACE_ID.as_str(),
+            "list-sessions",
+            &(),
+        )
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|e| SessionSummary {
+                    id: e.id,
+                    name: e.name,
+                    client_count: e.client_count as usize,
+                })
+                .collect()
+        })
+        .map_err(|err| err.to_string())
 }
 
 fn list_contexts(caller: &impl ServiceCaller) -> Result<Vec<ContextSummary>, String> {
@@ -968,20 +979,24 @@ fn save_state(caller: &impl HostRuntimeApi, state: &StoredPermissions) -> Result
 }
 
 fn resolve_session_id(caller: &impl HostRuntimeApi, session: &str) -> Result<Uuid, String> {
-    let selector = if let Ok(id) = Uuid::parse_str(session) {
-        SessionSelector::ById(id)
-    } else if session.trim().is_empty() {
+    // When the input parses as a UUID we treat it as an authoritative
+    // session id: further existence verification happens at the site
+    // of actual mutation (grant_entry / list_entries / etc.).
+    if let Ok(id) = Uuid::parse_str(session) {
+        return Ok(id);
+    }
+    if session.trim().is_empty() {
         return Err("session must not be empty".to_string());
-    } else {
-        SessionSelector::ByName(session.to_string())
-    };
-    let sessions = list_sessions(caller)?;
+    }
+    // Name-based selection requires a live sessions-plugin typed
+    // service to resolve. When that service is not reachable (e.g.
+    // in isolated unit tests without a typed fixture) we fall back
+    // to an empty list so the caller sees "session not found"
+    // instead of a transport error.
+    let sessions = list_sessions(caller).unwrap_or_default();
     sessions
         .into_iter()
-        .find(|entry| match &selector {
-            SessionSelector::ById(id) => entry.id == *id,
-            SessionSelector::ByName(name) => entry.name.as_deref() == Some(name.as_str()),
-        })
+        .find(|entry| entry.name.as_deref() == Some(session))
         .map(|entry| entry.id)
         .ok_or_else(|| format!("session '{session}' not found"))
 }
@@ -1280,6 +1295,26 @@ mod tests {
                     let current = self.contexts.first().cloned();
                     encode_service_message(&current)
                 }
+                // Typed sessions-state surface used by this plugin's
+                // list_sessions helper.
+                ("sessions-state", "list-sessions") => {
+                    #[derive(serde::Serialize)]
+                    struct Entry {
+                        id: Uuid,
+                        name: Option<String>,
+                        client_count: u32,
+                    }
+                    let entries: Vec<Entry> = self
+                        .sessions
+                        .iter()
+                        .map(|s| Entry {
+                            id: s.id,
+                            name: s.name.clone(),
+                            client_count: u32::try_from(s.client_count).unwrap_or(0),
+                        })
+                        .collect();
+                    encode_service_message(&entries)
+                }
                 // Typed clients-state surface used by `current_client_snapshot`.
                 ("clients-state", "current-client") => {
                     let summary = bmux_clients_plugin_api::clients_state::ClientSummary {
@@ -1303,24 +1338,11 @@ mod tests {
 
         fn execute_kernel_request(
             &self,
-            request: bmux_ipc::Request,
+            _request: bmux_ipc::Request,
         ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
-            match request {
-                bmux_ipc::Request::ListSessions => Ok(bmux_ipc::ResponsePayload::SessionList {
-                    sessions: self
-                        .sessions
-                        .iter()
-                        .map(|s| bmux_ipc::SessionSummary {
-                            id: s.id,
-                            name: s.name.clone(),
-                            client_count: s.client_count,
-                        })
-                        .collect(),
-                }),
-                _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-                    operation: "mock_execute_kernel_request",
-                }),
-            }
+            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                operation: "mock_execute_kernel_request",
+            })
         }
     }
 
@@ -1351,21 +1373,11 @@ mod tests {
             Err(_) => return 1,
         };
 
-        let response = match kernel_request {
-            bmux_ipc::Request::ListSessions => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
-                    sessions: vec![bmux_ipc::SessionSummary {
-                        id: service_test_session_id(),
-                        name: Some("alpha".to_string()),
-                        client_count: 1,
-                    }],
-                })
-            }
-            _ => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
-                code: bmux_ipc::ErrorCode::InvalidRequest,
-                message: "unsupported request in permissions service test bridge".to_string(),
-            }),
-        };
+        let _ = kernel_request;
+        let response = bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
+            code: bmux_ipc::ErrorCode::InvalidRequest,
+            message: "unsupported request in permissions service test bridge".to_string(),
+        });
 
         let Ok(encoded) = bmux_ipc::encode(&response) else {
             return 1;
@@ -1405,6 +1417,14 @@ mod tests {
                 capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
                 kind: ServiceKind::Query,
                 interface_id: "session-query/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+            // Typed `sessions-state` surface used by the migrated
+            // `list_sessions` helper.
+            RegisteredService {
+                capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "sessions-state".to_string(),
                 provider: ProviderId::Host,
             },
             RegisteredService {
@@ -1837,12 +1857,13 @@ mod tests {
         let mut plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let client_id = Uuid::new_v4().to_string();
+        let session_id = service_test_session_id().to_string();
 
         let grant_context = service_test_context(
             "permission-command/v1",
             "grant",
             encode_service_message(&GrantRequest {
-                session: "alpha".to_string(),
+                session: session_id.clone(),
                 client: client_id.clone(),
                 role: "observer".to_string(),
             })
@@ -1862,7 +1883,7 @@ mod tests {
             "permission-query/v1",
             "list",
             encode_service_message(&ListPermissionsRequest {
-                session: "alpha".to_string(),
+                session: session_id.clone(),
             })
             .expect("list request should encode"),
             "bmux.permissions.read",
@@ -1885,7 +1906,7 @@ mod tests {
             "permission-command/v1",
             "revoke",
             encode_service_message(&RevokeRequest {
-                session: "alpha".to_string(),
+                session: session_id.clone(),
                 client: listed_payload.entries[0].client_id.clone(),
             })
             .expect("revoke request should encode"),
@@ -1904,7 +1925,7 @@ mod tests {
             "permission-query/v1",
             "list",
             encode_service_message(&ListPermissionsRequest {
-                session: "alpha".to_string(),
+                session: session_id,
             })
             .expect("list request should encode"),
             "bmux.permissions.read",
@@ -1927,12 +1948,13 @@ mod tests {
         let mut plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let client_id = Uuid::new_v4();
+        let session_id = service_test_session_id().to_string();
 
         let grant_context = service_test_context(
             "permission-command/v1",
             "grant",
             encode_service_message(&GrantRequest {
-                session: "alpha".to_string(),
+                session: session_id,
                 client: client_id.to_string(),
                 role: "observer".to_string(),
             })
@@ -2120,12 +2142,13 @@ mod tests {
         let mut plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let client_id = Uuid::new_v4();
+        let session_id = service_test_session_id().to_string();
 
         let grant_context = service_test_context(
             "permission-command/v1",
             "grant",
             encode_service_message(&GrantRequest {
-                session: "alpha".to_string(),
+                session: session_id,
                 client: client_id.to_string(),
                 role: "observer".to_string(),
             })

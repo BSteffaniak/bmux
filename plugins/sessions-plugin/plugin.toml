@@ -4,7 +4,7 @@ name                  = "bmux Sessions"
 owns_namespaces       = []
 provided_capabilities = ["bmux.sessions.read", "bmux.sessions.write"]
 provided_features     = ["bmux.sessions"]
-required_capabilities = []
+required_capabilities = ["bmux.pane_runtime.write"]
 version               = "0.0.1-alpha.0"
 
 [[services]]

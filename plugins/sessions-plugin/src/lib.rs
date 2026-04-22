@@ -477,22 +477,39 @@ fn new_session_via_ipc(
     caller: &impl ServiceCaller,
     name: Option<String>,
 ) -> Result<SessionAck, NewSessionError> {
-    match caller.execute_kernel_request(bmux_ipc::Request::NewSession { name: name.clone() }) {
-        Ok(bmux_ipc::ResponsePayload::SessionCreated {
-            id,
-            name: created_name,
-        }) => {
+    #[derive(serde::Serialize)]
+    struct Args {
+        name: Option<String>,
+    }
+    let result = caller.call_service::<Args, Result<
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionAck,
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionRuntimeCommandError,
+    >>(
+        bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
+        ServiceKind::Command,
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
+        "new-session-with-runtime",
+        &Args { name: name.clone() },
+    );
+    match result {
+        Ok(Ok(ack)) => {
+            let session_id = ack.session_id;
             let _ = global_event_bus().emit(
                 &sessions_events::EVENT_KIND,
                 SessionEvent::Created {
-                    session_id: id,
-                    name: created_name.or(name),
+                    session_id,
+                    name,
                 },
             );
-            Ok(SessionAck { id })
+            Ok(SessionAck { id: session_id })
         }
-        Ok(_) => Err(NewSessionError::Failed {
-            reason: "unexpected response payload for new-session".to_string(),
+        Ok(Err(
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionRuntimeCommandError::NameAlreadyExists {
+                name: existing,
+            },
+        )) => Err(NewSessionError::NameAlreadyExists { name: existing }),
+        Ok(Err(err)) => Err(NewSessionError::Failed {
+            reason: format!("{err:?}"),
         }),
         Err(err) => Err(NewSessionError::Failed {
             reason: err.to_string(),
@@ -505,24 +522,72 @@ fn kill_session_via_ipc(
     selector: &WireSelector,
     force_local: bool,
 ) -> Result<SessionAck, KillSessionError> {
-    let Some(ipc_selector) = selector.to_ipc() else {
-        return Err(KillSessionError::Failed {
-            reason: "selector must specify either id or name".to_string(),
-        });
+    #[derive(serde::Serialize)]
+    struct Args {
+        session_id: ::uuid::Uuid,
+        force_local: bool,
+    }
+    // Name-based selection resolves to an id locally via the
+    // plugin-owned `SessionManager` so the typed pane-runtime call
+    // can receive a concrete uuid.
+    let session_id = match selector {
+        WireSelector { id: Some(id), .. } => *id,
+        WireSelector {
+            id: None,
+            name: Some(name),
+        } => {
+            let Some(state) = bmux_plugin::global_plugin_state_registry().get::<SessionManager>()
+            else {
+                return Err(KillSessionError::Failed {
+                    reason: "sessions plugin state not registered".to_string(),
+                });
+            };
+            let manager = state.read().map_err(|_| KillSessionError::Failed {
+                reason: "session manager lock poisoned".to_string(),
+            })?;
+            match manager
+                .list_sessions()
+                .into_iter()
+                .find(|info| info.name.as_deref() == Some(name.as_str()))
+            {
+                Some(info) => info.id.0,
+                None => return Err(KillSessionError::NotFound),
+            }
+        }
+        _ => {
+            return Err(KillSessionError::Failed {
+                reason: "selector must specify either id or name".to_string(),
+            });
+        }
     };
-    match caller.execute_kernel_request(bmux_ipc::Request::KillSession {
-        selector: ipc_selector,
-        force_local,
-    }) {
-        Ok(bmux_ipc::ResponsePayload::SessionKilled { id }) => {
+
+    let result = caller.call_service::<Args, Result<
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionAck,
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionRuntimeCommandError,
+    >>(
+        bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
+        ServiceKind::Command,
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
+        "kill-session-runtime",
+        &Args {
+            session_id,
+            force_local,
+        },
+    );
+    match result {
+        Ok(Ok(ack)) => {
+            let id = ack.session_id;
             let _ = global_event_bus().emit(
                 &sessions_events::EVENT_KIND,
                 SessionEvent::Removed { session_id: id },
             );
             Ok(SessionAck { id })
         }
-        Ok(_) => Err(KillSessionError::Failed {
-            reason: "unexpected response payload for kill-session".to_string(),
+        Ok(Err(
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionRuntimeCommandError::SessionNotFound,
+        )) => Err(KillSessionError::NotFound),
+        Ok(Err(err)) => Err(KillSessionError::Failed {
+            reason: format!("{err:?}"),
         }),
         Err(err) => Err(KillSessionError::Failed {
             reason: err.to_string(),

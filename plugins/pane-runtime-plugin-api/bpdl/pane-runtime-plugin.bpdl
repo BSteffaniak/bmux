@@ -36,7 +36,7 @@ interface pane-runtime-state {
         pane-not-found,
     }
 
-    query list-panes(session_id: uuid) -> result<session-pane-list, pane-state-error>;
+    query list-panes(session_id: uuid?) -> result<session-pane-list, pane-state-error>;
     query get-pane(session_id: uuid, pane_id: uuid)
         -> result<pane-summary, pane-state-error>;
 }

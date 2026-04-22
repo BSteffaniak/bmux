@@ -891,14 +891,6 @@ pub fn call_service_raw(
             unreachable!("host services should be handled earlier")
         }
     };
-    let registered =
-        registry
-            .get(&provider_plugin_id)
-            .ok_or_else(|| PluginError::MissingServiceProvider {
-                provider_plugin_id: provider_plugin_id.clone(),
-                capability: service.capability.as_str().to_string(),
-                interface_id: service.interface_id.clone(),
-            })?;
 
     let available_capability_map = available_capabilities
         .iter()
@@ -912,22 +904,62 @@ pub fn call_service_raw(
         })
         .collect::<BTreeMap<_, _>>();
 
-    let loaded = load_registered_plugin(registered, host, &available_capability_map)?;
+    // Try the statically-bundled vtable registry first. Bundled
+    // plugins don't appear in filesystem discovery but can still be
+    // reached via their registered vtable. Fall back to the
+    // discovered dynamic registry when no static vtable is present.
+    let loaded = if let Some(vtable) = crate::static_vtable(&provider_plugin_id) {
+        let manifest_ptr = (vtable.entry)();
+        if manifest_ptr.is_null() {
+            return Err(PluginError::NullPluginEntry {
+                plugin_id: provider_plugin_id.clone(),
+                symbol: "static_vtable::entry".to_string(),
+            });
+        }
+        let manifest_cstr = unsafe { std::ffi::CStr::from_ptr(manifest_ptr) };
+        let manifest_text =
+            manifest_cstr
+                .to_str()
+                .map_err(|_| PluginError::InvalidPluginEntry {
+                    plugin_id: provider_plugin_id.clone(),
+                    symbol: "static_vtable::entry".to_string(),
+                    details: "embedded manifest is not valid UTF-8".to_string(),
+                })?;
+        let embedded_manifest = crate::PluginManifest::from_toml_str(manifest_text)?;
+        let declaration = embedded_manifest.to_declaration()?;
+        let synthetic = RegisteredPlugin {
+            search_root: PathBuf::new(),
+            manifest_path: PathBuf::new(),
+            manifest: embedded_manifest,
+            declaration,
+            bundled_static: true,
+        };
+        load_static_plugin(&synthetic, vtable, host, &available_capability_map)?
+    } else {
+        let registered = registry.get(&provider_plugin_id).ok_or_else(|| {
+            PluginError::MissingServiceProvider {
+                provider_plugin_id: provider_plugin_id.clone(),
+                capability: service.capability.as_str().to_string(),
+                interface_id: service.interface_id.clone(),
+            }
+        })?;
+        load_registered_plugin(registered, host, &available_capability_map)?
+    };
     let response = loaded.invoke_service(&NativeServiceContext {
-        plugin_id: registered.declaration.id.as_str().to_string(),
+        plugin_id: provider_plugin_id,
         request: ServiceRequest {
             caller_plugin_id: caller_plugin_id.to_string(),
             service: service.clone(),
             operation: operation.to_string(),
             payload,
         },
-        required_capabilities: registered
+        required_capabilities: loaded
             .declaration
             .required_capabilities
             .iter()
             .map(ToString::to_string)
             .collect(),
-        provided_capabilities: registered
+        provided_capabilities: loaded
             .declaration
             .provided_capabilities
             .iter()
@@ -940,7 +972,7 @@ pub fn call_service_raw(
         host: host.clone(),
         connection: connection.clone(),
         settings: plugin_settings_map
-            .get(registered.declaration.id.as_str())
+            .get(loaded.declaration.id.as_str())
             .cloned(),
         plugin_settings_map: plugin_settings_map.clone(),
         caller_client_id,
@@ -2289,32 +2321,6 @@ sleep 60
         KERNEL_REQUESTS.with(|log| log.borrow_mut().push(kernel_request.clone()));
 
         let kernel_response = match kernel_request {
-            bmux_ipc::Request::NewSession { name: Some(name) } if name == "deny" => {
-                bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
-                    code: bmux_ipc::ErrorCode::InvalidRequest,
-                    message: "session policy denied for this operation".to_string(),
-                })
-            }
-            bmux_ipc::Request::NewSession { .. } => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionCreated {
-                    id: uuid::Uuid::new_v4(),
-                    name: Some("created".to_string()),
-                })
-            }
-            bmux_ipc::Request::KillSession { .. } => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionKilled {
-                    id: uuid::Uuid::new_v4(),
-                })
-            }
-            bmux_ipc::Request::ListSessions => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
-                    sessions: vec![bmux_ipc::SessionSummary {
-                        id: uuid::Uuid::new_v4(),
-                        name: Some("alpha".to_string()),
-                        client_count: 1,
-                    }],
-                })
-            }
             bmux_ipc::Request::Attach { selector } => {
                 let session_id = match selector {
                     bmux_ipc::SessionSelector::ById(id) => id,
@@ -2327,18 +2333,6 @@ sleep 60
                         attach_token: uuid::Uuid::new_v4(),
                         expires_at_epoch_ms: 42,
                     },
-                })
-            }
-            bmux_ipc::Request::ListPanes { .. } => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneList {
-                    panes: vec![bmux_ipc::PaneSummary {
-                        id: uuid::Uuid::new_v4(),
-                        index: 1,
-                        name: Some("pane-1".to_string()),
-                        focused: true,
-                        state: bmux_ipc::PaneState::Running,
-                        state_reason: None,
-                    }],
                 })
             }
             bmux_ipc::Request::SplitPane { .. } => {
@@ -3057,62 +3051,6 @@ minimum = "1.0"
     }
 
     #[test]
-    fn command_context_calls_core_session_query_via_kernel_bridge() {
-        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
-
-        let context = super::NativeCommandContext {
-            plugin_id: "caller.plugin".to_string(),
-            command: "list-sessions".to_string(),
-            arguments: Vec::new(),
-            required_capabilities: vec!["bmux.sessions.read".to_string()],
-            provided_capabilities: Vec::new(),
-            services: vec![bmux_plugin_sdk::RegisteredService {
-                capability: bmux_plugin_sdk::HostScope::new("bmux.sessions.read")
-                    .expect("capability should parse"),
-                kind: bmux_plugin_sdk::ServiceKind::Query,
-                interface_id: "session-query/v1".to_string(),
-                provider: bmux_plugin_sdk::ProviderId::Host,
-            }],
-            available_capabilities: vec!["bmux.sessions.read".to_string()],
-            enabled_plugins: Vec::new(),
-            plugin_search_roots: Vec::new(),
-            registered_plugins: Vec::new(),
-            host: HostMetadata {
-                product_name: "bmux".to_string(),
-                product_version: "0.1.0".to_string(),
-                plugin_api_version: ApiVersion::new(1, 0),
-                plugin_abi_version: ApiVersion::new(1, 0),
-            },
-            connection: bmux_plugin_sdk::HostConnectionInfo {
-                config_dir: "/config".to_string(),
-                runtime_dir: "/runtime".to_string(),
-                data_dir: "/data".to_string(),
-                state_dir: "/state".to_string(),
-            },
-            settings: None,
-            plugin_settings_map: BTreeMap::new(),
-            caller_client_id: None,
-            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
-        };
-
-        let response = context
-            .execute_kernel_request(bmux_ipc::Request::ListSessions)
-            .expect("core session query should succeed");
-        let sessions = match response {
-            bmux_ipc::ResponsePayload::SessionList { sessions } => sessions,
-            other => panic!("expected SessionList, got {other:?}"),
-        };
-        assert_eq!(sessions.len(), 1);
-
-        let last_is_list_sessions = KERNEL_REQUESTS.with(|log| {
-            log.borrow()
-                .last()
-                .is_some_and(|r| matches!(r, bmux_ipc::Request::ListSessions))
-        });
-        assert!(last_is_list_sessions);
-    }
-
-    #[test]
     fn command_context_calls_core_pane_command_via_kernel_bridge() {
         KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
 
@@ -3228,59 +3166,6 @@ minimum = "1.0"
                 .is_some_and(|r| matches!(r, bmux_ipc::Request::LaunchPane { .. }))
         });
         assert!(last_is_launch);
-    }
-
-    #[test]
-    fn command_context_calls_core_session_command_via_kernel_bridge() {
-        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
-
-        let context = super::NativeCommandContext {
-            plugin_id: "caller.plugin".to_string(),
-            command: "new-session".to_string(),
-            arguments: Vec::new(),
-            required_capabilities: vec!["bmux.sessions.write".to_string()],
-            provided_capabilities: Vec::new(),
-            services: vec![bmux_plugin_sdk::RegisteredService {
-                capability: bmux_plugin_sdk::HostScope::new("bmux.sessions.write")
-                    .expect("capability should parse"),
-                kind: bmux_plugin_sdk::ServiceKind::Command,
-                interface_id: "session-command/v1".to_string(),
-                provider: bmux_plugin_sdk::ProviderId::Host,
-            }],
-            available_capabilities: vec!["bmux.sessions.write".to_string()],
-            enabled_plugins: Vec::new(),
-            plugin_search_roots: Vec::new(),
-            registered_plugins: Vec::new(),
-            host: HostMetadata {
-                product_name: "bmux".to_string(),
-                product_version: "0.1.0".to_string(),
-                plugin_api_version: ApiVersion::new(1, 0),
-                plugin_abi_version: ApiVersion::new(1, 0),
-            },
-            connection: bmux_plugin_sdk::HostConnectionInfo {
-                config_dir: "/config".to_string(),
-                runtime_dir: "/runtime".to_string(),
-                data_dir: "/data".to_string(),
-                state_dir: "/state".to_string(),
-            },
-            settings: None,
-            plugin_settings_map: BTreeMap::new(),
-            caller_client_id: None,
-            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
-        };
-
-        let _response = context
-            .execute_kernel_request(bmux_ipc::Request::NewSession {
-                name: Some("created".to_string()),
-            })
-            .expect("core session command should succeed");
-
-        let last_is_new_session = KERNEL_REQUESTS.with(|log| {
-            log.borrow()
-                .last()
-                .is_some_and(|r| matches!(r, bmux_ipc::Request::NewSession { .. }))
-        });
-        assert!(last_is_new_session);
     }
 
     #[test]
@@ -3570,112 +3455,6 @@ minimum = "1.0"
             })
         });
         assert!(has_attach);
-    }
-
-    #[test]
-    fn command_context_surfaces_kernel_error_for_session_command() {
-        let context = super::NativeCommandContext {
-            plugin_id: "caller.plugin".to_string(),
-            command: "new-session".to_string(),
-            arguments: Vec::new(),
-            required_capabilities: vec!["bmux.sessions.write".to_string()],
-            provided_capabilities: Vec::new(),
-            services: vec![bmux_plugin_sdk::RegisteredService {
-                capability: bmux_plugin_sdk::HostScope::new("bmux.sessions.write")
-                    .expect("capability should parse"),
-                kind: bmux_plugin_sdk::ServiceKind::Command,
-                interface_id: "session-command/v1".to_string(),
-                provider: bmux_plugin_sdk::ProviderId::Host,
-            }],
-            available_capabilities: vec!["bmux.sessions.write".to_string()],
-            enabled_plugins: Vec::new(),
-            plugin_search_roots: Vec::new(),
-            registered_plugins: Vec::new(),
-            host: HostMetadata {
-                product_name: "bmux".to_string(),
-                product_version: "0.1.0".to_string(),
-                plugin_api_version: ApiVersion::new(1, 0),
-                plugin_abi_version: ApiVersion::new(1, 0),
-            },
-            connection: bmux_plugin_sdk::HostConnectionInfo {
-                config_dir: "/config".to_string(),
-                runtime_dir: "/runtime".to_string(),
-                data_dir: "/data".to_string(),
-                state_dir: "/state".to_string(),
-            },
-            settings: None,
-            plugin_settings_map: BTreeMap::new(),
-            caller_client_id: None,
-            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
-        };
-
-        let error = context
-            .execute_kernel_request(bmux_ipc::Request::NewSession {
-                name: Some("deny".to_string()),
-            })
-            .expect_err("kernel denial should propagate as service error");
-
-        assert!(
-            error
-                .to_string()
-                .contains("session policy denied for this operation")
-        );
-    }
-
-    #[test]
-    fn command_context_calls_core_pane_query_via_kernel_bridge() {
-        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
-
-        let context = super::NativeCommandContext {
-            plugin_id: "caller.plugin".to_string(),
-            command: "list-panes".to_string(),
-            arguments: Vec::new(),
-            required_capabilities: vec!["bmux.panes.read".to_string()],
-            provided_capabilities: Vec::new(),
-            services: vec![bmux_plugin_sdk::RegisteredService {
-                capability: bmux_plugin_sdk::HostScope::new("bmux.panes.read")
-                    .expect("capability should parse"),
-                kind: bmux_plugin_sdk::ServiceKind::Query,
-                interface_id: "pane-query/v1".to_string(),
-                provider: bmux_plugin_sdk::ProviderId::Host,
-            }],
-            available_capabilities: vec!["bmux.panes.read".to_string()],
-            enabled_plugins: Vec::new(),
-            plugin_search_roots: Vec::new(),
-            registered_plugins: Vec::new(),
-            host: HostMetadata {
-                product_name: "bmux".to_string(),
-                product_version: "0.1.0".to_string(),
-                plugin_api_version: ApiVersion::new(1, 0),
-                plugin_abi_version: ApiVersion::new(1, 0),
-            },
-            connection: bmux_plugin_sdk::HostConnectionInfo {
-                config_dir: "/config".to_string(),
-                runtime_dir: "/runtime".to_string(),
-                data_dir: "/data".to_string(),
-                state_dir: "/state".to_string(),
-            },
-            settings: None,
-            plugin_settings_map: BTreeMap::new(),
-            caller_client_id: None,
-            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
-        };
-
-        let response = context
-            .execute_kernel_request(bmux_ipc::Request::ListPanes { session: None })
-            .expect("core pane query should succeed");
-        let panes = match response {
-            bmux_ipc::ResponsePayload::PaneList { panes } => panes,
-            other => panic!("expected PaneList, got {other:?}"),
-        };
-        assert_eq!(panes.len(), 1);
-
-        let last_is_list_panes = KERNEL_REQUESTS.with(|log| {
-            log.borrow()
-                .last()
-                .is_some_and(|r| matches!(r, bmux_ipc::Request::ListPanes { .. }))
-        });
-        assert!(last_is_list_panes);
     }
 
     #[test]

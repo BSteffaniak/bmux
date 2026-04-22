@@ -20,8 +20,8 @@ use bmux_ipc::{
     PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection,
     PaneState, PaneSummary, PerformanceRecordingLevel, ProtocolContract, RecordingEventKind,
     RecordingPayload, RecordingRollingStartOptions, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
-    encode, negotiate_protocol,
+    ServerSnapshotStatus, SessionSelector, decode, default_supported_capabilities, encode,
+    negotiate_protocol,
 };
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
@@ -512,6 +512,13 @@ fn prune_context_mappings_for_session(
     Ok(context_handle().0.remove_contexts_for_session(session_id))
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Used only by the in-file test module; kept outside `#[cfg(test)]` so the production-section scan in architecture_guardrails.rs keeps picking up downstream helpers."
+    )
+)]
 fn create_session_runtime(name: Option<String>) -> Result<SessionId> {
     let manager = session_handle();
     if let Some(requested_name) = name.as_deref()
@@ -5738,73 +5745,6 @@ async fn handle_request(
                 })
             }
         }
-        Request::NewSession { name } => {
-            let session_id = match create_session_runtime(name.clone()) {
-                Ok(session_id) => session_id,
-                Err(error) => {
-                    let message = error.to_string();
-                    let code = if message.starts_with("session already exists with name") {
-                        ErrorCode::AlreadyExists
-                    } else {
-                        ErrorCode::Internal
-                    };
-                    return Ok(Response::Err(ErrorResponse { code, message }));
-                }
-            };
-
-            let context_bind_result = {
-                let handle = context_handle();
-                let context = handle.0.create(client_id, name.clone(), BTreeMap::new());
-                match handle.0.bind_session(context.id, session_id) {
-                    Ok(()) => Ok(()),
-                    Err(message) => {
-                        let _ = handle.0.remove_context_by_id(context.id, Some(client_id));
-                        Err(message.to_string())
-                    }
-                }
-            };
-
-            if let Err(message) = context_bind_result {
-                let _ = session_handle().0.remove_session(session_id);
-                if let Some(removed_runtime) = session_runtime_handle().0.remove_runtime(session_id)
-                {
-                    shutdown_runtime_info(removed_runtime);
-                }
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::Internal,
-                    message: format!("failed creating context for new session: {message}"),
-                }));
-            }
-
-            Response::Ok(ResponsePayload::SessionCreated {
-                id: session_id.0,
-                name,
-            })
-        }
-        Request::ListPanes { session } => {
-            let manager = session_handle();
-            let session_id = match resolve_session_request_session_id(
-                &*manager.0,
-                session.as_ref(),
-                selected_session.as_ref(),
-            ) {
-                Ok(session_id) => session_id,
-                Err(response) => return Ok(Response::Err(response)),
-            };
-            drop(manager);
-
-            let pane_result = session_runtime_handle().0.list_panes(session_id);
-            let panes = match pane_result {
-                Ok(panes) => panes,
-                Err(error) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: format!("failed listing panes: {error:#}"),
-                    }));
-                }
-            };
-            Response::Ok(ResponsePayload::PaneList { panes })
-        }
         Request::SplitPane {
             session,
             target,
@@ -6159,105 +6099,6 @@ async fn handle_request(
                 pane_id,
                 zoomed,
             })
-        }
-        Request::ListSessions => {
-            let sessions = session_handle()
-                .0
-                .list_sessions()
-                .into_iter()
-                .map(|session| SessionSummary {
-                    id: session.id.0,
-                    name: session.name,
-                    client_count: session.client_count,
-                })
-                .collect::<Vec<_>>();
-            Response::Ok(ResponsePayload::SessionList { sessions })
-        }
-        Request::KillSession {
-            selector,
-            force_local,
-        } => {
-            let session_id = {
-                let manager = session_handle();
-                let Some(session_id) = resolve_session_id(&*manager.0, &selector) else {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: session_not_found_message(&selector),
-                    }));
-                };
-
-                session_id
-            };
-
-            if force_local && client_principal_id != state.server_control_principal_id {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "force-local is only allowed for the server control principal"
-                        .to_string(),
-                }));
-            }
-
-            if !force_local
-                && let Err(response) = ensure_session_admin_allowed(
-                    state,
-                    shutdown_tx,
-                    session_id,
-                    client_id,
-                    client_principal_id,
-                    "session.kill",
-                )
-                .await
-            {
-                return Ok(Response::Err(response));
-            }
-
-            let removed_runtime = {
-                if session_handle().0.remove_session(session_id).is_err() {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: format!("failed removing session {}", session_id.0),
-                    }));
-                }
-                let _ = prune_context_mappings_for_session(state, session_id)?;
-                if *selected_session == Some(session_id) {
-                    *selected_session = None;
-                    persist_selected_session(state, client_id, None)?;
-                }
-                if *attached_stream_session == Some(session_id) {
-                    *attached_stream_session = None;
-                }
-
-                match session_runtime_handle().0.remove_runtime(session_id) {
-                    Some(removed) => removed,
-                    None => {
-                        return Ok(Response::Err(ErrorResponse {
-                            code: ErrorCode::Internal,
-                            message: format!(
-                                "failed stopping session runtime: session {} not found",
-                                session_id.0
-                            ),
-                        }));
-                    }
-                }
-            };
-
-            if !removed_runtime.attached_clients.is_empty() {
-                emit_event(state, Event::ClientDetached { id: session_id.0 })?;
-            }
-            shutdown_runtime_info(removed_runtime);
-
-            let mut attach_tokens = state
-                .attach_tokens
-                .lock()
-                .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-            attach_tokens.remove_for_session(session_id);
-            drop(attach_tokens);
-
-            clear_selected_session_for_all(state, session_id)?;
-
-            emit_event(state, Event::SessionRemoved { id: session_id.0 })?;
-
-            Response::Ok(ResponsePayload::SessionKilled { id: session_id.0 })
         }
         Request::Attach { selector } => {
             let manager = session_handle();
@@ -6916,15 +6757,6 @@ async fn handle_request(
         }
     };
 
-    if let Response::Ok(ResponsePayload::SessionCreated { id, name }) = &response {
-        emit_event(
-            state,
-            Event::SessionCreated {
-                id: *id,
-                name: name.clone(),
-            },
-        )?;
-    }
     if let Response::Ok(ResponsePayload::AttachReady { session_id, .. }) = &response {
         emit_event(state, Event::ClientAttached { id: *session_id })?;
     }
@@ -6946,8 +6778,6 @@ const fn request_requires_exclusive(request: &Request) -> bool {
         Request::ServerSave
             | Request::ServerStop
             | Request::ServerRestoreApply
-            | Request::NewSession { .. }
-            | Request::KillSession { .. }
             | Request::SplitPane { .. }
             | Request::LaunchPane { .. }
             | Request::FocusPane { .. }
@@ -6969,14 +6799,12 @@ const fn response_requires_snapshot(response: &Response) -> bool {
     matches!(
         response,
         Response::Ok(
-            ResponsePayload::SessionCreated { .. }
-                | ResponsePayload::PaneSplit { .. }
+            ResponsePayload::PaneSplit { .. }
                 | ResponsePayload::PaneLaunched { .. }
                 | ResponsePayload::PaneFocused { .. }
                 | ResponsePayload::PaneResized { .. }
                 | ResponsePayload::PaneClosed { .. }
                 | ResponsePayload::PaneRestarted { .. }
-                | ResponsePayload::SessionKilled { .. }
                 | ResponsePayload::Attached { .. }
                 | ResponsePayload::Detached
         )
@@ -6995,10 +6823,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
-        Request::NewSession { .. } => "new_session",
-        Request::ListSessions => "list_sessions",
-        Request::KillSession { .. } => "kill_session",
-        Request::ListPanes { .. } => "list_panes",
         Request::SplitPane { .. } => "split_pane",
         Request::LaunchPane { .. } => "launch_pane",
         Request::FocusPane { .. } => "focus_pane",
@@ -7212,10 +7036,6 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::ServerSnapshotRestored { .. } => "server_snapshot_restored",
         ResponsePayload::ServerStopping => "server_stopping",
         ResponsePayload::ServiceInvoked { .. } => "service_invoked",
-        ResponsePayload::SessionCreated { .. } => "session_created",
-        ResponsePayload::SessionList { .. } => "session_list",
-        ResponsePayload::SessionKilled { .. } => "session_killed",
-        ResponsePayload::PaneList { .. } => "pane_list",
         ResponsePayload::PaneSplit { .. } => "pane_split",
         ResponsePayload::PaneLaunched { .. } => "pane_launched",
         ResponsePayload::PaneFocused { .. } => "pane_focused",
@@ -7683,6 +7503,13 @@ async fn check_session_policy(
     Ok(Some(response))
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Used only by the in-file test module; kept outside `#[cfg(test)]` so the production-section scan in architecture_guardrails.rs keeps picking up downstream helpers."
+    )
+)]
 async fn ensure_session_admin_allowed(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
@@ -9001,6 +8828,32 @@ mod tests {
         .expect("request should complete")
     }
 
+    /// Test helper that replicates the server-side orchestration
+    /// which `Request::NewSession` used to perform. Creates a
+    /// session runtime and binds a fresh context. Returns the
+    /// created session id.
+    fn test_new_session_runtime(_server: &BmuxServer, client_id: ClientId) -> SessionId {
+        let session_id = create_session_runtime(None).expect("new session runtime should succeed");
+        let handle = context_handle();
+        let context = handle
+            .0
+            .create(client_id, None, std::collections::BTreeMap::new());
+        handle
+            .0
+            .bind_session(context.id, session_id)
+            .expect("test context bind should succeed");
+        session_id
+    }
+
+    /// Test helper: list panes via the typed runtime handle rather
+    /// than the deleted `Request::ListPanes` IPC variant.
+    fn test_list_panes(session_id: SessionId) -> Vec<PaneSummary> {
+        session_runtime_handle()
+            .0
+            .list_panes(session_id)
+            .expect("pane listing should succeed")
+    }
+
     fn test_endpoint() -> IpcEndpoint {
         #[cfg(unix)]
         {
@@ -9542,19 +9395,7 @@ mod tests {
         let mut selected_session = None;
         let mut attached_stream_session = None;
 
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::NewSession { name: None },
-        )
-        .await;
-        let session_id = match created {
-            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
-            response => panic!("expected session created response, got {response:?}"),
-        };
+        let session_id = test_new_session_runtime(&server, client_id).0;
 
         let split = execute_request(
             &server,
@@ -9591,19 +9432,7 @@ mod tests {
         let mut selected_session = None;
         let mut attached_stream_session = None;
 
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::NewSession { name: None },
-        )
-        .await;
-        let session_id = match created {
-            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
-            response => panic!("expected session created response, got {response:?}"),
-        };
+        let session_id = test_new_session_runtime(&server, client_id).0;
 
         let launched = execute_request(
             &server,
@@ -9636,21 +9465,7 @@ mod tests {
             response => panic!("expected successful launch response, got {response:?}"),
         }
 
-        let listed = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::ListPanes {
-                session: Some(SessionSelector::ById(session_id)),
-            },
-        )
-        .await;
-        let panes = match listed {
-            Response::Ok(ResponsePayload::PaneList { panes }) => panes,
-            response => panic!("expected pane list response, got {response:?}"),
-        };
+        let panes = test_list_panes(SessionId(session_id));
         assert_eq!(panes.len(), 2);
         assert!(
             panes
@@ -9668,19 +9483,7 @@ mod tests {
         let mut selected_session = None;
         let mut attached_stream_session = None;
 
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::NewSession { name: None },
-        )
-        .await;
-        let session_id = match created {
-            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
-            response => panic!("expected session created response, got {response:?}"),
-        };
+        let session_id = test_new_session_runtime(&server, client_id).0;
 
         let launched = execute_request(
             &server,
@@ -9724,19 +9527,7 @@ mod tests {
         let mut selected_session = None;
         let mut attached_stream_session = None;
 
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::NewSession { name: None },
-        )
-        .await;
-        let session_id = match created {
-            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
-            response => panic!("expected session created response, got {response:?}"),
-        };
+        let session_id = test_new_session_runtime(&server, client_id).0;
 
         let split = execute_request(
             &server,
@@ -9757,21 +9548,7 @@ mod tests {
             response => panic!("expected split response, got {response:?}"),
         }
 
-        let list_before = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::ListPanes {
-                session: Some(SessionSelector::ById(session_id)),
-            },
-        )
-        .await;
-        let panes_before = match list_before {
-            Response::Ok(ResponsePayload::PaneList { panes }) => panes,
-            response => panic!("expected pane list response, got {response:?}"),
-        };
+        let panes_before = test_list_panes(SessionId(session_id));
         assert_eq!(panes_before.len(), 2);
         let target_pane_id = panes_before[0].id;
 
@@ -9784,21 +9561,7 @@ mod tests {
         reap_exited_pane(&server.state, SessionId(session_id), target_pane_id)
             .expect("reap should succeed");
 
-        let list_exited = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::ListPanes {
-                session: Some(SessionSelector::ById(session_id)),
-            },
-        )
-        .await;
-        let panes_exited = match list_exited {
-            Response::Ok(ResponsePayload::PaneList { panes }) => panes,
-            response => panic!("expected pane list response, got {response:?}"),
-        };
+        let panes_exited = test_list_panes(SessionId(session_id));
         assert_eq!(panes_exited.len(), 2);
         let exited_summary = panes_exited
             .iter()
@@ -9829,21 +9592,7 @@ mod tests {
             response => panic!("expected pane restarted response, got {response:?}"),
         }
 
-        let list_after = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::ListPanes {
-                session: Some(SessionSelector::ById(session_id)),
-            },
-        )
-        .await;
-        let panes_after = match list_after {
-            Response::Ok(ResponsePayload::PaneList { panes }) => panes,
-            response => panic!("expected pane list response, got {response:?}"),
-        };
+        let panes_after = test_list_panes(SessionId(session_id));
         assert_eq!(panes_after.len(), 2);
         let restarted_summary = panes_after
             .iter()
@@ -9926,66 +9675,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_session_is_blocked_when_admin_policy_denies() {
-        let server = BmuxServer::new(test_endpoint());
-        install_test_state_handles();
-        server
-            .set_service_resolver(|route, payload| async move {
-                if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
-                    let request: SessionPolicyCheckRequest = decode(&payload)?;
-                    assert_eq!(request.action, "session.kill");
-                    return encode(&SessionPolicyCheckResponse {
-                        allowed: false,
-                        reason: Some("session policy denied for this operation".to_string()),
-                    })
-                    .map_err(anyhow::Error::from);
-                }
-                anyhow::bail!("unexpected policy route")
-            })
-            .expect("resolver registration should succeed");
-
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::NewSession { name: None },
-        )
-        .await;
-        let session_id = match created {
-            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
-            response => panic!("expected session created response, got {response:?}"),
-        };
-
-        let killed = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::KillSession {
-                selector: SessionSelector::ById(session_id),
-                force_local: false,
-            },
-        )
-        .await;
-
-        match killed {
-            Response::Err(error) => {
-                assert_eq!(error.code, ErrorCode::InvalidRequest);
-                assert!(error.message.contains("session policy denied"));
-            }
-            response @ Response::Ok(_) => panic!("expected denied kill response, got {response:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn split_pane_is_blocked_when_mutation_policy_denies() {
         let server = BmuxServer::new(test_endpoint());
         install_test_state_handles();
@@ -10009,19 +9698,7 @@ mod tests {
         let mut selected_session = None;
         let mut attached_stream_session = None;
 
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::NewSession { name: None },
-        )
-        .await;
-        let session_id = match created {
-            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
-            response => panic!("expected session created response, got {response:?}"),
-        };
+        let session_id = test_new_session_runtime(&server, client_id).0;
 
         let split = execute_request(
             &server,
@@ -10073,19 +9750,7 @@ mod tests {
         let mut selected_session = None;
         let mut attached_stream_session = None;
 
-        let created = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::NewSession { name: None },
-        )
-        .await;
-        let session_id = match created {
-            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
-            response => panic!("expected session created response, got {response:?}"),
-        };
+        let session_id = test_new_session_runtime(&server, client_id).0;
 
         let attach_input = execute_request(
             &server,

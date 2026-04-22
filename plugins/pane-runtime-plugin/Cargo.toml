@@ -15,12 +15,16 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bmux_attach_token_state      = { workspace = true }
+bmux_client_state            = { workspace = true }
+bmux_context_state           = { workspace = true }
 bmux_ipc                     = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_pane_runtime_state      = { workspace = true }
 bmux_plugin                  = { workspace = true }
 bmux_plugin_sdk              = { workspace = true }
 bmux_session_models          = { workspace = true }
+bmux_session_state           = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true }
 uuid                         = { workspace = true, features = ["serde", "std"] }

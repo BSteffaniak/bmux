@@ -23,6 +23,7 @@ mod manifest;
 mod plugin_state;
 pub mod prompt;
 mod registry;
+mod static_vtable_registry;
 pub mod test_support;
 mod typed_service_caller;
 
@@ -50,6 +51,7 @@ pub use registry::{
     CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
     ServiceProvider,
 };
+pub use static_vtable_registry::{register_static_vtable, static_vtable};
 pub use typed_service_caller::TypedServiceCaller;
 
 /// Default exported symbol used to invoke a plugin command.

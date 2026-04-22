@@ -25,11 +25,11 @@ pub mod pane_state;
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
         // pane-runtime-state queries.
-        "pane-runtime-state", "list-panes" => |req: pane_state::ListPanesArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_state::list_panes(&req))
+        "pane-runtime-state", "list-panes" => |req: pane_state::ListPanesArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_state::list_panes(&req, ctx))
         },
-        "pane-runtime-state", "get-pane" => |req: pane_state::GetPaneArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_state::get_pane(&req))
+        "pane-runtime-state", "get-pane" => |req: pane_state::GetPaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_state::get_pane(&req, ctx))
         },
 
         // pane-runtime-commands mutations.
@@ -58,7 +58,7 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
             Ok::<_, ServiceResponse>(pane_commands::pane_direct_input(req))
         },
         "pane-runtime-commands", "new-session-with-runtime" => |req: pane_commands::NewSessionArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_commands::new_session_with_runtime(req))
+            Ok::<_, ServiceResponse>(pane_commands::new_session_with_runtime(&req))
         },
         "pane-runtime-commands", "kill-session-runtime" => |req: pane_commands::KillSessionArgs, _ctx| {
             Ok::<_, ServiceResponse>(pane_commands::kill_session_runtime(&req))

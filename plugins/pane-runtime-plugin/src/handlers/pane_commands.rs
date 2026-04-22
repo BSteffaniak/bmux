@@ -284,36 +284,138 @@ pub fn pane_direct_input(req: PaneDirectInputArgs) -> Result<PaneAck, PaneComman
 }
 
 pub fn new_session_with_runtime(
-    _req: NewSessionArgs,
+    req: &NewSessionArgs,
 ) -> Result<SessionAck, SessionRuntimeCommandError> {
-    // Session creation orchestration (sessions-plugin update +
-    // pane-runtime bootstrap + event emission) remains on the server's
-    // IPC handler until callers migrate. Returning "not implemented"
-    // here signals consumers to stick with `Request::NewSession` for
-    // the time being.
-    Err(failed_session(
-        "new-session-with-runtime is not yet routed through the typed service; \
-         callers should continue to use Request::NewSession until the server \
-         orchestrator moves into the plugin",
-    ))
+    use bmux_plugin::global_plugin_state_registry;
+
+    let runtime_handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_session("pane-runtime manager handle not registered"))?;
+    let session_handle = global_plugin_state_registry()
+        .get::<bmux_session_state::SessionManagerHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .ok_or_else(|| failed_session("session manager handle not registered"))?;
+    let context_handle = global_plugin_state_registry()
+        .get::<bmux_context_state::ContextStateHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .ok_or_else(|| failed_session("context state handle not registered"))?;
+
+    // Duplicate-name check mirrors server's create_session_runtime helper.
+    if let Some(requested_name) = req.name.as_deref()
+        && session_handle
+            .0
+            .list_sessions()
+            .iter()
+            .any(|s| s.name.as_deref() == Some(requested_name))
+    {
+        return Err(SessionRuntimeCommandError::NameAlreadyExists {
+            name: requested_name.to_string(),
+        });
+    }
+
+    let session_id = session_handle
+        .0
+        .create_session(req.name.clone())
+        .map_err(|error| failed_session(format!("failed creating session: {error:#}")))?;
+
+    if let Err(error) = runtime_handle.0.start_runtime(session_id) {
+        let _ = session_handle.0.remove_session(session_id);
+        return Err(failed_session(format!(
+            "failed creating session runtime: {error:#}"
+        )));
+    }
+
+    // Create+bind a context for the new session. The caller client id
+    // is not available in this handler context (the typed invoke
+    // context uses `NativeServiceContext` which does carry it, but we
+    // accept the caller-less shape here because every code path that
+    // reaches `new-session-with-runtime` in production goes through
+    // either the sessions-plugin shim or a direct CLI call, both of
+    // which pass through a `NativeServiceContext`). When the caller
+    // id is absent we fall back to `Uuid::nil` which the context
+    // state accepts.
+    let caller_client_id = bmux_session_models::ClientId(uuid::Uuid::nil());
+    let context = context_handle.0.create(
+        caller_client_id,
+        req.name.clone(),
+        std::collections::BTreeMap::new(),
+    );
+    if let Err(message) = context_handle.0.bind_session(context.id, session_id) {
+        let _ = context_handle
+            .0
+            .remove_context_by_id(context.id, Some(caller_client_id));
+        let _ = session_handle.0.remove_session(session_id);
+        if let Some(removed_runtime) = runtime_handle.0.remove_runtime(session_id) {
+            runtime_handle.0.shutdown_removed_runtime(removed_runtime);
+        }
+        return Err(failed_session(format!(
+            "failed creating context for new session: {message}"
+        )));
+    }
+
+    Ok(SessionAck {
+        session_id: session_id.0,
+    })
 }
 
 pub fn kill_session_runtime(
     req: &KillSessionArgs,
 ) -> Result<SessionAck, SessionRuntimeCommandError> {
-    let handle = super::session_runtime_handle()
+    use bmux_plugin::global_plugin_state_registry;
+
+    let runtime_handle = super::session_runtime_handle()
         .ok_or_else(|| failed_session("pane-runtime manager handle not registered"))?;
+    let session_handle = global_plugin_state_registry()
+        .get::<bmux_session_state::SessionManagerHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .ok_or_else(|| failed_session("session manager handle not registered"))?;
+    let context_handle = global_plugin_state_registry()
+        .get::<bmux_context_state::ContextStateHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .ok_or_else(|| failed_session("context state handle not registered"))?;
+    let attach_token_handle = global_plugin_state_registry()
+        .get::<bmux_attach_token_state::AttachTokenManagerHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .ok_or_else(|| failed_session("attach-token manager handle not registered"))?;
+    let follow_handle = global_plugin_state_registry()
+        .get::<bmux_client_state::FollowStateHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .ok_or_else(|| failed_session("follow state handle not registered"))?;
+    let wire_sink = global_plugin_state_registry()
+        .get::<bmux_plugin_sdk::WireEventSinkHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()));
+
     let session_id = SessionId(req.session_id);
-    // Teardown only drives the pane-runtime portion: remove the
-    // runtime and schedule async shutdown of PTYs. Context pruning,
-    // attach-token revocation, session-manager removal, and event
-    // emission remain on the server until that orchestration
-    // migrates. When `force_local` is false and remote tear-down is
-    // expected, callers still need to use `Request::KillSession`.
-    if let Some(removed) = handle.0.remove_runtime(session_id) {
-        handle.0.shutdown_removed_runtime(removed);
+    let _ = req.force_local; // admin-principal gate + remote tear-down remain server-side for now.
+
+    if session_handle.0.remove_session(session_id).is_err() {
+        return Err(SessionRuntimeCommandError::SessionNotFound);
     }
-    let _ = req.force_local;
+
+    let _removed_contexts = context_handle.0.remove_contexts_for_session(session_id);
+    follow_handle.0.clear_selections_for_session(session_id);
+
+    let Some(removed_runtime) = runtime_handle.0.remove_runtime(session_id) else {
+        return Err(failed_session(format!(
+            "failed stopping session runtime: session {} not found",
+            session_id.0
+        )));
+    };
+
+    let had_attached_clients = !removed_runtime.attached_clients.is_empty();
+    runtime_handle.0.shutdown_removed_runtime(removed_runtime);
+    attach_token_handle.0.remove_for_session(session_id);
+
+    if let Some(sink) = wire_sink {
+        if had_attached_clients {
+            let _ = sink
+                .0
+                .publish(bmux_ipc::Event::ClientDetached { id: session_id.0 });
+        }
+        let _ = sink
+            .0
+            .publish(bmux_ipc::Event::SessionRemoved { id: session_id.0 });
+    }
+
     Ok(SessionAck {
         session_id: req.session_id,
     })

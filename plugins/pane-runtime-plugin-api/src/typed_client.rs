@@ -70,7 +70,8 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ListPanesArgs {
-    session_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,14 +80,15 @@ struct GetPaneArgs {
     pane_id: Uuid,
 }
 
-/// List the panes in a session runtime.
+/// List the panes in a session runtime. When `session_id` is `None`
+/// the server resolves the caller's currently-selected session.
 ///
 /// # Errors
 ///
 /// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn list_panes<C: TypedDispatchClient>(
     client: &mut C,
-    session_id: Uuid,
+    session_id: Option<Uuid>,
 ) -> Result<
     core::result::Result<pane_runtime_state::SessionPaneList, pane_runtime_state::PaneStateError>,
 > {

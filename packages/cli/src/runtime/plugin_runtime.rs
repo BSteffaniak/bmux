@@ -100,6 +100,11 @@ macro_rules! declare_bundled_plugins {
                         .unwrap_or_else(|| "<unknown-plugin-id>".to_string());
                     tracing::warn!("failed to register bundled plugin '{plugin_id}': {e}");
                 }
+                #[cfg(feature = $feature)]
+                if let Some(plugin_id) = bundled_manifest_plugin_id($manifest) {
+                    let vtable = bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest);
+                    bmux_plugin::register_static_vtable(&plugin_id, vtable);
+                }
             )*
         }
 

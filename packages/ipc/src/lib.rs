@@ -484,14 +484,6 @@ pub enum Request {
         operation: String,
         payload: Vec<u8>,
     },
-    NewSession {
-        name: Option<String>,
-    },
-    ListSessions,
-    KillSession {
-        selector: SessionSelector,
-        force_local: bool,
-    },
     SplitPane {
         session: Option<SessionSelector>,
         target: Option<PaneSelector>,
@@ -528,9 +520,6 @@ pub enum Request {
         target: Option<PaneSelector>,
     },
     ZoomPane {
-        session: Option<SessionSelector>,
-    },
-    ListPanes {
         session: Option<SessionSelector>,
     },
     Attach {
@@ -1107,16 +1096,6 @@ pub enum ResponsePayload {
         follows: usize,
         selected_sessions: usize,
     },
-    SessionCreated {
-        id: Uuid,
-        name: Option<String>,
-    },
-    SessionList {
-        sessions: Vec<SessionSummary>,
-    },
-    SessionKilled {
-        id: Uuid,
-    },
     PaneSplit {
         id: Uuid,
         session_id: Uuid,
@@ -1145,9 +1124,6 @@ pub enum ResponsePayload {
         session_id: Uuid,
         pane_id: Uuid,
         zoomed: bool,
-    },
-    PaneList {
-        panes: Vec<PaneSummary>,
     },
     Attached {
         grant: AttachGrant,
@@ -1559,10 +1535,7 @@ mod tests {
 
     #[test]
     fn serializes_request_roundtrip() {
-        let request = Request::KillSession {
-            selector: SessionSelector::ByName("dev-shell".to_string()),
-            force_local: false,
-        };
+        let request = Request::Ping;
         let bytes = encode(&request).expect("request should encode");
         let decoded: Request = decode(&bytes).expect("request should decode");
         assert_eq!(decoded, request);
@@ -1570,13 +1543,7 @@ mod tests {
 
     #[test]
     fn serializes_response_roundtrip() {
-        let response = Response::Ok(ResponsePayload::SessionList {
-            sessions: vec![SessionSummary {
-                id: Uuid::new_v4(),
-                name: Some("work".to_string()),
-                client_count: 1,
-            }],
-        });
+        let response = Response::Ok(ResponsePayload::Pong);
         let bytes = encode(&response).expect("response should encode");
         let decoded: Response = decode(&bytes).expect("response should decode");
         assert_eq!(decoded, response);
@@ -1840,19 +1807,6 @@ mod tests {
                 operation: "list".into(),
                 payload: vec![1, 2, 3],
             },
-            Request::NewSession {
-                name: Some("dev".into()),
-            },
-            Request::NewSession { name: None },
-            Request::ListSessions,
-            Request::KillSession {
-                selector: SessionSelector::ById(id),
-                force_local: true,
-            },
-            Request::KillSession {
-                selector: SessionSelector::ByName("session".into()),
-                force_local: false,
-            },
             Request::SplitPane {
                 session: Some(SessionSelector::ById(id)),
                 target: Some(PaneSelector::ById(id2)),
@@ -1924,10 +1878,6 @@ mod tests {
             Request::ZoomPane {
                 session: Some(SessionSelector::ByName("s".into())),
             },
-            Request::ListPanes {
-                session: Some(SessionSelector::ById(id)),
-            },
-            Request::ListPanes { session: None },
             Request::Attach {
                 selector: SessionSelector::ByName("main".into()),
             },
@@ -2144,25 +2094,6 @@ mod tests {
                 follows: 1,
                 selected_sessions: 2,
             },
-            ResponsePayload::SessionCreated {
-                id,
-                name: Some("dev".into()),
-            },
-            ResponsePayload::SessionList {
-                sessions: vec![
-                    SessionSummary {
-                        id,
-                        name: Some("s1".into()),
-                        client_count: 2,
-                    },
-                    SessionSummary {
-                        id: id2,
-                        name: None,
-                        client_count: 0,
-                    },
-                ],
-            },
-            ResponsePayload::SessionKilled { id },
             ResponsePayload::PaneSplit {
                 id: pane_id,
                 session_id: id,
@@ -2189,26 +2120,6 @@ mod tests {
                 session_id: id,
                 pane_id,
                 zoomed: true,
-            },
-            ResponsePayload::PaneList {
-                panes: vec![
-                    PaneSummary {
-                        id: pane_id,
-                        index: 0,
-                        name: Some("shell".into()),
-                        focused: true,
-                        state: PaneState::Running,
-                        state_reason: None,
-                    },
-                    PaneSummary {
-                        id: id2,
-                        index: 1,
-                        name: None,
-                        focused: false,
-                        state: PaneState::Exited,
-                        state_reason: Some("process exited".into()),
-                    },
-                ],
             },
             ResponsePayload::Attached {
                 grant: AttachGrant {

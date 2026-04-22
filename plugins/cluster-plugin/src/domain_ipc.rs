@@ -316,19 +316,31 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn session_list(&self) -> Result<SessionListResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::ListSessions)? {
-            bmux_ipc::ResponsePayload::SessionList { sessions } => Ok(SessionListResponse {
-                sessions: sessions
-                    .into_iter()
-                    .map(|s| SessionSummary {
-                        id: s.id,
-                        name: s.name,
-                        client_count: s.client_count,
-                    })
-                    .collect(),
-            }),
-            _ => Err(unexpected("session_list")),
+        #[derive(Deserialize)]
+        struct Entry {
+            id: Uuid,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            client_count: u32,
         }
+        let entries: Vec<Entry> = self.call_service(
+            bmux_sessions_plugin_api::capabilities::SESSIONS_READ.as_str(),
+            bmux_plugin_sdk::ServiceKind::Query,
+            bmux_sessions_plugin_api::sessions_state::INTERFACE_ID.as_str(),
+            "list-sessions",
+            &(),
+        )?;
+        Ok(SessionListResponse {
+            sessions: entries
+                .into_iter()
+                .map(|e| SessionSummary {
+                    id: e.id,
+                    name: e.name,
+                    client_count: e.client_count as usize,
+                })
+                .collect(),
+        })
     }
 
     /// Create a new session.
@@ -337,13 +349,31 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn session_create(&self, request: &SessionCreateRequest) -> Result<SessionCreateResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::NewSession {
-            name: request.name.clone(),
-        })? {
-            bmux_ipc::ResponsePayload::SessionCreated { id, name } => {
-                Ok(SessionCreateResponse { id, name })
-            }
-            _ => Err(unexpected("session_create")),
+        #[derive(Serialize)]
+        struct Args {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            name: Option<String>,
+        }
+        let result: std::result::Result<
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionAck,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionRuntimeCommandError,
+        > = self.call_service(
+            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
+            bmux_plugin_sdk::ServiceKind::Command,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
+            "new-session-with-runtime",
+            &Args {
+                name: request.name.clone(),
+            },
+        )?;
+        match result {
+            Ok(ack) => Ok(SessionCreateResponse {
+                id: ack.session_id,
+                name: request.name.clone(),
+            }),
+            Err(err) => Err(PluginError::ServiceProtocol {
+                details: format!("new-session-with-runtime failed: {err:?}"),
+            }),
         }
     }
 
@@ -603,21 +633,63 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_list(&self, request: &PaneListRequest) -> Result<PaneListResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::ListPanes {
-            session: request.session.as_ref().map(session_selector_to_ipc),
-        })? {
-            bmux_ipc::ResponsePayload::PaneList { panes } => Ok(PaneListResponse {
+        // Dispatch through pane-runtime plugin's typed
+        // `pane-runtime-state::list-panes` service. When the caller
+        // provides a by-id selector we forward it; otherwise we pass
+        // `None` and let the handler resolve the caller's
+        // selected session via FollowState.
+        #[derive(Serialize)]
+        struct Args {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            session_id: Option<Uuid>,
+        }
+        #[derive(Deserialize)]
+        struct Panes {
+            panes: Vec<PaneEntry>,
+        }
+        #[derive(Deserialize)]
+        struct PaneEntry {
+            id: Uuid,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            focused: bool,
+        }
+        let session_id = match request.session.as_ref() {
+            Some(SessionSelector::ById(id)) => Some(*id),
+            Some(SessionSelector::ByName(_)) => {
+                return Err(PluginError::ServiceProtocol {
+                    details: "cluster pane_list requires a by-id selector or `None`; \
+                              name-based selection is resolved by the caller"
+                        .to_string(),
+                });
+            }
+            None => None,
+        };
+        let result: std::result::Result<Panes, serde_json::Value> = self.call_service(
+            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_READ.as_str(),
+            bmux_plugin_sdk::ServiceKind::Query,
+            bmux_pane_runtime_plugin_api::pane_runtime_state::INTERFACE_ID.as_str(),
+            "list-panes",
+            &Args { session_id },
+        )?;
+        match result {
+            Ok(panes) => Ok(PaneListResponse {
                 panes: panes
+                    .panes
                     .into_iter()
-                    .map(|p| PaneSummary {
+                    .enumerate()
+                    .map(|(idx, p)| PaneSummary {
                         id: p.id,
-                        index: p.index,
+                        index: u32::try_from(idx).unwrap_or(0),
                         name: p.name,
                         focused: p.focused,
                     })
                     .collect(),
             }),
-            _ => Err(unexpected("pane_list")),
+            Err(err) => Err(PluginError::ServiceProtocol {
+                details: format!("list-panes typed dispatch returned error: {err}"),
+            }),
         }
     }
 
