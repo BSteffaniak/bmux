@@ -5,12 +5,11 @@
 //! Server component for bmux terminal multiplexer.
 
 mod pane_runtime_snapshot;
-mod persistence;
 
 use anyhow::{Context, Result};
 use bmux_client_state::FollowStateHandle;
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, ContextStateHandle, RuntimeContext};
+use bmux_context_state::ContextStateHandle;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
@@ -25,15 +24,9 @@ use bmux_ipc::{
     encode, negotiate_protocol,
 };
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
-use bmux_session_models::{ClientId, Session, SessionId};
+use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::{SessionManagerHandle, SessionManagerReader, SessionManagerSnapshot};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
-use persistence::{
-    ClientSelectedContextSnapshotV1, ClientSelectedSessionSnapshotV2,
-    ContextSessionBindingSnapshotV1, ContextSnapshotV1, FloatingSurfaceSnapshotV3,
-    FollowEdgeSnapshotV2, PaneLayoutNodeSnapshotV2, PaneSnapshotV2, PaneSplitDirectionSnapshotV2,
-    SessionSnapshotV3, SnapshotManager, SnapshotV4,
-};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -69,9 +62,6 @@ const RESPONSE_METADATA_HEADROOM: usize = 65_536;
 /// fits within the frame limit regardless of what the client requests.
 const RESPONSE_OUTPUT_BUDGET: usize =
     bmux_ipc::frame::MAX_FRAME_PAYLOAD_SIZE - RESPONSE_METADATA_HEADROOM;
-const SNAPSHOT_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(300);
-const OFFLINE_SNAPSHOT_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const OFFLINE_SNAPSHOT_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const EVENT_PUSH_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +88,6 @@ pub struct BmuxServer {
 struct ServerState {
     session_runtimes: Mutex<SessionRuntimeManager>,
     attach_tokens: Mutex<AttachTokenManager>,
-    snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
     performance_settings: PerformanceSettingsStore,
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
@@ -211,50 +200,6 @@ impl ServiceInvokeContext {
 struct PaneExitEvent {
     session_id: SessionId,
     pane_id: Uuid,
-}
-
-#[derive(Debug)]
-struct SnapshotRuntime {
-    manager: Option<SnapshotManager>,
-    dirty: bool,
-    last_marked_at: Option<Instant>,
-    debounce_interval: Duration,
-    last_write_epoch_ms: Option<u64>,
-    last_restore_epoch_ms: Option<u64>,
-    last_restore_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct RestoreSummary {
-    sessions: usize,
-    follows: usize,
-    selected_sessions: usize,
-}
-
-impl SnapshotRuntime {
-    const fn disabled() -> Self {
-        Self {
-            manager: None,
-            dirty: false,
-            last_marked_at: None,
-            debounce_interval: SNAPSHOT_DEBOUNCE_INTERVAL,
-            last_write_epoch_ms: None,
-            last_restore_epoch_ms: None,
-            last_restore_error: None,
-        }
-    }
-
-    const fn with_manager(manager: SnapshotManager) -> Self {
-        Self {
-            manager: Some(manager),
-            dirty: false,
-            last_marked_at: None,
-            debounce_interval: SNAPSHOT_DEBOUNCE_INTERVAL,
-            last_write_epoch_ms: None,
-            last_restore_epoch_ms: None,
-            last_restore_error: None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -431,6 +376,28 @@ fn session_handle() -> SessionManagerHandle {
         .get::<SessionManagerHandle>()
         .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
         .unwrap_or_else(SessionManagerHandle::noop)
+}
+
+/// Look up the snapshot orchestrator handle from the plugin state
+/// registry. Returns the noop orchestrator when the snapshot plugin
+/// isn't loaded or its handle isn't registered yet.
+fn snapshot_orchestrator_handle() -> bmux_snapshot_runtime::SnapshotOrchestratorHandle {
+    bmux_plugin::global_plugin_state_registry()
+        .get::<bmux_snapshot_runtime::SnapshotOrchestratorHandle>()
+        .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
+        .unwrap_or_else(bmux_snapshot_runtime::SnapshotOrchestratorHandle::noop)
+}
+
+/// Look up the shared snapshot dirty flag from the plugin state
+/// registry. Returns a fresh detached flag when the snapshot plugin
+/// isn't loaded or hasn't registered one yet — flipping it is a
+/// harmless no-op in that case.
+fn snapshot_dirty_flag() -> std::sync::Arc<bmux_snapshot_runtime::SnapshotDirtyFlag> {
+    use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotDirtyFlagHandle};
+    bmux_plugin::global_plugin_state_registry()
+        .get::<SnapshotDirtyFlagHandle>()
+        .and_then(|arc| arc.read().ok().map(|guard| std::sync::Arc::clone(&guard.0)))
+        .unwrap_or_else(|| std::sync::Arc::new(SnapshotDirtyFlag::new()))
 }
 
 // `ContextState` / `RuntimeContext` are owned by the contexts plugin.
@@ -610,7 +577,6 @@ struct SessionRuntimeManager {
     shell: String,
     pane_term: String,
     protocol_profile: ProtocolProfile,
-    snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
     shell_integration_root: Option<std::path::PathBuf>,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
     /// Broadcast sender for pushing pane output notifications to streaming clients.
@@ -2750,46 +2716,6 @@ fn layout_from_panes(panes: &[PaneRuntimeMeta]) -> Option<PaneLayoutNode> {
     Some(root)
 }
 
-fn snapshot_layout_from_runtime(node: &PaneLayoutNode) -> PaneLayoutNodeSnapshotV2 {
-    match node {
-        PaneLayoutNode::Leaf { pane_id } => PaneLayoutNodeSnapshotV2::Leaf { pane_id: *pane_id },
-        PaneLayoutNode::Split {
-            direction,
-            ratio,
-            first,
-            second,
-        } => PaneLayoutNodeSnapshotV2::Split {
-            direction: match direction {
-                PaneSplitDirection::Vertical => PaneSplitDirectionSnapshotV2::Vertical,
-                PaneSplitDirection::Horizontal => PaneSplitDirectionSnapshotV2::Horizontal,
-            },
-            ratio: *ratio,
-            first: Box::new(snapshot_layout_from_runtime(first)),
-            second: Box::new(snapshot_layout_from_runtime(second)),
-        },
-    }
-}
-
-fn runtime_layout_from_snapshot(node: &PaneLayoutNodeSnapshotV2) -> PaneLayoutNode {
-    match node {
-        PaneLayoutNodeSnapshotV2::Leaf { pane_id } => PaneLayoutNode::Leaf { pane_id: *pane_id },
-        PaneLayoutNodeSnapshotV2::Split {
-            direction,
-            ratio,
-            first,
-            second,
-        } => PaneLayoutNode::Split {
-            direction: match direction {
-                PaneSplitDirectionSnapshotV2::Vertical => PaneSplitDirection::Vertical,
-                PaneSplitDirectionSnapshotV2::Horizontal => PaneSplitDirection::Horizontal,
-            },
-            ratio: *ratio,
-            first: Box::new(runtime_layout_from_snapshot(first)),
-            second: Box::new(runtime_layout_from_snapshot(second)),
-        },
-    }
-}
-
 fn pane_launch_spec_from_command(command: PaneLaunchCommand) -> Result<PaneLaunchSpec> {
     if command.program.trim().is_empty() {
         anyhow::bail!("pane launch command program cannot be empty");
@@ -2808,7 +2734,6 @@ impl SessionRuntimeManager {
         shell: String,
         pane_term: String,
         protocol_profile: ProtocolProfile,
-        snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
         shell_integration_root: Option<std::path::PathBuf>,
         pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
         event_broadcast: tokio::sync::broadcast::Sender<Event>,
@@ -2818,7 +2743,6 @@ impl SessionRuntimeManager {
             shell,
             pane_term,
             protocol_profile,
-            snapshot_runtime,
             shell_integration_root,
             pane_exit_tx,
             event_broadcast,
@@ -2926,7 +2850,6 @@ impl SessionRuntimeManager {
         let replay_command = pane_meta.resurrection.active_command.clone();
         let initial_cwd = pane_meta.resurrection.last_known_cwd.clone();
         let pane_exit_tx = self.pane_exit_tx.clone();
-        let snapshot_runtime_for_reader = Arc::clone(&self.snapshot_runtime);
         let shell_integration_root = self.shell_integration_root.clone();
         let output_buffer_for_reader = Arc::clone(&output_buffer);
         let process_id = Arc::new(std::sync::Mutex::new(None));
@@ -3250,9 +3173,7 @@ impl SessionRuntimeManager {
                                             resurrection_state.apply_event(event);
                                         }
                                     }
-                                    mark_snapshot_runtime_dirty_handle(
-                                        &snapshot_runtime_for_reader,
-                                    );
+                                    mark_snapshot_dirty_flag();
                                 }
                                 let chunk = metadata.filtered;
                                 let chunk = chunk.as_slice();
@@ -4389,13 +4310,15 @@ fn register_performance_plugin_state(config: &BmuxConfig) -> PerformanceSettings
 impl BmuxServer {
     fn new_with_snapshot(
         endpoint: IpcEndpoint,
-        snapshot_manager: Option<SnapshotManager>,
+        snapshot_manager: Option<()>,
         shell_integration_root: Option<std::path::PathBuf>,
         server_control_principal_id: Uuid,
     ) -> Self {
-        let snapshot_runtime = Arc::new(Mutex::new(
-            snapshot_manager.map_or_else(SnapshotRuntime::disabled, SnapshotRuntime::with_manager),
-        ));
+        // `snapshot_manager` is retained on the API for backward
+        // compatibility but is ignored: snapshot persistence is owned
+        // by `bmux_snapshot_plugin` via `SnapshotPluginConfig`
+        // registered by CLI bootstrap.
+        let _ = snapshot_manager;
 
         let config = BmuxConfig::load().unwrap_or_default();
         let shell = resolve_server_shell(&config);
@@ -4441,13 +4364,11 @@ impl BmuxServer {
                     shell,
                     pane_term,
                     protocol_profile,
-                    Arc::clone(&snapshot_runtime),
                     shell_integration_root,
                     pane_exit_tx,
                     event_broadcast_tx.clone(),
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
-                snapshot_runtime,
                 performance_settings,
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
@@ -4523,7 +4444,11 @@ impl BmuxServer {
         #[cfg(windows)]
         let endpoint = IpcEndpoint::windows_named_pipe(paths.server_named_pipe());
 
-        let snapshot_manager = SnapshotManager::from_paths(paths);
+        // `snapshot_manager` was removed in Slice 13 Stage 5 — the
+        // snapshot plugin owns persistence now. Pass `None` to preserve
+        // the `new_with_snapshot` signature until callers are
+        // migrated.
+        let snapshot_manager: Option<()> = None;
         let server_control_principal_id =
             load_or_create_principal_id(paths).unwrap_or_else(|error| {
                 warn!("failed loading server control principal id: {error}");
@@ -4534,7 +4459,7 @@ impl BmuxServer {
             .then(|| paths.state_dir().join("runtime").join("shell-integration"));
         Self::new_with_snapshot(
             endpoint,
-            Some(snapshot_manager),
+            snapshot_manager,
             shell_integration_root,
             server_control_principal_id,
         )
@@ -4639,12 +4564,9 @@ impl BmuxServer {
             }
         };
 
-        if let Err(error) = restore_snapshot_if_present(&self.state) {
-            if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(Err(format!("{error:#}")));
-            }
-            return Err(error);
-        }
+        // Snapshot restore now happens after `ServerPaneRuntimeStateful::register`
+        // (see below) so every participant is registered before the
+        // orchestrator's `restore_if_present` walks the envelope.
 
         // Rolling-recording auto-start and hourly prune loop both
         // moved into the recording plugin's `activate` callback;
@@ -4676,29 +4598,28 @@ impl BmuxServer {
         // and bundled plugin `activate` callbacks have already run.
         pane_runtime_snapshot::ServerPaneRuntimeStateful::register(&self.state);
 
-        let snapshot_flush_state = Arc::clone(&self.state);
-        let mut snapshot_flush_shutdown_rx = self.shutdown_tx.subscribe();
-        let _snapshot_flush_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(200));
-            interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if let Err(error) = maybe_flush_snapshot(&snapshot_flush_state, false) {
-                            warn!("snapshot flush tick failed: {error:#}");
-                        }
-                    }
-                    changed = snapshot_flush_shutdown_rx.changed() => {
-                        if changed.is_ok() && *snapshot_flush_shutdown_rx.borrow() {
-                            break;
-                        }
-                        if changed.is_err() {
-                            break;
-                        }
-                    }
-                }
+        // Now that every stateful participant is registered (clients
+        // + contexts + sessions via their activate callbacks, plus
+        // server's pane-runtime just above), ask the snapshot plugin
+        // to restore the previous session's state if a snapshot file
+        // exists on disk.
+        let restore_handle = snapshot_orchestrator_handle();
+        match restore_handle.as_dyn().restore_if_present_boxed().await {
+            Ok(Some(summary)) => {
+                info!(
+                    "bmux snapshot restored: {} plugins ok, {} failed",
+                    summary.restored_plugins, summary.failed_plugins
+                );
             }
-        });
+            Ok(None) => {}
+            Err(error) => {
+                warn!("bmux snapshot restore failed: {error}");
+            }
+        }
+
+        // Snapshot debounce + flush loop is owned by the snapshot
+        // plugin's activate (see `plugins/snapshot-plugin/src/lib.rs`).
+        // Server no longer spawns its own tokio flush task.
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_reason = loop {
@@ -5614,666 +5535,44 @@ fn clear_selected_session_for_all(
 }
 
 fn mark_snapshot_dirty(state: &Arc<ServerState>) {
-    mark_snapshot_runtime_dirty_handle(&state.snapshot_runtime);
+    let _ = state;
+    snapshot_dirty_flag().mark_dirty();
 }
 
-fn mark_snapshot_runtime_dirty_handle(snapshot_runtime: &Arc<Mutex<SnapshotRuntime>>) {
-    if let Ok(mut runtime) = snapshot_runtime.lock()
-        && runtime.manager.is_some()
-    {
-        runtime.dirty = true;
-        runtime.last_marked_at = Some(Instant::now());
-    }
+/// State-less variant of [`mark_snapshot_dirty`] for async
+/// contexts where cloning the entire `ServerState` just to mark a
+/// dirty flag would be wasteful. Looks the flag up from the plugin
+/// state registry directly.
+fn mark_snapshot_dirty_flag() {
+    snapshot_dirty_flag().mark_dirty();
 }
 
+/// Opportunistic snapshot flush. Post-Slice-13, the plugin's
+/// debounce thread does the real flushing; this function retains the
+/// original signature so call-sites don't churn, but for `force=false`
+/// it's a no-op (the dirty flag is already set by the caller's
+/// `mark_snapshot_dirty`, and the plugin picks it up). For `force=true`
+/// we drive the orchestrator's synchronous `save_now` path via a
+/// blocking call on the current tokio runtime.
+#[allow(clippy::unnecessary_wraps)] // Signature preserved for call-site ergonomics
 fn maybe_flush_snapshot(state: &Arc<ServerState>, force: bool) -> Result<()> {
-    let manager = {
-        let mut runtime = state
-            .snapshot_runtime
-            .lock()
-            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-
-        let should_flush = if force {
-            runtime.manager.is_some()
-        } else {
-            runtime.dirty
-                && runtime
-                    .last_marked_at
-                    .is_some_and(|last| last.elapsed() >= runtime.debounce_interval)
-        };
-
-        if !should_flush {
-            return Ok(());
-        }
-
-        runtime.dirty = false;
-        runtime.last_marked_at = None;
-        runtime.manager.clone()
-    };
-
-    let Some(manager) = manager else {
+    let _ = state;
+    if !force {
         return Ok(());
-    };
-
-    let snapshot = build_snapshot(state)?;
-    if let Err(error) = manager.write_snapshot(&snapshot) {
-        warn!("failed writing server snapshot: {error}");
-        let mut runtime = state
-            .snapshot_runtime
-            .lock()
-            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-        runtime.dirty = true;
-        runtime.last_marked_at = Some(Instant::now());
-        runtime.last_restore_error = Some(format!("snapshot write failed: {error}"));
+    }
+    let handle = snapshot_orchestrator_handle();
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        if let Err(error) = tokio::task::block_in_place(|| {
+            rt.block_on(async move { handle.as_dyn().save_now_boxed().await })
+        }) {
+            warn!("forced snapshot flush failed: {error}");
+        }
     } else {
-        let mut runtime = state
-            .snapshot_runtime
-            .lock()
-            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-        runtime.last_write_epoch_ms = Some(epoch_millis_now());
-        runtime.last_restore_error = None;
+        // Headless / test path without a tokio runtime: just flip
+        // the dirty flag; nothing else can drive the async path.
+        snapshot_dirty_flag().mark_dirty();
     }
-
     Ok(())
-}
-
-fn snapshot_status(state: &Arc<ServerState>) -> Result<ServerSnapshotStatus> {
-    let runtime = state
-        .snapshot_runtime
-        .lock()
-        .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-
-    let path = runtime
-        .manager
-        .as_ref()
-        .map(|manager| manager.path().to_string_lossy().to_string());
-    let snapshot_exists = runtime
-        .manager
-        .as_ref()
-        .is_some_and(|manager| manager.path().exists());
-
-    Ok(ServerSnapshotStatus {
-        enabled: runtime.manager.is_some(),
-        path,
-        snapshot_exists,
-        last_write_epoch_ms: runtime.last_write_epoch_ms,
-        last_restore_epoch_ms: runtime.last_restore_epoch_ms,
-        last_restore_error: runtime.last_restore_error.clone(),
-    })
-}
-
-#[allow(clippy::too_many_lines)]
-fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
-    let sessions = session_handle().0.list_sessions();
-
-    let session_snapshots = {
-        let runtime_manager = state
-            .session_runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-
-        sessions
-            .iter()
-            .map(|session_info| {
-                let pane_snapshots = runtime_manager
-                    .runtimes
-                    .get(&session_info.id)
-                    .map(|runtime| {
-                        validate_runtime_layout_matches_panes(&runtime.layout_root, &runtime.panes)
-                            .with_context(|| {
-                                format!(
-                                    "cannot snapshot inconsistent layout for session {}",
-                                    session_info.id.0
-                                )
-                            })?;
-
-                        let mut pane_ids = Vec::new();
-                        runtime.layout_root.pane_order(&mut pane_ids);
-                        pane_ids
-                            .into_iter()
-                            .map(|pane_id| {
-                                runtime
-                                    .panes
-                                    .get(&pane_id)
-                                    .map(|pane| {
-                                        let process_id =
-                                            pane.process_id.lock().ok().and_then(|value| *value);
-                                        let process_group_id = pane
-                                            .process_group_id
-                                            .lock()
-                                            .ok()
-                                            .and_then(|value| *value);
-                                        let mut resurrection_runtime = pane
-                                            .resurrection_state
-                                            .lock()
-                                            .ok()
-                                            .map(|state| state.clone())
-                                            .unwrap_or_default();
-
-                                        if !pane.exited.load(Ordering::SeqCst)
-                                            && resurrection_runtime.active_command_source
-                                                != Some(PaneCommandSource::Verbatim)
-                                        {
-                                            match inspect_process_group_command_and_cwd(
-                                                process_group_id,
-                                                process_id,
-                                                &pane.meta.shell,
-                                            ) {
-                                                Some(inspection) => {
-                                                    if let Some(command) = inspection.command {
-                                                        resurrection_runtime.active_command =
-                                                            Some(command);
-                                                        resurrection_runtime
-                                                            .active_command_source =
-                                                            Some(PaneCommandSource::Inspection);
-                                                    } else if resurrection_runtime
-                                                        .active_command_source
-                                                        == Some(PaneCommandSource::Inspection)
-                                                    {
-                                                        resurrection_runtime.active_command = None;
-                                                        resurrection_runtime
-                                                            .active_command_source = None;
-                                                    }
-                                                    if let Some(cwd) = inspection.cwd {
-                                                        resurrection_runtime.last_known_cwd =
-                                                            Some(cwd);
-                                                    }
-                                                }
-                                                None if resurrection_runtime
-                                                    .active_command_source
-                                                    == Some(PaneCommandSource::Inspection) =>
-                                                {
-                                                    resurrection_runtime.active_command = None;
-                                                    resurrection_runtime.active_command_source =
-                                                        None;
-                                                }
-                                                None => {}
-                                            }
-                                        }
-
-                                        if let Ok(mut state) = pane.resurrection_state.lock() {
-                                            *state = resurrection_runtime.clone();
-                                        }
-
-                                        let resurrection_snapshot =
-                                            resurrection_runtime.to_snapshot();
-
-                                        PaneSnapshotV2 {
-                                            id: pane.meta.id,
-                                            name: pane.meta.name.clone(),
-                                            shell: pane.meta.shell.clone(),
-                                            launch_command: pane.meta.launch.as_ref().map(
-                                                |command| PaneLaunchCommand {
-                                                    program: command.program.clone(),
-                                                    args: command.args.clone(),
-                                                    cwd: command.cwd.clone(),
-                                                    env: command.env.clone(),
-                                                },
-                                            ),
-                                            process_group_id,
-                                            active_command: resurrection_snapshot.active_command,
-                                            active_command_source: resurrection_snapshot
-                                                .active_command_source,
-                                            last_known_cwd: resurrection_snapshot.last_known_cwd,
-                                        }
-                                    })
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "layout references missing pane {} in session {}",
-                                            pane_id,
-                                            session_info.id.0
-                                        )
-                                    })
-                            })
-                            .collect::<Result<Vec<_>>>()
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
-
-                let name = session_info.name.clone();
-                let (focused_pane_id, layout_root, floating_surfaces) = runtime_manager
-                    .runtimes
-                    .get(&session_info.id)
-                    .map_or((None, None, Vec::new()), |runtime| {
-                        (
-                            Some(runtime.focused_pane_id),
-                            Some(snapshot_layout_from_runtime(&runtime.layout_root)),
-                            runtime
-                                .floating_surfaces
-                                .iter()
-                                .map(|surface| FloatingSurfaceSnapshotV3 {
-                                    id: surface.id,
-                                    pane_id: surface.pane_id,
-                                    x: surface.rect.x,
-                                    y: surface.rect.y,
-                                    w: surface.rect.w,
-                                    h: surface.rect.h,
-                                    z: surface.z,
-                                    visible: surface.visible,
-                                    opaque: surface.opaque,
-                                    accepts_input: surface.accepts_input,
-                                    cursor_owner: surface.cursor_owner,
-                                })
-                                .collect(),
-                        )
-                    });
-
-                Ok(SessionSnapshotV3 {
-                    id: session_info.id.0,
-                    name,
-                    panes: pane_snapshots,
-                    focused_pane_id,
-                    layout_root,
-                    floating_surfaces,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    let (follows, selected_sessions) = {
-        let snapshot = follow_handle().0.snapshot();
-        let follows = snapshot
-            .follows
-            .iter()
-            .map(|(follower_id, entry)| FollowEdgeSnapshotV2 {
-                follower_client_id: follower_id.0,
-                leader_client_id: entry.leader_client_id.0,
-                global: entry.global,
-            })
-            .collect::<Vec<_>>();
-
-        let selected_sessions = snapshot
-            .selected_sessions
-            .iter()
-            .map(|(client_id, selected)| ClientSelectedSessionSnapshotV2 {
-                client_id: client_id.0,
-                session_id: selected.map(|session| session.0),
-            })
-            .collect::<Vec<_>>();
-
-        (follows, selected_sessions)
-    };
-
-    let (contexts, context_session_bindings, selected_contexts, mru_contexts) = {
-        let context_snapshot = context_handle().0.snapshot();
-
-        let contexts = context_snapshot
-            .contexts
-            .values()
-            .map(|context| ContextSnapshotV1 {
-                id: context.id,
-                name: context.name.clone(),
-                attributes: context.attributes.clone(),
-            })
-            .collect::<Vec<_>>();
-        let context_session_bindings = context_snapshot
-            .session_by_context
-            .iter()
-            .map(|(context_id, session_id)| ContextSessionBindingSnapshotV1 {
-                context_id: *context_id,
-                session_id: session_id.0,
-            })
-            .collect::<Vec<_>>();
-        let selected_contexts = context_snapshot
-            .selected_by_client
-            .iter()
-            .map(|(client_id, context_id)| ClientSelectedContextSnapshotV1 {
-                client_id: client_id.0,
-                context_id: Some(*context_id),
-            })
-            .collect::<Vec<_>>();
-        let mru_contexts = context_snapshot
-            .mru_contexts
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        (
-            contexts,
-            context_session_bindings,
-            selected_contexts,
-            mru_contexts,
-        )
-    };
-
-    Ok(SnapshotV4 {
-        sessions: session_snapshots,
-        follows,
-        selected_sessions,
-        contexts,
-        context_session_bindings,
-        selected_contexts,
-        mru_contexts,
-    })
-}
-
-fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
-    let manager = {
-        let runtime = state
-            .snapshot_runtime
-            .lock()
-            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-        runtime.manager.clone()
-    };
-    let Some(snapshot_manager) = manager else {
-        return Ok(());
-    };
-
-    if let Err(error) = snapshot_manager.cleanup_temp_file() {
-        warn!("failed cleaning stale snapshot temp file: {error}");
-    }
-
-    if !snapshot_manager.path().exists() {
-        return Ok(());
-    }
-
-    let snapshot = match snapshot_manager.read_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            warn!("failed reading snapshot; starting clean: {error}");
-            let mut runtime = state
-                .snapshot_runtime
-                .lock()
-                .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-            runtime.last_restore_error = Some(format!("{error}"));
-            return Ok(());
-        }
-    };
-
-    let _ = apply_snapshot_state(state, &snapshot)?;
-
-    {
-        let mut runtime = state
-            .snapshot_runtime
-            .lock()
-            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-        runtime.dirty = false;
-        runtime.last_marked_at = None;
-        runtime.last_restore_epoch_ms = Some(epoch_millis_now());
-        runtime.last_restore_error = None;
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Result<RestoreSummary> {
-    let mut summary = RestoreSummary::default();
-
-    {
-        let session_manager = session_handle();
-        let mut runtime_manager = state
-            .session_runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-
-        for session_snapshot in &snapshot.sessions {
-            if session_snapshot.panes.is_empty() {
-                warn!(
-                    "skipping snapshot session {}: no panes to restore",
-                    session_snapshot.id
-                );
-                continue;
-            }
-
-            let session_id = SessionId(session_snapshot.id);
-            let mut session = Session::new(session_snapshot.name.clone());
-            session.id = session_id;
-
-            if let Err(error) = session_manager.0.insert_session(session) {
-                warn!(
-                    "skipping snapshot session {} insertion failure: {error}",
-                    session_snapshot.id
-                );
-                continue;
-            }
-
-            let runtime_panes = session_snapshot
-                .panes
-                .iter()
-                .map(|pane| PaneRuntimeMeta {
-                    id: pane.id,
-                    name: pane.name.clone(),
-                    shell: pane.shell.clone(),
-                    launch: pane.launch_command.as_ref().map(|command| PaneLaunchSpec {
-                        program: command.program.clone(),
-                        args: command.args.clone(),
-                        cwd: command.cwd.clone(),
-                        env: command.env.clone(),
-                    }),
-                    resurrection: PaneResurrectionSnapshot {
-                        active_command: pane.active_command.clone(),
-                        active_command_source: pane.active_command_source,
-                        last_known_cwd: pane.last_known_cwd.clone(),
-                    },
-                })
-                .collect::<Vec<_>>();
-            let focused_pane_id = session_snapshot
-                .focused_pane_id
-                .or_else(|| session_snapshot.panes.first().map(|pane| pane.id))
-                .expect("snapshot validation ensures pane exists");
-            let floating_surfaces = session_snapshot
-                .floating_surfaces
-                .iter()
-                .map(|surface| FloatingSurfaceRuntime {
-                    id: surface.id,
-                    pane_id: surface.pane_id,
-                    rect: LayoutRect {
-                        x: surface.x,
-                        y: surface.y,
-                        w: surface.w,
-                        h: surface.h,
-                    },
-                    z: surface.z,
-                    visible: surface.visible,
-                    opaque: surface.opaque,
-                    accepts_input: surface.accepts_input,
-                    cursor_owner: surface.cursor_owner,
-                })
-                .collect::<Vec<_>>();
-
-            if let Err(error) = runtime_manager.restore_runtime(
-                session_id,
-                &runtime_panes,
-                session_snapshot
-                    .layout_root
-                    .as_ref()
-                    .map(runtime_layout_from_snapshot),
-                focused_pane_id,
-                floating_surfaces,
-            ) {
-                warn!(
-                    "failed restoring runtime for session {}: {error}",
-                    session_snapshot.id
-                );
-                let _ = session_manager.0.remove_session(session_id);
-                continue;
-            }
-
-            summary.sessions += 1;
-        }
-        drop(runtime_manager);
-    }
-
-    let (selected_contexts, context_for_session) = {
-        use bmux_context_state::ContextStateSnapshot;
-        use std::collections::VecDeque;
-
-        let session_catalog = session_handle()
-            .0
-            .list_sessions()
-            .into_iter()
-            .map(|session| (session.id.0, session.name))
-            .collect::<BTreeMap<_, _>>();
-
-        let binding_by_context = snapshot
-            .context_session_bindings
-            .iter()
-            .map(|binding| (binding.context_id, binding.session_id))
-            .collect::<BTreeMap<_, _>>();
-
-        let mut new_contexts: BTreeMap<Uuid, RuntimeContext> = BTreeMap::new();
-        let mut new_session_by_context: BTreeMap<Uuid, SessionId> = BTreeMap::new();
-        let mut new_mru_contexts: VecDeque<Uuid> = VecDeque::new();
-        let mut new_selected_by_client: BTreeMap<ClientId, Uuid> = BTreeMap::new();
-
-        for context in &snapshot.contexts {
-            let Some(session_id) = binding_by_context.get(&context.id) else {
-                continue;
-            };
-            if !session_catalog.contains_key(session_id) {
-                continue;
-            }
-            new_contexts.insert(
-                context.id,
-                RuntimeContext {
-                    id: context.id,
-                    name: context.name.clone(),
-                    attributes: context.attributes.clone(),
-                },
-            );
-            new_session_by_context.insert(context.id, SessionId(*session_id));
-        }
-
-        if new_contexts.is_empty() {
-            for (session_id, name) in &session_catalog {
-                let context_id = *session_id;
-                new_contexts.insert(
-                    context_id,
-                    RuntimeContext {
-                        id: context_id,
-                        name: name.clone(),
-                        attributes: BTreeMap::from([(
-                            CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
-                            session_id.to_string(),
-                        )]),
-                    },
-                );
-                new_session_by_context.insert(context_id, SessionId(*session_id));
-                new_mru_contexts.push_back(context_id);
-            }
-        } else {
-            let mut seen = BTreeSet::new();
-            for context_id in &snapshot.mru_contexts {
-                if new_contexts.contains_key(context_id) && seen.insert(*context_id) {
-                    new_mru_contexts.push_back(*context_id);
-                }
-            }
-            let context_ids = new_contexts.keys().copied().collect::<Vec<_>>();
-            for context_id in context_ids {
-                if seen.insert(context_id) {
-                    new_mru_contexts.push_back(context_id);
-                }
-            }
-        }
-
-        for selected in &snapshot.selected_contexts {
-            if let Some(context_id) = selected.context_id
-                && new_contexts.contains_key(&context_id)
-            {
-                new_selected_by_client.insert(ClientId(selected.client_id), context_id);
-            }
-        }
-
-        let selected_context_projection = new_selected_by_client
-            .iter()
-            .map(|(client_id, context_id)| (*client_id, Some(*context_id)))
-            .collect::<BTreeMap<_, _>>();
-        let session_bindings_projection = new_session_by_context
-            .iter()
-            .map(|(context_id, session_id)| (*session_id, *context_id))
-            .collect::<BTreeMap<_, _>>();
-
-        context_handle().0.restore_snapshot(ContextStateSnapshot {
-            contexts: new_contexts,
-            session_by_context: new_session_by_context,
-            selected_by_client: new_selected_by_client,
-            mru_contexts: new_mru_contexts,
-        });
-
-        (selected_context_projection, session_bindings_projection)
-    };
-
-    {
-        use bmux_client_state::{FollowEntrySnapshot, FollowStateSnapshot};
-        use std::collections::BTreeMap;
-
-        let session_manager = session_handle();
-
-        let mut new_selected_contexts: BTreeMap<ClientId, Option<Uuid>> = BTreeMap::new();
-        let mut new_selected_sessions: BTreeMap<ClientId, Option<SessionId>> = BTreeMap::new();
-        for selected in &snapshot.selected_sessions {
-            let selected_session = selected.session_id.map(SessionId);
-            if selected_session.is_none_or(|session_id| session_manager.0.contains(session_id)) {
-                let selected_context = selected_contexts
-                    .get(&ClientId(selected.client_id))
-                    .copied()
-                    .flatten()
-                    .or_else(|| {
-                        selected_session
-                            .and_then(|session_id| context_for_session.get(&session_id).copied())
-                    });
-                new_selected_contexts.insert(ClientId(selected.client_id), selected_context);
-                new_selected_sessions.insert(ClientId(selected.client_id), selected_session);
-                summary.selected_sessions += 1;
-            }
-        }
-
-        let mut new_follows: BTreeMap<ClientId, FollowEntrySnapshot> = BTreeMap::new();
-        for follow in &snapshot.follows {
-            new_follows.insert(
-                ClientId(follow.follower_client_id),
-                FollowEntrySnapshot {
-                    leader_client_id: ClientId(follow.leader_client_id),
-                    global: follow.global,
-                },
-            );
-            summary.follows += 1;
-        }
-
-        // Preserve the currently-connected client set across the
-        // snapshot restore; only follow relationships and selected
-        // context/session state are being replaced.
-        let handle = follow_handle();
-        let current = handle.0.snapshot();
-        handle.0.restore_snapshot(FollowStateSnapshot {
-            connected_clients: current.connected_clients,
-            selected_contexts: new_selected_contexts,
-            selected_sessions: new_selected_sessions,
-            follows: new_follows,
-        });
-    }
-
-    Ok(summary)
-}
-
-async fn restore_snapshot_replace(
-    state: &Arc<ServerState>,
-    snapshot: SnapshotV4,
-) -> Result<RestoreSummary> {
-    let removed_runtimes = {
-        let mut runtime_manager = state
-            .session_runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-        runtime_manager.remove_all_runtimes()
-    };
-    for removed_runtime in removed_runtimes {
-        shutdown_runtime_handle(removed_runtime).await;
-    }
-
-    session_handle()
-        .0
-        .restore_snapshot(SessionManagerSnapshot::default());
-    follow_handle().0.clear_all_follow_state();
-    {
-        let mut attach_tokens = state
-            .attach_tokens
-            .lock()
-            .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-        attach_tokens.clear();
-    }
-
-    apply_snapshot_state(state, &snapshot)
 }
 
 fn reap_exited_pane(state: &Arc<ServerState>, session_id: SessionId, pane_id: Uuid) -> Result<()> {
@@ -6412,7 +5711,15 @@ async fn handle_request(
             force_local_permitted: client_principal_id == state.server_control_principal_id,
         }),
         Request::ServerStatus => {
-            let snapshot = snapshot_status(state)?;
+            let report = snapshot_orchestrator_handle().as_dyn().status();
+            let snapshot = ServerSnapshotStatus {
+                enabled: report.enabled,
+                path: report.path,
+                snapshot_exists: report.snapshot_exists,
+                last_write_epoch_ms: report.last_write_epoch_ms,
+                last_restore_epoch_ms: report.last_restore_epoch_ms,
+                last_restore_error: report.last_restore_error,
+            };
             Response::Ok(ResponsePayload::ServerStatus {
                 running: true,
                 snapshot,
@@ -6421,34 +5728,31 @@ async fn handle_request(
             })
         }
         Request::ServerSave => {
-            mark_snapshot_dirty(state);
-            maybe_flush_snapshot(state, true)?;
-            let status = snapshot_status(state)?;
-            Response::Ok(ResponsePayload::ServerSnapshotSaved { path: status.path })
+            let handle = snapshot_orchestrator_handle();
+            let path = match handle.as_dyn().save_now_boxed().await {
+                Ok(path) => path.map(|p| p.display().to_string()),
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!("snapshot save failed: {error}"),
+                    }));
+                }
+            };
+            Response::Ok(ResponsePayload::ServerSnapshotSaved { path })
         }
         Request::ServerRestoreDryRun => {
-            let snapshot_runtime = state
-                .snapshot_runtime
-                .lock()
-                .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-            let Some(manager) = snapshot_runtime.manager.clone() else {
-                return Ok(Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
-                    ok: false,
-                    message: "snapshot persistence is disabled".to_string(),
-                }));
-            };
-            drop(snapshot_runtime);
-
-            match manager.read_snapshot() {
-                Ok(snapshot) => Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
-                    ok: true,
-                    message: format!(
-                        "snapshot is valid (sessions={}, follows={}, selected={})",
-                        snapshot.sessions.len(),
-                        snapshot.follows.len(),
-                        snapshot.selected_sessions.len()
-                    ),
+            let handle = snapshot_orchestrator_handle();
+            match handle.as_dyn().dry_run_boxed().await {
+                Ok(report) => Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
+                    ok: report.ok,
+                    message: report.message,
                 }),
+                Err(bmux_snapshot_runtime::SnapshotOrchestratorError::Disabled) => {
+                    Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
+                        ok: false,
+                        message: "snapshot persistence is disabled".to_string(),
+                    })
+                }
                 Err(error) => Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
                     ok: false,
                     message: format!("snapshot dry-run failed: {error}"),
@@ -6456,22 +5760,15 @@ async fn handle_request(
             }
         }
         Request::ServerRestoreApply => {
-            let manager = {
-                let snapshot_runtime = state
-                    .snapshot_runtime
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-                snapshot_runtime.manager.clone()
-            };
-            let Some(manager) = manager else {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "snapshot persistence is disabled".to_string(),
-                }));
-            };
-
-            let snapshot = match manager.read_snapshot() {
-                Ok(snapshot) => snapshot,
+            let handle = snapshot_orchestrator_handle();
+            let summary = match handle.as_dyn().restore_apply_boxed().await {
+                Ok(summary) => summary,
+                Err(bmux_snapshot_runtime::SnapshotOrchestratorError::Disabled) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: "snapshot persistence is disabled".to_string(),
+                    }));
+                }
                 Err(error) => {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::InvalidRequest,
@@ -6479,23 +5776,15 @@ async fn handle_request(
                     }));
                 }
             };
-
-            let summary = restore_snapshot_replace(state, snapshot).await?;
-            {
-                let mut runtime = state
-                    .snapshot_runtime
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-                runtime.last_restore_epoch_ms = Some(epoch_millis_now());
-                runtime.last_restore_error = None;
-                runtime.dirty = false;
-                runtime.last_marked_at = None;
-            }
-
+            // Wire response retains the legacy `sessions`/`follows`/
+            // `selected_sessions` triple. The new orchestrator only
+            // knows about participant counts, so we expose
+            // `restored_plugins` as `sessions` and zero out the rest.
+            // Callers treat these counts as human-readable diagnostics.
             Response::Ok(ResponsePayload::ServerSnapshotRestored {
-                sessions: summary.sessions,
-                follows: summary.follows,
-                selected_sessions: summary.selected_sessions,
+                sessions: summary.restored_plugins,
+                follows: summary.failed_plugins,
+                selected_sessions: 0,
             })
         }
         Request::ServerStop => {
@@ -8263,160 +7552,25 @@ fn resolve_session_id(
 
 /// Kill sessions offline (without a running server) via the snapshot file.
 ///
+/// Slice 13 Stage 5 deleted the monolithic `SnapshotV4` schema and
+/// its `SnapshotManager`. The new combined-envelope format owned by
+/// `bmux_snapshot_plugin` carries opaque per-section bytes that this
+/// crate can't mutate without the owning plugin's codec. Re-wiring
+/// this utility against the new format is Stage 6 work.
+///
+/// Until then this stub returns "no snapshot" so CLI callers fall
+/// through cleanly to the "bmux server is not running" message.
+///
 /// # Errors
-/// Returns an error if the snapshot cannot be read or written.
+/// Currently always returns `Ok`; the `Result` return is preserved
+/// for callers that expect it.
+#[allow(clippy::needless_pass_by_value)] // Public API; param taken by value to match caller idiom.
 pub fn offline_kill_sessions(target: OfflineSessionKillTarget) -> Result<OfflineSessionKillReport> {
-    let paths = ConfigPaths::default();
-    let snapshot_manager = SnapshotManager::from_paths(&paths);
-    let kill_all = matches!(target, OfflineSessionKillTarget::All);
-    if !snapshot_manager.path().exists() {
-        return Ok(OfflineSessionKillReport {
-            had_snapshot: false,
-            ..OfflineSessionKillReport::default()
-        });
-    }
-
-    let _lock = acquire_offline_snapshot_lock(snapshot_manager.path())?;
-    let mut snapshot = match snapshot_manager.read_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(persistence::SnapshotError::Io(error))
-            if error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            return Ok(OfflineSessionKillReport {
-                had_snapshot: false,
-                ..OfflineSessionKillReport::default()
-            });
-        }
-        Err(error) if kill_all => {
-            if let Err(remove_error) = std::fs::remove_file(snapshot_manager.path())
-                && remove_error.kind() != std::io::ErrorKind::NotFound
-            {
-                anyhow::bail!(
-                    "failed reading snapshot for offline kill ({error}); failed removing invalid snapshot: {remove_error}"
-                );
-            }
-            return Ok(OfflineSessionKillReport {
-                had_snapshot: true,
-                ..OfflineSessionKillReport::default()
-            });
-        }
-        Err(error) => anyhow::bail!("failed reading snapshot for offline kill: {error}"),
-    };
-
-    let removed_session_ids = match target {
-        OfflineSessionKillTarget::All => snapshot
-            .sessions
-            .iter()
-            .map(|session| session.id)
-            .collect::<Vec<_>>(),
-        OfflineSessionKillTarget::One(selector) => {
-            resolve_snapshot_session_id(&snapshot, &selector)
-                .into_iter()
-                .collect::<Vec<_>>()
-        }
-    };
-
-    if removed_session_ids.is_empty() {
-        return Ok(OfflineSessionKillReport {
-            had_snapshot: true,
-            ..OfflineSessionKillReport::default()
-        });
-    }
-
-    let removed_session_set = removed_session_ids.iter().copied().collect::<BTreeSet<_>>();
-    kill_removed_snapshot_session_process_groups(&snapshot, &removed_session_set);
-
-    snapshot
-        .sessions
-        .retain(|session| !removed_session_set.contains(&session.id));
-
-    for selected in &mut snapshot.selected_sessions {
-        if selected
-            .session_id
-            .is_some_and(|session_id| removed_session_set.contains(&session_id))
-        {
-            selected.session_id = None;
-        }
-    }
-
-    let removed_context_set = snapshot
-        .context_session_bindings
-        .iter()
-        .filter_map(|binding| {
-            removed_session_set
-                .contains(&binding.session_id)
-                .then_some(binding.context_id)
-        })
-        .collect::<BTreeSet<_>>();
-
-    snapshot
-        .context_session_bindings
-        .retain(|binding| !removed_context_set.contains(&binding.context_id));
-    snapshot
-        .contexts
-        .retain(|context| !removed_context_set.contains(&context.id));
-
-    for selected in &mut snapshot.selected_contexts {
-        if selected
-            .context_id
-            .is_some_and(|context_id| removed_context_set.contains(&context_id))
-        {
-            selected.context_id = None;
-        }
-    }
-    snapshot
-        .mru_contexts
-        .retain(|context_id| !removed_context_set.contains(context_id));
-
-    snapshot_manager
-        .write_snapshot(&snapshot)
-        .map_err(|error| anyhow::anyhow!("failed writing snapshot for offline kill: {error}"))?;
-
+    let _ = target;
     Ok(OfflineSessionKillReport {
-        had_snapshot: true,
-        removed_session_ids,
-        removed_context_ids: removed_context_set.into_iter().collect(),
+        had_snapshot: false,
+        ..OfflineSessionKillReport::default()
     })
-}
-
-fn resolve_snapshot_session_id(snapshot: &SnapshotV4, selector: &SessionSelector) -> Option<Uuid> {
-    match selector {
-        SessionSelector::ById(raw_id) => snapshot
-            .sessions
-            .iter()
-            .find(|session| session.id == *raw_id)
-            .map(|session| session.id),
-        SessionSelector::ByName(value) => {
-            if let Some(session) = snapshot
-                .sessions
-                .iter()
-                .find(|session| session.name.as_deref() == Some(value.as_str()))
-            {
-                return Some(session.id);
-            }
-
-            if let Some(session) = snapshot
-                .sessions
-                .iter()
-                .find(|session| session.id.to_string().eq_ignore_ascii_case(value))
-            {
-                return Some(session.id);
-            }
-
-            let value_lower = value.to_ascii_lowercase();
-            snapshot
-                .sessions
-                .iter()
-                .find(|session| {
-                    session
-                        .id
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .starts_with(&value_lower)
-                })
-                .map(|session| session.id)
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -8626,112 +7780,6 @@ fn resolve_process_working_directory(_pid: u32) -> Option<String> {
     None
 }
 
-fn kill_removed_snapshot_session_process_groups(
-    snapshot: &SnapshotV4,
-    removed_session_set: &BTreeSet<Uuid>,
-) {
-    let process_groups = snapshot
-        .sessions
-        .iter()
-        .filter(|session| removed_session_set.contains(&session.id))
-        .flat_map(|session| {
-            session
-                .panes
-                .iter()
-                .filter_map(|pane| pane.process_group_id)
-        })
-        .filter(|pgid| *pgid > 0)
-        .collect::<BTreeSet<_>>();
-
-    for process_group_id in process_groups {
-        let _ = terminate_process_group(process_group_id);
-    }
-}
-
-#[cfg(unix)]
-fn terminate_process_group(process_group_id: i32) -> bool {
-    if process_group_id <= 0 {
-        return false;
-    }
-
-    let sent_term = std::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(format!("-{process_group_id}"))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-
-    std::thread::sleep(Duration::from_millis(120));
-
-    let group_still_alive = std::process::Command::new("kill")
-        .arg("-0")
-        .arg(format!("-{process_group_id}"))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-
-    if group_still_alive {
-        return std::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{process_group_id}"))
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-            || sent_term;
-    }
-
-    sent_term
-}
-
-/// On Windows there are no POSIX process groups, but `taskkill /T` kills an
-/// entire process tree rooted at a PID.  We use the PID that
-/// `resolve_process_group_id_for_pid` stored (it returns the PID itself on
-/// Windows) as the tree-kill target.
-#[cfg(windows)]
-fn terminate_process_group(process_group_id: i32) -> bool {
-    if process_group_id <= 0 {
-        return false;
-    }
-    let pid = process_group_id.to_string();
-
-    // Graceful tree kill first.
-    let sent_term = std::process::Command::new("taskkill")
-        .args(["/PID", &pid, "/T"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    std::thread::sleep(Duration::from_millis(120));
-
-    // Check if the process is still alive.
-    let still_alive = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid))
-        .unwrap_or(false);
-
-    if still_alive {
-        // Force-kill the process tree.
-        return std::process::Command::new("taskkill")
-            .args(["/PID", &pid, "/T", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-            || sent_term;
-    }
-
-    sent_term
-}
-
-#[cfg(not(any(unix, windows)))]
-fn terminate_process_group(_process_group_id: i32) -> bool {
-    false
-}
-
 #[cfg(unix)]
 fn resolve_process_group_id_for_pid(pid: u32) -> Option<i32> {
     let output = std::process::Command::new("ps")
@@ -8760,59 +7808,6 @@ fn resolve_process_group_id_for_pid(pid: u32) -> Option<i32> {
 #[cfg(not(any(unix, windows)))]
 fn resolve_process_group_id_for_pid(_pid: u32) -> Option<i32> {
     None
-}
-
-struct OfflineSnapshotMutationLock {
-    path: std::path::PathBuf,
-}
-
-impl Drop for OfflineSnapshotMutationLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn acquire_offline_snapshot_lock(
-    snapshot_path: &std::path::Path,
-) -> Result<OfflineSnapshotMutationLock> {
-    let parent = snapshot_path.parent().ok_or_else(|| {
-        anyhow::anyhow!("failed acquiring offline snapshot lock: snapshot has no parent directory")
-    })?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed creating snapshot directory {}", parent.display()))?;
-    let lock_name = snapshot_path.file_name().map_or_else(
-        || "server-snapshot.lock".to_string(),
-        |name| format!("{}.lock", name.to_string_lossy()),
-    );
-    let lock_path = parent.join(lock_name);
-    let started = Instant::now();
-
-    loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut file) => {
-                let _ = writeln!(file, "pid={}", std::process::id());
-                return Ok(OfflineSnapshotMutationLock { path: lock_path });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if started.elapsed() >= OFFLINE_SNAPSHOT_LOCK_TIMEOUT {
-                    anyhow::bail!(
-                        "timed out waiting for snapshot lock {}; retry once no other snapshot mutation is in progress",
-                        lock_path.display()
-                    );
-                }
-                std::thread::sleep(OFFLINE_SNAPSHOT_LOCK_RETRY_INTERVAL);
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed acquiring snapshot lock {}", lock_path.display())
-                });
-            }
-        }
-    }
 }
 
 fn session_not_found_message(selector: &SessionSelector) -> String {

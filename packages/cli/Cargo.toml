@@ -38,6 +38,7 @@ bmux_recording_plugin_api       = { workspace = true }
 bmux_server                     = { workspace = true }
 bmux_sessions_plugin_api        = { workspace = true }
 bmux_slots                      = { workspace = true }
+bmux_snapshot_plugin_api        = { workspace = true }
 bmux_terminal_protocol          = { workspace = true }
 bmux_windows_plugin_api         = { workspace = true }
 

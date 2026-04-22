@@ -131,10 +131,6 @@ fn core_packages_do_not_reference_domain_plugin_markers() {
             include_str!("../../server/src/lib.rs"),
         ),
         (
-            "packages/server/src/persistence.rs",
-            include_str!("../../server/src/persistence.rs"),
-        ),
-        (
             "packages/client/src/lib.rs",
             include_str!("../../client/src/lib.rs"),
         ),

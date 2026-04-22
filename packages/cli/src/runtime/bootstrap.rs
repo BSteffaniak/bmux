@@ -369,6 +369,7 @@ pub(super) async fn run_server_start(
         effective_rolling_enabled,
         &effective_rolling_settings,
     );
+    register_snapshot_plugin_config(&paths);
     activate_loaded_plugins(&loaded_plugins, &config, &paths)?;
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;
     let server = BmuxServer::from_config_paths_with_start_options(
@@ -437,6 +438,23 @@ fn register_recording_plugin_config(
     };
     let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
     bmux_plugin::global_plugin_state_registry().register::<RecordingPluginConfig>(&handle);
+}
+
+/// Register the snapshot plugin's startup config (file path +
+/// debounce window) into the plugin state registry. Called between
+/// `load_enabled_plugins` and `activate_loaded_plugins` so the
+/// snapshot plugin's `activate` callback can read it and construct
+/// its orchestrator. The file name is versioned (`bmux-snapshot-v1.json`)
+/// so the new combined-envelope format never silently overwrites an
+/// older monolithic snapshot.
+fn register_snapshot_plugin_config(paths: &ConfigPaths) {
+    use bmux_snapshot_plugin_api::SnapshotPluginConfig;
+    let plugin_config = SnapshotPluginConfig {
+        snapshot_path: paths.data_dir.join("runtime").join("bmux-snapshot-v1.json"),
+        debounce_ms: 1_000,
+    };
+    let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
+    bmux_plugin::global_plugin_state_registry().register::<SnapshotPluginConfig>(&handle);
 }
 
 fn rolling_start_override_args(

@@ -29,16 +29,22 @@ bmux_snapshot_runtime       = { workspace = true }
 bmux_terminal_protocol      = { workspace = true }
 
 # External dependencies
-anyhow       = { workspace = true, features = ["std"] }
-bmux_codec   = { workspace = true }
+anyhow = { workspace = true, features = ["std"] }
+bmux_codec = { workspace = true }
 portable-pty = { workspace = true }
-serde        = { workspace = true, features = ["derive"] }
-serde_json   = { workspace = true, features = ["std"] }
-thiserror    = { workspace = true }
-tokio        = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
-tracing      = { workspace = true, features = ["std"] }
-uuid         = { workspace = true, features = ["std", "v4"] }
-vt100        = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tracing = { workspace = true, features = ["std"] }
+uuid = { workspace = true, features = ["std", "v4"] }
+vt100 = { workspace = true }
 
 
 [features]
