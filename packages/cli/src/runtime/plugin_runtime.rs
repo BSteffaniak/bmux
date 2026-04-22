@@ -1084,6 +1084,67 @@ pub(super) fn prime_decoration_scene_cache(
     }
 }
 
+/// Push a pane's current `rect` + `content_rect` to the decoration
+/// plugin via its typed `notify-pane-geometry` command. Silently
+/// no-ops when the decoration plugin is not loaded (mirrors the
+/// cold-start policy of [`prime_decoration_scene_cache`]).
+///
+/// The decoration plugin is a write-capability holder for this
+/// command. Core invokes it through the generic typed-dispatch
+/// registry, matching the existing precedent for the read path.
+pub(super) fn push_decoration_pane_geometry(
+    pane_id: uuid::Uuid,
+    rect: bmux_scene_protocol::scene_protocol::Rect,
+    content_rect: bmux_scene_protocol::scene_protocol::Rect,
+) {
+    let Ok(write_cap) = bmux_plugin_sdk::HostScope::new("bmux.decoration.write") else {
+        return;
+    };
+    let registry = typed_service_registry_snapshot();
+    let Some(handle) = registry.get(&(
+        write_cap,
+        bmux_plugin_sdk::ServiceKind::Command,
+        "decoration-state".to_string(),
+    )) else {
+        return;
+    };
+    let Ok(service) = handle.provider_as_trait::<
+        dyn bmux_decoration_plugin_api::decoration_state::DecorationStateService + Send + Sync,
+    >() else {
+        return;
+    };
+    let geometry = bmux_decoration_plugin_api::decoration_state::PaneGeometry {
+        pane_id,
+        rect,
+        content_rect,
+    };
+    let _ = block_on_future(service.notify_pane_geometry(geometry));
+}
+
+/// Drop any decoration state the plugin is holding for `pane_id`.
+/// Called by the attach runtime when a pane disappears from the
+/// observed layout (close / session detach). Silently no-ops when
+/// the decoration plugin is not loaded.
+pub(super) fn forget_decoration_pane(pane_id: uuid::Uuid) {
+    let Ok(write_cap) = bmux_plugin_sdk::HostScope::new("bmux.decoration.write") else {
+        return;
+    };
+    let registry = typed_service_registry_snapshot();
+    let Some(handle) = registry.get(&(
+        write_cap,
+        bmux_plugin_sdk::ServiceKind::Command,
+        "decoration-state".to_string(),
+    )) else {
+        return;
+    };
+    let Ok(service) = handle.provider_as_trait::<
+        dyn bmux_decoration_plugin_api::decoration_state::DecorationStateService + Send + Sync,
+    >() else {
+        return;
+    };
+    let _ = block_on_future(service.forget_pane(pane_id));
+}
+
 /// Minimal single-threaded executor for driving a typed-dispatch
 /// future to completion from synchronous code.
 ///

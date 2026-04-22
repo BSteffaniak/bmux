@@ -4,6 +4,7 @@
 
 use bmux_config_doc_derive::ConfigDoc;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Theme configuration
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
@@ -26,6 +27,23 @@ pub struct ThemeConfig {
     /// Status bar colors
     #[config_doc(nested)]
     pub status: StatusColors,
+    /// Opaque per-plugin theme extensions.
+    ///
+    /// Keys are plugin IDs (e.g. `"bmux.decoration"`); values are
+    /// plugin-owned TOML records that core stores but does not
+    /// interpret. Each plugin's `ConfigExtensionValidator` typed
+    /// service parses its slice against a BPDL-declared schema at
+    /// load time and surfaces errors through `bmux config validate`.
+    ///
+    /// Matches the existing `plugins.settings` idiom for non-theme
+    /// plugin configuration; the same round-trip-preserving
+    /// convention applies here.
+    #[serde(
+        default,
+        rename = "plugins",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub plugins: BTreeMap<String, toml::Value>,
 }
 
 /// Border color configuration
@@ -62,6 +80,7 @@ impl Default for ThemeConfig {
             selection_background: "#404040".to_string(),
             border: BorderColors::default(),
             status: StatusColors::default(),
+            plugins: BTreeMap::new(),
         }
     }
 }
@@ -83,5 +102,62 @@ impl Default for StatusColors {
             active_window: "#00ff00".to_string(),
             mode_indicator: "#ffff00".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_plugins_extension_round_trips_opaque_toml() {
+        let theme_text = r##"
+name = "hacker"
+foreground = "#39ff14"
+background = "#000000"
+cursor = "#39ff14"
+selection_background = "#004400"
+
+[border]
+active = "#39ff14"
+inactive = "#1a4d1a"
+
+[status]
+background = "#000000"
+foreground = "#39ff14"
+active_window = "#00ff00"
+mode_indicator = "#ffff00"
+
+[plugins."bmux.decoration"]
+whatever = "is fine"
+
+[plugins."bmux.decoration".nested]
+key = "value"
+"##;
+        let parsed: ThemeConfig = toml::from_str(theme_text).expect("parse");
+        let decoration_ext = parsed
+            .plugins
+            .get("bmux.decoration")
+            .expect("decoration extension present");
+        // Core did not interpret the payload — it's round-tripped as
+        // an opaque TOML value keyed by plugin id.
+        let table = decoration_ext.as_table().expect("table");
+        assert_eq!(
+            table.get("whatever").and_then(|v| v.as_str()),
+            Some("is fine"),
+        );
+        assert!(
+            table.get("nested").and_then(|v| v.as_table()).is_some(),
+            "nested tables should survive round-trip",
+        );
+    }
+
+    #[test]
+    fn theme_without_plugins_extension_parses_cleanly() {
+        let theme_text = r#"
+name = "spare"
+"#;
+        let parsed: ThemeConfig = toml::from_str(theme_text).expect("parse");
+        assert!(parsed.plugins.is_empty());
     }
 }

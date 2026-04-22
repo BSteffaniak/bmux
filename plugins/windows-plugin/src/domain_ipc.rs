@@ -13,9 +13,21 @@
 
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::{PluginError, Result};
+use bmux_windows_plugin_api::windows_events::{self, PaneEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
+
+/// Publish a `PaneEvent` on the typed plugin event bus. Silently
+/// no-ops when the channel has not been registered (plugin not yet
+/// activated, or the windows plugin is running in a context where
+/// the bus is unavailable). Every windows-owned state transition
+/// flows through one of these emits so subscriber plugins (notably
+/// `bmux.decoration`) can reflect focus/zoom/open/close without a
+/// follow-up query.
+pub fn emit_pane_event(event: PaneEvent) {
+    let _ = bmux_plugin::global_event_bus().emit(&windows_events::EVENT_KIND, event);
+}
 
 // ── Domain summary types ────────────────────────────────────────────
 
@@ -789,10 +801,16 @@ pub trait KernelOps: ServiceCaller {
             },
         )?;
         match result {
-            Ok(ack) => Ok(PaneSplitResponse {
-                id: ack.pane_id,
-                session_id: ack.session_id,
-            }),
+            Ok(ack) => {
+                emit_pane_event(PaneEvent::Opened {
+                    pane_id: ack.pane_id,
+                    session_id: ack.session_id,
+                });
+                Ok(PaneSplitResponse {
+                    id: ack.pane_id,
+                    session_id: ack.session_id,
+                })
+            }
             Err(err) => Err(PluginError::ServiceProtocol {
                 details: format!("split-pane failed: {err:?}"),
             }),
@@ -849,10 +867,16 @@ pub trait KernelOps: ServiceCaller {
             },
         )?;
         match result {
-            Ok(ack) => Ok(PaneLaunchResponse {
-                id: ack.pane_id,
-                session_id: ack.session_id,
-            }),
+            Ok(ack) => {
+                emit_pane_event(PaneEvent::Opened {
+                    pane_id: ack.pane_id,
+                    session_id: ack.session_id,
+                });
+                Ok(PaneLaunchResponse {
+                    id: ack.pane_id,
+                    session_id: ack.session_id,
+                })
+            }
             Err(err) => Err(PluginError::ServiceProtocol {
                 details: format!("launch-pane failed: {err:?}"),
             }),
@@ -895,10 +919,15 @@ pub trait KernelOps: ServiceCaller {
             },
         )?;
         match result {
-            Ok(ack) => Ok(PaneFocusResponse {
-                id: ack.pane_id,
-                session_id: ack.session_id,
-            }),
+            Ok(ack) => {
+                emit_pane_event(PaneEvent::Focused {
+                    pane_id: ack.pane_id,
+                });
+                Ok(PaneFocusResponse {
+                    id: ack.pane_id,
+                    session_id: ack.session_id,
+                })
+            }
             Err(err) => Err(PluginError::ServiceProtocol {
                 details: format!("focus-pane failed: {err:?}"),
             }),
@@ -975,16 +1004,21 @@ pub trait KernelOps: ServiceCaller {
             &Args { session_id, target },
         )?;
         match result {
-            Ok(ack) => Ok(PaneCloseResponse {
-                id: ack.pane_id,
-                session_id: ack.session_id,
-                // Pane-runtime close-pane doesn't report whether the
-                // session itself was removed; the caller (windows
-                // plugin) no longer depends on this flag because
-                // session teardown is orchestrated inside the pane
-                // runtime plugin.
-                session_closed: false,
-            }),
+            Ok(ack) => {
+                emit_pane_event(PaneEvent::Closed {
+                    pane_id: ack.pane_id,
+                });
+                Ok(PaneCloseResponse {
+                    id: ack.pane_id,
+                    session_id: ack.session_id,
+                    // Pane-runtime close-pane doesn't report whether the
+                    // session itself was removed; the caller (windows
+                    // plugin) no longer depends on this flag because
+                    // session teardown is orchestrated inside the pane
+                    // runtime plugin.
+                    session_closed: false,
+                })
+            }
             Err(err) => Err(PluginError::ServiceProtocol {
                 details: format!("close-pane failed: {err:?}"),
             }),
@@ -1014,11 +1048,20 @@ pub trait KernelOps: ServiceCaller {
             &Args { session_id },
         )?;
         match result {
-            Ok(ack) => Ok(PaneZoomResponse {
-                session_id: ack.session_id,
-                pane_id: ack.pane_id,
-                zoomed: true,
-            }),
+            Ok(ack) => {
+                // `zoomed` in the ack is informational; the pane-runtime
+                // flips the flag atomically. We emit the currently-claimed
+                // direction; if the runtime semantics change later, we'd
+                // thread the previous state through via a query first.
+                emit_pane_event(PaneEvent::Zoomed {
+                    pane_id: ack.pane_id,
+                });
+                Ok(PaneZoomResponse {
+                    session_id: ack.session_id,
+                    pane_id: ack.pane_id,
+                    zoomed: true,
+                })
+            }
             Err(err) => Err(PluginError::ServiceProtocol {
                 details: format!("zoom-pane failed: {err:?}"),
             }),

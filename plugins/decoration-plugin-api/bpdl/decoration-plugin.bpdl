@@ -26,6 +26,82 @@ interface decoration-state {
         double,
     }
 
+    // Structured description of the decoration theme extension
+    // attached to a user's theme file under
+    // `[plugins."bmux.decoration"]`. Plugins call
+    // `validate-theme-extension` before persisting a user's config
+    // edit; the decoration plugin uses the same record internally
+    // when compiling a theme into paint commands.
+    record decoration-theme-extension {
+        // Border spec for unfocused panes.
+        unfocused: border-spec,
+        // Border spec for focused panes.
+        focused: border-spec,
+        // Border spec for zoomed panes.
+        zoomed: border-spec,
+        // Badge text for running/exited panes. Empty strings mean
+        // "don't paint a badge".
+        badges: badge-spec,
+        // Optional theme-wide animation hint (off when absent).
+        animation: animation-spec?,
+    }
+
+    // A user-declared border style: what glyphs, what colour. Matches
+    // the vocabulary of the scene protocol (`border-glyphs` /
+    // `color`) without forcing the decoration plugin to re-import it
+    // in every theme file.
+    record border-spec {
+        // Named style — one of the built-in glyph presets
+        // (`ascii`/`single-line`/`rounded`/`thick`/... as declared in
+        // the scene protocol). `custom` means "read the six runes
+        // from `glyphs_custom`".
+        style: string,
+        // Foreground colour, hex (`#rrggbb`) or a named palette
+        // entry. Empty => terminal default.
+        fg: string,
+        // Background colour, hex or named. Empty => terminal default.
+        bg: string,
+        // Optional gradient endpoints. When populated the border is
+        // painted as a gradient from `gradient-from` to `gradient-to`
+        // rather than a flat `fg`.
+        gradient-from: string,
+        gradient-to: string,
+        // When `style == "custom"`, the six runes
+        // (top-left, top-right, bottom-left, bottom-right,
+        // horizontal, vertical). Ignored otherwise.
+        glyphs-custom: list<string>,
+    }
+
+    // Status badges drawn on the border of a pane.
+    record badge-spec {
+        running: string,
+        exited: string,
+    }
+
+    // Animation-hint preset. `kind` is a string so themes can extend
+    // the vocabulary without a schema bump (`pulse`, `shimmer`,
+    // `marquee`, ...); the decoration plugin treats unknown kinds as
+    // a warning.
+    record animation-spec {
+        kind: string,
+        hz: u16,
+    }
+
+    // Result of validating a theme extension.
+    variant validation-result {
+        @default ok,
+        // One or more fields failed validation.
+        errors { errors: list<validation-error> },
+    }
+
+    // Single field-level validation error.
+    record validation-error {
+        // Dotted path into the TOML document ("decoration.unfocused.fg").
+        path: string,
+        // Human-readable explanation.
+        message: string,
+    }
+
     // Errors a `set-*` command can produce.
     variant set-style-error {
         pane-not-found,
@@ -44,6 +120,46 @@ interface decoration-state {
         exited-badge: string?,
     }
 
+    // Live geometry of a pane as observed by the attach runtime. The
+    // decoration plugin caches the latest value per pane so paint
+    // commands can reference concrete cell coordinates. `rect` is the
+    // outer bounds used for border painting; `content_rect` is the
+    // PTY interior. Both are in scene (attach-global) cell coordinates.
+    record pane-geometry {
+        pane-id: uuid,
+        rect: scene.rect,
+        content-rect: scene.rect,
+    }
+
+    // Per-pane activity snapshot observed by the decoration plugin
+    // from the windows plugin's `pane-event` stream plus the attach
+    // runtime's focus updates. Plugins consuming the decoration API
+    // can inspect this to drive hover/focus animations.
+    record pane-activity {
+        pane-id: uuid,
+        focused: bool,
+        zoomed: bool,
+        // The pane's lifecycle state — mirrors `windows.pane-status`
+        // but is kept as a local enum to avoid cross-plugin imports.
+        status: pane-lifecycle,
+    }
+
+    // Mirror of `windows.pane-status` used in `pane-activity`. Kept
+    // local to avoid an import cycle with `bmux.windows`.
+    enum pane-lifecycle {
+        @default running,
+        exited,
+    }
+
+    // Errors a `notify-*` command can produce. The notification
+    // commands are transitional between core and plugin ownership of
+    // geometry; for now they always succeed unless the pane is
+    // unknown to the decoration store (which is non-fatal — the
+    // plugin silently records the update regardless).
+    variant notify-error {
+        invalid-argument { reason: string },
+    }
+
     // Queries.
     query pane-decoration(pane-id: uuid) -> pane-decoration?;
     query default-border-style() -> border-style;
@@ -52,10 +168,52 @@ interface decoration-state {
     // event pipe is wired and switch to event subscriptions once
     // available.
     query scene-snapshot() -> scene.decoration-scene;
+    // Geometry/activity read-back for inspector tooling and tests.
+    query pane-geometry(pane-id: uuid) -> pane-geometry?;
+    query pane-activity(pane-id: uuid) -> pane-activity?;
+    // Return the currently-loaded theme extension, if any. `None`
+    // means "no theme file provided a `[plugins.\"bmux.decoration\"]`
+    // section and the plugin is using its built-in defaults".
+    query current-theme-extension() -> decoration-theme-extension?;
+    // Validate a plain TOML blob against the decoration theme
+    // extension schema. The decoration plugin re-uses this method
+    // internally (and a future `bmux config validate` CLI
+    // subcommand will dispatch to it).
+    query validate-theme-extension(toml: string) -> validation-result;
 
     // Commands.
     command set-pane-border(pane-id: uuid, border: border-style) -> result<unit, set-style-error>;
     command set-default-border(border: border-style) -> result<unit, set-style-error>;
+    // Notify the plugin of a pane's current rect + content_rect.
+    // Called by the attach runtime whenever the observed layout
+    // changes. Decoration geometry is retained in a per-pane cache
+    // keyed by `pane-id`; subsequent paint-command builds consult
+    // the cache to position themselves. Panes absent from the
+    // attach scene are expected to be removed via `forget-pane`.
+    command notify-pane-geometry(geometry: pane-geometry) -> result<unit, notify-error>;
+    // Notify the plugin of a pane-level event. Today the decoration
+    // plugin also subscribes to `bmux.windows/windows-events` via the
+    // typed event bus; this typed command exists as an ordered
+    // fallback path (e.g. for test harnesses without the event bus,
+    // and for a future where the windows plugin uses typed-dispatch
+    // instead of the bus).
+    command notify-pane-event(event: pane-event) -> result<unit, notify-error>;
+    // Drop any cached geometry / activity for `pane-id`. Called when
+    // a pane disappears from the attach scene (close, session
+    // detach).
+    command forget-pane(pane-id: uuid) -> result<unit, notify-error>;
+
+    // Pane-level event mirror. Identical to `windows.pane-event` by
+    // design; kept local to avoid an import cycle with `bmux.windows`.
+    variant pane-event {
+        focused { pane-id: uuid },
+        unfocused { pane-id: uuid },
+        zoomed { pane-id: uuid },
+        unzoomed { pane-id: uuid },
+        opened { pane-id: uuid, session-id: uuid },
+        closed { pane-id: uuid },
+        status-changed { pane-id: uuid, exited: bool },
+    }
 
     // Events.
     variant decoration-event {
@@ -63,6 +221,10 @@ interface decoration-state {
         pane-restyled { pane-id: uuid },
         // The user-facing default border style changed globally.
         default-border-changed,
+        // A pane's focus / zoom / lifecycle state was observed to
+        // change. Mirrors the `pane-event` variant shape so UI
+        // plugins can react without re-deriving state.
+        pane-state-changed { pane-id: uuid },
     }
 
     events decoration-event;

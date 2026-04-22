@@ -16,23 +16,44 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bmux_decoration_plugin_api = { workspace = true }
+bmux_plugin                = { workspace = true }
 bmux_plugin_sdk            = { workspace = true }
 bmux_scene_protocol        = { workspace = true }
 bmux_windows_plugin_api    = { workspace = true }
+mlua                       = { workspace = true, optional = true }
 serde                      = { workspace = true, features = ["derive", "std"] }
+thiserror                  = { workspace = true }
+toml                       = { workspace = true, features = ["parse"] }
+tracing                    = { workspace = true, features = ["std"] }
 uuid                       = { workspace = true, features = ["serde", "std"] }
 
 [package.metadata.cargo-machete]
 # `serde` is consumed by the BPDL-generated bindings re-exported from the
-# decoration-plugin-api crate. `bmux_windows_plugin_api` will drive
-# pane-event subscriptions once host-side plumbing lands.
-ignored = ["serde", "bmux_windows_plugin_api"]
+# decoration-plugin-api crate; cargo-machete cannot see into proc-macro
+# source.
+ignored = ["serde"]
 
 [features]
-default = []
+default = ["bundled-themes", "bundled-decoration-scripts"]
+# Bundle the decoration plugin's preset theme files into the compiled
+# artifact via `include_str!`. When disabled, `bundled_theme_presets()`
+# returns an empty slice and users must install themes manually.
+bundled-themes = []
+# Bundle the decoration plugin's sample Lua scripts via `include_str!`.
+# Orthogonal to `scripting-*` — the scripts are always compiled in as
+# data; whether they run depends on whether a Lua backend is enabled.
+bundled-decoration-scripts = []
+# Lua scripting backends. At most one may be enabled per build; mlua
+# itself enforces mutual exclusion of `luajit` / `luau` / `lua54` at
+# link time. Consumers that ship on platforms without a working JIT
+# (e.g. Windows-MSVC, Apple Silicon when the local toolchain is
+# flaky) should select `scripting-luau`.
 fail-on-warnings = [
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_decoration_plugin_api/fail-on-warnings",
     "bmux_scene_protocol/fail-on-warnings",
 ]
+scripting-lua54 = ["dep:mlua", "mlua/lua54", "mlua/vendored", "mlua/send"]
+scripting-luajit = ["dep:mlua", "mlua/luajit", "mlua/vendored", "mlua/send"]
+scripting-luau = ["dep:mlua", "mlua/luau", "mlua/vendored", "mlua/send"]
 static-bundled = []

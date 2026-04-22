@@ -41,6 +41,19 @@ pub struct WindowsPlugin {
 }
 
 impl RustPlugin for WindowsPlugin {
+    fn activate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        // Register the typed event-bus channel for pane-event so
+        // subscribers (decoration, future UI plugins) can wait on
+        // `global_event_bus().subscribe::<PaneEvent>(...)` without
+        // racing the first emit. Failure to register is non-fatal —
+        // the channel may already exist from a prior load.
+        let _ = bmux_plugin::global_event_bus()
+            .register_channel::<bmux_windows_plugin_api::windows_events::PaneEvent>(
+                bmux_windows_plugin_api::windows_events::EVENT_KIND,
+            );
+        Ok(EXIT_OK)
+    }
+
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         handle_command(self, &context)?;
         Ok(EXIT_OK)

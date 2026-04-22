@@ -170,6 +170,20 @@ impl ConfigPaths {
         self.resolve(format!("themes/{name}.toml"))
     }
 
+    /// Get the decorations directory path (primary, for directory
+    /// creation). Decoration scripts (Lua / template files) live
+    /// here.
+    #[must_use]
+    pub fn decorations_dir(&self) -> PathBuf {
+        self.config_dir.join("decorations")
+    }
+
+    /// Resolve a decoration script by name through the candidate chain.
+    #[must_use]
+    pub fn resolve_decoration_file(&self, name: &str) -> PathBuf {
+        self.resolve(format!("decorations/{name}"))
+    }
+
     /// Get the plugins directory path
     #[must_use]
     pub fn plugins_dir(&self) -> PathBuf {
@@ -291,6 +305,7 @@ impl ConfigPaths {
         std::fs::create_dir_all(self.sessions_dir())?;
         std::fs::create_dir_all(self.logs_dir())?;
         std::fs::create_dir_all(self.config_dir.join("themes"))?;
+        std::fs::create_dir_all(self.decorations_dir())?;
         Ok(())
     }
 }

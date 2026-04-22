@@ -273,6 +273,16 @@ vt100 = { version = "0.16.2", default-features = false }
 windows-sys = { version = "0.61.2" }
 zstd = { version = "0.13", default-features = false }
 
+# File-system watcher for config / theme / decoration-script hot-reload.
+notify = { version = "6", default-features = false, features = [
+    "macos_fsevent",
+] }
+
+# Lua scripting runtime for the decoration plugin. Mutually-exclusive
+# features select the Lua ABI; see the decoration plugin's
+# `scripting-*` cargo features for the exposed matrix.
+mlua = { version = "0.10", default-features = false }
+
 # Dev/test dependencies
 serial_test = { version = "3.4.0" }
 

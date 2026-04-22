@@ -1,0 +1,47 @@
+# Minimal theme — rounded single-line borders, no colour.
+
+background           = "#000000"
+cursor               = "#e0e0e0"
+foreground           = "#e0e0e0"
+name                 = "minimal"
+selection_background = "#3a3a3a"
+
+[border]
+active   = "#e0e0e0"
+inactive = "#606060"
+
+[status]
+active_window  = "#ffffff"
+background     = "#1e1e1e"
+foreground     = "#e0e0e0"
+mode_indicator = "#e0e0e0"
+
+[plugins."bmux.decoration"]
+
+[plugins."bmux.decoration".unfocused]
+bg            = ""
+fg            = "#606060"
+glyphs_custom = []
+gradient_from = ""
+gradient_to   = ""
+style         = "rounded"
+
+[plugins."bmux.decoration".focused]
+bg            = ""
+fg            = "#e0e0e0"
+glyphs_custom = []
+gradient_from = ""
+gradient_to   = ""
+style         = "rounded"
+
+[plugins."bmux.decoration".zoomed]
+bg            = ""
+fg            = "#ffffff"
+glyphs_custom = []
+gradient_from = ""
+gradient_to   = ""
+style         = "thick"
+
+[plugins."bmux.decoration".badges]
+exited  = "○"
+running = "●"
