@@ -20,12 +20,28 @@ interface scene-protocol {
         h: u16,
     }
 
-    // A 16-colour palette plus `default` (terminal default fg/bg) and
-    // `reset` (hard-clear any prior style). Richer colour modes (24-bit
-    // RGB, 256-colour indexed) are deferred additively.
-    enum color {
+    // Colour used by a `style`. Four modes:
+    //   - `default`/`reset` — defer to the terminal's current colour.
+    //   - `named` — one of 16 named palette colours.
+    //   - `indexed` — 256-colour palette index (SGR `38;5;n` /
+    //     `48;5;n`).
+    //   - `rgb` — 24-bit truecolor (SGR `38;2;r;g;b` / `48;2;r;g;b`).
+    //
+    // Renderers that receive a colour mode they can't emit should
+    // degrade gracefully (nearest named match or `default`).
+    variant color {
         @default default,
         reset,
+        named { name: named-color },
+        indexed { index: u8 },
+        rgb { r: u8, g: u8, b: u8 },
+    }
+
+    // Canonical 16-colour palette used by `color.named`. Kept as an
+    // enum (rather than inline variant cases) so renderers can switch
+    // exhaustively.
+    enum named-color {
+        @default white,
         black,
         red,
         green,
@@ -33,7 +49,6 @@ interface scene-protocol {
         blue,
         magenta,
         cyan,
-        white,
         bright-black,
         bright-red,
         bright-green,
@@ -54,16 +69,94 @@ interface scene-protocol {
         underline: bool,
         italic: bool,
         reverse: bool,
+        // Added in v1.1 additively. Existing payloads parse with
+        // these as `false`.
+        dim: bool,
+        blink: bool,
+        strikethrough: bool,
     }
 
-    // A run of cells to paint at a specific position. `text` is
-    // treated as a single-line string; callers are responsible for not
-    // emitting newline control bytes. The run extends rightward from
-    // `(col, row)` for `text.len()` display columns.
-    record paint-command {
-        col: u16,
-        row: u16,
-        text: string,
+    // Variants of paint commands that can appear inside a
+    // `surface-decoration`. The renderer dispatches on the tag and
+    // applies the variant's geometry. All coordinates are in outer
+    // surface cells — i.e. relative to the scene origin, not the
+    // surface's own origin. `z` controls draw order within a single
+    // surface (lower = painted first; ties break by list order).
+    //
+    // `text` is the original primitive from v1.0 (a single styled run
+    // painted rightward from `(col, row)` for `text.len()` columns).
+    // The other variants are additive; renderers that encounter an
+    // unknown tag fall back to ignoring that paint command.
+    variant paint-command {
+        // Single styled text run painted rightward from `(col, row)`
+        // for `text.len()` display columns.
+        text {
+            col: u16,
+            row: u16,
+            z: i16,
+            text: string,
+            style: style,
+        },
+        // Fill `rect` with `glyph`, styled by `style`. Useful for
+        // solid-colour badges, backplates, and box fills. `glyph` is
+        // one grapheme; rendering a multi-column grapheme inside a
+        // 1-column slot is the caller's responsibility.
+        filled-rect {
+            rect: rect,
+            z: i16,
+            glyph: string,
+            style: style,
+        },
+        // A styled text run whose style interpolates cell-by-cell
+        // from `from_style` to `to_style` across `text`. `axis`
+        // describes whether to interpolate along the run
+        // (horizontal) or orthogonally (vertical — useful when the
+        // caller splits a column into a series of 1-cell
+        // horizontal runs).
+        gradient-run {
+            col: u16,
+            row: u16,
+            z: i16,
+            text: string,
+            axis: gradient-axis,
+            from-style: style,
+            to-style: style,
+        },
+        // Explicit per-cell grid. `origin` sits at top-left; the
+        // grid has `cols` columns and `cells.len() / cols` rows
+        // (excess cells are dropped). Empty `glyph` means "skip this
+        // cell" (leaves existing content visible).
+        cell-grid {
+            origin-col: u16,
+            origin-row: u16,
+            z: i16,
+            cols: u16,
+            cells: list<cell>,
+        },
+        // High-level border: paint a 1-cell border around `rect`
+        // using the given glyph set and `style`. Expands to the
+        // equivalent text runs internally. Preferred over emitting
+        // four sides by hand because it can take advantage of
+        // renderer-side diffing and adjacency awareness later.
+        box-border {
+            rect: rect,
+            z: i16,
+            glyphs: border-glyphs,
+            style: style,
+        },
+    }
+
+    // Axis used by `paint-command.gradient-run`.
+    enum gradient-axis {
+        @default horizontal,
+        vertical,
+    }
+
+    // One cell entry inside a `paint-command.cell-grid`. Empty
+    // `glyph` means "don't paint this cell" — useful for sparse
+    // overlays.
+    record cell {
+        glyph: string,
         style: style,
     }
 
@@ -71,6 +164,12 @@ interface scene-protocol {
     // around a pane surface. The decoration plugin owns the choice; a
     // renderer applies the glyphs to whatever rectangle geometry it
     // controls.
+    //
+    // Each built-in preset expands to a six-rune set
+    // `(top-left, top-right, bottom-left, bottom-right, horizontal,
+    // vertical)`. `custom` carries those six runes explicitly; earlier
+    // three-rune callers can encode their intent by repeating the
+    // single corner glyph four times.
     variant border-glyphs {
         // No border glyphs (for panes the plugin wants undecorated).
         none,
@@ -83,12 +182,36 @@ interface scene-protocol {
         // ASCII compatibility glyphs used for a zoomed pane:
         // `#` corners, `=` top/bottom, `║` sides.
         ascii-zoomed,
-        // 1-cell Unicode single-line box-drawing.
+        // 1-cell Unicode single-line box-drawing (`┌┐└┘ ─ │`).
         single-line,
-        // 1-cell Unicode double-line box-drawing.
+        // 1-cell Unicode double-line box-drawing (`╔╗╚╝ ═ ║`).
         double-line,
-        // Custom characters: `corner`, `horizontal`, `vertical`.
-        custom { corner: string, horizontal: string, vertical: string },
+        // 1-cell Unicode single-line with rounded corners
+        // (`╭╮╰╯ ─ │`).
+        rounded,
+        // 1-cell heavy Unicode box-drawing (`┏┓┗┛ ━ ┃`).
+        thick,
+        // 1-cell heavy-double mix (`┏┓┗┛ ═ ║`) — often used for
+        // zoomed-focused panes in "cyberpunk" themes.
+        heavy-double,
+        // 1-cell dashed single-line (`┌┐└┘ ╌ ╎`).
+        dashed,
+        // 1-cell dotted single-line (`┌┐└┘ ┈ ┊`).
+        dotted,
+        // 1-cell Powerline/Nerd-font "pill" (`          `). Falls
+        // back to ASCII if the host terminal can't render the glyphs.
+        nerd-powerline,
+        // Custom characters: the six runes of a border
+        // (top-left, top-right, bottom-left, bottom-right,
+        // horizontal, vertical).
+        custom {
+            top-left: string,
+            top-right: string,
+            bottom-left: string,
+            bottom-right: string,
+            horizontal: string,
+            vertical: string,
+        },
     }
 
     // Plugin-owned default style used when the scene does not carry a
@@ -120,6 +243,14 @@ interface scene-protocol {
         paint-commands: list<paint-command>,
     }
 
+    // Optional hint published alongside a scene when the plugin wants
+    // the host to spin up a periodic animation tick. `target-hz` is a
+    // soft request; the host caps it at its configured maximum.
+    // `None` means "no animation needed, park the ticker".
+    record animation-hint {
+        target-hz: u16,
+    }
+
     // Snapshot of every decorated surface. Published by the decoration
     // plugin through the typed event bus whenever its state changes
     // (focus, theme, per-pane override). Consumers replace their
@@ -135,6 +266,7 @@ interface scene-protocol {
         revision: u64,
         surfaces: map<uuid, surface-decoration>,
         fallback: fallback-style?,
+        animation: animation-hint?,
     }
 
     events decoration-scene;

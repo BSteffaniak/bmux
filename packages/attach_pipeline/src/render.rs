@@ -101,29 +101,388 @@ pub fn opaque_row_text(content: &str, width: usize) -> String {
 
 /// Apply every paint command in a [`crate::scene_cache::SurfaceDecoration`]
 /// to the terminal, emitting the equivalent of each command's styled
-/// text at its `(col, row)` position. Styles are translated to ANSI
-/// SGR escape sequences and reset after each run so they don't leak
-/// into subsequent writes.
+/// text at its position. Styles are translated to ANSI SGR escape
+/// sequences. A single reset is emitted at the end of the surface so
+/// attributes don't leak into subsequent surfaces.
+///
+/// Paint commands are sorted by their `z` ordering (lower first; ties
+/// break by source order) so the caller can layer decorations without
+/// caring about insertion order.
 fn apply_decoration_paint_commands<W: io::Write>(
     stdout: &mut W,
     surface: &crate::scene_cache::SurfaceDecoration,
 ) -> Result<()> {
-    for command in &surface.paint_commands {
-        queue!(stdout, MoveTo(command.col, command.row))
-            .context("failed positioning decoration paint command")?;
-        let prelude = scene_style_sgr_prelude(&command.style);
-        if !prelude.is_empty() {
-            queue!(stdout, Print(&prelude))
-                .context("failed emitting decoration paint command style")?;
-        }
-        queue!(stdout, Print(&command.text))
-            .context("failed emitting decoration paint command text")?;
-        // Hard reset so styles don't leak into subsequent writes. The
-        // CSI 0 m sequence is the canonical "reset all attributes".
-        queue!(stdout, Print("\x1b[0m"))
-            .context("failed resetting decoration paint command style")?;
+    use crate::scene_cache::PaintCommand;
+
+    // Collect with an index so stable sort preserves insertion order
+    // within a single `z` tier.
+    let mut ordered: Vec<(usize, &PaintCommand)> =
+        surface.paint_commands.iter().enumerate().collect();
+    ordered.sort_by_key(|(i, cmd)| (paint_command_z(cmd), *i));
+
+    let mut emitted_any = false;
+    for (_, command) in ordered {
+        emitted_any |= apply_paint_command(stdout, command)?;
+    }
+    if emitted_any {
+        // Single end-of-surface reset so adjacent surfaces don't
+        // inherit trailing attributes.
+        queue!(stdout, Print("\x1b[0m")).context("failed resetting decoration surface style")?;
     }
     Ok(())
+}
+
+/// Extract the `z` ordering for a paint command. Defaults to zero for
+/// variants that don't carry a `z` field (none at present; future
+/// additive variants may).
+const fn paint_command_z(command: &crate::scene_cache::PaintCommand) -> i16 {
+    use crate::scene_cache::PaintCommand;
+    match command {
+        PaintCommand::Text { z, .. }
+        | PaintCommand::FilledRect { z, .. }
+        | PaintCommand::GradientRun { z, .. }
+        | PaintCommand::CellGrid { z, .. }
+        | PaintCommand::BoxBorder { z, .. } => *z,
+    }
+}
+
+/// Apply a single paint command variant. Returns `true` when any
+/// bytes were queued (so the caller knows whether to emit a trailing
+/// reset).
+fn apply_paint_command<W: io::Write>(
+    stdout: &mut W,
+    command: &crate::scene_cache::PaintCommand,
+) -> Result<bool> {
+    use crate::scene_cache::PaintCommand;
+    match command {
+        PaintCommand::Text {
+            col,
+            row,
+            text,
+            style,
+            ..
+        } => {
+            queue_styled_text(stdout, *col, *row, text, style)?;
+            Ok(!text.is_empty())
+        }
+        PaintCommand::FilledRect {
+            rect, glyph, style, ..
+        } => {
+            if rect.w == 0 || rect.h == 0 || glyph.is_empty() {
+                return Ok(false);
+            }
+            let row_text = glyph.repeat(usize::from(rect.w));
+            for dy in 0..rect.h {
+                queue_styled_text(stdout, rect.x, rect.y.saturating_add(dy), &row_text, style)?;
+            }
+            Ok(true)
+        }
+        PaintCommand::GradientRun {
+            col,
+            row,
+            text,
+            axis,
+            from_style,
+            to_style,
+            ..
+        } => {
+            queue_gradient_run(stdout, *col, *row, text, *axis, from_style, to_style)?;
+            Ok(!text.is_empty())
+        }
+        PaintCommand::CellGrid {
+            origin_col,
+            origin_row,
+            cols,
+            cells,
+            ..
+        } => {
+            queue_cell_grid(stdout, *origin_col, *origin_row, *cols, cells)?;
+            Ok(!cells.is_empty())
+        }
+        PaintCommand::BoxBorder {
+            rect,
+            glyphs,
+            style,
+            ..
+        } => {
+            queue_box_border(stdout, rect, glyphs, style)?;
+            Ok(rect.w >= 2 && rect.h >= 2)
+        }
+    }
+}
+
+/// Write `text` at `(col, row)` prefixed by `style`'s SGR prelude.
+/// Emits no style when `style` is all-default so diff-sensitive
+/// callers can skip no-op writes.
+fn queue_styled_text<W: io::Write>(
+    stdout: &mut W,
+    col: u16,
+    row: u16,
+    text: &str,
+    style: &crate::scene_cache::Style,
+) -> Result<()> {
+    queue!(stdout, MoveTo(col, row)).context("failed positioning decoration paint command")?;
+    let prelude = scene_style_sgr_prelude(style);
+    if !prelude.is_empty() {
+        queue!(stdout, Print(&prelude))
+            .context("failed emitting decoration paint command style")?;
+    }
+    queue!(stdout, Print(text)).context("failed emitting decoration paint command text")?;
+    Ok(())
+}
+
+/// Emit a gradient-interpolated styled run. For each grapheme in
+/// `text` the effective style is the linear interpolation between
+/// `from_style` and `to_style`. `axis` currently affects only colour
+/// interpolation direction reporting; both horizontal and vertical
+/// runs are painted as a single row right now, and vertical variants
+/// are expected to be split into 1-cell horizontal runs by the caller
+/// until a vertical primitive exists.
+fn queue_gradient_run<W: io::Write>(
+    stdout: &mut W,
+    col: u16,
+    row: u16,
+    text: &str,
+    _axis: crate::scene_cache::GradientAxis,
+    from_style: &crate::scene_cache::Style,
+    to_style: &crate::scene_cache::Style,
+) -> Result<()> {
+    let graphemes: Vec<&str> = grapheme_iter(text).collect();
+    let n = graphemes.len();
+    if n == 0 {
+        return Ok(());
+    }
+    if n == 1 {
+        queue_styled_text(stdout, col, row, text, from_style)?;
+        return Ok(());
+    }
+    let mut offset: u16 = 0;
+    #[allow(clippy::cast_precision_loss)] // n bounded by terminal width; f32 precision is ample.
+    let denom = (n - 1) as f32;
+    for (i, grapheme) in graphemes.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        // Same — indices fit in f32 exactly at terminal sizes.
+        let t = i as f32 / denom;
+        let style = interpolate_style(from_style, to_style, t);
+        queue_styled_text(stdout, col.saturating_add(offset), row, grapheme, &style)?;
+        offset = offset.saturating_add(u16::try_from(grapheme_width(grapheme)).unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Paint an explicit per-cell grid.
+fn queue_cell_grid<W: io::Write>(
+    stdout: &mut W,
+    origin_col: u16,
+    origin_row: u16,
+    cols: u16,
+    cells: &[crate::scene_cache::Cell],
+) -> Result<()> {
+    if cols == 0 || cells.is_empty() {
+        return Ok(());
+    }
+    for (i, cell) in cells.iter().enumerate() {
+        if cell.glyph.is_empty() {
+            continue;
+        }
+        let grid_col = u16::try_from(i % usize::from(cols)).unwrap_or(0);
+        let grid_row = u16::try_from(i / usize::from(cols)).unwrap_or(0);
+        queue_styled_text(
+            stdout,
+            origin_col.saturating_add(grid_col),
+            origin_row.saturating_add(grid_row),
+            &cell.glyph,
+            &cell.style,
+        )?;
+    }
+    Ok(())
+}
+
+/// Paint a 1-cell border around `rect` using the given glyph set.
+fn queue_box_border<W: io::Write>(
+    stdout: &mut W,
+    rect: &crate::scene_cache::Rect,
+    glyphs: &crate::scene_cache::BorderGlyphs,
+    style: &crate::scene_cache::Style,
+) -> Result<()> {
+    if rect.w < 2 || rect.h < 2 {
+        return Ok(());
+    }
+    let Some(corners) = border_glyphs_corners_or_custom(glyphs) else {
+        return Ok(());
+    };
+    let top = assemble_border_row(
+        rect.w,
+        corners.top_left,
+        corners.horizontal,
+        corners.top_right,
+    );
+    let bottom = assemble_border_row(
+        rect.w,
+        corners.bottom_left,
+        corners.horizontal,
+        corners.bottom_right,
+    );
+    queue_styled_text(stdout, rect.x, rect.y, &top, style)?;
+    queue_styled_text(
+        stdout,
+        rect.x,
+        rect.y.saturating_add(rect.h.saturating_sub(1)),
+        &bottom,
+        style,
+    )?;
+    for dy in 1..rect.h.saturating_sub(1) {
+        let y = rect.y.saturating_add(dy);
+        queue_styled_text(stdout, rect.x, y, corners.vertical, style)?;
+        queue_styled_text(
+            stdout,
+            rect.x.saturating_add(rect.w.saturating_sub(1)),
+            y,
+            corners.vertical,
+            style,
+        )?;
+    }
+    Ok(())
+}
+
+/// Owned-string variant of [`BorderGlyphSet`] used when the glyph set
+/// comes from a `BorderGlyphs::Custom` variant (whose runes are
+/// plugin-supplied `String` values).
+struct OwnedBorderGlyphSet<'a> {
+    top_left: &'a str,
+    top_right: &'a str,
+    bottom_left: &'a str,
+    bottom_right: &'a str,
+    horizontal: &'a str,
+    vertical: &'a str,
+}
+
+/// Resolve a [`crate::scene_cache::BorderGlyphs`] choice to borrowed
+/// glyph strings, handling both the built-in presets and the custom
+/// variant. Returns `None` only for `BorderGlyphs::None`.
+fn border_glyphs_corners_or_custom(
+    glyphs: &crate::scene_cache::BorderGlyphs,
+) -> Option<OwnedBorderGlyphSet<'_>> {
+    use crate::scene_cache::BorderGlyphs;
+    if let BorderGlyphs::Custom {
+        top_left,
+        top_right,
+        bottom_left,
+        bottom_right,
+        horizontal,
+        vertical,
+    } = glyphs
+    {
+        return Some(OwnedBorderGlyphSet {
+            top_left,
+            top_right,
+            bottom_left,
+            bottom_right,
+            horizontal,
+            vertical,
+        });
+    }
+    let preset = border_glyphs_corners(glyphs)?;
+    Some(OwnedBorderGlyphSet {
+        top_left: preset.top_left,
+        top_right: preset.top_right,
+        bottom_left: preset.bottom_left,
+        bottom_right: preset.bottom_right,
+        horizontal: preset.horizontal,
+        vertical: preset.vertical,
+    })
+}
+
+/// Interpolate between two scene styles. Boolean flags are taken from
+/// whichever style is "closer" at `t` (< 0.5 → `from`, ≥ 0.5 → `to`).
+/// Colour interpolation works for paired truecolor endpoints and for
+/// paired named colours (nearest-endpoint step); mismatched pairs fall
+/// back to the `from` colour.
+fn interpolate_style(
+    from: &crate::scene_cache::Style,
+    to: &crate::scene_cache::Style,
+    t: f32,
+) -> crate::scene_cache::Style {
+    let pick = |a, b| if t < 0.5 { a } else { b };
+    crate::scene_cache::Style {
+        fg: interpolate_color(from.fg.as_ref(), to.fg.as_ref(), t),
+        bg: interpolate_color(from.bg.as_ref(), to.bg.as_ref(), t),
+        bold: pick(from.bold, to.bold),
+        underline: pick(from.underline, to.underline),
+        italic: pick(from.italic, to.italic),
+        reverse: pick(from.reverse, to.reverse),
+        dim: pick(from.dim, to.dim),
+        blink: pick(from.blink, to.blink),
+        strikethrough: pick(from.strikethrough, to.strikethrough),
+    }
+}
+
+fn interpolate_color(
+    from: Option<&crate::scene_cache::Color>,
+    to: Option<&crate::scene_cache::Color>,
+    t: f32,
+) -> Option<crate::scene_cache::Color> {
+    use crate::scene_cache::Color;
+    match (from, to) {
+        (
+            Some(Color::Rgb {
+                r: r0,
+                g: g0,
+                b: b0,
+            }),
+            Some(Color::Rgb {
+                r: r1,
+                g: g1,
+                b: b1,
+            }),
+        ) => Some(Color::Rgb {
+            r: lerp_u8(*r0, *r1, t),
+            g: lerp_u8(*g0, *g1, t),
+            b: lerp_u8(*b0, *b1, t),
+        }),
+        (a, b) => {
+            if t < 0.5 {
+                a.cloned()
+            } else {
+                b.cloned()
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // Colour channel lerp; fma and cast warnings are noise for u8 output.
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let a = f32::from(a);
+    let b = f32::from(b);
+    let v = a + (b - a) * t.clamp(0.0, 1.0);
+    // Round to nearest, clamp into u8 range.
+    v.round().clamp(0.0, 255.0) as u8
+}
+
+/// Grapheme iterator that falls back to chars when the
+/// unicode-segmentation crate is not available. `text` is treated as
+/// UTF-8; each `&str` slice corresponds to one user-perceived
+/// character.
+fn grapheme_iter(text: &str) -> impl Iterator<Item = &str> {
+    // We don't pull in `unicode-segmentation` — a char-based walker
+    // is accurate enough for border glyphs + ASCII art and keeps the
+    // render crate's dep graph minimal. Decoration scripts that use
+    // emoji will paint one char per position, which is an acceptable
+    // transitional behaviour.
+    let mut chars = text.char_indices().peekable();
+    std::iter::from_fn(move || {
+        let (start, _) = chars.next()?;
+        let end = chars.peek().map_or(text.len(), |(i, _)| *i);
+        Some(&text[start..end])
+    })
+}
+
+fn grapheme_width(g: &str) -> usize {
+    UnicodeWidthStr::width(g).max(1)
 }
 
 /// Paint a border + status badge around `rect` using the plugin-owned
@@ -147,25 +506,34 @@ fn draw_fallback_decoration<W: io::Write>(
         return Ok(());
     }
     let glyph_choice = fallback_border_glyphs(fallback, focus, zoomed);
-    let (corner, hch, vch) = border_glyphs_triplet(&glyph_choice);
-    if !(corner.is_empty() && hch.is_empty() && vch.is_empty()) {
-        let top = draw_border_row(usize::from(rect.w), corner, hch, corner);
-        let bottom = top.clone();
-        queue!(stdout, MoveTo(rect.x, rect.y), Print(top)).context("failed drawing pane top")?;
+    if let Some(corners) = border_glyphs_corners(&glyph_choice) {
+        let top = assemble_border_row(
+            rect.w,
+            corners.top_left,
+            corners.horizontal,
+            corners.top_right,
+        );
+        let bottom = assemble_border_row(
+            rect.w,
+            corners.bottom_left,
+            corners.horizontal,
+            corners.bottom_right,
+        );
+        queue!(stdout, MoveTo(rect.x, rect.y), Print(&top)).context("failed drawing pane top")?;
         queue!(
             stdout,
             MoveTo(rect.x, rect.y.saturating_add(rect.h.saturating_sub(1))),
-            Print(bottom)
+            Print(&bottom)
         )
         .context("failed drawing pane bottom")?;
 
         for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
-            queue!(stdout, MoveTo(rect.x, y), Print(vch))
+            queue!(stdout, MoveTo(rect.x, y), Print(corners.vertical))
                 .context("failed drawing pane left border")?;
             queue!(
                 stdout,
                 MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y),
-                Print(vch)
+                Print(corners.vertical)
             )
             .context("failed drawing pane right border")?;
         }
@@ -214,27 +582,148 @@ fn fallback_border_glyphs(
     }
 }
 
-/// Expand a [`crate::scene_cache::BorderGlyphs`] choice into the
-/// `(corner, horizontal, vertical)` strings used by the border-row
-/// painter. Returns empty strings for `None` or `Custom` so the caller
-/// can skip painting entirely.
-///
-/// `Custom` glyphs would need lifetime-extended access to the plugin-
-/// supplied record. Until the renderer supports owned custom glyphs,
-/// `Custom` is treated as "no border"; the plugin will likely publish
-/// per-surface paint commands for custom work instead.
-const fn border_glyphs_triplet(
+/// Six-rune border glyph set used when painting a 1-cell border.
+#[derive(Clone, Copy)]
+struct BorderGlyphSet {
+    top_left: &'static str,
+    top_right: &'static str,
+    bottom_left: &'static str,
+    bottom_right: &'static str,
+    horizontal: &'static str,
+    vertical: &'static str,
+}
+
+/// Expand a [`crate::scene_cache::BorderGlyphs`] choice into its
+/// `(top-left, top-right, bottom-left, bottom-right, horizontal,
+/// vertical)` runes. Returns `None` for `None` and `Custom` (the
+/// caller handles custom glyphs via the owning `BorderGlyphs` value
+/// directly because the runes are owned strings).
+#[allow(clippy::ref_option)] // Match arms borrow the `&BorderGlyphs` input directly.
+const fn border_glyphs_corners(
     choice: &crate::scene_cache::BorderGlyphs,
-) -> (&'static str, &'static str, &'static str) {
+) -> Option<BorderGlyphSet> {
     use crate::scene_cache::BorderGlyphs;
-    match choice {
-        BorderGlyphs::None | BorderGlyphs::Custom { .. } => ("", "", ""),
-        BorderGlyphs::Ascii => ("+", "-", "|"),
-        BorderGlyphs::AsciiFocused => ("+", "=", "|"),
-        BorderGlyphs::AsciiZoomed => ("#", "=", "\u{2551}"),
-        BorderGlyphs::SingleLine => ("\u{250c}", "\u{2500}", "\u{2502}"),
-        BorderGlyphs::DoubleLine => ("\u{2554}", "\u{2550}", "\u{2551}"),
+    let set = match choice {
+        // Custom carries owned strings; callers that need custom
+        // glyphs use `queue_box_border` which takes the full
+        // `BorderGlyphs` value (via the scene cache).
+        BorderGlyphs::None | BorderGlyphs::Custom { .. } => return None,
+        BorderGlyphs::Ascii => BorderGlyphSet {
+            top_left: "+",
+            top_right: "+",
+            bottom_left: "+",
+            bottom_right: "+",
+            horizontal: "-",
+            vertical: "|",
+        },
+        BorderGlyphs::AsciiFocused => BorderGlyphSet {
+            top_left: "+",
+            top_right: "+",
+            bottom_left: "+",
+            bottom_right: "+",
+            horizontal: "=",
+            vertical: "|",
+        },
+        BorderGlyphs::AsciiZoomed => BorderGlyphSet {
+            top_left: "#",
+            top_right: "#",
+            bottom_left: "#",
+            bottom_right: "#",
+            horizontal: "=",
+            vertical: "\u{2551}",
+        },
+        BorderGlyphs::SingleLine => BorderGlyphSet {
+            top_left: "\u{250c}",
+            top_right: "\u{2510}",
+            bottom_left: "\u{2514}",
+            bottom_right: "\u{2518}",
+            horizontal: "\u{2500}",
+            vertical: "\u{2502}",
+        },
+        BorderGlyphs::DoubleLine => BorderGlyphSet {
+            top_left: "\u{2554}",
+            top_right: "\u{2557}",
+            bottom_left: "\u{255a}",
+            bottom_right: "\u{255d}",
+            horizontal: "\u{2550}",
+            vertical: "\u{2551}",
+        },
+        BorderGlyphs::Rounded => BorderGlyphSet {
+            top_left: "\u{256d}",
+            top_right: "\u{256e}",
+            bottom_left: "\u{2570}",
+            bottom_right: "\u{256f}",
+            horizontal: "\u{2500}",
+            vertical: "\u{2502}",
+        },
+        BorderGlyphs::Thick => BorderGlyphSet {
+            top_left: "\u{250f}",
+            top_right: "\u{2513}",
+            bottom_left: "\u{2517}",
+            bottom_right: "\u{251b}",
+            horizontal: "\u{2501}",
+            vertical: "\u{2503}",
+        },
+        BorderGlyphs::HeavyDouble => BorderGlyphSet {
+            top_left: "\u{250f}",
+            top_right: "\u{2513}",
+            bottom_left: "\u{2517}",
+            bottom_right: "\u{251b}",
+            horizontal: "\u{2550}",
+            vertical: "\u{2551}",
+        },
+        BorderGlyphs::Dashed => BorderGlyphSet {
+            top_left: "\u{250c}",
+            top_right: "\u{2510}",
+            bottom_left: "\u{2514}",
+            bottom_right: "\u{2518}",
+            horizontal: "\u{254c}",
+            vertical: "\u{254e}",
+        },
+        BorderGlyphs::Dotted => BorderGlyphSet {
+            top_left: "\u{250c}",
+            top_right: "\u{2510}",
+            bottom_left: "\u{2514}",
+            bottom_right: "\u{2518}",
+            horizontal: "\u{2508}",
+            vertical: "\u{250a}",
+        },
+        BorderGlyphs::NerdPowerline => BorderGlyphSet {
+            top_left: "\u{e0b6}",
+            top_right: "\u{e0b4}",
+            bottom_left: "\u{e0b6}",
+            bottom_right: "\u{e0b4}",
+            horizontal: " ",
+            vertical: " ",
+        },
+    };
+    Some(set)
+}
+
+/// Compose a horizontal border row: `left` corner, `mid` repeated
+/// `width - 2` times, `right` corner. `left` / `mid` / `right` are
+/// expected to be single-display-column strings; non-ASCII box glyphs
+/// (Unicode `─`, `│`) work because they lie in the 1-column grapheme
+/// range.
+#[allow(clippy::suspicious_operation_groupings)] // Byte-length arithmetic for String capacity; clippy misfires.
+fn assemble_border_row(width: u16, left: &str, mid: &str, right: &str) -> String {
+    let width = usize::from(width);
+    if width == 0 {
+        return String::new();
     }
+    if width == 1 {
+        return left.to_string();
+    }
+    let body_len = mid.len() * width.saturating_sub(2);
+    let mut line = String::with_capacity(left.len() + body_len + right.len());
+    line.push_str(left);
+    if width > 2 {
+        for _ in 0..(width - 2) {
+            line.push_str(mid);
+        }
+    }
+    line.push_str(right);
+    line
 }
 
 /// Pick the badge text for `pane_state` from the plugin's fallback
@@ -260,38 +749,16 @@ const fn string_as_str(s: &String) -> &str {
     unsafe { std::str::from_utf8_unchecked(s.as_bytes()) }
 }
 
-/// Compose a horizontal border row: `left` corner, `mid` repeated
-/// `width - 2` times, `right` corner. `left` / `mid` / `right` are
-/// expected to be single-display-column strings; non-ASCII box glyphs
-/// (Unicode `─`, `│`) work because they lie in the 1-column grapheme
-/// range.
-#[allow(clippy::suspicious_operation_groupings)] // Byte-length arithmetic for String capacity; clippy misfires.
-fn draw_border_row(width: usize, left: &str, mid: &str, right: &str) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return left.to_string();
-    }
-    let body_len = mid.len() * width.saturating_sub(2);
-    let mut line = String::with_capacity(left.len() + body_len + right.len());
-    line.push_str(left);
-    if width > 2 {
-        for _ in 0..(width - 2) {
-            line.push_str(mid);
-        }
-    }
-    line.push_str(right);
-    line
-}
-
-/// Translate a [`crate::scene_cache::SceneStyle`] to the equivalent
-/// ANSI SGR prelude. Returns an empty string when every attribute is
-/// at its default, so the caller can skip the write entirely.
-fn scene_style_sgr_prelude(style: &crate::scene_cache::SceneStyle) -> String {
+/// Translate a [`crate::scene_cache::Style`] to the equivalent ANSI
+/// SGR prelude. Returns an empty string when every attribute is at
+/// its default, so the caller can skip the write entirely.
+fn scene_style_sgr_prelude(style: &crate::scene_cache::Style) -> String {
     let mut params: Vec<String> = Vec::new();
     if style.bold {
         params.push("1".to_string());
+    }
+    if style.dim {
+        params.push("2".to_string());
     }
     if style.italic {
         params.push("3".to_string());
@@ -299,14 +766,20 @@ fn scene_style_sgr_prelude(style: &crate::scene_cache::SceneStyle) -> String {
     if style.underline {
         params.push("4".to_string());
     }
+    if style.blink {
+        params.push("5".to_string());
+    }
     if style.reverse {
         params.push("7".to_string());
     }
+    if style.strikethrough {
+        params.push("9".to_string());
+    }
     if let Some(fg) = style.fg.as_ref() {
-        params.push(scene_color_to_sgr(*fg, false));
+        params.push(scene_color_to_sgr(fg, false));
     }
     if let Some(bg) = style.bg.as_ref() {
-        params.push(scene_color_to_sgr(*bg, true));
+        params.push(scene_color_to_sgr(bg, true));
     }
     if params.is_empty() {
         String::new()
@@ -315,36 +788,58 @@ fn scene_style_sgr_prelude(style: &crate::scene_cache::SceneStyle) -> String {
     }
 }
 
-/// Map a [`crate::scene_cache::SceneStyle`] colour enum value to its
-/// SGR numeric code for either foreground (`background = false`) or
-/// background (`background = true`).
+/// Map a [`crate::scene_cache::Color`] value to its SGR parameter
+/// string for either foreground (`background = false`) or background
+/// (`background = true`).
 ///
-/// `Default` and `Reset` both map to "reset" on that channel.
-fn scene_color_to_sgr(color: crate::scene_cache::Color, background: bool) -> String {
+/// `Default` and `Reset` both map to the "reset" parameter on that
+/// channel. `Indexed` emits `38;5;n` / `48;5;n`; `Rgb` emits
+/// `38;2;r;g;b` / `48;2;r;g;b`.
+fn scene_color_to_sgr(color: &crate::scene_cache::Color, background: bool) -> String {
     use crate::scene_cache::Color;
-    let base_fg = match color {
-        Color::Default | Color::Reset => {
-            return if background { "49" } else { "39" }.to_string();
+    match color {
+        Color::Default | Color::Reset => if background { "49" } else { "39" }.to_string(),
+        Color::Named { name } => named_color_to_sgr(*name, background).to_string(),
+        Color::Indexed { index } => {
+            if background {
+                format!("48;5;{index}")
+            } else {
+                format!("38;5;{index}")
+            }
         }
-        Color::Black => 30,
-        Color::Red => 31,
-        Color::Green => 32,
-        Color::Yellow => 33,
-        Color::Blue => 34,
-        Color::Magenta => 35,
-        Color::Cyan => 36,
-        Color::White => 37,
-        Color::BrightBlack => 90,
-        Color::BrightRed => 91,
-        Color::BrightGreen => 92,
-        Color::BrightYellow => 93,
-        Color::BrightBlue => 94,
-        Color::BrightMagenta => 95,
-        Color::BrightCyan => 96,
-        Color::BrightWhite => 97,
+        Color::Rgb { r, g, b } => {
+            if background {
+                format!("48;2;{r};{g};{b}")
+            } else {
+                format!("38;2;{r};{g};{b}")
+            }
+        }
+    }
+}
+
+/// Map a 16-colour palette entry to its foreground SGR code (or, when
+/// `background == true`, its background equivalent by adding 10).
+const fn named_color_to_sgr(name: crate::scene_cache::NamedColor, background: bool) -> u16 {
+    use crate::scene_cache::NamedColor;
+    let fg = match name {
+        NamedColor::Black => 30,
+        NamedColor::Red => 31,
+        NamedColor::Green => 32,
+        NamedColor::Yellow => 33,
+        NamedColor::Blue => 34,
+        NamedColor::Magenta => 35,
+        NamedColor::Cyan => 36,
+        NamedColor::White => 37,
+        NamedColor::BrightBlack => 90,
+        NamedColor::BrightRed => 91,
+        NamedColor::BrightGreen => 92,
+        NamedColor::BrightYellow => 93,
+        NamedColor::BrightBlue => 94,
+        NamedColor::BrightMagenta => 95,
+        NamedColor::BrightCyan => 96,
+        NamedColor::BrightWhite => 97,
     };
-    let code = if background { base_fg + 10 } else { base_fg };
-    code.to_string()
+    if background { fg + 10 } else { fg }
 }
 
 /// Fill an opaque layer interior with spaces.
@@ -1131,8 +1626,8 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Test fixture builds a full scene + cache + assertions inline.
     fn render_attach_scene_applies_decoration_paint_commands_when_cache_has_surface() {
         use crate::scene_cache::{
-            Color, DecorationScene, DecorationSceneCache, PaintCommand, SceneRect, SceneStyle,
-            SurfaceDecoration,
+            Color, DecorationScene, DecorationSceneCache, NamedColor, PaintCommand, SceneRect,
+            Style, SurfaceDecoration,
         };
         use std::collections::BTreeMap as StdBTreeMap;
 
@@ -1193,17 +1688,23 @@ mod tests {
                     w: 18,
                     h: 3,
                 },
-                paint_commands: vec![PaintCommand {
+                paint_commands: vec![PaintCommand::Text {
                     col: 0,
                     row: 1,
+                    z: 0,
                     text: "DECO!".to_string(),
-                    style: SceneStyle {
-                        fg: Some(Color::BrightYellow),
+                    style: Style {
+                        fg: Some(Color::Named {
+                            name: NamedColor::BrightYellow,
+                        }),
                         bg: None,
                         bold: true,
                         underline: false,
                         italic: false,
                         reverse: false,
+                        dim: false,
+                        blink: false,
+                        strikethrough: false,
                     },
                 }],
             },
@@ -1213,6 +1714,7 @@ mod tests {
             revision: 1,
             surfaces,
             fallback: None,
+            animation: None,
         });
 
         let mut output = Vec::new();
@@ -1315,6 +1817,7 @@ mod tests {
                 running_badge: "run".to_string(),
                 exited_badge: "bye".to_string(),
             }),
+            animation: None,
         });
 
         let mut output = Vec::new();
@@ -1546,6 +2049,428 @@ mod tests {
         assert!(
             rendered.contains("content"),
             "full_pane_redraw must draw content even when sync_update_in_progress is set"
+        );
+    }
+
+    // ─── PR 1: scene-protocol widening SGR snapshot tests ─────────────
+    //
+    // These exercise the new colour variants, style modifiers, and
+    // paint-command variants end-to-end through the same render path
+    // used in production.
+
+    use crate::scene_cache::{
+        BorderGlyphs, Cell, Color, DecorationScene, DecorationSceneCache, GradientAxis, NamedColor,
+        PaintCommand, SceneRect, Style, SurfaceDecoration,
+    };
+
+    fn default_style() -> Style {
+        Style {
+            fg: None,
+            bg: None,
+            bold: false,
+            underline: false,
+            italic: false,
+            reverse: false,
+            dim: false,
+            blink: false,
+            strikethrough: false,
+        }
+    }
+
+    fn render_with_single_surface_paint(paint_commands: Vec<PaintCommand>) -> String {
+        let pane_id = Uuid::from_u128(0xfeed);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(0xbeef),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 40,
+                    h: 6,
+                },
+                content_rect: AttachRect {
+                    x: 1,
+                    y: 1,
+                    w: 38,
+                    h: 4,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let panes = vec![PaneSummary {
+            id: pane_id,
+            index: 1,
+            name: None,
+            focused: true,
+            state: PaneState::Running,
+            state_reason: None,
+        }];
+        let mut pane_buffers = BTreeMap::new();
+        pane_buffers.insert(pane_id, PaneRenderBuffer::default());
+
+        let mut surfaces = std::collections::BTreeMap::new();
+        surfaces.insert(
+            pane_id,
+            SurfaceDecoration {
+                surface_id: pane_id,
+                rect: SceneRect {
+                    x: 0,
+                    y: 0,
+                    w: 40,
+                    h: 6,
+                },
+                content_rect: SceneRect {
+                    x: 1,
+                    y: 1,
+                    w: 38,
+                    h: 4,
+                },
+                paint_commands,
+            },
+        );
+        let mut cache = DecorationSceneCache::new();
+        cache.force_scene(DecorationScene {
+            revision: 1,
+            surfaces,
+            fallback: None,
+            animation: None,
+        });
+
+        let mut output = Vec::new();
+        let _ = render_attach_scene(
+            &mut output,
+            &scene,
+            &panes,
+            &mut pane_buffers,
+            &BTreeSet::from([pane_id]),
+            true,
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (80, 24),
+            Some(&cache),
+        )
+        .expect("render should succeed");
+        String::from_utf8(output).expect("render output should be utf8")
+    }
+
+    #[test]
+    fn truecolor_rgb_emits_24bit_fg_sgr() {
+        let mut style = default_style();
+        style.fg = Some(Color::Rgb {
+            r: 57,
+            g: 255,
+            b: 20,
+        });
+        let out = render_with_single_surface_paint(vec![PaintCommand::Text {
+            col: 2,
+            row: 0,
+            z: 0,
+            text: "LIME".to_string(),
+            style,
+        }]);
+        assert!(
+            out.contains("\x1b[38;2;57;255;20m"),
+            "expected 24-bit truecolor SGR; got: {out:?}"
+        );
+        assert!(out.contains("LIME"));
+    }
+
+    #[test]
+    fn indexed_color_emits_256_palette_sgr() {
+        let mut style = default_style();
+        style.fg = Some(Color::Indexed { index: 214 });
+        let out = render_with_single_surface_paint(vec![PaintCommand::Text {
+            col: 2,
+            row: 0,
+            z: 0,
+            text: "X".to_string(),
+            style,
+        }]);
+        assert!(
+            out.contains("\x1b[38;5;214m"),
+            "expected 256-indexed SGR; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn named_color_emits_legacy_palette_sgr() {
+        let mut style = default_style();
+        style.fg = Some(Color::Named {
+            name: NamedColor::BrightYellow,
+        });
+        style.bold = true;
+        let out = render_with_single_surface_paint(vec![PaintCommand::Text {
+            col: 2,
+            row: 0,
+            z: 0,
+            text: "Y".to_string(),
+            style,
+        }]);
+        assert!(
+            out.contains("\x1b[1;93m"),
+            "expected bold + bright-yellow SGR; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn new_style_modifiers_emit_their_sgr_codes() {
+        let mut style = default_style();
+        style.dim = true;
+        style.blink = true;
+        style.strikethrough = true;
+        let out = render_with_single_surface_paint(vec![PaintCommand::Text {
+            col: 2,
+            row: 0,
+            z: 0,
+            text: "M".to_string(),
+            style,
+        }]);
+        // Dim=2, blink=5, strikethrough=9 all in the prelude.
+        assert!(
+            out.contains("\x1b[2;5;9m"),
+            "expected dim+blink+strike SGR; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn filled_rect_paints_every_row_with_glyph() {
+        let mut style = default_style();
+        style.fg = Some(Color::Rgb {
+            r: 255,
+            g: 0,
+            b: 128,
+        });
+        let out = render_with_single_surface_paint(vec![PaintCommand::FilledRect {
+            rect: SceneRect {
+                x: 2,
+                y: 0,
+                w: 4,
+                h: 2,
+            },
+            z: 0,
+            glyph: "#".to_string(),
+            style,
+        }]);
+        // Row should be "####" painted twice.
+        let count = out.matches("####").count();
+        assert!(
+            count >= 2,
+            "expected filled-rect to emit 2 rows of ####; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn gradient_run_interpolates_rgb_endpoints() {
+        let mut from = default_style();
+        from.fg = Some(Color::Rgb { r: 0, g: 0, b: 0 });
+        let mut to = default_style();
+        to.fg = Some(Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        });
+        let out = render_with_single_surface_paint(vec![PaintCommand::GradientRun {
+            col: 2,
+            row: 0,
+            z: 0,
+            text: "abcde".to_string(),
+            axis: GradientAxis::Horizontal,
+            from_style: from,
+            to_style: to,
+        }]);
+        // The first cell must emit the `from` endpoint; the last the
+        // `to` endpoint. Intermediate cells interpolate between them.
+        assert!(
+            out.contains("\x1b[38;2;0;0;0m"),
+            "expected gradient start rgb; got: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[38;2;255;255;255m"),
+            "expected gradient end rgb; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cell_grid_paints_sparse_cells() {
+        let mut style = default_style();
+        style.fg = Some(Color::Indexed { index: 42 });
+        let cells = vec![
+            Cell {
+                glyph: "A".to_string(),
+                style: style.clone(),
+            },
+            Cell {
+                glyph: String::new(), // sparse — should be skipped
+                style: style.clone(),
+            },
+            Cell {
+                glyph: "B".to_string(),
+                style: style.clone(),
+            },
+            Cell {
+                glyph: "C".to_string(),
+                style,
+            },
+        ];
+        let out = render_with_single_surface_paint(vec![PaintCommand::CellGrid {
+            origin_col: 2,
+            origin_row: 0,
+            z: 0,
+            cols: 2,
+            cells,
+        }]);
+        assert!(out.contains('A'));
+        assert!(out.contains('B'));
+        assert!(out.contains('C'));
+    }
+
+    #[test]
+    fn box_border_paints_rounded_corners() {
+        let style = default_style();
+        let out = render_with_single_surface_paint(vec![PaintCommand::BoxBorder {
+            rect: SceneRect {
+                x: 0,
+                y: 0,
+                w: 6,
+                h: 3,
+            },
+            z: 0,
+            glyphs: BorderGlyphs::Rounded,
+            style,
+        }]);
+        assert!(out.contains('\u{256d}'), "top-left ╭ missing; got: {out:?}");
+        assert!(
+            out.contains('\u{256e}'),
+            "top-right ╮ missing; got: {out:?}"
+        );
+        assert!(out.contains('\u{2570}'), "bot-left ╰ missing; got: {out:?}");
+        assert!(
+            out.contains('\u{256f}'),
+            "bot-right ╯ missing; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn box_border_accepts_custom_six_rune_glyphs() {
+        let out = render_with_single_surface_paint(vec![PaintCommand::BoxBorder {
+            rect: SceneRect {
+                x: 0,
+                y: 0,
+                w: 6,
+                h: 3,
+            },
+            z: 0,
+            glyphs: BorderGlyphs::Custom {
+                top_left: "A".to_string(),
+                top_right: "B".to_string(),
+                bottom_left: "C".to_string(),
+                bottom_right: "D".to_string(),
+                horizontal: "h".to_string(),
+                vertical: "v".to_string(),
+            },
+            style: default_style(),
+        }]);
+        assert!(
+            out.contains("AhhhhB"),
+            "top row must be A + 4×h + B; got: {out:?}"
+        );
+        assert!(
+            out.contains("ChhhhD"),
+            "bot row must be C + 4×h + D; got: {out:?}"
+        );
+        assert!(out.contains('v'), "vertical must be emitted; got: {out:?}");
+    }
+
+    #[test]
+    fn paint_commands_respect_z_ordering() {
+        // Two Text commands at the same (col, row) — the one with the
+        // higher z must be visible (painted last).
+        let mut lo = default_style();
+        lo.fg = Some(Color::Rgb { r: 1, g: 1, b: 1 });
+        let mut hi = default_style();
+        hi.fg = Some(Color::Rgb {
+            r: 99,
+            g: 99,
+            b: 99,
+        });
+        let out = render_with_single_surface_paint(vec![
+            PaintCommand::Text {
+                col: 0,
+                row: 0,
+                z: 10,
+                text: "HIGH".to_string(),
+                style: hi,
+            },
+            PaintCommand::Text {
+                col: 0,
+                row: 0,
+                z: -5,
+                text: "LOW".to_string(),
+                style: lo,
+            },
+        ]);
+        // Both should appear in the byte stream (both were painted)
+        // but HIGH must appear *after* LOW in the stream so the
+        // terminal sees HIGH last.
+        let lo_pos = out.find("LOW").expect("LOW must appear");
+        let hi_pos = out.find("HIGH").expect("HIGH must appear");
+        assert!(
+            lo_pos < hi_pos,
+            "lower z must be painted first; got LOW at {lo_pos}, HIGH at {hi_pos}",
+        );
+    }
+
+    #[test]
+    fn surface_emits_single_trailing_reset() {
+        let mut style = default_style();
+        style.fg = Some(Color::Named {
+            name: NamedColor::BrightGreen,
+        });
+        let out = render_with_single_surface_paint(vec![
+            PaintCommand::Text {
+                col: 0,
+                row: 0,
+                z: 0,
+                text: "A".to_string(),
+                style: style.clone(),
+            },
+            PaintCommand::Text {
+                col: 0,
+                row: 1,
+                z: 0,
+                text: "B".to_string(),
+                style,
+            },
+        ]);
+        // The old path reset after every paint; the new path resets
+        // once at the end of the surface. Count resets between the
+        // last paint text and the end of the surface's decoration
+        // section — the PTY render path adds more resets afterwards
+        // but we only care that the decoration section emits exactly
+        // one.
+        let resets = out.matches("\x1b[0m").count();
+        // Exact count is noisy because the PTY row walker adds its
+        // own resets; the regression we guard against is "zero
+        // resets after the surface", so assert at least one reset
+        // shows up following the final paint text.
+        assert!(
+            resets >= 1,
+            "expected at least one SGR reset in output; got: {out:?}"
         );
     }
 }

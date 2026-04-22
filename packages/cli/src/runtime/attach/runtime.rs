@@ -7352,6 +7352,7 @@ mod tests {
                 revision: 1,
                 surfaces,
                 fallback: None,
+                animation: None,
             });
         }
 

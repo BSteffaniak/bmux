@@ -23,7 +23,7 @@ use bmux_decoration_plugin_api::decoration_state::{
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
-    BorderGlyphs, Color, DecorationScene, FallbackStyle, PaintCommand, Rect, Style,
+    BorderGlyphs, Color, DecorationScene, FallbackStyle, NamedColor, PaintCommand, Rect, Style,
     SurfaceDecoration,
 };
 use uuid::Uuid;
@@ -171,6 +171,7 @@ fn build_scene(state: &State) -> DecorationScene {
         revision: state.scene_revision,
         surfaces,
         fallback: Some(default_fallback_style()),
+        animation: None,
     }
 }
 
@@ -180,6 +181,7 @@ fn empty_scene() -> DecorationScene {
         revision: 0,
         surfaces: BTreeMap::new(),
         fallback: None,
+        animation: None,
     }
 }
 
@@ -290,18 +292,23 @@ fn paint_commands_for(border: BorderStyle) -> Vec<PaintCommand> {
 /// Style helper used by the renderer when expanding descriptors into
 /// concrete paint commands.
 #[must_use]
-pub const fn style_for_focus(focused: bool) -> Style {
+pub fn style_for_focus(focused: bool) -> Style {
     Style {
-        fg: Some(if focused {
-            Color::BrightWhite
-        } else {
-            Color::White
+        fg: Some(Color::Named {
+            name: if focused {
+                NamedColor::BrightWhite
+            } else {
+                NamedColor::White
+            },
         }),
         bg: None,
         bold: focused,
         underline: false,
         italic: false,
         reverse: false,
+        dim: false,
+        blink: false,
+        strikethrough: false,
     }
 }
 

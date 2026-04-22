@@ -10,8 +10,8 @@
 use uuid::Uuid;
 
 pub use bmux_scene_protocol::scene_protocol::{
-    BorderGlyphs, Color, DecorationScene, FallbackStyle, PaintCommand, Rect as SceneRect,
-    Style as SceneStyle, SurfaceDecoration,
+    AnimationHint, BorderGlyphs, Cell, Color, DecorationScene, FallbackStyle, GradientAxis,
+    NamedColor, PaintCommand, Rect, Rect as SceneRect, Style, SurfaceDecoration,
 };
 
 /// Render-side cache of the latest decoration scene.
@@ -138,6 +138,7 @@ mod tests {
             revision,
             surfaces,
             fallback: None,
+            animation: None,
         }
     }
 
