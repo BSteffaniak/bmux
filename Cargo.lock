@@ -1465,17 +1465,26 @@ dependencies = [
 name = "bmux_pane_runtime_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
+ "bmux_pane_runtime_state",
+ "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_session_models",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
 name = "bmux_pane_runtime_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
+ "thiserror 2.0.18",
  "uuid",
 ]
 

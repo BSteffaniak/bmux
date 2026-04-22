@@ -24,6 +24,10 @@ bmux_plugin_schema_macros::schema! {
     source: "bpdl/pane-runtime-plugin.bpdl",
 }
 
+/// Typed-client helpers for invoking this plugin's services from any
+/// `TypedDispatchClient` (production `bmux_client`, tests, mocks).
+pub mod typed_client;
+
 /// Capability identifiers gating access to this plugin's surfaces.
 pub mod capabilities {
     use bmux_plugin_sdk::CapabilityId;

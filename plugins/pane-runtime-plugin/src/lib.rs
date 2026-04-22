@@ -8,8 +8,8 @@
 //!
 //! - Hold the `bmux.pane_runtime` capability/feature declarations so
 //!   other plugins may declare typed dependencies on it.
-//! - Provide a future home for typed service handlers that translate
-//!   BPDL requests into `SessionRuntimeManagerApi` calls.
+//! - Provide typed service handlers that translate BPDL requests into
+//!   calls against the registered `SessionRuntimeManagerHandle`.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
@@ -17,6 +17,8 @@
 
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
+
+mod handlers;
 
 #[derive(Default)]
 pub struct PaneRuntimePlugin;
@@ -26,10 +28,6 @@ impl RustPlugin for PaneRuntimePlugin {
         &mut self,
         _context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        // No-op: server owns the `SessionRuntimeManager` and registers
-        // the `SessionRuntimeManagerHandle` during `BmuxServer::new`.
-        // This plugin exists today to declare the capability + feature
-        // surface; typed service handlers will land in a follow-up.
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -41,11 +39,7 @@ impl RustPlugin for PaneRuntimePlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
-        let _ = context;
-        ServiceResponse::error(
-            "not_yet_wired",
-            "pane-runtime plugin service handlers are not yet wired",
-        )
+        handlers::route(context)
     }
 
     fn register_typed_services(

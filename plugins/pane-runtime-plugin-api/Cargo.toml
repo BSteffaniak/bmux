@@ -11,9 +11,11 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_ipc                  = { workspace = true }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std"] }
+thiserror                 = { workspace = true }
 uuid                      = { workspace = true, features = ["serde", "std"] }
 
 [package.metadata.cargo-machete]
