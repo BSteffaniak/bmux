@@ -1230,3 +1230,285 @@ fn plugin_api_crates_expose_typed_client_helpers() {
         );
     }
 }
+
+/// Slice 13 deleted the monolithic `SnapshotV4` schema plus the
+/// `SnapshotManager` + `SnapshotRuntime` machinery and the entire
+/// `packages/server/src/persistence.rs` file. Persistence now flows
+/// through the `bmux.snapshot` plugin via
+/// `SnapshotOrchestratorHandle` (trait object registered in the
+/// plugin state registry); server must not reintroduce any of the
+/// legacy schema or functions.
+#[test]
+fn server_does_not_define_snapshot_schema() {
+    let persistence_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../server/src/persistence.rs");
+    assert!(
+        !persistence_path.exists(),
+        "packages/server/src/persistence.rs must remain deleted; the \
+         monolithic snapshot schema was replaced by the `bmux.snapshot` \
+         plugin in Slice 13",
+    );
+
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_source = production_section(server_source);
+
+    // Legacy schema types — must not be declared in server.
+    let denied_types = [
+        "struct SnapshotV4",
+        "struct SnapshotEnvelopeV4",
+        "struct SnapshotManager",
+        "struct SnapshotRuntime",
+        "struct SessionSnapshotV3",
+        "struct ContextSnapshotV1",
+        "struct FollowEdgeSnapshotV2",
+        "struct ClientSelectedSessionSnapshotV2",
+        "struct ClientSelectedContextSnapshotV1",
+        "struct ContextSessionBindingSnapshotV1",
+        "struct PaneSnapshotV2",
+        "struct FloatingSurfaceSnapshotV3",
+        "enum PaneLayoutNodeSnapshotV2",
+        "enum PaneSplitDirectionSnapshotV2",
+    ];
+    for ty in denied_types {
+        assert!(
+            !server_source.contains(ty),
+            "packages/server/src/lib.rs must not define `{ty}`; the \
+             legacy monolithic snapshot schema was deleted in Slice 13 \
+             Stage 5",
+        );
+    }
+
+    // Legacy pipeline functions — must not be redefined in server.
+    let denied_fns = [
+        "fn build_snapshot",
+        "fn apply_snapshot_state",
+        "fn restore_snapshot_replace",
+        "fn restore_snapshot_if_present",
+        "fn snapshot_status",
+        "fn snapshot_layout_from_runtime",
+        "fn runtime_layout_from_snapshot",
+    ];
+    for function in denied_fns {
+        assert!(
+            !server_source.contains(function),
+            "packages/server/src/lib.rs must not define `{function}`; \
+             the legacy snapshot pipeline was replaced by \
+             `SnapshotOrchestratorHandle` dispatch in Slice 13 Stage 5",
+        );
+    }
+
+    // `ServerState` must not hold a `snapshot_runtime` field.
+    assert!(
+        !server_source.contains("snapshot_runtime: Arc<Mutex<SnapshotRuntime>>"),
+        "packages/server/src/lib.rs must not hold `snapshot_runtime` \
+         on `ServerState`; the snapshot plugin owns the dirty flag + \
+         orchestrator via handles in the plugin state registry",
+    );
+
+    // Server MUST reach the orchestrator through the trait handle.
+    assert!(
+        server_source.contains("SnapshotOrchestratorHandle"),
+        "packages/server/src/lib.rs must reference \
+         `SnapshotOrchestratorHandle` so IPC handlers + restore hooks \
+         delegate through the trait object instead of owning \
+         persistence code directly",
+    );
+    assert!(
+        server_source.contains("bmux_snapshot_runtime::"),
+        "packages/server/src/lib.rs must import from \
+         `bmux_snapshot_runtime` (the neutral primitive crate \
+         hosting `SnapshotOrchestratorHandle` + `SnapshotDirtyFlag`)",
+    );
+}
+
+/// Verify that the snapshot plugin + plugin-api crates exist,
+/// export the expected file format + offline utility, and that the
+/// plugin impl registers `SnapshotOrchestratorHandle` into the
+/// plugin state registry so server can dispatch through it.
+#[test]
+fn snapshot_plugin_exists() {
+    let api_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/snapshot-plugin-api");
+    let plugin_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/snapshot-plugin");
+    assert!(
+        api_dir.join("Cargo.toml").exists(),
+        "plugins/snapshot-plugin-api/Cargo.toml must exist",
+    );
+    assert!(
+        plugin_dir.join("Cargo.toml").exists(),
+        "plugins/snapshot-plugin/Cargo.toml must exist",
+    );
+
+    // Plugin-api crate owns the envelope format + offline utility.
+    let api_envelope = include_str!("../../../plugins/snapshot-plugin-api/src/envelope.rs");
+    assert!(
+        api_envelope.contains("pub struct CombinedSnapshotEnvelope"),
+        "plugins/snapshot-plugin-api/src/envelope.rs must export the \
+         canonical `CombinedSnapshotEnvelope` struct",
+    );
+    assert!(
+        api_envelope.contains("pub struct SectionV1"),
+        "plugins/snapshot-plugin-api/src/envelope.rs must export the \
+         canonical `SectionV1` section wrapper",
+    );
+
+    let api_offline = include_str!("../../../plugins/snapshot-plugin-api/src/offline_snapshot.rs");
+    assert!(
+        api_offline.contains("pub fn offline_kill_sessions"),
+        "plugins/snapshot-plugin-api/src/offline_snapshot.rs must \
+         export the `offline_kill_sessions` utility (CLI fallback \
+         when the server is down)",
+    );
+    assert!(
+        api_offline.contains("pub enum OfflineSessionKillTarget"),
+        "plugins/snapshot-plugin-api/src/offline_snapshot.rs must \
+         export `OfflineSessionKillTarget`",
+    );
+
+    // Plugin impl constructs the orchestrator + registers the handle.
+    let plugin_lib = include_str!("../../../plugins/snapshot-plugin/src/lib.rs");
+    assert!(
+        plugin_lib.contains("pub struct SnapshotPlugin"),
+        "plugins/snapshot-plugin/src/lib.rs must export a \
+         `SnapshotPlugin` type implementing `RustPlugin`",
+    );
+    assert!(
+        plugin_lib.contains("register::<SnapshotOrchestratorHandle>"),
+        "plugins/snapshot-plugin/src/lib.rs must register a \
+         `SnapshotOrchestratorHandle` into the plugin state registry \
+         on `activate` so server + other plugins dispatch through it",
+    );
+
+    let orchestrator_src = include_str!("../../../plugins/snapshot-plugin/src/orchestrator.rs");
+    assert!(
+        orchestrator_src.contains("pub struct BmuxSnapshotOrchestrator"),
+        "plugins/snapshot-plugin/src/orchestrator.rs must export the \
+         concrete `BmuxSnapshotOrchestrator`",
+    );
+    assert!(
+        orchestrator_src.contains("impl SnapshotOrchestrator for BmuxSnapshotOrchestrator"),
+        "plugins/snapshot-plugin/src/orchestrator.rs must implement \
+         `SnapshotOrchestrator` for the concrete orchestrator type",
+    );
+
+    // CLI bootstrap must register the config before plugin activation.
+    let cli_bootstrap = include_str!("../src/runtime/bootstrap.rs");
+    assert!(
+        cli_bootstrap.contains("register_snapshot_plugin_config"),
+        "packages/cli/src/runtime/bootstrap.rs must call \
+         `register_snapshot_plugin_config` to install the \
+         `SnapshotPluginConfig` before `activate_loaded_plugins` \
+         so the snapshot plugin can read its path",
+    );
+    assert!(
+        cli_bootstrap.contains("bmux-snapshot-v1.json"),
+        "packages/cli/src/runtime/bootstrap.rs must reference the \
+         versioned `bmux-snapshot-v1.json` filename so the new \
+         combined-envelope format never silently overwrites a legacy \
+         `server-snapshot-v2.json`",
+    );
+}
+
+/// Verify that each foundational state plugin (clients, contexts,
+/// sessions) implements `StatefulPlugin` so the snapshot plugin can
+/// iterate them through a registered `StatefulPluginHandle`.
+#[test]
+fn state_plugins_implement_stateful_plugin() {
+    let plugins = [
+        (
+            "plugins/clients-plugin",
+            include_str!("../../../plugins/clients-plugin/src/lib.rs"),
+            "impl StatefulPlugin for ClientsStatefulPlugin",
+            "bmux.clients/follow-state",
+        ),
+        (
+            "plugins/contexts-plugin",
+            include_str!("../../../plugins/contexts-plugin/src/lib.rs"),
+            "impl StatefulPlugin for ContextsStatefulPlugin",
+            "bmux.contexts/context-state",
+        ),
+        (
+            "plugins/sessions-plugin",
+            include_str!("../../../plugins/sessions-plugin/src/lib.rs"),
+            "impl StatefulPlugin for SessionsStatefulPlugin",
+            "bmux.sessions/session-manager",
+        ),
+    ];
+    for (path, src, impl_marker, id) in plugins {
+        assert!(
+            src.contains(impl_marker),
+            "{path}/src/lib.rs must declare `{impl_marker}` so the \
+             plugin participates in the shared `StatefulPluginRegistry`",
+        );
+        assert!(
+            src.contains(id),
+            "{path}/src/lib.rs must ground its participant at the \
+             well-known id `{id}` so the snapshot orchestrator can \
+             route restore payloads back to it",
+        );
+        assert!(
+            src.contains("get_or_init_stateful_registry"),
+            "{path}/src/lib.rs must call \
+             `bmux_snapshot_runtime::get_or_init_stateful_registry` \
+             to push its `StatefulPluginHandle` into the shared \
+             registry on `activate`",
+        );
+    }
+}
+
+/// Verify that the server implements `StatefulPlugin` for its
+/// pane-runtime surface (panes + layout + floating + resurrection).
+/// Unlike the three foundational state plugins, pane-runtime is
+/// genuine server runtime — PTY handles live inside the server
+/// process — so the server itself registers a participant into the
+/// shared `StatefulPluginRegistry`.
+#[test]
+fn server_implements_pane_runtime_stateful() {
+    let pane_runtime_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../server/src/pane_runtime_snapshot.rs");
+    assert!(
+        pane_runtime_path.exists(),
+        "packages/server/src/pane_runtime_snapshot.rs must exist",
+    );
+
+    let module_src = include_str!("../../server/src/pane_runtime_snapshot.rs");
+    assert!(
+        module_src.contains("pub struct ServerPaneRuntimeStateful"),
+        "packages/server/src/pane_runtime_snapshot.rs must export \
+         `ServerPaneRuntimeStateful` — the server's participant in \
+         the shared `StatefulPluginRegistry`",
+    );
+    assert!(
+        module_src.contains("impl StatefulPlugin for ServerPaneRuntimeStateful"),
+        "packages/server/src/pane_runtime_snapshot.rs must implement \
+         `StatefulPlugin` for `ServerPaneRuntimeStateful`",
+    );
+    assert!(
+        module_src.contains("bmux.server/pane-runtime"),
+        "packages/server/src/pane_runtime_snapshot.rs must ground its \
+         participant at id `bmux.server/pane-runtime` so the snapshot \
+         orchestrator can route restore payloads back to it",
+    );
+    assert!(
+        module_src.contains("pub struct PaneRuntimeSnapshotV1"),
+        "packages/server/src/pane_runtime_snapshot.rs must define the \
+         `PaneRuntimeSnapshotV1` schema for the pane-runtime section",
+    );
+
+    let server_source = include_str!("../../server/src/lib.rs");
+    let server_prod = production_section(server_source);
+    assert!(
+        server_source.contains("mod pane_runtime_snapshot"),
+        "packages/server/src/lib.rs must declare the \
+         `pane_runtime_snapshot` module",
+    );
+    assert!(
+        server_prod.contains("ServerPaneRuntimeStateful::register"),
+        "packages/server/src/lib.rs must call \
+         `ServerPaneRuntimeStateful::register(&self.state)` during \
+         `run_impl` so the server's pane-runtime participant is \
+         pushed into the shared registry before \
+         `restore_if_present` runs",
+    );
+}
