@@ -9,7 +9,14 @@ provided_capabilities = [
     "bmux.attach_runtime.write",
 ]
 provided_features = ["bmux.pane_runtime"]
-required_capabilities = []
+required_capabilities = [
+    "bmux.clients.read",
+    "bmux.contexts.read",
+    "bmux.contexts.write",
+    "bmux.sessions.read",
+    "bmux.sessions.write",
+    "bmux.sessions.policy",
+]
 version = "0.0.1-alpha.0"
 
 [[dependencies]]

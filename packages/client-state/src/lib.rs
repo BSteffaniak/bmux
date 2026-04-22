@@ -273,3 +273,57 @@ impl FollowStateHandle {
         Self::new(NoopFollowState)
     }
 }
+
+// ── Client principal lookup ──────────────────────────────────────────
+
+/// Read/write trait for the server's per-client principal map.
+///
+/// Server owns the concrete `BTreeMap<ClientId, Uuid>` on
+/// `ServerState` and registers a trait object via
+/// [`ClientPrincipalHandle`]. Plugins look up the handle from the
+/// plugin state registry and query principals for the clients they
+/// act on behalf of (e.g. when performing policy checks that gate on
+/// principal identity).
+pub trait ClientPrincipalLookup: Send + Sync {
+    /// Return the principal id assigned to the given client, if any.
+    fn get(&self, client_id: ClientId) -> Option<Uuid>;
+    /// Record a client's principal id. Called by the server on
+    /// connection handshake.
+    fn set(&self, client_id: ClientId, principal_id: Uuid);
+    /// Forget a client's principal id on disconnect.
+    fn remove(&self, client_id: ClientId);
+}
+
+/// Registry newtype wrapping `Arc<dyn ClientPrincipalLookup>`.
+#[derive(Clone)]
+pub struct ClientPrincipalHandle(pub Arc<dyn ClientPrincipalLookup>);
+
+impl ClientPrincipalHandle {
+    #[must_use]
+    pub fn new<L: ClientPrincipalLookup + 'static>(lookup: L) -> Self {
+        Self(Arc::new(lookup))
+    }
+
+    #[must_use]
+    pub fn from_arc(lookup: Arc<dyn ClientPrincipalLookup>) -> Self {
+        Self(lookup)
+    }
+
+    /// Construct a handle backed by the built-in no-op impl.
+    #[must_use]
+    pub fn noop() -> Self {
+        Self::new(NoopClientPrincipalLookup)
+    }
+}
+
+/// No-op default impl. Server registers its real impl at startup.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopClientPrincipalLookup;
+
+impl ClientPrincipalLookup for NoopClientPrincipalLookup {
+    fn get(&self, _client_id: ClientId) -> Option<Uuid> {
+        None
+    }
+    fn set(&self, _client_id: ClientId, _principal_id: Uuid) {}
+    fn remove(&self, _client_id: ClientId) {}
+}

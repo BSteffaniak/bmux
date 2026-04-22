@@ -44,10 +44,15 @@ fn assert_no_domain_markers(source: &str, context: &str) {
 }
 
 fn assert_no_raw_host_kernel_coupling(source: &str, context: &str) {
+    // Legitimate typed dispatch uses `call_service(...)` on
+    // `ServiceCaller`. The raw-coupling check focuses on markers
+    // that indicate bypassing the typed surface (direct IPC enum
+    // references, host-kernel bridge handles, and the legacy
+    // `/v1` interface ids that were replaced by typed BPDL
+    // services).
     let denied = [
         "bmux_ipc::",
         "HostKernelBridge",
-        "call_service(",
         "\"session-query/v1\"",
         "\"session-command/v1\"",
         "\"pane-query/v1\"",

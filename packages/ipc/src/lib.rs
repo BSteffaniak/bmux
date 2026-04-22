@@ -484,44 +484,6 @@ pub enum Request {
         operation: String,
         payload: Vec<u8>,
     },
-    SplitPane {
-        session: Option<SessionSelector>,
-        target: Option<PaneSelector>,
-        direction: PaneSplitDirection,
-        /// Split ratio as a percentage (0-100). Currently passed through the
-        /// protocol but not yet used by the server runtime (layout-level feature).
-        #[serde(default)]
-        ratio_pct: Option<u32>,
-    },
-    LaunchPane {
-        session: Option<SessionSelector>,
-        target: Option<PaneSelector>,
-        direction: PaneSplitDirection,
-        #[serde(default)]
-        name: Option<String>,
-        command: PaneLaunchCommand,
-    },
-    FocusPane {
-        session: Option<SessionSelector>,
-        target: Option<PaneSelector>,
-        direction: Option<PaneFocusDirection>,
-    },
-    ResizePane {
-        session: Option<SessionSelector>,
-        target: Option<PaneSelector>,
-        delta: i16,
-    },
-    ClosePane {
-        session: Option<SessionSelector>,
-        target: Option<PaneSelector>,
-    },
-    RestartPane {
-        session: Option<SessionSelector>,
-        target: Option<PaneSelector>,
-    },
-    ZoomPane {
-        session: Option<SessionSelector>,
-    },
     Attach {
         selector: SessionSelector,
     },
@@ -594,12 +556,6 @@ pub enum Request {
         allow_detach: bool,
     },
     Detach,
-    /// Write input bytes directly to a specific pane by ID, bypassing focus routing.
-    PaneDirectInput {
-        session_id: Uuid,
-        pane_id: Uuid,
-        data: Vec<u8>,
-    },
     HelloV2 {
         contract: ProtocolContract,
         client_name: String,
@@ -1096,35 +1052,6 @@ pub enum ResponsePayload {
         follows: usize,
         selected_sessions: usize,
     },
-    PaneSplit {
-        id: Uuid,
-        session_id: Uuid,
-    },
-    PaneLaunched {
-        id: Uuid,
-        session_id: Uuid,
-    },
-    PaneFocused {
-        id: Uuid,
-        session_id: Uuid,
-    },
-    PaneResized {
-        session_id: Uuid,
-    },
-    PaneClosed {
-        id: Uuid,
-        session_id: Uuid,
-        session_closed: bool,
-    },
-    PaneRestarted {
-        id: Uuid,
-        session_id: Uuid,
-    },
-    PaneZoomed {
-        session_id: Uuid,
-        pane_id: Uuid,
-        zoomed: bool,
-    },
     Attached {
         grant: AttachGrant,
     },
@@ -1206,10 +1133,6 @@ pub enum ResponsePayload {
         allow_detach: bool,
     },
     Detached,
-    PaneDirectInputAccepted {
-        bytes: usize,
-        pane_id: Uuid,
-    },
     ServerStopping,
     ServiceInvoked {
         payload: Vec<u8>,
@@ -1807,77 +1730,6 @@ mod tests {
                 operation: "list".into(),
                 payload: vec![1, 2, 3],
             },
-            Request::SplitPane {
-                session: Some(SessionSelector::ById(id)),
-                target: Some(PaneSelector::ById(id2)),
-                direction: PaneSplitDirection::Vertical,
-                ratio_pct: None,
-            },
-            Request::SplitPane {
-                session: None,
-                target: Some(PaneSelector::ByIndex(0)),
-                direction: PaneSplitDirection::Horizontal,
-                ratio_pct: None,
-            },
-            Request::SplitPane {
-                session: None,
-                target: Some(PaneSelector::Active),
-                direction: PaneSplitDirection::Vertical,
-                ratio_pct: None,
-            },
-            Request::LaunchPane {
-                session: Some(SessionSelector::ById(id)),
-                target: Some(PaneSelector::ById(id2)),
-                direction: PaneSplitDirection::Horizontal,
-                name: Some("remote-a".into()),
-                command: PaneLaunchCommand {
-                    program: "ssh".into(),
-                    args: vec!["host-a".into()],
-                    cwd: Some("/tmp".into()),
-                    env: {
-                        let mut env = BTreeMap::new();
-                        env.insert("FOO".into(), "bar".into());
-                        env
-                    },
-                },
-            },
-            Request::FocusPane {
-                session: None,
-                target: None,
-                direction: Some(PaneFocusDirection::Next),
-            },
-            Request::FocusPane {
-                session: None,
-                target: None,
-                direction: Some(PaneFocusDirection::Prev),
-            },
-            Request::FocusPane {
-                session: None,
-                target: None,
-                direction: None,
-            },
-            Request::ResizePane {
-                session: None,
-                target: None,
-                delta: -5,
-            },
-            Request::ResizePane {
-                session: Some(SessionSelector::ByName("s".into())),
-                target: Some(PaneSelector::ByIndex(3)),
-                delta: 10,
-            },
-            Request::ClosePane {
-                session: None,
-                target: None,
-            },
-            Request::RestartPane {
-                session: None,
-                target: Some(PaneSelector::Active),
-            },
-            Request::ZoomPane { session: None },
-            Request::ZoomPane {
-                session: Some(SessionSelector::ByName("s".into())),
-            },
             Request::Attach {
                 selector: SessionSelector::ByName("main".into()),
             },
@@ -1923,11 +1775,6 @@ mod tests {
             Request::SubscribeEvents,
             Request::PollEvents { max_events: 100 },
             Request::Detach,
-            Request::PaneDirectInput {
-                session_id: id,
-                pane_id: id2,
-                data: vec![104, 101, 108, 108, 111],
-            },
         ];
 
         for (i, variant) in variants.iter().enumerate() {
@@ -2094,33 +1941,6 @@ mod tests {
                 follows: 1,
                 selected_sessions: 2,
             },
-            ResponsePayload::PaneSplit {
-                id: pane_id,
-                session_id: id,
-            },
-            ResponsePayload::PaneLaunched {
-                id: id2,
-                session_id: id,
-            },
-            ResponsePayload::PaneFocused {
-                id: pane_id,
-                session_id: id,
-            },
-            ResponsePayload::PaneResized { session_id: id },
-            ResponsePayload::PaneClosed {
-                id: pane_id,
-                session_id: id,
-                session_closed: false,
-            },
-            ResponsePayload::PaneRestarted {
-                id: pane_id,
-                session_id: id,
-            },
-            ResponsePayload::PaneZoomed {
-                session_id: id,
-                pane_id,
-                zoomed: true,
-            },
             ResponsePayload::Attached {
                 grant: AttachGrant {
                     context_id: Some(id2),
@@ -2261,7 +2081,6 @@ mod tests {
                 ],
             },
             ResponsePayload::Detached,
-            ResponsePayload::PaneDirectInputAccepted { bytes: 5, pane_id },
             ResponsePayload::ServerStopping,
             ResponsePayload::ServiceInvoked {
                 payload: vec![9, 8, 7],

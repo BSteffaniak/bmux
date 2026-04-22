@@ -111,15 +111,6 @@ impl RecordingStateTracker {
     /// Update state from a decoded `ResponsePayload`.
     fn process_response(&mut self, response: &ResponsePayload) {
         match response {
-            ResponsePayload::PaneSplit { id, .. } => {
-                self.add_pane(*id);
-            }
-            ResponsePayload::PaneFocused { id, .. } => {
-                self.set_focus(*id);
-            }
-            ResponsePayload::PaneClosed { id, .. } => {
-                self.remove_pane(id);
-            }
             ResponsePayload::AttachSnapshot {
                 focused_pane_id,
                 panes,
@@ -563,27 +554,8 @@ fn request_to_dsl(
                 "# unhandled invoke-service {interface_id}:{operation}"
             ))
         }
-        Request::SplitPane { direction, .. } => {
-            let dir = match direction {
-                PaneSplitDirection::Vertical => "vertical",
-                PaneSplitDirection::Horizontal => "horizontal",
-            };
-            RequestDslResult::Line(format!("split-pane direction={dir}"))
-        }
-        Request::FocusPane { target, .. } => match target {
-            Some(bmux_ipc::PaneSelector::ByIndex(idx)) => {
-                RequestDslResult::Line(format!("focus-pane target={idx}"))
-            }
-            _ => RequestDslResult::Line(
-                "# focus-pane (direction-based, manual edit needed)".to_string(),
-            ),
-        },
-        Request::ClosePane { .. } => RequestDslResult::Line("close-pane".to_string()),
         Request::AttachSetViewport { cols, rows, .. } => {
             RequestDslResult::Line(format!("resize-viewport cols={cols} rows={rows}"))
-        }
-        Request::ResizePane { delta, .. } => {
-            RequestDslResult::Line(format!("# resize-pane delta={delta}"))
         }
         Request::AttachInput { data, .. } => {
             if data.is_empty() || !*has_session {
@@ -593,12 +565,6 @@ fn request_to_dsl(
             // fall back to the tracker's focused pane.
             let pane_id = event.pane_id.or(state.focused_pane_id);
             RequestDslResult::CoalesceInput(data.clone(), pane_id)
-        }
-        Request::PaneDirectInput { data, pane_id, .. } => {
-            if data.is_empty() || !*has_session {
-                return RequestDslResult::Skip;
-            }
-            RequestDslResult::CoalesceInput(data.clone(), Some(*pane_id))
         }
         // Skip high-frequency / non-structural requests.
         // Recording-related requests aren't playbook actions.

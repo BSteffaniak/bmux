@@ -709,18 +709,21 @@ impl BmuxClient {
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> Result<usize> {
-        match self
-            .request(Request::PaneDirectInput {
-                session_id,
-                pane_id,
-                data,
-            })
-            .await?
+        let bytes_len = data.len();
+        match bmux_pane_runtime_plugin_api::typed_client::pane_direct_input(
+            self, session_id, pane_id, data,
+        )
+        .await
         {
-            ResponsePayload::PaneDirectInputAccepted { bytes, .. } => Ok(bytes),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected pane direct input accepted response",
-            )),
+            Ok(Ok(_ack)) => Ok(bytes_len),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("pane-direct-input failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("pane-direct-input typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1860,18 +1863,20 @@ impl StreamingBmuxClient {
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> Result<()> {
-        match self
-            .request(Request::PaneDirectInput {
-                session_id,
-                pane_id,
-                data,
-            })
-            .await?
+        match bmux_pane_runtime_plugin_api::typed_client::pane_direct_input(
+            self, session_id, pane_id, data,
+        )
+        .await
         {
-            ResponsePayload::PaneDirectInputAccepted { .. } => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected pane direct input accepted",
-            )),
+            Ok(Ok(_ack)) => Ok(()),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("pane-direct-input failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("pane-direct-input typed dispatch failed: {err}"),
+            }),
         }
     }
 
@@ -1928,13 +1933,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
-        Request::SplitPane { .. } => "split_pane",
-        Request::LaunchPane { .. } => "launch_pane",
-        Request::FocusPane { .. } => "focus_pane",
-        Request::ResizePane { .. } => "resize_pane",
-        Request::ClosePane { .. } => "close_pane",
-        Request::RestartPane { .. } => "restart_pane",
-        Request::ZoomPane { .. } => "zoom_pane",
         Request::Attach { .. } => "attach",
         Request::AttachContext { .. } => "attach_context",
         Request::AttachOpen { .. } => "attach_open",
@@ -1951,7 +1949,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
-        Request::PaneDirectInput { .. } => "pane_direct_input",
     }
 }
 
@@ -1970,13 +1967,6 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::ServerSnapshotRestored { .. } => "server_snapshot_restored",
             ResponsePayload::ServerStopping => "server_stopping",
             ResponsePayload::ServiceInvoked { .. } => "service_invoked",
-            ResponsePayload::PaneSplit { .. } => "pane_split",
-            ResponsePayload::PaneLaunched { .. } => "pane_launched",
-            ResponsePayload::PaneFocused { .. } => "pane_focused",
-            ResponsePayload::PaneResized { .. } => "pane_resized",
-            ResponsePayload::PaneClosed { .. } => "pane_closed",
-            ResponsePayload::PaneRestarted { .. } => "pane_restarted",
-            ResponsePayload::PaneZoomed { .. } => "pane_zoomed",
             ResponsePayload::Attached { .. } => "attached",
             ResponsePayload::AttachReady { .. } => "attach_ready",
             ResponsePayload::AttachInputAccepted { .. } => "attach_input_accepted",
@@ -1989,7 +1979,6 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
             ResponsePayload::ClientAttachPolicySet { .. } => "client_attach_policy_set",
             ResponsePayload::Detached => "detached",
-            ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
             ResponsePayload::EventsSubscribed => "events_subscribed",
             ResponsePayload::EventBatch { .. } => "event_batch",
             ResponsePayload::EventPushEnabled => "event_push_enabled",

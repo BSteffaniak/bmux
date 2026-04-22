@@ -351,7 +351,6 @@ pub trait KernelOps: ServiceCaller {
     fn session_create(&self, request: &SessionCreateRequest) -> Result<SessionCreateResponse> {
         #[derive(Serialize)]
         struct Args {
-            #[serde(skip_serializing_if = "Option::is_none")]
             name: Option<String>,
         }
         let result: std::result::Result<
@@ -640,7 +639,6 @@ pub trait KernelOps: ServiceCaller {
         // selected session via FollowState.
         #[derive(Serialize)]
         struct Args {
-            #[serde(skip_serializing_if = "Option::is_none")]
             session_id: Option<Uuid>,
         }
         #[derive(Deserialize)]
@@ -693,22 +691,89 @@ pub trait KernelOps: ServiceCaller {
         }
     }
 
+    /// Resolve a session selector to a concrete `Uuid` via the
+    /// sessions-state typed service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the typed service call fails or a
+    /// name-based selector doesn't match a known session.
+    fn resolve_session_uuid(&self, selector: Option<&SessionSelector>) -> Result<Uuid> {
+        match selector {
+            Some(SessionSelector::ById(id)) => Ok(*id),
+            Some(SessionSelector::ByName(name)) => {
+                #[derive(Deserialize)]
+                struct Entry {
+                    id: Uuid,
+                    #[serde(default)]
+                    name: Option<String>,
+                }
+                let entries: Vec<Entry> = self.call_service(
+                    bmux_sessions_plugin_api::capabilities::SESSIONS_READ.as_str(),
+                    bmux_plugin_sdk::ServiceKind::Query,
+                    bmux_sessions_plugin_api::sessions_state::INTERFACE_ID.as_str(),
+                    "list-sessions",
+                    &(),
+                )?;
+                entries
+                    .into_iter()
+                    .find(|e| e.name.as_deref() == Some(name.as_str()))
+                    .map(|e| e.id)
+                    .ok_or_else(|| PluginError::ServiceProtocol {
+                        details: format!("session '{name}' not found"),
+                    })
+            }
+            None => Err(PluginError::ServiceProtocol {
+                details: "cluster pane operations require an explicit session selector".to_string(),
+            }),
+        }
+    }
+
     /// Split a pane.
     ///
     /// # Errors
     ///
     /// Returns an error when the service call fails.
     fn pane_split(&self, request: &PaneSplitRequest) -> Result<PaneSplitResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::SplitPane {
-            session: request.session.as_ref().map(session_selector_to_ipc),
-            target: request.target.as_ref().map(pane_selector_to_ipc),
-            direction: split_direction_to_ipc(request.direction),
-            ratio_pct: None,
-        })? {
-            bmux_ipc::ResponsePayload::PaneSplit { id, session_id } => {
-                Ok(PaneSplitResponse { id, session_id })
-            }
-            _ => Err(unexpected("pane_split")),
+        #[derive(Serialize)]
+        struct Args {
+            session_id: Uuid,
+            target: Option<Uuid>,
+            direction: String,
+            ratio_percent: u8,
+        }
+        let session_id = self.resolve_session_uuid(request.session.as_ref())?;
+        let target = request.target.as_ref().and_then(|sel| match sel {
+            PaneSelector::ById(id) => Some(*id),
+            _ => None,
+        });
+        let direction = match request.direction {
+            PaneSplitDirection::Horizontal => "horizontal",
+            PaneSplitDirection::Vertical => "vertical",
+        };
+        let result: std::result::Result<
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
+        > = self.call_service(
+            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
+            bmux_plugin_sdk::ServiceKind::Command,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
+            "split-pane",
+            &Args {
+                session_id,
+                target,
+                direction: direction.to_string(),
+                ratio_percent: 50,
+            },
+        )?;
+        match result {
+            Ok(ack) => Ok(PaneSplitResponse {
+                id: ack.pane_id,
+                session_id: ack.session_id,
+            }),
+            Err(err) => Err(PluginError::ServiceProtocol {
+                details: format!("split-pane failed: {err:?}"),
+            }),
         }
     }
 
@@ -718,22 +783,53 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_launch(&self, request: &PaneLaunchRequest) -> Result<PaneLaunchResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::LaunchPane {
-            session: request.session.as_ref().map(session_selector_to_ipc),
-            target: request.target.as_ref().map(pane_selector_to_ipc),
-            direction: split_direction_to_ipc(request.direction),
-            name: request.name.clone(),
-            command: bmux_ipc::PaneLaunchCommand {
+        #[derive(Serialize)]
+        struct Args {
+            session_id: Uuid,
+            target: Option<Uuid>,
+            direction: String,
+            ratio_percent: u8,
+            name: Option<String>,
+            program: String,
+            args: Vec<String>,
+            cwd: Option<String>,
+        }
+        let session_id = self.resolve_session_uuid(request.session.as_ref())?;
+        let target = request.target.as_ref().and_then(|sel| match sel {
+            PaneSelector::ById(id) => Some(*id),
+            _ => None,
+        });
+        let direction = match request.direction {
+            PaneSplitDirection::Horizontal => "horizontal",
+            PaneSplitDirection::Vertical => "vertical",
+        };
+        let result: std::result::Result<
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
+        > = self.call_service(
+            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
+            bmux_plugin_sdk::ServiceKind::Command,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
+            "launch-pane",
+            &Args {
+                session_id,
+                target,
+                direction: direction.to_string(),
+                ratio_percent: 50,
+                name: request.name.clone(),
                 program: request.command.program.clone(),
                 args: request.command.args.clone(),
                 cwd: request.command.cwd.clone(),
-                env: request.command.env.clone(),
             },
-        })? {
-            bmux_ipc::ResponsePayload::PaneLaunched { id, session_id } => {
-                Ok(PaneLaunchResponse { id, session_id })
-            }
-            _ => Err(unexpected("pane_launch")),
+        )?;
+        match result {
+            Ok(ack) => Ok(PaneLaunchResponse {
+                id: ack.pane_id,
+                session_id: ack.session_id,
+            }),
+            Err(err) => Err(PluginError::ServiceProtocol {
+                details: format!("launch-pane failed: {err:?}"),
+            }),
         }
     }
 
@@ -743,15 +839,43 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_focus(&self, request: &PaneFocusRequest) -> Result<PaneFocusResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::FocusPane {
-            session: request.session.as_ref().map(session_selector_to_ipc),
-            target: request.target.as_ref().map(pane_selector_to_ipc),
-            direction: request.direction.map(focus_direction_to_ipc),
-        })? {
-            bmux_ipc::ResponsePayload::PaneFocused { id, session_id } => {
-                Ok(PaneFocusResponse { id, session_id })
-            }
-            _ => Err(unexpected("pane_focus")),
+        #[derive(Serialize)]
+        struct Args {
+            session_id: Uuid,
+            target: Option<Uuid>,
+            direction: String,
+        }
+        let session_id = self.resolve_session_uuid(request.session.as_ref())?;
+        let target = request.target.as_ref().and_then(|sel| match sel {
+            PaneSelector::ById(id) => Some(*id),
+            _ => None,
+        });
+        let direction = request.direction.map_or_else(String::new, |d| match d {
+            PaneFocusDirection::Next => "next".to_string(),
+            PaneFocusDirection::Prev => "prev".to_string(),
+        });
+        let result: std::result::Result<
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
+        > = self.call_service(
+            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
+            bmux_plugin_sdk::ServiceKind::Command,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
+            "focus-pane",
+            &Args {
+                session_id,
+                target,
+                direction,
+            },
+        )?;
+        match result {
+            Ok(ack) => Ok(PaneFocusResponse {
+                id: ack.pane_id,
+                session_id: ack.session_id,
+            }),
+            Err(err) => Err(PluginError::ServiceProtocol {
+                details: format!("focus-pane failed: {err:?}"),
+            }),
         }
     }
 
@@ -761,15 +885,40 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_resize(&self, request: &PaneResizeRequest) -> Result<PaneResizeResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::ResizePane {
-            session: request.session.as_ref().map(session_selector_to_ipc),
-            target: request.target.as_ref().map(pane_selector_to_ipc),
-            delta: request.delta,
-        })? {
-            bmux_ipc::ResponsePayload::PaneResized { session_id } => {
-                Ok(PaneResizeResponse { session_id })
-            }
-            _ => Err(unexpected("pane_resize")),
+        #[derive(Serialize)]
+        struct Args {
+            session_id: Uuid,
+            target: Option<Uuid>,
+            delta_percent: i8,
+        }
+        let session_id = self.resolve_session_uuid(request.session.as_ref())?;
+        let target = request.target.as_ref().and_then(|sel| match sel {
+            PaneSelector::ById(id) => Some(*id),
+            _ => None,
+        });
+        let delta_percent =
+            i8::try_from(request.delta).unwrap_or(if request.delta < 0 { -50 } else { 50 });
+        let result: std::result::Result<
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionAck,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
+        > = self.call_service(
+            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
+            bmux_plugin_sdk::ServiceKind::Command,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
+            "resize-pane",
+            &Args {
+                session_id,
+                target,
+                delta_percent,
+            },
+        )?;
+        match result {
+            Ok(ack) => Ok(PaneResizeResponse {
+                session_id: ack.session_id,
+            }),
+            Err(err) => Err(PluginError::ServiceProtocol {
+                details: format!("resize-pane failed: {err:?}"),
+            }),
         }
     }
 
@@ -779,20 +928,35 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_close(&self, request: &PaneCloseRequest) -> Result<PaneCloseResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::ClosePane {
-            session: request.session.as_ref().map(session_selector_to_ipc),
-            target: request.target.as_ref().map(pane_selector_to_ipc),
-        })? {
-            bmux_ipc::ResponsePayload::PaneClosed {
-                id,
-                session_id,
-                session_closed,
-            } => Ok(PaneCloseResponse {
-                id,
-                session_id,
-                session_closed,
+        #[derive(Serialize)]
+        struct Args {
+            session_id: Uuid,
+            target: Option<Uuid>,
+        }
+        let session_id = self.resolve_session_uuid(request.session.as_ref())?;
+        let target = request.target.as_ref().and_then(|sel| match sel {
+            PaneSelector::ById(id) => Some(*id),
+            _ => None,
+        });
+        let result: std::result::Result<
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
+        > = self.call_service(
+            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
+            bmux_plugin_sdk::ServiceKind::Command,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
+            "close-pane",
+            &Args { session_id, target },
+        )?;
+        match result {
+            Ok(ack) => Ok(PaneCloseResponse {
+                id: ack.pane_id,
+                session_id: ack.session_id,
+                session_closed: false,
             }),
-            _ => Err(unexpected("pane_close")),
+            Err(err) => Err(PluginError::ServiceProtocol {
+                details: format!("close-pane failed: {err:?}"),
+            }),
         }
     }
 
@@ -803,19 +967,30 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the service call fails.
     fn pane_zoom(&self, request: &PaneZoomRequest) -> Result<PaneZoomResponse> {
-        match self.execute_kernel_request(bmux_ipc::Request::ZoomPane {
-            session: request.session.as_ref().map(session_selector_to_ipc),
-        })? {
-            bmux_ipc::ResponsePayload::PaneZoomed {
-                session_id,
-                pane_id,
-                zoomed,
-            } => Ok(PaneZoomResponse {
-                session_id,
-                pane_id,
-                zoomed,
+        #[derive(Serialize)]
+        struct Args {
+            session_id: Uuid,
+        }
+        let session_id = self.resolve_session_uuid(request.session.as_ref())?;
+        let result: std::result::Result<
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
+        > = self.call_service(
+            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
+            bmux_plugin_sdk::ServiceKind::Command,
+            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
+            "zoom-pane",
+            &Args { session_id },
+        )?;
+        match result {
+            Ok(ack) => Ok(PaneZoomResponse {
+                session_id: ack.session_id,
+                pane_id: ack.pane_id,
+                zoomed: true,
             }),
-            _ => Err(unexpected("pane_zoom")),
+            Err(err) => Err(PluginError::ServiceProtocol {
+                details: format!("zoom-pane failed: {err:?}"),
+            }),
         }
     }
 }

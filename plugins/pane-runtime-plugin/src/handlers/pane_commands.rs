@@ -115,6 +115,87 @@ fn failed_session(reason: impl Into<String>) -> SessionRuntimeCommandError {
     }
 }
 
+/// Wire shape matching server's `SessionPolicyCheckRequest`.
+#[derive(serde::Serialize)]
+struct SessionPolicyCheckRequest {
+    session_id: Uuid,
+    context_id: Option<Uuid>,
+    client_id: Uuid,
+    principal_id: Uuid,
+    action: String,
+    plugin_id: Option<String>,
+    capability: Option<String>,
+    execution_class: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionPolicyCheckResponse {
+    allowed: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Perform the `bmux.sessions.policy / session-policy-query/v1 / check`
+/// policy query for a mutating pane/session operation. Returns `Ok(())`
+/// when the policy allows the operation (or no policy provider is
+/// registered), or a `PaneCommandError::Denied` when the policy
+/// responds with `allowed = false`.
+fn ensure_session_mutation_allowed(
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+    session_id: SessionId,
+    action: &str,
+) -> Result<(), PaneCommandError> {
+    use bmux_plugin::ServiceCaller;
+
+    let client_id = ctx
+        .caller_client_id
+        .ok_or_else(|| failed_command("policy check requires a caller client id"))?;
+    let principal_id = bmux_plugin::global_plugin_state_registry()
+        .get::<bmux_client_state::ClientPrincipalHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        .and_then(|handle| handle.0.get(bmux_session_models::ClientId(client_id)))
+        .unwrap_or_else(Uuid::nil);
+
+    let request = SessionPolicyCheckRequest {
+        session_id: session_id.0,
+        context_id: None,
+        client_id,
+        principal_id,
+        action: action.to_string(),
+        plugin_id: None,
+        capability: None,
+        execution_class: None,
+    };
+
+    // The policy service may not be registered in tests or headless
+    // tooling. Treat a missing provider as "allowed" (matches server's
+    // legacy behavior where `check_session_policy` returns `None` when
+    // no resolver is installed).
+    match ctx.call_service::<SessionPolicyCheckRequest, SessionPolicyCheckResponse>(
+        "bmux.sessions.policy",
+        bmux_plugin_sdk::ServiceKind::Query,
+        "session-policy-query/v1",
+        "check",
+        &request,
+    ) {
+        Ok(response) => {
+            if response.allowed {
+                Ok(())
+            } else {
+                Err(PaneCommandError::Denied {
+                    reason: response
+                        .reason
+                        .unwrap_or_else(|| "session policy denied for this operation".to_string()),
+                })
+            }
+        }
+        Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation { .. }) => Ok(()),
+        Err(err) => Err(failed_command(format!(
+            "session policy check failed: {err}"
+        ))),
+    }
+}
+
 fn parse_split_direction(raw: &str) -> Result<PaneSplitDirection, PaneCommandError> {
     match raw {
         "horizontal" => Ok(PaneSplitDirection::Horizontal),
@@ -140,25 +221,61 @@ fn target_selector(target: Option<Uuid>) -> Option<PaneSelector> {
     target.map(PaneSelector::ById)
 }
 
-pub fn split_pane(req: &SplitPaneArgs) -> Result<PaneAck, PaneCommandError> {
+/// Publish a wire event through the registered `WireEventSinkHandle`.
+/// When no sink is registered (tests/headless tooling) the publish
+/// is silently dropped.
+fn publish_wire_event(event: bmux_ipc::Event) {
+    if let Some(sink) = bmux_plugin::global_plugin_state_registry()
+        .get::<bmux_plugin_sdk::WireEventSinkHandle>()
+        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+    {
+        let _ = sink.0.publish(event);
+    }
+}
+
+/// Bump a session's attach-view revision and publish the scene
+/// component update. Mirrors the server's
+/// `emit_attach_view_changed_for_layout` helper so plugin-side
+/// handlers keep parity with the old IPC-handler behavior.
+fn emit_attach_view_changed_scene(session_id: SessionId) {
+    let Some(handle) = super::session_runtime_handle() else {
+        return;
+    };
+    let Some(revision) = handle.0.bump_attach_view_revision(session_id) else {
+        return;
+    };
+    publish_wire_event(bmux_ipc::Event::AttachViewChanged {
+        context_id: None,
+        session_id: session_id.0,
+        revision,
+        components: vec![bmux_ipc::AttachViewComponent::Scene],
+    });
+}
+
+pub fn split_pane(
+    req: &SplitPaneArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<PaneAck, PaneCommandError> {
     let handle = super::session_runtime_handle()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let direction = parse_split_direction(&req.direction)?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.split")?;
     let pane_id = handle
         .0
-        .split_pane(
-            SessionId(req.session_id),
-            target_selector(req.target),
-            direction,
-        )
+        .split_pane(session_id, target_selector(req.target), direction)
         .map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
     })
 }
 
-pub fn launch_pane(req: LaunchPaneArgs) -> Result<PaneAck, PaneCommandError> {
+pub fn launch_pane(
+    req: LaunchPaneArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<PaneAck, PaneCommandError> {
     let handle = super::session_runtime_handle()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let direction = parse_split_direction(&req.direction)?;
@@ -168,26 +285,33 @@ pub fn launch_pane(req: LaunchPaneArgs) -> Result<PaneAck, PaneCommandError> {
         cwd: req.cwd,
         env: std::collections::BTreeMap::new(),
     };
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.launch")?;
     let pane_id = handle
         .0
         .launch_pane(
-            SessionId(req.session_id),
+            session_id,
             target_selector(req.target),
             direction,
             req.name,
             command,
         )
         .map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
     })
 }
 
-pub fn focus_pane(req: &FocusPaneArgs) -> Result<PaneAck, PaneCommandError> {
+pub fn focus_pane(
+    req: &FocusPaneArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<PaneAck, PaneCommandError> {
     let handle = super::session_runtime_handle()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.focus")?;
     let pane_id = match (req.target, parse_focus_direction(&req.direction)?) {
         (Some(t), None) => handle
             .0
@@ -203,79 +327,154 @@ pub fn focus_pane(req: &FocusPaneArgs) -> Result<PaneAck, PaneCommandError> {
         }
     }
     .map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
     })
 }
 
-pub fn resize_pane(req: &ResizePaneArgs) -> Result<SessionAck, PaneCommandError> {
+pub fn resize_pane(
+    req: &ResizePaneArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<SessionAck, PaneCommandError> {
     let handle = super::session_runtime_handle()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.resize")?;
     handle
         .0
         .resize_pane(
-            SessionId(req.session_id),
+            session_id,
             target_selector(req.target),
             i16::from(req.delta_percent),
         )
         .map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
     Ok(SessionAck {
         session_id: req.session_id,
     })
 }
 
-pub fn close_pane(req: &ClosePaneArgs) -> Result<PaneAck, PaneCommandError> {
+pub fn close_pane(
+    req: &ClosePaneArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<PaneAck, PaneCommandError> {
+    use bmux_plugin::global_plugin_state_registry;
+
     let handle = super::session_runtime_handle()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
-    // Orchestration (session removal cleanup, context pruning,
-    // attach-token revocation, event emission) lives in the server's
-    // IPC handler until callers migrate to typed dispatch. This
-    // handler only performs the pane-runtime portion: invoking
-    // close-pane on the manager. When `removed_session` is Some the
-    // caller must invoke `shutdown_removed_runtime` etc.
-    let (pane_id, _removed) = handle
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.close")?;
+    let (pane_id, removed_runtime) = handle
         .0
-        .close_pane(SessionId(req.session_id), target_selector(req.target))
+        .close_pane(session_id, target_selector(req.target))
         .map_err(|e| failed_command(e.to_string()))?;
+
+    // When closing the last pane removes the whole session, tear down
+    // every associated piece (session-manager entry, context
+    // mappings, follow-state selections, attach tokens) and emit the
+    // session-level wire events. Mirrors the server's legacy
+    // `Request::ClosePane` orchestration.
+    let session_closed = removed_runtime.is_some();
+    if let Some(removed) = removed_runtime {
+        let had_attached_clients = !removed.attached_clients.is_empty();
+        handle.0.shutdown_removed_runtime(removed);
+
+        if let Some(session_handle) = global_plugin_state_registry()
+            .get::<bmux_session_state::SessionManagerHandle>()
+            .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        {
+            let _ = session_handle.0.remove_session(session_id);
+        }
+        if let Some(context_handle) = global_plugin_state_registry()
+            .get::<bmux_context_state::ContextStateHandle>()
+            .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        {
+            let _ = context_handle.0.remove_contexts_for_session(session_id);
+        }
+        if let Some(follow_handle) = global_plugin_state_registry()
+            .get::<bmux_client_state::FollowStateHandle>()
+            .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        {
+            follow_handle.0.clear_selections_for_session(session_id);
+        }
+        if let Some(attach_tokens) = global_plugin_state_registry()
+            .get::<bmux_attach_token_state::AttachTokenManagerHandle>()
+            .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+        {
+            attach_tokens.0.remove_for_session(session_id);
+        }
+
+        if had_attached_clients {
+            publish_wire_event(bmux_ipc::Event::ClientDetached { id: session_id.0 });
+        }
+        publish_wire_event(bmux_ipc::Event::SessionRemoved { id: session_id.0 });
+    }
+
+    if !session_closed {
+        emit_attach_view_changed_scene(session_id);
+    }
+
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
     })
 }
 
-pub fn restart_pane(req: &RestartPaneArgs) -> Result<PaneAck, PaneCommandError> {
+pub fn restart_pane(
+    req: &RestartPaneArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<PaneAck, PaneCommandError> {
     let handle = super::session_runtime_handle()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.restart")?;
     let pane_id = handle
         .0
-        .restart_pane(SessionId(req.session_id), target_selector(req.target))
+        .restart_pane(session_id, target_selector(req.target))
         .map_err(|e| failed_command(e.to_string()))?;
+    publish_wire_event(bmux_ipc::Event::PaneRestarted {
+        session_id: session_id.0,
+        pane_id,
+    });
+    emit_attach_view_changed_scene(session_id);
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
     })
 }
 
-pub fn zoom_pane(req: &ZoomPaneArgs) -> Result<PaneAck, PaneCommandError> {
+pub fn zoom_pane(
+    req: &ZoomPaneArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<PaneAck, PaneCommandError> {
     let handle = super::session_runtime_handle()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.zoom")?;
     let (pane_id, _zoomed) = handle
         .0
-        .toggle_zoom(SessionId(req.session_id))
+        .toggle_zoom(session_id)
         .map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
     })
 }
 
-pub fn pane_direct_input(req: PaneDirectInputArgs) -> Result<PaneAck, PaneCommandError> {
+pub fn pane_direct_input(
+    req: PaneDirectInputArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<PaneAck, PaneCommandError> {
     let handle = super::session_runtime_handle()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.direct_input")?;
     handle
         .0
-        .write_input_to_pane(SessionId(req.session_id), req.pane_id, req.data)
+        .write_input_to_pane(session_id, req.pane_id, req.data)
         .map_err(|e| failed_command(e.to_string()))?;
     Ok(PaneAck {
         session_id: req.session_id,

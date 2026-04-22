@@ -33,29 +33,29 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         },
 
         // pane-runtime-commands mutations.
-        "pane-runtime-commands", "split-pane" => |req: pane_commands::SplitPaneArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_commands::split_pane(&req))
+        "pane-runtime-commands", "split-pane" => |req: pane_commands::SplitPaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::split_pane(&req, ctx))
         },
-        "pane-runtime-commands", "launch-pane" => |req: pane_commands::LaunchPaneArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_commands::launch_pane(req))
+        "pane-runtime-commands", "launch-pane" => |req: pane_commands::LaunchPaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::launch_pane(req, ctx))
         },
-        "pane-runtime-commands", "focus-pane" => |req: pane_commands::FocusPaneArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_commands::focus_pane(&req))
+        "pane-runtime-commands", "focus-pane" => |req: pane_commands::FocusPaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::focus_pane(&req, ctx))
         },
-        "pane-runtime-commands", "resize-pane" => |req: pane_commands::ResizePaneArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_commands::resize_pane(&req))
+        "pane-runtime-commands", "resize-pane" => |req: pane_commands::ResizePaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::resize_pane(&req, ctx))
         },
-        "pane-runtime-commands", "close-pane" => |req: pane_commands::ClosePaneArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_commands::close_pane(&req))
+        "pane-runtime-commands", "close-pane" => |req: pane_commands::ClosePaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::close_pane(&req, ctx))
         },
-        "pane-runtime-commands", "restart-pane" => |req: pane_commands::RestartPaneArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_commands::restart_pane(&req))
+        "pane-runtime-commands", "restart-pane" => |req: pane_commands::RestartPaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::restart_pane(&req, ctx))
         },
-        "pane-runtime-commands", "zoom-pane" => |req: pane_commands::ZoomPaneArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_commands::zoom_pane(&req))
+        "pane-runtime-commands", "zoom-pane" => |req: pane_commands::ZoomPaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::zoom_pane(&req, ctx))
         },
-        "pane-runtime-commands", "pane-direct-input" => |req: pane_commands::PaneDirectInputArgs, _ctx| {
-            Ok::<_, ServiceResponse>(pane_commands::pane_direct_input(req))
+        "pane-runtime-commands", "pane-direct-input" => |req: pane_commands::PaneDirectInputArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::pane_direct_input(req, ctx))
         },
         "pane-runtime-commands", "new-session-with-runtime" => |req: pane_commands::NewSessionArgs, _ctx| {
             Ok::<_, ServiceResponse>(pane_commands::new_session_with_runtime(&req))

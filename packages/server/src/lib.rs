@@ -84,7 +84,7 @@ struct ServerState {
     event_hub: Mutex<EventHub>,
     /// Broadcast channel for pushing events to streaming clients.
     event_broadcast: tokio::sync::broadcast::Sender<Event>,
-    client_principals: Mutex<BTreeMap<ClientId, Uuid>>,
+    client_principals: Arc<Mutex<BTreeMap<ClientId, Uuid>>>,
     server_control_principal_id: Uuid,
     handshake_timeout: Duration,
     pane_exit_rx: AsyncMutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
@@ -402,6 +402,38 @@ impl bmux_attach_token_state::AttachTokenManagerWriter for ServerAttachTokenAdap
     fn clear(&self) {
         if let Ok(mut guard) = self.inner.lock() {
             guard.clear();
+        }
+    }
+}
+
+/// Adapter wrapping `Arc<Mutex<BTreeMap<ClientId, Uuid>>>` and
+/// implementing [`bmux_client_state::ClientPrincipalLookup`] so
+/// plugin handlers can query the principal for a caller client
+/// when performing session-policy checks.
+struct ServerClientPrincipalAdapter {
+    inner: Arc<Mutex<BTreeMap<ClientId, Uuid>>>,
+}
+
+impl ServerClientPrincipalAdapter {
+    const fn new(inner: Arc<Mutex<BTreeMap<ClientId, Uuid>>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl bmux_client_state::ClientPrincipalLookup for ServerClientPrincipalAdapter {
+    fn get(&self, client_id: ClientId) -> Option<Uuid> {
+        self.inner.lock().ok()?.get(&client_id).copied()
+    }
+
+    fn set(&self, client_id: ClientId, principal_id: Uuid) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.insert(client_id, principal_id);
+        }
+    }
+
+    fn remove(&self, client_id: ClientId) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.remove(&client_id);
         }
     }
 }
@@ -4251,6 +4283,8 @@ impl BmuxServer {
         )));
 
         let attach_tokens = Arc::new(Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)));
+        let client_principals: Arc<Mutex<BTreeMap<ClientId, Uuid>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
 
         // Register server's `SessionRuntimeManager` into the plugin
         // state registry so `session_runtime_handle()` lookups reach
@@ -4277,6 +4311,17 @@ impl BmuxServer {
             std::sync::RwLock::new(attach_token_handle),
         ));
 
+        // Register server's per-client principal map so plugin
+        // handlers can look up the principal for the caller client
+        // when performing session-policy checks.
+        let principal_handle = bmux_client_state::ClientPrincipalHandle::new(
+            ServerClientPrincipalAdapter::new(Arc::clone(&client_principals)),
+        );
+        bmux_plugin::global_plugin_state_registry()
+            .register::<bmux_client_state::ClientPrincipalHandle>(&Arc::new(
+                std::sync::RwLock::new(principal_handle),
+            ));
+
         Self {
             endpoint,
             state: Arc::new(ServerState {
@@ -4286,7 +4331,7 @@ impl BmuxServer {
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 event_broadcast: event_broadcast_tx,
-                client_principals: Mutex::new(BTreeMap::new()),
+                client_principals,
                 server_control_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
                 pane_exit_rx: AsyncMutex::new(pane_exit_rx),
@@ -5713,361 +5758,6 @@ async fn handle_request(
                 })
             }
         }
-        Request::SplitPane {
-            session,
-            target,
-            direction,
-            ratio_pct: _, // TODO: pass to layout system when supported
-        } => {
-            let session_id = {
-                let manager = session_handle();
-                match resolve_session_request_session_id(
-                    &*manager.0,
-                    session.as_ref(),
-                    selected_session.as_ref(),
-                ) {
-                    Ok(session_id) => session_id,
-                    Err(response) => return Ok(Response::Err(response)),
-                }
-            };
-            if let Err(response) = ensure_session_mutation_allowed(
-                state,
-                shutdown_tx,
-                session_id,
-                client_id,
-                client_principal_id,
-                "pane.split",
-            )
-            .await
-            {
-                return Ok(Response::Err(response));
-            }
-            let pane_id = match session_runtime_handle()
-                .0
-                .split_pane(session_id, target, direction)
-            {
-                Ok(id) => id,
-                Err(error) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: format!("failed splitting pane: {error:#}"),
-                    }));
-                }
-            };
-            emit_attach_view_changed_for_layout(state, session_id)?;
-            Response::Ok(ResponsePayload::PaneSplit {
-                id: pane_id,
-                session_id: session_id.0,
-            })
-        }
-        Request::LaunchPane {
-            session,
-            target,
-            direction,
-            name,
-            command,
-        } => {
-            let session_id = {
-                let manager = session_handle();
-                match resolve_session_request_session_id(
-                    &*manager.0,
-                    session.as_ref(),
-                    selected_session.as_ref(),
-                ) {
-                    Ok(session_id) => session_id,
-                    Err(response) => return Ok(Response::Err(response)),
-                }
-            };
-            if let Err(response) = ensure_session_mutation_allowed(
-                state,
-                shutdown_tx,
-                session_id,
-                client_id,
-                client_principal_id,
-                "pane.launch",
-            )
-            .await
-            {
-                return Ok(Response::Err(response));
-            }
-            let pane_id = match session_runtime_handle()
-                .0
-                .launch_pane(session_id, target, direction, name, command)
-            {
-                Ok(id) => id,
-                Err(error) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: format!("failed launching pane: {error:#}"),
-                    }));
-                }
-            };
-            emit_attach_view_changed_for_layout(state, session_id)?;
-            Response::Ok(ResponsePayload::PaneLaunched {
-                id: pane_id,
-                session_id: session_id.0,
-            })
-        }
-        Request::FocusPane {
-            session,
-            target,
-            direction,
-        } => {
-            let session_id = {
-                let manager = session_handle();
-                match resolve_session_request_session_id(
-                    &*manager.0,
-                    session.as_ref(),
-                    selected_session.as_ref(),
-                ) {
-                    Ok(session_id) => session_id,
-                    Err(response) => return Ok(Response::Err(response)),
-                }
-            };
-            if let Err(response) = ensure_session_mutation_allowed(
-                state,
-                shutdown_tx,
-                session_id,
-                client_id,
-                client_principal_id,
-                "pane.focus",
-            )
-            .await
-            {
-                return Ok(Response::Err(response));
-            }
-            let handle = session_runtime_handle();
-            let pane_id = match (target, direction) {
-                (Some(_), Some(_)) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::InvalidRequest,
-                        message: "focus-pane cannot use target and direction together".to_string(),
-                    }));
-                }
-                (Some(target), None) => handle.0.focus_pane_target(session_id, &target),
-                (None, Some(direction)) => handle.0.focus_pane(session_id, direction),
-                (None, None) => handle
-                    .0
-                    .focus_pane_target(session_id, &PaneSelector::Active),
-            };
-            let pane_id = match pane_id {
-                Ok(id) => id,
-                Err(error) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: format!("failed focusing pane: {error:#}"),
-                    }));
-                }
-            };
-            emit_attach_view_changed_for_layout(state, session_id)?;
-            Response::Ok(ResponsePayload::PaneFocused {
-                id: pane_id,
-                session_id: session_id.0,
-            })
-        }
-        Request::ResizePane {
-            session,
-            target,
-            delta,
-        } => {
-            let session_id = {
-                let manager = session_handle();
-                match resolve_session_request_session_id(
-                    &*manager.0,
-                    session.as_ref(),
-                    selected_session.as_ref(),
-                ) {
-                    Ok(session_id) => session_id,
-                    Err(response) => return Ok(Response::Err(response)),
-                }
-            };
-            if let Err(response) = ensure_session_mutation_allowed(
-                state,
-                shutdown_tx,
-                session_id,
-                client_id,
-                client_principal_id,
-                "pane.resize",
-            )
-            .await
-            {
-                return Ok(Response::Err(response));
-            }
-            if let Err(error) = session_runtime_handle()
-                .0
-                .resize_pane(session_id, target, delta)
-            {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("failed resizing pane: {error:#}"),
-                }));
-            }
-            emit_attach_view_changed_for_layout(state, session_id)?;
-            Response::Ok(ResponsePayload::PaneResized {
-                session_id: session_id.0,
-            })
-        }
-        Request::ClosePane { session, target } => {
-            let session_id = {
-                let manager = session_handle();
-                match resolve_session_request_session_id(
-                    &*manager.0,
-                    session.as_ref(),
-                    selected_session.as_ref(),
-                ) {
-                    Ok(session_id) => session_id,
-                    Err(response) => return Ok(Response::Err(response)),
-                }
-            };
-            if let Err(response) = ensure_session_mutation_allowed(
-                state,
-                shutdown_tx,
-                session_id,
-                client_id,
-                client_principal_id,
-                "pane.close",
-            )
-            .await
-            {
-                return Ok(Response::Err(response));
-            }
-
-            let (closed_pane_id, removed_session) = session_runtime_handle()
-                .0
-                .close_pane(session_id, target)
-                .map_err(|error| anyhow::anyhow!("failed closing pane: {error:#}"))?;
-
-            let mut session_closed = false;
-            if let Some(removed_session) = removed_session {
-                session_closed = true;
-                let removed_session_id = removed_session.session_id;
-                if !removed_session.attached_clients.is_empty() {
-                    emit_event(
-                        state,
-                        Event::ClientDetached {
-                            id: removed_session_id.0,
-                        },
-                    )?;
-                }
-                shutdown_runtime_info(removed_session);
-                let _ = session_handle().0.remove_session(removed_session_id);
-                let _ = prune_context_mappings_for_session(state, removed_session_id)?;
-                if *selected_session == Some(removed_session_id) {
-                    *selected_session = None;
-                    persist_selected_session(state, client_id, None)?;
-                }
-                if *attached_stream_session == Some(removed_session_id) {
-                    *attached_stream_session = None;
-                }
-
-                let mut attach_tokens = state
-                    .attach_tokens
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-                attach_tokens.remove_for_session(removed_session_id);
-                drop(attach_tokens);
-
-                clear_selected_session_for_all(state, removed_session_id)?;
-
-                emit_event(
-                    state,
-                    Event::SessionRemoved {
-                        id: removed_session_id.0,
-                    },
-                )?;
-            }
-
-            emit_attach_view_changed_for_pane_close(state, session_id, session_closed)?;
-
-            Response::Ok(ResponsePayload::PaneClosed {
-                id: closed_pane_id,
-                session_id: session_id.0,
-                session_closed,
-            })
-        }
-        Request::RestartPane { session, target } => {
-            let session_id = {
-                let manager = session_handle();
-                match resolve_session_request_session_id(
-                    &*manager.0,
-                    session.as_ref(),
-                    selected_session.as_ref(),
-                ) {
-                    Ok(session_id) => session_id,
-                    Err(response) => return Ok(Response::Err(response)),
-                }
-            };
-            if let Err(response) = ensure_session_mutation_allowed(
-                state,
-                shutdown_tx,
-                session_id,
-                client_id,
-                client_principal_id,
-                "pane.restart",
-            )
-            .await
-            {
-                return Ok(Response::Err(response));
-            }
-
-            let pane_id = session_runtime_handle()
-                .0
-                .restart_pane(session_id, target)
-                .map_err(|error| anyhow::anyhow!("failed restarting pane: {error:#}"))?;
-
-            emit_event(
-                state,
-                Event::PaneRestarted {
-                    session_id: session_id.0,
-                    pane_id,
-                },
-            )?;
-            emit_attach_view_changed_for_layout(state, session_id)?;
-            Response::Ok(ResponsePayload::PaneRestarted {
-                id: pane_id,
-                session_id: session_id.0,
-            })
-        }
-        Request::ZoomPane { session } => {
-            let session_id = {
-                let manager = session_handle();
-                match resolve_session_request_session_id(
-                    &*manager.0,
-                    session.as_ref(),
-                    selected_session.as_ref(),
-                ) {
-                    Ok(session_id) => session_id,
-                    Err(response) => return Ok(Response::Err(response)),
-                }
-            };
-            if let Err(response) = ensure_session_mutation_allowed(
-                state,
-                shutdown_tx,
-                session_id,
-                client_id,
-                client_principal_id,
-                "pane.zoom",
-            )
-            .await
-            {
-                return Ok(Response::Err(response));
-            }
-            let (pane_id, zoomed) = match session_runtime_handle().0.toggle_zoom(session_id) {
-                Ok(result) => result,
-                Err(error) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: format!("failed toggling zoom: {error:#}"),
-                    }));
-                }
-            };
-            emit_attach_view_changed_for_layout(state, session_id)?;
-            Response::Ok(ResponsePayload::PaneZoomed {
-                session_id: session_id.0,
-                pane_id,
-                zoomed,
-            })
-        }
         Request::Attach { selector } => {
             let manager = session_handle();
             let Some(next_session_id) = resolve_session_id(&*manager.0, &selector) else {
@@ -6657,72 +6347,6 @@ async fn handle_request(
         // is sent — the actual push task spawning happens there. Here we just
         // acknowledge the request.
         Request::EnableEventPush => Response::Ok(ResponsePayload::EventPushEnabled),
-        Request::PaneDirectInput {
-            session_id,
-            pane_id,
-            data,
-        } => {
-            let session_id = SessionId(session_id);
-            if !ensure_attach_session_exists(state, session_id).await? {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {}", session_id.0),
-                }));
-            }
-            if let Err(response) = ensure_session_mutation_allowed(
-                state,
-                shutdown_tx,
-                session_id,
-                client_id,
-                client_principal_id,
-                "pane.direct_input",
-            )
-            .await
-            {
-                return Ok(Response::Err(response));
-            }
-            let captured_input = data.clone();
-            let write_result = session_runtime_handle()
-                .0
-                .write_input_to_pane(session_id, pane_id, data);
-            match write_result {
-                Ok(bytes) => {
-                    if captured_input
-                        .iter()
-                        .any(|byte| *byte == b'\n' || *byte == b'\r')
-                    {
-                        mark_snapshot_dirty(state);
-                    }
-                    record_to_all_runtimes(
-                        RecordingEventKind::PaneInputRaw,
-                        RecordingPayload::Bytes {
-                            data: captured_input,
-                        },
-                        RecordMeta {
-                            session_id: Some(session_id.0),
-                            pane_id: Some(pane_id),
-                            client_id: Some(client_id.0),
-                        },
-                    );
-                    Response::Ok(ResponsePayload::PaneDirectInputAccepted { bytes, pane_id })
-                }
-                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!(
-                        "session or pane not found: session={}, pane={}",
-                        session_id.0, pane_id
-                    ),
-                }),
-                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "client is not attached to session runtime".to_string(),
-                }),
-                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("pane is closed: {pane_id}"),
-                }),
-            }
-        }
     };
 
     if let Response::Ok(ResponsePayload::AttachReady { session_id, .. }) = &response {
@@ -6746,19 +6370,11 @@ const fn request_requires_exclusive(request: &Request) -> bool {
         Request::ServerSave
             | Request::ServerStop
             | Request::ServerRestoreApply
-            | Request::SplitPane { .. }
-            | Request::LaunchPane { .. }
-            | Request::FocusPane { .. }
-            | Request::ResizePane { .. }
-            | Request::ClosePane { .. }
-            | Request::RestartPane { .. }
-            | Request::ZoomPane { .. }
             | Request::Attach { .. }
             | Request::AttachContext { .. }
             | Request::AttachOpen { .. }
             | Request::AttachInput { .. }
             | Request::AttachSetViewport { .. }
-            | Request::PaneDirectInput { .. }
             | Request::Detach
     )
 }
@@ -6766,16 +6382,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
 const fn response_requires_snapshot(response: &Response) -> bool {
     matches!(
         response,
-        Response::Ok(
-            ResponsePayload::PaneSplit { .. }
-                | ResponsePayload::PaneLaunched { .. }
-                | ResponsePayload::PaneFocused { .. }
-                | ResponsePayload::PaneResized { .. }
-                | ResponsePayload::PaneClosed { .. }
-                | ResponsePayload::PaneRestarted { .. }
-                | ResponsePayload::Attached { .. }
-                | ResponsePayload::Detached
-        )
+        Response::Ok(ResponsePayload::Attached { .. } | ResponsePayload::Detached)
     )
 }
 
@@ -6791,13 +6398,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
-        Request::SplitPane { .. } => "split_pane",
-        Request::LaunchPane { .. } => "launch_pane",
-        Request::FocusPane { .. } => "focus_pane",
-        Request::ResizePane { .. } => "resize_pane",
-        Request::ClosePane { .. } => "close_pane",
-        Request::RestartPane { .. } => "restart_pane",
-        Request::ZoomPane { .. } => "zoom_pane",
         Request::Attach { .. } => "attach",
         Request::AttachContext { .. } => "attach_context",
         Request::AttachOpen { .. } => "attach_open",
@@ -6814,7 +6414,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
-        Request::PaneDirectInput { .. } => "pane_direct_input",
     }
 }
 
@@ -7004,13 +6603,6 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::ServerSnapshotRestored { .. } => "server_snapshot_restored",
         ResponsePayload::ServerStopping => "server_stopping",
         ResponsePayload::ServiceInvoked { .. } => "service_invoked",
-        ResponsePayload::PaneSplit { .. } => "pane_split",
-        ResponsePayload::PaneLaunched { .. } => "pane_launched",
-        ResponsePayload::PaneFocused { .. } => "pane_focused",
-        ResponsePayload::PaneResized { .. } => "pane_resized",
-        ResponsePayload::PaneClosed { .. } => "pane_closed",
-        ResponsePayload::PaneRestarted { .. } => "pane_restarted",
-        ResponsePayload::PaneZoomed { .. } => "pane_zoomed",
         ResponsePayload::Attached { .. } => "attached",
         ResponsePayload::AttachReady { .. } => "attach_ready",
         ResponsePayload::AttachInputAccepted { .. } => "attach_input_accepted",
@@ -7023,7 +6615,6 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
         ResponsePayload::ClientAttachPolicySet { .. } => "client_attach_policy_set",
         ResponsePayload::Detached => "detached",
-        ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
         ResponsePayload::EventsSubscribed => "events_subscribed",
         ResponsePayload::EventBatch { .. } => "event_batch",
         ResponsePayload::EventPushEnabled => "event_push_enabled",
@@ -9379,222 +8970,6 @@ mod tests {
         assert_eq!(detached, Response::Ok(ResponsePayload::Detached));
     }
 
-    #[tokio::test]
-    async fn split_pane_succeeds_without_policy_provider() {
-        let server = BmuxServer::new(test_endpoint());
-        install_test_state_handles();
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let session_id = test_new_session_runtime(&server, client_id).0;
-
-        let split = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::SplitPane {
-                session: Some(SessionSelector::ById(session_id)),
-                target: None,
-                direction: PaneSplitDirection::Vertical,
-                ratio_pct: None,
-            },
-        )
-        .await;
-
-        match split {
-            Response::Ok(ResponsePayload::PaneSplit {
-                session_id: split_session_id,
-                ..
-            }) => {
-                assert_eq!(split_session_id, session_id);
-            }
-            response => panic!("expected successful split response, got {response:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn launch_pane_succeeds_without_policy_provider() {
-        let server = BmuxServer::new(test_endpoint());
-        install_test_state_handles();
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let session_id = test_new_session_runtime(&server, client_id).0;
-
-        let launched = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::LaunchPane {
-                session: Some(SessionSelector::ById(session_id)),
-                target: None,
-                direction: PaneSplitDirection::Vertical,
-                name: Some("remote-a".to_string()),
-                command: PaneLaunchCommand {
-                    program: "/bin/sh".to_string(),
-                    args: vec!["-lc".to_string(), "printf launched".to_string()],
-                    cwd: None,
-                    env: BTreeMap::new(),
-                },
-            },
-        )
-        .await;
-
-        match launched {
-            Response::Ok(ResponsePayload::PaneLaunched {
-                session_id: launched_session_id,
-                ..
-            }) => {
-                assert_eq!(launched_session_id, session_id);
-            }
-            response => panic!("expected successful launch response, got {response:?}"),
-        }
-
-        let panes = test_list_panes(SessionId(session_id));
-        assert_eq!(panes.len(), 2);
-        assert!(
-            panes
-                .iter()
-                .any(|pane| pane.name.as_deref() == Some("remote-a"))
-        );
-    }
-
-    #[tokio::test]
-    async fn launch_pane_rejects_empty_program() {
-        let server = BmuxServer::new(test_endpoint());
-        install_test_state_handles();
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let session_id = test_new_session_runtime(&server, client_id).0;
-
-        let launched = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::LaunchPane {
-                session: Some(SessionSelector::ById(session_id)),
-                target: None,
-                direction: PaneSplitDirection::Vertical,
-                name: None,
-                command: PaneLaunchCommand {
-                    program: "   ".to_string(),
-                    args: Vec::new(),
-                    cwd: None,
-                    env: BTreeMap::new(),
-                },
-            },
-        )
-        .await;
-
-        match launched {
-            Response::Err(ErrorResponse { code, message }) => {
-                assert_eq!(code, ErrorCode::Internal);
-                assert!(message.contains("program cannot be empty"));
-            }
-            response @ Response::Ok(_) => {
-                panic!("expected launch failure response, got {response:?}")
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    async fn exited_pane_keeps_layout_and_restart_reuses_same_pane_id() {
-        let server = BmuxServer::new(test_endpoint());
-        install_test_state_handles();
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let session_id = test_new_session_runtime(&server, client_id).0;
-
-        let split = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::SplitPane {
-                session: Some(SessionSelector::ById(session_id)),
-                target: None,
-                direction: PaneSplitDirection::Vertical,
-                ratio_pct: None,
-            },
-        )
-        .await;
-        match split {
-            Response::Ok(ResponsePayload::PaneSplit { .. }) => {}
-            response => panic!("expected split response, got {response:?}"),
-        }
-
-        let panes_before = test_list_panes(SessionId(session_id));
-        assert_eq!(panes_before.len(), 2);
-        let target_pane_id = panes_before[0].id;
-
-        assert!(session_runtime_handle().0.test_mark_pane_exited(
-            SessionId(session_id),
-            target_pane_id,
-            "process exited with status 130".to_string(),
-        ));
-
-        reap_exited_pane(&server.state, SessionId(session_id), target_pane_id)
-            .expect("reap should succeed");
-
-        let panes_exited = test_list_panes(SessionId(session_id));
-        assert_eq!(panes_exited.len(), 2);
-        let exited_summary = panes_exited
-            .iter()
-            .find(|pane| pane.id == target_pane_id)
-            .expect("target pane summary should exist");
-        assert_eq!(exited_summary.state, PaneState::Exited);
-
-        let restarted = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::RestartPane {
-                session: Some(SessionSelector::ById(session_id)),
-                target: Some(PaneSelector::ById(target_pane_id)),
-            },
-        )
-        .await;
-        match restarted {
-            Response::Ok(ResponsePayload::PaneRestarted {
-                id,
-                session_id: sid,
-            }) => {
-                assert_eq!(id, target_pane_id);
-                assert_eq!(sid, session_id);
-            }
-            response => panic!("expected pane restarted response, got {response:?}"),
-        }
-
-        let panes_after = test_list_panes(SessionId(session_id));
-        assert_eq!(panes_after.len(), 2);
-        let restarted_summary = panes_after
-            .iter()
-            .find(|pane| pane.id == target_pane_id)
-            .expect("target pane summary should exist");
-        assert_eq!(restarted_summary.state, PaneState::Running);
-        assert!(restarted_summary.state_reason.is_none());
-    }
-
     // Tests for deleted Request::{CreateContext, SelectContext,
     // CloseContext, CurrentContext, AttachContext} handlers were
     // removed along with the Request variants themselves. The
@@ -9665,108 +9040,6 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn split_pane_is_blocked_when_mutation_policy_denies() {
-        let server = BmuxServer::new(test_endpoint());
-        install_test_state_handles();
-        server
-            .set_service_resolver(|route, payload| async move {
-                if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
-                    let request: SessionPolicyCheckRequest = decode(&payload)?;
-                    assert_eq!(request.action, "pane.split");
-                    return encode(&SessionPolicyCheckResponse {
-                        allowed: false,
-                        reason: Some("session policy denied for this operation".to_string()),
-                    })
-                    .map_err(anyhow::Error::from);
-                }
-                anyhow::bail!("unexpected policy route")
-            })
-            .expect("resolver registration should succeed");
-
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let session_id = test_new_session_runtime(&server, client_id).0;
-
-        let split = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::SplitPane {
-                session: Some(SessionSelector::ById(session_id)),
-                target: None,
-                direction: PaneSplitDirection::Vertical,
-                ratio_pct: None,
-            },
-        )
-        .await;
-
-        match split {
-            Response::Err(error) => {
-                assert_eq!(error.code, ErrorCode::InvalidRequest);
-                assert!(error.message.contains("session policy denied"));
-            }
-            response @ Response::Ok(_) => {
-                panic!("expected denied split response, got {response:?}")
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn attach_input_is_blocked_when_mutation_policy_denies() {
-        let server = BmuxServer::new(test_endpoint());
-        install_test_state_handles();
-        server
-            .set_service_resolver(|route, payload| async move {
-                if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
-                    let request: SessionPolicyCheckRequest = decode(&payload)?;
-                    assert_eq!(request.action, "attach.input");
-                    return encode(&SessionPolicyCheckResponse {
-                        allowed: false,
-                        reason: Some("session policy denied for this operation".to_string()),
-                    })
-                    .map_err(anyhow::Error::from);
-                }
-                anyhow::bail!("unexpected policy route")
-            })
-            .expect("resolver registration should succeed");
-
-        let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
-
-        let session_id = test_new_session_runtime(&server, client_id).0;
-
-        let attach_input = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::AttachInput {
-                session_id,
-                data: b"echo hi\n".to_vec(),
-            },
-        )
-        .await;
-
-        match attach_input {
-            Response::Err(error) => {
-                assert_eq!(error.code, ErrorCode::InvalidRequest);
-                assert!(error.message.contains("session policy denied"));
-            }
-            response @ Response::Ok(_) => {
-                panic!("expected denied attach input response, got {response:?}")
-            }
-        }
     }
 
     // ---- EscSeqPhase state machine tests ----

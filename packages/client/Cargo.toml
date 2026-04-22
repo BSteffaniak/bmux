@@ -12,9 +12,10 @@ version     = { workspace = true }
 
 [dependencies]
 # Internal bmux packages
-bmux_config     = { workspace = true }
-bmux_ipc        = { workspace = true }
-bmux_plugin_sdk = { workspace = true }
+bmux_config                  = { workspace = true }
+bmux_ipc                     = { workspace = true }
+bmux_pane_runtime_plugin_api = { workspace = true }
+bmux_plugin_sdk              = { workspace = true }
 
 # External dependencies
 bmux_codec = { workspace = true }
