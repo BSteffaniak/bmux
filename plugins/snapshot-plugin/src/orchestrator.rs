@@ -17,7 +17,7 @@ use bmux_snapshot_runtime::{
 };
 use tracing::warn;
 
-use crate::envelope::{CombinedSnapshotEnvelope, SectionV1};
+use bmux_snapshot_plugin_api::envelope::{CombinedSnapshotEnvelope, SectionV1};
 
 /// Internal status bookkeeping.
 #[derive(Debug, Default)]

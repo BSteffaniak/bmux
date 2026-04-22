@@ -64,19 +64,6 @@ const RESPONSE_OUTPUT_BUDGET: usize =
     bmux_ipc::frame::MAX_FRAME_PAYLOAD_SIZE - RESPONSE_METADATA_HEADROOM;
 const EVENT_PUSH_CHANNEL_CAPACITY: usize = 256;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OfflineSessionKillTarget {
-    One(SessionSelector),
-    All,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OfflineSessionKillReport {
-    pub had_snapshot: bool,
-    pub removed_session_ids: Vec<Uuid>,
-    pub removed_context_ids: Vec<Uuid>,
-}
-
 /// Main server implementation.
 #[derive(Clone)]
 pub struct BmuxServer {
@@ -7548,29 +7535,6 @@ fn resolve_session_id(
                 .map(|session| session.id)
         }
     }
-}
-
-/// Kill sessions offline (without a running server) via the snapshot file.
-///
-/// Slice 13 Stage 5 deleted the monolithic `SnapshotV4` schema and
-/// its `SnapshotManager`. The new combined-envelope format owned by
-/// `bmux_snapshot_plugin` carries opaque per-section bytes that this
-/// crate can't mutate without the owning plugin's codec. Re-wiring
-/// this utility against the new format is Stage 6 work.
-///
-/// Until then this stub returns "no snapshot" so CLI callers fall
-/// through cleanly to the "bmux server is not running" message.
-///
-/// # Errors
-/// Currently always returns `Ok`; the `Result` return is preserved
-/// for callers that expect it.
-#[allow(clippy::needless_pass_by_value)] // Public API; param taken by value to match caller idiom.
-pub fn offline_kill_sessions(target: OfflineSessionKillTarget) -> Result<OfflineSessionKillReport> {
-    let _ = target;
-    Ok(OfflineSessionKillReport {
-        had_snapshot: false,
-        ..OfflineSessionKillReport::default()
-    })
 }
 
 #[derive(Debug, Clone)]

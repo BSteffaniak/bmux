@@ -4,6 +4,11 @@
 //! it performs a save: a monotonic version, an integrity checksum, and
 //! a `Vec<SectionV1>` where each section is one participant's opaque
 //! payload plus its schema metadata.
+//!
+//! This lives in `bmux_snapshot_plugin_api` (not the plugin impl crate)
+//! because offline utilities — specifically `offline_snapshot`, which
+//! edits the snapshot file while the server is down — need to read
+//! and mutate the envelope without depending on the plugin impl crate.
 
 use bmux_snapshot_runtime::SnapshotOrchestratorError;
 use serde::{Deserialize, Serialize};
@@ -24,7 +29,12 @@ pub struct CombinedSnapshotEnvelope {
 impl CombinedSnapshotEnvelope {
     /// Build an envelope from participant sections, computing a fresh
     /// checksum over the serialized sections.
-    pub(crate) fn build(sections: Vec<SectionV1>) -> Result<Self, SnapshotOrchestratorError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotOrchestratorError::Codec`] if the sections
+    /// cannot be JSON-encoded for checksum computation.
+    pub fn build(sections: Vec<SectionV1>) -> Result<Self, SnapshotOrchestratorError> {
         let checksum = sections_checksum(&sections)?;
         Ok(Self {
             version: COMBINED_SNAPSHOT_VERSION,
@@ -34,7 +44,12 @@ impl CombinedSnapshotEnvelope {
     }
 
     /// Validate the envelope's version + recompute its checksum.
-    pub(crate) fn validate(&self) -> Result<(), SnapshotOrchestratorError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotOrchestratorError::Codec`] when the version
+    /// is unsupported or the checksum does not match the sections.
+    pub fn validate(&self) -> Result<(), SnapshotOrchestratorError> {
         if self.version != COMBINED_SNAPSHOT_VERSION {
             return Err(SnapshotOrchestratorError::Codec(format!(
                 "unsupported envelope version {} (expected {})",

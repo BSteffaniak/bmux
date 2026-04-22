@@ -10,6 +10,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod envelope;
 pub mod offline_snapshot;
 pub mod typed_client;
 

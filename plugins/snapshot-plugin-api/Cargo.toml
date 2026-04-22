@@ -11,10 +11,22 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_ipc        = { workspace = true }
-bmux_plugin_sdk = { workspace = true }
-serde           = { workspace = true, features = ["derive", "std"] }
-thiserror       = { workspace = true }
+anyhow                = { workspace = true, features = ["std"] }
+bmux_client_state     = { workspace = true }
+bmux_config           = { workspace = true }
+bmux_context_state    = { workspace = true }
+bmux_ipc              = { workspace = true }
+bmux_plugin_sdk       = { workspace = true }
+bmux_session_models   = { workspace = true, features = ["serde"] }
+bmux_session_state    = { workspace = true }
+bmux_snapshot_runtime = { workspace = true }
+serde                 = { workspace = true, features = ["derive", "std"] }
+serde_json            = { workspace = true }
+thiserror             = { workspace = true }
+uuid                  = { workspace = true, features = ["serde", "std"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 default          = []

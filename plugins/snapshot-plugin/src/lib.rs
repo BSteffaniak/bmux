@@ -15,10 +15,9 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-mod envelope;
 mod orchestrator;
 
-pub use envelope::{CombinedSnapshotEnvelope, SectionV1};
+pub use bmux_snapshot_plugin_api::envelope::{CombinedSnapshotEnvelope, SectionV1};
 pub use orchestrator::BmuxSnapshotOrchestrator;
 
 use std::sync::{Arc, RwLock};

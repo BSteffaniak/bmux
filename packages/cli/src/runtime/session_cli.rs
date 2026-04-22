@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_clients_plugin_api::clients_state::ClientSummary as TypedClientSummary;
 use bmux_ipc::SessionSelector;
-use bmux_server::OfflineSessionKillTarget;
 use bmux_sessions_plugin_api::sessions_commands::{NewSessionError, SessionAck};
 use bmux_sessions_plugin_api::sessions_state::SessionSummary as TypedSessionSummary;
+use bmux_snapshot_plugin_api::offline_snapshot::OfflineSessionKillTarget;
 
 use super::attach::runtime::short_uuid;
 use super::typed_clients;
