@@ -8160,10 +8160,428 @@ fn record_to_all_runtimes(kind: RecordingEventKind, payload: RecordingPayload, m
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "Test scaffolding holds guards only for short critical sections; tightening adds churn without runtime benefit."
+)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use bmux_context_state::{
+        CONTEXT_SESSION_ID_ATTRIBUTE, ContextStateReader, ContextStateSnapshot, ContextStateWriter,
+        RuntimeContext,
+    };
+    use bmux_ipc::{ContextSelector, ContextSummary};
+    use bmux_session_models::{Session, SessionInfo};
+    use bmux_session_state::SessionManagerWriter;
+    use std::collections::{BTreeMap, VecDeque};
     use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
+
+    /// In-memory [`SessionManagerWriter`] for tests.
+    ///
+    /// Mirrors the sessions plugin's real writer surface without
+    /// pulling in the plugin crate as a test dependency. Tests install
+    /// one of these into the plugin state registry so requests that
+    /// reach `create_session` / `remove_session` don't hit the
+    /// `NoopSessionManager` fallback that [`BmuxServer::new`] registers
+    /// when no sessions plugin is active.
+    #[derive(Default)]
+    struct TestSessionManager {
+        sessions: StdMutex<BTreeMap<SessionId, Session>>,
+    }
+
+    impl SessionManagerReader for TestSessionManager {
+        fn list_sessions(&self) -> Vec<SessionInfo> {
+            self.sessions
+                .lock()
+                .expect("test session manager lock poisoned")
+                .values()
+                .map(SessionInfo::from)
+                .collect()
+        }
+
+        fn get_session(&self, session_id: SessionId) -> Option<Session> {
+            self.sessions
+                .lock()
+                .expect("test session manager lock poisoned")
+                .get(&session_id)
+                .cloned()
+        }
+
+        fn contains(&self, session_id: SessionId) -> bool {
+            self.sessions
+                .lock()
+                .expect("test session manager lock poisoned")
+                .contains_key(&session_id)
+        }
+    }
+
+    impl SessionManagerWriter for TestSessionManager {
+        fn create_session(&self, name: Option<String>) -> anyhow::Result<SessionId> {
+            let session = Session::new(name);
+            let id = session.id;
+            self.sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test session manager lock poisoned"))?
+                .insert(id, session);
+            Ok(id)
+        }
+
+        fn insert_session(&self, session: Session) -> anyhow::Result<()> {
+            let id = session.id;
+            let mut guard = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test session manager lock poisoned"))?;
+            if guard.contains_key(&id) {
+                anyhow::bail!("session already exists: {id}");
+            }
+            guard.insert(id, session);
+            Ok(())
+        }
+
+        fn remove_session(&self, session_id: SessionId) -> anyhow::Result<()> {
+            self.sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test session manager lock poisoned"))?
+                .remove(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))
+                .map(|_| ())
+        }
+
+        fn add_client(&self, session_id: SessionId, client_id: ClientId) {
+            if let Ok(mut guard) = self.sessions.lock()
+                && let Some(session) = guard.get_mut(&session_id)
+            {
+                session.add_client(client_id);
+            }
+        }
+
+        fn remove_client(&self, session_id: SessionId, client_id: &ClientId) {
+            if let Ok(mut guard) = self.sessions.lock()
+                && let Some(session) = guard.get_mut(&session_id)
+            {
+                session.remove_client(client_id);
+            }
+        }
+
+        fn snapshot(&self) -> SessionManagerSnapshot {
+            self.sessions.lock().map_or_else(
+                |_| SessionManagerSnapshot::default(),
+                |guard| SessionManagerSnapshot(guard.values().cloned().collect()),
+            )
+        }
+
+        fn restore_snapshot(&self, snapshot: SessionManagerSnapshot) {
+            if let Ok(mut guard) = self.sessions.lock() {
+                guard.clear();
+                for session in snapshot.0 {
+                    guard.insert(session.id, session);
+                }
+            }
+        }
+    }
+
+    /// Install a fresh [`TestSessionManager`] into the plugin state
+    /// registry, replacing any previously-registered
+    /// [`SessionManagerHandle`] (including the no-op that
+    /// [`BmuxServer::new`] registers at construction time).
+    ///
+    /// Call this after constructing a `BmuxServer` in tests that
+    /// exercise request paths reaching `create_session`,
+    /// `remove_session`, etc.
+    fn install_test_session_manager_handle() {
+        let handle = SessionManagerHandle::new(TestSessionManager::default());
+        let slot = Arc::new(std::sync::RwLock::new(handle));
+        let _previous =
+            bmux_plugin::global_plugin_state_registry().register::<SessionManagerHandle>(&slot);
+    }
+
+    /// Inner mutable state for [`TestContextState`].
+    ///
+    /// Mirrors the subset of the real contexts-plugin state that server
+    /// request paths exercise (create, bind, remove, query) without
+    /// pulling in the contexts plugin as a test dep.
+    #[derive(Default)]
+    struct TestContextStateInner {
+        contexts: BTreeMap<Uuid, RuntimeContext>,
+        session_by_context: BTreeMap<Uuid, SessionId>,
+        selected_by_client: BTreeMap<ClientId, Uuid>,
+        mru_contexts: VecDeque<Uuid>,
+    }
+
+    impl TestContextStateInner {
+        fn to_summary(context: &RuntimeContext) -> ContextSummary {
+            ContextSummary {
+                id: context.id,
+                name: context.name.clone(),
+                attributes: context.attributes.clone(),
+            }
+        }
+
+        fn touch_mru(&mut self, id: Uuid) {
+            self.mru_contexts.retain(|existing| *existing != id);
+            self.mru_contexts.push_front(id);
+        }
+    }
+
+    /// In-memory [`ContextStateWriter`] for tests.
+    #[derive(Default)]
+    struct TestContextState {
+        inner: StdMutex<TestContextStateInner>,
+    }
+
+    impl ContextStateReader for TestContextState {
+        fn list(&self) -> Vec<ContextSummary> {
+            let guard = self.inner.lock().expect("test context state lock poisoned");
+            guard
+                .mru_contexts
+                .iter()
+                .filter_map(|id| guard.contexts.get(id))
+                .map(TestContextStateInner::to_summary)
+                .collect()
+        }
+
+        fn current_for_client(&self, client_id: ClientId) -> Option<ContextSummary> {
+            let guard = self.inner.lock().ok()?;
+            let selected = guard
+                .selected_by_client
+                .get(&client_id)
+                .copied()
+                .filter(|id| guard.contexts.contains_key(id))
+                .or_else(|| {
+                    guard
+                        .mru_contexts
+                        .iter()
+                        .copied()
+                        .find(|id| guard.contexts.contains_key(id))
+                })?;
+            guard
+                .contexts
+                .get(&selected)
+                .map(TestContextStateInner::to_summary)
+        }
+
+        fn current_session_for_client(&self, client_id: ClientId) -> Option<SessionId> {
+            let guard = self.inner.lock().ok()?;
+            let selected = guard
+                .selected_by_client
+                .get(&client_id)
+                .copied()
+                .filter(|id| guard.contexts.contains_key(id))
+                .or_else(|| {
+                    guard
+                        .mru_contexts
+                        .iter()
+                        .copied()
+                        .find(|id| guard.contexts.contains_key(id))
+                })?;
+            guard.session_by_context.get(&selected).copied()
+        }
+
+        fn context_for_session(&self, session_id: SessionId) -> Option<Uuid> {
+            let guard = self.inner.lock().ok()?;
+            guard
+                .session_by_context
+                .iter()
+                .find_map(|(context_id, mapped)| (*mapped == session_id).then_some(*context_id))
+        }
+
+        fn resolve_id(&self, selector: &ContextSelector) -> Result<Uuid, &'static str> {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| "test context state lock poisoned")?;
+            match selector {
+                ContextSelector::ById(id) => {
+                    if guard.contexts.contains_key(id) {
+                        Ok(*id)
+                    } else {
+                        Err("context not found")
+                    }
+                }
+                ContextSelector::ByName(name) => {
+                    let matches: Vec<Uuid> = guard
+                        .contexts
+                        .values()
+                        .filter(|context| context.name.as_deref() == Some(name.as_str()))
+                        .map(|context| context.id)
+                        .collect();
+                    match matches.len() {
+                        0 => Err("context not found"),
+                        1 => Ok(matches[0]),
+                        _ => Err("context selector is ambiguous"),
+                    }
+                }
+            }
+        }
+    }
+
+    impl ContextStateWriter for TestContextState {
+        fn create(
+            &self,
+            client_id: ClientId,
+            name: Option<String>,
+            attributes: BTreeMap<String, String>,
+        ) -> ContextSummary {
+            let mut guard = self.inner.lock().expect("test context state lock poisoned");
+            let context = RuntimeContext {
+                id: Uuid::new_v4(),
+                name,
+                attributes,
+            };
+            let id = context.id;
+            guard.contexts.insert(id, context.clone());
+            guard.selected_by_client.insert(client_id, id);
+            guard.touch_mru(id);
+            TestContextStateInner::to_summary(&context)
+        }
+
+        fn select_for_client(
+            &self,
+            client_id: ClientId,
+            selector: &ContextSelector,
+        ) -> Result<ContextSummary, &'static str> {
+            let id = self.resolve_id(selector)?;
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| "test context state lock poisoned")?;
+            guard.selected_by_client.insert(client_id, id);
+            guard.touch_mru(id);
+            guard
+                .contexts
+                .get(&id)
+                .map(TestContextStateInner::to_summary)
+                .ok_or("context not found")
+        }
+
+        fn close(
+            &self,
+            _client_id: ClientId,
+            selector: &ContextSelector,
+            _force: bool,
+        ) -> Result<(Uuid, Option<SessionId>), &'static str> {
+            let id = self.resolve_id(selector)?;
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| "test context state lock poisoned")?;
+            let removed_session = guard.session_by_context.remove(&id);
+            guard.contexts.remove(&id);
+            guard.mru_contexts.retain(|existing| *existing != id);
+            guard
+                .selected_by_client
+                .retain(|_client, selected| *selected != id);
+            Ok((id, removed_session))
+        }
+
+        fn remove_contexts_for_session(&self, session_id: SessionId) -> Vec<Uuid> {
+            let Ok(mut guard) = self.inner.lock() else {
+                return Vec::new();
+            };
+            let to_remove: Vec<Uuid> = guard
+                .session_by_context
+                .iter()
+                .filter_map(|(context_id, mapped)| (*mapped == session_id).then_some(*context_id))
+                .collect();
+            for context_id in &to_remove {
+                guard.session_by_context.remove(context_id);
+                guard.contexts.remove(context_id);
+                guard.mru_contexts.retain(|existing| existing != context_id);
+                guard
+                    .selected_by_client
+                    .retain(|_client, selected| selected != context_id);
+            }
+            to_remove
+        }
+
+        fn bind_session(
+            &self,
+            context_id: Uuid,
+            session_id: SessionId,
+        ) -> Result<(), &'static str> {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| "test context state lock poisoned")?;
+            let Some(context) = guard.contexts.get_mut(&context_id) else {
+                return Err("context not found");
+            };
+            context.attributes.insert(
+                CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
+                session_id.0.to_string(),
+            );
+            guard.session_by_context.insert(context_id, session_id);
+            Ok(())
+        }
+
+        fn disconnect_client(&self, client_id: ClientId) {
+            if let Ok(mut guard) = self.inner.lock() {
+                guard.selected_by_client.remove(&client_id);
+            }
+        }
+
+        fn remove_context_by_id(
+            &self,
+            context_id: Uuid,
+            _preferred_client: Option<ClientId>,
+        ) -> Option<(Uuid, Option<SessionId>)> {
+            let mut guard = self.inner.lock().ok()?;
+            if !guard.contexts.contains_key(&context_id) {
+                return None;
+            }
+            let removed_session = guard.session_by_context.remove(&context_id);
+            guard.contexts.remove(&context_id);
+            guard
+                .mru_contexts
+                .retain(|existing| *existing != context_id);
+            guard
+                .selected_by_client
+                .retain(|_client, selected| *selected != context_id);
+            Some((context_id, removed_session))
+        }
+
+        fn snapshot(&self) -> ContextStateSnapshot {
+            self.inner.lock().map_or_else(
+                |_| ContextStateSnapshot::default(),
+                |guard| ContextStateSnapshot {
+                    contexts: guard.contexts.clone(),
+                    session_by_context: guard.session_by_context.clone(),
+                    selected_by_client: guard.selected_by_client.clone(),
+                    mru_contexts: guard.mru_contexts.clone(),
+                },
+            )
+        }
+
+        fn restore_snapshot(&self, snapshot: ContextStateSnapshot) {
+            if let Ok(mut guard) = self.inner.lock() {
+                guard.contexts = snapshot.contexts;
+                guard.session_by_context = snapshot.session_by_context;
+                guard.selected_by_client = snapshot.selected_by_client;
+                guard.mru_contexts = snapshot.mru_contexts;
+            }
+        }
+    }
+
+    /// Install a fresh [`TestContextState`] into the plugin state
+    /// registry, replacing any previously-registered
+    /// [`ContextStateHandle`] (including the no-op that
+    /// [`BmuxServer::new`] registers at construction time).
+    fn install_test_context_state_handle() {
+        let handle = ContextStateHandle::new(TestContextState::default());
+        let slot = Arc::new(std::sync::RwLock::new(handle));
+        let _previous =
+            bmux_plugin::global_plugin_state_registry().register::<ContextStateHandle>(&slot);
+    }
+
+    /// Install fresh test-mode session and context handles. Call this
+    /// immediately after `BmuxServer::new(...)` in tests that exercise
+    /// request paths reaching `create_session` / context binding.
+    fn install_test_state_handles() {
+        install_test_session_manager_handle();
+        install_test_context_state_handle();
+    }
 
     async fn execute_request(
         server: &BmuxServer,
@@ -8729,6 +9147,7 @@ mod tests {
     #[tokio::test]
     async fn split_pane_succeeds_without_policy_provider() {
         let server = BmuxServer::new(test_endpoint());
+        install_test_state_handles();
         let client_id = ClientId::new();
         let principal_id = Uuid::new_v4();
         let mut selected_session = None;
@@ -8777,6 +9196,7 @@ mod tests {
     #[tokio::test]
     async fn launch_pane_succeeds_without_policy_provider() {
         let server = BmuxServer::new(test_endpoint());
+        install_test_state_handles();
         let client_id = ClientId::new();
         let principal_id = Uuid::new_v4();
         let mut selected_session = None;
@@ -8853,6 +9273,7 @@ mod tests {
     #[tokio::test]
     async fn launch_pane_rejects_empty_program() {
         let server = BmuxServer::new(test_endpoint());
+        install_test_state_handles();
         let client_id = ClientId::new();
         let principal_id = Uuid::new_v4();
         let mut selected_session = None;
@@ -8908,6 +9329,7 @@ mod tests {
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     async fn exited_pane_keeps_layout_and_restart_reuses_same_pane_id() {
         let server = BmuxServer::new(test_endpoint());
+        install_test_state_handles();
         let client_id = ClientId::new();
         let principal_id = Uuid::new_v4();
         let mut selected_session = None;
@@ -9131,6 +9553,7 @@ mod tests {
     #[tokio::test]
     async fn kill_session_is_blocked_when_admin_policy_denies() {
         let server = BmuxServer::new(test_endpoint());
+        install_test_state_handles();
         server
             .set_service_resolver(|route, payload| async move {
                 if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
@@ -9190,6 +9613,7 @@ mod tests {
     #[tokio::test]
     async fn split_pane_is_blocked_when_mutation_policy_denies() {
         let server = BmuxServer::new(test_endpoint());
+        install_test_state_handles();
         server
             .set_service_resolver(|route, payload| async move {
                 if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
@@ -9253,6 +9677,7 @@ mod tests {
     #[tokio::test]
     async fn attach_input_is_blocked_when_mutation_policy_denies() {
         let server = BmuxServer::new(test_endpoint());
+        install_test_state_handles();
         server
             .set_service_resolver(|route, payload| async move {
                 if route.interface_id == "session-policy-query/v1" && route.operation == "check" {

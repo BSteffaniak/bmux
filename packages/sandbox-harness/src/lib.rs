@@ -382,7 +382,7 @@ fn is_pid_alive(pid: u32) -> bool {
 mod tests {
     use super::{SandboxHarness, create_temp_paths, ensure_sandbox_dirs};
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sandbox_harness_starts_and_connects() {
         let sandbox = SandboxHarness::start()
             .await
