@@ -512,38 +512,6 @@ fn prune_context_mappings_for_session(
     Ok(context_handle().0.remove_contexts_for_session(session_id))
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "Used only by the in-file test module; kept outside `#[cfg(test)]` so the production-section scan in architecture_guardrails.rs keeps picking up downstream helpers."
-    )
-)]
-fn create_session_runtime(name: Option<String>) -> Result<SessionId> {
-    let manager = session_handle();
-    if let Some(requested_name) = name.as_deref()
-        && manager
-            .0
-            .list_sessions()
-            .iter()
-            .any(|session| session.name.as_deref() == Some(requested_name))
-    {
-        anyhow::bail!("session already exists with name '{requested_name}'");
-    }
-
-    let session_id = manager
-        .0
-        .create_session(name)
-        .map_err(|error| anyhow::anyhow!("failed creating session: {error:#}"))?;
-
-    if let Err(error) = session_runtime_handle().0.start_runtime(session_id) {
-        let _ = session_handle().0.remove_session(session_id);
-        anyhow::bail!("failed creating session runtime: {error:#}");
-    }
-
-    Ok(session_id)
-}
-
 fn resolve_server_shell(config: &BmuxConfig) -> String {
     if let Some(shell) = config.general.default_shell.as_ref()
         && !shell.trim().is_empty()
@@ -7503,43 +7471,6 @@ async fn check_session_policy(
     Ok(Some(response))
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "Used only by the in-file test module; kept outside `#[cfg(test)]` so the production-section scan in architecture_guardrails.rs keeps picking up downstream helpers."
-    )
-)]
-async fn ensure_session_admin_allowed(
-    state: &Arc<ServerState>,
-    shutdown_tx: &watch::Sender<bool>,
-    session_id: SessionId,
-    client_id: ClientId,
-    client_principal_id: Uuid,
-    action: &str,
-) -> std::result::Result<(), ErrorResponse> {
-    let decision = check_session_policy(
-        state,
-        shutdown_tx,
-        session_id,
-        client_id,
-        client_principal_id,
-        action,
-    )
-    .await?;
-    if let Some(decision) = decision
-        && !decision.allowed
-    {
-        return Err(ErrorResponse {
-            code: ErrorCode::InvalidRequest,
-            message: decision
-                .reason
-                .unwrap_or_else(|| "session policy denied for this operation".to_string()),
-        });
-    }
-    Ok(())
-}
-
 async fn ensure_session_mutation_allowed(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
@@ -8826,6 +8757,68 @@ mod tests {
         )
         .await
         .expect("request should complete")
+    }
+
+    /// Test helper: create a session runtime and register it with
+    /// the session manager. Mirrors the orchestration that the
+    /// deleted `Request::NewSession` IPC handler used to perform.
+    fn create_session_runtime(name: Option<String>) -> Result<SessionId> {
+        let manager = session_handle();
+        if let Some(requested_name) = name.as_deref()
+            && manager
+                .0
+                .list_sessions()
+                .iter()
+                .any(|session| session.name.as_deref() == Some(requested_name))
+        {
+            anyhow::bail!("session already exists with name '{requested_name}'");
+        }
+
+        let session_id = manager
+            .0
+            .create_session(name)
+            .map_err(|error| anyhow::anyhow!("failed creating session: {error:#}"))?;
+
+        if let Err(error) = session_runtime_handle().0.start_runtime(session_id) {
+            let _ = session_handle().0.remove_session(session_id);
+            anyhow::bail!("failed creating session runtime: {error:#}");
+        }
+
+        Ok(session_id)
+    }
+
+    /// Test helper: run the admin-policy check that the deleted
+    /// `Request::KillSession` IPC handler used to perform. Kept in
+    /// the test module so server tests can verify policy-denial
+    /// plumbing without resurrecting the legacy IPC variant.
+    async fn ensure_session_admin_allowed(
+        state: &Arc<ServerState>,
+        shutdown_tx: &watch::Sender<bool>,
+        session_id: SessionId,
+        client_id: ClientId,
+        client_principal_id: Uuid,
+        action: &str,
+    ) -> std::result::Result<(), ErrorResponse> {
+        let decision = check_session_policy(
+            state,
+            shutdown_tx,
+            session_id,
+            client_id,
+            client_principal_id,
+            action,
+        )
+        .await?;
+        if let Some(decision) = decision
+            && !decision.allowed
+        {
+            return Err(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                message: decision
+                    .reason
+                    .unwrap_or_else(|| "session policy denied for this operation".to_string()),
+            });
+        }
+        Ok(())
     }
 
     /// Test helper that replicates the server-side orchestration

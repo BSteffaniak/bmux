@@ -1,5 +1,12 @@
+/// Strip the `mod tests { ... }` block from a source file so
+/// downstream assertions only consider production code.
+///
+/// Splits on `\nmod tests {` (the unique test-module header shape
+/// used across this crate's production files) rather than any
+/// `#[cfg(test)]` attribute, because those attributes can legitimately
+/// appear on individual test helpers that live in module scope.
 fn production_section(source: &str) -> &str {
-    source.split("\n#[cfg(test)]").next().unwrap_or(source)
+    source.split("\nmod tests {").next().unwrap_or(source)
 }
 
 fn assert_no_domain_markers(source: &str, context: &str) {
