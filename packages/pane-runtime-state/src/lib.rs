@@ -25,11 +25,17 @@
 pub mod attach;
 pub mod error;
 pub mod layout;
+pub mod manager_handle;
 pub mod meta;
 pub mod output;
 
 pub use attach::AttachViewport;
 pub use error::SessionRuntimeError;
-pub use layout::{FloatingSurfaceRuntime, LayoutRect, PaneLayoutNode};
+pub use layout::{FloatingSurfaceRuntime, LayoutRect, PaneLayoutNode, contains_pane};
+pub use manager_handle::{
+    AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, NoopSessionRuntimeManager,
+    RemovedRuntimeInfo, SessionRuntimeManagerApi, SessionRuntimeManagerHandle,
+    SessionRuntimeSnapshot,
+};
 pub use meta::{PaneCommandSource, PaneLaunchSpec, PaneResurrectionSnapshot, PaneRuntimeMeta};
 pub use output::{OutputRead, PaneOutputReader, PaneOutputReaderHandle};

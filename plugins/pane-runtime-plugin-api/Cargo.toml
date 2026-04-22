@@ -17,10 +17,10 @@ serde                     = { workspace = true, features = ["derive", "std"] }
 uuid                      = { workspace = true, features = ["serde", "std"] }
 
 [package.metadata.cargo-machete]
-# `serde` is consumed by code generated from the BPDL schema via the
-# `bmux_plugin_schema_macros::schema!` proc macro; cargo-machete cannot
-# see into proc-macro-generated source.
-ignored = ["serde"]
+# `serde` and `uuid` are consumed by code generated from the BPDL
+# schema via the `bmux_plugin_schema_macros::schema!` proc macro;
+# cargo-machete cannot see into proc-macro-generated source.
+ignored = ["serde", "uuid"]
 
 [features]
 default          = []

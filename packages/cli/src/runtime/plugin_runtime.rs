@@ -164,6 +164,10 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/sessions-plugin/plugin.toml"),
     plugin_type = bmux_sessions_plugin::SessionsPlugin;
 
+    feature = "bundled-plugin-pane-runtime",
+    manifest = include_str!("../../../../plugins/pane-runtime-plugin/plugin.toml"),
+    plugin_type = bmux_pane_runtime_plugin::PaneRuntimePlugin;
+
     feature = "bundled-plugin-snapshot",
     manifest = include_str!("../../../../plugins/snapshot-plugin/plugin.toml"),
     plugin_type = bmux_snapshot_plugin::SnapshotPlugin;

@@ -23,6 +23,10 @@ use bmux_ipc::{
     ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
     encode, negotiate_protocol,
 };
+use bmux_pane_runtime_state::{
+    AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
+    PaneLayoutNode, PaneResurrectionSnapshot, PaneRuntimeMeta, SessionRuntimeError,
+};
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::{SessionManagerHandle, SessionManagerReader, SessionManagerSnapshot};
@@ -73,7 +77,7 @@ pub struct BmuxServer {
 }
 
 struct ServerState {
-    session_runtimes: Mutex<SessionRuntimeManager>,
+    session_runtimes: Arc<Mutex<SessionRuntimeManager>>,
     attach_tokens: Mutex<AttachTokenManager>,
     performance_settings: PerformanceSettingsStore,
     operation_lock: AsyncMutex<()>,
@@ -365,6 +369,16 @@ fn session_handle() -> SessionManagerHandle {
         .unwrap_or_else(SessionManagerHandle::noop)
 }
 
+/// Look up the pane-runtime manager handle from the plugin state
+/// registry. Returns the noop manager when the pane-runtime plugin
+/// isn't loaded or its handle isn't registered yet.
+fn session_runtime_handle() -> bmux_pane_runtime_state::SessionRuntimeManagerHandle {
+    bmux_plugin::global_plugin_state_registry()
+        .get::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>()
+        .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
+        .unwrap_or_else(bmux_pane_runtime_state::SessionRuntimeManagerHandle::noop)
+}
+
 /// Look up the snapshot orchestrator handle from the plugin state
 /// registry. Returns the noop orchestrator when the snapshot plugin
 /// isn't loaded or its handle isn't registered yet.
@@ -426,7 +440,7 @@ fn prune_context_mappings_for_session(
     Ok(context_handle().0.remove_contexts_for_session(session_id))
 }
 
-fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Result<SessionId> {
+fn create_session_runtime(name: Option<String>) -> Result<SessionId> {
     let manager = session_handle();
     if let Some(requested_name) = name.as_deref()
         && manager
@@ -443,16 +457,10 @@ fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Res
         .create_session(name)
         .map_err(|error| anyhow::anyhow!("failed creating session: {error:#}"))?;
 
-    let mut runtime_manager = state
-        .session_runtimes
-        .lock()
-        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-    if let Err(error) = runtime_manager.start_runtime(session_id) {
-        drop(runtime_manager);
+    if let Err(error) = session_runtime_handle().0.start_runtime(session_id) {
         let _ = session_handle().0.remove_session(session_id);
         anyhow::bail!("failed creating session runtime: {error:#}");
     }
-    drop(runtime_manager);
 
     Ok(session_id)
 }
@@ -528,6 +536,12 @@ async fn shutdown_runtime_handle(removed: RemovedRuntime) {
     }
 }
 
+/// Drive the plugin-side async shutdown for a `RemovedRuntimeInfo`
+/// projection through the registered `SessionRuntimeManagerHandle`.
+fn shutdown_runtime_info(info: bmux_pane_runtime_state::RemovedRuntimeInfo) {
+    session_runtime_handle().0.shutdown_removed_runtime(info);
+}
+
 async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
     if let Some(stop_tx) = pane.stop_tx.take() {
         let _ = stop_tx.send(());
@@ -579,58 +593,6 @@ struct SessionRuntimeHandle {
     attached_clients: BTreeSet<ClientId>,
     attach_viewport: Option<AttachViewport>,
     attach_view_revision: u64,
-}
-
-#[derive(Clone, Copy)]
-struct AttachViewport {
-    cols: u16,
-    rows: u16,
-    status_top_inset: u16,
-    status_bottom_inset: u16,
-}
-
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FloatingSurfaceRuntime {
-    id: Uuid,
-    pane_id: Uuid,
-    rect: LayoutRect,
-    z: i32,
-    visible: bool,
-    opaque: bool,
-    accepts_input: bool,
-    cursor_owner: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PaneLaunchSpec {
-    program: String,
-    args: Vec<String>,
-    cwd: Option<String>,
-    env: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone)]
-struct PaneRuntimeMeta {
-    id: Uuid,
-    name: Option<String>,
-    shell: String,
-    launch: Option<PaneLaunchSpec>,
-    resurrection: PaneResurrectionSnapshot,
-}
-
-#[derive(Debug, Clone, Default)]
-struct PaneResurrectionSnapshot {
-    active_command: Option<String>,
-    active_command_source: Option<PaneCommandSource>,
-    last_known_cwd: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PaneCommandSource {
-    Verbatim,
-    Inspection,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1719,14 +1681,6 @@ $env.config = (
 "#
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LayoutRect {
-    x: u16,
-    y: u16,
-    w: u16,
-    h: u16,
-}
-
 impl PaneRuntimeHandle {
     fn send_input(&self, data: Vec<u8>) -> std::result::Result<(), SessionRuntimeError> {
         self.input_tx
@@ -1876,10 +1830,41 @@ struct OutputRead {
     stream_gap: bool,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Kept for test coverage of the OutputRead -> Event conversion; production code uses `pane_output_event_from_push_read` instead."
+    )
+)]
 fn pane_output_event_from_read(
     session_id: Uuid,
     pane_id: Uuid,
     read: OutputRead,
+    sync_update_active: bool,
+) -> Option<Event> {
+    if read.bytes.is_empty() && !read.stream_gap {
+        return None;
+    }
+
+    Some(Event::PaneOutput {
+        session_id,
+        pane_id,
+        data: read.bytes,
+        stream_start: read.stream_start,
+        stream_end: read.stream_end,
+        stream_gap: read.stream_gap,
+        sync_update_active,
+    })
+}
+
+/// Variant of `pane_output_event_from_read` for the
+/// `bmux_pane_runtime_state::OutputRead` DTO produced by the
+/// per-client push-loop path.
+fn pane_output_event_from_push_read(
+    session_id: Uuid,
+    pane_id: Uuid,
+    read: bmux_pane_runtime_state::OutputRead,
     sync_update_active: bool,
 ) -> Option<Event> {
     if read.bytes.is_empty() && !read.stream_gap {
@@ -2111,7 +2096,6 @@ impl OutputFanoutBuffer {
 
 struct RemovedRuntime {
     session_id: SessionId,
-    had_attached_clients: bool,
     handle: SessionRuntimeHandle,
 }
 
@@ -2124,7 +2108,6 @@ struct AttachLayoutState {
 }
 
 struct AttachSnapshotState {
-    session_id: SessionId,
     focused_pane_id: Uuid,
     panes: Vec<PaneSummary>,
     layout_root: IpcPaneLayoutNode,
@@ -2139,136 +2122,6 @@ struct AttachPaneSnapshotState {
     chunks: Vec<AttachPaneChunk>,
     pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
     pane_input_modes: Vec<AttachPaneInputMode>,
-}
-
-#[derive(Debug, Clone)]
-enum PaneLayoutNode {
-    Leaf {
-        pane_id: Uuid,
-    },
-    Split {
-        direction: PaneSplitDirection,
-        ratio: f32,
-        first: Box<Self>,
-        second: Box<Self>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionRuntimeError {
-    NotFound,
-    NotAttached,
-    Closed,
-}
-
-impl PaneLayoutNode {
-    fn pane_order(&self, out: &mut Vec<Uuid>) {
-        match self {
-            Self::Leaf { pane_id } => out.push(*pane_id),
-            Self::Split { first, second, .. } => {
-                first.pane_order(out);
-                second.pane_order(out);
-            }
-        }
-    }
-
-    fn replace_leaf_with_split(
-        &mut self,
-        target: Uuid,
-        direction: PaneSplitDirection,
-        ratio: f32,
-        new_pane_id: Uuid,
-    ) -> bool {
-        match self {
-            Self::Leaf { pane_id } if *pane_id == target => {
-                *self = Self::Split {
-                    direction,
-                    ratio,
-                    first: Box::new(Self::Leaf { pane_id: target }),
-                    second: Box::new(Self::Leaf {
-                        pane_id: new_pane_id,
-                    }),
-                };
-                true
-            }
-            Self::Split { first, second, .. } => {
-                first.replace_leaf_with_split(target, direction, ratio, new_pane_id)
-                    || second.replace_leaf_with_split(target, direction, ratio, new_pane_id)
-            }
-            Self::Leaf { .. } => false,
-        }
-    }
-
-    fn remove_leaf(&mut self, target: Uuid) -> bool {
-        enum RemoveResult {
-            NotFound,
-            Removed,
-            RemoveThis,
-        }
-
-        fn remove_inner(node: &mut PaneLayoutNode, target: Uuid) -> RemoveResult {
-            match node {
-                PaneLayoutNode::Leaf { pane_id } => {
-                    if *pane_id == target {
-                        RemoveResult::RemoveThis
-                    } else {
-                        RemoveResult::NotFound
-                    }
-                }
-                PaneLayoutNode::Split { first, second, .. } => {
-                    match remove_inner(first, target) {
-                        RemoveResult::NotFound => {}
-                        RemoveResult::Removed => return RemoveResult::Removed,
-                        RemoveResult::RemoveThis => {
-                            *node = *second.clone();
-                            return RemoveResult::Removed;
-                        }
-                    }
-
-                    match remove_inner(second, target) {
-                        RemoveResult::NotFound => RemoveResult::NotFound,
-                        RemoveResult::Removed => RemoveResult::Removed,
-                        RemoveResult::RemoveThis => {
-                            *node = *first.clone();
-                            RemoveResult::Removed
-                        }
-                    }
-                }
-            }
-        }
-
-        !matches!(remove_inner(self, target), RemoveResult::NotFound)
-    }
-
-    fn adjust_focused_ratio(&mut self, target: Uuid, delta: f32) -> Option<f32> {
-        match self {
-            Self::Leaf { .. } => None,
-            Self::Split {
-                ratio,
-                first,
-                second,
-                ..
-            } => {
-                if contains_pane(first, target) || contains_pane(second, target) {
-                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
-                    Some(*ratio)
-                } else {
-                    first
-                        .adjust_focused_ratio(target, delta)
-                        .or_else(|| second.adjust_focused_ratio(target, delta))
-                }
-            }
-        }
-    }
-}
-
-fn contains_pane(node: &PaneLayoutNode, pane_id: Uuid) -> bool {
-    match node {
-        PaneLayoutNode::Leaf { pane_id: id } => *id == pane_id,
-        PaneLayoutNode::Split { first, second, .. } => {
-            contains_pane(first, pane_id) || contains_pane(second, pane_id)
-        }
-    }
 }
 
 fn ipc_layout_from_runtime(node: &PaneLayoutNode) -> IpcPaneLayoutNode {
@@ -3821,7 +3674,6 @@ impl SessionRuntimeManager {
         }
 
         Ok(AttachSnapshotState {
-            session_id,
             focused_pane_id: session.focused_pane_id,
             panes,
             layout_root: ipc_layout_from_runtime(&session.layout_root),
@@ -3969,7 +3821,6 @@ impl SessionRuntimeManager {
 
         Ok(RemovedRuntime {
             session_id,
-            had_attached_clients: !runtime.attached_clients.is_empty(),
             handle: runtime,
         })
     }
@@ -3979,7 +3830,6 @@ impl SessionRuntimeManager {
             .into_iter()
             .map(|(session_id, runtime)| RemovedRuntime {
                 session_id,
-                had_attached_clients: !runtime.attached_clients.is_empty(),
                 handle: runtime,
             })
             .collect()
@@ -4344,17 +4194,33 @@ impl BmuxServer {
 
         let (event_broadcast_tx, _) =
             tokio::sync::broadcast::channel::<Event>(EVENT_PUSH_CHANNEL_CAPACITY);
+        let session_runtimes = Arc::new(Mutex::new(SessionRuntimeManager::new(
+            shell,
+            pane_term,
+            protocol_profile,
+            shell_integration_root,
+            pane_exit_tx,
+            event_broadcast_tx.clone(),
+        )));
+
+        // Register server's `SessionRuntimeManager` into the plugin
+        // state registry so `session_runtime_handle()` lookups reach
+        // this single instance. The adapter is defined inline below
+        // to avoid a cross-crate cardinal-sin dependency (server must
+        // not pull in plugin impl crates). When pane-runtime is
+        // relocated into a plugin, this registration moves with it.
+        let runtime_handle = bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(
+            ServerSessionRuntimeAdapter::new(Arc::clone(&session_runtimes)),
+        );
+        bmux_plugin::global_plugin_state_registry()
+            .register::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>(&Arc::new(
+            std::sync::RwLock::new(runtime_handle),
+        ));
+
         Self {
             endpoint,
             state: Arc::new(ServerState {
-                session_runtimes: Mutex::new(SessionRuntimeManager::new(
-                    shell,
-                    pane_term,
-                    protocol_profile,
-                    shell_integration_root,
-                    pane_exit_tx,
-                    event_broadcast_tx.clone(),
-                )),
+                session_runtimes,
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 performance_settings,
                 operation_lock: AsyncMutex::new(()),
@@ -4651,12 +4517,9 @@ impl BmuxServer {
         let _ = maybe_flush_snapshot(&self.state, true);
         let _ = pane_exit_task.await;
 
-        let removed_runtimes = self.state.session_runtimes.lock().map_or_else(
-            |_| Vec::new(),
-            |mut runtime_manager| runtime_manager.remove_all_runtimes(),
-        );
+        let removed_runtimes = session_runtime_handle().0.remove_all_runtimes();
         for removed_runtime in removed_runtimes {
-            if removed_runtime.had_attached_clients {
+            if !removed_runtime.attached_clients.is_empty() {
                 let _ = emit_event(
                     &self.state,
                     Event::ClientDetached {
@@ -4664,7 +4527,7 @@ impl BmuxServer {
                     },
                 );
             }
-            shutdown_runtime_handle(removed_runtime).await;
+            shutdown_runtime_info(removed_runtime);
         }
         session_handle()
             .0
@@ -4998,38 +4861,17 @@ async fn handle_connection(
                                     session_id,
                                     pane_id,
                                 } => {
-                                    let (read, sync_update_active) = {
-                                        let Ok(runtime_mgr) = push_state.session_runtimes.lock()
-                                        else {
-                                            continue;
-                                        };
-                                        let Some(runtime) =
-                                            runtime_mgr.runtimes.get(&SessionId(session_id))
-                                        else {
-                                            continue;
-                                        };
-                                        // Only read output for panes in
-                                        // sessions this client is attached to.
-                                        if !runtime.attached_clients.contains(&push_client_id) {
-                                            continue;
-                                        }
-                                        let Some(pane) = runtime.panes.get(&pane_id) else {
-                                            continue;
-                                        };
-                                        pane.output_dirty
-                                            .store(false, std::sync::atomic::Ordering::SeqCst);
-                                        let Ok(mut buf) = pane.output_buffer.lock() else {
-                                            continue;
-                                        };
-                                        let read = buf.read_for_client(
+                                    let Some((read, sync_update_active)) =
+                                        session_runtime_handle().0.read_pane_output_for_push(
+                                            SessionId(session_id),
+                                            pane_id,
                                             push_client_id,
                                             RESPONSE_OUTPUT_BUDGET,
-                                        );
-                                        let sync_update_active =
-                                            pane.sync_update_in_progress.load(Ordering::SeqCst);
-                                        (read, sync_update_active)
+                                        )
+                                    else {
+                                        continue;
                                     };
-                                    let Some(pane_output_event) = pane_output_event_from_read(
+                                    let Some(pane_output_event) = pane_output_event_from_push_read(
                                         session_id,
                                         pane_id,
                                         read,
@@ -5287,23 +5129,10 @@ fn lag_recovery_attach_view_events_for_client(
     state: &Arc<ServerState>,
     client_id: ClientId,
 ) -> Vec<Event> {
-    let revisions = {
-        let Ok(mut runtime_manager) = state.session_runtimes.lock() else {
-            return Vec::new();
-        };
-
-        runtime_manager
-            .runtimes
-            .iter_mut()
-            .filter_map(|(session_id, runtime)| {
-                if !runtime.attached_clients.contains(&client_id) {
-                    return None;
-                }
-                runtime.attach_view_revision = runtime.attach_view_revision.saturating_add(1);
-                Some((*session_id, runtime.attach_view_revision))
-            })
-            .collect::<Vec<_>>()
-    };
+    let _ = state;
+    let revisions = session_runtime_handle()
+        .0
+        .lag_recovery_bump_attach_view_for_client(client_id);
 
     if revisions.is_empty() {
         return Vec::new();
@@ -5347,10 +5176,8 @@ fn emit_attach_view_changed(
         return Ok(());
     }
     let revision = {
-        let Some(revision) = state
-            .session_runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?
+        let Some(revision) = session_runtime_handle()
+            .0
             .bump_attach_view_revision(session_id)
         else {
             return Ok(());
@@ -5563,17 +5390,9 @@ fn maybe_flush_snapshot(state: &Arc<ServerState>, force: bool) -> Result<()> {
 }
 
 fn reap_exited_pane(state: &Arc<ServerState>, session_id: SessionId, pane_id: Uuid) -> Result<()> {
-    let state_reason = {
-        let runtime_manager = state
-            .session_runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-        runtime_manager
-            .runtimes
-            .get(&session_id)
-            .and_then(|session| session.panes.get(&pane_id))
-            .and_then(pane_state_reason_for_handle)
-    };
+    let state_reason = session_runtime_handle()
+        .0
+        .pane_state_reason(session_id, pane_id);
     emit_event(
         state,
         Event::PaneExited {
@@ -5616,43 +5435,35 @@ async fn process_pane_exit_events(state: Arc<ServerState>, mut shutdown_rx: watc
     }
 }
 
+#[allow(
+    clippy::unused_async,
+    reason = "Keeps signature async to match other IPC-handler helpers; may re-acquire lock contention resolution asynchronously in future."
+)]
 async fn ensure_attach_session_exists(
     state: &Arc<ServerState>,
     session_id: SessionId,
 ) -> Result<bool> {
     let exists = session_handle().0.contains(session_id);
+    let handle = session_runtime_handle();
 
     if exists {
-        let mut runtime_manager = state
-            .session_runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-        if !runtime_manager.runtimes.contains_key(&session_id) {
-            runtime_manager.start_runtime(session_id).with_context(|| {
+        if !handle.0.session_exists(session_id) {
+            handle.0.start_runtime(session_id).with_context(|| {
                 format!(
                     "failed starting missing session runtime for existing session {}",
                     session_id.0
                 )
             })?;
         }
-        drop(runtime_manager);
         return Ok(true);
     }
 
-    let removed_runtime = {
-        let mut runtime_manager = state
-            .session_runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-        runtime_manager.remove_runtime(session_id).ok()
-    };
-    if let Some(removed_runtime) = removed_runtime {
-        shutdown_runtime_handle(removed_runtime).await;
+    if let Some(removed_runtime) = handle.0.remove_runtime(session_id) {
+        shutdown_runtime_info(removed_runtime);
     }
 
     let removed_context_ids = prune_context_mappings_for_session(state, session_id)?;
-    let _ = removed_context_ids; // Catalog-changed event is now fired by the
-    // control-catalog plugin in response to ContextEvent emissions.
+    let _ = removed_context_ids;
 
     Ok(false)
 }
@@ -5837,7 +5648,7 @@ async fn handle_request(
             }
         }
         Request::NewSession { name } => {
-            let session_id = match create_session_runtime(state, name.clone()) {
+            let session_id = match create_session_runtime(name.clone()) {
                 Ok(session_id) => session_id,
                 Err(error) => {
                     let message = error.to_string();
@@ -5863,17 +5674,10 @@ async fn handle_request(
             };
 
             if let Err(message) = context_bind_result {
-                let removed_runtime = {
-                    let _ = session_handle().0.remove_session(session_id);
-
-                    let mut runtime_manager = state
-                        .session_runtimes
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                    runtime_manager.remove_runtime(session_id).ok()
-                };
-                if let Some(removed_runtime) = removed_runtime {
-                    shutdown_runtime_handle(removed_runtime).await;
+                let _ = session_handle().0.remove_session(session_id);
+                if let Some(removed_runtime) = session_runtime_handle().0.remove_runtime(session_id)
+                {
+                    shutdown_runtime_info(removed_runtime);
                 }
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::Internal,
@@ -5898,11 +5702,7 @@ async fn handle_request(
             };
             drop(manager);
 
-            let pane_result = state
-                .session_runtimes
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?
-                .list_panes(session_id);
+            let pane_result = session_runtime_handle().0.list_panes(session_id);
             let panes = match pane_result {
                 Ok(panes) => panes,
                 Err(error) => {
@@ -5943,11 +5743,10 @@ async fn handle_request(
             {
                 return Ok(Response::Err(response));
             }
-            let mut runtime_manager = state
-                .session_runtimes
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-            let pane_id = match runtime_manager.split_pane(session_id, target, direction) {
+            let pane_id = match session_runtime_handle()
+                .0
+                .split_pane(session_id, target, direction)
+            {
                 Ok(id) => id,
                 Err(error) => {
                     return Ok(Response::Err(ErrorResponse {
@@ -5956,7 +5755,6 @@ async fn handle_request(
                     }));
                 }
             };
-            drop(runtime_manager);
             emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneSplit {
                 id: pane_id,
@@ -5993,21 +5791,18 @@ async fn handle_request(
             {
                 return Ok(Response::Err(response));
             }
-            let mut runtime_manager = state
-                .session_runtimes
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-            let pane_id =
-                match runtime_manager.launch_pane(session_id, target, direction, name, command) {
-                    Ok(id) => id,
-                    Err(error) => {
-                        return Ok(Response::Err(ErrorResponse {
-                            code: ErrorCode::Internal,
-                            message: format!("failed launching pane: {error:#}"),
-                        }));
-                    }
-                };
-            drop(runtime_manager);
+            let pane_id = match session_runtime_handle()
+                .0
+                .launch_pane(session_id, target, direction, name, command)
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!("failed launching pane: {error:#}"),
+                    }));
+                }
+            };
             emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneLaunched {
                 id: pane_id,
@@ -6042,10 +5837,7 @@ async fn handle_request(
             {
                 return Ok(Response::Err(response));
             }
-            let mut runtime_manager = state
-                .session_runtimes
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            let handle = session_runtime_handle();
             let pane_id = match (target, direction) {
                 (Some(_), Some(_)) => {
                     return Ok(Response::Err(ErrorResponse {
@@ -6053,11 +5845,11 @@ async fn handle_request(
                         message: "focus-pane cannot use target and direction together".to_string(),
                     }));
                 }
-                (Some(target), None) => runtime_manager.focus_pane_target(session_id, &target),
-                (None, Some(direction)) => runtime_manager.focus_pane(session_id, direction),
-                (None, None) => {
-                    runtime_manager.focus_pane_target(session_id, &PaneSelector::Active)
-                }
+                (Some(target), None) => handle.0.focus_pane_target(session_id, &target),
+                (None, Some(direction)) => handle.0.focus_pane(session_id, direction),
+                (None, None) => handle
+                    .0
+                    .focus_pane_target(session_id, &PaneSelector::Active),
             };
             let pane_id = match pane_id {
                 Ok(id) => id,
@@ -6068,7 +5860,6 @@ async fn handle_request(
                     }));
                 }
             };
-            drop(runtime_manager);
             emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneFocused {
                 id: pane_id,
@@ -6103,17 +5894,15 @@ async fn handle_request(
             {
                 return Ok(Response::Err(response));
             }
-            let mut runtime_manager = state
-                .session_runtimes
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-            if let Err(error) = runtime_manager.resize_pane(session_id, target, delta) {
+            if let Err(error) = session_runtime_handle()
+                .0
+                .resize_pane(session_id, target, delta)
+            {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("failed resizing pane: {error:#}"),
                 }));
             }
-            drop(runtime_manager);
             emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneResized {
                 session_id: session_id.0,
@@ -6144,10 +5933,8 @@ async fn handle_request(
                 return Ok(Response::Err(response));
             }
 
-            let (closed_pane_id, removed_session) = state
-                .session_runtimes
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?
+            let (closed_pane_id, removed_session) = session_runtime_handle()
+                .0
                 .close_pane(session_id, target)
                 .map_err(|error| anyhow::anyhow!("failed closing pane: {error:#}"))?;
 
@@ -6155,7 +5942,7 @@ async fn handle_request(
             if let Some(removed_session) = removed_session {
                 session_closed = true;
                 let removed_session_id = removed_session.session_id;
-                if removed_session.had_attached_clients {
+                if !removed_session.attached_clients.is_empty() {
                     emit_event(
                         state,
                         Event::ClientDetached {
@@ -6163,7 +5950,7 @@ async fn handle_request(
                         },
                     )?;
                 }
-                shutdown_runtime_handle(removed_session).await;
+                shutdown_runtime_info(removed_session);
                 let _ = session_handle().0.remove_session(removed_session_id);
                 let _ = prune_context_mappings_for_session(state, removed_session_id)?;
                 if *selected_session == Some(removed_session_id) {
@@ -6224,15 +6011,10 @@ async fn handle_request(
                 return Ok(Response::Err(response));
             }
 
-            let pane_id = {
-                let mut runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager
-                    .restart_pane(session_id, target)
-                    .map_err(|error| anyhow::anyhow!("failed restarting pane: {error:#}"))?
-            };
+            let pane_id = session_runtime_handle()
+                .0
+                .restart_pane(session_id, target)
+                .map_err(|error| anyhow::anyhow!("failed restarting pane: {error:#}"))?;
 
             emit_event(
                 state,
@@ -6271,11 +6053,7 @@ async fn handle_request(
             {
                 return Ok(Response::Err(response));
             }
-            let mut runtime_manager = state
-                .session_runtimes
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-            let (pane_id, zoomed) = match runtime_manager.toggle_zoom(session_id) {
+            let (pane_id, zoomed) = match session_runtime_handle().0.toggle_zoom(session_id) {
                 Ok(result) => result,
                 Err(error) => {
                     return Ok(Response::Err(ErrorResponse {
@@ -6284,7 +6062,6 @@ async fn handle_request(
                     }));
                 }
             };
-            drop(runtime_manager);
             emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneZoomed {
                 session_id: session_id.0,
@@ -6359,25 +6136,24 @@ async fn handle_request(
                     *attached_stream_session = None;
                 }
 
-                let mut runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                match runtime_manager.remove_runtime(session_id) {
-                    Ok(removed) => removed,
-                    Err(error) => {
+                match session_runtime_handle().0.remove_runtime(session_id) {
+                    Some(removed) => removed,
+                    None => {
                         return Ok(Response::Err(ErrorResponse {
                             code: ErrorCode::Internal,
-                            message: format!("failed stopping session runtime: {error:#}"),
+                            message: format!(
+                                "failed stopping session runtime: session {} not found",
+                                session_id.0
+                            ),
                         }));
                     }
                 }
             };
 
-            if removed_runtime.had_attached_clients {
+            if !removed_runtime.attached_clients.is_empty() {
                 emit_event(state, Event::ClientDetached { id: session_id.0 })?;
             }
-            shutdown_runtime_handle(removed_runtime).await;
+            shutdown_runtime_info(removed_runtime);
 
             let mut attach_tokens = state
                 .attach_tokens
@@ -6519,13 +6295,11 @@ async fn handle_request(
                     let can_write = true;
 
                     let begin_result = {
-                        let mut runtime_manager = state.session_runtimes.lock().map_err(|_| {
-                            anyhow::anyhow!("session runtime manager lock poisoned")
-                        })?;
+                        let handle = session_runtime_handle();
                         if let Some(previous_stream_session) = *attached_stream_session
                             && previous_stream_session != session_id
                         {
-                            runtime_manager.end_attach(previous_stream_session, client_id);
+                            handle.0.end_attach(previous_stream_session, client_id);
                             emit_event(
                                 state,
                                 Event::ClientDetached {
@@ -6533,26 +6307,28 @@ async fn handle_request(
                                 },
                             )?;
                         }
-                        match runtime_manager.begin_attach(session_id, client_id) {
+                        match handle.0.begin_attach(session_id, client_id) {
                             Ok(()) => Ok(()),
                             Err(SessionRuntimeError::NotFound) => {
-                                if let Err(error) = runtime_manager.start_runtime(session_id) {
+                                if let Err(error) = handle.0.start_runtime(session_id) {
                                     warn!(
                                         "failed restarting missing session runtime {} before attach-open: {error:#}",
                                         session_id.0
                                     );
                                 }
-                                runtime_manager.begin_attach(session_id, client_id)
+                                handle.0.begin_attach(session_id, client_id)
                             }
                             Err(SessionRuntimeError::Closed) => {
-                                let _ = runtime_manager.remove_runtime(session_id);
-                                if let Err(error) = runtime_manager.start_runtime(session_id) {
+                                if let Some(removed) = handle.0.remove_runtime(session_id) {
+                                    shutdown_runtime_info(removed);
+                                }
+                                if let Err(error) = handle.0.start_runtime(session_id) {
                                     warn!(
                                         "failed restarting closed session runtime {} before attach-open: {error:#}",
                                         session_id.0
                                     );
                                 }
-                                runtime_manager.begin_attach(session_id, client_id)
+                                handle.0.begin_attach(session_id, client_id)
                             }
                             Err(error) => Err(error),
                         }
@@ -6615,13 +6391,9 @@ async fn handle_request(
                 return Ok(Response::Err(response));
             }
             let captured_input = data.clone();
-            let write_result = {
-                let mut runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.write_input(session_id, client_id, data)
-            };
+            let write_result = session_runtime_handle()
+                .0
+                .write_input(session_id, client_id, data);
             match write_result {
                 Ok((bytes, focused_pane_id)) => {
                     if captured_input
@@ -6674,22 +6446,16 @@ async fn handle_request(
                 }));
             }
 
-            let update_result = {
-                let mut runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.set_attach_viewport(
-                    session_id,
-                    client_id,
-                    cols,
-                    rows,
-                    status_top_inset,
-                    status_bottom_inset,
-                    cell_pixel_width,
-                    cell_pixel_height,
-                )
-            };
+            let update_result = session_runtime_handle().0.set_attach_viewport(
+                session_id,
+                client_id,
+                cols,
+                rows,
+                status_top_inset,
+                status_bottom_inset,
+                cell_pixel_width,
+                cell_pixel_height,
+            );
 
             match update_result {
                 Ok((cols, rows, status_top_inset, status_bottom_inset)) => {
@@ -6727,13 +6493,9 @@ async fn handle_request(
                     message: format!("session runtime not found: {}", session_id.0),
                 }));
             }
-            let read_result = {
-                let mut runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.read_output(session_id, client_id, max_bytes)
-            };
+            let read_result = session_runtime_handle()
+                .0
+                .read_output(session_id, client_id, max_bytes);
             match read_result {
                 Ok(data) => Response::Ok(ResponsePayload::AttachOutput { data }),
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
@@ -6758,13 +6520,9 @@ async fn handle_request(
                     message: format!("session runtime not found: {}", session_id.0),
                 }));
             }
-            let state_snapshot = {
-                let runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.attach_layout_state(session_id, client_id)
-            };
+            let state_snapshot = session_runtime_handle()
+                .0
+                .attach_layout_state(session_id, client_id);
             match state_snapshot {
                 Ok(snapshot) => Response::Ok(ResponsePayload::AttachLayout {
                     context_id: current_context_id_for_client(state, client_id),
@@ -6801,18 +6559,16 @@ async fn handle_request(
                 }));
             }
 
-            let snapshot = {
-                let mut runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.attach_snapshot_state(session_id, client_id, max_bytes_per_pane)
-            };
+            let snapshot = session_runtime_handle().0.attach_snapshot_state(
+                session_id,
+                client_id,
+                max_bytes_per_pane,
+            );
 
             match snapshot {
                 Ok(snapshot) => Response::Ok(ResponsePayload::AttachSnapshot {
                     context_id: current_context_id_for_client(state, client_id),
-                    session_id: snapshot.session_id.0,
+                    session_id: session_id.0,
                     focused_pane_id: snapshot.focused_pane_id,
                     panes: snapshot.panes,
                     layout_root: snapshot.layout_root,
@@ -6849,18 +6605,12 @@ async fn handle_request(
                 }));
             }
 
-            let pane_snapshot = {
-                let mut runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.attach_pane_snapshot_state(
-                    session_id,
-                    client_id,
-                    &pane_ids,
-                    max_bytes_per_pane,
-                )
-            };
+            let pane_snapshot = session_runtime_handle().0.attach_pane_snapshot_state(
+                session_id,
+                client_id,
+                &pane_ids,
+                max_bytes_per_pane,
+            );
 
             match pane_snapshot {
                 Ok(snapshot) => Response::Ok(ResponsePayload::AttachPaneSnapshot {
@@ -6894,35 +6644,11 @@ async fn handle_request(
                     message: format!("session runtime not found: {}", session_id.0),
                 }));
             }
-            let (chunks, output_still_pending) = {
-                let mut runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                // Clear output_dirty flags for requested panes so the PTY reader
-                // can re-notify on the next chunk of output.
-                if let Some(runtime) = runtime_manager.runtimes.get(&session_id) {
-                    for pane_id in &pane_ids {
-                        if let Some(pane) = runtime.panes.get(pane_id) {
-                            pane.output_dirty.store(false, Ordering::SeqCst);
-                        }
-                    }
-                }
-                let chunks = runtime_manager
-                    .read_pane_output_batch(session_id, client_id, &pane_ids, max_bytes);
-                // Re-check output_dirty: if the PTY reader pushed new data
-                // between the clear above and this check, the client should
-                // keep draining instead of proceeding to render.
-                let still_pending = runtime_manager.runtimes.get(&session_id).is_some_and(|rt| {
-                    pane_ids.iter().any(|pane_id| {
-                        rt.panes
-                            .get(pane_id)
-                            .is_some_and(|p| p.output_dirty.load(Ordering::SeqCst))
-                    })
-                });
-                drop(runtime_manager);
-                (chunks, still_pending)
-            };
+            let (chunks, output_still_pending) = session_runtime_handle()
+                .0
+                .attach_pane_output_batch_with_dirty_check(
+                    session_id, client_id, &pane_ids, max_bytes,
+                );
             match chunks {
                 Ok(chunks) => Response::Ok(ResponsePayload::AttachPaneOutputBatch {
                     chunks,
@@ -6954,47 +6680,20 @@ async fn handle_request(
                     message: format!("session runtime not found: {}", session_id.0),
                 }));
             }
-            let deltas = {
-                let runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                let mut result = Vec::new();
-                if let Some(runtime) = runtime_manager.runtimes.get(&session_id) {
-                    // Clear image_dirty flags so the PTY reader can re-notify
-                    // on the next image change (mirrors output_dirty pattern).
-                    for pane_id in &pane_ids {
-                        if let Some(pane) = runtime.panes.get(pane_id) {
-                            #[cfg(feature = "image-registry")]
-                            pane.image_dirty.store(false, Ordering::SeqCst);
-                            #[cfg(not(feature = "image-registry"))]
-                            let _ = pane;
-                        }
-                    }
-                    for (i, pane_id) in pane_ids.iter().enumerate() {
-                        let since = since_sequences.get(i).copied().unwrap_or(0);
-                        if let Some(pane) = runtime.panes.get(pane_id) {
-                            #[cfg(feature = "image-registry")]
-                            if let Ok(reg) = pane.image_registry.lock() {
-                                let delta = reg.delta_since(since);
-                                result.push(delta.to_ipc(*pane_id, state.payload_codec.as_deref()));
-                            }
-                            #[cfg(not(feature = "image-registry"))]
-                            {
-                                let _ = (pane, since);
-                                result.push(bmux_ipc::AttachPaneImageDelta {
-                                    pane_id: *pane_id,
-                                    added: Vec::new(),
-                                    removed: Vec::new(),
-                                    sequence: 0,
-                                });
-                            }
-                        }
-                    }
-                }
-                drop(runtime_manager);
-                result
-            };
+            #[cfg(feature = "image-registry")]
+            let deltas = session_runtime_handle().0.attach_pane_image_deltas(
+                session_id,
+                &pane_ids,
+                &since_sequences,
+                state.payload_codec.as_deref(),
+            );
+            #[cfg(not(feature = "image-registry"))]
+            let deltas = session_runtime_handle().0.attach_pane_image_deltas(
+                session_id,
+                &pane_ids,
+                &since_sequences,
+                None,
+            );
             Response::Ok(ResponsePayload::AttachPaneImages { deltas })
         }
         Request::SetClientAttachPolicy { allow_detach } => {
@@ -7018,10 +6717,8 @@ async fn handle_request(
             drop(manager);
 
             if let Some(current_stream_session) = attached_stream_session.take() {
-                state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?
+                session_runtime_handle()
+                    .0
                     .end_attach(current_stream_session, client_id);
                 emit_event(
                     state,
@@ -7085,13 +6782,9 @@ async fn handle_request(
                 return Ok(Response::Err(response));
             }
             let captured_input = data.clone();
-            let write_result = {
-                let mut runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.write_input_to_pane(session_id, pane_id, data)
-            };
+            let write_result = session_runtime_handle()
+                .0
+                .write_input_to_pane(session_id, pane_id, data);
             match write_result {
                 Ok(bytes) => {
                     if captured_input
@@ -7478,12 +7171,9 @@ fn detach_client_state_on_disconnect(
     }
 
     if let Some(stream_session_id) = previous_stream {
-        let mut runtime_manager = state
-            .session_runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-        runtime_manager.end_attach(stream_session_id, client_id);
-        drop(runtime_manager);
+        session_runtime_handle()
+            .0
+            .end_attach(stream_session_id, client_id);
 
         emit_event(
             state,
@@ -8159,6 +7849,620 @@ fn record_to_all_runtimes(kind: RecordingEventKind, payload: RecordingPayload, m
     guard.0.record(kind, payload, meta);
 }
 
+// ── `ServerSessionRuntimeAdapter` ────────────────────────────────
+//
+// Inline adapter implementing `SessionRuntimeManagerApi` over the
+// server's own `Arc<Mutex<SessionRuntimeManager>>`. Registered into
+// the plugin state registry during `BmuxServer::new` so
+// `session_runtime_handle()` lookups reach this single manager
+// instance.
+//
+// Kept in `lib.rs` to access the many private fields/methods of
+// `SessionRuntimeManager`, `SessionRuntimeHandle`, and `PaneRuntimeHandle`
+// without widening their visibility to `pub(crate)`. When the
+// `SessionRuntimeManager` implementation finally relocates into the
+// pane-runtime plugin crate, this adapter and its registration move
+// with it.
+
+struct ServerSessionRuntimeAdapter {
+    inner: Arc<Mutex<SessionRuntimeManager>>,
+}
+
+impl ServerSessionRuntimeAdapter {
+    const fn new(inner: Arc<Mutex<SessionRuntimeManager>>) -> Self {
+        Self { inner }
+    }
+
+    fn with_lock<R>(&self, f: impl FnOnce(&mut SessionRuntimeManager) -> R) -> Option<R> {
+        self.inner.lock().ok().map(|mut g| f(&mut g))
+    }
+
+    fn with_lock_read<R>(&self, f: impl FnOnce(&SessionRuntimeManager) -> R) -> Option<R> {
+        self.inner.lock().ok().map(|g| f(&g))
+    }
+
+    fn remove_to_info(
+        session_id: SessionId,
+        handle: SessionRuntimeHandle,
+    ) -> bmux_pane_runtime_state::RemovedRuntimeInfo {
+        let attached = handle.attached_clients.clone();
+        let boxed: Box<dyn std::any::Any + Send + 'static> = Box::new(handle);
+        bmux_pane_runtime_state::RemovedRuntimeInfo {
+            session_id,
+            attached_clients: attached,
+            shutdown_token: Arc::new(Mutex::new(Some(boxed))),
+        }
+    }
+
+    fn lock_poisoned_anyhow() -> anyhow::Error {
+        anyhow::anyhow!("session runtime manager lock poisoned")
+    }
+
+    fn take_shutdown_handle(
+        info: &bmux_pane_runtime_state::RemovedRuntimeInfo,
+    ) -> Option<SessionRuntimeHandle> {
+        let boxed = {
+            let mut guard = info.shutdown_token.lock().ok()?;
+            guard.take()?
+        };
+        boxed.downcast::<SessionRuntimeHandle>().ok().map(|b| *b)
+    }
+}
+
+impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeAdapter {
+    fn start_runtime(&self, session_id: SessionId) -> anyhow::Result<()> {
+        self.with_lock(|m| m.start_runtime(session_id))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn restore_runtime(
+        &self,
+        session_id: SessionId,
+        panes: &[bmux_pane_runtime_state::PaneRuntimeMeta],
+        layout_root: Option<bmux_pane_runtime_state::PaneLayoutNode>,
+        focused_pane_id: Uuid,
+        floating_surfaces: Vec<bmux_pane_runtime_state::FloatingSurfaceRuntime>,
+    ) -> anyhow::Result<()> {
+        self.with_lock(|m| {
+            m.restore_runtime(
+                session_id,
+                panes,
+                layout_root,
+                focused_pane_id,
+                floating_surfaces,
+            )
+        })
+        .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn remove_runtime(
+        &self,
+        session_id: SessionId,
+    ) -> Option<bmux_pane_runtime_state::RemovedRuntimeInfo> {
+        let removed = self
+            .with_lock(|m| m.remove_runtime(session_id).ok())
+            .flatten()?;
+        Some(Self::remove_to_info(removed.session_id, removed.handle))
+    }
+
+    fn remove_all_runtimes(&self) -> Vec<bmux_pane_runtime_state::RemovedRuntimeInfo> {
+        let Some(removed) = self.with_lock(SessionRuntimeManager::remove_all_runtimes) else {
+            return Vec::new();
+        };
+        removed
+            .into_iter()
+            .map(|r| Self::remove_to_info(r.session_id, r.handle))
+            .collect()
+    }
+
+    fn session_exists(&self, session_id: SessionId) -> bool {
+        self.with_lock_read(|m| m.runtimes.contains_key(&session_id))
+            .unwrap_or(false)
+    }
+
+    fn split_pane(
+        &self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        direction: PaneSplitDirection,
+    ) -> anyhow::Result<Uuid> {
+        self.with_lock(|m| m.split_pane(session_id, target, direction))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn launch_pane(
+        &self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        direction: PaneSplitDirection,
+        name: Option<String>,
+        command: PaneLaunchCommand,
+    ) -> anyhow::Result<Uuid> {
+        self.with_lock(|m| m.launch_pane(session_id, target, direction, name, command))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn focus_pane(
+        &self,
+        session_id: SessionId,
+        direction: PaneFocusDirection,
+    ) -> anyhow::Result<Uuid> {
+        self.with_lock(|m| m.focus_pane(session_id, direction))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn focus_pane_target(
+        &self,
+        session_id: SessionId,
+        target: &PaneSelector,
+    ) -> anyhow::Result<Uuid> {
+        self.with_lock(|m| m.focus_pane_target(session_id, target))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn resize_pane(
+        &self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        delta: i16,
+    ) -> anyhow::Result<()> {
+        self.with_lock(|m| m.resize_pane(session_id, target, delta))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn close_pane(
+        &self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+    ) -> anyhow::Result<(Uuid, Option<bmux_pane_runtime_state::RemovedRuntimeInfo>)> {
+        let (pane_id, removed) = self
+            .with_lock(|m| m.close_pane(session_id, target))
+            .ok_or_else(Self::lock_poisoned_anyhow)??;
+        let info = removed.map(|r| Self::remove_to_info(r.session_id, r.handle));
+        Ok((pane_id, info))
+    }
+
+    fn restart_pane(
+        &self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+    ) -> anyhow::Result<Uuid> {
+        self.with_lock(|m| m.restart_pane(session_id, target))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn toggle_zoom(&self, session_id: SessionId) -> anyhow::Result<(Uuid, bool)> {
+        self.with_lock(|m| m.toggle_zoom(session_id))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn list_panes(&self, session_id: SessionId) -> anyhow::Result<Vec<PaneSummary>> {
+        self.with_lock_read(|m| m.list_panes(session_id))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn write_input(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        data: Vec<u8>,
+    ) -> Result<(usize, Uuid), SessionRuntimeError> {
+        self.with_lock(|m| m.write_input(session_id, client_id, data))
+            .unwrap_or(Err(SessionRuntimeError::Closed))
+    }
+
+    fn write_input_to_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        data: Vec<u8>,
+    ) -> Result<usize, SessionRuntimeError> {
+        self.with_lock(|m| m.write_input_to_pane(session_id, pane_id, data))
+            .unwrap_or(Err(SessionRuntimeError::Closed))
+    }
+
+    fn read_output(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, SessionRuntimeError> {
+        self.with_lock(|m| m.read_output(session_id, client_id, max_bytes))
+            .unwrap_or(Err(SessionRuntimeError::Closed))
+    }
+
+    fn read_pane_output_batch(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_ids: &[Uuid],
+        max_bytes: usize,
+    ) -> Result<Vec<AttachPaneChunk>, SessionRuntimeError> {
+        self.with_lock(|m| m.read_pane_output_batch(session_id, client_id, pane_ids, max_bytes))
+            .unwrap_or(Err(SessionRuntimeError::Closed))
+    }
+
+    fn attach_pane_output_batch_with_dirty_check(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_ids: &[Uuid],
+        max_bytes: usize,
+    ) -> (Result<Vec<AttachPaneChunk>, SessionRuntimeError>, bool) {
+        self.with_lock(|m| {
+            if let Some(runtime) = m.runtimes.get(&session_id) {
+                for pane_id in pane_ids {
+                    if let Some(pane) = runtime.panes.get(pane_id) {
+                        pane.output_dirty.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+            let chunks = m.read_pane_output_batch(session_id, client_id, pane_ids, max_bytes);
+            let still_pending = m.runtimes.get(&session_id).is_some_and(|rt| {
+                pane_ids.iter().any(|pane_id| {
+                    rt.panes
+                        .get(pane_id)
+                        .is_some_and(|p| p.output_dirty.load(Ordering::SeqCst))
+                })
+            });
+            (chunks, still_pending)
+        })
+        .unwrap_or((Err(SessionRuntimeError::Closed), false))
+    }
+
+    fn attach_pane_image_deltas(
+        &self,
+        session_id: SessionId,
+        pane_ids: &[Uuid],
+        since_sequences: &[u64],
+        payload_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
+    ) -> Vec<bmux_ipc::AttachPaneImageDelta> {
+        self.with_lock_read(|m| {
+            let mut result = Vec::new();
+            let Some(runtime) = m.runtimes.get(&session_id) else {
+                return result;
+            };
+            for pane_id in pane_ids {
+                if let Some(pane) = runtime.panes.get(pane_id) {
+                    #[cfg(feature = "image-registry")]
+                    pane.image_dirty.store(false, Ordering::SeqCst);
+                    #[cfg(not(feature = "image-registry"))]
+                    let _ = pane;
+                }
+            }
+            for (i, pane_id) in pane_ids.iter().enumerate() {
+                let since = since_sequences.get(i).copied().unwrap_or(0);
+                if let Some(pane) = runtime.panes.get(pane_id) {
+                    #[cfg(feature = "image-registry")]
+                    if let Ok(reg) = pane.image_registry.lock() {
+                        let delta = reg.delta_since(since);
+                        result.push(delta.to_ipc(*pane_id, payload_codec));
+                    }
+                    #[cfg(not(feature = "image-registry"))]
+                    {
+                        let _ = (pane, since, payload_codec);
+                        result.push(bmux_ipc::AttachPaneImageDelta {
+                            pane_id: *pane_id,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            sequence: 0,
+                        });
+                    }
+                }
+            }
+            result
+        })
+        .unwrap_or_default()
+    }
+
+    fn begin_attach(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<(), SessionRuntimeError> {
+        self.with_lock(|m| m.begin_attach(session_id, client_id))
+            .unwrap_or(Err(SessionRuntimeError::Closed))
+    }
+
+    fn end_attach(&self, session_id: SessionId, client_id: ClientId) {
+        let _ = self.with_lock(|m| m.end_attach(session_id, client_id));
+    }
+
+    fn set_attach_viewport(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+        cell_pixel_width: u16,
+        cell_pixel_height: u16,
+    ) -> Result<(u16, u16, u16, u16), SessionRuntimeError> {
+        self.with_lock(|m| {
+            m.set_attach_viewport(
+                session_id,
+                client_id,
+                cols,
+                rows,
+                status_top_inset,
+                status_bottom_inset,
+                cell_pixel_width,
+                cell_pixel_height,
+            )
+        })
+        .unwrap_or(Err(SessionRuntimeError::Closed))
+    }
+
+    fn apply_stored_attach_viewport(&self, session_id: SessionId) {
+        let _ = self.with_lock(|m| m.apply_stored_attach_viewport(session_id));
+    }
+
+    fn attach_layout_state(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<bmux_pane_runtime_state::AttachLayoutState, SessionRuntimeError> {
+        let inner = self
+            .with_lock(|m| m.attach_layout_state(session_id, client_id))
+            .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        Ok(bmux_pane_runtime_state::AttachLayoutState {
+            focused_pane_id: inner.focused_pane_id,
+            panes: inner.panes,
+            layout_root: inner.layout_root,
+            scene: inner.scene,
+            zoomed: inner.zoomed,
+        })
+    }
+
+    fn attach_snapshot_state(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        max_bytes_per_pane: usize,
+    ) -> Result<bmux_pane_runtime_state::AttachSnapshotState, SessionRuntimeError> {
+        let inner = self
+            .with_lock(|m| m.attach_snapshot_state(session_id, client_id, max_bytes_per_pane))
+            .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        Ok(bmux_pane_runtime_state::AttachSnapshotState {
+            focused_pane_id: inner.focused_pane_id,
+            panes: inner.panes,
+            layout_root: inner.layout_root,
+            scene: inner.scene,
+            zoomed: inner.zoomed,
+            chunks: inner.chunks,
+            pane_mouse_protocols: inner.pane_mouse_protocols,
+            pane_input_modes: inner.pane_input_modes,
+        })
+    }
+
+    fn attach_pane_snapshot_state(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_ids: &[Uuid],
+        max_bytes_per_pane: usize,
+    ) -> Result<bmux_pane_runtime_state::AttachPaneSnapshotState, SessionRuntimeError> {
+        let inner = self
+            .with_lock(|m| {
+                m.attach_pane_snapshot_state(session_id, client_id, pane_ids, max_bytes_per_pane)
+            })
+            .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        Ok(bmux_pane_runtime_state::AttachPaneSnapshotState {
+            chunks: inner.chunks,
+            pane_mouse_protocols: inner.pane_mouse_protocols,
+            pane_input_modes: inner.pane_input_modes,
+        })
+    }
+
+    fn pane_state(&self, session_id: SessionId, pane_id: Uuid) -> Option<PaneState> {
+        self.with_lock_read(|m| {
+            m.runtimes
+                .get(&session_id)
+                .and_then(|r| r.panes.get(&pane_id))
+                .map(pane_state_for_handle)
+        })
+        .flatten()
+    }
+
+    fn pane_state_reason(&self, session_id: SessionId, pane_id: Uuid) -> Option<String> {
+        self.with_lock_read(|m| {
+            m.runtimes
+                .get(&session_id)
+                .and_then(|r| r.panes.get(&pane_id))
+                .and_then(pane_state_reason_for_handle)
+        })
+        .flatten()
+    }
+
+    fn clear_output_dirty(&self, session_id: SessionId, pane_id: Uuid) {
+        let _ = self.with_lock_read(|m| {
+            if let Some(r) = m.runtimes.get(&session_id)
+                && let Some(p) = r.panes.get(&pane_id)
+            {
+                p.output_dirty.store(false, Ordering::SeqCst);
+            }
+        });
+    }
+
+    fn clear_image_dirty(&self, session_id: SessionId, pane_id: Uuid) {
+        #[cfg(feature = "image-registry")]
+        {
+            let _ = self.with_lock_read(|m| {
+                if let Some(r) = m.runtimes.get(&session_id)
+                    && let Some(p) = r.panes.get(&pane_id)
+                {
+                    p.image_dirty.store(false, Ordering::SeqCst);
+                }
+            });
+        }
+        #[cfg(not(feature = "image-registry"))]
+        {
+            let _ = (session_id, pane_id);
+        }
+    }
+
+    fn client_is_attached(&self, session_id: SessionId, client_id: ClientId) -> bool {
+        self.with_lock_read(|m| {
+            m.runtimes
+                .get(&session_id)
+                .is_some_and(|r| r.attached_clients.contains(&client_id))
+        })
+        .unwrap_or(false)
+    }
+
+    fn pane_output_has_pending(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        _client_id: ClientId,
+    ) -> bool {
+        self.with_lock_read(|m| {
+            m.runtimes
+                .get(&session_id)
+                .and_then(|r| r.panes.get(&pane_id))
+                .is_some_and(|p| p.output_dirty.load(Ordering::SeqCst))
+        })
+        .unwrap_or(false)
+    }
+
+    fn session_has_stored_viewport(&self, session_id: SessionId) -> bool {
+        self.with_lock_read(|m| {
+            m.runtimes
+                .get(&session_id)
+                .is_some_and(|r| r.attach_viewport.is_some())
+        })
+        .unwrap_or(false)
+    }
+
+    fn snapshot_session_runtime(
+        &self,
+        session_id: SessionId,
+    ) -> Option<bmux_pane_runtime_state::SessionRuntimeSnapshot> {
+        self.with_lock_read(|m| {
+            let runtime = m.runtimes.get(&session_id)?;
+            let panes = runtime
+                .panes
+                .values()
+                .map(|p| p.meta.clone())
+                .collect::<Vec<_>>();
+            Some(bmux_pane_runtime_state::SessionRuntimeSnapshot {
+                session_id,
+                panes,
+                focused_pane_id: runtime.focused_pane_id,
+                layout_root: runtime.layout_root.clone(),
+                floating_surfaces: runtime.floating_surfaces.clone(),
+                attached_clients: runtime.attached_clients.clone(),
+                attach_viewport: runtime.attach_viewport,
+            })
+        })
+        .flatten()
+    }
+
+    fn list_session_ids(&self) -> Vec<SessionId> {
+        self.with_lock_read(|m| m.runtimes.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn shutdown_removed_runtime(&self, info: bmux_pane_runtime_state::RemovedRuntimeInfo) {
+        let Some(handle) = Self::take_shutdown_handle(&info) else {
+            return;
+        };
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
+                rt.block_on(shutdown_runtime_handle(RemovedRuntime {
+                    session_id: info.session_id,
+                    handle,
+                }));
+            });
+        } else {
+            drop(handle);
+        }
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Guard must live for the duration of the runtime lookup + pane read; tightening would split it into two locks."
+    )]
+    fn read_pane_output_for_push(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        client_id: ClientId,
+        budget: usize,
+    ) -> Option<(bmux_pane_runtime_state::OutputRead, bool)> {
+        let (inner_read, sync_update_active) = {
+            let guard = self.inner.lock().ok()?;
+            let runtime = guard.runtimes.get(&session_id)?;
+            if !runtime.attached_clients.contains(&client_id) {
+                return None;
+            }
+            let pane = runtime.panes.get(&pane_id)?;
+            pane.output_dirty.store(false, Ordering::SeqCst);
+            let mut buf = pane.output_buffer.lock().ok()?;
+            let inner_read = buf.read_for_client(client_id, budget);
+            let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
+            drop(buf);
+            (inner_read, sync_update_active)
+        };
+        Some((
+            bmux_pane_runtime_state::OutputRead {
+                bytes: inner_read.bytes,
+                stream_start: inner_read.stream_start,
+                stream_end: inner_read.stream_end,
+                stream_gap: inner_read.stream_gap,
+            },
+            sync_update_active,
+        ))
+    }
+
+    fn lag_recovery_bump_attach_view_for_client(
+        &self,
+        client_id: ClientId,
+    ) -> Vec<(SessionId, u64)> {
+        self.with_lock(|m| {
+            m.runtimes
+                .iter_mut()
+                .filter_map(|(session_id, runtime)| {
+                    if !runtime.attached_clients.contains(&client_id) {
+                        return None;
+                    }
+                    runtime.attach_view_revision = runtime.attach_view_revision.saturating_add(1);
+                    Some((*session_id, runtime.attach_view_revision))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn bump_attach_view_revision(&self, session_id: SessionId) -> Option<u64> {
+        self.with_lock(|m| m.bump_attach_view_revision(session_id))
+            .flatten()
+    }
+
+    fn shell_integration_root(&self) -> Option<std::path::PathBuf> {
+        self.with_lock_read(|m| m.shell_integration_root.clone())
+            .flatten()
+    }
+
+    fn test_mark_pane_exited(&self, session_id: SessionId, pane_id: Uuid, reason: String) -> bool {
+        self.with_lock(|m| {
+            let Some(runtime) = m.runtimes.get_mut(&session_id) else {
+                return false;
+            };
+            let Some(pane) = runtime.panes.get_mut(&pane_id) else {
+                return false;
+            };
+            pane.exited.store(true, Ordering::SeqCst);
+            if let Ok(mut slot) = pane.exit_reason.lock() {
+                *slot = Some(reason);
+            }
+            true
+        })
+        .unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::significant_drop_tightening,
@@ -8636,14 +8940,8 @@ mod tests {
         )
     }
 
-    fn shell_integration_root_for_server(server: &BmuxServer) -> Option<PathBuf> {
-        server
-            .state
-            .session_runtimes
-            .lock()
-            .expect("session runtime manager lock should succeed")
-            .shell_integration_root
-            .clone()
+    fn shell_integration_root_for_server(_server: &BmuxServer) -> Option<PathBuf> {
+        session_runtime_handle().0.shell_integration_root()
     }
 
     #[test]
@@ -9386,25 +9684,11 @@ mod tests {
         assert_eq!(panes_before.len(), 2);
         let target_pane_id = panes_before[0].id;
 
-        {
-            let mut runtime_manager = server
-                .state
-                .session_runtimes
-                .lock()
-                .expect("session runtime manager lock should succeed");
-            let runtime = runtime_manager
-                .runtimes
-                .get_mut(&SessionId(session_id))
-                .expect("session runtime should exist");
-            let pane = runtime
-                .panes
-                .get_mut(&target_pane_id)
-                .expect("target pane should exist");
-            pane.exited.store(true, Ordering::SeqCst);
-            if let Ok(mut reason) = pane.exit_reason.lock() {
-                *reason = Some("process exited with status 130".to_string());
-            }
-        }
+        assert!(session_runtime_handle().0.test_mark_pane_exited(
+            SessionId(session_id),
+            target_pane_id,
+            "process exited with status 130".to_string(),
+        ));
 
         reap_exited_pane(&server.state, SessionId(session_id), target_pane_id)
             .expect("reap should succeed");
