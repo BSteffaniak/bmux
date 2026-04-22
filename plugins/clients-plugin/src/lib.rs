@@ -97,6 +97,14 @@ impl FollowStateReader for FollowStateAdapter {
     fn is_connected(&self, client_id: ClientId) -> bool {
         self.with_read(|state| state.connected_clients.contains(&client_id), false)
     }
+
+    fn attached_stream_session(&self, client_id: ClientId) -> Option<SessionId> {
+        self.with_read(|state| state.attached_stream_session(client_id), None)
+    }
+
+    fn attach_detach_allowed(&self, client_id: ClientId) -> bool {
+        self.with_read(|state| state.attach_detach_allowed(client_id), true)
+    }
 }
 
 impl FollowStateWriter for FollowStateAdapter {
@@ -212,6 +220,8 @@ impl FollowStateWriter for FollowStateAdapter {
                     .iter()
                     .map(|(id, entry)| (*id, (*entry).into()))
                     .collect(),
+                attached_stream_sessions: state.attached_stream_sessions.clone(),
+                attach_detach_allowed: state.attach_detach_allowed.clone(),
             },
             FollowStateSnapshot::default(),
         )
@@ -228,7 +238,23 @@ impl FollowStateWriter for FollowStateAdapter {
                     .into_iter()
                     .map(|(id, entry)| (id, entry.into()))
                     .collect();
+                state.attached_stream_sessions = snapshot.attached_stream_sessions;
+                state.attach_detach_allowed = snapshot.attach_detach_allowed;
             },
+            (),
+        );
+    }
+
+    fn set_attached_stream_session(&self, client_id: ClientId, session_id: Option<SessionId>) {
+        self.with_write(
+            |state| state.set_attached_stream_session(client_id, session_id),
+            (),
+        );
+    }
+
+    fn set_attach_detach_allowed(&self, client_id: ClientId, allowed: bool) {
+        self.with_write(
+            |state| state.set_attach_detach_allowed(client_id, allowed),
             (),
         );
     }

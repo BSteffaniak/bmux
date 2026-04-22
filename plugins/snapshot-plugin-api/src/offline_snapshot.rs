@@ -745,6 +745,8 @@ mod tests {
                 m
             },
             follows: BTreeMap::new(),
+            attached_stream_sessions: BTreeMap::new(),
+            attach_detach_allowed: BTreeMap::new(),
         };
         let follow_bytes = serde_json::to_vec(&follow_snapshot).unwrap();
         let follow_section = SectionV1 {

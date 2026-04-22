@@ -78,7 +78,7 @@ pub struct BmuxServer {
 
 struct ServerState {
     session_runtimes: Arc<Mutex<SessionRuntimeManager>>,
-    attach_tokens: Mutex<AttachTokenManager>,
+    attach_tokens: Arc<Mutex<AttachTokenManager>>,
     performance_settings: PerformanceSettingsStore,
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
@@ -331,6 +331,78 @@ impl AttachTokenManager {
     fn prune_expired(&mut self) {
         let now = Instant::now();
         self.tokens.retain(|_, entry| entry.expires_at > now);
+    }
+}
+
+/// Adapter wrapping `Arc<Mutex<AttachTokenManager>>` and implementing
+/// the domain-agnostic [`bmux_attach_token_state::AttachTokenManagerWriter`]
+/// trait. Registered during `BmuxServer::new` so plugins reach the
+/// attach-token manager through [`AttachTokenManagerHandle`] rather
+/// than naming this concrete type.
+struct ServerAttachTokenAdapter {
+    inner: Arc<Mutex<AttachTokenManager>>,
+}
+
+impl ServerAttachTokenAdapter {
+    const fn new(inner: Arc<Mutex<AttachTokenManager>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl bmux_attach_token_state::AttachTokenManagerReader for ServerAttachTokenAdapter {
+    fn contains(&self, token: Uuid) -> bool {
+        self.inner
+            .lock()
+            .map(|guard| guard.tokens.contains_key(&token))
+            .unwrap_or(false)
+    }
+}
+
+impl bmux_attach_token_state::AttachTokenManagerWriter for ServerAttachTokenAdapter {
+    fn issue(&self, session_id: SessionId) -> AttachGrant {
+        self.inner.lock().map_or_else(
+            |_| AttachGrant {
+                context_id: None,
+                session_id: session_id.0,
+                attach_token: Uuid::nil(),
+                expires_at_epoch_ms: 0,
+            },
+            |mut guard| guard.issue(session_id),
+        )
+    }
+
+    fn consume(
+        &self,
+        session_id: SessionId,
+        token: Uuid,
+    ) -> std::result::Result<(), bmux_attach_token_state::AttachTokenValidationError> {
+        let Ok(mut guard) = self.inner.lock() else {
+            return Err(bmux_attach_token_state::AttachTokenValidationError::NotFound);
+        };
+        match guard.consume(session_id, token) {
+            Ok(()) => Ok(()),
+            Err(AttachTokenValidationError::NotFound) => {
+                Err(bmux_attach_token_state::AttachTokenValidationError::NotFound)
+            }
+            Err(AttachTokenValidationError::Expired) => {
+                Err(bmux_attach_token_state::AttachTokenValidationError::Expired)
+            }
+            Err(AttachTokenValidationError::SessionMismatch) => {
+                Err(bmux_attach_token_state::AttachTokenValidationError::SessionMismatch)
+            }
+        }
+    }
+
+    fn remove_for_session(&self, session_id: SessionId) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.remove_for_session(session_id);
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.clear();
+        }
     }
 }
 
@@ -4203,6 +4275,8 @@ impl BmuxServer {
             event_broadcast_tx.clone(),
         )));
 
+        let attach_tokens = Arc::new(Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)));
+
         // Register server's `SessionRuntimeManager` into the plugin
         // state registry so `session_runtime_handle()` lookups reach
         // this single instance. The adapter is defined inline below
@@ -4217,11 +4291,22 @@ impl BmuxServer {
             std::sync::RwLock::new(runtime_handle),
         ));
 
+        // Register server's `AttachTokenManager` so the pane-runtime
+        // plugin can issue/consume tokens during attach orchestration
+        // without owning its own copy.
+        let attach_token_handle = bmux_attach_token_state::AttachTokenManagerHandle::new(
+            ServerAttachTokenAdapter::new(Arc::clone(&attach_tokens)),
+        );
+        bmux_plugin::global_plugin_state_registry()
+            .register::<bmux_attach_token_state::AttachTokenManagerHandle>(&Arc::new(
+            std::sync::RwLock::new(attach_token_handle),
+        ));
+
         Self {
             endpoint,
             state: Arc::new(ServerState {
                 session_runtimes,
-                attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
+                attach_tokens,
                 performance_settings,
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
@@ -5596,6 +5681,12 @@ async fn handle_request(
             operation,
             payload,
         } => {
+            // Typed service calls don't acquire the global operation
+            // lock here: many handlers re-enter `handle_request`
+            // through `execute_kernel_request`, which takes the lock
+            // at the inner `Request::*` level. A dedicated
+            // `OperationLockHandle` will gate pure typed mutations
+            // once the legacy IPC surface deletes.
             let route = ServiceRoute {
                 capability: capability.clone(),
                 kind,

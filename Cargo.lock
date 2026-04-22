@@ -1001,6 +1001,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_attach_token_state"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_ipc",
+ "bmux_session_models",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1729,6 +1738,7 @@ name = "bmux_server"
 version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
+ "bmux_attach_token_state",
  "bmux_client_state",
  "bmux_codec",
  "bmux_config",

@@ -29,6 +29,13 @@ pub struct FollowState {
     pub selected_contexts: BTreeMap<ClientId, Option<Uuid>>,
     pub selected_sessions: BTreeMap<ClientId, Option<SessionId>>,
     pub follows: BTreeMap<ClientId, FollowEntry>,
+    /// Session each client currently has an open `attach-open` stream
+    /// against (if any). Distinct from `selected_sessions`: selection
+    /// is a soft "current target"; attach is a hard open IO pipe.
+    pub attached_stream_sessions: BTreeMap<ClientId, Option<SessionId>>,
+    /// Per-client opt-out of server-initiated detach. Missing entry
+    /// means "allowed" (default).
+    pub attach_detach_allowed: BTreeMap<ClientId, bool>,
 }
 
 impl FollowState {
@@ -37,6 +44,10 @@ impl FollowState {
         self.connected_clients.insert(client_id);
         self.selected_contexts.entry(client_id).or_insert(None);
         self.selected_sessions.entry(client_id).or_insert(None);
+        self.attached_stream_sessions
+            .entry(client_id)
+            .or_insert(None);
+        self.attach_detach_allowed.entry(client_id).or_insert(true);
     }
 
     /// Remove a client's tracking and return follow-target-gone events
@@ -45,6 +56,8 @@ impl FollowState {
         self.connected_clients.remove(&client_id);
         self.selected_contexts.remove(&client_id);
         self.selected_sessions.remove(&client_id);
+        self.attached_stream_sessions.remove(&client_id);
+        self.attach_detach_allowed.remove(&client_id);
         self.follows.remove(&client_id);
 
         #[allow(clippy::needless_collect)]
@@ -217,5 +230,44 @@ impl FollowState {
                 }
             })
             .collect()
+    }
+
+    /// Session the client currently has an open `attach-open` stream
+    /// against.
+    #[must_use]
+    pub fn attached_stream_session(&self, client_id: ClientId) -> Option<SessionId> {
+        self.attached_stream_sessions
+            .get(&client_id)
+            .copied()
+            .flatten()
+    }
+
+    /// Update the client's attached streaming session. Passing `None`
+    /// clears the field.
+    pub fn set_attached_stream_session(
+        &mut self,
+        client_id: ClientId,
+        session_id: Option<SessionId>,
+    ) {
+        if self.connected_clients.contains(&client_id) {
+            self.attached_stream_sessions.insert(client_id, session_id);
+        }
+    }
+
+    /// Whether the client currently permits detach. Defaults to `true`
+    /// for a connected client that never toggled the flag.
+    #[must_use]
+    pub fn attach_detach_allowed(&self, client_id: ClientId) -> bool {
+        self.attach_detach_allowed
+            .get(&client_id)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// Update the "detach allowed" toggle for a client.
+    pub fn set_attach_detach_allowed(&mut self, client_id: ClientId, allowed: bool) {
+        if self.connected_clients.contains(&client_id) {
+            self.attach_detach_allowed.insert(client_id, allowed);
+        }
     }
 }

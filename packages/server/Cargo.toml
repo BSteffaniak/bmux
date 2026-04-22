@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 # Internal bmux packages
+bmux_attach_token_state     = { workspace = true }
 bmux_client_state           = { workspace = true }
 bmux_config                 = { workspace = true }
 bmux_context_state          = { workspace = true }

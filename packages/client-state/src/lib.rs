@@ -41,6 +41,16 @@ pub struct FollowStateSnapshot {
     pub selected_contexts: BTreeMap<ClientId, Option<Uuid>>,
     pub selected_sessions: BTreeMap<ClientId, Option<SessionId>>,
     pub follows: BTreeMap<ClientId, FollowEntrySnapshot>,
+    /// Per-client attached streaming session (the session a client
+    /// has an open `attach-open` stream against). Distinct from
+    /// `selected_sessions`: selection is soft, attach is hard.
+    #[serde(default)]
+    pub attached_stream_sessions: BTreeMap<ClientId, Option<SessionId>>,
+    /// Per-client "detach allowed" toggle. Defaults to `true` when
+    /// absent; a client can set it to `false` to prevent accidental
+    /// detach (used by integration tests and pinned surfaces).
+    #[serde(default)]
+    pub attach_detach_allowed: BTreeMap<ClientId, bool>,
 }
 
 /// Wire shape of [`FollowEntry`] for snapshot serialization.
@@ -86,6 +96,14 @@ pub trait FollowStateReader: Send + Sync {
     fn selected_target(&self, client_id: ClientId) -> Option<(Option<Uuid>, Option<SessionId>)>;
     /// Whether the given client is currently connected.
     fn is_connected(&self, client_id: ClientId) -> bool;
+    /// Session the client has an active `attach-open` stream against.
+    /// Distinct from `selected_session`: selection is soft
+    /// (persisted, follow-driven); attach is hard (IO pipe open).
+    fn attached_stream_session(&self, client_id: ClientId) -> Option<SessionId>;
+    /// Whether the client currently permits server-initiated detach.
+    /// Defaults to `true` when the client hasn't explicitly opted
+    /// out.
+    fn attach_detach_allowed(&self, client_id: ClientId) -> bool;
 }
 
 /// Mutation surface over follow-state. Server calls these on the
@@ -146,6 +164,12 @@ pub trait FollowStateWriter: FollowStateReader {
     fn snapshot(&self) -> FollowStateSnapshot;
     /// Replace state with a previously-captured snapshot.
     fn restore_snapshot(&self, snapshot: FollowStateSnapshot);
+    /// Update the client's attached streaming session (the session
+    /// whose attach-open stream is currently held by this client).
+    /// Passing `None` clears the field.
+    fn set_attached_stream_session(&self, client_id: ClientId, session_id: Option<SessionId>);
+    /// Update the "detach allowed" toggle for a client.
+    fn set_attach_detach_allowed(&self, client_id: ClientId, allowed: bool);
 }
 
 /// Registry newtype wrapping an `Arc<dyn FollowStateWriter>`. Server
@@ -192,6 +216,12 @@ impl FollowStateReader for NoopFollowState {
     fn is_connected(&self, _client_id: ClientId) -> bool {
         false
     }
+    fn attached_stream_session(&self, _client_id: ClientId) -> Option<SessionId> {
+        None
+    }
+    fn attach_detach_allowed(&self, _client_id: ClientId) -> bool {
+        true
+    }
 }
 
 impl FollowStateWriter for NoopFollowState {
@@ -232,6 +262,8 @@ impl FollowStateWriter for NoopFollowState {
         FollowStateSnapshot::default()
     }
     fn restore_snapshot(&self, _snapshot: FollowStateSnapshot) {}
+    fn set_attached_stream_session(&self, _client_id: ClientId, _session_id: Option<SessionId>) {}
+    fn set_attach_detach_allowed(&self, _client_id: ClientId, _allowed: bool) {}
 }
 
 impl FollowStateHandle {

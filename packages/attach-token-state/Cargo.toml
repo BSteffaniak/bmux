@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral primitive crate: AttachTokenManager reader/writer traits + registry handle for the pane-runtime plugin's attach-token surface"
+edition     = { workspace = true }
+keywords    = ["bmux", "attach", "token", "state", "primitive"]
+license     = { workspace = true }
+name        = "bmux_attach_token_state"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_ipc            = { workspace = true }
+bmux_session_models = { workspace = true, features = ["serde"] }
+uuid                = { workspace = true, features = ["serde", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []
