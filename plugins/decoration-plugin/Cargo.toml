@@ -34,7 +34,7 @@ uuid                       = { workspace = true, features = ["serde", "std"] }
 ignored = ["serde"]
 
 [features]
-default = ["bundled-themes", "bundled-decoration-scripts"]
+default = ["bundled-themes", "bundled-decoration-scripts", "scripting-luau"]
 # Bundle the decoration plugin's preset theme files into the compiled
 # artifact via `include_str!`. When disabled, `bundled_theme_presets()`
 # returns an empty slice and users must install themes manually.

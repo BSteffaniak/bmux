@@ -15,8 +15,10 @@ pub mod scripting;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use bmux_decoration_plugin_api::decoration_state::{
     BorderStyle, DecorationEvent, DecorationStateService, DecorationThemeExtension,
@@ -31,8 +33,10 @@ use bmux_scene_protocol::scene_protocol::{
 };
 use uuid::Uuid;
 
+use crate::scripting::{DecorateContext, PerfTracker, ScriptBackend, bundled_decoration_scripts};
+
 /// In-memory state store.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct State {
     /// Per-pane overrides. Panes without an override fall through to
     /// [`State::default_border`].
@@ -56,6 +60,39 @@ struct State {
     /// file; `None` means "no theme extension observed; paint with
     /// built-in ASCII defaults".
     current_theme: Option<DecorationThemeExtension>,
+    /// Compiled decoration script, if any. `None` means the theme
+    /// did not request a script, or scripting was disabled at build
+    /// time, or compilation failed (the loader logs the failure).
+    script_backend: Option<Box<dyn ScriptBackend>>,
+    /// Display path of the active script (used for perf + error
+    /// messages). `None` when no script is loaded.
+    script_path: Option<PathBuf>,
+    /// Monotonic start instant used to populate `DecorateContext::time_ms`.
+    /// Set when the first script is installed so relative timings are
+    /// stable across reloads.
+    script_started_at: Option<Instant>,
+    /// Monotonic frame counter passed to the script each invocation.
+    script_frame: u64,
+    /// Optional perf tracker that emits a `WARN` log when the script's
+    /// P95 invoke time drifts above the threshold.
+    script_perf: Option<PerfTracker>,
+}
+
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Box<dyn ScriptBackend>` is not `Debug`, so derive(Debug) is
+        // off. We still want inspector-friendly output for the rest.
+        f.debug_struct("State")
+            .field("panes", &self.panes)
+            .field("geometry", &self.geometry)
+            .field("activity", &self.activity)
+            .field("default_border", &self.default_border)
+            .field("scene_revision", &self.scene_revision)
+            .field("current_theme", &self.current_theme)
+            .field("script_path", &self.script_path)
+            .field("script_frame", &self.script_frame)
+            .finish_non_exhaustive()
+    }
 }
 
 impl State {
@@ -155,7 +192,7 @@ impl DecorationStateService for DecorationServiceHandle {
         Box::pin(async move {
             self.state
                 .lock()
-                .map_or_else(|_| empty_scene(), |state| build_scene(&state))
+                .map_or_else(|_| empty_scene(), |mut state| build_scene(&mut state))
         })
     }
 
@@ -360,7 +397,7 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
 /// out of the plugin's inherent method so the typed
 /// [`DecorationStateService::scene_snapshot`] can share the same
 /// build logic without re-locking the mutex.
-fn build_scene(state: &State) -> DecorationScene {
+fn build_scene(state: &mut State) -> DecorationScene {
     let mut surfaces = BTreeMap::new();
     for (pane_id, decoration) in &state.panes {
         surfaces.insert(
@@ -368,11 +405,89 @@ fn build_scene(state: &State) -> DecorationScene {
             surface_decoration_for(*pane_id, decoration.border, state.geometry.get(pane_id)),
         );
     }
+    merge_script_paint_commands(state, &mut surfaces);
     DecorationScene {
         revision: state.scene_revision,
         surfaces,
         fallback: Some(default_fallback_style()),
         animation: None,
+    }
+}
+
+/// Build a `DecorateContext` from the plugin's cached geometry /
+/// activity for `pane_id`. Returns `None` if geometry is not known
+/// yet — the script has nothing concrete to paint until the attach
+/// runtime reports layout.
+fn decorate_context_for(state: &State, pane_id: Uuid) -> Option<DecorateContext> {
+    let geom = state.geometry.get(&pane_id)?;
+    let activity = state.activity.get(&pane_id);
+    let (focused, zoomed) = activity.map_or((false, false), |a| (a.focused, a.zoomed));
+    let started_at = state.script_started_at?;
+    let time_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Some(DecorateContext {
+        rect: (geom.rect.x, geom.rect.y, geom.rect.w, geom.rect.h),
+        content_rect: (
+            geom.content_rect.x,
+            geom.content_rect.y,
+            geom.content_rect.w,
+            geom.content_rect.h,
+        ),
+        focused,
+        zoomed,
+        bell: false,
+        time_ms,
+        frame: state.script_frame,
+    })
+}
+
+/// Invoke the compiled script (if any) for each pane that has
+/// geometry cached and merge its paint commands into `surfaces`.
+/// Panes without an existing surface entry get one lazily so script
+/// output still reaches the renderer.
+fn merge_script_paint_commands(
+    state: &mut State,
+    surfaces: &mut BTreeMap<Uuid, SurfaceDecoration>,
+) {
+    let Some(backend) = state.script_backend.as_ref() else {
+        return;
+    };
+    // Advance the frame counter once per build — every pane sees the
+    // same frame number within a single scene publication.
+    state.script_frame = state.script_frame.saturating_add(1);
+    // Snapshot the set of panes we want to paint. We can't iterate
+    // `state.geometry` while also reading from `state.activity` /
+    // mutating `state.script_perf`, so collect the pane ids first.
+    let pane_ids: Vec<Uuid> = state.geometry.keys().copied().collect();
+    for pane_id in pane_ids {
+        let Some(ctx) = decorate_context_for(state, pane_id) else {
+            continue;
+        };
+        let outcome = match backend.invoke(&ctx) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(
+                    target: "decoration.script",
+                    pane_id = %pane_id,
+                    error = %e,
+                    "decoration script invocation failed",
+                );
+                continue;
+            }
+        };
+        if let Some(tracker) = state.script_perf.as_ref()
+            && let Some(msg) = tracker.record(outcome.duration)
+        {
+            tracing::warn!(target: "decoration.script", "{msg}");
+        }
+        if outcome.commands.is_empty() {
+            continue;
+        }
+        // Get-or-create the surface entry for this pane.
+        let surface = surfaces.entry(pane_id).or_insert_with(|| {
+            let geom = state.geometry.get(&pane_id);
+            surface_decoration_for(pane_id, state.default_border, geom)
+        });
+        surface.paint_commands.extend(outcome.commands);
     }
 }
 
@@ -471,7 +586,7 @@ impl DecorationPlugin {
         self.state
             .inner
             .lock()
-            .map_or_else(|_| empty_scene(), |state| build_scene(&state))
+            .map_or_else(|_| empty_scene(), |mut state| build_scene(&mut state))
     }
 }
 
@@ -568,18 +683,98 @@ pub fn style_for_focus(focused: bool) -> Style {
     }
 }
 
+/// Resolved decoration script: the canonical path used for error
+/// reporting plus the source string handed to the Lua backend. The
+/// path is synthetic (`bundled:<name>`) for bundled scripts and
+/// filesystem-absolute for user-authored scripts.
+#[derive(Debug, Clone)]
+struct ResolvedScript {
+    path: PathBuf,
+    source: String,
+}
+
+/// Resolve a `script = "..."` theme value into a concrete source
+/// string. Resolution rules (first match wins):
+///
+/// 1. An absolute path is read directly from the filesystem.
+/// 2. A relative path containing `/` or `.` is resolved against
+///    `config_dir` and read from the filesystem.
+/// 3. A bare stem (no slashes, no dots) matches a bundled script by
+///    name (`"pulse"` -> `pulse.lua`).
+///
+/// Returns `None` (and logs a warning) when no match produces a
+/// readable script.
+fn resolve_decoration_script(config_dir: &std::path::Path, spec: &str) -> Option<ResolvedScript> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let looks_like_path = trimmed.contains('/') || trimmed.contains('.');
+    if looks_like_path {
+        let candidate = if std::path::Path::new(trimmed).is_absolute() {
+            PathBuf::from(trimmed)
+        } else {
+            config_dir.join(trimmed)
+        };
+        match std::fs::read_to_string(&candidate) {
+            Ok(source) => {
+                return Some(ResolvedScript {
+                    path: candidate,
+                    source,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "decoration.script",
+                    path = ?candidate,
+                    error = %err,
+                    "failed to read decoration script from theme; decorations fall back to defaults",
+                );
+                return None;
+            }
+        }
+    }
+    // Bare stem — try bundled scripts.
+    for (name, source) in bundled_decoration_scripts() {
+        if *name == trimmed {
+            return Some(ResolvedScript {
+                path: PathBuf::from(format!("bundled:{name}")),
+                source: (*source).to_string(),
+            });
+        }
+    }
+    tracing::warn!(
+        target: "decoration.script",
+        script = %trimmed,
+        "decoration script not found (neither filesystem path nor bundled name)",
+    );
+    None
+}
+
 /// Load the decoration theme extension from the active theme file
 /// resolved via the user's config directory. Reads `bmux.toml`,
 /// extracts `appearance.theme`, reads `themes/{name}.toml`, then
 /// pulls `[plugins."bmux.decoration"]` and parses it against the
 /// `DecorationThemeExtension` schema.
 ///
-/// Returns `None` when any step fails — the plugin should fall back
-/// to its built-in defaults and not crash on a malformed user
-/// config. Errors are logged at info/debug.
+/// When the extension names a `script`, the corresponding source is
+/// resolved and returned alongside the parsed extension. Returns
+/// `None` when any step fails — the plugin should fall back to its
+/// built-in defaults and not crash on a malformed user config.
+#[cfg(test)]
 fn load_theme_extension_from_config_dir(
     config_dir: &std::path::Path,
 ) -> Option<DecorationThemeExtension> {
+    load_theme_from_config_dir(config_dir).map(|(extension, _)| extension)
+}
+
+/// Variant of [`load_theme_extension_from_config_dir`] that also
+/// returns the resolved script source when the theme specifies one.
+/// Kept as a sibling so legacy call sites (tests, read-only queries)
+/// don't have to deal with the script tuple.
+fn load_theme_from_config_dir(
+    config_dir: &std::path::Path,
+) -> Option<(DecorationThemeExtension, Option<ResolvedScript>)> {
     // Step 1: locate appearance.theme in bmux.toml.
     let main_config_path = config_dir.join("bmux.toml");
     let main_toml: toml::Value = std::fs::read_to_string(&main_config_path)
@@ -591,17 +786,28 @@ fn load_theme_extension_from_config_dir(
         .and_then(toml::Value::as_str)
         .unwrap_or("default")
         .to_string();
-    if theme_name.is_empty() || theme_name == "default" {
+    if theme_name.is_empty() {
         return None;
     }
-    // Step 2: load the theme file.
+    // Step 2: load the theme file — first try filesystem, then fall
+    // back to any bundled preset with the same name.
     let theme_path = config_dir.join("themes").join(format!("{theme_name}.toml"));
-    let theme_toml: toml::Value =
-        toml::from_str(&std::fs::read_to_string(&theme_path).ok()?).ok()?;
+    let theme_text = match std::fs::read_to_string(&theme_path) {
+        Ok(text) => text,
+        Err(_) => bundled_theme_presets()
+            .iter()
+            .find_map(|(n, text)| (*n == theme_name.as_str()).then(|| (*text).to_string()))?,
+    };
+    let theme_toml: toml::Value = toml::from_str(&theme_text).ok()?;
     // Step 3: extract `plugins."bmux.decoration"` and parse.
     let plugins_table = theme_toml.get("plugins")?;
     let decoration_table = plugins_table.get("bmux.decoration")?.clone();
-    decoration_table.try_into().ok()
+    let extension: DecorationThemeExtension = decoration_table.try_into().ok()?;
+    let script = extension
+        .script
+        .as_deref()
+        .and_then(|spec| resolve_decoration_script(config_dir, spec));
+    Some((extension, script))
 }
 
 impl RustPlugin for DecorationPlugin {
@@ -617,11 +823,22 @@ impl RustPlugin for DecorationPlugin {
         // Load the decoration theme extension from the user's active
         // theme file, if any. Errors are logged but non-fatal — the
         // plugin falls back to its built-in defaults.
-        let theme_extension = load_theme_extension_from_config_dir(std::path::Path::new(
-            &context.connection.config_dir,
-        ));
+        let config_dir = std::path::PathBuf::from(&context.connection.config_dir);
+        let loaded = load_theme_from_config_dir(&config_dir);
+        let (theme_extension, resolved_script) = match loaded {
+            Some((ext, script)) => (Some(ext), script),
+            None => (None, None),
+        };
+        let animation_hz = theme_extension
+            .as_ref()
+            .and_then(|t| t.animation.as_ref())
+            .map(|a| a.hz);
         if let Ok(mut state) = self.state.inner.lock() {
             state.current_theme = theme_extension;
+            // Install the script backend (if any) before the first
+            // revision bump so subscribers see the very first scene
+            // with script output already merged.
+            install_script_backend(&mut state, resolved_script);
             // Bump the scene revision so the first build_scene() call
             // returns a non-zero revision, signalling consumers that
             // the plugin has published at least once. Emission runs
@@ -633,6 +850,14 @@ impl RustPlugin for DecorationPlugin {
         // the lifetime of the decoration plugin; the host tears down
         // background threads at shutdown.
         spawn_windows_pane_event_subscriber(self.state.clone_arc());
+        // Spawn the animation tick thread when the theme requests a
+        // non-zero hz and a script is compiled. The thread holds a
+        // `Weak` so it exits cleanly when the plugin is dropped.
+        if let Some(hz) = animation_hz
+            && hz > 0
+        {
+            spawn_animation_tick_thread(Arc::downgrade(&self.state.inner), hz);
+        }
         Ok(EXIT_OK)
     }
 
@@ -663,6 +888,73 @@ impl RustPlugin for DecorationPlugin {
             service,
         );
     }
+}
+
+/// Compile `script` into a fresh backend and install it on `state`.
+/// Invoked during `activate` before the first revision bump so the
+/// initial published scene already reflects any script output.
+///
+/// Failure modes (compile error, stub backend when no `scripting-*`
+/// feature is compiled in) are logged at `warn` and leave the plugin
+/// in its non-scripted state — the rest of the decoration pipeline
+/// keeps working.
+fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
+    let Some(script) = script else {
+        return;
+    };
+    let backend = crate::scripting::make_backend();
+    if !backend.is_functional() {
+        tracing::warn!(
+            target: "decoration.script",
+            script = ?script.path,
+            "decoration scripting is not compiled into this build — script will be ignored",
+        );
+        return;
+    }
+    if let Err(err) = backend.compile(&script.path, &script.source) {
+        tracing::warn!(
+            target: "decoration.script",
+            script = ?script.path,
+            error = %err,
+            "decoration script failed to compile — falling back to static decorations",
+        );
+        return;
+    }
+    state.script_backend = Some(backend);
+    state.script_path = Some(script.path.clone());
+    state.script_started_at = Some(Instant::now());
+    state.script_frame = 0;
+    state.script_perf = Some(PerfTracker::new(
+        script.path,
+        crate::scripting::DEFAULT_WARN_MS,
+    ));
+}
+
+/// Background timer that re-invokes the decoration script at `hz`
+/// ticks per second while the plugin's shared state is alive. The
+/// thread holds a [`Weak`] reference so it terminates cleanly when
+/// the plugin (and thus the `Arc<Mutex<State>>`) is dropped.
+fn spawn_animation_tick_thread(state: Weak<Mutex<State>>, hz: u16) {
+    // `u16` hz * `Duration::from_micros` keeps arithmetic safe up to
+    // 65535 Hz. We do not clamp — users are responsible for the CPU
+    // cost of their chosen frame rate.
+    let period = Duration::from_micros((1_000_000u64 / u64::from(hz.max(1))).max(1));
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(period);
+            let Some(arc) = state.upgrade() else {
+                return;
+            };
+            let Ok(mut guard) = arc.lock() else {
+                return;
+            };
+            // Skip the tick entirely if the script was unloaded
+            // between frames — avoids a useless revision bump.
+            if guard.script_backend.is_some() {
+                bump_revision(&mut guard);
+            }
+        }
+    });
 }
 
 /// Subscribe to the windows plugin's `pane-event` topic on the typed
@@ -765,6 +1057,10 @@ pub fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
             ("hacker", include_str!("../assets/themes/hacker.toml")),
             ("cyberpunk", include_str!("../assets/themes/cyberpunk.toml")),
             ("minimal", include_str!("../assets/themes/minimal.toml")),
+            (
+                "pulse-demo",
+                include_str!("../assets/themes/pulse-demo.toml"),
+            ),
         ]
     }
     #[cfg(not(feature = "bundled-themes"))]
@@ -793,6 +1089,7 @@ bmux_plugin_sdk::export_plugin!(DecorationPlugin, include_str!("../plugin.toml")
 mod tests {
     use super::*;
     use bmux_scene_protocol::scene_protocol::Rect as SceneRect;
+    use std::path::Path;
 
     fn block_on<F: Future>(fut: F) -> F::Output {
         use std::sync::Arc;
@@ -1245,5 +1542,268 @@ theme = "hacker"
         assert_eq!(ext.focused.style, "thick");
         assert_eq!(ext.focused.fg, "#39ff14");
         assert_eq!(ext.badges.running, "▶");
+    }
+
+    // ─── PR 5: Luau scripting ─────────────────────────────────────
+
+    #[test]
+    fn theme_without_script_field_still_parses() {
+        // The existing `hacker.toml` bundle does not specify `script`
+        // — regression guard for the schema addition being additive.
+        let ext = validate_theme_extension_toml(include_str!("../assets/themes/hacker.toml"));
+        // The bundled theme contains non-decoration fields at the
+        // top level; validate just the decoration section.
+        let _ = ext;
+        let toml_text = include_str!("../assets/themes/hacker.toml");
+        let value: toml::Value = toml::from_str(toml_text).expect("parse hacker toml");
+        let decoration_table = value
+            .get("plugins")
+            .and_then(|p| p.get("bmux.decoration"))
+            .expect("hacker.toml must carry a decoration section");
+        let extension: DecorationThemeExtension = decoration_table.clone().try_into().expect(
+            "hacker.toml decoration section must round-trip through DecorationThemeExtension",
+        );
+        assert!(
+            extension.script.is_none(),
+            "hacker.toml does not declare a script"
+        );
+    }
+
+    #[test]
+    fn pulse_demo_bundled_theme_includes_script_reference() {
+        let toml_text = include_str!("../assets/themes/pulse-demo.toml");
+        let value: toml::Value = toml::from_str(toml_text).expect("parse pulse-demo toml");
+        let decoration_table = value
+            .get("plugins")
+            .and_then(|p| p.get("bmux.decoration"))
+            .expect("pulse-demo.toml must carry a decoration section");
+        let extension: DecorationThemeExtension = decoration_table
+            .clone()
+            .try_into()
+            .expect("pulse-demo.toml decoration section must parse");
+        assert_eq!(extension.script.as_deref(), Some("pulse"));
+    }
+
+    #[test]
+    fn resolve_decoration_script_matches_bundled_name() {
+        let tmp = std::env::temp_dir().join(format!("bmux-script-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let resolved = resolve_decoration_script(&tmp, "pulse")
+            .expect("bundled `pulse` script must resolve by bare name");
+        assert!(
+            resolved.source.contains("function decorate"),
+            "resolved pulse source must contain a decorate function"
+        );
+        assert_eq!(resolved.path.to_str(), Some("bundled:pulse"));
+    }
+
+    #[test]
+    fn resolve_decoration_script_reads_filesystem_path() {
+        let tmp = std::env::temp_dir().join(format!("bmux-script-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(tmp.join("decorations")).expect("mkdir");
+        let rel = "decorations/test.lua";
+        let body = "function decorate(ctx) return {} end\n";
+        std::fs::write(tmp.join(rel), body).expect("write script");
+        let resolved = resolve_decoration_script(&tmp, rel)
+            .expect("filesystem script must resolve against config_dir");
+        assert_eq!(resolved.source, body);
+        assert!(resolved.path.ends_with(rel));
+    }
+
+    #[test]
+    fn resolve_decoration_script_returns_none_for_unknown_name() {
+        let tmp = std::env::temp_dir().join(format!("bmux-script-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        assert!(resolve_decoration_script(&tmp, "no-such-script").is_none());
+    }
+
+    #[test]
+    fn load_theme_from_config_dir_resolves_script_when_present() {
+        let tmp = std::env::temp_dir().join(format!("bmux-decoration-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(tmp.join("themes")).expect("mkdir themes");
+        std::fs::create_dir_all(tmp.join("decorations")).expect("mkdir decorations");
+        std::fs::write(
+            tmp.join("bmux.toml"),
+            r#"
+[appearance]
+theme = "with-script"
+"#,
+        )
+        .expect("write main");
+        std::fs::write(
+            tmp.join("themes/with-script.toml"),
+            r#"
+[plugins."bmux.decoration"]
+script = "decorations/demo.lua"
+
+[plugins."bmux.decoration".unfocused]
+style = "rounded"
+fg = ""
+bg = ""
+gradient_from = ""
+gradient_to = ""
+glyphs_custom = []
+
+[plugins."bmux.decoration".focused]
+style = "thick"
+fg = ""
+bg = ""
+gradient_from = ""
+gradient_to = ""
+glyphs_custom = []
+
+[plugins."bmux.decoration".zoomed]
+style = "double"
+fg = ""
+bg = ""
+gradient_from = ""
+gradient_to = ""
+glyphs_custom = []
+
+[plugins."bmux.decoration".badges]
+running = ""
+exited = ""
+"#,
+        )
+        .expect("write theme");
+        std::fs::write(
+            tmp.join("decorations/demo.lua"),
+            "function decorate(ctx) return {} end\n",
+        )
+        .expect("write script");
+        let (ext, script) =
+            load_theme_from_config_dir(&tmp).expect("loader must find theme + script");
+        assert_eq!(ext.script.as_deref(), Some("decorations/demo.lua"));
+        let script = script.expect("script must resolve");
+        assert!(script.source.contains("function decorate"));
+    }
+
+    #[test]
+    fn install_script_backend_compiles_and_stores_backend() {
+        let plugin = DecorationPlugin::new();
+        {
+            let mut state = plugin.state.inner.lock().expect("lock");
+            install_script_backend(
+                &mut state,
+                Some(ResolvedScript {
+                    path: PathBuf::from("bundled:test"),
+                    source: "function decorate(ctx) return {} end".into(),
+                }),
+            );
+            assert!(
+                state.script_backend.is_some(),
+                "backend must be installed after a successful compile"
+            );
+            assert_eq!(
+                state.script_path.as_deref(),
+                Some(Path::new("bundled:test"))
+            );
+            assert!(state.script_started_at.is_some());
+        }
+    }
+
+    #[test]
+    fn install_script_backend_discards_on_compile_failure() {
+        let plugin = DecorationPlugin::new();
+        let mut state = plugin.state.inner.lock().expect("lock");
+        install_script_backend(
+            &mut state,
+            Some(ResolvedScript {
+                path: PathBuf::from("bundled:broken"),
+                source: "function decorate(ctx return {}".into(),
+            }),
+        );
+        assert!(
+            state.script_backend.is_none(),
+            "compile failure must leave backend unset"
+        );
+    }
+
+    #[test]
+    fn build_scene_merges_script_paint_commands_for_known_geometry() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(777);
+        {
+            let mut state = plugin.state.inner.lock().expect("lock");
+            install_script_backend(
+                &mut state,
+                Some(ResolvedScript {
+                    path: PathBuf::from("bundled:test"),
+                    source: r#"
+                        function decorate(ctx)
+                            return {
+                                {
+                                    kind = "text",
+                                    col = ctx.rect.x,
+                                    row = ctx.rect.y,
+                                    z = 5,
+                                    text = "hi",
+                                    style = {},
+                                },
+                            }
+                        end
+                    "#
+                    .into(),
+                }),
+            );
+            state.geometry.insert(
+                pane,
+                PaneGeometry {
+                    pane_id: pane,
+                    rect: SceneRect {
+                        x: 3,
+                        y: 4,
+                        w: 10,
+                        h: 2,
+                    },
+                    content_rect: SceneRect {
+                        x: 4,
+                        y: 5,
+                        w: 8,
+                        h: 0,
+                    },
+                },
+            );
+        }
+        let scene = plugin.build_scene();
+        let surface = scene.surfaces.get(&pane).expect("surface emitted");
+        let text_cmd = surface
+            .paint_commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                PaintCommand::Text { col, row, text, .. } => Some((*col, *row, text.clone())),
+                _ => None,
+            })
+            .expect("script's text paint command must appear in the scene");
+        assert_eq!(text_cmd, (3, 4, "hi".to_string()));
+    }
+
+    #[test]
+    fn tick_thread_exits_cleanly_when_plugin_is_dropped() {
+        let plugin = DecorationPlugin::new();
+        let weak = Arc::downgrade(&plugin.state.inner);
+        spawn_animation_tick_thread(weak.clone(), 100);
+        drop(plugin);
+        // After the strong arc is dropped, the Weak upgrade must
+        // fail; the thread either already exited or is blocked in
+        // sleep and will exit on the next iteration. Give it a
+        // moment and confirm the weak count drops to zero.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "plugin state must be fully released after drop",
+        );
+    }
+
+    #[test]
+    fn script_backend_not_installed_when_theme_has_no_script() {
+        let plugin = DecorationPlugin::new();
+        let mut state = plugin.state.inner.lock().expect("lock");
+        install_script_backend(&mut state, None);
+        assert!(
+            state.script_backend.is_none(),
+            "install_script_backend must be a no-op when script is None",
+        );
     }
 }

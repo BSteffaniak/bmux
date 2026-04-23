@@ -44,6 +44,13 @@ interface decoration-state {
         badges: badge-spec,
         // Optional theme-wide animation hint (off when absent).
         animation: animation-spec?,
+        // Optional decoration script. When present, the decoration
+        // plugin compiles this Lua source and invokes its global
+        // `decorate(ctx)` function per animation tick (and on every
+        // revision bump). The string is resolved against the user's
+        // config directory; bare names without `/` or `.` match a
+        // bundled script (e.g. `"pulse"` -> `pulse.lua`).
+        script: string?,
     }
 
     // A user-declared border style: what glyphs, what colour. Matches
