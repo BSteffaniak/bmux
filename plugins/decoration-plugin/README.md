@@ -93,3 +93,21 @@ CPU cost.
 The `pulse-demo` bundled theme exercises the full scripting path.
 Activate it by setting `appearance.theme = "pulse-demo"` in your
 `bmux.toml`; no additional files are required.
+
+## Opting out
+
+Scripting is on by default. The Luau backend is gated by the
+`scripting-luau` feature on this crate (on in `default`) and by the
+`decoration-scripting` feature on `bmux_cli` (on in its `default`,
+which the `bmux` binary inherits automatically). To build a `bmux`
+without the Luau dependency:
+
+```
+cargo build --bin bmux \
+    --no-default-features \
+    --features "bmux_cli/bundled-fonts bmux_cli/bundled-plugins bmux_cli/compression bmux_cli/kitty-keyboard bmux_cli/image-protocols"
+```
+
+The resulting binary falls back to a stub backend: themes that set
+`script = "..."` log a warning at activation and render with their
+static border/badge settings.
