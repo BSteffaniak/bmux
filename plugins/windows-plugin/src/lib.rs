@@ -1755,6 +1755,7 @@ mod tests {
             },
             connection: HostConnectionInfo {
                 config_dir: "/config".to_string(),
+                config_dir_candidates: vec!["/config".to_string()],
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
                 state_dir: "/state".to_string(),
@@ -2890,6 +2891,7 @@ mod tests {
         };
         let host_connection = bmux_plugin_sdk::HostConnectionInfo {
             config_dir: "/tmp".to_string(),
+            config_dir_candidates: vec!["/tmp".to_string()],
             runtime_dir: "/tmp".to_string(),
             data_dir: "/tmp".to_string(),
             state_dir: "/tmp".to_string(),

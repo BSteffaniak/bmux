@@ -697,42 +697,65 @@ struct ResolvedScript {
 /// string. Resolution rules (first match wins):
 ///
 /// 1. An absolute path is read directly from the filesystem.
-/// 2. A relative path containing `/` or `.` is resolved against
-///    `config_dir` and read from the filesystem.
+/// 2. A relative path containing `/` or `.` is probed against each
+///    candidate config dir in order, returning the first readable
+///    match.
 /// 3. A bare stem (no slashes, no dots) matches a bundled script by
 ///    name (`"pulse"` -> `pulse.lua`).
 ///
 /// Returns `None` (and logs a warning) when no match produces a
 /// readable script.
-fn resolve_decoration_script(config_dir: &std::path::Path, spec: &str) -> Option<ResolvedScript> {
+fn resolve_decoration_script(
+    config_dir_candidates: &[PathBuf],
+    spec: &str,
+) -> Option<ResolvedScript> {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
         return None;
     }
     let looks_like_path = trimmed.contains('/') || trimmed.contains('.');
     if looks_like_path {
-        let candidate = if std::path::Path::new(trimmed).is_absolute() {
-            PathBuf::from(trimmed)
-        } else {
-            config_dir.join(trimmed)
-        };
-        match std::fs::read_to_string(&candidate) {
-            Ok(source) => {
-                return Some(ResolvedScript {
+        if std::path::Path::new(trimmed).is_absolute() {
+            let candidate = PathBuf::from(trimmed);
+            return match std::fs::read_to_string(&candidate) {
+                Ok(source) => Some(ResolvedScript {
                     path: candidate,
                     source,
-                });
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target: "decoration.script",
-                    path = ?candidate,
-                    error = %err,
-                    "failed to read decoration script from theme; decorations fall back to defaults",
-                );
-                return None;
+                }),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "decoration.script",
+                        path = ?candidate,
+                        error = %err,
+                        "failed to read decoration script from theme; decorations fall back to defaults",
+                    );
+                    None
+                }
+            };
+        }
+        // Relative path — probe each candidate config dir.
+        let mut last_error: Option<(PathBuf, std::io::Error)> = None;
+        for dir in config_dir_candidates {
+            let candidate = dir.join(trimmed);
+            match std::fs::read_to_string(&candidate) {
+                Ok(source) => {
+                    return Some(ResolvedScript {
+                        path: candidate,
+                        source,
+                    });
+                }
+                Err(err) => last_error = Some((candidate, err)),
             }
         }
+        if let Some((path, err)) = last_error {
+            tracing::warn!(
+                target: "decoration.script",
+                path = ?path,
+                error = %err,
+                "failed to read decoration script from any config dir candidate; decorations fall back to defaults",
+            );
+        }
+        return None;
     }
     // Bare stem — try bundled scripts.
     for (name, source) in bundled_decoration_scripts() {
@@ -765,21 +788,31 @@ fn resolve_decoration_script(config_dir: &std::path::Path, spec: &str) -> Option
 fn load_theme_extension_from_config_dir(
     config_dir: &std::path::Path,
 ) -> Option<DecorationThemeExtension> {
-    load_theme_from_config_dir(config_dir).map(|(extension, _)| extension)
+    load_theme_from_config_dir(&[config_dir.to_path_buf()]).map(|(extension, _)| extension)
 }
 
 /// Variant of [`load_theme_extension_from_config_dir`] that also
 /// returns the resolved script source when the theme specifies one.
 /// Kept as a sibling so legacy call sites (tests, read-only queries)
 /// don't have to deal with the script tuple.
+///
+/// The candidate chain is probed in order for each filesystem lookup
+/// (`bmux.toml`, the theme file under `themes/`, and scripts). The
+/// first candidate that carries a readable `bmux.toml` anchors the
+/// theme lookup — once we commit to a candidate we keep reading from
+/// that same dir for the theme file before falling back to bundled
+/// presets.
 fn load_theme_from_config_dir(
-    config_dir: &std::path::Path,
+    config_dir_candidates: &[PathBuf],
 ) -> Option<(DecorationThemeExtension, Option<ResolvedScript>)> {
-    // Step 1: locate appearance.theme in bmux.toml.
-    let main_config_path = config_dir.join("bmux.toml");
-    let main_toml: toml::Value = std::fs::read_to_string(&main_config_path)
-        .ok()
-        .and_then(|text| toml::from_str(&text).ok())?;
+    // Step 1: probe each candidate for a parseable bmux.toml. The
+    // first hit wins and we remember which dir served it so steps 2
+    // and 3 stay anchored there.
+    let (anchor_dir, main_toml) = config_dir_candidates.iter().find_map(|dir| {
+        let text = std::fs::read_to_string(dir.join("bmux.toml")).ok()?;
+        let value: toml::Value = toml::from_str(&text).ok()?;
+        Some((dir.clone(), value))
+    })?;
     let theme_name = main_toml
         .get("appearance")
         .and_then(|a| a.get("theme"))
@@ -789,9 +822,13 @@ fn load_theme_from_config_dir(
     if theme_name.is_empty() {
         return None;
     }
-    // Step 2: load the theme file — first try filesystem, then fall
-    // back to any bundled preset with the same name.
-    let theme_path = config_dir.join("themes").join(format!("{theme_name}.toml"));
+    // Step 2: load the theme file from the anchor dir; if it's not
+    // on the filesystem there, fall back to any bundled preset with
+    // the same name. (We intentionally don't probe every candidate
+    // for the theme file — users who separate bmux.toml from their
+    // themes dir can install a symlink, and this keeps behaviour
+    // predictable.)
+    let theme_path = anchor_dir.join("themes").join(format!("{theme_name}.toml"));
     let theme_text = match std::fs::read_to_string(&theme_path) {
         Ok(text) => text,
         Err(_) => bundled_theme_presets()
@@ -806,7 +843,7 @@ fn load_theme_from_config_dir(
     let script = extension
         .script
         .as_deref()
-        .and_then(|spec| resolve_decoration_script(config_dir, spec));
+        .and_then(|spec| resolve_decoration_script(config_dir_candidates, spec));
     Some((extension, script))
 }
 
@@ -822,9 +859,12 @@ impl RustPlugin for DecorationPlugin {
             );
         // Load the decoration theme extension from the user's active
         // theme file, if any. Errors are logged but non-fatal — the
-        // plugin falls back to its built-in defaults.
-        let config_dir = std::path::PathBuf::from(&context.connection.config_dir);
-        let loaded = load_theme_from_config_dir(&config_dir);
+        // plugin falls back to its built-in defaults. We respect the
+        // host's candidate-chain so XDG-style config dirs (e.g.
+        // `~/.config/bmux` on macOS when the native path is
+        // `~/Library/Application Support/bmux`) resolve correctly.
+        let config_dir_candidates = context.connection.config_dir_candidate_paths();
+        let loaded = load_theme_from_config_dir(&config_dir_candidates);
         let (theme_extension, resolved_script) = match loaded {
             Some((ext, script)) => (Some(ext), script),
             None => (None, None),
@@ -1210,6 +1250,7 @@ mod tests {
         };
         let host_connection = bmux_plugin_sdk::HostConnectionInfo {
             config_dir: "/tmp".to_string(),
+            config_dir_candidates: vec!["/tmp".to_string()],
             runtime_dir: "/tmp".to_string(),
             data_dir: "/tmp".to_string(),
             state_dir: "/tmp".to_string(),
@@ -1588,7 +1629,7 @@ theme = "hacker"
     fn resolve_decoration_script_matches_bundled_name() {
         let tmp = std::env::temp_dir().join(format!("bmux-script-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("mkdir");
-        let resolved = resolve_decoration_script(&tmp, "pulse")
+        let resolved = resolve_decoration_script(std::slice::from_ref(&tmp), "pulse")
             .expect("bundled `pulse` script must resolve by bare name");
         assert!(
             resolved.source.contains("function decorate"),
@@ -1604,7 +1645,7 @@ theme = "hacker"
         let rel = "decorations/test.lua";
         let body = "function decorate(ctx) return {} end\n";
         std::fs::write(tmp.join(rel), body).expect("write script");
-        let resolved = resolve_decoration_script(&tmp, rel)
+        let resolved = resolve_decoration_script(std::slice::from_ref(&tmp), rel)
             .expect("filesystem script must resolve against config_dir");
         assert_eq!(resolved.source, body);
         assert!(resolved.path.ends_with(rel));
@@ -1614,7 +1655,7 @@ theme = "hacker"
     fn resolve_decoration_script_returns_none_for_unknown_name() {
         let tmp = std::env::temp_dir().join(format!("bmux-script-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("mkdir");
-        assert!(resolve_decoration_script(&tmp, "no-such-script").is_none());
+        assert!(resolve_decoration_script(std::slice::from_ref(&tmp), "no-such-script").is_none());
     }
 
     #[test]
@@ -1671,8 +1712,8 @@ exited = ""
             "function decorate(ctx) return {} end\n",
         )
         .expect("write script");
-        let (ext, script) =
-            load_theme_from_config_dir(&tmp).expect("loader must find theme + script");
+        let (ext, script) = load_theme_from_config_dir(std::slice::from_ref(&tmp))
+            .expect("loader must find theme + script");
         assert_eq!(ext.script.as_deref(), Some("decorations/demo.lua"));
         let script = script.expect("script must resolve");
         assert!(script.source.contains("function decorate"));
@@ -1805,5 +1846,144 @@ exited = ""
             state.script_backend.is_none(),
             "install_script_backend must be a no-op when script is None",
         );
+    }
+
+    // ─── Candidate-chain probing ─────────────────────────────────
+
+    #[test]
+    fn load_theme_from_config_dir_probes_secondary_candidate_when_primary_missing() {
+        let base = std::env::temp_dir().join(format!("bmux-chain-test-{}", Uuid::new_v4()));
+        let primary = base.join("primary");
+        let secondary = base.join("secondary");
+        std::fs::create_dir_all(&primary).expect("mkdir primary");
+        std::fs::create_dir_all(secondary.join("themes")).expect("mkdir secondary themes");
+
+        // Only the secondary dir has bmux.toml + the theme file.
+        std::fs::write(
+            secondary.join("bmux.toml"),
+            r#"
+[appearance]
+theme = "hacker"
+"#,
+        )
+        .expect("write bmux.toml in secondary");
+        std::fs::write(
+            secondary.join("themes/hacker.toml"),
+            include_str!("../assets/themes/hacker.toml"),
+        )
+        .expect("write theme in secondary");
+
+        let (ext, _script) = load_theme_from_config_dir(&[primary.clone(), secondary.clone()])
+            .expect("loader must succeed using the secondary candidate");
+        assert_eq!(ext.focused.style, "thick");
+    }
+
+    #[test]
+    fn resolve_decoration_script_probes_all_candidates_for_filesystem_paths() {
+        let base = std::env::temp_dir().join(format!("bmux-chain-test-{}", Uuid::new_v4()));
+        let primary = base.join("primary");
+        let secondary = base.join("secondary");
+        std::fs::create_dir_all(&primary).expect("mkdir primary");
+        std::fs::create_dir_all(secondary.join("decorations"))
+            .expect("mkdir secondary decorations");
+        let body = "function decorate(ctx) return {} end\n";
+        std::fs::write(secondary.join("decorations/custom.lua"), body).expect("write script");
+
+        // Primary dir lacks the script; secondary has it.
+        let resolved = resolve_decoration_script(
+            &[primary.clone(), secondary.clone()],
+            "decorations/custom.lua",
+        )
+        .expect("loader must succeed using the secondary candidate");
+        assert_eq!(resolved.source, body);
+        assert!(resolved.path.starts_with(&secondary));
+    }
+
+    #[test]
+    fn load_theme_from_config_dir_prefers_primary_when_both_candidates_have_bmux_toml() {
+        let base = std::env::temp_dir().join(format!("bmux-chain-test-{}", Uuid::new_v4()));
+        let primary = base.join("primary");
+        let secondary = base.join("secondary");
+        std::fs::create_dir_all(primary.join("themes")).expect("mkdir primary themes");
+        std::fs::create_dir_all(secondary.join("themes")).expect("mkdir secondary themes");
+
+        // Two bmux.tomls pointing at two different themes.
+        std::fs::write(
+            primary.join("bmux.toml"),
+            r#"
+[appearance]
+theme = "hacker"
+"#,
+        )
+        .expect("write primary bmux.toml");
+        std::fs::write(
+            secondary.join("bmux.toml"),
+            r#"
+[appearance]
+theme = "cyberpunk"
+"#,
+        )
+        .expect("write secondary bmux.toml");
+        std::fs::write(
+            primary.join("themes/hacker.toml"),
+            include_str!("../assets/themes/hacker.toml"),
+        )
+        .expect("write primary theme");
+        std::fs::write(
+            secondary.join("themes/cyberpunk.toml"),
+            include_str!("../assets/themes/cyberpunk.toml"),
+        )
+        .expect("write secondary theme");
+
+        let (ext, _) = load_theme_from_config_dir(&[primary.clone(), secondary.clone()])
+            .expect("loader must succeed");
+        // Primary's theme is "hacker" -> focused style = "thick".
+        assert_eq!(ext.focused.style, "thick");
+    }
+
+    #[test]
+    fn probe_config_file_falls_back_to_config_dir_when_chain_is_empty() {
+        use bmux_plugin_sdk::HostConnectionInfo;
+        let tmp = std::env::temp_dir().join(format!("bmux-probe-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        std::fs::write(tmp.join("bmux.toml"), "").expect("write");
+
+        let info = HostConnectionInfo {
+            config_dir: tmp.to_string_lossy().into_owned(),
+            config_dir_candidates: Vec::new(),
+            runtime_dir: "/tmp".to_string(),
+            data_dir: "/tmp".to_string(),
+            state_dir: "/tmp".to_string(),
+        };
+        let probed = info
+            .probe_config_file("bmux.toml")
+            .expect("probe must fall back to config_dir when chain is empty");
+        assert!(probed.ends_with("bmux.toml"));
+    }
+
+    #[test]
+    fn probe_config_file_uses_chain_when_populated() {
+        use bmux_plugin_sdk::HostConnectionInfo;
+        let base = std::env::temp_dir().join(format!("bmux-probe-test-{}", Uuid::new_v4()));
+        let primary = base.join("primary");
+        let secondary = base.join("secondary");
+        std::fs::create_dir_all(&primary).expect("mkdir primary");
+        std::fs::create_dir_all(&secondary).expect("mkdir secondary");
+        std::fs::write(secondary.join("bmux.toml"), "").expect("write secondary");
+
+        let info = HostConnectionInfo {
+            config_dir: primary.to_string_lossy().into_owned(),
+            config_dir_candidates: vec![
+                primary.to_string_lossy().into_owned(),
+                secondary.to_string_lossy().into_owned(),
+            ],
+            runtime_dir: "/tmp".to_string(),
+            data_dir: "/tmp".to_string(),
+            state_dir: "/tmp".to_string(),
+        };
+        let probed = info
+            .probe_config_file("bmux.toml")
+            .expect("probe must find the secondary candidate");
+        assert!(probed.starts_with(&secondary));
     }
 }

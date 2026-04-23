@@ -897,6 +897,11 @@ fn install_typed_service_registry(
     let host_metadata = plugin_host_metadata();
     let host_connection = bmux_plugin_sdk::HostConnectionInfo {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
+        config_dir_candidates: paths
+            .config_dir_candidates()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
         runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
         data_dir: paths.data_dir.to_string_lossy().into_owned(),
         state_dir: paths.state_dir.to_string_lossy().into_owned(),
@@ -1193,6 +1198,11 @@ pub(super) fn activate_loaded_plugins(
     let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
     let connection_info = HostConnectionInfo {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
+        config_dir_candidates: paths
+            .config_dir_candidates()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
         runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
         data_dir: paths.data_dir.to_string_lossy().into_owned(),
         state_dir: paths.state_dir.to_string_lossy().into_owned(),
@@ -1277,6 +1287,11 @@ pub(super) fn deactivate_loaded_plugins(
 ) -> Result<()> {
     let connection_info = HostConnectionInfo {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
+        config_dir_candidates: paths
+            .config_dir_candidates()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
         runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
         data_dir: paths.data_dir.to_string_lossy().into_owned(),
         state_dir: paths.state_dir.to_string_lossy().into_owned(),

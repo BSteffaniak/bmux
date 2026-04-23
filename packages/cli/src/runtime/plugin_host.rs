@@ -31,6 +31,11 @@ impl CliPluginHost {
             metadata,
             connection: HostConnectionInfo {
                 config_dir: paths.config_dir.to_string_lossy().into_owned(),
+                config_dir_candidates: paths
+                    .config_dir_candidates()
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
                 runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
                 data_dir: paths.data_dir.to_string_lossy().into_owned(),
                 state_dir: paths.state_dir.to_string_lossy().into_owned(),

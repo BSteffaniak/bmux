@@ -2722,6 +2722,7 @@ mod tests {
             },
             connection: HostConnectionInfo {
                 config_dir: config_dir.to_string(),
+                config_dir_candidates: vec![config_dir.to_string()],
                 runtime_dir: config_dir.to_string(),
                 data_dir: config_dir.to_string(),
                 state_dir: config_dir.to_string(),

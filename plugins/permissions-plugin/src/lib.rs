@@ -1487,6 +1487,7 @@ mod tests {
             },
             connection: HostConnectionInfo {
                 config_dir: "/config".to_string(),
+                config_dir_candidates: vec!["/config".to_string()],
                 runtime_dir: "/runtime".to_string(),
                 data_dir: data_dir.to_string_lossy().into_owned(),
                 state_dir: "/state".to_string(),

@@ -1,6 +1,7 @@
 use crate::{HostScope, PluginError, RegisteredService, Result, ServiceKind, TypedServiceHandle};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostMetadata {
@@ -12,10 +13,67 @@ pub struct HostMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostConnectionInfo {
+    /// Canonical configuration directory. On macOS this is typically
+    /// `~/Library/Application Support/bmux`; on Linux `~/.config/bmux`.
+    /// Plugins that want to read user configuration files should
+    /// prefer [`HostConnectionInfo::probe_config_file`] over joining
+    /// against this path directly, because the host may expose a
+    /// fallback chain through `config_dir_candidates`.
     pub config_dir: String,
+    /// Ordered fallback chain for config-file lookups. The first entry
+    /// is typically equal to `config_dir`; on macOS a second entry
+    /// points at `~/.config/bmux` so XDG-style setups (e.g. home-manager
+    /// managed dotfiles) resolve correctly. When empty, consumers fall
+    /// back to `[config_dir]` alone. Serialized payloads that predate
+    /// this field (recording playbooks, persisted state snapshots)
+    /// round-trip cleanly thanks to `#[serde(default)]`.
+    #[serde(default)]
+    pub config_dir_candidates: Vec<String>,
     pub runtime_dir: String,
     pub data_dir: String,
     pub state_dir: String,
+}
+
+impl HostConnectionInfo {
+    /// Probe the candidate config-dir chain for a file with the given
+    /// relative path. Returns the first `candidate.join(relative)`
+    /// that exists on disk.
+    ///
+    /// When `config_dir_candidates` is empty (older host or minimal
+    /// test construction), the probe falls back to checking
+    /// `config_dir.join(relative)` alone. This keeps the helper
+    /// forward-compatible with payloads serialized before the
+    /// candidate chain was introduced.
+    #[must_use]
+    pub fn probe_config_file(&self, relative: impl AsRef<Path>) -> Option<PathBuf> {
+        let relative = relative.as_ref();
+        let candidates: Vec<&str> = if self.config_dir_candidates.is_empty() {
+            vec![self.config_dir.as_str()]
+        } else {
+            self.config_dir_candidates
+                .iter()
+                .map(String::as_str)
+                .collect()
+        };
+        candidates
+            .into_iter()
+            .map(|dir| Path::new(dir).join(relative))
+            .find(|path| path.exists())
+    }
+
+    /// Return the ordered list of candidate config directories as
+    /// `Path` references. Falls back to `[config_dir]` when the
+    /// explicit chain is empty, matching [`Self::probe_config_file`].
+    pub fn config_dir_candidate_paths(&self) -> Vec<PathBuf> {
+        if self.config_dir_candidates.is_empty() {
+            vec![PathBuf::from(&self.config_dir)]
+        } else {
+            self.config_dir_candidates
+                .iter()
+                .map(PathBuf::from)
+                .collect()
+        }
+    }
 }
 
 /// Result of looking up a registered service with optional typed dispatch.
@@ -180,6 +238,7 @@ mod tests {
                 },
                 connection: HostConnectionInfo {
                     config_dir: "/tmp/config".to_string(),
+                    config_dir_candidates: vec!["/tmp/config".to_string()],
                     runtime_dir: "/tmp/runtime".to_string(),
                     data_dir: "/tmp/data".to_string(),
                     state_dir: "/tmp/state".to_string(),
