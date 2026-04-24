@@ -21,3 +21,12 @@ kind         = "command"
 capability   = "bmux.contexts.read"
 interface_id = "contexts-events"
 kind         = "event"
+
+# The contexts-events stream needs to reach streaming clients so the
+# attach pipeline can retarget on `Selected` /
+# `SessionActiveContextChanged` without polling. The server forwards
+# every emission on this kind as `ServerEvent::PluginBusEvent` over the
+# per-client event channel (see `spawn_plugin_bus_forwarder` in server).
+[[event_publications]]
+forward_to_streaming_clients = true
+kind                         = "bmux.contexts/contexts-events"

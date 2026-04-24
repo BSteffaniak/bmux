@@ -1446,6 +1446,41 @@ pub async fn run_session_attach_with_client(
                                 );
                             }
                         }
+                    } else if kind.as_str()
+                        == bmux_contexts_plugin_api::contexts_events::EVENT_KIND.as_str()
+                    {
+                        // Attach-retarget on context lifecycle events.
+                        // `create-context` and `select-context` each emit
+                        // two events of interest here: `Selected` (for
+                        // the initiating client) and
+                        // `SessionActiveContextChanged` (multi-client
+                        // broadcast). We act on whichever arrives first
+                        // per (session, context) pair and dedup via
+                        // `attached_context_id` — retargeting to the
+                        // already-attached context is a no-op but wastes
+                        // round-trips.
+                        match serde_json::from_slice::<
+                            bmux_contexts_plugin_api::contexts_events::ContextEvent,
+                        >(payload)
+                        {
+                            Ok(event) => {
+                                handle_context_event_forwarded(
+                                    &mut client,
+                                    &mut view_state,
+                                    &event,
+                                    self_client_id,
+                                    &attach_config,
+                                )
+                                .await?;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    kind = %kind,
+                                    error = %error,
+                                    "decoding forwarded contexts-events payload",
+                                );
+                            }
+                        }
                     }
                 } else {
                     if let bmux_client::ServerEvent::AttachViewChanged { .. } = &server_event {
@@ -2117,6 +2152,101 @@ pub async fn apply_plugin_command_outcome(
     _outcome: PluginCommandOutcome,
 ) -> std::result::Result<bool, ClientError> {
     Ok(false)
+}
+
+/// React to a `contexts-events` payload forwarded from the server
+/// via `ServerEvent::PluginBusEvent`.
+///
+/// Two event variants drive attach retargeting:
+///
+/// - `Selected { context_id }` — classic selection delta. We do NOT
+///   know which client initiated it from this variant, so we only
+///   retarget if the event id differs from the already-attached
+///   context. This is a safety net; the normal path uses
+///   `SessionActiveContextChanged`.
+///
+/// - `SessionActiveContextChanged { session_id, context_id,
+///   initiator_client_id }` — multi-client-aware broadcast. If the
+///   initiator is this client, always retarget (the local user just
+///   asked for a new tab). If the initiator is another client, only
+///   retarget when the attached session matches AND the user opted
+///   into follow semantics via `multi_client.default_follow_mode`.
+///
+/// Retargeting to the already-attached context is a no-op — early
+/// return so we don't thrash viewport / snapshot hydration.
+async fn handle_context_event_forwarded(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    event: &bmux_contexts_plugin_api::contexts_events::ContextEvent,
+    self_client_id: Uuid,
+    attach_config: &BmuxConfig,
+) -> std::result::Result<(), ClientError> {
+    use bmux_contexts_plugin_api::contexts_events::ContextEvent;
+    match event {
+        ContextEvent::SessionActiveContextChanged {
+            session_id,
+            context_id,
+            initiator_client_id,
+        } => {
+            if view_state.attached_context_id == Some(*context_id) {
+                return Ok(());
+            }
+            let is_self = *initiator_client_id == Some(self_client_id);
+            if !is_self {
+                // Only drag peers when follow-mode is on and they are
+                // attached to the same session as the initiator.
+                if !attach_config.multi_client.default_follow_mode {
+                    return Ok(());
+                }
+                if view_state.attached_id != *session_id {
+                    return Ok(());
+                }
+            }
+            debug!(
+                context_id = %context_id,
+                session_id = %session_id,
+                is_self,
+                "attach.context_event.retarget"
+            );
+            retarget_attach_to_context(client, view_state, *context_id).await?;
+            view_state.dirty.layout_needs_refresh = true;
+            view_state.dirty.full_pane_redraw = true;
+        }
+        ContextEvent::Selected { context_id } => {
+            // Safety net: if the richer
+            // `SessionActiveContextChanged` variant did not arrive
+            // (e.g. legacy select path, or a future plugin that only
+            // emits `Selected`), still retarget when this client
+            // appears to have initiated — we can't know the initiator
+            // here, so we rely on the `attached_context_id` diff as a
+            // conservative trigger and defer to
+            // `SessionActiveContextChanged` for multi-client policy.
+            if view_state.attached_context_id == Some(*context_id) {
+                return Ok(());
+            }
+            // Without initiator info we cannot drag peers safely; only
+            // retarget self. A reasonable heuristic is "always retarget
+            // on Selected" because `Selected` is always scoped to a
+            // client, and any plugin emitting it for another client
+            // should use the richer variant. Implementers of new
+            // selection events should emit
+            // `SessionActiveContextChanged` instead.
+            debug!(
+                context_id = %context_id,
+                "attach.context_event.selected_retarget"
+            );
+            retarget_attach_to_context(client, view_state, *context_id).await?;
+            view_state.dirty.layout_needs_refresh = true;
+            view_state.dirty.full_pane_redraw = true;
+        }
+        ContextEvent::Created { .. } | ContextEvent::Closed { .. } => {
+            // Creation and closure are informational here. Retarget
+            // happens via the accompanying `Selected` /
+            // `SessionActiveContextChanged` events that
+            // `create_context_local` / `close_context_local` emit.
+        }
+    }
+    Ok(())
 }
 
 pub async fn retarget_attach_to_context(
@@ -6564,17 +6694,107 @@ pub fn attach_key_event_actions(
     attach_input_processor: &mut InputProcessor,
     _ui_mode: AttachUiMode,
 ) -> Result<Vec<AttachEventAction>> {
-    // Accept Press and Repeat events. Release events are filtered out here
-    // and also inside InputProcessor's crossterm adapter as a safety net.
+    // Release events are filtered out here and also inside
+    // InputProcessor's crossterm adapter as a safety net.
     if key.kind == KeyEventKind::Release {
         return Ok(vec![AttachEventAction::Ignore]);
     }
 
     let actions = attach_input_processor.process_terminal_event(Event::Key(*key));
+    // Auto-repeat handling. Under kitty keyboard protocol (and on
+    // platforms where the OS emits repeat events liberally), a single
+    // quick tap can produce a `Press` followed by one or more `Repeat`
+    // events before the key is released. State-mutating actions
+    // (creating windows, closing panes, invoking plugin commands) must
+    // fire exactly once per logical press; navigation-style actions
+    // (focus, scroll, resize) benefit from repeat. `action_supports_repeat`
+    // classifies each resolved action so mutating ones are silently
+    // dropped on `Repeat` events.
+    let is_repeat = key.kind == KeyEventKind::Repeat;
     Ok(actions
         .into_iter()
+        .filter(|action| !is_repeat || action_supports_repeat(action))
         .map(runtime_action_to_attach_event_action)
         .collect())
+}
+
+/// Returns `true` when the action's semantics make sense under key
+/// auto-repeat.
+///
+/// Mutating actions (new/close/kill, plugin commands, detach, exit)
+/// must return `false` — each press must create exactly one mutation.
+/// Navigation and adjustment actions (focus, scroll, resize) return
+/// `true` so hold-to-navigate / hold-to-resize behave the same as
+/// pressing repeatedly.
+///
+/// `PluginCommand` is conservatively non-repeatable until the plugin
+/// manifest grows a per-command `accepts_repeat` flag; the current
+/// bundled plugins (windows, permissions, cluster) all dispatch
+/// mutating commands for which repeat would be harmful (multi-tab
+/// creation was the bug that motivated this rule).
+pub(super) const fn action_supports_repeat(action: &RuntimeAction) -> bool {
+    match action {
+        // Navigation — safe to repeat.
+        RuntimeAction::FocusNext
+        | RuntimeAction::FocusPrev
+        | RuntimeAction::FocusLeft
+        | RuntimeAction::FocusRight
+        | RuntimeAction::FocusUp
+        | RuntimeAction::FocusDown
+        | RuntimeAction::SessionNext
+        | RuntimeAction::SessionPrev
+        | RuntimeAction::WindowNext
+        | RuntimeAction::WindowPrev
+        | RuntimeAction::ScrollUpLine
+        | RuntimeAction::ScrollDownLine
+        | RuntimeAction::ScrollUpPage
+        | RuntimeAction::ScrollDownPage
+        | RuntimeAction::MoveCursorLeft
+        | RuntimeAction::MoveCursorRight
+        | RuntimeAction::MoveCursorUp
+        | RuntimeAction::MoveCursorDown
+        | RuntimeAction::IncreaseSplit
+        | RuntimeAction::DecreaseSplit
+        | RuntimeAction::ResizeLeft
+        | RuntimeAction::ResizeRight
+        | RuntimeAction::ResizeUp
+        | RuntimeAction::ResizeDown
+        | RuntimeAction::ForwardToPane(_) => true,
+        // Mutating and mode-switching — never repeat.
+        RuntimeAction::Quit
+        | RuntimeAction::Detach
+        | RuntimeAction::NewWindow
+        | RuntimeAction::NewSession
+        | RuntimeAction::ToggleSplitDirection
+        | RuntimeAction::SplitFocusedVertical
+        | RuntimeAction::SplitFocusedHorizontal
+        | RuntimeAction::RestartFocusedPane
+        | RuntimeAction::CloseFocusedPane
+        | RuntimeAction::ZoomPane
+        | RuntimeAction::ShowHelp
+        | RuntimeAction::EnterScrollMode
+        | RuntimeAction::ExitScrollMode
+        | RuntimeAction::ScrollTop
+        | RuntimeAction::ScrollBottom
+        | RuntimeAction::BeginSelection
+        | RuntimeAction::CopyScrollback
+        | RuntimeAction::ConfirmScrollback
+        | RuntimeAction::EnterWindowMode
+        | RuntimeAction::ExitMode
+        | RuntimeAction::WindowGoto1
+        | RuntimeAction::WindowGoto2
+        | RuntimeAction::WindowGoto3
+        | RuntimeAction::WindowGoto4
+        | RuntimeAction::WindowGoto5
+        | RuntimeAction::WindowGoto6
+        | RuntimeAction::WindowGoto7
+        | RuntimeAction::WindowGoto8
+        | RuntimeAction::WindowGoto9
+        | RuntimeAction::WindowClose
+        | RuntimeAction::EnterMode(_)
+        | RuntimeAction::SwitchProfile(_)
+        | RuntimeAction::PluginCommand { .. } => false,
+    }
 }
 
 pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEventAction {
@@ -7007,6 +7227,115 @@ mod tests {
         )
         .expect("attach key action should parse");
         assert!(actions.is_empty());
+    }
+
+    // ── Repeat-event filtering ───────────────────────────────────────
+    //
+    // Quick tap of the `c` binding (which resolves to
+    // `plugin:bmux.windows:new-window`) under kitty keyboard protocol
+    // can surface as a Press plus one or more Repeat events. The
+    // per-action `action_supports_repeat` classifier ensures the
+    // mutating PluginCommand only fires on Press.
+
+    #[test]
+    fn action_supports_repeat_allows_navigation() {
+        assert!(super::action_supports_repeat(&RuntimeAction::FocusNext));
+        assert!(super::action_supports_repeat(&RuntimeAction::ResizeLeft));
+        assert!(super::action_supports_repeat(&RuntimeAction::ScrollUpLine));
+        assert!(super::action_supports_repeat(
+            &RuntimeAction::ForwardToPane(b"x".to_vec())
+        ));
+    }
+
+    #[test]
+    fn action_supports_repeat_denies_mutating_actions() {
+        assert!(!super::action_supports_repeat(&RuntimeAction::NewWindow));
+        assert!(!super::action_supports_repeat(&RuntimeAction::NewSession));
+        assert!(!super::action_supports_repeat(
+            &RuntimeAction::CloseFocusedPane
+        ));
+        assert!(!super::action_supports_repeat(&RuntimeAction::Quit));
+        assert!(!super::action_supports_repeat(&RuntimeAction::Detach));
+    }
+
+    #[test]
+    fn action_supports_repeat_denies_plugin_commands() {
+        let action = RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "new-window".to_string(),
+            args: vec![],
+        };
+        assert!(!super::action_supports_repeat(&action));
+    }
+
+    #[test]
+    fn repeat_event_drops_plugin_command_action() {
+        // Binding `c` resolves to plugin:bmux.windows:new-window. A
+        // Repeat event for `c` must not emit a PluginCommand action.
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        // First simulate a Press so the InputProcessor is primed.
+        let press = attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('c'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            AttachUiMode::Normal,
+        )
+        .expect("press should parse");
+        let press_has_plugin = press
+            .iter()
+            .any(|a| matches!(a, AttachEventAction::PluginCommand { .. }));
+        assert!(press_has_plugin, "press should emit a PluginCommand");
+
+        let repeat = attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('c'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Repeat,
+            ),
+            &mut processor,
+            AttachUiMode::Normal,
+        )
+        .expect("repeat should parse");
+        let repeat_has_plugin = repeat
+            .iter()
+            .any(|a| matches!(a, AttachEventAction::PluginCommand { .. }));
+        assert!(!repeat_has_plugin, "repeat must not emit a PluginCommand");
+    }
+
+    #[test]
+    fn repeat_event_preserves_navigation_action() {
+        // Navigation-class runtime actions that survived the Repeat
+        // filter must all satisfy `action_supports_repeat`. We don't
+        // care about the specific chord here — just that the filter
+        // never lets through a repeat-unsafe runtime action on Repeat.
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let repeat = attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Left,
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Repeat,
+            ),
+            &mut processor,
+            AttachUiMode::Normal,
+        )
+        .expect("repeat should parse");
+        for action in &repeat {
+            if let AttachEventAction::Runtime(a) = action {
+                assert!(
+                    super::action_supports_repeat(a),
+                    "Repeat emitted a repeat-unsafe runtime action",
+                );
+            }
+            assert!(
+                !matches!(action, AttachEventAction::PluginCommand { .. }),
+                "Repeat must never emit a PluginCommand",
+            );
+        }
     }
 
     #[test]

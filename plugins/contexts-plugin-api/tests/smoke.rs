@@ -94,3 +94,37 @@ fn event_payload_alias_matches_declared_type() {
         serde_json::to_string(&via_type).unwrap()
     );
 }
+
+#[test]
+fn session_active_context_changed_round_trips() {
+    // Regression: the multi-client retarget broadcast carries
+    // session id, context id, and the initiating client (None =
+    // server-initiated) so attach runtimes can apply follow policy.
+    let initiator = uuid::Uuid::from_u128(0x1234);
+    let session = uuid::Uuid::from_u128(0x0A01);
+    let context = uuid::Uuid::from_u128(0x0B02);
+    let ev = ContextEvent::SessionActiveContextChanged {
+        session_id: session,
+        context_id: context,
+        initiator_client_id: Some(initiator),
+    };
+    let json = serde_json::to_string(&ev).expect("serialize");
+    assert!(json.contains("session_active_context_changed"), "{json}");
+    assert!(json.contains(&session.to_string()), "{json}");
+    assert!(json.contains(&context.to_string()), "{json}");
+    assert!(json.contains(&initiator.to_string()), "{json}");
+    let round: ContextEvent = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(ev, round);
+}
+
+#[test]
+fn session_active_context_changed_accepts_none_initiator() {
+    let ev = ContextEvent::SessionActiveContextChanged {
+        session_id: uuid::Uuid::nil(),
+        context_id: uuid::Uuid::nil(),
+        initiator_client_id: None,
+    };
+    let json = serde_json::to_string(&ev).expect("serialize");
+    let round: ContextEvent = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(ev, round);
+}

@@ -397,6 +397,12 @@ pub(super) async fn run_server_start(
                 server.spawn_plugin_bus_forwarder::<
                     bmux_scene_protocol::scene_protocol::EventPayload,
                 >(&publication.kind)
+            } else if publication.kind.as_str()
+                == bmux_contexts_plugin_api::contexts_events::EVENT_KIND.as_str()
+            {
+                server.spawn_plugin_bus_forwarder::<
+                    bmux_contexts_plugin_api::contexts_events::ContextEvent,
+                >(&publication.kind)
             } else {
                 tracing::warn!(
                     plugin_id = plugin.declaration.id.as_str(),

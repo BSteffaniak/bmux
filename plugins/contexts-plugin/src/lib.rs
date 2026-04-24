@@ -29,7 +29,8 @@ use bmux_contexts_plugin_api::contexts_state::{
     ContextsStateService,
 };
 use bmux_plugin::{
-    ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
+    HostRuntimeApi, ServiceCaller, TypedServiceCaller, global_event_bus,
+    global_plugin_state_registry,
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
@@ -556,11 +557,51 @@ fn create_context_local(
         });
     }
 
+    // Cross-plugin orchestration: atomic create-and-select. The
+    // sessions-plugin tracks each client's selected session
+    // independently from context state, so we mirror the selection
+    // there too. Without this, followers / multi-client attach views
+    // can see the new context in listings but cannot retarget to its
+    // pane runtime.
+    if let Err(reason) = select_session_via_sessions_plugin(caller, session_id) {
+        // Session select is best-effort; failing should not unwind
+        // the context creation. Log through the host so the error is
+        // observable without corrupting a TUI.
+        let _ = caller.log_write(&bmux_plugin_sdk::LogWriteRequest {
+            level: bmux_plugin_sdk::LogWriteLevel::Warn,
+            message: format!(
+                "contexts.create_context: failed to select created session (context_id={} session_id={}): {reason}",
+                context_summary.id, session_id.0,
+            ),
+            target: Some("bmux.contexts".to_string()),
+        });
+    }
+
+    // Event ordering: `Created` first (listings / catalog refresh),
+    // then `Selected` (so subscribers observing the selection delta
+    // retarget deterministically), then
+    // `SessionActiveContextChanged` (multi-client focus broadcast
+    // carrying enough context for attach runtimes to apply follow
+    // policy).
     let _ = global_event_bus().emit(
         &contexts_events::EVENT_KIND,
         ContextEvent::Created {
             context_id: context_summary.id,
             name,
+        },
+    );
+    let _ = global_event_bus().emit(
+        &contexts_events::EVENT_KIND,
+        ContextEvent::Selected {
+            context_id: context_summary.id,
+        },
+    );
+    let _ = global_event_bus().emit(
+        &contexts_events::EVENT_KIND,
+        ContextEvent::SessionActiveContextChanged {
+            session_id: session_id.0,
+            context_id: context_summary.id,
+            initiator_client_id: Some(client_id.0),
         },
     );
     Ok(ContextAck {
@@ -618,6 +659,19 @@ fn select_context_local(
             context_id: context.id,
         },
     );
+    // Multi-client retarget broadcast: carries the session id so
+    // other clients attached to the same session can decide whether
+    // to follow the selection based on their local follow policy.
+    if let Some(session_id) = session_after_select {
+        let _ = global_event_bus().emit(
+            &contexts_events::EVENT_KIND,
+            ContextEvent::SessionActiveContextChanged {
+                session_id: session_id.0,
+                context_id: context.id,
+                initiator_client_id: Some(client_id.0),
+            },
+        );
+    }
     Ok(ContextAck { id: context.id })
 }
 
@@ -653,7 +707,11 @@ fn close_context_local(
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| CloseContextError::Failed { reason })?;
 
-    let (removed_id, bound_session_id) = mutate_state_close(client_id, &ipc_selector, force)?;
+    let CloseOutcome {
+        removed_id,
+        bound_session_id,
+        replacement,
+    } = mutate_state_close(client_id, &ipc_selector, force)?;
 
     // Cross-plugin orchestration: if the closed context had a bound
     // session runtime, kill it via the sessions plugin.
@@ -667,7 +725,54 @@ fn close_context_local(
             context_id: removed_id,
         },
     );
+
+    // Auto-focus-sibling: if the caller had this context selected and
+    // a replacement was chosen by `ContextState::close`, mirror the
+    // selection into sessions-plugin and emit the same event pair
+    // `select-context` would, so attach runtimes retarget
+    // deterministically.
+    if let Some((replacement_context_id, replacement_session_id)) = replacement {
+        if let Some(session_id) = replacement_session_id
+            && let Err(reason) = select_session_via_sessions_plugin(caller, session_id)
+        {
+            let _ = caller.log_write(&bmux_plugin_sdk::LogWriteRequest {
+                level: bmux_plugin_sdk::LogWriteLevel::Warn,
+                message: format!(
+                    "contexts.close_context: failed to select sibling session (context_id={replacement_context_id} session_id={}): {reason}",
+                    session_id.0,
+                ),
+                target: Some("bmux.contexts".to_string()),
+            });
+        }
+        let _ = global_event_bus().emit(
+            &contexts_events::EVENT_KIND,
+            ContextEvent::Selected {
+                context_id: replacement_context_id,
+            },
+        );
+        if let Some(session_id) = replacement_session_id {
+            let _ = global_event_bus().emit(
+                &contexts_events::EVENT_KIND,
+                ContextEvent::SessionActiveContextChanged {
+                    session_id: session_id.0,
+                    context_id: replacement_context_id,
+                    initiator_client_id: Some(client_id.0),
+                },
+            );
+        }
+    }
+
     Ok(ContextAck { id: removed_id })
+}
+
+/// Result of `mutate_state_close`, extending `ContextState::close` with
+/// the sibling the underlying state picked for the caller's new active
+/// selection (if any). `replacement` is `None` when either no contexts
+/// remain or the caller didn't actually have this context selected.
+struct CloseOutcome {
+    removed_id: ::uuid::Uuid,
+    bound_session_id: Option<SessionId>,
+    replacement: Option<(::uuid::Uuid, Option<SessionId>)>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -675,14 +780,31 @@ fn mutate_state_close(
     client_id: ClientId,
     ipc_selector: &bmux_ipc::ContextSelector,
     force: bool,
-) -> Result<(::uuid::Uuid, Option<SessionId>), CloseContextError> {
+) -> Result<CloseOutcome, CloseContextError> {
     let state = local_state().map_err(|reason| CloseContextError::Failed { reason })?;
     let mut guard = state.write().map_err(|_| CloseContextError::Failed {
         reason: "context state lock poisoned".to_string(),
     })?;
-    guard
+    let (removed_id, bound_session_id) = guard
         .close(client_id, ipc_selector, force)
-        .map_err(|_reason| CloseContextError::NotFound)
+        .map_err(|_reason| CloseContextError::NotFound)?;
+    // After `close`, the caller's `selected_by_client` now either
+    // points at the replacement (if ContextState picked one) or is
+    // absent (no contexts remain). Read it back to drive the event
+    // emission above.
+    let replacement = guard
+        .selected_by_client
+        .get(&client_id)
+        .copied()
+        .map(|context_id| {
+            let session_id = guard.session_by_context.get(&context_id).copied();
+            (context_id, session_id)
+        });
+    Ok(CloseOutcome {
+        removed_id,
+        bound_session_id,
+        replacement,
+    })
 }
 
 // ── Cross-plugin helpers: sessions-commands typed dispatch ───────────
@@ -996,5 +1118,254 @@ mod tests {
             .current_for_client(client_id)
             .expect("current context should exist after close");
         assert_eq!(current.id, second_id);
+    }
+
+    // ── Event emission tests ─────────────────────────────────────────
+    //
+    // These tests verify the attach-side retarget contract:
+    // `create_context_local` must emit `Created` -> `Selected` ->
+    // `SessionActiveContextChanged` in order, and
+    // `close_context_local` must emit `Closed` followed by
+    // `Selected` + `SessionActiveContextChanged` for the sibling the
+    // caller was reseated onto. These event pairs are what the attach
+    // runtime subscribes to for deterministic focus switching.
+
+    /// Install a minimal cross-plugin test router that satisfies the
+    /// sessions-commands and clients-state calls contexts-plugin
+    /// makes from its create / close / select paths.
+    fn install_contexts_test_router(
+        fixed_client_id: Uuid,
+    ) -> bmux_plugin::test_support::TestServiceRouterGuard {
+        use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
+        let router: TestServiceRouter = std::sync::Arc::new(
+            move |_caller_plugin,
+                  _caller_client,
+                  _capability,
+                  _kind,
+                  interface,
+                  operation,
+                  _payload| {
+                match (interface, operation) {
+                    ("sessions-commands", "new-session") => {
+                        let ack: std::result::Result<
+                            bmux_sessions_plugin_api::sessions_commands::SessionAck,
+                            bmux_sessions_plugin_api::sessions_commands::NewSessionError,
+                        > = Ok(bmux_sessions_plugin_api::sessions_commands::SessionAck {
+                            id: Uuid::new_v4(),
+                        });
+                        encode_service_message(&ack)
+                    }
+                    ("sessions-commands", "select-session") => {
+                        let ack: std::result::Result<
+                            bmux_sessions_plugin_api::sessions_commands::SessionAck,
+                            bmux_sessions_plugin_api::sessions_commands::SelectSessionError,
+                        > = Ok(bmux_sessions_plugin_api::sessions_commands::SessionAck {
+                            id: Uuid::new_v4(),
+                        });
+                        encode_service_message(&ack)
+                    }
+                    ("sessions-commands", "kill-session") => {
+                        let ack: std::result::Result<
+                            bmux_sessions_plugin_api::sessions_commands::SessionAck,
+                            bmux_sessions_plugin_api::sessions_commands::KillSessionError,
+                        > = Ok(bmux_sessions_plugin_api::sessions_commands::SessionAck {
+                            id: Uuid::new_v4(),
+                        });
+                        encode_service_message(&ack)
+                    }
+                    ("clients-state", "current-client") => {
+                        let summary: std::result::Result<
+                            bmux_clients_plugin_api::clients_state::ClientSummary,
+                            bmux_clients_plugin_api::clients_state::ClientQueryError,
+                        > = Ok(bmux_clients_plugin_api::clients_state::ClientSummary {
+                            id: fixed_client_id,
+                            selected_session_id: None,
+                            selected_context_id: None,
+                            following_client_id: None,
+                            following_global: false,
+                        });
+                        encode_service_message(&summary)
+                    }
+                    ("logging-command/v1", "write") => encode_service_message(&()),
+                    _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "contexts_test_router",
+                    }),
+                }
+            },
+        );
+        install_test_service_router(router)
+    }
+
+    /// Minimal `NativeServiceContext` wired to the fake router above.
+    fn test_service_context(caller_client_id: Uuid) -> bmux_plugin_sdk::NativeServiceContext {
+        bmux_plugin_sdk::NativeServiceContext {
+            plugin_id: "bmux.contexts".to_string(),
+            request: bmux_plugin_sdk::ServiceRequest {
+                caller_plugin_id: "bmux.windows".to_string(),
+                service: bmux_plugin_sdk::RegisteredService {
+                    capability: HostScope::new("bmux.contexts.write")
+                        .expect("capability should parse"),
+                    kind: SdkServiceKind::Command,
+                    interface_id: "contexts-commands".to_string(),
+                    provider: bmux_plugin_sdk::ProviderId::Plugin("bmux.contexts".to_string()),
+                },
+                operation: "create-context".to_string(),
+                payload: Vec::new(),
+            },
+            required_capabilities: vec![
+                "bmux.contexts.read".to_string(),
+                "bmux.contexts.write".to_string(),
+                "bmux.clients.read".to_string(),
+                "bmux.sessions.write".to_string(),
+                "bmux.logs.write".to_string(),
+            ],
+            provided_capabilities: vec!["bmux.contexts.read".to_string()],
+            services: Vec::new(),
+            available_capabilities: vec![
+                "bmux.contexts.read".to_string(),
+                "bmux.contexts.write".to_string(),
+                "bmux.clients.read".to_string(),
+                "bmux.sessions.write".to_string(),
+                "bmux.logs.write".to_string(),
+            ],
+            enabled_plugins: vec!["bmux.contexts".to_string()],
+            plugin_search_roots: Vec::new(),
+            host: bmux_plugin_sdk::HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: env!("CARGO_PKG_VERSION").to_string(),
+                plugin_api_version: bmux_plugin_sdk::ApiVersion::new(1, 0),
+                plugin_abi_version: bmux_plugin_sdk::ApiVersion::new(1, 0),
+            },
+            connection: bmux_plugin_sdk::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                config_dir_candidates: vec!["/config".to_string()],
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+                state_dir: "/state".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            caller_client_id: Some(caller_client_id),
+            host_kernel_bridge: None,
+        }
+    }
+
+    /// Subscribe to the contexts-events bus and collect emissions from
+    /// the current thread for the duration of the test.
+    fn subscribe_events() -> std::sync::mpsc::Receiver<ContextEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut bus_rx = bmux_plugin::global_event_bus()
+            .subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)
+            .expect("event channel should be registered");
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("subscriber runtime should build");
+            runtime.block_on(async move {
+                while let Ok(event) = bus_rx.recv().await {
+                    if tx.send((*event).clone()).is_err() {
+                        return;
+                    }
+                }
+            });
+        });
+        rx
+    }
+
+    /// Drain events already available on `rx` without blocking past a
+    /// short grace window. Used at the end of tests to assert exact
+    /// emitted sequences.
+    fn drain_events_after_short_wait(
+        rx: &std::sync::mpsc::Receiver<ContextEvent>,
+    ) -> Vec<ContextEvent> {
+        // Allow the async subscriber thread a moment to forward the
+        // emissions before we call `try_recv`.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    #[test]
+    fn create_context_emits_created_selected_and_session_active_change_in_order() {
+        // Ensure `ContextState` is registered for this test thread;
+        // the plugin's `activate` normally does this during startup.
+        let state_handle = std::sync::Arc::new(std::sync::RwLock::new(ContextState::default()));
+        let _existing = global_plugin_state_registry().register::<ContextState>(&state_handle);
+        // The contexts-events bus channel is also registered during
+        // `activate`; outside of activate we may need to register it
+        // here. `register_channel` is idempotent in the sense that a
+        // second registration replaces the first with a fresh channel,
+        // which is fine for tests.
+        bmux_plugin::global_event_bus()
+            .register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
+
+        let client_id = Uuid::new_v4();
+        let _router_guard = install_contexts_test_router(client_id);
+        let events_rx = subscribe_events();
+        let ctx = test_service_context(client_id);
+
+        let ack = create_context_local(
+            &ctx,
+            Some(client_id),
+            Some("test-context".to_string()),
+            BTreeMap::new(),
+        )
+        .expect("create-context should succeed");
+
+        let emitted = drain_events_after_short_wait(&events_rx);
+        assert!(
+            emitted.len() >= 3,
+            "expected at least 3 events, got {emitted:?}"
+        );
+
+        // Find the triple of events for this context id and verify
+        // their ordering and content.
+        let context_id = ack.id;
+        let positions: Vec<(usize, &ContextEvent)> = emitted
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| match ev {
+                ContextEvent::Created { context_id: id, .. }
+                | ContextEvent::Selected { context_id: id }
+                | ContextEvent::SessionActiveContextChanged { context_id: id, .. } => {
+                    *id == context_id
+                }
+                ContextEvent::Closed { .. } => false,
+            })
+            .collect();
+        assert_eq!(
+            positions.len(),
+            3,
+            "expected Created+Selected+SessionActiveContextChanged for {context_id}, got {emitted:?}"
+        );
+        assert!(
+            matches!(positions[0].1, ContextEvent::Created { .. }),
+            "first event should be Created, got {:?}",
+            positions[0].1
+        );
+        assert!(
+            matches!(positions[1].1, ContextEvent::Selected { .. }),
+            "second event should be Selected, got {:?}",
+            positions[1].1
+        );
+        let ContextEvent::SessionActiveContextChanged {
+            initiator_client_id,
+            ..
+        } = positions[2].1
+        else {
+            panic!(
+                "third event should be SessionActiveContextChanged, got {:?}",
+                positions[2].1
+            );
+        };
+        assert_eq!(
+            *initiator_client_id,
+            Some(client_id),
+            "SessionActiveContextChanged must carry the initiating client id",
+        );
     }
 }

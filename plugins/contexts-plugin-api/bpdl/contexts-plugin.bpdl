@@ -94,6 +94,17 @@ interface contexts-events {
         closed { context-id: uuid },
         // A context was selected (became current for a client).
         selected { context-id: uuid },
+        // The active context for a session changed. Emitted whenever
+        // a client's "current context" for a given session flips
+        // (create, select, or close that promotes a sibling). Carries
+        // the initiating client id so attach runtimes can distinguish
+        // "my own action" from "another client's action" and apply
+        // multi-client follow policy.
+        session-active-context-changed {
+            session-id: uuid,
+            context-id: uuid,
+            initiator-client-id: uuid?,
+        },
     }
 
     events context-event;
