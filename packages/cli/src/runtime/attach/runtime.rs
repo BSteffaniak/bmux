@@ -1,4 +1,7 @@
 use anyhow::{Context, Result};
+use bmux_attach_layout_protocol::attach_layout_protocol::{
+    AttachLayoutSnapshot, AttachSurfaceSummary, STATE_KIND as ATTACH_LAYOUT_STATE_KIND,
+};
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::apply_attach_output_chunk_with;
 use bmux_attach_pipeline::{AttachChunkApplyOutcome, AttachOutputChunkMeta};
@@ -689,6 +692,7 @@ async fn notify_decoration_of_layout(
 
     let Some(current) = current else {
         tracing::trace!("notify_decoration_of_layout called (current=None)");
+        publish_attach_layout_snapshot(&[]);
         return std::collections::BTreeSet::new();
     };
 
@@ -697,6 +701,36 @@ async fn notify_decoration_of_layout(
         current_surfaces = current.scene.surfaces.len(),
         "notify_decoration_of_layout",
     );
+
+    // Build the generic attach-layout-protocol snapshot and publish on
+    // the state channel. Any plugin that subscribed to
+    // `attach-layout-protocol/attach-layout-snapshot` picks up the
+    // current layout plus every subsequent refresh. This replaces
+    // the push-only `push_decoration_pane_geometry` path for plugins
+    // that migrate to the generic channel.
+    let layout_entries: Vec<AttachSurfaceSummary> = current
+        .scene
+        .surfaces
+        .iter()
+        .map(|surface| AttachSurfaceSummary {
+            surface_id: surface.id,
+            pane_id: surface.pane_id,
+            rect: SceneRect {
+                x: surface.rect.x,
+                y: surface.rect.y,
+                w: surface.rect.w,
+                h: surface.rect.h,
+            },
+            content_rect: SceneRect {
+                x: surface.content_rect.x,
+                y: surface.content_rect.y,
+                w: surface.content_rect.w,
+                h: surface.content_rect.h,
+            },
+            visible: surface.visible,
+        })
+        .collect();
+    publish_attach_layout_snapshot(&layout_entries);
 
     let mut current_pane_ids = std::collections::BTreeSet::new();
     for surface in &current.scene.surfaces {
@@ -745,6 +779,22 @@ async fn notify_decoration_of_layout(
     );
 
     current_pane_ids
+}
+
+/// Publish an [`AttachLayoutSnapshot`] on the attach-layout state
+/// channel. Called from `notify_decoration_of_layout` on every layout
+/// refresh, and from attach startup to register the channel with an
+/// initial empty value. Late-subscribing plugins see the current
+/// value immediately; subsequent receivers fire on each refresh.
+fn publish_attach_layout_snapshot(surfaces: &[AttachSurfaceSummary]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REVISION: AtomicU64 = AtomicU64::new(0);
+    let revision = REVISION.fetch_add(1, Ordering::Relaxed) + 1;
+    let payload = AttachLayoutSnapshot {
+        surfaces: surfaces.to_vec(),
+        revision,
+    };
+    let _ = bmux_plugin::global_event_bus().publish_state(&ATTACH_LAYOUT_STATE_KIND, payload);
 }
 
 /// Reconcile the attach runtime's animation ticker against the Hz
@@ -1100,6 +1150,19 @@ pub async fn run_session_attach_with_client(
         StatusPosition::Off
     };
 
+    // Register the generic attach-layout state channel so any plugin
+    // subscribing via `EventBus::subscribe_state::<AttachLayoutSnapshot>`
+    // sees a valid initial payload. Subsequent layout refreshes update
+    // the retained value via `publish_attach_layout_snapshot`. The
+    // channel is process-wide; re-registration is a no-op.
+    let _ = bmux_plugin::global_event_bus().register_state_channel::<AttachLayoutSnapshot>(
+        ATTACH_LAYOUT_STATE_KIND,
+        AttachLayoutSnapshot {
+            surfaces: Vec::new(),
+            revision: 0,
+        },
+    );
+
     // Wait briefly for the decoration plugin to signal that it has
     // published its first scene. If the plugin isn't registered, this
     // returns immediately because the signal was never declared;
@@ -1116,6 +1179,19 @@ pub async fn run_session_attach_with_client(
             "scene-published",
             DECORATION_READY_TIMEOUT,
         );
+    }
+    // Honour any additional startup gates plugins have self-registered
+    // via `bmux_plugin::register_startup_ready_gate`. This is the
+    // generic replacement for the hardcoded decoration gate above; PR
+    // 3 of the decoration-leakage refactor deletes the hardcoded check
+    // once the decoration plugin registers its own gate.
+    for gate in bmux_plugin::registered_startup_ready_gates() {
+        if ready_tracker
+            .status(&gate.plugin_id, &gate.signal)
+            .is_some()
+        {
+            let _ = ready_tracker.await_ready(&gate.plugin_id, &gate.signal, gate.timeout);
+        }
     }
 
     // Prime the decoration scene cache with the decoration plugin's

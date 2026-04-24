@@ -5,6 +5,7 @@ members = [
     "examples/prompt-showcase",
     "examples/prompt-plugin-showcase",
     "packages/attach-token-state",
+    "packages/attach-layout-protocol",
     "packages/attach_pipeline",
     "packages/attach_pipeline/models",
     "packages/bmux",
@@ -37,6 +38,7 @@ members = [
     "packages/snapshot-runtime",
     "packages/sandbox-harness",
     "packages/scene-protocol",
+    "packages/scene-protocol-render",
     "packages/slots",
     "packages/bmux-env",
     "packages/terminal_protocol",
@@ -115,6 +117,7 @@ version    = "0.0.1-alpha.0"
 [workspace.dependencies]
 # Internal bmux packages
 bmux                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux" }
+bmux_attach_layout_protocol = { version = "0.0.1-alpha.0", default-features = false, path = "packages/attach-layout-protocol" }
 bmux_attach_pipeline        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/attach_pipeline" }
 bmux_attach_pipeline_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/attach_pipeline/models" }
 bmux_attach_token_state     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/attach-token-state" }
@@ -147,6 +150,7 @@ bmux_plugin_sdk             = { version = "0.0.1-alpha.0", default-features = fa
 bmux_recording_runtime      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/recording-runtime" }
 bmux_sandbox_harness        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/sandbox-harness" }
 bmux_scene_protocol         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/scene-protocol" }
+bmux_scene_protocol_render  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/scene-protocol-render" }
 bmux_server                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bmux_session_models         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
 bmux_session_state          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-state" }

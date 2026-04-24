@@ -1,0 +1,33 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Typed attach-layout state-channel protocol shared between core and any plugin that consumes layout snapshots"
+edition     = { workspace = true }
+keywords    = ["bmux", "protocol", "layout", "attach"]
+license     = { workspace = true }
+name        = "bmux_attach_layout_protocol"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_plugin_schema_macros = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+bmux_scene_protocol       = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+uuid                      = { workspace = true, features = ["serde", "std"] }
+
+[package.metadata.cargo-machete]
+# `serde` and `uuid` are consumed by code generated from the BPDL
+# schema via the `bmux_plugin_schema_macros::schema!` proc macro;
+# cargo-machete cannot see into proc-macro-generated source.
+# `bmux_plugin_sdk` is referenced by generated code for the typed
+# `INTERFACE_ID` / `EVENT_KIND` constants.
+# `bmux_scene_protocol` is referenced by generated code that resolves
+# the `import scene = bmux.scene;` alias in the BPDL source to
+# concrete Rust types like `bmux_scene_protocol::scene_protocol::Rect`.
+ignored = ["serde", "uuid", "bmux_plugin_sdk", "bmux_scene_protocol"]
+
+[features]
+default          = []
+fail-on-warnings = []

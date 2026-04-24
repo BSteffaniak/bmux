@@ -978,6 +978,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_attach_layout_protocol"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "bmux_scene_protocol",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_attach_pipeline"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -986,6 +997,7 @@ dependencies = [
  "bmux_client",
  "bmux_ipc",
  "bmux_scene_protocol",
+ "bmux_scene_protocol_render",
  "crossterm",
  "unicode-width",
  "uuid",
@@ -1015,6 +1027,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
+ "bmux_attach_layout_protocol",
  "bmux_attach_pipeline",
  "bmux_cli_output",
  "bmux_cli_schema",
@@ -1748,6 +1761,17 @@ dependencies = [
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_scene_protocol_render"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "bmux_scene_protocol",
+ "crossterm",
+ "unicode-width",
  "uuid",
 ]
 

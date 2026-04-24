@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Terminal-ANSI renderer for bmux scene-protocol paint commands and glyph helpers"
+edition     = { workspace = true }
+keywords    = ["bmux", "scene", "render", "ansi"]
+license     = { workspace = true }
+name        = "bmux_scene_protocol_render"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+anyhow              = { workspace = true }
+bmux_scene_protocol = { workspace = true }
+crossterm           = { workspace = true }
+unicode-width       = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true, features = ["serde", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -23,7 +23,9 @@ mod manifest;
 mod plugin_state;
 pub mod prompt;
 mod registry;
+pub mod render;
 mod service_location;
+mod startup_gate;
 mod static_vtable_registry;
 pub mod test_support;
 mod typed_service_caller;
@@ -52,7 +54,15 @@ pub use registry::{
     CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
     ServiceProvider,
 };
+pub use render::{
+    AttachRenderExtension, ExtensionRect, RenderExtensionRegistry,
+    global_render_extension_registry, register_render_extension, registered_render_extensions,
+};
 pub use service_location::{ServiceLocation, ServiceLocationMap, global_service_locations};
+pub use startup_gate::{
+    StartupReadyGate, StartupReadyGateRegistry, global_startup_ready_gate_registry,
+    register_startup_ready_gate, registered_startup_ready_gates,
+};
 pub use static_vtable_registry::{register_static_vtable, static_vtable};
 pub use typed_service_caller::TypedServiceCaller;
 

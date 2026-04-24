@@ -1,0 +1,51 @@
+// Attach-layout state-channel protocol.
+//
+// The attach runtime publishes an `attach-layout-snapshot` whenever
+// its surface layout changes. Any plugin that wants to observe pane
+// geometry (decoration, overlays, future live-rendering plugins)
+// subscribes to this state channel instead of relying on per-plugin
+// push helpers in core.
+//
+// Payload semantics:
+// - `surfaces` carries one entry per live attach surface. Order is
+//   deterministic so subscribers can zip against it for diffing.
+// - `revision` is a monotonic counter advancing on each publish.
+//
+// Subscribers use `EventBus::subscribe_state::<AttachLayoutSnapshot>`
+// to obtain the current value synchronously plus a live-update
+// receiver.
+
+plugin bmux.attach_layout version 1;
+
+import scene = bmux.scene;
+
+interface attach-layout-protocol {
+    // Minimal per-surface geometry needed by plugins reacting to
+    // layout changes. Mirrors the fields of `AttachSurface` the
+    // attach runtime already owns, trimmed to what a decoration-style
+    // plugin actually uses.
+    record attach-surface-summary {
+        // Surface identifier from the attach scene. For pane-owning
+        // surfaces this is typically the pane's own id.
+        surface_id: uuid,
+        // Pane id when the surface is backed by a pane; absent for
+        // non-pane surfaces (overlays, status bars, future kinds).
+        pane_id: uuid?,
+        // Outer bounds of the surface in terminal cells.
+        rect: scene.rect,
+        // Interior bounds the PTY (or other producer) is allowed to
+        // write into. For simple decorated panes this equals `rect`
+        // with a 1-cell inset; overlays may use the full `rect`.
+        content_rect: scene.rect,
+        // False when the surface exists logically but isn't on-screen
+        // (e.g. hidden tabs). Consumers usually skip invisible ones.
+        visible: bool,
+    }
+
+    record attach-layout-snapshot {
+        surfaces: list<attach-surface-summary>,
+        revision: u64,
+    }
+
+    @state events attach-layout-snapshot;
+}

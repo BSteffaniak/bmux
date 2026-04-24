@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal bmux packages
+bmux_attach_layout_protocol     = { workspace = true }
 bmux_attach_pipeline            = { workspace = true }
 bmux_cli_output                 = { workspace = true }
 bmux_cli_schema                 = { workspace = true }
@@ -159,6 +160,7 @@ default = [
 fail-on-warnings = [
     "bmux_cli_schema/fail-on-warnings",
     "bmux_cli_output/fail-on-warnings",
+    "bmux_attach_layout_protocol/fail-on-warnings",
     "bmux_attach_pipeline/fail-on-warnings",
     "bmux_client/fail-on-warnings",
     "bmux_clients_plugin?/fail-on-warnings",
