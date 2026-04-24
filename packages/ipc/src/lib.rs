@@ -1146,6 +1146,17 @@ pub enum Event {
         #[serde(default)]
         full_resync: bool,
     },
+    /// Plugin-bus emission forwarded from the server for client-side
+    /// consumption. Forwarded kinds are declared in each plugin's
+    /// manifest (`[[event_publications]] forward_to_streaming_clients
+    /// = true`). The payload is `bmux_codec`-encoded and carries the
+    /// plugin's typed event struct; consumers decode based on `kind`.
+    PluginBusEvent {
+        /// Canonical event kind (e.g. `"bmux.scene/scene-protocol"`).
+        kind: String,
+        /// `bmux_codec`-encoded typed payload.
+        payload: Vec<u8>,
+    },
 }
 
 /// Serialize any protocol message using the bmux binary codec.

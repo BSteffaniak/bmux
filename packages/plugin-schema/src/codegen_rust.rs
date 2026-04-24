@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::ast::{
-    EnumDef, Field, Interface, InterfaceItem, Operation, Primitive, RecordDef, Schema, TypeRef,
-    VariantCase, VariantDef,
+    DeliveryMode, EnumDef, Field, Interface, InterfaceItem, Operation, Primitive, RecordDef,
+    Schema, TypeRef, VariantCase, VariantDef,
 };
 
 /// Resolution table used by codegen to turn qualified BPDL type
@@ -199,22 +199,36 @@ fn emit_service_trait(iface: &Interface, imports: &ImportMap, out: &mut String) 
 ///
 /// Interfaces without an `events` declaration emit nothing here.
 fn emit_event_bindings(plugin_id: &str, iface: &Interface, imports: &ImportMap, out: &mut String) {
-    let Some(event_ty) = iface.items.iter().find_map(|item| match item {
-        InterfaceItem::Events(ty) => Some(ty),
+    let Some(decl) = iface.items.iter().find_map(|item| match item {
+        InterfaceItem::Events(decl) => Some(decl),
         _ => None,
     }) else {
         return;
     };
     let kind_literal = format!("{plugin_id}/{}", iface.name);
-    let _ = writeln!(
-        out,
-        "    /// Canonical [`bmux_plugin_sdk::PluginEventKind`] for this\n    /// interface's event stream. Publishers and subscribers both\n    /// reference this constant; the underlying wire value is\n    /// `\"{kind_literal}\"`.\n    pub const EVENT_KIND: ::bmux_plugin_sdk::PluginEventKind = ::bmux_plugin_sdk::PluginEventKind::from_static(\"{kind_literal}\");\n"
-    );
-    let ty = rust_type(event_ty, imports);
-    let _ = writeln!(
-        out,
-        "    /// Payload type published on this interface's event stream.\n    pub type EventPayload = {ty};\n"
-    );
+    let ty = rust_type(&decl.ty, imports);
+    match decl.delivery {
+        DeliveryMode::Broadcast => {
+            let _ = writeln!(
+                out,
+                "    /// Canonical [`bmux_plugin_sdk::PluginEventKind`] for this\n    /// interface's event stream. Publishers and subscribers both\n    /// reference this constant; the underlying wire value is\n    /// `\"{kind_literal}\"`.\n    pub const EVENT_KIND: ::bmux_plugin_sdk::PluginEventKind = ::bmux_plugin_sdk::PluginEventKind::from_static(\"{kind_literal}\");\n"
+            );
+            let _ = writeln!(
+                out,
+                "    /// Payload type published on this interface's event stream.\n    pub type EventPayload = {ty};\n"
+            );
+        }
+        DeliveryMode::State => {
+            let _ = writeln!(
+                out,
+                "    /// Canonical [`bmux_plugin_sdk::PluginEventKind`] for this\n    /// interface's state channel. Publishers call\n    /// `EventBus::publish_state`; subscribers call\n    /// `EventBus::subscribe_state` and receive the current value\n    /// synchronously followed by a live-update receiver. The\n    /// underlying wire value is `\"{kind_literal}\"`.\n    pub const STATE_KIND: ::bmux_plugin_sdk::PluginEventKind = ::bmux_plugin_sdk::PluginEventKind::from_static(\"{kind_literal}\");\n"
+            );
+            let _ = writeln!(
+                out,
+                "    /// Payload type published on this interface's state channel.\n    pub type StatePayload = {ty};\n"
+            );
+        }
+    }
 }
 
 fn emit_service_client(iface: &Interface, imports: &ImportMap, out: &mut String, trait_name: &str) {
@@ -550,6 +564,43 @@ mod tests {
         assert!(
             !rust.contains("EventPayload"),
             "interfaces without events must not emit EventPayload; got: {rust}"
+        );
+        assert!(
+            !rust.contains("STATE_KIND"),
+            "interfaces without events must not emit STATE_KIND; got: {rust}"
+        );
+        assert!(
+            !rust.contains("StatePayload"),
+            "interfaces without events must not emit StatePayload; got: {rust}"
+        );
+    }
+
+    #[test]
+    fn emits_state_bindings_for_state_annotated_events() {
+        let src = "plugin bmux.pane_runtime version 1;\n\
+                   interface pane-runtime-focus {\n\
+                     record focus-state { focused_pane_id: uuid }\n\
+                     @state events focus-state;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            rust.contains(
+                "pub const STATE_KIND: ::bmux_plugin_sdk::PluginEventKind = ::bmux_plugin_sdk::PluginEventKind::from_static(\"bmux.pane_runtime/pane-runtime-focus\");"
+            ),
+            "@state events must emit STATE_KIND; got: {rust}"
+        );
+        assert!(
+            rust.contains("pub type StatePayload = FocusState;"),
+            "@state events must emit StatePayload alias; got: {rust}"
+        );
+        assert!(
+            !rust.contains("EVENT_KIND"),
+            "@state events must not emit EVENT_KIND; got: {rust}"
+        );
+        assert!(
+            !rust.contains("pub type EventPayload"),
+            "@state events must not emit EventPayload; got: {rust}"
         );
     }
 

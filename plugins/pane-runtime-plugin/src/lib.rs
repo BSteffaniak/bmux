@@ -15,8 +15,10 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+use bmux_pane_runtime_plugin_api::pane_runtime_focus::{self, SessionFocusStateMap};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
+use std::collections::BTreeMap;
 
 mod handlers;
 
@@ -28,6 +30,23 @@ impl RustPlugin for PaneRuntimePlugin {
         &mut self,
         _context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        // Register the focus-state channel so subscribers (e.g.
+        // the decoration plugin) can observe the focused pane per
+        // session. Seeded empty — `publish_focus_state_snapshot`
+        // republishes the full map on every session-mutating pane
+        // command (via `handlers::publish_focus_state_snapshot`).
+        bmux_plugin::global_event_bus().register_state_channel::<SessionFocusStateMap>(
+            pane_runtime_focus::STATE_KIND,
+            SessionFocusStateMap {
+                entries: BTreeMap::new(),
+                revision: 0,
+            },
+        );
+        // Publish the initial snapshot so any already-registered
+        // subscribers see the current focus state immediately (even
+        // though the map is usually empty at activate time — sessions
+        // are created later).
+        handlers::publish_focus_state_snapshot();
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 

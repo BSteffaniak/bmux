@@ -3,8 +3,8 @@
 use crate::{
     Error, Span,
     ast::{
-        EnumCase, EnumDef, Field, Import, Interface, InterfaceItem, Operation, PluginHeader,
-        Primitive, RecordDef, Schema, TypeRef, VariantCase, VariantDef,
+        DeliveryMode, EnumCase, EnumDef, EventsDecl, Field, Import, Interface, InterfaceItem,
+        Operation, PluginHeader, Primitive, RecordDef, Schema, TypeRef, VariantCase, VariantDef,
     },
     lexer::{Token, TokenKind},
 };
@@ -99,7 +99,17 @@ impl Parser<'_> {
             TokenKind::Command => Ok(InterfaceItem::Command(
                 self.parse_operation(OpKind::Command)?,
             )),
-            TokenKind::Events => Ok(InterfaceItem::Events(self.parse_events()?)),
+            TokenKind::Events => Ok(InterfaceItem::Events(
+                self.parse_events(DeliveryMode::Broadcast)?,
+            )),
+            TokenKind::At => {
+                // Annotation prefix. Currently only `@state events T;` is
+                // recognised; future annotations (e.g. `@durable`)
+                // extend this arm. The annotation may only precede an
+                // `events` declaration.
+                let delivery = self.consume_events_delivery_annotation()?;
+                Ok(InterfaceItem::Events(self.parse_events(delivery)?))
+            }
             _ => Err(Error::Parse {
                 span: tok.span,
                 message: format!("unexpected token in interface body: {:?}", tok.kind),
@@ -220,14 +230,49 @@ impl Parser<'_> {
         })
     }
 
-    fn parse_events(&mut self) -> Result<TypeRef, Error> {
-        self.expect(&TokenKind::Events, "expected `events`")?;
+    fn parse_events(&mut self, delivery: DeliveryMode) -> Result<EventsDecl, Error> {
+        let span = self.expect(&TokenKind::Events, "expected `events`")?;
         let ty = self.parse_type()?;
         self.expect(
             &TokenKind::Semicolon,
             "expected `;` ending events declaration",
         )?;
-        Ok(ty)
+        Ok(EventsDecl { ty, delivery, span })
+    }
+
+    /// Consume an `@state` prefix annotation if present and return the
+    /// resulting delivery mode. Only `@state` is currently recognised;
+    /// any other `@<ident>` sequence before an `events` declaration is
+    /// rejected with a parse error pointing at the annotation site.
+    fn consume_events_delivery_annotation(&mut self) -> Result<DeliveryMode, Error> {
+        let at_span = self.expect(&TokenKind::At, "expected `@`")?;
+        let (name, span) = match self.advance().cloned() {
+            Some(Token {
+                kind: TokenKind::Identifier(name),
+                span,
+            }) => (name, span),
+            Some(other) => {
+                return Err(Error::Parse {
+                    span: other.span,
+                    message: format!("expected identifier after `@`; got {:?}", other.kind),
+                });
+            }
+            None => {
+                return Err(Error::Parse {
+                    span: at_span,
+                    message: "expected annotation identifier after `@`".to_string(),
+                });
+            }
+        };
+        match name.as_str() {
+            "state" => Ok(DeliveryMode::State),
+            other => Err(Error::Parse {
+                span,
+                message: format!(
+                    "unknown annotation `@{other}`; only `@state` is recognised as a delivery hint on `events` declarations",
+                ),
+            }),
+        }
     }
 
     fn parse_fields(&mut self) -> Result<Vec<Field>, Error> {
@@ -489,7 +534,45 @@ mod tests {
         let items = &schema.interfaces[0].items;
         assert!(matches!(items[1], InterfaceItem::Query(_)));
         assert!(matches!(items[2], InterfaceItem::Command(_)));
-        assert!(matches!(items[3], InterfaceItem::Events(_)));
+        let InterfaceItem::Events(decl) = &items[3] else {
+            panic!("expected events");
+        };
+        assert_eq!(decl.delivery, DeliveryMode::Broadcast);
+    }
+
+    #[test]
+    fn parses_state_annotated_events() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+             interface focus {\n\
+               record focus-state { pane_id: uuid }\n\
+               @state events focus-state;\n\
+             }",
+        );
+        let InterfaceItem::Events(decl) = &schema.interfaces[0].items[1] else {
+            panic!("expected events declaration");
+        };
+        assert_eq!(decl.delivery, DeliveryMode::State);
+    }
+
+    #[test]
+    fn rejects_unknown_events_annotation() {
+        let source = "plugin p version 1;\n\
+                      interface focus {\n\
+                        record r { pane_id: uuid }\n\
+                        @durable events r;\n\
+                      }";
+        let tokens = tokenize(source).expect("lex");
+        let err = parse(&tokens).expect_err("unknown annotation must fail");
+        match err {
+            Error::Parse { message, .. } => {
+                assert!(
+                    message.contains("@durable"),
+                    "parse error should mention the unknown annotation name; got: {message}",
+                );
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
     }
 
     #[test]

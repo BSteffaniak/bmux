@@ -76,6 +76,12 @@ struct State {
     /// Optional perf tracker that emits a `WARN` log when the script's
     /// P95 invoke time drifts above the threshold.
     script_perf: Option<PerfTracker>,
+    /// Diagnostic flag flipped on the first frame where the script was
+    /// actually invoked against at least one pane's geometry. Paired
+    /// with a one-shot info log so we can confirm the full
+    /// load-compile-geometry-invoke chain during debugging. Reset on
+    /// plugin activation (implicit via `State::default`).
+    script_first_invoke_logged: bool,
 }
 
 impl std::fmt::Debug for State {
@@ -270,6 +276,18 @@ impl DecorationStateService for DecorationServiceHandle {
                 })?;
             let pane_id = geometry.pane_id;
             let previous = state.geometry.insert(pane_id, geometry);
+            if previous.is_none() {
+                // One-shot breadcrumb per pane — confirms the attach
+                // runtime's layout-notify path is reaching the
+                // decoration plugin at all.
+                if let Some(geom) = state.geometry.get(&pane_id) {
+                    tracing::debug!(
+                        pane_id = %pane_id,
+                        rect = ?(geom.rect.x, geom.rect.y, geom.rect.w, geom.rect.h),
+                        "decoration plugin received first geometry for pane",
+                    );
+                }
+            }
             // Only bump the revision when geometry actually changed —
             // the attach runtime re-pushes on every layout diff even
             // when individual rects didn't move.
@@ -454,14 +472,19 @@ fn merge_script_paint_commands(
     // Advance the frame counter once per build — every pane sees the
     // same frame number within a single scene publication.
     state.script_frame = state.script_frame.saturating_add(1);
+    let is_first_frame = state.script_frame == 1;
     // Snapshot the set of panes we want to paint. We can't iterate
     // `state.geometry` while also reading from `state.activity` /
     // mutating `state.script_perf`, so collect the pane ids first.
     let pane_ids: Vec<Uuid> = state.geometry.keys().copied().collect();
+    let geometry_count = pane_ids.len();
+    let mut invoked = 0_usize;
+    let mut commands_merged = 0_usize;
     for pane_id in pane_ids {
         let Some(ctx) = decorate_context_for(state, pane_id) else {
             continue;
         };
+        invoked += 1;
         let outcome = match backend.invoke(&ctx) {
             Ok(o) => o,
             Err(e) => {
@@ -482,12 +505,30 @@ fn merge_script_paint_commands(
         if outcome.commands.is_empty() {
             continue;
         }
+        commands_merged += outcome.commands.len();
         // Get-or-create the surface entry for this pane.
         let surface = surfaces.entry(pane_id).or_insert_with(|| {
             let geom = state.geometry.get(&pane_id);
             surface_decoration_for(pane_id, state.default_border, geom)
         });
         surface.paint_commands.extend(outcome.commands);
+    }
+    if is_first_frame {
+        tracing::debug!(
+            geometry_count = geometry_count,
+            invoked = invoked,
+            commands_merged = commands_merged,
+            "first decoration script merge complete",
+        );
+    }
+    if !state.script_first_invoke_logged && invoked > 0 {
+        state.script_first_invoke_logged = true;
+        tracing::debug!(
+            geometry_count = geometry_count,
+            invoked = invoked,
+            commands_merged = commands_merged,
+            "first decoration script invocation with geometry",
+        );
     }
 }
 
@@ -865,6 +906,15 @@ impl RustPlugin for DecorationPlugin {
         // `~/Library/Application Support/bmux`) resolve correctly.
         let config_dir_candidates = context.connection.config_dir_candidate_paths();
         let loaded = load_theme_from_config_dir(&config_dir_candidates);
+        tracing::debug!(
+            candidates = ?config_dir_candidates,
+            theme_loaded = loaded.is_some(),
+            script_resolved = ?loaded
+                .as_ref()
+                .and_then(|(_, s)| s.as_ref())
+                .map(|s| s.path.display().to_string()),
+            "decoration plugin theme loader result",
+        );
         let (theme_extension, resolved_script) = match loaded {
             Some((ext, script)) => (Some(ext), script),
             None => (None, None),
@@ -873,12 +923,16 @@ impl RustPlugin for DecorationPlugin {
             .as_ref()
             .and_then(|t| t.animation.as_ref())
             .map(|a| a.hz);
+        let mut summary_theme_loaded = false;
+        let mut summary_script_loaded = false;
         if let Ok(mut state) = self.state.inner.lock() {
             state.current_theme = theme_extension;
             // Install the script backend (if any) before the first
             // revision bump so subscribers see the very first scene
             // with script output already merged.
             install_script_backend(&mut state, resolved_script);
+            summary_theme_loaded = state.current_theme.is_some();
+            summary_script_loaded = state.script_backend.is_some();
             // Bump the scene revision so the first build_scene() call
             // returns a non-zero revision, signalling consumers that
             // the plugin has published at least once. Emission runs
@@ -886,10 +940,26 @@ impl RustPlugin for DecorationPlugin {
             // scene on their next poll.
             bump_revision(&mut state);
         }
-        // Spawn the windows-plugin pane-event subscriber. Runs for
-        // the lifetime of the decoration plugin; the host tears down
-        // background threads at shutdown.
+        tracing::debug!(
+            theme_loaded = summary_theme_loaded,
+            script_loaded = summary_script_loaded,
+            animation_hz = ?animation_hz,
+            "decoration plugin activate complete",
+        );
+        // Spawn the windows-plugin pane-event broadcast subscriber.
+        // This captures transient focus-change / zoom / lifecycle
+        // events emitted by the windows plugin's focus-pane shim.
+        // Activation-order races can make this subscriber miss the
+        // initial focus event; the state-channel subscriber below
+        // covers that gap with `subscribe_state` semantics (new
+        // subscribers receive the current value immediately).
         spawn_windows_pane_event_subscriber(self.state.clone_arc());
+        // Spawn the pane-runtime focus-state subscriber. Unlike the
+        // broadcast subscriber above, this one is race-free: the
+        // event bus replays the most recently published
+        // `SessionFocusStateMap` to late subscribers before any live
+        // updates arrive.
+        spawn_pane_runtime_focus_state_subscriber(self.state.clone_arc());
         // Spawn the animation tick thread when the theme requests a
         // non-zero hz and a script is compiled. The thread holds a
         // `Weak` so it exits cleanly when the plugin is dropped.
@@ -928,6 +998,206 @@ impl RustPlugin for DecorationPlugin {
             service,
         );
     }
+
+    #[allow(clippy::too_many_lines)] // route_service! naturally spans every typed op; splitting hurts readability.
+    fn invoke_service(
+        &mut self,
+        context: bmux_plugin_sdk::NativeServiceContext,
+    ) -> bmux_plugin_sdk::ServiceResponse {
+        // IPC-level dispatch for every typed op declared in the
+        // decoration BPDL. The server routes `Request::InvokeService`
+        // here when a client (attach runtime, sibling plugin, etc.)
+        // reaches the decoration plugin over the wire rather than the
+        // in-process typed registry. Each arm decodes the
+        // `bmux_codec`-encoded payload, runs the same logic the
+        // `DecorationStateService` trait methods use against the
+        // shared state, and encodes the response back.
+        let state = self.state.clone_arc();
+        bmux_plugin_sdk::route_service!(context, {
+            "decoration-state", "pane-decoration" => |req: PaneDecorationArgs, _ctx| {
+                let result = state
+                    .lock()
+                    .ok()
+                    .map(|s| {
+                        if let Some(p) = s.panes.get(&req.pane_id) {
+                            return p.clone();
+                        }
+                        let focused = s.activity.get(&req.pane_id).is_some_and(|a| a.focused);
+                        default_pane_decoration(req.pane_id, s.default_border, focused)
+                    });
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(result)
+            },
+            "decoration-state", "default-border-style" => |_req: (), _ctx| {
+                let border = state
+                    .lock()
+                    .map_or(BorderStyle::default(), |s| s.default_border);
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(border)
+            },
+            "decoration-state", "scene-snapshot" => |_req: (), _ctx| {
+                let scene = state
+                    .lock()
+                    .map_or_else(|_| empty_scene(), |mut s| build_scene(&mut s));
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(scene)
+            },
+            "decoration-state", "pane-geometry" => |req: PaneGeometryArgs, _ctx| {
+                let geom = state.lock().ok().and_then(|s| s.geometry.get(&req.pane_id).cloned());
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(geom)
+            },
+            "decoration-state", "pane-activity" => |req: PaneActivityArgs, _ctx| {
+                let activity = state.lock().ok().and_then(|s| s.activity.get(&req.pane_id).cloned());
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(activity)
+            },
+            "decoration-state", "current-theme-extension" => |_req: (), _ctx| {
+                let theme = state.lock().ok().and_then(|s| s.current_theme.clone());
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(theme)
+            },
+            "decoration-state", "validate-theme-extension" => |req: ValidateThemeExtensionArgs, _ctx| {
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(validate_theme_extension_toml(&req.toml))
+            },
+            "decoration-state", "set-pane-border" => |req: SetPaneBorderArgs, _ctx| {
+                let outcome: Result<(), SetStyleError> = (|| {
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| SetStyleError::StyleUnsupported {
+                            style: "<poisoned>".into(),
+                        })?;
+                    let focused = state.activity.get(&req.pane_id).is_some_and(|a| a.focused);
+                    let entry = state
+                        .panes
+                        .entry(req.pane_id)
+                        .or_insert_with(|| default_pane_decoration(req.pane_id, req.border, focused));
+                    entry.border = req.border;
+                    entry.focused = focused;
+                    bump_revision(&mut state);
+                    Ok(())
+                })();
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
+            },
+            "decoration-state", "set-default-border" => |req: SetDefaultBorderArgs, _ctx| {
+                let outcome: Result<(), SetStyleError> = (|| {
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| SetStyleError::StyleUnsupported {
+                            style: "<poisoned>".into(),
+                        })?;
+                    state.default_border = req.border;
+                    bump_revision(&mut state);
+                    Ok(())
+                })();
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
+            },
+            "decoration-state", "notify-pane-geometry" => |req: NotifyPaneGeometryArgs, _ctx| {
+                let outcome: Result<(), NotifyError> = (|| {
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| NotifyError::InvalidArgument {
+                            reason: "decoration state mutex poisoned".to_string(),
+                        })?;
+                    let pane_id = req.geometry.pane_id;
+                    let previous = state.geometry.insert(pane_id, req.geometry);
+                    if previous.is_none()
+                        && let Some(geom) = state.geometry.get(&pane_id)
+                    {
+                        tracing::debug!(
+                            pane_id = %pane_id,
+                            rect = ?(geom.rect.x, geom.rect.y, geom.rect.w, geom.rect.h),
+                            "decoration plugin received first geometry for pane",
+                        );
+                    }
+                    let changed = previous
+                        .as_ref()
+                        .is_none_or(|prev| prev != state.geometry.get(&pane_id).unwrap());
+                    if changed {
+                        bump_revision(&mut state);
+                    }
+                    Ok(())
+                })();
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
+            },
+            "decoration-state", "notify-pane-event" => |req: NotifyPaneEventArgs, _ctx| {
+                let outcome: Result<(), NotifyError> = (|| {
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| NotifyError::InvalidArgument {
+                            reason: "decoration state mutex poisoned".to_string(),
+                        })?;
+                    apply_pane_event(&mut state, &req.event);
+                    Ok(())
+                })();
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
+            },
+            "decoration-state", "forget-pane" => |req: ForgetPaneArgs, _ctx| {
+                let outcome: Result<(), NotifyError> = (|| {
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| NotifyError::InvalidArgument {
+                            reason: "decoration state mutex poisoned".to_string(),
+                        })?;
+                    let removed = state.panes.remove(&req.pane_id).is_some()
+                        | state.geometry.remove(&req.pane_id).is_some()
+                        | state.activity.remove(&req.pane_id).is_some();
+                    if removed {
+                        bump_revision(&mut state);
+                    }
+                    Ok(())
+                })();
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
+            },
+        })
+    }
+}
+
+// ── Request payload structs for `invoke_service` dispatch ───────────
+//
+// BPDL ops carry named parameters; `invoke_service` receives them as a
+// single encoded struct. The structs below mirror the BPDL operation
+// signatures exactly so `bmux_codec` round-trips cleanly against the
+// client's encoded args.
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PaneDecorationArgs {
+    pane_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PaneGeometryArgs {
+    pane_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PaneActivityArgs {
+    pane_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ValidateThemeExtensionArgs {
+    toml: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SetPaneBorderArgs {
+    pane_id: Uuid,
+    border: BorderStyle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SetDefaultBorderArgs {
+    border: BorderStyle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct NotifyPaneGeometryArgs {
+    geometry: PaneGeometry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct NotifyPaneEventArgs {
+    event: PaneEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ForgetPaneArgs {
+    pane_id: Uuid,
 }
 
 /// Compile `script` into a fresh backend and install it on `state`.
@@ -965,9 +1235,17 @@ fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
     state.script_started_at = Some(Instant::now());
     state.script_frame = 0;
     state.script_perf = Some(PerfTracker::new(
-        script.path,
+        script.path.clone(),
         crate::scripting::DEFAULT_WARN_MS,
     ));
+    tracing::debug!(
+        script = ?script.path,
+        backend = state
+            .script_backend
+            .as_ref()
+            .map_or("none", |b| b.name()),
+        "decoration script compiled and installed",
+    );
 }
 
 /// Background timer that re-invokes the decoration script at `hz`
@@ -1023,6 +1301,133 @@ fn spawn_windows_pane_event_subscriber(state: Arc<Mutex<State>>) {
             apply_pane_event(&mut guard, &translate_windows_event(&event));
         }
     });
+}
+
+/// Subscribe to the pane-runtime focus-state channel and keep
+/// `state.activity` in sync with the authoritative per-session focus
+/// snapshot.
+///
+/// The state channel (registered by the pane-runtime plugin via
+/// [`EventBus::register_state_channel`]) retains the last-published
+/// `SessionFocusStateMap` and replays it synchronously to any new
+/// subscriber. This closes the late-subscriber gap that plain
+/// broadcast channels can't — regardless of whether the decoration
+/// plugin activates before or after pane-runtime, it observes the
+/// current focus state.
+///
+/// The subscriber thread reconciles the full map against
+/// `state.activity` on every update: every pane listed as
+/// `focused_pane_id` gets `activity.focused = true`, every other
+/// known pane gets `focused = false`. A fresh revision bumps the
+/// scene so downstream consumers (attach renderer) pick up the
+/// change.
+fn spawn_pane_runtime_focus_state_subscriber(state: Arc<Mutex<State>>) {
+    let subscribe_result = bmux_plugin::global_event_bus()
+        .subscribe_state::<bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap>(
+        &bmux_pane_runtime_plugin_api::pane_runtime_focus::STATE_KIND,
+    );
+    let (initial, mut rx) = match subscribe_result {
+        Ok(pair) => {
+            tracing::debug!("focus-state subscribe OK");
+            pair
+        }
+        Err(err) => {
+            tracing::warn!(%err, "focus-state subscribe FAILED");
+            return;
+        }
+    };
+    // Apply the initial snapshot immediately so any pane already
+    // carrying state sees the correct focus before the first
+    // `decorate(ctx)` invocation.
+    tracing::debug!(
+        entries = initial.entries.len(),
+        revision = initial.revision,
+        "focus-state initial applied"
+    );
+    if let Ok(mut guard) = state.lock() {
+        apply_focus_state_map(&mut guard, initial.as_ref());
+    }
+    std::thread::spawn(move || {
+        // Drive the watch receiver on a dedicated tokio runtime — we
+        // don't have an ambient runtime at this call site and the
+        // thread is plugin-lifetime long anyway, so the one-time
+        // construction cost is acceptable.
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            tracing::error!("focus-state subscriber thread FAILED to build tokio runtime");
+            return;
+        };
+        rt.block_on(async move {
+            while rx.changed().await.is_ok() {
+                let snapshot = rx.borrow().clone();
+                tracing::trace!(
+                    entries = snapshot.entries.len(),
+                    revision = snapshot.revision,
+                    "focus-state update"
+                );
+                let Ok(mut guard) = state.lock() else {
+                    break;
+                };
+                apply_focus_state_map(&mut guard, snapshot.as_ref());
+            }
+            tracing::debug!("focus-state subscriber loop exited");
+        });
+    });
+}
+
+/// Reconcile the decoration plugin's `state.activity` map against a
+/// pane-runtime focus snapshot. Any pane listed as a focused pane in
+/// the snapshot is marked `focused = true`; all other known panes are
+/// unfocused. The scene revision bumps when anything changes.
+fn apply_focus_state_map(
+    state: &mut State,
+    snapshot: &bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap,
+) {
+    use std::collections::BTreeSet;
+    let focused: BTreeSet<Uuid> = snapshot
+        .entries
+        .values()
+        .map(|entry| entry.focused_pane_id)
+        .collect();
+    let mut changed = false;
+    // Unfocus everything not in the focused set.
+    for (pane_id, act) in &mut state.activity {
+        let should_focus = focused.contains(pane_id);
+        if act.focused != should_focus {
+            act.focused = should_focus;
+            changed = true;
+        }
+    }
+    // Ensure focused panes we haven't seen before exist in the
+    // activity map with `focused = true`.
+    let snapshot_focused_count = focused.len();
+    for pane_id in focused {
+        let needs_insert = !state.activity.contains_key(&pane_id);
+        if needs_insert {
+            let entry = state.activity_mut(pane_id);
+            entry.focused = true;
+            state.sync_focused_mirror(pane_id, true);
+            changed = true;
+        } else {
+            // If the pane already existed but was just flipped above,
+            // mirror the focused bit onto the pane's decoration row.
+            state.sync_focused_mirror(pane_id, true);
+        }
+    }
+    let activity_focused_after = state.activity.values().filter(|a| a.focused).count();
+    let activity_total = state.activity.len();
+    tracing::trace!(
+        snapshot_focused = snapshot_focused_count,
+        changed,
+        activity_total,
+        activity_focused_after,
+        "apply_focus_state_map"
+    );
+    if changed {
+        bump_revision(state);
+    }
 }
 
 /// Translate a `windows.pane-event` enum value to the decoration

@@ -680,15 +680,23 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 /// service is resolved via the generic typed-dispatch registry —
 /// same pattern as the existing `prime_decoration_scene_cache` read
 /// path.
-fn notify_decoration_of_layout(
+async fn notify_decoration_of_layout(
+    client: &mut bmux_client::StreamingBmuxClient,
     previous: Option<&bmux_client::AttachLayoutState>,
     current: Option<&bmux_client::AttachLayoutState>,
 ) -> std::collections::BTreeSet<Uuid> {
     use bmux_scene_protocol::scene_protocol::Rect as SceneRect;
 
     let Some(current) = current else {
+        tracing::trace!("notify_decoration_of_layout called (current=None)");
         return std::collections::BTreeSet::new();
     };
+
+    tracing::trace!(
+        has_previous = previous.is_some(),
+        current_surfaces = current.scene.surfaces.len(),
+        "notify_decoration_of_layout",
+    );
 
     let mut current_pane_ids = std::collections::BTreeSet::new();
     for surface in &current.scene.surfaces {
@@ -711,7 +719,13 @@ fn notify_decoration_of_layout(
             w: surface.content_rect.w,
             h: surface.content_rect.h,
         };
-        crate::runtime::plugin_runtime::push_decoration_pane_geometry(pane_id, rect, content_rect);
+        crate::runtime::plugin_runtime::push_decoration_pane_geometry(
+            client,
+            pane_id,
+            rect,
+            content_rect,
+        )
+        .await;
     }
 
     if let Some(previous) = previous {
@@ -720,10 +734,15 @@ fn notify_decoration_of_layout(
                 continue;
             };
             if !current_pane_ids.contains(&pane_id) {
-                crate::runtime::plugin_runtime::forget_decoration_pane(pane_id);
+                crate::runtime::plugin_runtime::forget_decoration_pane(client, pane_id).await;
             }
         }
     }
+
+    tracing::trace!(
+        visible_with_pane_id = current_pane_ids.len(),
+        "notify_decoration_of_layout pushed geometry",
+    );
 
     current_pane_ids
 }
@@ -1104,7 +1123,11 @@ pub async fn run_session_attach_with_client(
     // `scene-protocol` event stream; this one-shot pull guarantees the
     // render path has something to consult on its very first frame
     // when the plugin is registered.
-    super::super::plugin_runtime::prime_decoration_scene_cache(&view_state.decoration_scene_cache);
+    super::super::plugin_runtime::prime_decoration_scene_cache(
+        &mut client,
+        &view_state.decoration_scene_cache,
+    )
+    .await;
 
     update_attach_viewport(
         &mut client,
@@ -1113,6 +1136,14 @@ pub async fn run_session_attach_with_client(
     )
     .await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
+    // `hydrate_attach_state_from_snapshot` populated
+    // `cached_layout_state` but did NOT push geometry to the
+    // decoration plugin. Do it here so the decoration plugin
+    // receives initial per-pane rects on attach entry. Subsequent
+    // layout changes flow through the loop-body call to
+    // `notify_decoration_of_layout` at the layout-refresh site.
+    let _ = notify_decoration_of_layout(&mut client, None, view_state.cached_layout_state.as_ref())
+        .await;
     refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
     sync_attach_active_mode_from_processor(&mut view_state, &attach_keymap, None);
     view_state.set_transient_status(
@@ -1298,6 +1329,48 @@ pub async fn run_session_attach_with_client(
                     perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
                         settings,
                     ));
+                } else if let bmux_client::ServerEvent::PluginBusEvent {
+                    ref kind,
+                    ref payload,
+                } = server_event
+                {
+                    // Server-forwarded plugin event. Currently we decode
+                    // decoration-scene events and update the scene cache;
+                    // other kinds are ignored (future plugins can extend
+                    // this dispatch).
+                    if kind.as_str()
+                        == bmux_scene_protocol::scene_protocol::EVENT_KIND.as_str()
+                    {
+                        match serde_json::from_slice::<
+                            bmux_scene_protocol::scene_protocol::EventPayload,
+                        >(payload)
+                        {
+                            Ok(scene) => {
+                                let requested_hz = scene
+                                    .animation
+                                    .as_ref()
+                                    .map(|hint| hint.target_hz);
+                                if let Ok(mut cache) =
+                                    view_state.decoration_scene_cache.write()
+                                    && cache.set_scene(scene)
+                                {
+                                    view_state.dirty.full_pane_redraw = true;
+                                }
+                                reconcile_decoration_animation_ticker(
+                                    &mut animation_ticker,
+                                    &mut animation_current_hz,
+                                    requested_hz,
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    kind = %kind,
+                                    error = %error,
+                                    "decoding forwarded decoration scene payload",
+                                );
+                            }
+                        }
+                    }
                 } else {
                     if let bmux_client::ServerEvent::AttachViewChanged { .. } = &server_event {
                         pane_output_pending = true;
@@ -1547,9 +1620,11 @@ pub async fn run_session_attach_with_client(
             // panes that disappeared from the new scene. The helpers
             // silently no-op when the decoration plugin isn't loaded.
             let current_pane_ids = notify_decoration_of_layout(
+                &mut client,
                 previous_layout.as_ref(),
                 view_state.cached_layout_state.as_ref(),
-            );
+            )
+            .await;
             drop(current_pane_ids);
             view_state.dirty.layout_needs_refresh = false;
 

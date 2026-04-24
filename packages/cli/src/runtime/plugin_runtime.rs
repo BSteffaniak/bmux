@@ -1064,26 +1064,42 @@ pub(super) fn ready_tracker_snapshot() -> bmux_plugin_sdk::ReadyTracker {
 /// The push-based event subscription path will later invalidate the
 /// cache incrementally; this helper handles the cold-start case where
 /// the render loop needs a scene before any event has fired.
-pub(super) fn prime_decoration_scene_cache(
+pub(super) async fn prime_decoration_scene_cache(
+    client: &mut bmux_client::StreamingBmuxClient,
     cache: &bmux_attach_pipeline::scene_cache::SharedSceneCache,
 ) {
-    let Ok(read_cap) = bmux_plugin_sdk::HostScope::new("bmux.decoration.read") else {
-        return;
+    let payload = match bmux_codec::to_vec(&()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(error = %error, "encoding scene-snapshot args");
+            return;
+        }
     };
-    let registry = typed_service_registry_snapshot();
-    let Some(handle) = registry.get(&(
-        read_cap,
-        bmux_plugin_sdk::ServiceKind::Query,
-        "decoration-state".to_string(),
-    )) else {
-        return;
+    let bytes = match client
+        .invoke_service_raw(
+            "bmux.decoration.read",
+            bmux_ipc::InvokeServiceKind::Query,
+            "decoration-state",
+            "scene-snapshot",
+            payload,
+        )
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::debug!(error = %error, "decoration scene-snapshot priming query failed");
+            return;
+        }
     };
-    let Ok(service) = handle.provider_as_trait::<
-        dyn bmux_decoration_plugin_api::decoration_state::DecorationStateService + Send + Sync,
-    >() else {
-        return;
+    let scene = match bmux_codec::from_bytes::<bmux_scene_protocol::scene_protocol::DecorationScene>(
+        &bytes,
+    ) {
+        Ok(scene) => scene,
+        Err(error) => {
+            tracing::warn!(error = %error, "decoding scene-snapshot response");
+            return;
+        }
     };
-    let scene = block_on_future(service.scene_snapshot());
     if let Ok(mut guard) = cache.write() {
         guard.set_scene(scene);
     }
@@ -1094,60 +1110,89 @@ pub(super) fn prime_decoration_scene_cache(
 /// no-ops when the decoration plugin is not loaded (mirrors the
 /// cold-start policy of [`prime_decoration_scene_cache`]).
 ///
-/// The decoration plugin is a write-capability holder for this
-/// command. Core invokes it through the generic typed-dispatch
-/// registry, matching the existing precedent for the read path.
-pub(super) fn push_decoration_pane_geometry(
+/// The decoration plugin lives in the server process; we route the
+/// command over the client/server IPC so the plugin actually
+/// receives the update. Errors are logged at debug only — the attach
+/// loop re-pushes on the next layout diff regardless.
+pub(super) async fn push_decoration_pane_geometry(
+    client: &mut bmux_client::StreamingBmuxClient,
     pane_id: uuid::Uuid,
     rect: bmux_scene_protocol::scene_protocol::Rect,
     content_rect: bmux_scene_protocol::scene_protocol::Rect,
 ) {
-    let Ok(write_cap) = bmux_plugin_sdk::HostScope::new("bmux.decoration.write") else {
-        return;
-    };
-    let registry = typed_service_registry_snapshot();
-    let Some(handle) = registry.get(&(
-        write_cap,
-        bmux_plugin_sdk::ServiceKind::Command,
-        "decoration-state".to_string(),
-    )) else {
-        return;
-    };
-    let Ok(service) = handle.provider_as_trait::<
-        dyn bmux_decoration_plugin_api::decoration_state::DecorationStateService + Send + Sync,
-    >() else {
-        return;
-    };
+    #[derive(serde::Serialize)]
+    struct Args {
+        geometry: bmux_decoration_plugin_api::decoration_state::PaneGeometry,
+    }
+    tracing::trace!(
+        pane_id = %pane_id,
+        "push_decoration_pane_geometry dispatching IPC",
+    );
     let geometry = bmux_decoration_plugin_api::decoration_state::PaneGeometry {
         pane_id,
         rect,
         content_rect,
     };
-    let _ = block_on_future(service.notify_pane_geometry(geometry));
+    let payload = match bmux_codec::to_vec(&Args { geometry }) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(error = %error, "encoding notify-pane-geometry args");
+            return;
+        }
+    };
+    if let Err(error) = client
+        .invoke_service_raw(
+            "bmux.decoration.write",
+            bmux_ipc::InvokeServiceKind::Command,
+            "decoration-state",
+            "notify-pane-geometry",
+            payload,
+        )
+        .await
+    {
+        tracing::debug!(
+            pane_id = %pane_id,
+            error = %error,
+            "notify-pane-geometry dispatch failed; decoration plugin may not be loaded",
+        );
+    }
 }
 
 /// Drop any decoration state the plugin is holding for `pane_id`.
 /// Called by the attach runtime when a pane disappears from the
 /// observed layout (close / session detach). Silently no-ops when
 /// the decoration plugin is not loaded.
-pub(super) fn forget_decoration_pane(pane_id: uuid::Uuid) {
-    let Ok(write_cap) = bmux_plugin_sdk::HostScope::new("bmux.decoration.write") else {
-        return;
+pub(super) async fn forget_decoration_pane(
+    client: &mut bmux_client::StreamingBmuxClient,
+    pane_id: uuid::Uuid,
+) {
+    #[derive(serde::Serialize)]
+    struct Args {
+        pane_id: uuid::Uuid,
+    }
+    let payload = match bmux_codec::to_vec(&Args { pane_id }) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(error = %error, "encoding forget-pane args");
+            return;
+        }
     };
-    let registry = typed_service_registry_snapshot();
-    let Some(handle) = registry.get(&(
-        write_cap,
-        bmux_plugin_sdk::ServiceKind::Command,
-        "decoration-state".to_string(),
-    )) else {
-        return;
-    };
-    let Ok(service) = handle.provider_as_trait::<
-        dyn bmux_decoration_plugin_api::decoration_state::DecorationStateService + Send + Sync,
-    >() else {
-        return;
-    };
-    let _ = block_on_future(service.forget_pane(pane_id));
+    if let Err(error) = client
+        .invoke_service_raw(
+            "bmux.decoration.write",
+            bmux_ipc::InvokeServiceKind::Command,
+            "decoration-state",
+            "forget-pane",
+            payload,
+        )
+        .await
+    {
+        tracing::debug!(
+            pane_id = %pane_id,
+            error = %error,
+            "forget-pane dispatch failed; decoration plugin may not be loaded",
+        );
+    }
 }
 
 /// Minimal single-threaded executor for driving a typed-dispatch
@@ -1161,6 +1206,7 @@ pub(super) fn forget_decoration_pane(pane_id: uuid::Uuid) {
 /// typed service are `async move { ... }` blocks that never suspend,
 /// so `Poll::Pending` shouldn't be reachable in practice; if it is
 /// observed we spin briefly and yield rather than hanging the thread.
+#[allow(dead_code)] // Kept for future sync-call-site typed dispatch (no current consumers).
 fn block_on_future<T>(
     fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>>,
 ) -> T {
@@ -2210,6 +2256,7 @@ mod tests {
             }],
             commands: Vec::new(),
             event_subscriptions: Vec::new(),
+            event_publications: Vec::new(),
             dependencies: Vec::new(),
             lifecycle: bmux_plugin::PluginLifecycle::default(),
             ready_signals: Vec::new(),
@@ -2379,6 +2426,7 @@ mod tests {
             ],
             commands: Vec::new(),
             event_subscriptions: Vec::new(),
+            event_publications: Vec::new(),
             dependencies: Vec::new(),
             lifecycle: bmux_plugin::PluginLifecycle::default(),
             ready_signals: Vec::new(),

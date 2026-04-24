@@ -237,6 +237,10 @@ fn publish_wire_event(event: bmux_ipc::Event) {
 /// component update. Mirrors the server's
 /// `emit_attach_view_changed_for_layout` helper so plugin-side
 /// handlers keep parity with the old IPC-handler behavior.
+///
+/// Also republishes the pane-runtime-focus state channel so
+/// subscribers (decoration plugin, future status bars) see the
+/// current focused pane without polling.
 fn emit_attach_view_changed_scene(session_id: SessionId) {
     let Some(handle) = super::session_runtime_handle() else {
         return;
@@ -250,6 +254,7 @@ fn emit_attach_view_changed_scene(session_id: SessionId) {
         revision,
         components: vec![bmux_ipc::AttachViewComponent::Scene],
     });
+    super::publish_focus_state_snapshot();
 }
 
 pub fn split_pane(

@@ -4459,6 +4459,79 @@ impl BmuxServer {
         let _ = self.shutdown_tx.send(true);
     }
 
+    /// Spawn a forwarder that subscribes to the process-local plugin
+    /// event bus for `kind` and broadcasts each emission to every
+    /// streaming client as [`Event::PluginBusEvent`].
+    ///
+    /// Bootstrap invokes this once per plugin declaration that opts
+    /// into `forward_to_streaming_clients` in its manifest. The task
+    /// holds a [`Weak<ServerState>`] so it terminates cleanly when
+    /// the server shuts down.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event bus rejects the subscription
+    /// request (e.g. no matching channel is registered). Callers may
+    /// choose to warn and continue — unregistered channels usually
+    /// mean the emitting plugin hasn't activated yet, which is fine
+    /// because the bus lets subscribers predate the channel in
+    /// `subscribe_waiting` mode. We use the strict `subscribe` here
+    /// to surface misconfigurations loudly.
+    pub fn spawn_plugin_bus_forwarder<T>(
+        &self,
+        kind: &bmux_plugin_sdk::PluginEventKind,
+    ) -> Result<()>
+    where
+        T: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        // Subscribe to the plugin-owned channel with its typed payload.
+        // The plugin registers the channel with the typed struct at
+        // activation time; consumers (this forwarder included) must
+        // pass the matching `T` for the bus to hand out receivers.
+        let mut rx = bmux_plugin::global_event_bus()
+            .subscribe::<T>(kind)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed subscribing to plugin bus kind {kind:?} for streaming forward: {error}"
+                )
+            })?;
+        let kind_string = kind.as_str().to_string();
+        let state = Arc::downgrade(&self.state);
+        tokio::spawn(async move {
+            loop {
+                let Ok(payload) = rx.recv().await else {
+                    return;
+                };
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                let encoded = match serde_json::to_vec(payload.as_ref()) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(
+                            kind = %kind_string,
+                            error = %error,
+                            "failed encoding plugin bus event payload; dropping",
+                        );
+                        continue;
+                    }
+                };
+                let event = Event::PluginBusEvent {
+                    kind: kind_string.clone(),
+                    payload: encoded,
+                };
+                if let Err(error) = emit_event(&state, event) {
+                    tracing::warn!(
+                        kind = %kind_string,
+                        error = %error,
+                        "failed emitting forwarded plugin bus event",
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Run the server accept loop until shutdown is requested.
     ///
     /// # Errors
@@ -5114,7 +5187,8 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         | Event::RecordingStarted { .. }
         | Event::RecordingStopped { .. }
         | Event::PerformanceSettingsUpdated { .. }
-        | Event::ControlCatalogChanged { .. } => None,
+        | Event::ControlCatalogChanged { .. }
+        | Event::PluginBusEvent { .. } => None,
     };
     record_to_all_runtimes(
         RecordingEventKind::ServerEvent,

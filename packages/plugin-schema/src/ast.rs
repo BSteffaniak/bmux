@@ -54,7 +54,35 @@ pub enum InterfaceItem {
     Command(Operation),
     /// Declares the event type emitted by this interface's event stream.
     /// An interface has at most one event declaration.
-    Events(TypeRef),
+    Events(EventsDecl),
+}
+
+/// An event-stream declaration. The delivery mode distinguishes
+/// one-shot broadcast events (default) from state channels that
+/// retain the latest value and replay it to late subscribers.
+///
+/// - `@state events T;` → [`DeliveryMode::State`]
+/// - `events T;` → [`DeliveryMode::Broadcast`] (default)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventsDecl {
+    pub ty: TypeRef,
+    pub delivery: DeliveryMode,
+    pub span: Span,
+}
+
+/// Delivery semantics for an interface's event stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeliveryMode {
+    /// Classic broadcast: emissions fan out to current subscribers.
+    /// Late subscribers miss prior emissions. Suitable for transient
+    /// events (bell, recording-started, per-tick updates).
+    #[default]
+    Broadcast,
+    /// Reactive state channel: the most-recently-published value is
+    /// retained and replayed synchronously to new subscribers before
+    /// any live updates. Suitable for shared state (focused pane,
+    /// zoom status, session list).
+    State,
 }
 
 /// A `record <name> { field: type, ... }` definition.

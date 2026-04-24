@@ -317,6 +317,10 @@ pub fn attach_open(
                 .current_for_client(client_id)
                 .map(|c| c.id);
             publish_event(Event::ClientAttached { id: session_id.0 });
+            // Publish focus state so the newly-attached client's
+            // consumers (decoration, future status plugins) observe
+            // the current focused pane without an extra round-trip.
+            super::publish_focus_state_snapshot();
             Ok(AttachReady {
                 session_id: session_id.0,
                 context_id,

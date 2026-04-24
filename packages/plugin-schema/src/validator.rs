@@ -232,8 +232,8 @@ fn resolve_type_references(
                     imports,
                 )?;
             }
-            InterfaceItem::Events(ty) => {
-                check_type(ty, type_names, &iface.name, declared_aliases, imports)?;
+            InterfaceItem::Events(decl) => {
+                check_type(&decl.ty, type_names, &iface.name, declared_aliases, imports)?;
             }
         }
     }

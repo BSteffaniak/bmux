@@ -3351,6 +3351,7 @@ minimum = "1.0"
                 event_subscriptions: vec![PluginEventSubscription::for_kind(
                     PluginEventKind::from_static("bmux.core/server-started"),
                 )],
+                event_publications: Vec::new(),
                 dependencies: Vec::new(),
                 lifecycle: crate::PluginLifecycle::default(),
                 ready_signals: Vec::new(),

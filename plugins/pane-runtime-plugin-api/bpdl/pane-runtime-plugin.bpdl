@@ -338,3 +338,37 @@ interface pane-runtime-events {
 
     events pane-event;
 }
+
+// Reactive state channel announcing the currently-focused pane (and
+// the zoomed pane, if any) for every live session. Pane-runtime is
+// the authoritative owner of this state; it publishes a fresh snapshot
+// whenever any session's focus/zoom transitions, and also at attach
+// time so newly-attached consumers observe the current state without
+// an extra query round-trip.
+//
+// Payload semantics:
+// - `entries` maps session-id to a per-session `focus-snapshot`. A
+//   session with no entry means "no focus state observed yet"; most
+//   consumers can ignore such gaps.
+// - `focused_pane_id` is the pane currently receiving input focus.
+// - `zoomed_pane_id` is the pane that has taken over the viewport
+//   via zoom mode; `None` means not zoomed.
+// - `revision` is a monotonic counter that advances on every publish;
+//   consumers can use it to deduplicate or order updates.
+//
+// Subscribers use `EventBus::subscribe_state::<SessionFocusStateMap>`
+// to obtain the current value synchronously plus a live-update
+// receiver.
+interface pane-runtime-focus {
+    record focus-snapshot {
+        focused_pane_id: uuid,
+        zoomed_pane_id: uuid?,
+    }
+
+    record session-focus-state-map {
+        entries: map<uuid, focus-snapshot>,
+        revision: u64,
+    }
+
+    @state events session-focus-state-map;
+}

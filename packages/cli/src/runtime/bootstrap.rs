@@ -380,6 +380,42 @@ pub(super) async fn run_server_start(
         pane_shell_integration_override,
     );
     register_plugin_service_handlers(&server, &config, &paths, &registry)?;
+    // Spawn a plugin-bus → streaming-client forwarder task for every
+    // `event_publications` entry that opted into
+    // `forward_to_streaming_clients`. These live for the server's
+    // lifetime; they terminate automatically when the server drops
+    // (see `spawn_plugin_bus_forwarder` for the Weak-held shutdown
+    // story).
+    for plugin in &loaded_plugins {
+        for publication in &plugin.declaration.event_publications {
+            if !publication.forward_to_streaming_clients {
+                continue;
+            }
+            let spawn_result = if publication.kind.as_str()
+                == bmux_scene_protocol::scene_protocol::EVENT_KIND.as_str()
+            {
+                server.spawn_plugin_bus_forwarder::<
+                    bmux_scene_protocol::scene_protocol::EventPayload,
+                >(&publication.kind)
+            } else {
+                tracing::warn!(
+                    plugin_id = plugin.declaration.id.as_str(),
+                    kind = publication.kind.as_str(),
+                    "no plugin-bus forwarder specialization registered for this kind; \
+                     streaming clients will miss emissions until one is added in bootstrap",
+                );
+                continue;
+            };
+            if let Err(error) = spawn_result {
+                tracing::warn!(
+                    plugin_id = plugin.declaration.id.as_str(),
+                    kind = publication.kind.as_str(),
+                    error = %error,
+                    "failed to spawn plugin-bus forwarder; streaming clients will miss emissions for this kind",
+                );
+            }
+        }
+    }
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_started"))?;

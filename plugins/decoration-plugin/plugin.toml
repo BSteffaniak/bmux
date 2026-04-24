@@ -6,6 +6,10 @@ provided_features     = ["bmux.decoration"]
 required_capabilities = ["bmux.events.subscribe"]
 version               = "0.0.1-alpha.0"
 
+[[dependencies]]
+plugin_id   = "bmux.pane_runtime"
+version_req = ">=0.0.1-alpha.0"
+
 [[services]]
 capability   = "bmux.decoration.read"
 interface_id = "decoration-state"
@@ -24,3 +28,11 @@ kind         = "event"
 [[ready_signals]]
 description = "Initial DecorationScene has been published to the event bus."
 name        = "scene-published"
+
+# The decoration scene stream needs to reach streaming clients so the
+# attach-pipeline renderer can apply paint commands. The server
+# forwards every emission on this kind as
+# `ServerEvent::PluginBusEvent` over the per-client event channel.
+[[event_publications]]
+forward_to_streaming_clients = true
+kind                         = "bmux.scene/scene-protocol"

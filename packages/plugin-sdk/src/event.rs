@@ -108,6 +108,39 @@ impl PluginEventSubscription {
     }
 }
 
+/// A declaration that a plugin publishes events of a given kind, with
+/// hints about how the host should route them.
+///
+/// Plugins list publications in their `plugin.toml` so the host runtime
+/// can wire up routing without scanning BPDL schemas at runtime. The
+/// primary consumer today is the server's plugin-bus forwarder, which
+/// propagates emissions over the wire to streaming clients when
+/// `forward_to_streaming_clients` is true.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginEventPublication {
+    /// Canonical event kind the plugin emits.
+    pub kind: PluginEventKind,
+    /// When true, the server forwards every emission of `kind` onto
+    /// each connected streaming client's event channel. Clients
+    /// subscribe via the normal `ServerEvent::PluginBusEvent` arm and
+    /// decode the payload using the plugin's typed schema. Leave this
+    /// false for events that are purely intra-server (plugin-to-plugin)
+    /// to avoid paying the IPC cost.
+    #[serde(default)]
+    pub forward_to_streaming_clients: bool,
+}
+
+impl PluginEventPublication {
+    /// Construct a publication entry for `kind` with forwarding on.
+    #[must_use]
+    pub const fn streaming(kind: PluginEventKind) -> Self {
+        Self {
+            kind,
+            forward_to_streaming_clients: true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

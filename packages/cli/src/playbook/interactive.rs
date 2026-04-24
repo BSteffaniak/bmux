@@ -2603,6 +2603,7 @@ const fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
             "performance_settings_updated"
         }
         bmux_client::ServerEvent::ControlCatalogChanged { .. } => "control_catalog_changed",
+        bmux_client::ServerEvent::PluginBusEvent { .. } => "plugin_bus_event",
     }
 }
 

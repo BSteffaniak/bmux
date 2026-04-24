@@ -1,6 +1,7 @@
 use bmux_plugin_sdk::{
     CommandExecutionKind, HostScope, PluginCommand, PluginContext, PluginError,
-    PluginEventSubscription, PluginFeature, PluginService, Result, VersionRange,
+    PluginEventPublication, PluginEventSubscription, PluginFeature, PluginService, Result,
+    VersionRange,
 };
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
@@ -137,6 +138,8 @@ pub struct PluginDeclaration {
     pub commands: Vec<PluginCommand>,
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
+    #[serde(default)]
+    pub event_publications: Vec<PluginEventPublication>,
     #[serde(default)]
     pub dependencies: Vec<PluginDependency>,
     #[serde(default)]
@@ -369,6 +372,7 @@ mod tests {
                 },
             ],
             event_subscriptions: Vec::new(),
+            event_publications: Vec::new(),
             dependencies: Vec::new(),
             lifecycle: super::PluginLifecycle::default(),
             ready_signals: Vec::new(),
@@ -413,6 +417,7 @@ mod tests {
                 expose_in_cli: true,
             }],
             event_subscriptions: Vec::new(),
+            event_publications: Vec::new(),
             dependencies: Vec::new(),
             lifecycle: super::PluginLifecycle::default(),
             ready_signals: Vec::new(),
@@ -444,6 +449,7 @@ mod tests {
             services: Vec::new(),
             commands: Vec::new(),
             event_subscriptions: Vec::new(),
+            event_publications: Vec::new(),
             dependencies: vec![
                 PluginDependency {
                     plugin_id: PluginId::new("bmux.sessions").expect("dep id should parse"),

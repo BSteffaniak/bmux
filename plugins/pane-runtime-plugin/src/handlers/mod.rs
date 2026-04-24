@@ -10,7 +10,12 @@
 //! tests that didn't register a real manager), handlers return a
 //! `handle_unavailable` error response.
 
+use bmux_pane_runtime_plugin_api::pane_runtime_focus::{
+    FocusSnapshot, STATE_KIND as FOCUS_STATE_KIND, SessionFocusStateMap,
+};
 use bmux_plugin_sdk::{NativeServiceContext, ServiceResponse};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod attach_commands;
 pub mod attach_state;
@@ -121,4 +126,48 @@ pub(super) fn session_runtime_handle()
     bmux_plugin::global_plugin_state_registry()
         .get::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
+}
+
+/// Monotonic counter for the focus-state channel. Incremented once
+/// per [`publish_focus_state_snapshot`] call so subscribers can
+/// deduplicate or order updates without relying on wall-clock time.
+static FOCUS_STATE_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Publish the current per-session focus snapshot on the
+/// `pane-runtime-focus` state channel.
+///
+/// Walks every live session via `list_session_ids` + `snapshot_session_runtime`
+/// and builds a fresh `SessionFocusStateMap`. Called by pane-command
+/// handlers after every mutation that could change focus (split,
+/// focus, close, restart, zoom), and by `attach-open` so newly-
+/// attached consumers observe the current state without round-trip.
+/// Silently no-ops when the session-runtime manager handle isn't
+/// registered (early boot, unit tests).
+pub(crate) fn publish_focus_state_snapshot() {
+    let Some(handle) = session_runtime_handle() else {
+        return;
+    };
+    let mut entries = BTreeMap::new();
+    for session_id in handle.0.list_session_ids() {
+        let Some(snapshot) = handle.0.snapshot_session_runtime(session_id) else {
+            continue;
+        };
+        entries.insert(
+            session_id.0,
+            FocusSnapshot {
+                focused_pane_id: snapshot.focused_pane_id,
+                // Zoom state isn't exposed on the snapshot API today;
+                // a future trait method on `SessionRuntimeManagerApi`
+                // could thread this through. Consumers treat `None`
+                // as "not zoomed" and use `focused_pane_id` directly.
+                zoomed_pane_id: None,
+            },
+        );
+    }
+    let revision = FOCUS_STATE_REVISION.fetch_add(1, Ordering::Relaxed) + 1;
+    let payload = SessionFocusStateMap { entries, revision };
+    // Ignore publish errors — the channel is registered in `activate`
+    // before any mutation can run; a failure here means the plugin
+    // was dropped, and there's nothing to do.
+    let _ = bmux_plugin::global_event_bus().publish_state(&FOCUS_STATE_KIND, payload);
 }

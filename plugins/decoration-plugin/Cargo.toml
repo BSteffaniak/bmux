@@ -15,17 +15,19 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bmux_decoration_plugin_api = { workspace = true }
-bmux_plugin                = { workspace = true }
-bmux_plugin_sdk            = { workspace = true }
-bmux_scene_protocol        = { workspace = true }
-bmux_windows_plugin_api    = { workspace = true }
-mlua                       = { workspace = true, optional = true }
-serde                      = { workspace = true, features = ["derive", "std"] }
-thiserror                  = { workspace = true }
-toml                       = { workspace = true, features = ["parse"] }
-tracing                    = { workspace = true, features = ["std"] }
-uuid                       = { workspace = true, features = ["serde", "std"] }
+bmux_decoration_plugin_api   = { workspace = true }
+bmux_pane_runtime_plugin_api = { workspace = true }
+bmux_plugin                  = { workspace = true }
+bmux_plugin_sdk              = { workspace = true }
+bmux_scene_protocol          = { workspace = true }
+bmux_windows_plugin_api      = { workspace = true }
+mlua                         = { workspace = true, optional = true }
+serde                        = { workspace = true, features = ["derive", "std"] }
+thiserror                    = { workspace = true }
+tokio                        = { workspace = true, features = ["rt", "sync"] }
+toml                         = { workspace = true, features = ["parse"] }
+tracing                      = { workspace = true, features = ["std"] }
+uuid                         = { workspace = true, features = ["serde", "std"] }
 
 [package.metadata.cargo-machete]
 # `serde` is consumed by the BPDL-generated bindings re-exported from the

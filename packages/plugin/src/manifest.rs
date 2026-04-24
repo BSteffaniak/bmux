@@ -3,8 +3,8 @@ use crate::{
     PluginOwnedPath,
 };
 use bmux_plugin_sdk::{
-    ApiVersion, HostScope, PluginCommand, PluginError, PluginEventSubscription, PluginFeature,
-    PluginService, Result, VersionRange,
+    ApiVersion, HostScope, PluginCommand, PluginError, PluginEventPublication,
+    PluginEventSubscription, PluginFeature, PluginService, Result, VersionRange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,6 +104,13 @@ pub struct PluginManifest {
     pub commands: Vec<PluginCommand>,
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
+    /// Declares the event kinds this plugin publishes. Used by the
+    /// server to wire up routing (e.g. forwarding to streaming
+    /// clients) without scanning BPDL schemas at runtime. Omitting
+    /// the field or leaving it empty means the plugin's emissions
+    /// stay intra-process.
+    #[serde(default)]
+    pub event_publications: Vec<PluginEventPublication>,
     #[serde(default)]
     pub dependencies: Vec<PluginManifestDependency>,
     #[serde(default)]
@@ -192,6 +199,7 @@ impl PluginManifest {
             services: self.services.clone(),
             commands: self.commands.clone(),
             event_subscriptions: self.event_subscriptions.clone(),
+            event_publications: self.event_publications.clone(),
             dependencies: self
                 .dependencies
                 .iter()

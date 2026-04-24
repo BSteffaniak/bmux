@@ -72,7 +72,7 @@ pub use context::{
     encode_host_kernel_bridge_plugin_command_payload,
 };
 pub use error::{PluginError, Result};
-pub use event::{PluginEvent, PluginEventPayload, PluginEventSubscription};
+pub use event::{PluginEvent, PluginEventPayload, PluginEventPublication, PluginEventSubscription};
 pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost, ResolvedService};
 pub use host_services::{
     LogWriteLevel, LogWriteRequest, PluginCommandOutcome, RecordingWriteEventRequest,
