@@ -11,10 +11,13 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_codec                = { workspace = true }
+bmux_ipc                  = { workspace = true }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
 bmux_scene_protocol       = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std"] }
+thiserror                 = { workspace = true }
 uuid                      = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]

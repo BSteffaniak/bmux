@@ -988,6 +988,22 @@ async fn maybe_emit_attach_frame_perf(
     Ok(())
 }
 
+/// Install every bundled plugin's client-side render extension.
+///
+/// Each `install` call is idempotent (uses its own `OnceLock` to
+/// guard extension construction). Extensions are feature-gated so
+/// builds that don't bundle a plugin simply skip its install call.
+///
+/// Called once per attach session from
+/// [`run_session_attach_with_client`]; subsequent attaches reuse the
+/// already-installed extensions.
+fn install_bundled_render_extensions() {
+    #[cfg(feature = "bundled-plugin-decoration")]
+    {
+        bmux_decoration_plugin_renderer::install();
+    }
+}
+
 #[allow(clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
 pub async fn run_session_attach_with_client(
     mut client: BmuxClient,
@@ -1002,6 +1018,12 @@ pub async fn run_session_attach_with_client(
     if target.is_some() && follow.is_some() {
         anyhow::bail!("attach accepts either a session target or --follow, not both");
     }
+
+    // Install client-side render extensions for any bundled plugins
+    // that ship one. Each crate's `install` is idempotent; process-
+    // wide state is initialised on first call. Extensions populate
+    // themselves lazily as scene events arrive.
+    install_bundled_render_extensions();
 
     let follow_target_id = match follow {
         Some(follow_target) => Some(parse_uuid_value(follow_target, "follow target client id")?),
@@ -1426,6 +1448,21 @@ pub async fn run_session_attach_with_client(
                                     .animation
                                     .as_ref()
                                     .map(|hint| hint.target_hz);
+                                // Re-emit on the local event bus so any
+                                // render extension subscribing via
+                                // `EventBus::subscribe::<DecorationScene>`
+                                // sees the latest scene without
+                                // decoding IPC bytes itself. Emit
+                                // succeeds when a render extension (or
+                                // other local consumer) has registered
+                                // the broadcast channel; otherwise it
+                                // returns `ChannelNotRegistered`, which
+                                // we deliberately ignore so builds
+                                // without any consumer stay silent.
+                                let _ = bmux_plugin::global_event_bus().emit(
+                                    &bmux_scene_protocol::scene_protocol::EVENT_KIND,
+                                    scene.clone(),
+                                );
                                 if let Ok(mut cache) =
                                     view_state.decoration_scene_cache.write()
                                     && cache.set_scene(scene)

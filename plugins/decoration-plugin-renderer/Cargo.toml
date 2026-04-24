@@ -1,0 +1,29 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Client-side render extension for the bmux decoration plugin"
+edition     = { workspace = true }
+keywords    = ["bmux", "decoration", "plugin", "renderer"]
+license     = { workspace = true }
+name        = "bmux_decoration_plugin_renderer"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_plugin                = { workspace = true }
+bmux_scene_protocol        = { workspace = true }
+bmux_scene_protocol_render = { workspace = true }
+
+tokio   = { workspace = true, features = ["rt", "macros", "sync"] }
+tracing = { workspace = true, features = ["std"] }
+uuid    = { workspace = true, features = ["std"] }
+
+[features]
+default = []
+
+fail-on-warnings = [
+    "bmux_plugin/fail-on-warnings",
+    "bmux_scene_protocol/fail-on-warnings",
+    "bmux_scene_protocol_render/fail-on-warnings",
+]

@@ -18,3 +18,7 @@ bmux_plugin_schema_macros::schema! {
         },
     },
 }
+
+/// Typed-client helpers for invoking this plugin's services from any
+/// `TypedDispatchClient` (production `bmux_client`, tests, mocks).
+pub mod client;

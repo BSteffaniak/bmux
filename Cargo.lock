@@ -1044,6 +1044,7 @@ dependencies = [
  "bmux_control_catalog_plugin_api",
  "bmux_decoration_plugin",
  "bmux_decoration_plugin_api",
+ "bmux_decoration_plugin_renderer",
  "bmux_env",
  "bmux_fonts",
  "bmux_image",
@@ -1341,11 +1342,26 @@ dependencies = [
 name = "bmux_decoration_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_codec",
+ "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_scene_protocol",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_decoration_plugin_renderer"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin",
+ "bmux_scene_protocol",
+ "bmux_scene_protocol_render",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
