@@ -6,7 +6,8 @@ use crate::{
     discover_registered_plugins_in_roots, test_support::test_service_router,
 };
 use bmux_ipc::{
-    Request as IpcRequest, Response as IpcResponse, ResponsePayload as IpcResponsePayload,
+    InvokeServiceKind, Request as IpcRequest, Response as IpcResponse,
+    ResponsePayload as IpcResponsePayload,
 };
 use bmux_plugin_sdk::{
     CORE_CLI_BRIDGE_PROTOCOL_V1, CORE_CLI_COMMAND_INTERFACE_V1,
@@ -880,17 +881,41 @@ pub fn call_service_raw(
         );
     }
 
-    let search_roots = plugin_search_roots
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let registry = discover_registered_plugins_in_roots(&search_roots)?;
     let provider_plugin_id = match &service.provider {
         bmux_plugin_sdk::ProviderId::Plugin(plugin_id) => plugin_id.clone(),
         bmux_plugin_sdk::ProviderId::Host => {
             unreachable!("host services should be handled earlier")
         }
     };
+
+    // Consult the process-level `ServiceLocationMap` to decide whether
+    // this process owns the provider (`Local` → continue to in-process
+    // dispatch below) or must forward the call over IPC (`Remote` →
+    // wrap in `Request::InvokeService` and ship through the host
+    // kernel bridge). Providers with no recorded location are treated
+    // as local for backward compatibility with tests and pre-bootstrap
+    // paths; real runtime code paths mark every known plugin before
+    // any typed service call fires.
+    if matches!(
+        crate::global_service_locations().get(&provider_plugin_id),
+        Some(crate::ServiceLocation::Remote)
+    ) {
+        return dispatch_remote_typed_service(
+            host_kernel_bridge,
+            &provider_plugin_id,
+            capability.as_str(),
+            kind,
+            interface_id,
+            operation,
+            payload,
+        );
+    }
+
+    let search_roots = plugin_search_roots
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let registry = discover_registered_plugins_in_roots(&search_roots)?;
 
     let available_capability_map = available_capabilities
         .iter()
@@ -1119,6 +1144,52 @@ fn emit_plugin_log(
     }
 
     Ok(())
+}
+
+/// Forward a typed plugin service call to whichever process owns the
+/// activated provider by wrapping it in [`IpcRequest::InvokeService`]
+/// and shipping it through the host kernel bridge.
+///
+/// The server's `Request::InvokeService` handler dispatches through
+/// its activated `service_registry`, so callers get the same handler
+/// behavior they would see if the provider were local in this
+/// process.
+fn dispatch_remote_typed_service(
+    host_kernel_bridge: Option<HostKernelBridge>,
+    provider_plugin_id: &str,
+    capability: &str,
+    kind: ServiceKind,
+    interface_id: &str,
+    operation: &str,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let invoke_kind = match kind {
+        ServiceKind::Query => InvokeServiceKind::Query,
+        ServiceKind::Command => InvokeServiceKind::Command,
+        ServiceKind::Event => {
+            return Err(PluginError::ServiceProtocol {
+                details: format!(
+                    "cannot forward Event typed call to remote provider '{provider_plugin_id}' — events are delivered via the event bus, not synchronous InvokeService"
+                ),
+            });
+        }
+    };
+    let request = IpcRequest::InvokeService {
+        capability: capability.to_string(),
+        kind: invoke_kind,
+        interface_id: interface_id.to_string(),
+        operation: operation.to_string(),
+        payload,
+    };
+    let response_payload = execute_kernel_request(host_kernel_bridge, request)?;
+    match response_payload {
+        IpcResponsePayload::ServiceInvoked { payload } => Ok(payload),
+        other => Err(PluginError::ServiceProtocol {
+            details: format!(
+                "unexpected kernel response for remote service call to '{provider_plugin_id}': {other:?}"
+            ),
+        }),
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3386,5 +3457,236 @@ minimum = "1.0"
         assert!(!source.contains("\"windows-state\""));
         assert!(!source.contains("\"windows-commands\""));
         assert!(!source.contains("\"windows-events\""));
+    }
+
+    // ── Remote typed-service dispatch tests ──────────────────────────
+    //
+    // These tests exercise `dispatch_remote_typed_service` in isolation:
+    // they install a fake `HostKernelBridge` function pointer, verify
+    // that a typed call is encoded as `Request::InvokeService` with the
+    // supplied capability / kind / interface / operation / payload, and
+    // that a `ResponsePayload::ServiceInvoked` reply is decoded back to
+    // the caller. The goal is to lock in the contract the rest of the
+    // runtime (attach / CLI) depends on: a `ServiceLocation::Remote`
+    // provider must round-trip through `Request::InvokeService` over
+    // the host kernel bridge.
+
+    use bmux_ipc::{
+        ErrorCode, ErrorResponse, InvokeServiceKind as TestInvokeKind, Request as TestIpcRequest,
+        Response as TestIpcResponse, ResponsePayload as TestIpcResponsePayload,
+    };
+    use bmux_plugin_sdk::{
+        HostKernelBridge as TestHostKernelBridge, HostKernelBridgeRequest as TestBridgeRequest,
+        HostKernelBridgeResponse as TestBridgeResponse, ServiceKind as TestServiceKind,
+        decode_service_message as test_decode_service_message,
+        encode_service_message as test_encode_service_message,
+    };
+
+    thread_local! {
+        static LAST_REMOTE_REQUEST: RefCell<Option<TestIpcRequest>> = const { RefCell::new(None) };
+        static NEXT_REMOTE_RESPONSE: RefCell<Option<TestIpcResponse>> = const { RefCell::new(None) };
+    }
+
+    /// Reset thread-local bridge fixtures so tests don't leak state
+    /// into each other.
+    fn reset_remote_bridge_slots() {
+        LAST_REMOTE_REQUEST.with(|slot| slot.borrow_mut().take());
+        NEXT_REMOTE_RESPONSE.with(|slot| slot.borrow_mut().take());
+    }
+
+    /// Test bridge: decodes the inbound `HostKernelBridgeRequest` into
+    /// a `Request`, stashes it for assertions, then encodes the
+    /// configured `Response` back into a `HostKernelBridgeResponse`.
+    ///
+    /// # Safety
+    ///
+    /// Called only via `HostKernelBridge::from_fn` in these tests. The
+    /// runtime FFI contract matches the real `host_kernel_bridge`
+    /// shape.
+    unsafe extern "C" fn test_remote_bridge(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+    ) -> i32 {
+        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        let Ok(bridge_request) = test_decode_service_message::<TestBridgeRequest>(input) else {
+            return 3;
+        };
+        let Ok(inner_request) = bmux_ipc::decode::<TestIpcRequest>(&bridge_request.payload) else {
+            return 3;
+        };
+        LAST_REMOTE_REQUEST.with(|slot| {
+            *slot.borrow_mut() = Some(inner_request);
+        });
+
+        let response = NEXT_REMOTE_RESPONSE
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or_else(|| {
+                TestIpcResponse::Ok(TestIpcResponsePayload::ServiceInvoked {
+                    payload: Vec::new(),
+                })
+            });
+        let Ok(encoded_response) = bmux_ipc::encode(&response) else {
+            return 5;
+        };
+        let bridge_response = TestBridgeResponse {
+            payload: encoded_response,
+        };
+        let Ok(encoded) = test_encode_service_message(&bridge_response) else {
+            return 5;
+        };
+        unsafe { *output_len = encoded.len() };
+        if output_ptr.is_null() || encoded.len() > output_capacity {
+            return 4;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+        }
+        0
+    }
+
+    #[test]
+    fn dispatch_remote_typed_service_round_trips_payload_and_encodes_invoke_service() {
+        reset_remote_bridge_slots();
+        NEXT_REMOTE_RESPONSE.with(|slot| {
+            *slot.borrow_mut() = Some(TestIpcResponse::Ok(
+                TestIpcResponsePayload::ServiceInvoked {
+                    payload: b"remote-reply".to_vec(),
+                },
+            ));
+        });
+        let bridge = TestHostKernelBridge::from_fn(test_remote_bridge);
+
+        let response = super::dispatch_remote_typed_service(
+            Some(bridge),
+            "bmux.contexts",
+            "bmux.contexts.read",
+            TestServiceKind::Query,
+            "contexts-state",
+            "list-contexts",
+            b"args-bytes".to_vec(),
+        )
+        .expect("remote dispatch should succeed");
+
+        assert_eq!(response, b"remote-reply".to_vec());
+
+        LAST_REMOTE_REQUEST.with(|slot| {
+            let captured = slot.borrow().clone().expect("bridge saw a request");
+            match captured {
+                TestIpcRequest::InvokeService {
+                    capability,
+                    kind,
+                    interface_id,
+                    operation,
+                    payload,
+                } => {
+                    assert_eq!(capability, "bmux.contexts.read");
+                    assert_eq!(kind, TestInvokeKind::Query);
+                    assert_eq!(interface_id, "contexts-state");
+                    assert_eq!(operation, "list-contexts");
+                    assert_eq!(payload, b"args-bytes".to_vec());
+                }
+                other => panic!("expected InvokeService, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn dispatch_remote_typed_service_maps_command_kind() {
+        reset_remote_bridge_slots();
+        NEXT_REMOTE_RESPONSE.with(|slot| {
+            *slot.borrow_mut() = Some(TestIpcResponse::Ok(
+                TestIpcResponsePayload::ServiceInvoked {
+                    payload: Vec::new(),
+                },
+            ));
+        });
+        let bridge = TestHostKernelBridge::from_fn(test_remote_bridge);
+
+        super::dispatch_remote_typed_service(
+            Some(bridge),
+            "bmux.contexts",
+            "bmux.contexts.write",
+            TestServiceKind::Command,
+            "contexts-commands",
+            "create-context",
+            Vec::new(),
+        )
+        .expect("remote dispatch should succeed");
+
+        LAST_REMOTE_REQUEST.with(|slot| {
+            let captured = slot.borrow().clone().expect("bridge saw a request");
+            if let TestIpcRequest::InvokeService { kind, .. } = captured {
+                assert_eq!(kind, TestInvokeKind::Command);
+            } else {
+                panic!("expected InvokeService");
+            }
+        });
+    }
+
+    #[test]
+    fn dispatch_remote_typed_service_rejects_event_kind() {
+        reset_remote_bridge_slots();
+        let bridge = TestHostKernelBridge::from_fn(test_remote_bridge);
+
+        let err = super::dispatch_remote_typed_service(
+            Some(bridge),
+            "bmux.contexts",
+            "bmux.contexts.read",
+            TestServiceKind::Event,
+            "contexts-events",
+            "emit",
+            Vec::new(),
+        )
+        .expect_err("event kind should not forward as InvokeService");
+        let msg = err.to_string();
+        assert!(msg.contains("Event"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn dispatch_remote_typed_service_propagates_server_error_response() {
+        reset_remote_bridge_slots();
+        NEXT_REMOTE_RESPONSE.with(|slot| {
+            *slot.borrow_mut() = Some(TestIpcResponse::Err(ErrorResponse {
+                code: ErrorCode::NotFound,
+                message: "no provider".to_string(),
+            }));
+        });
+        let bridge = TestHostKernelBridge::from_fn(test_remote_bridge);
+
+        let err = super::dispatch_remote_typed_service(
+            Some(bridge),
+            "bmux.contexts",
+            "bmux.contexts.read",
+            TestServiceKind::Query,
+            "contexts-state",
+            "list-contexts",
+            Vec::new(),
+        )
+        .expect_err("error response should propagate");
+        let msg = err.to_string();
+        assert!(msg.contains("no provider"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn dispatch_remote_typed_service_requires_kernel_bridge() {
+        reset_remote_bridge_slots();
+        let err = super::dispatch_remote_typed_service(
+            None,
+            "bmux.contexts",
+            "bmux.contexts.read",
+            TestServiceKind::Query,
+            "contexts-state",
+            "list-contexts",
+            Vec::new(),
+        )
+        .expect_err("no bridge should yield error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported host operation"),
+            "unexpected message: {msg}"
+        );
     }
 }

@@ -303,6 +303,17 @@ fn runtime_command_state() -> Result<RuntimeCommandState> {
             plugin_search_roots,
             registered_plugin_infos,
         };
+        // Mark every enabled plugin as `Remote` for typed service
+        // dispatch. This is the default view from an attach client or
+        // standalone CLI process: the server owns the activated
+        // providers, so plugin-to-plugin typed calls must forward via
+        // `Request::InvokeService`. `mark_remote` leaves any prior
+        // `Local` entry untouched, which keeps the server's own
+        // activation marks correct when it shares this code path.
+        let locations = bmux_plugin::global_service_locations();
+        for plugin_id in &state.enabled_plugins {
+            locations.mark_remote(plugin_id);
+        }
         *slot.borrow_mut() = Some(state.clone());
         Ok(state)
     })
@@ -1321,6 +1332,13 @@ pub(super) fn activate_loaded_plugins(
 
         activated.push(plugin);
         mark_plugin_ready_signals(plugin);
+        // Record that this process holds the activated provider for
+        // `plugin`'s typed services. Plugin-to-plugin typed calls
+        // consult the `ServiceLocationMap` and stay in-process when
+        // the target is `Local`; remote callers (attach / CLI) mark
+        // the same plugins as `Remote` so their typed calls forward
+        // here via `Request::InvokeService`.
+        bmux_plugin::global_service_locations().mark_local(plugin.declaration.id.as_str());
     }
 
     Ok(())

@@ -434,10 +434,25 @@ impl RustPlugin for ContextsPlugin {
 // ── Plugin-local state helpers ───────────────────────────────────────
 
 /// Retrieve the plugin-owned `ContextState` handle.
-fn local_state() -> Arc<RwLock<ContextState>> {
-    global_plugin_state_registry().get::<ContextState>().expect(
-        "contexts-plugin: ContextState must be registered by activate before any handler runs",
-    )
+///
+/// Returns `Err` rather than panicking when no state has been
+/// registered. The typical cause is a handler firing in a process
+/// where `ContextsPlugin::activate` has not run (for example, an
+/// attach client that loaded the plugin crate in-process but is
+/// expected to reach the activated instance via
+/// `Request::InvokeService`). The service-location dispatch layer in
+/// `bmux_plugin::loader::call_service_raw` normally routes such
+/// callers to the server-side provider before this function runs, so
+/// a non-routed reach here indicates a bootstrap ordering issue.
+fn local_state() -> Result<Arc<RwLock<ContextState>>, String> {
+    global_plugin_state_registry()
+        .get::<ContextState>()
+        .ok_or_else(|| {
+            "contexts-plugin: ContextState not registered in this process \
+             (activate did not run here; typed dispatch should forward to the \
+             process that owns the activated provider)"
+                .to_string()
+        })
 }
 
 /// Resolve the caller's `ClientId` from the `NativeServiceContext`.
@@ -467,7 +482,7 @@ fn resolve_caller_client_id(
 // ── Read handlers (state-local) ──────────────────────────────────────
 
 fn list_contexts_local(_caller: &impl ServiceCaller) -> Result<Vec<ContextSummary>, String> {
-    let state = local_state();
+    let state = local_state()?;
     let guard = state
         .read()
         .map_err(|_| "context state lock poisoned".to_string())?;
@@ -484,7 +499,7 @@ fn get_context_local(
             reason: "selector must specify either id or name".to_string(),
         }));
     };
-    let state = local_state();
+    let state = local_state()?;
     let guard = state
         .read()
         .map_err(|_| "context state lock poisoned".to_string())?;
@@ -504,7 +519,7 @@ fn current_context_local(
     caller_client_id: Option<::uuid::Uuid>,
 ) -> Result<Option<ContextSummary>, String> {
     let client_id = resolve_caller_client_id(caller, caller_client_id)?;
-    let state = local_state();
+    let state = local_state()?;
     let guard = state
         .read()
         .map_err(|_| "context state lock poisoned".to_string())?;
@@ -566,7 +581,7 @@ fn mutate_state_create(
     ),
     CreateContextError,
 > {
-    let state = local_state();
+    let state = local_state().map_err(|reason| CreateContextError::Failed { reason })?;
     let mut guard = state.write().map_err(|_| CreateContextError::Failed {
         reason: "context state lock poisoned".to_string(),
     })?;
@@ -611,7 +626,7 @@ fn mutate_state_select(
     client_id: ClientId,
     ipc_selector: &bmux_ipc::ContextSelector,
 ) -> Result<(bmux_ipc::ContextSummary, Option<SessionId>), SelectContextError> {
-    let state = local_state();
+    let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
     let mut guard = state.write().map_err(|_| SelectContextError::Denied {
         reason: "context state lock poisoned".to_string(),
     })?;
@@ -661,7 +676,7 @@ fn mutate_state_close(
     ipc_selector: &bmux_ipc::ContextSelector,
     force: bool,
 ) -> Result<(::uuid::Uuid, Option<SessionId>), CloseContextError> {
-    let state = local_state();
+    let state = local_state().map_err(|reason| CloseContextError::Failed { reason })?;
     let mut guard = state.write().map_err(|_| CloseContextError::Failed {
         reason: "context state lock poisoned".to_string(),
     })?;
