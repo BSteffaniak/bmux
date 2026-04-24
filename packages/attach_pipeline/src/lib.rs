@@ -6,7 +6,6 @@ pub mod cursor;
 pub mod mouse;
 pub mod reconcile;
 pub mod render;
-pub mod scene_cache;
 pub mod scene_pipeline;
 pub mod types;
 

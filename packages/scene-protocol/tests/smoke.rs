@@ -82,6 +82,7 @@ fn decoration_scene_round_trips_through_json() {
             text: "+--".to_string(),
             style,
         }],
+        interactive_regions: Vec::new(),
     };
 
     let mut surfaces = BTreeMap::new();

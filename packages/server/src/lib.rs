@@ -16,11 +16,11 @@ use bmux_ipc::{
     AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneInputMode,
     AttachPaneMouseProtocol, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
     AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector, Envelope, EnvelopeKind,
-    ErrorCode, ErrorResponse, Event, InteractiveRegion, IpcEndpoint, PaneFocusDirection,
-    PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection,
-    PaneState, PaneSummary, PerformanceRecordingLevel, ProtocolContract, RecordingEventKind,
-    RecordingPayload, RecordingRollingStartOptions, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, decode, default_supported_capabilities, encode, negotiate_protocol,
+    ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection, PaneLaunchCommand,
+    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
+    PerformanceRecordingLevel, ProtocolContract, RecordingEventKind, RecordingPayload,
+    RecordingRollingStartOptions, Request, Response, ResponsePayload, ServerSnapshotStatus, decode,
+    default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
@@ -2312,15 +2312,15 @@ const fn attach_rect_from_layout_rect(rect: LayoutRect) -> AttachRect {
     }
 }
 
-/// Compute the `content_rect` for a pane surface that has a 1-cell border on
-/// all sides. This matches the border currently painted by
-/// `packages/attach_pipeline/src/render.rs`. When the decoration plugin
-/// eventually owns border painting, this helper will be replaced by a
-/// plugin-driven layout pass. Until then, a single source of truth lives here.
+/// Compute the `content_rect` for a pane surface that reserves a
+/// 1-cell inset on all sides for decoration chrome (borders, badges).
+///
+/// Every decoration consumer (the decoration plugin today; future
+/// overlay / chrome plugins later) lays out within this content rect.
+/// Panes smaller than 2 cells in either dimension have no interior
+/// and fall back to the full rect so downstream consumers don't see
+/// a zero-sized content rect.
 const fn pane_content_rect_for_outer(rect: AttachRect) -> AttachRect {
-    // A pane smaller than 2 cells in either dimension has no interior; use the
-    // full rect so downstream consumers don't see a zero-sized content rect.
-    // (The server's PTY sizer still guards with `.max(1)`.)
     if rect.w < 2 || rect.h < 2 {
         return rect;
     }
@@ -2330,65 +2330,6 @@ const fn pane_content_rect_for_outer(rect: AttachRect) -> AttachRect {
         w: rect.w - 2,
         h: rect.h - 2,
     }
-}
-
-/// Build the four `InteractiveRegion`s that make up a 1-cell border around a
-/// pane. Each border edge is declared as a separate region so that hit-tests
-/// can report which edge was clicked. Owning plugin id matches the identifier
-/// used by the (future) decoration plugin; today it's used by core's
-/// focus-follow-click behavior as a fallback.
-fn border_regions_for_rect(rect: AttachRect, owning_plugin_id: &str) -> Vec<InteractiveRegion> {
-    if rect.w < 2 || rect.h < 2 {
-        return Vec::new();
-    }
-    let mut regions = Vec::with_capacity(4);
-    // Top edge, full width including corners.
-    regions.push(InteractiveRegion {
-        rect: AttachRect {
-            x: rect.x,
-            y: rect.y,
-            w: rect.w,
-            h: 1,
-        },
-        region_id: "border-top".to_string(),
-        owning_plugin_id: owning_plugin_id.to_string(),
-    });
-    // Bottom edge, full width including corners.
-    regions.push(InteractiveRegion {
-        rect: AttachRect {
-            x: rect.x,
-            y: rect.y + rect.h - 1,
-            w: rect.w,
-            h: 1,
-        },
-        region_id: "border-bottom".to_string(),
-        owning_plugin_id: owning_plugin_id.to_string(),
-    });
-    // Left edge, excluding corners (already covered by top/bottom).
-    if rect.h > 2 {
-        regions.push(InteractiveRegion {
-            rect: AttachRect {
-                x: rect.x,
-                y: rect.y + 1,
-                w: 1,
-                h: rect.h - 2,
-            },
-            region_id: "border-left".to_string(),
-            owning_plugin_id: owning_plugin_id.to_string(),
-        });
-        // Right edge, excluding corners.
-        regions.push(InteractiveRegion {
-            rect: AttachRect {
-                x: rect.x + rect.w - 1,
-                y: rect.y + 1,
-                w: 1,
-                h: rect.h - 2,
-            },
-            region_id: "border-right".to_string(),
-            owning_plugin_id: owning_plugin_id.to_string(),
-        });
-    }
-    regions
 }
 
 fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
@@ -2413,8 +2354,8 @@ fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
 }
 
 // Building the attach scene requires constructing every surface's
-// `rect` + `content_rect` + border `interactive_regions` literally;
-// splitting this further would hurt readability more than it helps.
+// `rect` + `content_rect` + `interactive_regions` literally; splitting
+// this further would hurt readability more than it helps.
 #[allow(clippy::too_many_lines)]
 fn build_attach_scene(
     session_id: SessionId,
@@ -2435,7 +2376,7 @@ fn build_attach_scene(
             z: 0,
             rect: zoomed_rect,
             content_rect: pane_content_rect_for_outer(zoomed_rect),
-            interactive_regions: border_regions_for_rect(zoomed_rect, "bmux.decoration"),
+            interactive_regions: Vec::new(),
             opaque: true,
             visible: true,
             accepts_input: true,
@@ -2460,7 +2401,7 @@ fn build_attach_scene(
                         z: surface.z,
                         rect,
                         content_rect: pane_content_rect_for_outer(rect),
-                        interactive_regions: border_regions_for_rect(rect, "bmux.decoration"),
+                        interactive_regions: Vec::new(),
                         opaque: surface.opaque,
                         visible: surface.visible,
                         accepts_input: surface.accepts_input,
@@ -2498,7 +2439,7 @@ fn build_attach_scene(
                     z: index as i32,
                     rect: attach_rect,
                     content_rect: pane_content_rect_for_outer(attach_rect),
-                    interactive_regions: border_regions_for_rect(attach_rect, "bmux.decoration"),
+                    interactive_regions: Vec::new(),
                     opaque: true,
                     visible: true,
                     accepts_input: true,
@@ -2523,7 +2464,7 @@ fn build_attach_scene(
                     z: surface.z,
                     rect,
                     content_rect: pane_content_rect_for_outer(rect),
-                    interactive_regions: border_regions_for_rect(rect, "bmux.decoration"),
+                    interactive_regions: Vec::new(),
                     opaque: surface.opaque,
                     visible: surface.visible,
                     accepts_input: surface.accepts_input,

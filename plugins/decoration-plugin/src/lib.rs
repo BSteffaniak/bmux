@@ -29,8 +29,8 @@ use bmux_decoration_plugin_api::decoration_state::{
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
-    BorderGlyphs, Color, DecorationScene, GradientAxis, NamedColor, PaintCommand, Rect, Style,
-    SurfaceDecoration,
+    BorderGlyphs, Color, DecorationScene, GradientAxis, InteractiveRegion, NamedColor,
+    PaintCommand, Rect, Style, SurfaceDecoration,
 };
 use uuid::Uuid;
 
@@ -458,6 +458,14 @@ fn build_scene(state: &mut State) -> DecorationScene {
             paint_commands_default(focused, &rect)
         };
 
+        // Every pane with a visible border contributes four
+        // interactive regions (one per edge). The attach runtime
+        // merges these into the AttachScene's per-surface regions so
+        // core mouse dispatch can route border clicks back to the
+        // decoration plugin without needing to know anything about
+        // decoration internals.
+        let interactive_regions = border_interactive_regions(&rect);
+
         surfaces.insert(
             pane_id,
             SurfaceDecoration {
@@ -465,6 +473,7 @@ fn build_scene(state: &mut State) -> DecorationScene {
                 rect,
                 content_rect,
                 paint_commands,
+                interactive_regions,
             },
         );
     }
@@ -581,6 +590,7 @@ fn merge_script_paint_commands(
                 rect,
                 content_rect,
                 paint_commands: Vec::new(),
+                interactive_regions: Vec::new(),
             }
         });
         surface.paint_commands.extend(outcome.commands);
@@ -602,6 +612,65 @@ fn merge_script_paint_commands(
             "first decoration script invocation with geometry",
         );
     }
+}
+
+/// Identifier the decoration plugin attributes to its own
+/// interactive regions. Used by the attach runtime's mouse hit-test
+/// to route clicks on decoration chrome back to this plugin.
+const DECORATION_PLUGIN_ID: &str = "bmux.decoration";
+
+/// Build the four edge regions (top / bottom / left / right) of a
+/// pane border as [`InteractiveRegion`]s owned by the decoration
+/// plugin. Returns an empty vec for rects too small to carry a
+/// border (fewer than 2 cells on either axis).
+fn border_interactive_regions(rect: &Rect) -> Vec<InteractiveRegion> {
+    if rect.w < 2 || rect.h < 2 {
+        return Vec::new();
+    }
+    let last_y = rect.y.saturating_add(rect.h.saturating_sub(1));
+    let last_x = rect.x.saturating_add(rect.w.saturating_sub(1));
+    vec![
+        InteractiveRegion {
+            rect: Rect {
+                x: rect.x,
+                y: rect.y,
+                w: rect.w,
+                h: 1,
+            },
+            region_id: "border-top".to_string(),
+            owning_plugin_id: DECORATION_PLUGIN_ID.to_string(),
+        },
+        InteractiveRegion {
+            rect: Rect {
+                x: rect.x,
+                y: last_y,
+                w: rect.w,
+                h: 1,
+            },
+            region_id: "border-bottom".to_string(),
+            owning_plugin_id: DECORATION_PLUGIN_ID.to_string(),
+        },
+        InteractiveRegion {
+            rect: Rect {
+                x: rect.x,
+                y: rect.y,
+                w: 1,
+                h: rect.h,
+            },
+            region_id: "border-left".to_string(),
+            owning_plugin_id: DECORATION_PLUGIN_ID.to_string(),
+        },
+        InteractiveRegion {
+            rect: Rect {
+                x: last_x,
+                y: rect.y,
+                w: 1,
+                h: rect.h,
+            },
+            region_id: "border-right".to_string(),
+            owning_plugin_id: DECORATION_PLUGIN_ID.to_string(),
+        },
+    ]
 }
 
 /// Fallback scene returned when the state lock is poisoned.

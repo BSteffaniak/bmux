@@ -227,15 +227,38 @@ interface scene-protocol {
     // pane paint nothing around it (the plugin is absent or the pane
     // hasn't been reported yet).
 
+    // Named rectangular region the plugin wants the attach runtime to
+    // hit-test for mouse input. The region is rendered by the plugin
+    // (typically via `paint-commands` on the owning surface); core
+    // only routes mouse events intersecting the rect back to the
+    // owning plugin.
+    record interactive-region {
+        // Absolute terminal-cell coordinates of the region.
+        rect: rect,
+        // Plugin-chosen identifier, unique within the owning surface.
+        region-id: string,
+        // Plugin id that receives mouse events intersecting this
+        // region. Matches the `plugin.<id>` form used elsewhere in
+        // the manifest (`bmux.decoration`, `bmux.windows`, ...).
+        owning-plugin-id: string,
+    }
+
     // All decoration data for a single scene surface. The
     // `content_rect` is authoritative for mouse translation and PTY
     // sizing — it may differ from the outer `rect` to reserve space
     // for the paint commands (borders, badges, etc.).
+    //
+    // `interactive-regions` lists sub-rectangles of `rect` that
+    // belong to the publishing plugin. The attach runtime merges
+    // these into `AttachSurface.interactive_regions` so core mouse
+    // dispatch can route events back to the owning plugin without
+    // needing direct decoration-plugin knowledge.
     record surface-decoration {
         surface-id: uuid,
         rect: rect,
         content-rect: rect,
         paint-commands: list<paint-command>,
+        interactive-regions: list<interactive-region>,
     }
 
     // Optional hint published alongside a scene when the plugin wants

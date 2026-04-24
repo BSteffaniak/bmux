@@ -328,7 +328,7 @@ impl AttachScenePipeline {
             None,
             layout_state.zoomed,
             (self.viewport.cols, self.viewport.rows),
-            None,
+            &[],
         )?;
         apply_attach_cursor_state(
             &mut frame_bytes,

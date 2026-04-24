@@ -2288,3 +2288,109 @@ fn runtime_action_variants_stay_on_allowlist() {
          and should be removed from `RUNTIME_ACTION_ALLOWLIST`: {missing:?}"
     );
 }
+
+/// Enforce the boundary rule that core crates carry no
+/// decoration-plugin-specific identifiers. The decoration plugin is
+/// a domain plugin; everything plumbed between core and it must
+/// route through generic primitives (scene-protocol wire types,
+/// `AttachRenderExtension`, attach-layout-protocol state channel,
+/// typed-client helpers in `bmux_decoration_plugin_api::client`).
+///
+/// The single permitted exception is the bundled-plugin static
+/// registration macro in `plugin_runtime.rs`, which by design names
+/// each bundled plugin's impl crate under a feature gate. That site
+/// is explicitly excluded from the check.
+#[test]
+fn core_crates_contain_no_decoration_plugin_references() {
+    use std::fs;
+
+    // Core crates that must remain decoration-agnostic. Does NOT
+    // include `bmux_attach_pipeline` because that crate transitively
+    // imports `bmux_plugin` for the `AttachRenderExtension` trait
+    // and render-extension registry — which is generic, not
+    // decoration-specific.
+    let core_crate_src_dirs = [
+        "packages/server/src",
+        "packages/session-state/src",
+        "packages/context-state/src",
+        "packages/pane-runtime-state/src",
+        "packages/plugin/src",
+        "packages/plugin-sdk/src",
+        "packages/ipc/src",
+        "packages/client/src",
+    ];
+
+    // Symbols that must never appear in core crate sources.
+    let decoration_markers = [
+        "bmux_decoration_plugin",
+        "bmux_decoration_plugin_api",
+        "bmux_decoration_plugin_renderer",
+        "DecorationPlugin",
+        "DecorationSceneCache",
+        "push_decoration_pane_geometry",
+        "forget_decoration_pane",
+        "prime_decoration_scene_cache",
+        "DECORATION_READY_TIMEOUT",
+        "DECORATION_ANIMATION_HZ",
+    ];
+
+    let root = repo_root();
+    for rel_dir in core_crate_src_dirs {
+        let dir = root.join(rel_dir);
+        if !dir.exists() {
+            continue;
+        }
+        walk_rust_files(&dir, &mut |path| {
+            // Skip lib.rs of scene-protocol-render-adjacent crates if they
+            // legitimately reference decoration in a doc example; the
+            // enumerated markers above are symbol-level, not doc-example
+            // words, so this is defensive.
+            let source = fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for marker in decoration_markers {
+                assert!(
+                    !source.contains(marker),
+                    "core crate file must not reference decoration-plugin symbol `{marker}`: {}",
+                    path.display()
+                );
+            }
+        });
+    }
+
+    // Confirm the only place in `bmux_cli/src` that may reference
+    // `bmux_decoration_plugin*` is the bundled-plugin macro in
+    // `plugin_runtime.rs`. Feature-gated `install()` calls in
+    // `attach/runtime.rs` are also allowed. This is a positive
+    // allowlist rather than a blanket ban because the CLI bundles
+    // plugins by construction.
+    let cli_src = root.join("packages/cli/src");
+    walk_rust_files(&cli_src, &mut |path| {
+        let source = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        if !source.contains("bmux_decoration_plugin") {
+            return;
+        }
+        let allowed = path.ends_with("plugin_runtime.rs")
+            || path.ends_with("runtime.rs")
+            || path.ends_with("bootstrap.rs");
+        assert!(
+            allowed,
+            "unexpected decoration-plugin reference in bmux_cli source: {}",
+            path.display()
+        );
+    });
+}
+
+fn walk_rust_files(dir: &std::path::Path, visitor: &mut impl FnMut(&std::path::Path)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_rust_files(&path, visitor);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            visitor(&path);
+        }
+    }
+}

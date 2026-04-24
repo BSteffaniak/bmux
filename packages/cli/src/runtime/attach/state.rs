@@ -1,6 +1,5 @@
 use crate::input::RuntimeAction;
 use crate::status::AttachStatusLine;
-use bmux_attach_pipeline::scene_cache::SharedSceneCache;
 pub use bmux_attach_pipeline::{
     AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
 };
@@ -95,16 +94,6 @@ pub struct AttachViewState {
     pub mouse: AttachMouseState,
     pub dirty: AttachDirtyFlags,
 
-    /// Shared cache of the latest [`bmux_scene_protocol::scene_protocol::DecorationScene`]
-    /// published by the decoration plugin. Populated during attach
-    /// startup via the typed `scene_snapshot` query and refreshed
-    /// whenever a decoration-scene event arrives.
-    ///
-    /// The render path consults this cache on every frame; when a
-    /// surface is present, its paint commands are applied and the
-    /// plugin's `content_rect` is treated as authoritative.
-    pub decoration_scene_cache: SharedSceneCache,
-
     // -- Image protocol support (feature-gated) --
     /// Per-pane image cache received from the server.
     #[cfg(any(
@@ -188,7 +177,6 @@ impl AttachViewState {
                 ..AttachMouseState::default()
             },
             dirty: AttachDirtyFlags::default(),
-            decoration_scene_cache: bmux_attach_pipeline::scene_cache::shared_cache(),
             #[cfg(any(
                 feature = "image-sixel",
                 feature = "image-kitty",

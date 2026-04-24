@@ -152,7 +152,6 @@ default = [
     "bundled-fonts",
     "bundled-plugins",
     "compression",
-    "decoration-scripting",
     "kitty-keyboard",
     "image-protocols",
 ]
@@ -234,15 +233,6 @@ bundled-plugin-recording = ["dep:bmux_recording_plugin"]
 bundled-plugin-sessions = ["dep:bmux_sessions_plugin"]
 bundled-plugin-snapshot = ["dep:bmux_snapshot_plugin"]
 bundled-plugin-windows = ["dep:bmux_windows_plugin"]
-
-# Enable the Luau scripting backend inside the bundled decoration
-# plugin. When on, themes can attach a `script = "..."` that emits
-# paint commands per animation tick (see `plugins/decoration-plugin`
-# for the contract). Adds mlua + vendored Luau to the build, which
-# costs ~5-10s of additional cold-compile time and a few hundred KB
-# of binary size. On by default; opt-out with
-# `--no-default-features` and explicitly list the other defaults.
-decoration-scripting = ["bmux_decoration_plugin?/scripting-luau"]
 
 # Optional features
 bundled-fonts = ["bmux_fonts/bundled-fonts", "bmux_fonts/bundled-nerd-fonts"]

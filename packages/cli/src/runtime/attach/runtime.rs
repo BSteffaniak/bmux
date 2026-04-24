@@ -74,23 +74,6 @@ const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 /// naturally yields CPU time to the PTY reader thread, so no explicit
 /// sleep/yield is needed between rounds.
 const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
-/// How long attach startup waits for the decoration plugin to signal
-/// `scene-published` before rendering its first frame. The wait short-
-/// circuits when the plugin never declared the signal (so attaching
-/// without the decoration plugin stays fast) and when the signal has
-/// already been marked `Ready`.
-const DECORATION_READY_TIMEOUT: Duration = Duration::from_millis(2000);
-
-/// Ceiling on the ticker Hz advertised by the decoration plugin's
-/// `animation_hint`. Clamps user-configured values so a misconfigured
-/// theme can't spin the attach loop. 120 Hz matches common refresh
-/// rates; decorations above that are indistinguishable on terminals.
-const DECORATION_ANIMATION_HZ_CEILING: u16 = 120;
-
-/// Default Hz used when a scene advertises an `animation_hint` with
-/// `target_hz == 0` (interpreted as "default"). Kept modest so the
-/// attach loop idles low unless the user explicitly turns the dial up.
-const DECORATION_ANIMATION_HZ_DEFAULT: u16 = 30;
 
 use super::super::{typed_clients, typed_contexts, typed_sessions, typed_windows};
 
@@ -669,45 +652,27 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-/// Push per-pane geometry updates to the decoration plugin on every
-/// observed layout change, and drop any panes that disappeared from
-/// the new scene.
+/// Publish the current attach-layout snapshot on the generic
+/// [`AttachLayoutSnapshot`] state channel. Plugins that need
+/// per-pane geometry (decoration renderers, overlays, etc.)
+/// subscribe to that channel via [`bmux_plugin::global_event_bus`]
+/// and receive the current value plus live updates.
 ///
 /// Returns the set of pane ids present in the latest layout so the
-/// caller can optionally forward it to other listeners.
-///
-/// This helper sits on the attach-runtime side of the core-boundary
-/// because it's the only place per-pane rects are observable (they're
-/// computed server-side inside `build_scene` and flow through
-/// `AttachLayoutState.scene`). The decoration plugin's typed write
-/// service is resolved via the generic typed-dispatch registry —
-/// same pattern as the existing `prime_decoration_scene_cache` read
-/// path.
-async fn notify_decoration_of_layout(
-    client: &mut bmux_client::StreamingBmuxClient,
-    previous: Option<&bmux_client::AttachLayoutState>,
+/// caller can optionally forward it to other listeners. When the
+/// layout is absent the snapshot is empty and the pane-id set is
+/// empty too.
+fn notify_extensions_of_layout(
+    _previous: Option<&bmux_client::AttachLayoutState>,
     current: Option<&bmux_client::AttachLayoutState>,
 ) -> std::collections::BTreeSet<Uuid> {
     use bmux_scene_protocol::scene_protocol::Rect as SceneRect;
 
     let Some(current) = current else {
-        tracing::trace!("notify_decoration_of_layout called (current=None)");
         publish_attach_layout_snapshot(&[]);
         return std::collections::BTreeSet::new();
     };
 
-    tracing::trace!(
-        has_previous = previous.is_some(),
-        current_surfaces = current.scene.surfaces.len(),
-        "notify_decoration_of_layout",
-    );
-
-    // Build the generic attach-layout-protocol snapshot and publish on
-    // the state channel. Any plugin that subscribed to
-    // `attach-layout-protocol/attach-layout-snapshot` picks up the
-    // current layout plus every subsequent refresh. This replaces
-    // the push-only `push_decoration_pane_geometry` path for plugins
-    // that migrate to the generic channel.
     let layout_entries: Vec<AttachSurfaceSummary> = current
         .scene
         .surfaces
@@ -741,51 +706,15 @@ async fn notify_decoration_of_layout(
             continue;
         }
         current_pane_ids.insert(pane_id);
-        let rect = SceneRect {
-            x: surface.rect.x,
-            y: surface.rect.y,
-            w: surface.rect.w,
-            h: surface.rect.h,
-        };
-        let content_rect = SceneRect {
-            x: surface.content_rect.x,
-            y: surface.content_rect.y,
-            w: surface.content_rect.w,
-            h: surface.content_rect.h,
-        };
-        crate::runtime::plugin_runtime::push_decoration_pane_geometry(
-            client,
-            pane_id,
-            rect,
-            content_rect,
-        )
-        .await;
     }
-
-    if let Some(previous) = previous {
-        for surface in &previous.scene.surfaces {
-            let Some(pane_id) = surface.pane_id else {
-                continue;
-            };
-            if !current_pane_ids.contains(&pane_id) {
-                crate::runtime::plugin_runtime::forget_decoration_pane(client, pane_id).await;
-            }
-        }
-    }
-
-    tracing::trace!(
-        visible_with_pane_id = current_pane_ids.len(),
-        "notify_decoration_of_layout pushed geometry",
-    );
-
     current_pane_ids
 }
 
 /// Publish an [`AttachLayoutSnapshot`] on the attach-layout state
-/// channel. Called from `notify_decoration_of_layout` on every layout
-/// refresh, and from attach startup to register the channel with an
-/// initial empty value. Late-subscribing plugins see the current
-/// value immediately; subsequent receivers fire on each refresh.
+/// channel. Called from `notify_extensions_of_layout` on every
+/// layout refresh, and from attach startup to register the channel
+/// with an initial empty value. Late-subscribing plugins see the
+/// current value immediately; subsequent receivers fire on each refresh.
 fn publish_attach_layout_snapshot(surfaces: &[AttachSurfaceSummary]) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static REVISION: AtomicU64 = AtomicU64::new(0);
@@ -795,46 +724,6 @@ fn publish_attach_layout_snapshot(surfaces: &[AttachSurfaceSummary]) {
         revision,
     };
     let _ = bmux_plugin::global_event_bus().publish_state(&ATTACH_LAYOUT_STATE_KIND, payload);
-}
-
-/// Reconcile the attach runtime's animation ticker against the Hz
-/// advertised in the latest `DecorationScene.animation` hint.
-///
-/// - `None` or `Some(0)` parks the ticker (idle cost is zero).
-/// - `Some(hz)` starts/resets a `tokio::time::Interval` at the
-///   clamped Hz.
-/// - Identical Hz requests are idempotent (no ticker churn).
-///
-/// Clamp ceiling is [`DECORATION_ANIMATION_HZ_CEILING`]; 0 resolves
-/// to the ticker being parked.
-fn reconcile_decoration_animation_ticker(
-    ticker: &mut Option<tokio::time::Interval>,
-    current_hz: &mut u16,
-    requested_hz: Option<u16>,
-) {
-    let target = requested_hz.unwrap_or(0);
-    let target = if target == 0 {
-        0
-    } else {
-        let clamped = target.min(DECORATION_ANIMATION_HZ_CEILING);
-        if clamped == 0 {
-            DECORATION_ANIMATION_HZ_DEFAULT
-        } else {
-            clamped
-        }
-    };
-    if target == *current_hz {
-        return;
-    }
-    if target == 0 {
-        *ticker = None;
-    } else {
-        let period = Duration::from_micros(1_000_000 / u64::from(target));
-        let mut new_ticker = tokio::time::interval(period);
-        new_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        *ticker = Some(new_ticker);
-    }
-    *current_hz = target;
 }
 
 async fn maybe_emit_attach_perf_window(
@@ -1185,28 +1074,12 @@ pub async fn run_session_attach_with_client(
         },
     );
 
-    // Wait briefly for the decoration plugin to signal that it has
-    // published its first scene. If the plugin isn't registered, this
-    // returns immediately because the signal was never declared;
-    // otherwise it blocks up to the configured timeout. Consumers that
-    // want to disable the gate can unregister the plugin or configure a
-    // zero-timeout policy (planned follow-up).
+    // Honour any startup gates plugins have self-registered via
+    // `bmux_plugin::register_startup_ready_gate`. Attach startup
+    // blocks briefly for each gate so subsystems like the
+    // decoration renderer have a chance to publish their initial
+    // scene before the first frame is painted.
     let ready_tracker = super::super::plugin_runtime::ready_tracker_snapshot();
-    if ready_tracker
-        .status("bmux.decoration", "scene-published")
-        .is_some()
-    {
-        let _ready = ready_tracker.await_ready(
-            "bmux.decoration",
-            "scene-published",
-            DECORATION_READY_TIMEOUT,
-        );
-    }
-    // Honour any additional startup gates plugins have self-registered
-    // via `bmux_plugin::register_startup_ready_gate`. This is the
-    // generic replacement for the hardcoded decoration gate above; PR
-    // 3 of the decoration-leakage refactor deletes the hardcoded check
-    // once the decoration plugin registers its own gate.
     for gate in bmux_plugin::registered_startup_ready_gates() {
         if ready_tracker
             .status(&gate.plugin_id, &gate.signal)
@@ -1216,17 +1089,6 @@ pub async fn run_session_attach_with_client(
         }
     }
 
-    // Prime the decoration scene cache with the decoration plugin's
-    // current snapshot. Later updates arrive via the typed
-    // `scene-protocol` event stream; this one-shot pull guarantees the
-    // render path has something to consult on its very first frame
-    // when the plugin is registered.
-    super::super::plugin_runtime::prime_decoration_scene_cache(
-        &mut client,
-        &view_state.decoration_scene_cache,
-    )
-    .await;
-
     update_attach_viewport(
         &mut client,
         view_state.attached_id,
@@ -1235,13 +1097,12 @@ pub async fn run_session_attach_with_client(
     .await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
     // `hydrate_attach_state_from_snapshot` populated
-    // `cached_layout_state` but did NOT push geometry to the
-    // decoration plugin. Do it here so the decoration plugin
-    // receives initial per-pane rects on attach entry. Subsequent
-    // layout changes flow through the loop-body call to
-    // `notify_decoration_of_layout` at the layout-refresh site.
-    let _ = notify_decoration_of_layout(&mut client, None, view_state.cached_layout_state.as_ref())
-        .await;
+    // `cached_layout_state`; emit the first attach-layout snapshot so
+    // plugins subscribing to the state channel observe initial
+    // per-pane rects at attach entry. Subsequent layout changes flow
+    // through the loop-body call to
+    // `notify_extensions_of_layout` at the layout-refresh site.
+    let _ = notify_extensions_of_layout(None, view_state.cached_layout_state.as_ref());
     refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
     sync_attach_active_mode_from_processor(&mut view_state, &attach_keymap, None);
     view_state.set_transient_status(
@@ -1313,25 +1174,17 @@ pub async fn run_session_attach_with_client(
     ))]
     let mut image_fetch_pending = false;
 
-    // Subscribe to the decoration plugin's push-based scene event.
-    // When the plugin isn't loaded (or hasn't registered the channel
-    // yet), the subscription returns `Err` and we silently run without
-    // scene updates — the attach runtime still functions via the
-    // compiled-in fallback paint path.
+    // Subscribe to the generic scene-protocol broadcast so the
+    // attach runtime can mark the frame dirty whenever a new scene
+    // arrives. Render extensions subscribe to the same channel
+    // independently. When no plugin has registered the channel the
+    // subscription returns `Err` and we run without scene updates —
+    // extensions that aren't loaded simply have nothing to draw.
     let mut scene_event_rx = bmux_plugin::global_event_bus()
         .subscribe::<bmux_scene_protocol::scene_protocol::EventPayload>(
             &bmux_scene_protocol::scene_protocol::EVENT_KIND,
         )
         .ok();
-
-    // Optional animation ticker. Parked until a scene advertises an
-    // `animation_hint`; at that point the ticker is reset to the
-    // advertised Hz. Tick events set `dirty.full_pane_redraw = true`
-    // so subsequent frames pick up time-varying paint commands. The
-    // ticker is capped by `DECORATION_ANIMATION_HZ_CEILING` and
-    // defaults to off entirely.
-    let mut animation_ticker: Option<tokio::time::Interval> = None;
-    let mut animation_current_hz: u16 = 0;
 
     loop {
         // ── Event-driven select: sleep until something happens ────────
@@ -1432,10 +1285,13 @@ pub async fn run_session_attach_with_client(
                     ref payload,
                 } = server_event
                 {
-                    // Server-forwarded plugin event. Currently we decode
-                    // decoration-scene events and update the scene cache;
-                    // other kinds are ignored (future plugins can extend
-                    // this dispatch).
+                    // Server-forwarded plugin event. Decode by kind
+                    // and re-emit onto the local event bus so any
+                    // render extension (decoration, future overlays,
+                    // etc.) subscribing via
+                    // `EventBus::subscribe::<T>` sees the payload.
+                    // Core code does NOT interpret the payload itself
+                    // — extensions own that.
                     if kind.as_str()
                         == bmux_scene_protocol::scene_protocol::EVENT_KIND.as_str()
                     {
@@ -1444,42 +1300,27 @@ pub async fn run_session_attach_with_client(
                         >(payload)
                         {
                             Ok(scene) => {
-                                let requested_hz = scene
-                                    .animation
-                                    .as_ref()
-                                    .map(|hint| hint.target_hz);
-                                // Re-emit on the local event bus so any
-                                // render extension subscribing via
-                                // `EventBus::subscribe::<DecorationScene>`
-                                // sees the latest scene without
-                                // decoding IPC bytes itself. Emit
-                                // succeeds when a render extension (or
-                                // other local consumer) has registered
-                                // the broadcast channel; otherwise it
-                                // returns `ChannelNotRegistered`, which
-                                // we deliberately ignore so builds
-                                // without any consumer stay silent.
+                                // Re-emit on the local event bus so
+                                // render extensions pick it up. When
+                                // no subscriber has registered the
+                                // channel the emit returns
+                                // `ChannelNotRegistered`; we ignore
+                                // that so builds without extensions
+                                // stay silent.
                                 let _ = bmux_plugin::global_event_bus().emit(
                                     &bmux_scene_protocol::scene_protocol::EVENT_KIND,
-                                    scene.clone(),
+                                    scene,
                                 );
-                                if let Ok(mut cache) =
-                                    view_state.decoration_scene_cache.write()
-                                    && cache.set_scene(scene)
-                                {
-                                    view_state.dirty.full_pane_redraw = true;
-                                }
-                                reconcile_decoration_animation_ticker(
-                                    &mut animation_ticker,
-                                    &mut animation_current_hz,
-                                    requested_hz,
-                                );
+                                // Any new scene makes the frame dirty
+                                // so render extensions get a chance
+                                // to repaint.
+                                view_state.dirty.full_pane_redraw = true;
                             }
                             Err(error) => {
                                 tracing::warn!(
                                     kind = %kind,
                                     error = %error,
-                                    "decoding forwarded decoration scene payload",
+                                    "decoding forwarded scene-protocol payload",
                                 );
                             }
                         }
@@ -1615,55 +1456,24 @@ pub async fn run_session_attach_with_client(
                 }
             }
 
-            // Scene events pushed by the decoration plugin. Update
-            // the scene cache in place and mark the frame dirty so
-            // the renderer picks up the new paint commands on the
-            // next pass. Adjust the animation ticker if the scene
-            // carries an `animation_hint`.
+            // Scene events pushed on the local event bus. The
+            // PluginBusEvent handler above emits incoming scenes
+            // onto the same channel; render extensions subscribe
+            // independently. Core observes the stream only to mark
+            // the frame dirty so the renderer consults extensions
+            // on the next pass.
             scene_result = async {
                 match &mut scene_event_rx {
                     Some(rx) => rx.recv().await.ok(),
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(scene) = scene_result {
-                    let scene = (*scene).clone();
-                    let requested_hz = scene
-                        .animation
-                        .as_ref()
-                        .map(|hint| hint.target_hz);
-                    if let Ok(mut cache) = view_state.decoration_scene_cache.write()
-                        && cache.set_scene(scene)
-                    {
-                        view_state.dirty.full_pane_redraw = true;
-                    }
-                    reconcile_decoration_animation_ticker(
-                        &mut animation_ticker,
-                        &mut animation_current_hz,
-                        requested_hz,
-                    );
+                if scene_result.is_some() {
+                    view_state.dirty.full_pane_redraw = true;
                 } else {
-                    // Broadcast lagged/closed — drop subscription and
-                    // fall back to the static scene already cached.
+                    // Broadcast lagged/closed — drop subscription.
                     scene_event_rx = None;
                 }
-            }
-
-            // Animation ticker — only fires when the scene advertises
-            // a non-zero `animation_hint.target_hz`. Every tick dirties
-            // the frame; the actual paint decisions come from whatever
-            // scene is currently cached (the decoration plugin is
-            // expected to re-emit with time-varying paint commands
-            // under an animation-active scene, but we also force a
-            // redraw here so scripts that read `time_ms` inside their
-            // `decorate()` body can re-evaluate deterministically).
-            () = async {
-                match &mut animation_ticker {
-                    Some(ticker) => { ticker.tick().await; }
-                    None => std::future::pending().await,
-                }
-            } => {
-                view_state.dirty.full_pane_redraw = true;
             }
 
         }
@@ -1763,16 +1573,14 @@ pub async fn run_session_attach_with_client(
                     view_state.cached_layout_state = Some(layout_state.clone());
                 }
             }
-            // Push updated per-pane geometry to the decoration plugin
-            // so paint commands can reference live rects. Also forget
-            // panes that disappeared from the new scene. The helpers
-            // silently no-op when the decoration plugin isn't loaded.
-            let current_pane_ids = notify_decoration_of_layout(
-                &mut client,
+            // Publish the new layout on the attach-layout state
+            // channel. Render extensions (decoration, overlays, etc.)
+            // subscribe to this channel and react without core needing
+            // to know which plugins care.
+            let current_pane_ids = notify_extensions_of_layout(
                 previous_layout.as_ref(),
                 view_state.cached_layout_state.as_ref(),
-            )
-            .await;
+            );
             drop(current_pane_ids);
             view_state.dirty.layout_needs_refresh = false;
 
@@ -4112,17 +3920,11 @@ pub fn render_attach_frame(
     let render_scene =
         view_state.dirty.full_pane_redraw || !view_state.dirty.pane_dirty_ids.is_empty();
     let cursor_state = if render_scene {
-        // Clone the scene cache into a local snapshot so the RwLock
-        // guard is released before `render_attach_scene` runs. The
-        // cache is small (per-surface SurfaceDecoration entries) and
-        // rarely contended; cloning avoids holding the lock across
-        // the render path and keeps clippy's
-        // significant_drop_tightening invariant clean.
-        let scene_cache_snapshot = view_state
-            .decoration_scene_cache
-            .read()
-            .ok()
-            .map(|guard| guard.clone());
+        // Snapshot the current set of registered render extensions
+        // once per frame. The snapshot is cheap (Arc-clones) and
+        // keeps the per-surface loop inside `render_attach_scene`
+        // free of registry-lock churn.
+        let extensions = bmux_plugin::registered_render_extensions();
         render_attach_scene(
             &mut frame_bytes,
             &layout_state.scene,
@@ -4138,7 +3940,7 @@ pub fn render_attach_frame(
             view_state.selection_anchor,
             layout_state.zoomed,
             terminal::size().unwrap_or((0, 0)),
-            scene_cache_snapshot.as_ref(),
+            &extensions,
         )?
     } else {
         view_state.last_cursor_state
@@ -6408,21 +6210,23 @@ fn attach_scene_pane_content_rect(
     }
     let (_, _, _, surface_id, scene_rect) = best?;
 
-    // Prefer the decoration plugin's published `content_rect` for this
-    // surface when it carries real geometry. Zero-sized entries are
-    // placeholders the plugin emits when it hasn't been told about the
-    // layout yet; those stay pinned to the scene producer's value.
-    if let Ok(cache) = view_state.decoration_scene_cache.read()
-        && let Some(entry) = cache.surface(&surface_id)
-        && entry.content_rect.w > 0
-        && entry.content_rect.h > 0
-    {
-        return Some(bmux_ipc::AttachRect {
-            x: entry.content_rect.x,
-            y: entry.content_rect.y,
-            w: entry.content_rect.w,
-            h: entry.content_rect.h,
-        });
+    // Prefer any render extension's published `content_rect` override
+    // for this surface. Extensions (decoration renderer, overlays,
+    // etc.) are the authoritative source of chrome insets; core
+    // merely consults them. When no extension overrides, fall back
+    // to the scene producer's content rect.
+    for ext in bmux_plugin::registered_render_extensions() {
+        if let Some(override_rect) = ext.content_rect_override(surface_id)
+            && override_rect.w > 0
+            && override_rect.h > 0
+        {
+            return Some(bmux_ipc::AttachRect {
+                x: override_rect.x,
+                y: override_rect.y,
+                w: override_rect.w,
+                h: override_rect.h,
+            });
+        }
     }
 
     Some(scene_rect)
@@ -8035,17 +7839,49 @@ mod tests {
         );
     }
 
-    /// The decoration plugin can publish a tighter `content_rect` than
-    /// the scene producer (e.g., a plugin that paints a 2-cell border).
-    /// When the plugin's rect is non-zero, the mouse translator must
-    /// prefer it over the scene producer's value so clicks on the
-    /// first visual content cell under that thicker border still
-    /// encode to SGR `(1, 1)`.
+    /// A render extension can publish a tighter `content_rect` than
+    /// the scene producer (e.g., a plugin that paints a 2-cell
+    /// border). When the extension returns a non-zero override, the
+    /// mouse translator must prefer it over the scene producer's
+    /// value so clicks on the first visual content cell under that
+    /// thicker border still encode to SGR `(1, 1)`.
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn attach_mouse_forward_honors_decoration_cache_content_rect() {
-        use bmux_attach_pipeline::scene_cache::{DecorationScene, SceneRect, SurfaceDecoration};
-        use std::collections::BTreeMap as StdBTreeMap;
+    fn attach_mouse_forward_honors_render_extension_content_rect() {
+        use bmux_plugin::{AttachRenderExtension, ExtensionRect};
+        use std::io;
+        use std::sync::Arc;
+
+        // Test-only render extension that reports a fixed
+        // `content_rect` override for a known surface id.
+        struct FixedInsetExtension {
+            surface_id: Uuid,
+            override_rect: ExtensionRect,
+        }
+
+        impl AttachRenderExtension for FixedInsetExtension {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "test.fixed_inset"
+            }
+
+            fn apply_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+            ) -> io::Result<bool> {
+                Ok(false)
+            }
+
+            fn content_rect_override(&self, surface_id: Uuid) -> Option<ExtensionRect> {
+                if surface_id == self.surface_id {
+                    Some(self.override_rect)
+                } else {
+                    None
+                }
+            }
+        }
 
         let session_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
@@ -8102,36 +7938,18 @@ mod tests {
             zoomed: false,
         });
 
-        // Decoration plugin publishes a tighter 2-cell inset for this
-        // surface.
-        let plugin_content = SceneRect {
+        // Register a render extension that overrides `content_rect`
+        // to a tighter 2-cell inset.
+        let plugin_content = ExtensionRect {
             x: 2,
             y: 2,
             w: 36,
             h: 6,
         };
-        let mut surfaces = StdBTreeMap::new();
-        surfaces.insert(
+        bmux_plugin::register_render_extension(Arc::new(FixedInsetExtension {
             surface_id,
-            SurfaceDecoration {
-                surface_id,
-                rect: SceneRect {
-                    x: outer.x,
-                    y: outer.y,
-                    w: outer.w,
-                    h: outer.h,
-                },
-                content_rect: plugin_content.clone(),
-                paint_commands: Vec::new(),
-            },
-        );
-        if let Ok(mut cache) = view_state.decoration_scene_cache.write() {
-            cache.force_scene(DecorationScene {
-                revision: 1,
-                surfaces,
-                animation: None,
-            });
-        }
+            override_rect: plugin_content,
+        }));
 
         let buffer = view_state
             .pane_buffers
@@ -8146,8 +7964,9 @@ mod tests {
         append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
 
         // Click on absolute (plugin_content.x, plugin_content.y) — the
-        // first visible content cell when the plugin's 2-cell border
-        // is painted. Should encode to pane-local (0, 0) → SGR (1, 1).
+        // first visible content cell when the extension's 2-cell
+        // border is painted. Should encode to pane-local (0, 0) →
+        // SGR (1, 1).
         let first_cell = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: plugin_content.x,
@@ -8156,16 +7975,16 @@ mod tests {
         };
         let forwarded =
             attach_mouse_forward_bytes_for_target(&view_state, first_cell, Some(pane_id), true)
-                .expect("click on plugin's first content cell should forward");
+                .expect("click on extension's first content cell should forward");
         assert_eq!(
             forwarded,
             b"\x1b[<0;1;1M".to_vec(),
-            "decoration cache's content_rect must take precedence over the scene producer's"
+            "extension's content_rect_override must take precedence over the scene producer's"
         );
 
         // Click at (scene_content.x, scene_content.y) — the scene
-        // producer's first content cell, but UNDER the plugin's 2-cell
-        // border. Should NOT forward bytes.
+        // producer's first content cell, but UNDER the extension's
+        // 2-cell border. Should NOT forward bytes.
         let scene_cell = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: scene_content.x,
@@ -8176,7 +7995,7 @@ mod tests {
             attach_mouse_forward_bytes_for_target(&view_state, scene_cell, Some(pane_id), true);
         assert!(
             forwarded.is_none(),
-            "clicks under the plugin's wider border must not forward bytes"
+            "clicks under the extension's wider border must not forward bytes"
         );
     }
 
@@ -9208,69 +9027,5 @@ server_timeout = 1234
         let after = std::fs::read_to_string(&temp_path).expect("read temp config");
         assert_eq!(after, initial_config);
         assert_eq!(processor.active_mode_id(), original_mode.as_deref());
-    }
-
-    // ── PR 3: decoration animation ticker tests ───────────────────
-
-    #[tokio::test(start_paused = true)]
-    async fn animation_ticker_parks_when_hint_absent() {
-        let mut ticker: Option<tokio::time::Interval> = None;
-        let mut current_hz: u16 = 0;
-        reconcile_decoration_animation_ticker(&mut ticker, &mut current_hz, None);
-        assert!(ticker.is_none());
-        assert_eq!(current_hz, 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn animation_ticker_starts_when_hint_set() {
-        let mut ticker: Option<tokio::time::Interval> = None;
-        let mut current_hz: u16 = 0;
-        reconcile_decoration_animation_ticker(&mut ticker, &mut current_hz, Some(30));
-        assert!(ticker.is_some());
-        assert_eq!(current_hz, 30);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn animation_ticker_clamps_to_ceiling() {
-        let mut ticker: Option<tokio::time::Interval> = None;
-        let mut current_hz: u16 = 0;
-        reconcile_decoration_animation_ticker(&mut ticker, &mut current_hz, Some(999));
-        assert!(ticker.is_some());
-        assert_eq!(current_hz, DECORATION_ANIMATION_HZ_CEILING);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn animation_ticker_zero_hint_parks() {
-        let mut ticker: Option<tokio::time::Interval> = None;
-        let mut current_hz: u16 = 0;
-        // Arm the ticker at 60 Hz from a 0-state transition so the
-        // reconciler actually installs one.
-        reconcile_decoration_animation_ticker(&mut ticker, &mut current_hz, Some(60));
-        assert!(ticker.is_some());
-        assert_eq!(current_hz, 60);
-        // Now advertise 0 Hz — should park.
-        reconcile_decoration_animation_ticker(&mut ticker, &mut current_hz, Some(0));
-        assert!(ticker.is_none());
-        assert_eq!(current_hz, 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn animation_ticker_idempotent_when_hz_unchanged() {
-        let mut ticker: Option<tokio::time::Interval> = None;
-        let mut current_hz: u16 = 0;
-        reconcile_decoration_animation_ticker(&mut ticker, &mut current_hz, Some(30));
-        let first_addr = ticker
-            .as_ref()
-            .map(|t| std::ptr::addr_of!(*t) as usize)
-            .unwrap();
-        reconcile_decoration_animation_ticker(&mut ticker, &mut current_hz, Some(30));
-        let second_addr = ticker
-            .as_ref()
-            .map(|t| std::ptr::addr_of!(*t) as usize)
-            .unwrap();
-        assert_eq!(
-            first_addr, second_addr,
-            "identical Hz requests must not recreate the ticker",
-        );
     }
 }

@@ -12,7 +12,7 @@
 //!
 //! // Schema that imports types from another plugin.
 //! bmux_plugin_schema_macros::schema! {
-//!     source: "bpdl/decoration-plugin.bpdl",
+//!     source: "bpdl/my-plugin.bpdl",
 //!     imports: {
 //!         windows: {
 //!             source: "../windows-plugin-api/bpdl/windows-plugin.bpdl",

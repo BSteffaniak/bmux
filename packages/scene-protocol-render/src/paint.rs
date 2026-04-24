@@ -453,6 +453,7 @@ mod tests {
                     style: default_style(),
                 },
             ],
+            interactive_regions: Vec::new(),
         };
         // Clone so we can also verify a second call produces identical output.
         let surface2 = surface.clone();

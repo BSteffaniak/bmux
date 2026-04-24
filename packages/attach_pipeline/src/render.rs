@@ -3,9 +3,7 @@ use crate::types::{
 };
 use anyhow::{Context, Result};
 use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
-use bmux_scene_protocol_render::paint::{
-    apply_paint_commands, opaque_row_text as shared_opaque_row_text,
-};
+use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
 use crossterm::style::Print;
@@ -282,7 +280,7 @@ pub fn render_attach_scene<W: io::Write>(
     selection_anchor: Option<AttachScrollbackPosition>,
     _zoomed: bool,
     terminal_size: (u16, u16),
-    decoration_scene_cache: Option<&crate::scene_cache::DecorationSceneCache>,
+    render_extensions: &[std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>],
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal_size;
     if cols == 0 || rows <= status_top_inset.saturating_add(status_bottom_inset) {
@@ -364,14 +362,30 @@ pub fn render_attach_scene<W: io::Write>(
             || focused_surface_id == Some(surface.id)
             || focused_pane_id == Some(pane_id);
         if should_draw {
-            // Apply the decoration plugin's paint commands when a
-            // matching surface entry is cached. When no entry exists
-            // (the plugin isn't loaded, or hasn't seen this pane yet)
-            // we draw nothing — borders are exclusively plugin-owned.
-            if let Some(entry) = decoration_scene_cache.and_then(|cache| cache.surface(&surface.id))
-            {
-                apply_paint_commands(stdout, entry)
-                    .context("failed applying decoration paint commands")?;
+            // Consult every registered render extension for this
+            // surface. Extensions (decoration renderer, overlays,
+            // etc.) paint their own chrome. When no extension has
+            // anything to render for the surface, we draw nothing —
+            // chrome is exclusively plugin-owned.
+            let ext_rect = bmux_plugin::ExtensionRect {
+                x: rect.x,
+                y: rect.y,
+                w: rect.w,
+                h: rect.h,
+            };
+            // Re-bind through `&mut dyn io::Write` so the extension
+            // trait's object-safe signature sees a dyn writer
+            // regardless of the concrete `W` the caller passed.
+            let mut dyn_writer: &mut dyn io::Write = stdout;
+            for ext in render_extensions {
+                if let Err(err) = ext.apply_surface(&mut dyn_writer, surface.id, &ext_rect) {
+                    tracing::warn!(
+                        extension = ext.name(),
+                        surface_id = %surface.id,
+                        error = %err,
+                        "render extension apply_surface failed",
+                    );
+                }
             }
         }
 
@@ -719,7 +733,7 @@ mod tests {
             None,
             false,
             (80, 24),
-            None,
+            &[],
         )
         .expect("render should succeed");
 
@@ -781,7 +795,7 @@ mod tests {
             Some(AttachScrollbackPosition { row: 0, col: 1 }),
             false,
             (80, 24),
-            None,
+            &[],
         )
         .expect("render should succeed");
 
@@ -789,13 +803,74 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)] // Test fixture builds a full scene + cache + assertions inline.
-    fn render_attach_scene_applies_decoration_paint_commands_when_cache_has_surface() {
-        use crate::scene_cache::{
-            Color, DecorationScene, DecorationSceneCache, NamedColor, PaintCommand, SceneRect,
-            Style, SurfaceDecoration,
-        };
-        use std::collections::BTreeMap as StdBTreeMap;
+    #[allow(clippy::too_many_lines)] // Test fixture builds a full scene + extension + assertions inline.
+    fn render_attach_scene_applies_render_extension_paint_commands() {
+        use bmux_plugin::{AttachRenderExtension, ExtensionRect};
+        use bmux_scene_protocol::scene_protocol::{Color, NamedColor};
+        use std::io;
+        use std::sync::Arc;
+
+        // Test-only render extension that writes a fixed styled run
+        // onto the stream. This mirrors what the decoration renderer
+        // does in production; the exact paint commands aren't the
+        // point — the point is that render extensions are consulted
+        // at all.
+        struct StyledRunExtension;
+
+        impl AttachRenderExtension for StyledRunExtension {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "test.styled_run"
+            }
+
+            fn apply_surface(
+                &self,
+                stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+            ) -> io::Result<bool> {
+                let style = bmux_scene_protocol::scene_protocol::Style {
+                    fg: Some(Color::Named {
+                        name: NamedColor::BrightYellow,
+                    }),
+                    bg: None,
+                    bold: true,
+                    underline: false,
+                    italic: false,
+                    reverse: false,
+                    dim: false,
+                    blink: false,
+                    strikethrough: false,
+                };
+                let surface = bmux_scene_protocol::scene_protocol::SurfaceDecoration {
+                    surface_id: Uuid::nil(),
+                    rect: bmux_scene_protocol::scene_protocol::Rect {
+                        x: 0,
+                        y: 1,
+                        w: 20,
+                        h: 5,
+                    },
+                    content_rect: bmux_scene_protocol::scene_protocol::Rect {
+                        x: 1,
+                        y: 2,
+                        w: 18,
+                        h: 3,
+                    },
+                    paint_commands: vec![bmux_scene_protocol::scene_protocol::PaintCommand::Text {
+                        col: 0,
+                        row: 1,
+                        z: 0,
+                        text: "DECO!".to_string(),
+                        style,
+                    }],
+                    interactive_regions: Vec::new(),
+                };
+                let mut writer: &mut dyn io::Write = stdout;
+                bmux_scene_protocol_render::paint::apply_paint_commands(&mut writer, &surface)
+                    .map(|()| true)
+                    .map_err(|err| io::Error::other(err.to_string()))
+            }
+        }
 
         let pane_id = Uuid::from_u128(71);
         let scene = AttachScene {
@@ -837,50 +912,8 @@ mod tests {
         let mut pane_buffers = BTreeMap::new();
         pane_buffers.insert(pane_id, PaneRenderBuffer::default());
 
-        let mut surfaces = StdBTreeMap::new();
-        surfaces.insert(
-            pane_id,
-            SurfaceDecoration {
-                surface_id: pane_id,
-                rect: SceneRect {
-                    x: 0,
-                    y: 1,
-                    w: 20,
-                    h: 5,
-                },
-                content_rect: SceneRect {
-                    x: 1,
-                    y: 2,
-                    w: 18,
-                    h: 3,
-                },
-                paint_commands: vec![PaintCommand::Text {
-                    col: 0,
-                    row: 1,
-                    z: 0,
-                    text: "DECO!".to_string(),
-                    style: Style {
-                        fg: Some(Color::Named {
-                            name: NamedColor::BrightYellow,
-                        }),
-                        bg: None,
-                        bold: true,
-                        underline: false,
-                        italic: false,
-                        reverse: false,
-                        dim: false,
-                        blink: false,
-                        strikethrough: false,
-                    },
-                }],
-            },
-        );
-        let mut cache = DecorationSceneCache::new();
-        cache.force_scene(DecorationScene {
-            revision: 1,
-            surfaces,
-            animation: None,
-        });
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(StyledRunExtension) as Arc<dyn AttachRenderExtension>];
 
         let mut output = Vec::new();
         let _ = render_attach_scene(
@@ -898,14 +931,14 @@ mod tests {
             None,
             false,
             (80, 24),
-            Some(&cache),
+            &extensions,
         )
         .expect("render should succeed");
 
         let rendered = String::from_utf8(output).expect("render output should be utf8");
         assert!(
             rendered.contains("DECO!"),
-            "decoration paint command text should appear in render output"
+            "render extension paint-command text should appear in render output"
         );
         assert!(
             rendered.contains("\x1b[1;93m"),
@@ -980,7 +1013,7 @@ mod tests {
             None,
             false,
             (80, 24),
-            None,
+            &[],
         )
         .expect("initial render should succeed");
         assert!(!output1.is_empty(), "initial render should produce output");
@@ -1009,7 +1042,7 @@ mod tests {
             None,
             false,
             (80, 24),
-            None,
+            &[],
         )
         .expect("deferred render should succeed");
 
@@ -1042,7 +1075,7 @@ mod tests {
             None,
             false,
             (80, 24),
-            None,
+            &[],
         )
         .expect("completed render should succeed");
 
@@ -1107,7 +1140,7 @@ mod tests {
             None,
             false,
             (80, 24),
-            None,
+            &[],
         )
         .expect("full redraw should succeed despite sync flag");
 
@@ -1124,10 +1157,13 @@ mod tests {
     // paint-command variants end-to-end through the same render path
     // used in production.
 
-    use crate::scene_cache::{
-        BorderGlyphs, Cell, Color, DecorationScene, DecorationSceneCache, GradientAxis, NamedColor,
-        PaintCommand, SceneRect, Style, SurfaceDecoration,
+    use bmux_plugin::{AttachRenderExtension, ExtensionRect};
+    use bmux_scene_protocol::scene_protocol::{
+        BorderGlyphs, Cell, Color, GradientAxis, NamedColor, PaintCommand, Rect as SceneRect,
+        Style, SurfaceDecoration,
     };
+    use std::io;
+    use std::sync::{Arc, Mutex};
 
     fn default_style() -> Style {
         Style {
@@ -1140,6 +1176,36 @@ mod tests {
             dim: false,
             blink: false,
             strikethrough: false,
+        }
+    }
+
+    /// Test-only render extension that paints a single
+    /// [`SurfaceDecoration`] onto the stream for every surface the
+    /// renderer asks about. Used by the PR-1 vocabulary tests to
+    /// drive paint-command variants through the render path.
+    struct SingleSurfaceExtension {
+        surface: Mutex<SurfaceDecoration>,
+    }
+
+    impl AttachRenderExtension for SingleSurfaceExtension {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn name(&self) -> &str {
+            "test.single_surface"
+        }
+
+        fn apply_surface(
+            &self,
+            stdout: &mut dyn io::Write,
+            _surface_id: Uuid,
+            _surface_rect: &ExtensionRect,
+        ) -> io::Result<bool> {
+            let Ok(surface) = self.surface.lock() else {
+                return Ok(false);
+            };
+            let mut writer: &mut dyn io::Write = stdout;
+            bmux_scene_protocol_render::paint::apply_paint_commands(&mut writer, &surface)
+                .map(|()| true)
+                .map_err(|err| io::Error::other(err.to_string()))
         }
     }
 
@@ -1184,32 +1250,27 @@ mod tests {
         let mut pane_buffers = BTreeMap::new();
         pane_buffers.insert(pane_id, PaneRenderBuffer::default());
 
-        let mut surfaces = std::collections::BTreeMap::new();
-        surfaces.insert(
-            pane_id,
-            SurfaceDecoration {
-                surface_id: pane_id,
-                rect: SceneRect {
-                    x: 0,
-                    y: 0,
-                    w: 40,
-                    h: 6,
-                },
-                content_rect: SceneRect {
-                    x: 1,
-                    y: 1,
-                    w: 38,
-                    h: 4,
-                },
-                paint_commands,
+        let surface = SurfaceDecoration {
+            surface_id: pane_id,
+            rect: SceneRect {
+                x: 0,
+                y: 0,
+                w: 40,
+                h: 6,
             },
-        );
-        let mut cache = DecorationSceneCache::new();
-        cache.force_scene(DecorationScene {
-            revision: 1,
-            surfaces,
-            animation: None,
-        });
+            content_rect: SceneRect {
+                x: 1,
+                y: 1,
+                w: 38,
+                h: 4,
+            },
+            paint_commands,
+            interactive_regions: Vec::new(),
+        };
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(SingleSurfaceExtension {
+                surface: Mutex::new(surface),
+            }) as Arc<dyn AttachRenderExtension>];
 
         let mut output = Vec::new();
         let _ = render_attach_scene(
@@ -1227,7 +1288,7 @@ mod tests {
             None,
             false,
             (80, 24),
-            Some(&cache),
+            &extensions,
         )
         .expect("render should succeed");
         String::from_utf8(output).expect("render output should be utf8")

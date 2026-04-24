@@ -1080,162 +1080,16 @@ pub(super) fn ready_tracker_snapshot() -> bmux_plugin_sdk::ReadyTracker {
     READY_TRACKER.with(|cell| cell.borrow().clone())
 }
 
-/// Populate a [`bmux_attach_pipeline::scene_cache::SharedSceneCache`]
-/// with the decoration plugin's current [`bmux_scene_protocol::scene_protocol::DecorationScene`].
-///
-/// Resolves the typed `decoration-state` service from the thread-local
-/// typed-service registry, invokes `scene_snapshot`, and writes the
-/// result through the revision-guarded cache update. Silently no-ops
-/// when no decoration plugin is registered, when the typed handle is
-/// not present (e.g. the plugin is loaded but opted out of typed
-/// dispatch), or when the plugin's `scene_snapshot` produces a stale
-/// revision.
-///
-/// The push-based event subscription path will later invalidate the
-/// cache incrementally; this helper handles the cold-start case where
-/// the render loop needs a scene before any event has fired.
-pub(super) async fn prime_decoration_scene_cache(
-    client: &mut bmux_client::StreamingBmuxClient,
-    cache: &bmux_attach_pipeline::scene_cache::SharedSceneCache,
-) {
-    let payload = match bmux_codec::to_vec(&()) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(error = %error, "encoding scene-snapshot args");
-            return;
-        }
-    };
-    let bytes = match client
-        .invoke_service_raw(
-            "bmux.decoration.read",
-            bmux_ipc::InvokeServiceKind::Query,
-            "decoration-state",
-            "scene-snapshot",
-            payload,
-        )
-        .await
-    {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::debug!(error = %error, "decoration scene-snapshot priming query failed");
-            return;
-        }
-    };
-    let scene = match bmux_codec::from_bytes::<bmux_scene_protocol::scene_protocol::DecorationScene>(
-        &bytes,
-    ) {
-        Ok(scene) => scene,
-        Err(error) => {
-            tracing::warn!(error = %error, "decoding scene-snapshot response");
-            return;
-        }
-    };
-    if let Ok(mut guard) = cache.write() {
-        guard.set_scene(scene);
-    }
-}
-
-/// Push a pane's current `rect` + `content_rect` to the decoration
-/// plugin via its typed `notify-pane-geometry` command. Silently
-/// no-ops when the decoration plugin is not loaded (mirrors the
-/// cold-start policy of [`prime_decoration_scene_cache`]).
-///
-/// The decoration plugin lives in the server process; we route the
-/// command over the client/server IPC so the plugin actually
-/// receives the update. Errors are logged at debug only — the attach
-/// loop re-pushes on the next layout diff regardless.
-pub(super) async fn push_decoration_pane_geometry(
-    client: &mut bmux_client::StreamingBmuxClient,
-    pane_id: uuid::Uuid,
-    rect: bmux_scene_protocol::scene_protocol::Rect,
-    content_rect: bmux_scene_protocol::scene_protocol::Rect,
-) {
-    #[derive(serde::Serialize)]
-    struct Args {
-        geometry: bmux_decoration_plugin_api::decoration_state::PaneGeometry,
-    }
-    tracing::trace!(
-        pane_id = %pane_id,
-        "push_decoration_pane_geometry dispatching IPC",
-    );
-    let geometry = bmux_decoration_plugin_api::decoration_state::PaneGeometry {
-        pane_id,
-        rect,
-        content_rect,
-    };
-    let payload = match bmux_codec::to_vec(&Args { geometry }) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(error = %error, "encoding notify-pane-geometry args");
-            return;
-        }
-    };
-    if let Err(error) = client
-        .invoke_service_raw(
-            "bmux.decoration.write",
-            bmux_ipc::InvokeServiceKind::Command,
-            "decoration-state",
-            "notify-pane-geometry",
-            payload,
-        )
-        .await
-    {
-        tracing::debug!(
-            pane_id = %pane_id,
-            error = %error,
-            "notify-pane-geometry dispatch failed; decoration plugin may not be loaded",
-        );
-    }
-}
-
-/// Drop any decoration state the plugin is holding for `pane_id`.
-/// Called by the attach runtime when a pane disappears from the
-/// observed layout (close / session detach). Silently no-ops when
-/// the decoration plugin is not loaded.
-pub(super) async fn forget_decoration_pane(
-    client: &mut bmux_client::StreamingBmuxClient,
-    pane_id: uuid::Uuid,
-) {
-    #[derive(serde::Serialize)]
-    struct Args {
-        pane_id: uuid::Uuid,
-    }
-    let payload = match bmux_codec::to_vec(&Args { pane_id }) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(error = %error, "encoding forget-pane args");
-            return;
-        }
-    };
-    if let Err(error) = client
-        .invoke_service_raw(
-            "bmux.decoration.write",
-            bmux_ipc::InvokeServiceKind::Command,
-            "decoration-state",
-            "forget-pane",
-            payload,
-        )
-        .await
-    {
-        tracing::debug!(
-            pane_id = %pane_id,
-            error = %error,
-            "forget-pane dispatch failed; decoration plugin may not be loaded",
-        );
-    }
-}
-
 /// Minimal single-threaded executor for driving a typed-dispatch
 /// future to completion from synchronous code.
 ///
 /// Typed service method futures returned by the BPDL-generated trait
 /// are `Pin<Box<dyn Future + Send>>`. Runtime consumers that live
-/// inside synchronous call paths (e.g. the attach startup sequence
-/// priming the scene cache) can use this helper without pulling in a
-/// full tokio runtime. The futures produced by the decoration plugin's
-/// typed service are `async move { ... }` blocks that never suspend,
-/// so `Poll::Pending` shouldn't be reachable in practice; if it is
-/// observed we spin briefly and yield rather than hanging the thread.
+/// inside synchronous call paths can use this helper without pulling
+/// in a full tokio runtime. Typed-service futures are `async move
+/// { ... }` blocks that never suspend, so `Poll::Pending` shouldn't
+/// be reachable in practice; if it is observed we spin briefly and
+/// yield rather than hanging the thread.
 #[allow(dead_code)] // Kept for future sync-call-site typed dispatch (no current consumers).
 fn block_on_future<T>(
     fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>>,

@@ -29,7 +29,7 @@ pub struct ThemeConfig {
     pub status: StatusColors,
     /// Opaque per-plugin theme extensions.
     ///
-    /// Keys are plugin IDs (e.g. `"bmux.decoration"`); values are
+    /// Keys are plugin IDs (e.g. `"bmux.my-plugin"`); values are
     /// plugin-owned TOML records that core stores but does not
     /// interpret. Each plugin's `ConfigExtensionValidator` typed
     /// service parses its slice against a BPDL-declared schema at
@@ -128,20 +128,20 @@ foreground = "#39ff14"
 active_window = "#00ff00"
 mode_indicator = "#ffff00"
 
-[plugins."bmux.decoration"]
+[plugins."bmux.example"]
 whatever = "is fine"
 
-[plugins."bmux.decoration".nested]
+[plugins."bmux.example".nested]
 key = "value"
 "##;
         let parsed: ThemeConfig = toml::from_str(theme_text).expect("parse");
-        let decoration_ext = parsed
+        let example_ext = parsed
             .plugins
-            .get("bmux.decoration")
-            .expect("decoration extension present");
+            .get("bmux.example")
+            .expect("example extension present");
         // Core did not interpret the payload — it's round-tripped as
         // an opaque TOML value keyed by plugin id.
-        let table = decoration_ext.as_table().expect("table");
+        let table = example_ext.as_table().expect("table");
         assert_eq!(
             table.get("whatever").and_then(|v| v.as_str()),
             Some("is fine"),

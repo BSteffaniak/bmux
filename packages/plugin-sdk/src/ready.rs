@@ -7,10 +7,10 @@
 //! available.
 //!
 //! Host subsystems that depend on a signal wait for it before running
-//! dependent logic (e.g. the render loop waits for the decoration plugin's
-//! first scene publish before painting a frame). Readiness is a cooperative
-//! lifecycle concept owned by the plugin; the host only observes and
-//! sequences against it.
+//! dependent logic (e.g. the attach runtime gating its first render
+//! on a plugin's `scene-published` ready signal). Readiness is a
+//! cooperative lifecycle concept owned by the plugin; the host only
+//! observes and sequences against it.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
