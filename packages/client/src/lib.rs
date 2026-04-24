@@ -509,6 +509,34 @@ impl BmuxClient {
         }
     }
 
+    /// Relay a wire-encoded payload onto the server's plugin event
+    /// bus under `kind`. The server looks up the registered channel's
+    /// decoder and invokes it; channels without a registered decoder
+    /// silently drop the payload (returns `emitted = false`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails transport/protocol
+    /// validation or if the server's decoder returns an error.
+    pub async fn emit_on_plugin_bus(
+        &mut self,
+        kind: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<bool> {
+        match self
+            .request(Request::EmitOnPluginBus {
+                kind: kind.into(),
+                payload,
+            })
+            .await?
+        {
+            ResponsePayload::PluginBusEmitted { emitted } => Ok(emitted),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected plugin bus emitted",
+            )),
+        }
+    }
+
     /// Execute a raw kernel request and return the full response envelope payload.
     ///
     /// # Errors
@@ -2094,6 +2122,33 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Relay a wire-encoded payload onto the server's plugin event
+    /// bus under `kind`. See [`BmuxClient::emit_on_plugin_bus`] for
+    /// the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails transport/protocol
+    /// validation or if the server's decoder returns an error.
+    pub async fn emit_on_plugin_bus(
+        &mut self,
+        kind: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<bool> {
+        match self
+            .request(Request::EmitOnPluginBus {
+                kind: kind.into(),
+                payload,
+            })
+            .await?
+        {
+            ResponsePayload::PluginBusEmitted { emitted } => Ok(emitted),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected plugin bus emitted",
+            )),
+        }
+    }
+
     /// Send bytes directly to a specific pane by ID, bypassing focus routing.
     ///
     /// # Errors
@@ -2175,6 +2230,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
+        Request::EmitOnPluginBus { .. } => "emit_on_plugin_bus",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
@@ -2199,6 +2255,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::EventsSubscribed => "events_subscribed",
             ResponsePayload::EventBatch { .. } => "event_batch",
             ResponsePayload::EventPushEnabled => "event_push_enabled",
+            ResponsePayload::PluginBusEmitted { .. } => "plugin_bus_emitted",
         },
         Response::Err(_) => "error",
     }

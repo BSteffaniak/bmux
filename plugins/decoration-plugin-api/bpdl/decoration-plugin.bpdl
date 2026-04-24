@@ -197,13 +197,6 @@ interface decoration-state {
     // Commands.
     command set-pane-border(pane-id: uuid, border: border-style) -> result<unit, set-style-error>;
     command set-default-border(border: border-style) -> result<unit, set-style-error>;
-    // Notify the plugin of a pane's current rect + content_rect.
-    // Called by the attach runtime whenever the observed layout
-    // changes. Decoration geometry is retained in a per-pane cache
-    // keyed by `pane-id`; subsequent paint-command builds consult
-    // the cache to position themselves. Panes absent from the
-    // attach scene are expected to be removed via `forget-pane`.
-    command notify-pane-geometry(geometry: pane-geometry) -> result<unit, notify-error>;
     // Notify the plugin of a pane-level event. Today the decoration
     // plugin also subscribes to `bmux.windows/windows-events` via the
     // typed event bus; this typed command exists as an ordered
@@ -211,10 +204,6 @@ interface decoration-state {
     // and for a future where the windows plugin uses typed-dispatch
     // instead of the bus).
     command notify-pane-event(event: pane-event) -> result<unit, notify-error>;
-    // Drop any cached geometry / activity for `pane-id`. Called when
-    // a pane disappears from the attach scene (close, session
-    // detach).
-    command forget-pane(pane-id: uuid) -> result<unit, notify-error>;
 
     // Pane-level event mirror. Identical to `windows.pane-event` by
     // design; kept local to avoid an import cycle with `bmux.windows`.

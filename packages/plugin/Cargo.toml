@@ -21,6 +21,7 @@ libloading                = { workspace = true }
 semver                    = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std"] }
 serde_json                = { workspace = true }
+thiserror                 = { workspace = true }
 tokio                     = { workspace = true, features = ["sync"] }
 toml                      = { workspace = true, features = ["parse"] }
 tracing                   = { workspace = true, features = ["std"] }

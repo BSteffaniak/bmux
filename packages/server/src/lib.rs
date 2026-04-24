@@ -5617,6 +5617,23 @@ async fn handle_request(
                 })
             }
         }
+        Request::EmitOnPluginBus { kind, payload } => {
+            // Relay a wire-encoded payload onto the server's plugin
+            // event bus. Decoders registered via
+            // `EventBus::register_state_channel_with_decoder` pick it
+            // up; channels without a decoder or not yet registered
+            // silently drop the payload (returns `emitted: false`) so
+            // early wire traffic from a client doesn't fail loudly.
+            let event_kind =
+                bmux_plugin_sdk::PluginEventKind::from_static(Box::leak(kind.into_boxed_str()));
+            match bmux_plugin::global_event_bus().emit_from_bytes(&event_kind, &payload) {
+                Ok(emitted) => Response::Ok(ResponsePayload::PluginBusEmitted { emitted }),
+                Err(error) => Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("emit_on_plugin_bus failed: {error}"),
+                }),
+            }
+        }
         Request::SubscribeEvents => {
             state
                 .event_hub
@@ -5683,6 +5700,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
+        Request::EmitOnPluginBus { .. } => "emit_on_plugin_bus",
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
         Request::SubscribeEvents => "subscribe_events",
@@ -5878,6 +5896,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::EventsSubscribed => "events_subscribed",
         ResponsePayload::EventBatch { .. } => "event_batch",
         ResponsePayload::EventPushEnabled => "event_push_enabled",
+        ResponsePayload::PluginBusEmitted { .. } => "plugin_bus_emitted",
     }
 }
 

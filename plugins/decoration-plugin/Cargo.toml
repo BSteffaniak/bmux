@@ -15,6 +15,7 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bmux_attach_layout_protocol  = { workspace = true }
 bmux_decoration_plugin_api   = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin                  = { workspace = true }

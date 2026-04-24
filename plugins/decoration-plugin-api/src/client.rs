@@ -9,16 +9,6 @@
 //! directly, with no decoration-specific string constants leaking
 //! out to other crates.
 //!
-//! Current helpers cover the client-side paths the attach runtime
-//! uses today:
-//!
-//! - [`scene_snapshot`] — one-shot read of the current
-//!   `DecorationScene`.
-//! - [`notify_pane_geometry`] — push a pane's observed rect /
-//!   content_rect so the plugin can paint against live geometry.
-//! - [`forget_pane`] — evict the plugin's per-pane state when a
-//!   pane disappears.
-//!
 //! All helpers route through
 //! [`bmux_plugin_sdk::TypedDispatchClient::invoke_service_raw`] with
 //! hardcoded capability/interface/op strings captured in private
@@ -28,18 +18,11 @@
 
 use bmux_ipc::InvokeServiceKind;
 use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError};
-use bmux_scene_protocol::scene_protocol::{DecorationScene, Rect};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-use crate::decoration_state::PaneGeometry;
+use bmux_scene_protocol::scene_protocol::DecorationScene;
 
 const READ_CAPABILITY: &str = "bmux.decoration.read";
-const WRITE_CAPABILITY: &str = "bmux.decoration.write";
 const INTERFACE_DECORATION_STATE: &str = "decoration-state";
 const OP_SCENE_SNAPSHOT: &str = "scene-snapshot";
-const OP_NOTIFY_PANE_GEOMETRY: &str = "notify-pane-geometry";
-const OP_FORGET_PANE: &str = "forget-pane";
 
 /// Errors returned by decoration typed-client helpers.
 #[derive(Debug, thiserror::Error)]
@@ -81,67 +64,4 @@ pub async fn scene_snapshot<C: TypedDispatchClient>(client: &mut C) -> Result<De
         )
         .await?;
     bmux_codec::from_bytes(&bytes).map_err(|err| DecorationClientError::Decode(err.to_string()))
-}
-
-/// Push a pane's current rect + content-rect to the decoration
-/// plugin via its typed `notify-pane-geometry` command.
-///
-/// # Errors
-///
-/// Returns [`DecorationClientError::Encode`] when serialising the
-/// request fails or [`DecorationClientError::Dispatch`] on
-/// transport errors. Callers that want "plugin absent → no-op"
-/// semantics should log-and-continue on `Dispatch`.
-pub async fn notify_pane_geometry<C: TypedDispatchClient>(
-    client: &mut C,
-    pane_id: Uuid,
-    rect: Rect,
-    content_rect: Rect,
-) -> Result<()> {
-    #[derive(Serialize)]
-    struct Args {
-        geometry: PaneGeometry,
-    }
-    let geometry = PaneGeometry {
-        pane_id,
-        rect,
-        content_rect,
-    };
-    let payload = bmux_codec::to_vec(&Args { geometry })
-        .map_err(|err| DecorationClientError::Encode(err.to_string()))?;
-    client
-        .invoke_service_raw(
-            WRITE_CAPABILITY,
-            InvokeServiceKind::Command,
-            INTERFACE_DECORATION_STATE,
-            OP_NOTIFY_PANE_GEOMETRY,
-            payload,
-        )
-        .await?;
-    Ok(())
-}
-
-/// Drop the plugin's per-pane state for `pane_id`. Called by the
-/// attach runtime when a pane disappears from the observed layout.
-///
-/// # Errors
-///
-/// Same shape as [`notify_pane_geometry`].
-pub async fn forget_pane<C: TypedDispatchClient>(client: &mut C, pane_id: Uuid) -> Result<()> {
-    #[derive(Serialize, Deserialize)]
-    struct Args {
-        pane_id: Uuid,
-    }
-    let payload = bmux_codec::to_vec(&Args { pane_id })
-        .map_err(|err| DecorationClientError::Encode(err.to_string()))?;
-    client
-        .invoke_service_raw(
-            WRITE_CAPABILITY,
-            InvokeServiceKind::Command,
-            INTERFACE_DECORATION_STATE,
-            OP_FORGET_PANE,
-            payload,
-        )
-        .await?;
-    Ok(())
 }

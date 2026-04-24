@@ -662,14 +662,15 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 /// caller can optionally forward it to other listeners. When the
 /// layout is absent the snapshot is empty and the pane-id set is
 /// empty too.
-fn notify_extensions_of_layout(
+async fn notify_extensions_of_layout(
+    client: &mut bmux_client::StreamingBmuxClient,
     _previous: Option<&bmux_client::AttachLayoutState>,
     current: Option<&bmux_client::AttachLayoutState>,
 ) -> std::collections::BTreeSet<Uuid> {
     use bmux_scene_protocol::scene_protocol::Rect as SceneRect;
 
     let Some(current) = current else {
-        publish_attach_layout_snapshot(&[]);
+        publish_attach_layout_snapshot(client, &[]).await;
         return std::collections::BTreeSet::new();
     };
 
@@ -695,7 +696,7 @@ fn notify_extensions_of_layout(
             visible: surface.visible,
         })
         .collect();
-    publish_attach_layout_snapshot(&layout_entries);
+    publish_attach_layout_snapshot(client, &layout_entries).await;
 
     let mut current_pane_ids = std::collections::BTreeSet::new();
     for surface in &current.scene.surfaces {
@@ -711,11 +712,15 @@ fn notify_extensions_of_layout(
 }
 
 /// Publish an [`AttachLayoutSnapshot`] on the attach-layout state
-/// channel. Called from `notify_extensions_of_layout` on every
-/// layout refresh, and from attach startup to register the channel
-/// with an initial empty value. Late-subscribing plugins see the
-/// current value immediately; subsequent receivers fire on each refresh.
-fn publish_attach_layout_snapshot(surfaces: &[AttachSurfaceSummary]) {
+/// channel (client-side event bus) AND forward the same payload to
+/// the server's event bus via [`Request::EmitOnPluginBus`]. Plugins
+/// that live in the server process (e.g. the decoration plugin)
+/// subscribe to the server-side channel and see the snapshot
+/// alongside client-side subscribers.
+async fn publish_attach_layout_snapshot(
+    client: &mut bmux_client::StreamingBmuxClient,
+    surfaces: &[AttachSurfaceSummary],
+) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static REVISION: AtomicU64 = AtomicU64::new(0);
     let revision = REVISION.fetch_add(1, Ordering::Relaxed) + 1;
@@ -723,7 +728,28 @@ fn publish_attach_layout_snapshot(surfaces: &[AttachSurfaceSummary]) {
         surfaces: surfaces.to_vec(),
         revision,
     };
-    let _ = bmux_plugin::global_event_bus().publish_state(&ATTACH_LAYOUT_STATE_KIND, payload);
+    // Client-side publish: any render extension running in this
+    // process picks up the snapshot.
+    let _ =
+        bmux_plugin::global_event_bus().publish_state(&ATTACH_LAYOUT_STATE_KIND, payload.clone());
+    // Server-side publish via IPC: any plugin that registered the
+    // attach-layout channel with a decoder picks up the snapshot on
+    // its process-local event bus. When the server hasn't registered
+    // a decoder (no subscribing plugin), the server silently drops
+    // the payload.
+    let encoded = match serde_json::to_vec(&payload) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "failed encoding attach-layout snapshot for plugin-bus relay");
+            return;
+        }
+    };
+    if let Err(error) = client
+        .emit_on_plugin_bus(ATTACH_LAYOUT_STATE_KIND.as_str(), encoded)
+        .await
+    {
+        tracing::debug!(%error, "emit_on_plugin_bus for attach-layout failed");
+    }
 }
 
 async fn maybe_emit_attach_perf_window(
@@ -1102,7 +1128,8 @@ pub async fn run_session_attach_with_client(
     // per-pane rects at attach entry. Subsequent layout changes flow
     // through the loop-body call to
     // `notify_extensions_of_layout` at the layout-refresh site.
-    let _ = notify_extensions_of_layout(None, view_state.cached_layout_state.as_ref());
+    let _ = notify_extensions_of_layout(&mut client, None, view_state.cached_layout_state.as_ref())
+        .await;
     refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
     sync_attach_active_mode_from_processor(&mut view_state, &attach_keymap, None);
     view_state.set_transient_status(
@@ -1578,9 +1605,11 @@ pub async fn run_session_attach_with_client(
             // subscribe to this channel and react without core needing
             // to know which plugins care.
             let current_pane_ids = notify_extensions_of_layout(
+                &mut client,
                 previous_layout.as_ref(),
                 view_state.cached_layout_state.as_ref(),
-            );
+            )
+            .await;
             drop(current_pane_ids);
             view_state.dirty.layout_needs_refresh = false;
 

@@ -1045,7 +1045,6 @@ dependencies = [
  "bmux_control_catalog_plugin",
  "bmux_control_catalog_plugin_api",
  "bmux_decoration_plugin",
- "bmux_decoration_plugin_api",
  "bmux_decoration_plugin_renderer",
  "bmux_env",
  "bmux_fonts",
@@ -1325,6 +1324,7 @@ dependencies = [
 name = "bmux_decoration_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_attach_layout_protocol",
  "bmux_decoration_plugin_api",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
@@ -1622,6 +1622,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
  "tracing",

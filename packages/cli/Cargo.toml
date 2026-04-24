@@ -26,7 +26,6 @@ bmux_codec                      = { workspace = true }
 bmux_config                     = { workspace = true }
 bmux_contexts_plugin_api        = { workspace = true }
 bmux_control_catalog_plugin_api = { workspace = true }
-bmux_decoration_plugin_api      = { workspace = true }
 bmux_env                        = { workspace = true }
 bmux_fonts                      = { workspace = true, default-features = false }
 bmux_ipc                        = { workspace = true }

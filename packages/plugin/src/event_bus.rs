@@ -154,7 +154,30 @@ struct ChannelEntry {
     kind: ChannelKind,
     payload_type_id: TypeId,
     payload_type_name: &'static str,
+    /// Optional bytes-to-publish trampoline. Registered channels that
+    /// want to receive wire-forwarded payloads (e.g. via the
+    /// `Request::EmitOnPluginBus` cross-process relay) provide a
+    /// decoder at registration time. Channels without a decoder can
+    /// still be published to in-process via the typed
+    /// [`EventBus::publish_state`] / [`EventBus::emit`] APIs; they
+    /// simply can't accept wire-encoded payloads.
+    decoder: Option<BytesDecoder>,
 }
+
+/// Error surface for `emit_from_bytes` decoder invocation.
+#[derive(Debug, thiserror::Error)]
+pub enum EventBusBytesError {
+    #[error("failed to decode wire payload: {0}")]
+    Decode(String),
+    #[error(transparent)]
+    Bus(#[from] EventBusError),
+}
+
+/// Type alias for the bytes-to-publish trampoline stored on a
+/// registered channel. Given raw wire bytes, the decoder
+/// deserialises them into the channel's typed payload and invokes
+/// `publish_state` on the owning event bus.
+type BytesDecoder = Arc<dyn Fn(&[u8]) -> Result<(), EventBusBytesError> + Send + Sync + 'static>;
 
 /// Host-side typed event bus.
 #[derive(Default)]
@@ -216,6 +239,7 @@ impl EventBus {
             kind: ChannelKind::Broadcast(Arc::new(sender.clone())),
             payload_type_id: TypeId::of::<E>(),
             payload_type_name: std::any::type_name::<E>(),
+            decoder: None,
         };
         let mut guard = self.entries.write().expect("event bus lock poisoned");
         guard.insert(interface, entry);
@@ -250,10 +274,90 @@ impl EventBus {
             kind: ChannelKind::State(Arc::new(sender.clone())),
             payload_type_id: TypeId::of::<T>(),
             payload_type_name: std::any::type_name::<T>(),
+            decoder: None,
         };
         let mut guard = self.entries.write().expect("event bus lock poisoned");
         guard.insert(interface, entry);
         sender
+    }
+
+    /// Register a state channel plus a wire-bytes decoder so callers
+    /// of [`Self::emit_from_bytes`] can publish on this channel
+    /// without knowing its concrete payload type at compile time.
+    ///
+    /// Use this instead of [`Self::register_state_channel`] when the
+    /// channel needs to accept wire-encoded payloads (e.g. via the
+    /// cross-process `Request::EmitOnPluginBus` relay). The decoder
+    /// takes the JSON-encoded bytes, deserialises them into `T`, and
+    /// invokes `publish_state` on the same bus.
+    ///
+    /// Returns the typed sender so the registering plugin can publish
+    /// directly without re-looking up the entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal lock is poisoned.
+    #[allow(clippy::needless_pass_by_value)] // Consumed twice via `.clone()` into both the registry and the captured closure.
+    pub fn register_state_channel_with_decoder<T>(
+        self: &Arc<Self>,
+        interface: PluginEventKind,
+        initial: T,
+    ) -> watch::Sender<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static + serde::de::DeserializeOwned,
+    {
+        let sender = self.register_state_channel::<T>(interface.clone(), initial);
+        let bus = Arc::downgrade(self);
+        let decoder_kind = interface.clone();
+        let decoder: BytesDecoder =
+            Arc::new(move |bytes: &[u8]| -> Result<(), EventBusBytesError> {
+                let Some(bus) = bus.upgrade() else {
+                    return Err(EventBusBytesError::Decode("event bus dropped".to_string()));
+                };
+                let value: T = serde_json::from_slice(bytes)
+                    .map_err(|err| EventBusBytesError::Decode(err.to_string()))?;
+                bus.publish_state::<T>(&decoder_kind, value)?;
+                Ok(())
+            });
+        if let Ok(mut guard) = self.entries.write()
+            && let Some(entry) = guard.get_mut(&interface)
+        {
+            entry.decoder = Some(decoder);
+        }
+        sender
+    }
+
+    /// Publish a wire-encoded payload on the channel registered for
+    /// `interface`. The channel must have been registered with a
+    /// decoder via [`Self::register_state_channel_with_decoder`];
+    /// otherwise the payload is silently dropped (returns
+    /// `Ok(false)`) so early wire events before a subscribing plugin
+    /// activates don't fail loudly.
+    ///
+    /// Returns `Ok(true)` when a decoder ran and published, `Ok(false)`
+    /// when no channel or no decoder is registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventBusBytesError::Decode`] when the decoder fails
+    /// to parse the payload or when the underlying
+    /// [`Self::publish_state`] rejects the type.
+    pub fn emit_from_bytes(
+        &self,
+        interface: &PluginEventKind,
+        payload: &[u8],
+    ) -> Result<bool, EventBusBytesError> {
+        let decoder = self
+            .entries
+            .read()
+            .map_err(|_| EventBusBytesError::Decode("event bus lock poisoned".to_string()))?
+            .get(interface)
+            .and_then(|entry| entry.decoder.as_ref().map(Arc::clone));
+        let Some(decoder) = decoder else {
+            return Ok(false);
+        };
+        decoder(payload)?;
+        Ok(true)
     }
 
     /// Emit an event on the broadcast channel registered for

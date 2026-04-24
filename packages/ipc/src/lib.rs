@@ -484,6 +484,18 @@ pub enum Request {
         operation: String,
         payload: Vec<u8>,
     },
+    /// Emit a wire-encoded payload onto the server's plugin event bus
+    /// under `kind`. The server looks up the registered channel and
+    /// invokes its decoder to deserialise the bytes into the channel's
+    /// typed value, then publishes on the same bus. Used by the
+    /// attach runtime to relay state-channel payloads (e.g. attach
+    /// layout snapshots) from client-process plugins to their
+    /// server-process counterparts so every plugin can subscribe to
+    /// the same wire vocabulary regardless of which process owns it.
+    EmitOnPluginBus {
+        kind: String,
+        payload: Vec<u8>,
+    },
     SubscribeEvents,
     PollEvents {
         max_events: usize,
@@ -998,6 +1010,15 @@ pub enum ResponsePayload {
     /// Acknowledgement that server-push event delivery has been enabled.
     EventPushEnabled,
     ServerStopping,
+    /// Acknowledgement that an [`Request::EmitOnPluginBus`] payload
+    /// was delivered to the server's event bus. `emitted` is `true`
+    /// when a subscriber-ready channel received the bytes; `false`
+    /// when no channel was registered (dropped silently so early
+    /// wire traffic before plugin activation doesn't surface an
+    /// error).
+    PluginBusEmitted {
+        emitted: bool,
+    },
     ServiceInvoked {
         payload: Vec<u8>,
     },

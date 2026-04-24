@@ -264,44 +264,6 @@ impl DecorationStateService for DecorationServiceHandle {
         })
     }
 
-    fn notify_pane_geometry<'a>(
-        &'a self,
-        geometry: PaneGeometry,
-    ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| NotifyError::InvalidArgument {
-                    reason: "decoration state mutex poisoned".to_string(),
-                })?;
-            let pane_id = geometry.pane_id;
-            let previous = state.geometry.insert(pane_id, geometry);
-            if previous.is_none() {
-                // One-shot breadcrumb per pane — confirms the attach
-                // runtime's layout-notify path is reaching the
-                // decoration plugin at all.
-                if let Some(geom) = state.geometry.get(&pane_id) {
-                    tracing::debug!(
-                        pane_id = %pane_id,
-                        rect = ?(geom.rect.x, geom.rect.y, geom.rect.w, geom.rect.h),
-                        "decoration plugin received first geometry for pane",
-                    );
-                }
-            }
-            // Only bump the revision when geometry actually changed —
-            // the attach runtime re-pushes on every layout diff even
-            // when individual rects didn't move.
-            let changed = previous
-                .as_ref()
-                .is_none_or(|prev| prev != state.geometry.get(&pane_id).unwrap());
-            if changed {
-                bump_revision(&mut state);
-            }
-            Ok(())
-        })
-    }
-
     fn notify_pane_event<'a>(
         &'a self,
         event: PaneEvent,
@@ -314,27 +276,6 @@ impl DecorationStateService for DecorationServiceHandle {
                     reason: "decoration state mutex poisoned".to_string(),
                 })?;
             apply_pane_event(&mut state, &event);
-            Ok(())
-        })
-    }
-
-    fn forget_pane<'a>(
-        &'a self,
-        pane_id: Uuid,
-    ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| NotifyError::InvalidArgument {
-                    reason: "decoration state mutex poisoned".to_string(),
-                })?;
-            let removed = state.panes.remove(&pane_id).is_some()
-                | state.geometry.remove(&pane_id).is_some()
-                | state.activity.remove(&pane_id).is_some();
-            if removed {
-                bump_revision(&mut state);
-            }
             Ok(())
         })
     }
@@ -1525,6 +1466,23 @@ impl RustPlugin for DecorationPlugin {
         // `SessionFocusStateMap` to late subscribers before any live
         // updates arrive.
         spawn_pane_runtime_focus_state_subscriber(self.state.clone_arc());
+        // Register the attach-layout state channel with a JSON
+        // decoder so the attach runtime can relay layout snapshots
+        // across the client/server boundary via
+        // `Request::EmitOnPluginBus`. The decorator plugin lives in
+        // the server process and relies on this to observe pane
+        // geometry without any client-side hardcoded push helper.
+        let _ = bmux_plugin::global_event_bus()
+            .register_state_channel_with_decoder::<
+                bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot,
+            >(
+                bmux_attach_layout_protocol::attach_layout_protocol::STATE_KIND,
+                bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot {
+                    surfaces: Vec::new(),
+                    revision: 0,
+                },
+            );
+        spawn_attach_layout_subscriber(self.state.clone_arc());
         // Spawn the animation tick thread when the theme requests a
         // non-zero hz and a script is compiled. The thread holds a
         // `Weak` so it exits cleanly when the plugin is dropped.
@@ -1651,34 +1609,6 @@ impl RustPlugin for DecorationPlugin {
                 })();
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
-            "decoration-state", "notify-pane-geometry" => |req: NotifyPaneGeometryArgs, _ctx| {
-                let outcome: Result<(), NotifyError> = (|| {
-                    let mut state = state
-                        .lock()
-                        .map_err(|_| NotifyError::InvalidArgument {
-                            reason: "decoration state mutex poisoned".to_string(),
-                        })?;
-                    let pane_id = req.geometry.pane_id;
-                    let previous = state.geometry.insert(pane_id, req.geometry);
-                    if previous.is_none()
-                        && let Some(geom) = state.geometry.get(&pane_id)
-                    {
-                        tracing::debug!(
-                            pane_id = %pane_id,
-                            rect = ?(geom.rect.x, geom.rect.y, geom.rect.w, geom.rect.h),
-                            "decoration plugin received first geometry for pane",
-                        );
-                    }
-                    let changed = previous
-                        .as_ref()
-                        .is_none_or(|prev| prev != state.geometry.get(&pane_id).unwrap());
-                    if changed {
-                        bump_revision(&mut state);
-                    }
-                    Ok(())
-                })();
-                Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
-            },
             "decoration-state", "notify-pane-event" => |req: NotifyPaneEventArgs, _ctx| {
                 let outcome: Result<(), NotifyError> = (|| {
                     let mut state = state
@@ -1687,23 +1617,6 @@ impl RustPlugin for DecorationPlugin {
                             reason: "decoration state mutex poisoned".to_string(),
                         })?;
                     apply_pane_event(&mut state, &req.event);
-                    Ok(())
-                })();
-                Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
-            },
-            "decoration-state", "forget-pane" => |req: ForgetPaneArgs, _ctx| {
-                let outcome: Result<(), NotifyError> = (|| {
-                    let mut state = state
-                        .lock()
-                        .map_err(|_| NotifyError::InvalidArgument {
-                            reason: "decoration state mutex poisoned".to_string(),
-                        })?;
-                    let removed = state.panes.remove(&req.pane_id).is_some()
-                        | state.geometry.remove(&req.pane_id).is_some()
-                        | state.activity.remove(&req.pane_id).is_some();
-                    if removed {
-                        bump_revision(&mut state);
-                    }
                     Ok(())
                 })();
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
@@ -1751,18 +1664,8 @@ struct SetDefaultBorderArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct NotifyPaneGeometryArgs {
-    geometry: PaneGeometry,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct NotifyPaneEventArgs {
     event: PaneEvent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct ForgetPaneArgs {
-    pane_id: Uuid,
 }
 
 /// Compile `script` into a fresh backend and install it on `state`.
@@ -1990,6 +1893,107 @@ fn apply_focus_state_map(
         activity_focused_after,
         "apply_focus_state_map"
     );
+    if changed {
+        bump_revision(state);
+    }
+}
+
+/// Subscribe to the attach-layout state channel and reconcile
+/// incoming snapshots into `state.geometry`. Each snapshot carries
+/// the set of visible attach surfaces; we insert/update the
+/// `PaneGeometry` for every pane-backed surface and drop any panes
+/// that disappeared from the new snapshot. Bumping the scene
+/// revision after a change lets subscribers pick up the updated
+/// paint commands on the next frame.
+fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
+    let subscribe_result = bmux_plugin::global_event_bus()
+        .subscribe_state::<
+            bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot,
+        >(
+        &bmux_attach_layout_protocol::attach_layout_protocol::STATE_KIND,
+    );
+    let (initial, mut rx) = match subscribe_result {
+        Ok(pair) => {
+            tracing::debug!("attach-layout subscribe OK");
+            pair
+        }
+        Err(err) => {
+            tracing::warn!(%err, "attach-layout subscribe FAILED");
+            return;
+        }
+    };
+    if let Ok(mut guard) = state.lock() {
+        apply_attach_layout_snapshot(&mut guard, initial.as_ref());
+    }
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            tracing::error!("attach-layout subscriber FAILED to build tokio runtime");
+            return;
+        };
+        rt.block_on(async move {
+            while rx.changed().await.is_ok() {
+                let snapshot = rx.borrow().clone();
+                tracing::trace!(
+                    surfaces = snapshot.surfaces.len(),
+                    revision = snapshot.revision,
+                    "attach-layout update"
+                );
+                let Ok(mut guard) = state.lock() else {
+                    break;
+                };
+                apply_attach_layout_snapshot(&mut guard, snapshot.as_ref());
+            }
+            tracing::debug!("attach-layout subscriber loop exited");
+        });
+    });
+}
+
+/// Reconcile `state.geometry` against an [`AttachLayoutSnapshot`].
+/// Surfaces backed by a pane (non-`None` `pane_id`) update the
+/// plugin's geometry record; panes that disappeared from the
+/// snapshot are removed. `state.activity` entries for removed panes
+/// are cleaned up too so stale focus / zoom flags don't linger.
+fn apply_attach_layout_snapshot(
+    state: &mut State,
+    snapshot: &bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot,
+) {
+    use std::collections::BTreeSet;
+    let mut changed = false;
+    let mut seen: BTreeSet<Uuid> = BTreeSet::new();
+    for surface in &snapshot.surfaces {
+        let Some(pane_id) = surface.pane_id else {
+            continue;
+        };
+        if !surface.visible {
+            continue;
+        }
+        seen.insert(pane_id);
+        let new_geometry = PaneGeometry {
+            pane_id,
+            rect: surface.rect.clone(),
+            content_rect: surface.content_rect.clone(),
+        };
+        let prev = state.geometry.insert(pane_id, new_geometry);
+        if prev.as_ref() != state.geometry.get(&pane_id) {
+            changed = true;
+        }
+    }
+    // Drop panes that are no longer in the visible set.
+    let drop_ids: Vec<Uuid> = state
+        .geometry
+        .keys()
+        .filter(|id| !seen.contains(id))
+        .copied()
+        .collect();
+    for pane_id in drop_ids {
+        state.geometry.remove(&pane_id);
+        state.activity.remove(&pane_id);
+        state.panes.remove(&pane_id);
+        changed = true;
+    }
     if changed {
         bump_revision(state);
     }
@@ -2602,38 +2606,61 @@ mod tests {
     }
 
     #[test]
-    fn notify_pane_geometry_caches_rects_and_bumps_revision() {
+    fn apply_attach_layout_snapshot_caches_rects_and_bumps_revision() {
+        use bmux_attach_layout_protocol::attach_layout_protocol::{
+            AttachLayoutSnapshot, AttachSurfaceSummary,
+        };
         let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
         let pane = Uuid::from_u128(100);
         let before = plugin.build_scene().revision;
-        block_on(handle.notify_pane_geometry(PaneGeometry {
-            pane_id: pane,
-            rect: rect(0, 0, 20, 5),
-            content_rect: rect(1, 1, 18, 3),
-        }))
-        .expect("notify");
+        let snapshot = AttachLayoutSnapshot {
+            surfaces: vec![AttachSurfaceSummary {
+                surface_id: pane,
+                pane_id: Some(pane),
+                rect: rect(0, 0, 20, 5),
+                content_rect: rect(1, 1, 18, 3),
+                visible: true,
+            }],
+            revision: 1,
+        };
+        {
+            let mut state = plugin.state.inner.lock().expect("state");
+            apply_attach_layout_snapshot(&mut state, &snapshot);
+        }
         let after = plugin.build_scene().revision;
         assert!(after > before);
+        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
         let geom = block_on(handle.pane_geometry(pane)).expect("geometry cached");
         assert_eq!(geom.rect, rect(0, 0, 20, 5));
         assert_eq!(geom.content_rect, rect(1, 1, 18, 3));
     }
 
     #[test]
-    fn notify_pane_geometry_skips_revision_bump_for_unchanged_rects() {
-        let plugin = DecorationPlugin::new();
-        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
-        let pane = Uuid::from_u128(101);
-        let geom = PaneGeometry {
-            pane_id: pane,
-            rect: rect(0, 0, 10, 5),
-            content_rect: rect(1, 1, 8, 3),
+    fn apply_attach_layout_snapshot_skips_revision_bump_for_unchanged_rects() {
+        use bmux_attach_layout_protocol::attach_layout_protocol::{
+            AttachLayoutSnapshot, AttachSurfaceSummary,
         };
-        block_on(handle.notify_pane_geometry(geom.clone())).expect("first notify");
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(101);
+        let snapshot = AttachLayoutSnapshot {
+            surfaces: vec![AttachSurfaceSummary {
+                surface_id: pane,
+                pane_id: Some(pane),
+                rect: rect(0, 0, 10, 5),
+                content_rect: rect(1, 1, 8, 3),
+                visible: true,
+            }],
+            revision: 1,
+        };
+        {
+            let mut state = plugin.state.inner.lock().expect("state");
+            apply_attach_layout_snapshot(&mut state, &snapshot);
+        }
         let r1 = plugin.build_scene().revision;
-        // Same geometry — should not bump.
-        block_on(handle.notify_pane_geometry(geom)).expect("second notify");
+        {
+            let mut state = plugin.state.inner.lock().expect("state");
+            apply_attach_layout_snapshot(&mut state, &snapshot);
+        }
         let r2 = plugin.build_scene().revision;
         assert_eq!(r1, r2, "unchanged geometry must not bump revision");
     }
@@ -2697,39 +2724,68 @@ mod tests {
     }
 
     #[test]
-    fn forget_pane_drops_all_state() {
+    fn dropping_pane_from_attach_layout_clears_all_state() {
+        use bmux_attach_layout_protocol::attach_layout_protocol::{
+            AttachLayoutSnapshot, AttachSurfaceSummary,
+        };
         let plugin = DecorationPlugin::new();
         let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
         let pane = Uuid::from_u128(600);
         block_on(handle.set_pane_border(pane, BorderStyle::Double)).expect("set");
-        block_on(handle.notify_pane_geometry(PaneGeometry {
-            pane_id: pane,
-            rect: rect(0, 0, 10, 5),
-            content_rect: rect(1, 1, 8, 3),
-        }))
-        .expect("geom");
+        let snapshot = AttachLayoutSnapshot {
+            surfaces: vec![AttachSurfaceSummary {
+                surface_id: pane,
+                pane_id: Some(pane),
+                rect: rect(0, 0, 10, 5),
+                content_rect: rect(1, 1, 8, 3),
+                visible: true,
+            }],
+            revision: 1,
+        };
+        {
+            let mut state = plugin.state.inner.lock().expect("state");
+            apply_attach_layout_snapshot(&mut state, &snapshot);
+        }
         block_on(handle.notify_pane_event(PaneEvent::Focused { pane_id: pane })).expect("focus");
-        block_on(handle.forget_pane(pane)).expect("forget");
+        // Empty snapshot — pane disappears from the attach layout and
+        // the decoration plugin drops all state for it.
+        let empty = AttachLayoutSnapshot {
+            surfaces: Vec::new(),
+            revision: 2,
+        };
+        {
+            let mut state = plugin.state.inner.lock().expect("state");
+            apply_attach_layout_snapshot(&mut state, &empty);
+        }
         assert!(block_on(handle.pane_geometry(pane)).is_none());
         assert!(block_on(handle.pane_activity(pane)).is_none());
-        // pane_decoration always returns something (falls back to
-        // default); after forget, focused must be false again.
         let deco = block_on(handle.pane_decoration(pane)).expect("default");
         assert!(!deco.focused);
     }
 
     #[test]
-    fn build_scene_includes_geometry_when_pane_has_override_and_notify() {
+    fn build_scene_includes_geometry_when_pane_has_override_and_layout() {
+        use bmux_attach_layout_protocol::attach_layout_protocol::{
+            AttachLayoutSnapshot, AttachSurfaceSummary,
+        };
         let plugin = DecorationPlugin::new();
         let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
         let pane = Uuid::from_u128(700);
         block_on(handle.set_pane_border(pane, BorderStyle::Single)).expect("set");
-        block_on(handle.notify_pane_geometry(PaneGeometry {
-            pane_id: pane,
-            rect: rect(2, 3, 20, 5),
-            content_rect: rect(3, 4, 18, 3),
-        }))
-        .expect("geom");
+        let snapshot = AttachLayoutSnapshot {
+            surfaces: vec![AttachSurfaceSummary {
+                surface_id: pane,
+                pane_id: Some(pane),
+                rect: rect(2, 3, 20, 5),
+                content_rect: rect(3, 4, 18, 3),
+                visible: true,
+            }],
+            revision: 1,
+        };
+        {
+            let mut state = plugin.state.inner.lock().expect("state");
+            apply_attach_layout_snapshot(&mut state, &snapshot);
+        }
         let scene = plugin.build_scene();
         let surface = scene.surfaces.get(&pane).expect("surface present");
         assert_eq!(surface.rect, rect(2, 3, 20, 5));
