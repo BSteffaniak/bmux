@@ -5564,6 +5564,38 @@ async fn handle_request(
             operation,
             payload,
         } => {
+            // Diagnostic span per typed-service call. `Command` kind
+            // lands at `info` because mutating dispatches are both
+            // rarer and more interesting to audit; `Query` kind lands
+            // at `trace` so catalog / listing polls don't flood the
+            // log at default levels. Enable queries with
+            // `RUST_LOG=bmux_server::invoke_service=trace`.
+            let span = match kind {
+                bmux_ipc::InvokeServiceKind::Command => tracing::info_span!(
+                    target: "bmux_server::invoke_service",
+                    "invoke_service",
+                    capability = %capability,
+                    interface = %interface_id,
+                    operation = %operation,
+                    kind = "command",
+                    client_id = ?client_id,
+                    elapsed_ms = tracing::field::Empty,
+                    outcome = tracing::field::Empty,
+                ),
+                bmux_ipc::InvokeServiceKind::Query => tracing::trace_span!(
+                    target: "bmux_server::invoke_service",
+                    "invoke_service",
+                    capability = %capability,
+                    interface = %interface_id,
+                    operation = %operation,
+                    kind = "query",
+                    client_id = ?client_id,
+                    elapsed_ms = tracing::field::Empty,
+                    outcome = tracing::field::Empty,
+                ),
+            };
+            let _span_guard = span.enter();
+            let started_at = std::time::Instant::now();
             // Typed service calls don't acquire the global operation
             // lock here: many handlers re-enter `handle_request`
             // through `execute_kernel_request`, which takes the lock
@@ -5600,22 +5632,34 @@ async fn handle_request(
                 resolver.map(|resolver| resolver(route.clone(), payload))
             };
 
-            if let Some(invocation) = invocation {
+            let response = if let Some(invocation) = invocation {
                 match invocation.await {
-                    Ok(payload) => Response::Ok(ResponsePayload::ServiceInvoked { payload }),
-                    Err(error) => Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: format!("service invocation failed: {error:#}"),
-                    }),
+                    Ok(payload) => {
+                        span.record("outcome", "ok");
+                        Response::Ok(ResponsePayload::ServiceInvoked { payload })
+                    }
+                    Err(error) => {
+                        span.record("outcome", "err:internal");
+                        Response::Err(ErrorResponse {
+                            code: ErrorCode::Internal,
+                            message: format!("service invocation failed: {error:#}"),
+                        })
+                    }
                 }
             } else {
+                span.record("outcome", "err:not_found");
                 Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!(
                         "no provider for service capability='{capability}' kind='{kind:?}' interface='{interface_id}' operation='{operation}'"
                     ),
                 })
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                span.record("elapsed_ms", started_at.elapsed().as_millis() as u64);
             }
+            response
         }
         Request::EmitOnPluginBus { kind, payload } => {
             // Relay a wire-encoded payload onto the server's plugin

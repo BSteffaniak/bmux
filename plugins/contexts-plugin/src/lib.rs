@@ -46,6 +46,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use tracing::instrument;
 use uuid::Uuid;
 
 /// Adapter wrapping the plugin's `Arc<RwLock<ContextState>>` and
@@ -531,6 +532,17 @@ fn current_context_local(
 
 // ── Write handlers (state-local + cross-plugin orchestration) ────────
 
+#[instrument(
+    level = "debug",
+    target = "bmux_contexts_plugin::lifecycle",
+    skip_all,
+    fields(
+        caller_client_id = ?caller_client_id,
+        name = %name.as_deref().unwrap_or("<unnamed>"),
+        context_id = tracing::field::Empty,
+        session_id = tracing::field::Empty,
+    ),
+)]
 fn create_context_local(
     caller: &impl ServiceCaller,
     caller_client_id: Option<::uuid::Uuid>,
@@ -576,6 +588,12 @@ fn create_context_local(
             target: Some("bmux.contexts".to_string()),
         });
     }
+
+    // Record the freshly-minted ids on the instrumentation span so
+    // downstream log analysis can attribute events / retargets to the
+    // specific create call that produced them.
+    tracing::Span::current().record("context_id", tracing::field::display(context_summary.id));
+    tracing::Span::current().record("session_id", tracing::field::display(session_id.0));
 
     // Event ordering: `Created` first (listings / catalog refresh),
     // then `Selected` (so subscribers observing the selection delta
@@ -631,6 +649,16 @@ fn mutate_state_create(
     Ok((context, bind_result))
 }
 
+#[instrument(
+    level = "debug",
+    target = "bmux_contexts_plugin::lifecycle",
+    skip_all,
+    fields(
+        caller_client_id = ?caller_client_id,
+        context_id = tracing::field::Empty,
+        session_id = tracing::field::Empty,
+    ),
+)]
 fn select_context_local(
     caller: &impl ServiceCaller,
     caller_client_id: Option<::uuid::Uuid>,
@@ -645,6 +673,11 @@ fn select_context_local(
         .map_err(|reason| SelectContextError::Denied { reason })?;
 
     let (context, session_after_select) = mutate_state_select(client_id, &ipc_selector)?;
+
+    tracing::Span::current().record("context_id", tracing::field::display(context.id));
+    if let Some(session_id) = session_after_select {
+        tracing::Span::current().record("session_id", tracing::field::display(session_id.0));
+    }
 
     // If the newly-selected context is bound to a session, ask the
     // sessions plugin to make it the caller's selected session so the
@@ -693,6 +726,18 @@ fn mutate_state_select(
     Ok((context, session_id))
 }
 
+#[instrument(
+    level = "debug",
+    target = "bmux_contexts_plugin::lifecycle",
+    skip_all,
+    fields(
+        caller_client_id = ?caller_client_id,
+        force,
+        removed_id = tracing::field::Empty,
+        replacement_context_id = tracing::field::Empty,
+        replacement_session_id = tracing::field::Empty,
+    ),
+)]
 fn close_context_local(
     caller: &impl ServiceCaller,
     caller_client_id: Option<::uuid::Uuid>,
@@ -712,6 +757,20 @@ fn close_context_local(
         bound_session_id,
         replacement,
     } = mutate_state_close(client_id, &ipc_selector, force)?;
+
+    tracing::Span::current().record("removed_id", tracing::field::display(removed_id));
+    if let Some((replacement_context_id, replacement_session_id)) = replacement {
+        tracing::Span::current().record(
+            "replacement_context_id",
+            tracing::field::display(replacement_context_id),
+        );
+        if let Some(session_id) = replacement_session_id {
+            tracing::Span::current().record(
+                "replacement_session_id",
+                tracing::field::display(session_id.0),
+            );
+        }
+    }
 
     // Cross-plugin orchestration: if the closed context had a bound
     // session runtime, kill it via the sessions plugin.

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 use super::{
     KernelClientFactory, available_capability_providers, available_service_descriptors,
@@ -1480,6 +1480,19 @@ pub(super) struct PluginCommandExecution {
     pub(super) outcome: PluginCommandOutcome,
 }
 
+#[instrument(
+    level = "debug",
+    target = "bmux_cli::runtime::plugin_command",
+    skip_all,
+    fields(
+        plugin_id = %plugin_id,
+        command_name = %command_name,
+        invocation_source = ?invocation_source,
+        args_count = args.len(),
+        status = tracing::field::Empty,
+        error = tracing::field::Empty,
+    ),
+)]
 pub(super) fn run_plugin_command_internal(
     plugin_id: &str,
     command_name: &str,
@@ -1527,12 +1540,20 @@ pub(super) fn run_plugin_command_internal(
     let run_result =
         loaded.run_command_with_context_and_outcome(command_name, args, Some(&context));
     let (status, outcome) = run_result.map_err(|error| {
+        // Record the error on the current span so structured tracing
+        // preserves the full failure shape rather than only the
+        // formatted message string the caller sees.
+        tracing::Span::current().record("error", tracing::field::display(&error));
         anyhow::anyhow!(format_plugin_command_run_error(
             plugin_id,
             command_name,
             &error
         ))
     })?;
+    tracing::Span::current().record("status", status);
+    if let Some(msg) = outcome.error_message.as_deref() {
+        tracing::Span::current().record("error", msg);
+    }
     Ok(PluginCommandExecution { status, outcome })
 }
 

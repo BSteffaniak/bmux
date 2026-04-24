@@ -6564,13 +6564,30 @@ pub fn attach_key_event_actions(
     attach_input_processor: &mut InputProcessor,
     _ui_mode: AttachUiMode,
 ) -> Result<Vec<AttachEventAction>> {
+    // Trace every accepted key event at `trace` level so input-path
+    // duplication (e.g. terminal-emitted Press+Repeat on a quick tap)
+    // is diagnosable without spamming the log at default levels.
+    // Enable with `RUST_LOG=bmux_cli::runtime::attach::input=trace`.
+    let span = tracing::trace_span!(
+        target: "bmux_cli::runtime::attach::input",
+        "attach_key_event",
+        kind = ?key.kind,
+        code = ?key.code,
+        modifiers = ?key.modifiers,
+        emitted = tracing::field::Empty,
+        dropped_by_repeat_filter = tracing::field::Empty,
+    );
+    let _enter = span.enter();
+
     // Release events are filtered out here and also inside
     // InputProcessor's crossterm adapter as a safety net.
     if key.kind == KeyEventKind::Release {
+        span.record("emitted", 0usize);
         return Ok(vec![AttachEventAction::Ignore]);
     }
 
     let actions = attach_input_processor.process_terminal_event(Event::Key(*key));
+    let pre_filter_count = actions.len();
     // Auto-repeat handling. Under kitty keyboard protocol (and on
     // platforms where the OS emits repeat events liberally), a single
     // quick tap can produce a `Press` followed by one or more `Repeat`
@@ -6581,11 +6598,27 @@ pub fn attach_key_event_actions(
     // classifies each resolved action so mutating ones are silently
     // dropped on `Repeat` events.
     let is_repeat = key.kind == KeyEventKind::Repeat;
-    Ok(actions
+    let filtered: Vec<_> = actions
         .into_iter()
         .filter(|action| !is_repeat || action_supports_repeat(action))
         .map(runtime_action_to_attach_event_action)
-        .collect())
+        .collect();
+    let dropped = pre_filter_count.saturating_sub(filtered.len());
+    span.record("emitted", filtered.len());
+    span.record("dropped_by_repeat_filter", dropped);
+    if dropped > 0 {
+        // When the repeat filter drops actions we elevate to `debug`
+        // so operators investigating multi-press bugs see the drop
+        // without enabling `trace`.
+        tracing::debug!(
+            target: "bmux_cli::runtime::attach::input",
+            kind = ?key.kind,
+            code = ?key.code,
+            dropped,
+            "repeat filter dropped repeat-unsafe actions"
+        );
+    }
+    Ok(filtered)
 }
 
 /// Returns `true` when the action's semantics make sense under key
