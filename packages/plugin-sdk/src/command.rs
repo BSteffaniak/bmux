@@ -25,6 +25,14 @@ pub struct PluginCommand {
     pub execution: CommandExecutionKind,
     #[serde(default = "default_expose_in_cli")]
     pub expose_in_cli: bool,
+    /// Whether this command is safe to fire repeatedly under
+    /// keyboard auto-repeat. Navigation and resize commands set this
+    /// to `true`; mutating / destructive / one-shot commands leave it
+    /// `false`. The attach runtime consults this via the plugin
+    /// registry to decide whether to filter `KeyEventKind::Repeat`
+    /// events for plugin-command keybindings.
+    #[serde(default)]
+    pub accepts_repeat: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +91,7 @@ impl PluginCommand {
             arguments: Vec::new(),
             execution: default_execution_kind(),
             expose_in_cli: default_expose_in_cli(),
+            accepts_repeat: false,
         }
     }
 
@@ -120,6 +129,12 @@ impl PluginCommand {
     #[must_use]
     pub const fn expose_in_cli(mut self, expose_in_cli: bool) -> Self {
         self.expose_in_cli = expose_in_cli;
+        self
+    }
+
+    #[must_use]
+    pub const fn accepts_repeat(mut self, accepts_repeat: bool) -> Self {
+        self.accepts_repeat = accepts_repeat;
         self
     }
 

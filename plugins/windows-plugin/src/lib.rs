@@ -408,6 +408,95 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             }
             Ok(())
         }
+        // ── Pane-level commands (promoted from service handlers) ──
+        //
+        // Each of these dispatches to the same typed-service logic
+        // implemented in `invoke_service`, but via a command-style
+        // entry so keybindings can reach them through
+        // `plugin:bmux.windows:<name>`. The handlers forward to the
+        // `HostRuntimeApi::pane_*` trait methods which ultimately
+        // route through the windows-plugin service boundary.
+        //
+        // Keybindings do not pass a `--session` arg (the attach
+        // runtime always operates on the currently-attached session),
+        // so we pass `session: None` to the underlying request and
+        // rely on the host to resolve to the caller's attached
+        // session.
+        "focus-pane-in-direction" => {
+            let direction = option_value(&context.arguments, "direction")
+                .ok_or_else(|| "--direction is required".to_string())?;
+            let direction = parse_pane_direction_arg(&direction)?;
+            let focus_dir = pane_direction_to_focus(direction).ok_or_else(|| {
+                "direction must be left/right/up/down/next/prev (horizontal/vertical are split-only)".to_string()
+            })?;
+            let request = domain_ipc::PaneFocusRequest {
+                session: None,
+                target: None,
+                direction: Some(focus_dir),
+            };
+            context.pane_focus(&request).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        "split-pane" => {
+            let direction = option_value(&context.arguments, "direction")
+                .ok_or_else(|| "--direction is required".to_string())?;
+            let direction = parse_pane_direction_arg(&direction)?;
+            let request = domain_ipc::PaneSplitRequest {
+                session: None,
+                target: None,
+                direction: pane_direction_to_split(direction),
+            };
+            context.pane_split(&request).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        "resize-pane" => {
+            let direction_arg = option_value(&context.arguments, "direction");
+            // Translate direction to a delta:
+            //   - increase / right / down → +1
+            //   - decrease / left / up   → -1
+            // The pane-runtime picks the axis from the focused split;
+            // the delta sign controls grow-vs-shrink.
+            //
+            // Arms are grouped by user intent (one per direction
+            // keyword), not by return value, so we keep them split
+            // rather than collapsing by shared body.
+            #[allow(clippy::match_same_arms)]
+            let delta: i16 = match direction_arg.as_deref() {
+                Some("increase" | "right" | "down") => 1,
+                Some("decrease" | "left" | "up") => -1,
+                Some(other) => {
+                    return Err(format!(
+                        "unknown resize direction '{other}' (expected increase/decrease/left/right/up/down)"
+                    ));
+                }
+                None => 1,
+            };
+            let request = domain_ipc::PaneResizeRequest {
+                session: None,
+                target: None,
+                delta,
+            };
+            context.pane_resize(&request).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        "zoom-pane" => {
+            let request = domain_ipc::PaneZoomRequest { session: None };
+            context.pane_zoom(&request).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        "close-active-pane" => {
+            let request = domain_ipc::PaneCloseRequest {
+                session: None,
+                target: None,
+            };
+            context.pane_close(&request).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        "restart-pane" => {
+            // Restart wiring is a pre-existing stub; we return a clean
+            // error until the host primitive lands.
+            Err("restart-pane is not yet wired to a host primitive".to_string())
+        }
         _ => Err(format!("unsupported command '{}'", context.command)),
     }
 }
@@ -1368,6 +1457,25 @@ fn positional_value(arguments: &[String]) -> Option<String> {
         .iter()
         .find(|argument| !argument.starts_with('-'))
         .cloned()
+}
+
+/// Parse a `--direction` argument value from a keybinding-dispatched
+/// plugin command into the `PaneDirection` enum understood by the
+/// pane-runtime service requests.
+///
+/// `next` folds to `Right` and `prev`/`previous` fold to `Left` so
+/// that `pane_direction_to_focus` emits the correct `Next`/`Prev`
+/// mapping at the IPC boundary.
+fn parse_pane_direction_arg(value: &str) -> Result<PaneDirection, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "horizontal" => Ok(PaneDirection::Horizontal),
+        "vertical" => Ok(PaneDirection::Vertical),
+        "left" | "prev" | "previous" => Ok(PaneDirection::Left),
+        "right" | "next" => Ok(PaneDirection::Right),
+        "up" => Ok(PaneDirection::Up),
+        "down" => Ok(PaneDirection::Down),
+        other => Err(format!("unknown direction '{other}'")),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

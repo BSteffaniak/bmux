@@ -359,6 +359,7 @@ mod tests {
                     arguments: Vec::new(),
                     execution: CommandExecutionKind::ProviderExec,
                     expose_in_cli: true,
+                    accepts_repeat: false,
                 },
                 PluginCommand {
                     name: "run".to_string(),
@@ -369,6 +370,7 @@ mod tests {
                     arguments: Vec::new(),
                     execution: CommandExecutionKind::ProviderExec,
                     expose_in_cli: true,
+                    accepts_repeat: false,
                 },
             ],
             event_subscriptions: Vec::new(),
@@ -415,6 +417,7 @@ mod tests {
                 arguments: Vec::new(),
                 execution: CommandExecutionKind::RuntimeHook,
                 expose_in_cli: true,
+                accepts_repeat: false,
             }],
             event_subscriptions: Vec::new(),
             event_publications: Vec::new(),

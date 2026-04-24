@@ -2130,3 +2130,161 @@ mod capability_guardrail_helpers {
         assert!(out.contains("bmux.contexts.read"), "got {out:?}");
     }
 }
+
+// ── RuntimeAction domain-leak guardrail ──────────────────────────────
+//
+// AGENTS.md forbids domain leaks in core architecture crates.
+// `packages/keybind/src/lib.rs::RuntimeAction` historically grew
+// domain-named variants (NewWindow, FocusLeft, ZoomPane,
+// WindowGoto1..9 etc.) that belong to plugins, not core. The
+// migration in `docs/runtime-action-migration.md` tracks removing
+// them in favor of `RuntimeAction::PluginCommand { plugin_id, command_name, args }`.
+//
+// Until that migration completes, this guardrail is a watchlist
+// assertion: it allowlists the known-leaking variants so the test
+// documents the remaining surface without artificially passing, and
+// fails if a NEW domain-named variant is introduced (regression
+// prevention). After the migration deletes the variants, the
+// allowlist shrinks to empty and the assertion enforces the clean
+// boundary.
+
+/// Variant names allowed to appear in `RuntimeAction` *as of today*.
+/// The set is ordered alphabetically to make drift reviews clear.
+/// When removing a variant from `RuntimeAction`, also remove its
+/// entry here.
+const RUNTIME_ACTION_ALLOWLIST: &[&str] = &[
+    // Core (not domain-scoped)
+    "Quit",
+    "Detach",
+    "ShowHelp",
+    "EnterScrollMode",
+    "ExitScrollMode",
+    "ScrollUpLine",
+    "ScrollDownLine",
+    "ScrollUpPage",
+    "ScrollDownPage",
+    "ScrollTop",
+    "ScrollBottom",
+    "BeginSelection",
+    "MoveCursorLeft",
+    "MoveCursorRight",
+    "MoveCursorUp",
+    "MoveCursorDown",
+    "CopyScrollback",
+    "ConfirmScrollback",
+    "EnterMode",
+    "ExitMode",
+    "SwitchProfile",
+    "PluginCommand",
+    "ForwardToPane",
+    // DOMAIN-leaking variants pending migration. Each should move to
+    // a `plugin:bmux.<plugin>:<cmd>` invocation before deletion.
+    // See `docs/runtime-action-migration.md` for the plan.
+    "NewWindow",
+    "NewSession",
+    "SessionPrev",
+    "SessionNext",
+    "FocusNext",
+    "FocusPrev",
+    "FocusLeft",
+    "FocusRight",
+    "FocusUp",
+    "FocusDown",
+    "ToggleSplitDirection",
+    "SplitFocusedVertical",
+    "SplitFocusedHorizontal",
+    "IncreaseSplit",
+    "DecreaseSplit",
+    "ResizeLeft",
+    "ResizeRight",
+    "ResizeUp",
+    "ResizeDown",
+    "RestartFocusedPane",
+    "CloseFocusedPane",
+    "ZoomPane",
+    "EnterWindowMode",
+    "WindowPrev",
+    "WindowNext",
+    "WindowGoto1",
+    "WindowGoto2",
+    "WindowGoto3",
+    "WindowGoto4",
+    "WindowGoto5",
+    "WindowGoto6",
+    "WindowGoto7",
+    "WindowGoto8",
+    "WindowGoto9",
+    "WindowClose",
+];
+
+#[test]
+fn runtime_action_variants_stay_on_allowlist() {
+    let path = repo_root()
+        .join("packages")
+        .join("keybind")
+        .join("src")
+        .join("lib.rs");
+    let source =
+        std::fs::read_to_string(&path).expect("packages/keybind/src/lib.rs should be readable");
+
+    // Find the `pub enum RuntimeAction { ... }` block and extract
+    // variant identifiers. Matches any identifier that begins a line
+    // inside the enum body up to the closing brace. We keep this
+    // parser intentionally small: if it ever over-matches we'd rather
+    // see a clear test failure than silently accept a leak.
+    let enum_marker = "pub enum RuntimeAction {";
+    let Some(start) = source.find(enum_marker) else {
+        panic!(
+            "could not locate `pub enum RuntimeAction` in {}",
+            path.display()
+        );
+    };
+    let body_start = start + enum_marker.len();
+    let body_end = source[body_start..]
+        .find("\n}\n")
+        .expect("RuntimeAction enum body should close with `\\n}\\n`");
+    let body = &source[body_start..body_start + body_end];
+
+    let mut found = std::collections::BTreeSet::new();
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        // Skip comments, attributes, and blank lines.
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+        // Variant identifier is the leading word before `,`, `{`, or
+        // `(`. Closing `}` lines end up with empty tokens; skip them.
+        let terminator = trimmed
+            .find(|c: char| c == ',' || c == '{' || c == '(' || c.is_whitespace())
+            .unwrap_or(trimmed.len());
+        let ident = &trimmed[..terminator];
+        if ident.is_empty() || !ident.chars().next().is_some_and(char::is_uppercase) {
+            continue;
+        }
+        found.insert(ident.to_string());
+    }
+
+    let allow: std::collections::BTreeSet<String> = RUNTIME_ACTION_ALLOWLIST
+        .iter()
+        .copied()
+        .map(ToString::to_string)
+        .collect();
+
+    let unexpected: Vec<String> = found.difference(&allow).cloned().collect();
+    let missing: Vec<String> = allow.difference(&found).cloned().collect();
+
+    assert!(
+        unexpected.is_empty(),
+        "new RuntimeAction variants detected that are not on the allowlist: {unexpected:?}\n\
+         Every new action should be routed through \
+         `RuntimeAction::PluginCommand {{ plugin_id, command_name, args }}` \
+         rather than a domain-named variant. If you are intentionally \
+         extending core (not a plugin domain), add the variant to \
+         `RUNTIME_ACTION_ALLOWLIST` with a comment explaining why."
+    );
+    assert!(
+        missing.is_empty(),
+        "RuntimeAction allowlist is stale — the following entries no longer exist in the enum \
+         and should be removed from `RUNTIME_ACTION_ALLOWLIST`: {missing:?}"
+    );
+}

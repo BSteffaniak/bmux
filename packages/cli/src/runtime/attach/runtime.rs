@@ -43,9 +43,9 @@ use super::super::{
     ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE, ATTACH_TRANSIENT_STATUS_TTL, ATTACH_WELCOME_STATUS_TTL,
     BmuxClient, HELP_OVERLAY_SURFACE_ID, InputProcessor, KernelClientFactory, Keymap,
     RuntimeAction, action_dispatch, attach, attach_quit_failure_status,
-    available_capability_providers, available_service_descriptors, effective_enabled_plugins,
-    enter_host_kernel_connection, host_kernel_bridge, load_plugin, map_attach_client_error,
-    merged_runtime_keybindings, parse_session_selector, parse_uuid_value,
+    available_capability_providers, available_service_descriptors, command_accepts_repeat,
+    effective_enabled_plugins, enter_host_kernel_connection, host_kernel_bridge, load_plugin,
+    map_attach_client_error, merged_runtime_keybindings, parse_session_selector, parse_uuid_value,
     plugin_command_policy_hints, plugin_host_metadata, recording, resolve_plugin_search_paths,
     run_plugin_keybinding_command, scan_available_plugins,
 };
@@ -6758,18 +6758,19 @@ pub fn attach_key_event_actions(
 /// Returns `true` when the action's semantics make sense under key
 /// auto-repeat.
 ///
-/// Mutating actions (new/close/kill, plugin commands, detach, exit)
-/// must return `false` — each press must create exactly one mutation.
-/// Navigation and adjustment actions (focus, scroll, resize) return
-/// `true` so hold-to-navigate / hold-to-resize behave the same as
-/// pressing repeatedly.
+/// Mutating actions (new/close/kill, plugin commands by default,
+/// detach, exit) return `false` — each press must create exactly one
+/// mutation. Navigation and adjustment actions (focus, scroll,
+/// resize) return `true` so hold-to-navigate / hold-to-resize behave
+/// the same as pressing repeatedly.
 ///
-/// `PluginCommand` is conservatively non-repeatable until the plugin
-/// manifest grows a per-command `accepts_repeat` flag; the current
-/// bundled plugins (windows, permissions, cluster) all dispatch
-/// mutating commands for which repeat would be harmful (multi-tab
-/// creation was the bug that motivated this rule).
-pub(super) const fn action_supports_repeat(action: &RuntimeAction) -> bool {
+/// For `RuntimeAction::PluginCommand`, repeat-eligibility is
+/// delegated to the plugin's manifest: commands that declare
+/// `accepts_repeat = true` in `plugin.toml` are repeat-eligible.
+/// This is the generic mechanism that replaces the historical
+/// exhaustive match over every domain `RuntimeAction` variant; new
+/// repeat-eligible commands are added by plugins, not by core.
+pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
     match action {
         // Navigation — safe to repeat.
         RuntimeAction::FocusNext
@@ -6797,6 +6798,12 @@ pub(super) const fn action_supports_repeat(action: &RuntimeAction) -> bool {
         | RuntimeAction::ResizeUp
         | RuntimeAction::ResizeDown
         | RuntimeAction::ForwardToPane(_) => true,
+        // Plugin commands: delegate to the manifest flag.
+        RuntimeAction::PluginCommand {
+            plugin_id,
+            command_name,
+            ..
+        } => command_accepts_repeat(plugin_id, command_name),
         // Mutating and mode-switching — never repeat.
         RuntimeAction::Quit
         | RuntimeAction::Detach
@@ -6829,8 +6836,7 @@ pub(super) const fn action_supports_repeat(action: &RuntimeAction) -> bool {
         | RuntimeAction::WindowGoto9
         | RuntimeAction::WindowClose
         | RuntimeAction::EnterMode(_)
-        | RuntimeAction::SwitchProfile(_)
-        | RuntimeAction::PluginCommand { .. } => false,
+        | RuntimeAction::SwitchProfile(_) => false,
     }
 }
 

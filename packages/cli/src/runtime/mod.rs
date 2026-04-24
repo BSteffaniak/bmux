@@ -116,7 +116,7 @@ use plugin_kernel::{
     service_descriptors_from_declarations,
 };
 use plugin_runtime::{
-    activate_loaded_plugins, bundled_plugin_root as bundled_plugin_roots,
+    activate_loaded_plugins, bundled_plugin_root as bundled_plugin_roots, command_accepts_repeat,
     deactivate_loaded_plugins, discover_bundled_plugin_ids, dispatch_loaded_plugin_event,
     effective_enabled_plugins, load_enabled_plugins, load_plugin, plugin_command_policy_hints,
     plugin_event_bridge_loop, plugin_host_metadata, plugin_system_event,

@@ -13,6 +13,12 @@ owns_namespaces = [
     "last-window",
     "goto-window",
     "close-current-window",
+    "focus-pane-in-direction",
+    "split-pane",
+    "resize-pane",
+    "zoom-pane",
+    "close-active-pane",
+    "restart-pane",
 ]
 provided_capabilities = ["bmux.windows.read", "bmux.windows.write"]
 provided_features = ["bmux.windows"]
@@ -195,8 +201,148 @@ name          = "close-current-window"
 path          = ["close-current-window"]
 summary       = "Close the current workspace window"
 
+# ── Pane-level commands ──────────────────────────────────────────────
+# These commands were previously exposed only as typed-service
+# handlers (not reachable by keybinding) and as hardcoded
+# `RuntimeAction::*` variants in core. Exposing them as
+# `[[commands]]` lets keybindings invoke them via
+# `plugin:bmux.windows:<cmd>` and removes the need for core to carry
+# domain-specific variants.
+
+[[commands]]
+accepts_repeat = true
+expose_in_cli  = true
+name           = "focus-pane-in-direction"
+path           = ["focus-pane-in-direction"]
+summary        = "Focus a pane in the given direction"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "direction"
+name       = "direction"
+required   = true
+value_name = "DIRECTION"
+values     = ["next", "prev", "left", "right", "up", "down"]
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands]]
+expose_in_cli = true
+name          = "split-pane"
+path          = ["split-pane"]
+summary       = "Split the active pane"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "direction"
+name       = "direction"
+required   = true
+value_name = "DIRECTION"
+values     = ["horizontal", "vertical"]
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands]]
+accepts_repeat = true
+expose_in_cli  = true
+name           = "resize-pane"
+path           = ["resize-pane"]
+summary        = "Resize the active pane"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "direction"
+name       = "direction"
+value_name = "DIRECTION"
+values     = ["left", "right", "up", "down", "increase", "decrease"]
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands]]
+expose_in_cli = true
+name          = "zoom-pane"
+path          = ["zoom-pane"]
+summary       = "Toggle fullscreen zoom on the active pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands]]
+expose_in_cli = true
+name          = "close-active-pane"
+path          = ["close-active-pane"]
+summary       = "Close the active pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands]]
+expose_in_cli = true
+name          = "restart-pane"
+path          = ["restart-pane"]
+summary       = "Restart the active pane's process"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
 [keybindings.runtime]
+# Window lifecycle
 c = "plugin:bmux.windows:new-window"
 n = "plugin:bmux.windows:next-window"
 p = "plugin:bmux.windows:prev-window"
 w = "plugin:bmux.windows:last-window"
+# Pane focus (hjkl + arrows) — repeat-safe via accepts_repeat on focus-pane-in-direction
+arrow_down  = "plugin:bmux.windows:focus-pane-in-direction --direction down"
+arrow_left  = "plugin:bmux.windows:focus-pane-in-direction --direction left"
+arrow_right = "plugin:bmux.windows:focus-pane-in-direction --direction right"
+arrow_up    = "plugin:bmux.windows:focus-pane-in-direction --direction up"
+h           = "plugin:bmux.windows:focus-pane-in-direction --direction left"
+j           = "plugin:bmux.windows:focus-pane-in-direction --direction down"
+k           = "plugin:bmux.windows:focus-pane-in-direction --direction up"
+l           = "plugin:bmux.windows:focus-pane-in-direction --direction right"
+o           = "plugin:bmux.windows:focus-pane-in-direction --direction next"
+# Pane split
+'"' = "plugin:bmux.windows:split-pane --direction horizontal"
+"%" = "plugin:bmux.windows:split-pane --direction vertical"
+# Pane resize (repeat-safe)
+"minus"             = "plugin:bmux.windows:resize-pane --direction decrease"
+"plus"              = "plugin:bmux.windows:resize-pane --direction increase"
+"shift+arrow_down"  = "plugin:bmux.windows:resize-pane --direction down"
+"shift+arrow_left"  = "plugin:bmux.windows:resize-pane --direction left"
+"shift+arrow_right" = "plugin:bmux.windows:resize-pane --direction right"
+"shift+arrow_up"    = "plugin:bmux.windows:resize-pane --direction up"
+"shift+h"           = "plugin:bmux.windows:resize-pane --direction left"
+"shift+j"           = "plugin:bmux.windows:resize-pane --direction down"
+"shift+k"           = "plugin:bmux.windows:resize-pane --direction up"
+"shift+l"           = "plugin:bmux.windows:resize-pane --direction right"
+# Pane zoom / close / restart
+r = "plugin:bmux.windows:restart-pane"
+x = "plugin:bmux.windows:close-active-pane"
+z = "plugin:bmux.windows:zoom-pane"

@@ -1,7 +1,7 @@
 execution_class       = "native_fast"
 id                    = "bmux.sessions"
 name                  = "bmux Sessions"
-owns_namespaces       = []
+owns_namespaces       = ["new-session"]
 provided_capabilities = ["bmux.sessions.read", "bmux.sessions.write"]
 provided_features     = ["bmux.sessions"]
 required_capabilities = ["bmux.attach_runtime.write", "bmux.pane_runtime.write"]
@@ -21,3 +21,20 @@ kind         = "command"
 capability   = "bmux.sessions.read"
 interface_id = "sessions-events"
 kind         = "event"
+
+# CLI / keybinding surface. Each of these maps to the corresponding
+# typed service handler (`new-session`, etc.) so attach keybindings
+# and shell CLIs can invoke sessions-plugin behavior via
+# `plugin:bmux.sessions:<cmd>`.
+[[commands]]
+expose_in_cli = true
+name          = "new-session"
+path          = ["new-session"]
+summary       = "Create a new session"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "name"
+name       = "name"
+short      = "n"
+value_name = "NAME"

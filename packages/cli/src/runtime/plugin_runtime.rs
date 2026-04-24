@@ -353,6 +353,23 @@ pub(super) fn resolve_plugin_search_paths(
     Ok(resolved)
 }
 
+/// Look up the `accepts_repeat` flag for a plugin command through the
+/// process-level command state cache.
+///
+/// Called from the attach runtime's repeat filter
+/// (`action_supports_repeat`) to decide whether a
+/// `RuntimeAction::PluginCommand` should fire on `KeyEventKind::Repeat`
+/// events. Returns `false` when state is not initialized or the plugin
+/// / command is unknown — the conservative choice matches the default
+/// behavior of filtering mutating commands out of repeat.
+pub(super) fn command_accepts_repeat(plugin_id: &str, command_name: &str) -> bool {
+    runtime_command_state().ok().is_some_and(|state| {
+        state
+            .registry
+            .command_accepts_repeat(plugin_id, command_name)
+    })
+}
+
 pub(super) fn bundled_plugin_root() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
     let parent = executable.parent()?;
@@ -2636,7 +2653,7 @@ mod tests {
         assert_eq!(runtime.get("o"), Some(&"quit".to_string()));
         assert_eq!(
             runtime.get("%"),
-            Some(&"split_focused_vertical".to_string())
+            Some(&"plugin:bmux.windows:split-pane --direction vertical".to_string())
         );
         assert_eq!(runtime.get("["), Some(&"enter_scroll_mode".to_string()));
     }

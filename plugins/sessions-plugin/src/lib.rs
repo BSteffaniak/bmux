@@ -311,9 +311,28 @@ impl RustPlugin for SessionsPlugin {
 
     fn run_command(
         &mut self,
-        _context: NativeCommandContext,
+        context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        Err(PluginCommandError::unknown_command(""))
+        match context.command.as_str() {
+            "new-session" => {
+                let name = option_value(&context.arguments, "name");
+                match new_session_via_ipc(&context, name) {
+                    Ok(ack) => {
+                        if matches!(
+                            context.invocation_source,
+                            bmux_plugin_sdk::NativeCommandInvocationSource::Cli
+                        ) {
+                            println!("created session: {}", ack.id);
+                        }
+                        Ok(bmux_plugin_sdk::EXIT_OK)
+                    }
+                    Err(error) => Err(PluginCommandError::failed(format!(
+                        "new-session failed: {error:?}"
+                    ))),
+                }
+            }
+            other => Err(PluginCommandError::unknown_command(other)),
+        }
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
@@ -772,5 +791,15 @@ impl SessionsCommandsService for SessionsCommandsHandle {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Extract the value of a `--<long_name> <value>` option from a
+/// flattened argument vector. Mirrors the helper used by other
+/// plugins for keybinding-dispatched commands.
+fn option_value(arguments: &[String], long_name: &str) -> Option<String> {
+    let long_flag = format!("--{long_name}");
+    arguments
+        .windows(2)
+        .find_map(|chunk| (chunk[0] == long_flag).then(|| chunk[1].clone()))
+}
 
 bmux_plugin_sdk::export_plugin!(SessionsPlugin, include_str!("../plugin.toml"));

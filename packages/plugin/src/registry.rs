@@ -161,6 +161,27 @@ impl PluginRegistry {
         self.plugins.get(plugin_id)
     }
 
+    /// Look up the `accepts_repeat` policy for a specific plugin
+    /// command.
+    ///
+    /// Returns `false` when the plugin / command is unknown or the
+    /// command did not declare `accepts_repeat = true` in its
+    /// manifest. This is the signal the attach runtime uses to
+    /// decide whether keyboard auto-repeat should fire additional
+    /// invocations for a `PluginCommand` binding.
+    #[must_use]
+    pub fn command_accepts_repeat(&self, plugin_id: &str, command_name: &str) -> bool {
+        self.get(plugin_id)
+            .and_then(|plugin| {
+                plugin
+                    .declaration
+                    .commands
+                    .iter()
+                    .find(|cmd| cmd.name == command_name)
+            })
+            .is_some_and(|cmd| cmd.accepts_repeat)
+    }
+
     /// # Errors
     ///
     /// Returns an error when the requested plugins or any required dependency is
