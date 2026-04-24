@@ -146,10 +146,14 @@ interface scene-protocol {
         },
     }
 
-    // Axis used by `paint-command.gradient-run`.
+    // Axis used by `paint-command.gradient-run` and gradient-border
+    // paint helpers. `diagonal` interpolates across the x+y axis so
+    // the top-left cell is at `from`, the bottom-right cell is at
+    // `to`, and everything between is linearly blended.
     enum gradient-axis {
         @default horizontal,
         vertical,
+        diagonal,
     }
 
     // One cell entry inside a `paint-command.cell-grid`. Empty
@@ -215,22 +219,13 @@ interface scene-protocol {
     }
 
     // Plugin-owned default style used when the scene does not carry a
-    // surface-specific entry. Core reads this once per frame and
-    // applies it as a fallback painter; this keeps "style" ownership
-    // in the plugin even when geometry computation is still in core.
-    record fallback-style {
-        // Border glyphs for unfocused panes.
-        border-unfocused: border-glyphs,
-        // Border glyphs for focused panes.
-        border-focused: border-glyphs,
-        // Border glyphs for the zoomed pane (focus has no effect when
-        // only one pane is visible).
-        border-zoomed: border-glyphs,
-        // Status-badge text for a running pane. Empty => no badge.
-        running-badge: string,
-        // Status-badge text for an exited pane. Empty => no badge.
-        exited-badge: string,
-    }
+    // surface-specific entry.
+    //
+    // Removed in v1.x: the decoration plugin is now fully
+    // geometry-aware and emits a `surface-decoration` for every pane
+    // with known geometry. Renderers that see no surface entry for a
+    // pane paint nothing around it (the plugin is absent or the pane
+    // hasn't been reported yet).
 
     // All decoration data for a single scene surface. The
     // `content_rect` is authoritative for mouse translation and PTY
@@ -255,17 +250,9 @@ interface scene-protocol {
     // plugin through the typed event bus whenever its state changes
     // (focus, theme, per-pane override). Consumers replace their
     // cached snapshot when `revision` exceeds the one they hold.
-    //
-    // `fallback` carries the plugin-owned defaults a renderer applies
-    // to surfaces not present in `surfaces`. The decoration plugin is
-    // expected to publish this every revision; consumers that receive
-    // a scene without one fall back to compiled-in defaults (the ASCII
-    // glyph set), which should only happen transitionally while the
-    // decoration plugin boots.
     record decoration-scene {
         revision: u64,
         surfaces: map<uuid, surface-decoration>,
-        fallback: fallback-style?,
         animation: animation-hint?,
     }
 

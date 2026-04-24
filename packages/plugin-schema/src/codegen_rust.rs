@@ -98,9 +98,34 @@ fn emit_record(r: &RecordDef, imports: &ImportMap, out: &mut String) {
     for f in &r.fields {
         let field_name = snake_case(&f.name);
         let ty = rust_type(&f.ty, imports);
+        // Emit `#[serde(default)]` on fields whose Rust type carries a
+        // sensible Default impl. This lets additively-added fields
+        // round-trip old payloads: a missing TOML/JSON key parses as
+        // the type's default value instead of rejecting the whole
+        // record. Option<T> already defaults to None without the
+        // attribute, but adding it is harmless.
+        if type_has_default(&f.ty) {
+            out.push_str("        #[serde(default)]\n");
+        }
         let _ = writeln!(out, "        pub {field_name}: {ty},");
     }
     out.push_str("    }\n\n");
+}
+
+/// Best-effort check: does the type we'd emit for `ty` derive
+/// [`Default`]? Used by [`emit_record`] to decide whether to add
+/// `#[serde(default)]`. Types that definitely have a `Default`:
+/// primitives, `Vec`, `Option`, `BTreeMap`. User-defined
+/// record/variant references don't necessarily derive `Default`, so we
+/// conservatively skip them.
+fn type_has_default(ty: &crate::ast::TypeRef) -> bool {
+    use crate::ast::TypeRef;
+    match ty {
+        TypeRef::Primitive(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Option(_) => true,
+        TypeRef::Named(_) | TypeRef::Qualified { .. } | TypeRef::Result(_, _) | TypeRef::Unit => {
+            false
+        }
+    }
 }
 
 fn emit_variant(v: &VariantDef, imports: &ImportMap, out: &mut String) {

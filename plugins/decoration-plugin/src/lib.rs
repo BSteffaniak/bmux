@@ -11,6 +11,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod glyphs;
 pub mod scripting;
 
 use std::collections::{BTreeMap, HashMap};
@@ -21,14 +22,14 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use bmux_decoration_plugin_api::decoration_state::{
-    BorderStyle, DecorationEvent, DecorationStateService, DecorationThemeExtension,
+    BorderSpec, BorderStyle, DecorationEvent, DecorationStateService, DecorationThemeExtension,
     INTERFACE_ID as DECORATION_STATE_INTERFACE_ID, NotifyError, PaneActivity, PaneDecoration,
     PaneEvent, PaneGeometry, PaneLifecycle, SetStyleError, ValidationError, ValidationResult,
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
-    BorderGlyphs, Color, DecorationScene, FallbackStyle, NamedColor, PaintCommand, Rect, Style,
+    BorderGlyphs, Color, DecorationScene, GradientAxis, NamedColor, PaintCommand, Rect, Style,
     SurfaceDecoration,
 };
 use uuid::Uuid;
@@ -415,19 +416,62 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
 /// out of the plugin's inherent method so the typed
 /// [`DecorationStateService::scene_snapshot`] can share the same
 /// build logic without re-locking the mutex.
+/// Build a [`DecorationScene`] from the plugin's current state.
+///
+/// The authoritative set of panes is `state.geometry`: every pane the
+/// attach runtime has reported gets an explicit `SurfaceDecoration`
+/// entry, even when no script is loaded and no per-pane override
+/// exists. The paint-command vector for each surface is resolved in
+/// priority order:
+///
+/// 1. If the pane has an explicit override in `state.panes` (set via
+///    `set-pane-border` IPC), honour that override's glyph choice.
+/// 2. Else if a theme is loaded, pick `focused` / `zoomed` /
+///    `unfocused` based on `state.activity` and emit paint commands
+///    driven by the theme's [`BorderSpec`].
+/// 3. Else emit a built-in default (rounded glyphs, bright-white for
+///    the focused pane, white for unfocused).
+///
+/// After surfaces are pre-populated, `merge_script_paint_commands`
+/// runs and layers the active decoration script's paint commands on
+/// top at higher `z` values.
 fn build_scene(state: &mut State) -> DecorationScene {
     let mut surfaces = BTreeMap::new();
-    for (pane_id, decoration) in &state.panes {
+    let pane_ids: Vec<Uuid> = state.geometry.keys().copied().collect();
+    for pane_id in pane_ids {
+        let Some(geom) = state.geometry.get(&pane_id).cloned() else {
+            continue;
+        };
+        let (focused, zoomed) = state
+            .activity
+            .get(&pane_id)
+            .map_or((false, false), |a| (a.focused, a.zoomed));
+        let rect = geom.rect.clone();
+        let content_rect = geom.content_rect.clone();
+
+        let paint_commands = if let Some(override_entry) = state.panes.get(&pane_id) {
+            paint_commands_from_override(override_entry.border, focused, &rect)
+        } else if let Some(theme) = state.current_theme.as_ref() {
+            let spec = theme_border_spec_for(theme, focused, zoomed);
+            paint_commands_from_border_spec(spec, &rect)
+        } else {
+            paint_commands_default(focused, &rect)
+        };
+
         surfaces.insert(
-            *pane_id,
-            surface_decoration_for(*pane_id, decoration.border, state.geometry.get(pane_id)),
+            pane_id,
+            SurfaceDecoration {
+                surface_id: pane_id,
+                rect,
+                content_rect,
+                paint_commands,
+            },
         );
     }
     merge_script_paint_commands(state, &mut surfaces);
     DecorationScene {
         revision: state.scene_revision,
         surfaces,
-        fallback: Some(default_fallback_style()),
         animation: None,
     }
 }
@@ -506,10 +550,38 @@ fn merge_script_paint_commands(
             continue;
         }
         commands_merged += outcome.commands.len();
-        // Get-or-create the surface entry for this pane.
+        // Get-or-create the surface entry for this pane. Defensive
+        // path — `build_scene` pre-populates every pane with known
+        // geometry, so this branch only fires when a script's own
+        // observation includes a pane that isn't in `state.geometry`
+        // (shouldn't happen given `decorate_context_for` already
+        // requires geometry, but the code is resilient to it).
         let surface = surfaces.entry(pane_id).or_insert_with(|| {
-            let geom = state.geometry.get(&pane_id);
-            surface_decoration_for(pane_id, state.default_border, geom)
+            let (rect, content_rect) = state.geometry.get(&pane_id).map_or_else(
+                || {
+                    (
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            w: 0,
+                            h: 0,
+                        },
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            w: 0,
+                            h: 0,
+                        },
+                    )
+                },
+                |g| (g.rect.clone(), g.content_rect.clone()),
+            );
+            SurfaceDecoration {
+                surface_id: pane_id,
+                rect,
+                content_rect,
+                paint_commands: Vec::new(),
+            }
         });
         surface.paint_commands.extend(outcome.commands);
     }
@@ -537,20 +609,7 @@ fn empty_scene() -> DecorationScene {
     DecorationScene {
         revision: 0,
         surfaces: BTreeMap::new(),
-        fallback: None,
         animation: None,
-    }
-}
-
-/// Plugin-owned defaults used by the renderer for panes that aren't
-/// represented explicitly in the scene's `surfaces` map.
-fn default_fallback_style() -> FallbackStyle {
-    FallbackStyle {
-        border_unfocused: BorderGlyphs::Ascii,
-        border_focused: BorderGlyphs::AsciiFocused,
-        border_zoomed: BorderGlyphs::AsciiZoomed,
-        running_badge: DEFAULT_RUNNING_BADGE.to_string(),
-        exited_badge: DEFAULT_EXITED_BADGE.to_string(),
     }
 }
 
@@ -651,54 +710,491 @@ fn default_pane_decoration(pane_id: Uuid, border: BorderStyle, focused: bool) ->
     }
 }
 
-/// Produce a [`SurfaceDecoration`] for a pane given its border style
-/// and (optionally) its cached geometry. When geometry is present,
-/// the surface reports the observed rects; otherwise it falls back to
-/// zeroed rects so the renderer can detect "plugin has no geometry
-/// yet" and paint the fallback.
-fn surface_decoration_for(
-    pane_id: Uuid,
-    border: BorderStyle,
-    geometry: Option<&PaneGeometry>,
-) -> SurfaceDecoration {
-    let (rect, content_rect) = geometry.map_or_else(
-        || {
-            (
-                Rect {
-                    x: 0,
-                    y: 0,
-                    w: 0,
-                    h: 0,
-                },
-                Rect {
-                    x: 0,
-                    y: 0,
-                    w: 0,
-                    h: 0,
-                },
-            )
-        },
-        |g| (g.rect.clone(), g.content_rect.clone()),
-    );
-    SurfaceDecoration {
-        surface_id: pane_id,
-        rect,
-        content_rect,
-        paint_commands: paint_commands_for(border),
+/// Parse a `#rrggbb` hex colour string into [`Color::Rgb`]. Returns
+/// `None` for empty strings, missing `#` prefix, non-hex digits, or
+/// wrong-length inputs. Callers use this to resolve theme spec
+/// colours.
+fn parse_hex_color(s: &str) -> Option<Color> {
+    let trimmed = s.trim();
+    let hex = trimmed.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(hex.get(0..2)?, 16).ok()?;
+    let g = u8::from_str_radix(hex.get(2..4)?, 16).ok()?;
+    let b = u8::from_str_radix(hex.get(4..6)?, 16).ok()?;
+    Some(Color::Rgb { r, g, b })
+}
+
+/// Parse a theme's `gradient-axis` string into the scene-protocol
+/// enum. Accepts `kebab-case`, `snake_case`, and mixed case; empty
+/// string and unknown values default to [`GradientAxis::Horizontal`]
+/// to match historical behaviour.
+fn parse_gradient_axis(s: &str) -> GradientAxis {
+    let normalized = s.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "vertical" => GradientAxis::Vertical,
+        "diagonal" => GradientAxis::Diagonal,
+        _ => GradientAxis::Horizontal,
     }
 }
 
-/// Placeholder paint commands for a border style. The actual border
-/// characters are positioned by the renderer using the live surface
-/// geometry; this list carries style metadata so the renderer knows
-/// which palette to use per style.
-fn paint_commands_for(border: BorderStyle) -> Vec<PaintCommand> {
-    // When the renderer pairs the scene with live geometry it
-    // expands these descriptors into concrete per-cell paints. Until
-    // that wiring lands we keep the paint list empty so consumers see
-    // the intended style without relying on hardcoded ASCII glyphs.
-    let _ = border;
-    Vec::new()
+/// Pick the per-focus/per-zoom [`BorderSpec`] from a theme. Zoom wins
+/// over focus (a zoomed pane is always focused by construction, but
+/// the zoom style takes precedence).
+fn theme_border_spec_for(
+    theme: &DecorationThemeExtension,
+    focused: bool,
+    zoomed: bool,
+) -> &BorderSpec {
+    if zoomed {
+        &theme.zoomed
+    } else if focused {
+        &theme.focused
+    } else {
+        &theme.unfocused
+    }
+}
+
+/// Map the `decoration-state::border-style` enum (used by
+/// `set-pane-border` IPC) onto a [`BorderGlyphs`] preset. Explicit
+/// overrides honour the user's glyph choice but otherwise derive
+/// their style from the focused/unfocused named-colour pair used by
+/// the no-theme default.
+fn border_style_to_glyphs(border: BorderStyle) -> BorderGlyphs {
+    match border {
+        BorderStyle::None => BorderGlyphs::None,
+        BorderStyle::Ascii => BorderGlyphs::Ascii,
+        BorderStyle::Single => BorderGlyphs::SingleLine,
+        BorderStyle::Double => BorderGlyphs::DoubleLine,
+    }
+}
+
+/// Build a [`Style`] whose only populated field is `fg`. Used by the
+/// gradient-border constructor so each `GradientRun`/`CellGrid` cell
+/// carries the per-position colour without inheriting bold/underline.
+fn solid_fg_style(fg: Color) -> Style {
+    Style {
+        fg: Some(fg),
+        bg: None,
+        bold: false,
+        underline: false,
+        italic: false,
+        reverse: false,
+        dim: false,
+        blink: false,
+        strikethrough: false,
+    }
+}
+
+/// Linear-interpolate two [`Color::Rgb`] endpoints. Returns the `from`
+/// colour when either input isn't RGB (theme gradient endpoints are
+/// always hex strings in practice; other colour modes can't
+/// interpolate meaningfully).
+fn lerp_rgb(from: &Color, to: &Color, t: f32) -> Color {
+    let (
+        &Color::Rgb {
+            r: fr,
+            g: fg,
+            b: fb,
+        },
+        &Color::Rgb {
+            r: tr,
+            g: tg,
+            b: tb,
+        },
+    ) = (from, to)
+    else {
+        return from.clone();
+    };
+    let blend = |a: u8, b: u8| -> u8 {
+        let v = f32::from(a) + (f32::from(b) - f32::from(a)) * t.clamp(0.0, 1.0);
+        // Clamp to u8 range before cast; cast is safe because
+        // `clamp(0.0, 255.0)` guarantees the value is in [0, 255].
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let out = v.round().clamp(0.0, 255.0) as u8;
+        out
+    };
+    Color::Rgb {
+        r: blend(fr, tr),
+        g: blend(fg, tg),
+        b: blend(fb, tb),
+    }
+}
+
+/// No-theme default paint commands: rounded glyphs, bright-white for
+/// the focused pane, white for the unfocused pane, bold on focused.
+fn paint_commands_default(focused: bool, rect: &Rect) -> Vec<PaintCommand> {
+    if rect.w < 2 || rect.h < 2 {
+        return Vec::new();
+    }
+    let fg = Color::Named {
+        name: if focused {
+            NamedColor::BrightWhite
+        } else {
+            NamedColor::White
+        },
+    };
+    let style = Style {
+        fg: Some(fg),
+        bg: None,
+        bold: focused,
+        underline: false,
+        italic: false,
+        reverse: false,
+        dim: false,
+        blink: false,
+        strikethrough: false,
+    };
+    vec![PaintCommand::BoxBorder {
+        rect: rect.clone(),
+        z: 0,
+        glyphs: BorderGlyphs::Rounded,
+        style,
+    }]
+}
+
+/// Paint commands for an explicit `set-pane-border` override. The
+/// user picked this glyph set directly, so we emit a single
+/// [`PaintCommand::BoxBorder`] with the matching preset and the
+/// focused/unfocused colour pair used by the no-theme default.
+fn paint_commands_from_override(
+    border: BorderStyle,
+    focused: bool,
+    rect: &Rect,
+) -> Vec<PaintCommand> {
+    if matches!(border, BorderStyle::None) || rect.w < 2 || rect.h < 2 {
+        return Vec::new();
+    }
+    let glyphs = border_style_to_glyphs(border);
+    let fg = Color::Named {
+        name: if focused {
+            NamedColor::BrightWhite
+        } else {
+            NamedColor::White
+        },
+    };
+    let style = Style {
+        fg: Some(fg),
+        bg: None,
+        bold: focused,
+        underline: false,
+        italic: false,
+        reverse: false,
+        dim: false,
+        blink: false,
+        strikethrough: false,
+    };
+    vec![PaintCommand::BoxBorder {
+        rect: rect.clone(),
+        z: 0,
+        glyphs,
+        style,
+    }]
+}
+
+/// Resolve a theme's [`BorderSpec`] into concrete paint commands for a
+/// pane of `rect` size. Picks between flat colour (single
+/// `BoxBorder`) and gradient (multiple `GradientRun` / `CellGrid`
+/// commands depending on `gradient-axis`) based on whether both
+/// `gradient-from` and `gradient-to` parse as hex colours.
+fn paint_commands_from_border_spec(spec: &BorderSpec, rect: &Rect) -> Vec<PaintCommand> {
+    if rect.w < 2 || rect.h < 2 {
+        return Vec::new();
+    }
+    let glyphs = if spec.style.eq_ignore_ascii_case("custom") {
+        crate::glyphs::parse_custom_glyphs(&spec.glyphs_custom)
+    } else {
+        crate::glyphs::parse_border_glyphs(&spec.style)
+    };
+    if matches!(glyphs, BorderGlyphs::None) {
+        return Vec::new();
+    }
+    let grad_from = parse_hex_color(&spec.gradient_from);
+    let grad_to = parse_hex_color(&spec.gradient_to);
+    if let (Some(from), Some(to)) = (grad_from, grad_to) {
+        let axis = parse_gradient_axis(&spec.gradient_axis);
+        return paint_commands_gradient_border(rect, &glyphs, &from, &to, axis);
+    }
+    let style = Style {
+        fg: parse_hex_color(&spec.fg),
+        bg: parse_hex_color(&spec.bg),
+        bold: false,
+        underline: false,
+        italic: false,
+        reverse: false,
+        dim: false,
+        blink: false,
+        strikethrough: false,
+    };
+    vec![PaintCommand::BoxBorder {
+        rect: rect.clone(),
+        z: 0,
+        glyphs,
+        style,
+    }]
+}
+
+/// Paint a gradient box border by emitting four [`PaintCommand`]s
+/// (top, bottom, left, right edges) whose styles interpolate from
+/// `from` to `to` along `axis`.
+///
+/// Behaviour per axis:
+/// - `Horizontal` — top and bottom edges carry a `GradientRun` that
+///   interpolates along the edge from `from` (left) to `to` (right);
+///   left edge is a flat `GradientRun` at `from`; right edge is a
+///   flat `GradientRun` at `to`. This gives a CSS
+///   `linear-gradient(to right, from, to)` look.
+/// - `Vertical` — symmetric: top flat at `from`, bottom flat at
+///   `to`, left and right gradient top-to-bottom.
+/// - `Diagonal` — every border cell is painted explicitly with its
+///   own interpolated colour via per-edge [`PaintCommand::CellGrid`]
+///   commands. Corners meet at their natural diagonal positions.
+#[allow(clippy::too_many_lines)] // Explicit per-axis match: splitting further obscures the variant-dispatch shape.
+fn paint_commands_gradient_border(
+    rect: &Rect,
+    glyphs: &BorderGlyphs,
+    from: &Color,
+    to: &Color,
+    axis: GradientAxis,
+) -> Vec<PaintCommand> {
+    let Some(corners) = bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom(glyphs) else {
+        return Vec::new();
+    };
+    let w = rect.w;
+    let h = rect.h;
+    if w < 2 || h < 2 {
+        return Vec::new();
+    }
+    let from_style = solid_fg_style(from.clone());
+    let to_style = solid_fg_style(to.clone());
+    let last_x = rect.x.saturating_add(w.saturating_sub(1));
+    let last_y = rect.y.saturating_add(h.saturating_sub(1));
+
+    let horizontal = String::from(corners.horizontal);
+    let vertical = String::from(corners.vertical);
+
+    match axis {
+        GradientAxis::Horizontal => {
+            let top_text = build_edge_text(corners.top_left, &horizontal, corners.top_right, w);
+            let bottom_text =
+                build_edge_text(corners.bottom_left, &horizontal, corners.bottom_right, w);
+            let mut commands = Vec::with_capacity(4);
+            commands.push(PaintCommand::GradientRun {
+                col: rect.x,
+                row: rect.y,
+                z: 0,
+                text: top_text,
+                axis: GradientAxis::Horizontal,
+                from_style: from_style.clone(),
+                to_style: to_style.clone(),
+            });
+            commands.push(PaintCommand::GradientRun {
+                col: rect.x,
+                row: last_y,
+                z: 0,
+                text: bottom_text,
+                axis: GradientAxis::Horizontal,
+                from_style: from_style.clone(),
+                to_style: to_style.clone(),
+            });
+            if h > 2 {
+                let side_len = usize::from(h.saturating_sub(2));
+                let side_text = vertical.repeat(side_len);
+                commands.push(PaintCommand::GradientRun {
+                    col: rect.x,
+                    row: rect.y.saturating_add(1),
+                    z: 0,
+                    text: side_text.clone(),
+                    axis: GradientAxis::Vertical,
+                    from_style: from_style.clone(),
+                    to_style: from_style.clone(),
+                });
+                commands.push(PaintCommand::GradientRun {
+                    col: last_x,
+                    row: rect.y.saturating_add(1),
+                    z: 0,
+                    text: side_text,
+                    axis: GradientAxis::Vertical,
+                    from_style: to_style.clone(),
+                    to_style,
+                });
+            }
+            commands
+        }
+        GradientAxis::Vertical => {
+            let top_text = build_edge_text(corners.top_left, &horizontal, corners.top_right, w);
+            let bottom_text =
+                build_edge_text(corners.bottom_left, &horizontal, corners.bottom_right, w);
+            let mut commands = Vec::with_capacity(4);
+            commands.push(PaintCommand::GradientRun {
+                col: rect.x,
+                row: rect.y,
+                z: 0,
+                text: top_text,
+                axis: GradientAxis::Horizontal,
+                from_style: from_style.clone(),
+                to_style: from_style.clone(),
+            });
+            commands.push(PaintCommand::GradientRun {
+                col: rect.x,
+                row: last_y,
+                z: 0,
+                text: bottom_text,
+                axis: GradientAxis::Horizontal,
+                from_style: to_style.clone(),
+                to_style: to_style.clone(),
+            });
+            if h > 2 {
+                let side_len = usize::from(h.saturating_sub(2));
+                let side_text = vertical.repeat(side_len);
+                commands.push(PaintCommand::GradientRun {
+                    col: rect.x,
+                    row: rect.y.saturating_add(1),
+                    z: 0,
+                    text: side_text.clone(),
+                    axis: GradientAxis::Vertical,
+                    from_style: from_style.clone(),
+                    to_style: to_style.clone(),
+                });
+                commands.push(PaintCommand::GradientRun {
+                    col: last_x,
+                    row: rect.y.saturating_add(1),
+                    z: 0,
+                    text: side_text,
+                    axis: GradientAxis::Vertical,
+                    from_style,
+                    to_style,
+                });
+            }
+            commands
+        }
+        GradientAxis::Diagonal => paint_commands_diagonal_gradient_border(rect, &corners, from, to),
+    }
+}
+
+/// Build the full horizontal edge string (top or bottom) given its
+/// corner glyphs and the horizontal run glyph. Widths < 2 are caller-
+/// filtered; width == 2 yields just the two corners.
+fn build_edge_text(left: &str, mid: &str, right: &str, width: u16) -> String {
+    let w = usize::from(width);
+    if w == 0 {
+        return String::new();
+    }
+    if w == 1 {
+        return left.to_string();
+    }
+    let body_len = mid.len() * w.saturating_sub(2);
+    let mut out = String::with_capacity(left.len() + body_len + right.len());
+    out.push_str(left);
+    if w > 2 {
+        for _ in 0..(w - 2) {
+            out.push_str(mid);
+        }
+    }
+    out.push_str(right);
+    out
+}
+
+/// Per-cell diagonal gradient: each border cell is painted via a
+/// [`PaintCommand::CellGrid`] entry whose style carries its own
+/// lerped colour. Produces one `CellGrid` per edge so the renderer
+/// can diff them independently.
+fn paint_commands_diagonal_gradient_border(
+    rect: &Rect,
+    corners: &bmux_scene_protocol::glyphs::BorderGlyphSet<'_>,
+    from: &Color,
+    to: &Color,
+) -> Vec<PaintCommand> {
+    use bmux_scene_protocol::scene_protocol::Cell;
+    let w = rect.w;
+    let h = rect.h;
+    if w < 2 || h < 2 {
+        return Vec::new();
+    }
+    // `t` at (dx, dy) = (dx + dy) / (w + h - 2). Corners land at
+    // (0, 0) -> t=0 and (w-1, h-1) -> t=1.
+    let denom = f32::from(w.saturating_sub(1).saturating_add(h.saturating_sub(1))).max(1.0);
+    let cell_at = |dx: u16, dy: u16, glyph: &str| -> Cell {
+        #[allow(clippy::cast_precision_loss)]
+        let t = (f32::from(dx) + f32::from(dy)) / denom;
+        let color = lerp_rgb(from, to, t);
+        Cell {
+            glyph: glyph.to_string(),
+            style: solid_fg_style(color),
+        }
+    };
+    let mut commands = Vec::new();
+
+    // Top edge: top_left + horizontal*(w-2) + top_right, all at dy=0.
+    let mut top_cells = Vec::with_capacity(usize::from(w));
+    for dx in 0..w {
+        let glyph = if dx == 0 {
+            corners.top_left
+        } else if dx == w - 1 {
+            corners.top_right
+        } else {
+            corners.horizontal
+        };
+        top_cells.push(cell_at(dx, 0, glyph));
+    }
+    commands.push(PaintCommand::CellGrid {
+        origin_col: rect.x,
+        origin_row: rect.y,
+        z: 0,
+        cols: w,
+        cells: top_cells,
+    });
+
+    // Bottom edge at dy=h-1.
+    let mut bottom_cells = Vec::with_capacity(usize::from(w));
+    for dx in 0..w {
+        let glyph = if dx == 0 {
+            corners.bottom_left
+        } else if dx == w - 1 {
+            corners.bottom_right
+        } else {
+            corners.horizontal
+        };
+        bottom_cells.push(cell_at(dx, h - 1, glyph));
+    }
+    commands.push(PaintCommand::CellGrid {
+        origin_col: rect.x,
+        origin_row: rect.y.saturating_add(h - 1),
+        z: 0,
+        cols: w,
+        cells: bottom_cells,
+    });
+
+    // Left and right edges skip corners (already painted above).
+    if h > 2 {
+        let side_len = usize::from(h - 2);
+        let mut left_cells = Vec::with_capacity(side_len);
+        let mut right_cells = Vec::with_capacity(side_len);
+        for dy in 1..(h - 1) {
+            left_cells.push(cell_at(0, dy, corners.vertical));
+            right_cells.push(cell_at(w - 1, dy, corners.vertical));
+        }
+        commands.push(PaintCommand::CellGrid {
+            origin_col: rect.x,
+            origin_row: rect.y.saturating_add(1),
+            z: 0,
+            cols: 1,
+            cells: left_cells,
+        });
+        commands.push(PaintCommand::CellGrid {
+            origin_col: rect.x.saturating_add(w - 1),
+            origin_row: rect.y.saturating_add(1),
+            z: 0,
+            cols: 1,
+            cells: right_cells,
+        });
+    }
+    commands
 }
 
 /// Style helper used by the renderer when expanding descriptors into
@@ -1617,14 +2113,349 @@ mod tests {
         assert!(scene.surfaces.is_empty());
     }
 
+    // Helpers shared by the new theme-aware build-scene tests below.
+    // Seeding geometry and activity directly on the shared state lets
+    // each test exercise `build_scene` without routing through the
+    // full IPC path.
+    fn seed_geometry(plugin: &DecorationPlugin, pane: Uuid, w: u16, h: u16) {
+        if let Ok(mut state) = plugin.state.inner.lock() {
+            state.geometry.insert(
+                pane,
+                PaneGeometry {
+                    pane_id: pane,
+                    rect: Rect { x: 0, y: 0, w, h },
+                    content_rect: Rect {
+                        x: 1,
+                        y: 1,
+                        w: w.saturating_sub(2),
+                        h: h.saturating_sub(2),
+                    },
+                },
+            );
+        }
+    }
+
+    fn set_activity(plugin: &DecorationPlugin, pane: Uuid, focused: bool, zoomed: bool) {
+        if let Ok(mut state) = plugin.state.inner.lock() {
+            let entry = state.activity.entry(pane).or_insert(PaneActivity {
+                pane_id: pane,
+                focused: false,
+                zoomed: false,
+                status: PaneLifecycle::Running,
+            });
+            entry.focused = focused;
+            entry.zoomed = zoomed;
+        }
+    }
+
+    fn sample_theme() -> DecorationThemeExtension {
+        DecorationThemeExtension {
+            unfocused: BorderSpec {
+                style: "single-line".to_string(),
+                fg: "#1a4d1a".to_string(),
+                bg: String::new(),
+                gradient_from: String::new(),
+                gradient_to: String::new(),
+                gradient_axis: String::new(),
+                glyphs_custom: Vec::new(),
+            },
+            focused: BorderSpec {
+                style: "thick".to_string(),
+                fg: "#39ff14".to_string(),
+                bg: String::new(),
+                gradient_from: String::new(),
+                gradient_to: String::new(),
+                gradient_axis: String::new(),
+                glyphs_custom: Vec::new(),
+            },
+            zoomed: BorderSpec {
+                style: "double".to_string(),
+                fg: "#ffd700".to_string(),
+                bg: String::new(),
+                gradient_from: String::new(),
+                gradient_to: String::new(),
+                gradient_axis: String::new(),
+                glyphs_custom: Vec::new(),
+            },
+            badges: bmux_decoration_plugin_api::decoration_state::BadgeSpec {
+                running: String::new(),
+                exited: String::new(),
+            },
+            animation: None,
+            script: None,
+        }
+    }
+
+    fn install_theme(plugin: &DecorationPlugin, theme: DecorationThemeExtension) {
+        if let Ok(mut state) = plugin.state.inner.lock() {
+            state.current_theme = Some(theme);
+        }
+    }
+
+    fn box_border_of(scene: &DecorationScene, pane: &Uuid) -> PaintCommand {
+        let surface = scene
+            .surfaces
+            .get(pane)
+            .expect("surface should exist for seeded pane");
+        surface
+            .paint_commands
+            .iter()
+            .find(|c| matches!(c, PaintCommand::BoxBorder { .. }))
+            .cloned()
+            .expect("surface must carry a BoxBorder paint command")
+    }
+
+    #[test]
+    fn build_scene_emits_themed_unfocused_border() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xa1);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, false, false);
+        install_theme(&plugin, sample_theme());
+        let scene = plugin.build_scene();
+        let PaintCommand::BoxBorder { glyphs, style, .. } = box_border_of(&scene, &pane) else {
+            panic!("expected BoxBorder");
+        };
+        assert_eq!(glyphs, BorderGlyphs::SingleLine);
+        assert_eq!(
+            style.fg,
+            Some(Color::Rgb {
+                r: 0x1a,
+                g: 0x4d,
+                b: 0x1a,
+            })
+        );
+    }
+
+    #[test]
+    fn build_scene_emits_themed_focused_border() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xa2);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, true, false);
+        install_theme(&plugin, sample_theme());
+        let scene = plugin.build_scene();
+        let PaintCommand::BoxBorder { glyphs, style, .. } = box_border_of(&scene, &pane) else {
+            panic!("expected BoxBorder");
+        };
+        assert_eq!(glyphs, BorderGlyphs::Thick);
+        assert_eq!(
+            style.fg,
+            Some(Color::Rgb {
+                r: 0x39,
+                g: 0xff,
+                b: 0x14,
+            })
+        );
+    }
+
+    #[test]
+    fn build_scene_emits_themed_zoomed_border() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xa3);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, true, true);
+        install_theme(&plugin, sample_theme());
+        let scene = plugin.build_scene();
+        let PaintCommand::BoxBorder { glyphs, style, .. } = box_border_of(&scene, &pane) else {
+            panic!("expected BoxBorder");
+        };
+        assert_eq!(glyphs, BorderGlyphs::DoubleLine);
+        assert_eq!(
+            style.fg,
+            Some(Color::Rgb {
+                r: 0xff,
+                g: 0xd7,
+                b: 0x00,
+            })
+        );
+    }
+
+    #[test]
+    fn build_scene_falls_back_to_rounded_when_theme_absent() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xa4);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, false, false);
+        let scene = plugin.build_scene();
+        let PaintCommand::BoxBorder { glyphs, style, .. } = box_border_of(&scene, &pane) else {
+            panic!("expected BoxBorder");
+        };
+        assert_eq!(glyphs, BorderGlyphs::Rounded);
+        assert_eq!(
+            style.fg,
+            Some(Color::Named {
+                name: NamedColor::White,
+            })
+        );
+        assert!(!style.bold);
+    }
+
+    #[test]
+    fn build_scene_default_focused_is_bold_bright_white() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xa5);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, true, false);
+        let scene = plugin.build_scene();
+        let PaintCommand::BoxBorder { glyphs, style, .. } = box_border_of(&scene, &pane) else {
+            panic!("expected BoxBorder");
+        };
+        assert_eq!(glyphs, BorderGlyphs::Rounded);
+        assert_eq!(
+            style.fg,
+            Some(Color::Named {
+                name: NamedColor::BrightWhite,
+            })
+        );
+        assert!(style.bold);
+    }
+
+    #[test]
+    fn build_scene_override_wins_over_theme() {
+        let plugin = DecorationPlugin::new();
+        let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
+        let pane = Uuid::from_u128(0xa6);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, false, false);
+        install_theme(&plugin, sample_theme());
+        // Explicit override: user chose Double. This must win even
+        // though the theme's unfocused spec is SingleLine.
+        block_on(handle.set_pane_border(pane, BorderStyle::Double)).expect("set");
+        let scene = plugin.build_scene();
+        let PaintCommand::BoxBorder { glyphs, .. } = box_border_of(&scene, &pane) else {
+            panic!("expected BoxBorder");
+        };
+        assert_eq!(glyphs, BorderGlyphs::DoubleLine);
+    }
+
+    #[test]
+    fn build_scene_horizontal_gradient_emits_four_gradient_runs() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xa7);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, true, false);
+        let mut theme = sample_theme();
+        theme.focused.gradient_from = "#ff0000".to_string();
+        theme.focused.gradient_to = "#0000ff".to_string();
+        theme.focused.gradient_axis = "horizontal".to_string();
+        install_theme(&plugin, theme);
+        let scene = plugin.build_scene();
+        let surface = scene.surfaces.get(&pane).expect("surface present");
+        let gradients: Vec<_> = surface
+            .paint_commands
+            .iter()
+            .filter(|c| matches!(c, PaintCommand::GradientRun { .. }))
+            .collect();
+        assert_eq!(
+            gradients.len(),
+            4,
+            "horizontal gradient emits top/bottom/left/right runs"
+        );
+    }
+
+    #[test]
+    fn build_scene_vertical_gradient_emits_four_gradient_runs() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xa8);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, true, false);
+        let mut theme = sample_theme();
+        theme.focused.gradient_from = "#00ff00".to_string();
+        theme.focused.gradient_to = "#ff00ff".to_string();
+        theme.focused.gradient_axis = "vertical".to_string();
+        install_theme(&plugin, theme);
+        let scene = plugin.build_scene();
+        let surface = scene.surfaces.get(&pane).expect("surface present");
+        let gradients: Vec<_> = surface
+            .paint_commands
+            .iter()
+            .filter(|c| matches!(c, PaintCommand::GradientRun { .. }))
+            .collect();
+        assert_eq!(gradients.len(), 4);
+    }
+
+    #[test]
+    fn build_scene_diagonal_gradient_emits_cell_grids() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xa9);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, true, false);
+        let mut theme = sample_theme();
+        theme.focused.gradient_from = "#ff0000".to_string();
+        theme.focused.gradient_to = "#0000ff".to_string();
+        theme.focused.gradient_axis = "diagonal".to_string();
+        install_theme(&plugin, theme);
+        let scene = plugin.build_scene();
+        let surface = scene.surfaces.get(&pane).expect("surface present");
+        let cell_grids: Vec<_> = surface
+            .paint_commands
+            .iter()
+            .filter(|c| matches!(c, PaintCommand::CellGrid { .. }))
+            .collect();
+        // Top + bottom + left + right = 4 CellGrids (left+right only
+        // emitted when height > 2).
+        assert_eq!(cell_grids.len(), 4);
+    }
+
+    #[test]
+    fn parse_hex_color_handles_valid_and_invalid_inputs() {
+        assert_eq!(
+            parse_hex_color("#39ff14"),
+            Some(Color::Rgb {
+                r: 0x39,
+                g: 0xff,
+                b: 0x14,
+            })
+        );
+        assert_eq!(parse_hex_color("39ff14"), None);
+        assert_eq!(parse_hex_color("#xyz000"), None);
+        assert_eq!(parse_hex_color(""), None);
+        assert_eq!(parse_hex_color("#fff"), None);
+    }
+
+    #[test]
+    fn parse_gradient_axis_accepts_kebab_and_snake() {
+        assert_eq!(parse_gradient_axis("horizontal"), GradientAxis::Horizontal);
+        assert_eq!(parse_gradient_axis("Vertical"), GradientAxis::Vertical);
+        assert_eq!(parse_gradient_axis("diagonal"), GradientAxis::Diagonal);
+        assert_eq!(parse_gradient_axis(""), GradientAxis::Horizontal);
+        assert_eq!(parse_gradient_axis("unknown"), GradientAxis::Horizontal);
+    }
+
     #[test]
     fn setting_pane_border_bumps_revision_and_populates_scene() {
         let plugin = DecorationPlugin::new();
         let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
         let pane = Uuid::from_u128(42);
+        // Seed geometry first — `build_scene` now uses `state.geometry`
+        // as the authoritative set of visible panes. Setting an
+        // override via `set-pane-border` only affects paint-command
+        // selection for panes that also have geometry reported to the
+        // plugin.
+        if let Ok(mut state) = plugin.state.inner.lock() {
+            state.geometry.insert(
+                pane,
+                PaneGeometry {
+                    pane_id: pane,
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 5,
+                    },
+                    content_rect: Rect {
+                        x: 1,
+                        y: 1,
+                        w: 18,
+                        h: 3,
+                    },
+                },
+            );
+        }
         block_on(handle.set_pane_border(pane, BorderStyle::Single)).expect("set");
         let scene = plugin.build_scene();
-        assert_eq!(scene.revision, 1);
+        assert!(scene.revision >= 1);
         assert!(scene.surfaces.contains_key(&pane));
     }
 

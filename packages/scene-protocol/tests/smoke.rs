@@ -5,8 +5,8 @@
 //! protocol v1.1 refresh.
 
 use bmux_scene_protocol::scene_protocol::{
-    AnimationHint, BorderGlyphs, Cell, Color, DecorationScene, FallbackStyle, GradientAxis,
-    INTERFACE_ID, NamedColor, PaintCommand, Rect, Style, SurfaceDecoration,
+    AnimationHint, BorderGlyphs, Cell, Color, DecorationScene, GradientAxis, INTERFACE_ID,
+    NamedColor, PaintCommand, Rect, Style, SurfaceDecoration,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -89,7 +89,6 @@ fn decoration_scene_round_trips_through_json() {
     let scene = DecorationScene {
         revision: 7,
         surfaces,
-        fallback: None,
         animation: None,
     };
 
@@ -221,18 +220,4 @@ fn animation_hint_round_trips() {
     let json = serde_json::to_string(&hint).expect("encode");
     let round: AnimationHint = serde_json::from_str(&json).expect("decode");
     assert_eq!(round, hint);
-}
-
-#[test]
-fn fallback_style_round_trips() {
-    let fs = FallbackStyle {
-        border_unfocused: BorderGlyphs::Rounded,
-        border_focused: BorderGlyphs::Thick,
-        border_zoomed: BorderGlyphs::HeavyDouble,
-        running_badge: "▶".to_string(),
-        exited_badge: "✓".to_string(),
-    };
-    let json = serde_json::to_string(&fs).expect("encode");
-    let round: FallbackStyle = serde_json::from_str(&json).expect("decode");
-    assert_eq!(round, fs);
 }

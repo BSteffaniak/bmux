@@ -618,7 +618,7 @@ mod lua_backend {
                     let glyphs_name: String = entry
                         .get("glyphs")
                         .unwrap_or_else(|_| "single_line".to_string());
-                    let glyphs = parse_border_glyphs(&glyphs_name);
+                    let glyphs = crate::glyphs::parse_border_glyphs(&glyphs_name);
                     let style = style_from_table(entry.get("style").ok());
                     out.push(PaintCommand::BoxBorder {
                         rect,
@@ -719,24 +719,6 @@ mod lua_backend {
             "bright_cyan" => NamedColor::BrightCyan,
             "bright_white" => NamedColor::BrightWhite,
             _ => NamedColor::White,
-        }
-    }
-
-    fn parse_border_glyphs(name: &str) -> bmux_scene_protocol::scene_protocol::BorderGlyphs {
-        use bmux_scene_protocol::scene_protocol::BorderGlyphs;
-        match name {
-            "none" => BorderGlyphs::None,
-            "ascii" => BorderGlyphs::Ascii,
-            "ascii_focused" => BorderGlyphs::AsciiFocused,
-            "ascii_zoomed" => BorderGlyphs::AsciiZoomed,
-            "double_line" => BorderGlyphs::DoubleLine,
-            "rounded" => BorderGlyphs::Rounded,
-            "thick" => BorderGlyphs::Thick,
-            "heavy_double" => BorderGlyphs::HeavyDouble,
-            "dashed" => BorderGlyphs::Dashed,
-            "dotted" => BorderGlyphs::Dotted,
-            "nerd_powerline" => BorderGlyphs::NerdPowerline,
-            _ => BorderGlyphs::SingleLine,
         }
     }
 }

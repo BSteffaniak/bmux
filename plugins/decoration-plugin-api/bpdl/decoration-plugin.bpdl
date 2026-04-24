@@ -73,6 +73,12 @@ interface decoration-state {
         // rather than a flat `fg`.
         gradient-from: string,
         gradient-to: string,
+        // Direction of gradient interpolation when `gradient-from` and
+        // `gradient-to` are both populated. One of `horizontal`,
+        // `vertical`, `diagonal` (case-insensitive; accepts kebab-case
+        // too). Empty string defaults to `horizontal`. Ignored for
+        // non-gradient borders.
+        gradient-axis: string,
         // When `style == "custom"`, the six runes
         // (top-left, top-right, bottom-left, bottom-right,
         // horizontal, vertical). Ignored otherwise.

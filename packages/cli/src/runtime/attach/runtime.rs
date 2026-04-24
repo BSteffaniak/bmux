@@ -7624,7 +7624,6 @@ mod tests {
             cache.force_scene(DecorationScene {
                 revision: 1,
                 surfaces,
-                fallback: None,
                 animation: None,
             });
         }
