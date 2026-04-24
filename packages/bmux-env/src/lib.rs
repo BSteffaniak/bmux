@@ -8,7 +8,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -76,6 +76,14 @@ pub struct InstallParams {
     pub format: SlotOutputFormat,
     /// When true, never touch disk; just print what would happen.
     pub dry_run: bool,
+    /// Allow replacing an existing slot with the same name. Without this,
+    /// duplicates are refused (after an interactive confirmation prompt if
+    /// a TTY is attached).
+    pub overwrite: bool,
+    /// Skip interactive confirmation prompts. When a slot with the same
+    /// name already exists, `overwrite` must also be set to actually
+    /// replace it.
+    pub yes: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +387,12 @@ pub enum InstallOutcome {
     RefusedReadOnly,
     /// `--dry-run` was specified; nothing was written.
     DryRun,
+    /// A slot with the same name already exists and the caller did not
+    /// pass `overwrite` (and either is non-interactive or `yes` was set).
+    RefusedDuplicate,
+    /// A slot with the same name already exists and the user declined the
+    /// overwrite confirmation prompt.
+    RefusedCancelled,
 }
 
 /// Install a new slot.
@@ -431,6 +445,34 @@ pub fn cmd_install<W: Write>(w: &mut W, params: &InstallParams) -> Result<Instal
             manifest_path.display()
         )?;
         return Ok(InstallOutcome::RefusedReadOnly);
+    }
+
+    // Detect a pre-existing `[slots.<name>]` block in the target manifest file
+    // (we intentionally do not consider `extend` files — we only edit this
+    // file). If found, either refuse, prompt, or remove it depending on
+    // `overwrite` / `yes` / TTY.
+    let existing = manifest_has_slot(&manifest_path, &params.name)?;
+    if existing {
+        match resolve_overwrite_decision(w, &params.name, params.overwrite, params.yes)? {
+            OverwriteDecision::Proceed => {
+                writeln!(w, "overwriting existing slot '{}'", params.name)?;
+                // Drop the old block. Ignore `UnknownSlot` since we already
+                // know it exists; surface any other error.
+                remove_slot_block(&manifest_path, &params.name).map_err(|e| anyhow!("{e}"))?;
+            }
+            OverwriteDecision::RefusedDuplicate => {
+                writeln!(
+                    w,
+                    "slot '{}' already exists; pass --overwrite to replace it",
+                    params.name
+                )?;
+                return Ok(InstallOutcome::RefusedDuplicate);
+            }
+            OverwriteDecision::RefusedCancelled => {
+                writeln!(w, "aborted; slot '{}' left unchanged", params.name)?;
+                return Ok(InstallOutcome::RefusedCancelled);
+            }
+        }
     }
 
     // Place the binary first so a partial failure is easier to reason about
@@ -488,6 +530,84 @@ pub fn cmd_install<W: Write>(w: &mut W, params: &InstallParams) -> Result<Instal
         manifest_path.display()
     )?;
     Ok(InstallOutcome::Written)
+}
+
+/// Decision produced by [`resolve_overwrite_decision`] for a slot install
+/// request where a manifest block with the same name already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverwriteDecision {
+    /// Remove the existing block and continue with the install.
+    Proceed,
+    /// Do not overwrite; caller did not opt in (non-interactive or `--yes`
+    /// without `--overwrite`).
+    RefusedDuplicate,
+    /// Do not overwrite; user explicitly declined the confirmation prompt.
+    RefusedCancelled,
+}
+
+/// Check whether the target manifest file already contains a
+/// `[slots.<name>]` block. Mirrors the detection used by
+/// [`bmux_slots::write_slot_block`] so both paths agree.
+fn manifest_has_slot(manifest_path: &Path, name: &str) -> Result<bool> {
+    let contents = match std::fs::read_to_string(manifest_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(anyhow!(
+                "failed reading manifest {}: {e}",
+                manifest_path.display()
+            ));
+        }
+    };
+    let header = format!("[slots.{name}]");
+    Ok(contents.contains(&header))
+}
+
+/// Decide what to do when the target slot name already exists. On an
+/// interactive TTY the user is prompted (`[y/N]`). Non-interactive callers
+/// must pass `overwrite` to proceed.
+fn resolve_overwrite_decision<W: Write>(
+    w: &mut W,
+    name: &str,
+    overwrite: bool,
+    yes: bool,
+) -> Result<OverwriteDecision> {
+    let interactive = std::io::stdin().is_terminal();
+
+    // With `--overwrite --yes`, skip the prompt entirely.
+    if overwrite && yes {
+        return Ok(OverwriteDecision::Proceed);
+    }
+
+    // Non-interactive: require `--overwrite` to proceed; no prompting.
+    if !interactive {
+        if overwrite {
+            return Ok(OverwriteDecision::Proceed);
+        }
+        return Ok(OverwriteDecision::RefusedDuplicate);
+    }
+
+    // Interactive TTY: always confirm before replacing (even with
+    // `--overwrite`, since the operation is destructive).
+    if prompt_overwrite_confirmation(w, name)? {
+        Ok(OverwriteDecision::Proceed)
+    } else {
+        Ok(OverwriteDecision::RefusedCancelled)
+    }
+}
+
+/// Prompt the user on stdin/stdout for an overwrite confirmation. Returns
+/// `true` only when the user typed `y` / `yes` (case-insensitive). Default
+/// is No.
+fn prompt_overwrite_confirmation<W: Write>(w: &mut W, name: &str) -> Result<bool> {
+    writeln!(w, "Slot '{name}' already exists. Overwrite? [y/N]")?;
+    w.flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("failed reading overwrite confirmation")?;
+    let trimmed = answer.trim().to_ascii_lowercase();
+    Ok(trimmed == "y" || trimmed == "yes")
 }
 
 /// Outcome of [`cmd_uninstall`].
@@ -970,6 +1090,8 @@ mod tests {
             bin_dir: Some(bin_dir.clone()),
             format: SlotOutputFormat::Toml,
             dry_run: true,
+            overwrite: false,
+            yes: false,
         };
         let mut out = Vec::new();
         let outcome = cmd_install(&mut out, &params).unwrap();
@@ -977,6 +1099,166 @@ mod tests {
         assert!(!bin_dir.join("bmux-cursor").exists());
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("[slots.cursor]"));
+    }
+
+    #[test]
+    fn manifest_has_slot_detects_existing_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("slots.toml");
+        std::fs::write(
+            &path,
+            "[slots.dev]\nbinary = \"/tmp/bmux\"\ninherit_base = true\n",
+        )
+        .unwrap();
+        assert!(manifest_has_slot(&path, "dev").unwrap());
+        assert!(!manifest_has_slot(&path, "prod").unwrap());
+    }
+
+    #[test]
+    fn manifest_has_slot_returns_false_for_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.toml");
+        assert!(!manifest_has_slot(&path, "dev").unwrap());
+    }
+
+    // Global mutex serialising tests that mutate BMUX_SLOTS_MANIFEST /
+    // BMUX_SLOTS_BIN_DIR. Tests are otherwise racy since env is process-wide.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let prev = std::env::var_os(key);
+            // Safety: tests are serialised via env_lock() to avoid races.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // Safety: tests are serialised via env_lock() to avoid races.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn make_install_params(
+        name: &str,
+        binary: PathBuf,
+        bin_dir: PathBuf,
+        overwrite: bool,
+        yes: bool,
+    ) -> InstallParams {
+        InstallParams {
+            name: name.to_string(),
+            binary,
+            inherit_base: false,
+            mode: InstallMode::Symlink,
+            bin_dir: Some(bin_dir),
+            format: SlotOutputFormat::Toml,
+            dry_run: false,
+            overwrite,
+            yes,
+        }
+    }
+
+    #[test]
+    fn cmd_install_refuses_duplicate_without_overwrite_non_interactive() {
+        let _g = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("slots.toml");
+        let bin_dir = tmp.path().join("bin");
+        let binary = tmp.path().join("fake-bmux");
+        std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
+        // Seed an existing slot block.
+        std::fs::write(
+            &manifest,
+            "[slots.dev]\nbinary = \"/tmp/old-bmux\"\ninherit_base = true\n",
+        )
+        .unwrap();
+
+        let _manifest_env = EnvGuard::set(bmux_slots::SLOTS_MANIFEST_ENV, &manifest);
+
+        let params = make_install_params("dev", binary, bin_dir, false, false);
+        let mut out = Vec::new();
+        let outcome = cmd_install(&mut out, &params).unwrap();
+        assert!(matches!(outcome, InstallOutcome::RefusedDuplicate));
+
+        // Manifest untouched.
+        let contents = std::fs::read_to_string(&manifest).unwrap();
+        assert!(contents.contains("/tmp/old-bmux"));
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("already exists"));
+        assert!(text.contains("--overwrite"));
+    }
+
+    #[test]
+    fn cmd_install_overwrite_yes_replaces_existing_slot() {
+        let _g = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("slots.toml");
+        let bin_dir = tmp.path().join("bin");
+        let binary = tmp.path().join("new-bmux");
+        std::fs::write(&binary, b"#!/bin/sh\n# new\n").unwrap();
+        std::fs::write(
+            &manifest,
+            "[slots.dev]\nbinary = \"/tmp/old-bmux\"\ninherit_base = true\n",
+        )
+        .unwrap();
+
+        let _manifest_env = EnvGuard::set(bmux_slots::SLOTS_MANIFEST_ENV, &manifest);
+
+        let params = make_install_params("dev", binary.clone(), bin_dir.clone(), true, true);
+        let mut out = Vec::new();
+        let outcome = cmd_install(&mut out, &params).unwrap();
+        assert!(matches!(outcome, InstallOutcome::Written));
+
+        // The old block is gone; the new one points at the new binary.
+        let contents = std::fs::read_to_string(&manifest).unwrap();
+        assert!(!contents.contains("/tmp/old-bmux"));
+        assert!(contents.contains(binary.to_string_lossy().as_ref()));
+
+        // The bin-dir symlink/file exists for the slot.
+        assert!(bin_dir.join("bmux-dev").exists() || bin_dir.join("bmux-dev").is_symlink());
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("overwriting existing slot 'dev'"));
+        assert!(text.contains("installed slot 'dev'"));
+    }
+
+    #[test]
+    fn cmd_install_dry_run_with_existing_slot_does_not_touch_disk() {
+        let _g = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("slots.toml");
+        let bin_dir = tmp.path().join("bin");
+        let binary = tmp.path().join("new-bmux");
+        std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
+        let original = "[slots.dev]\nbinary = \"/tmp/old-bmux\"\ninherit_base = true\n";
+        std::fs::write(&manifest, original).unwrap();
+
+        let _manifest_env = EnvGuard::set(bmux_slots::SLOTS_MANIFEST_ENV, &manifest);
+
+        let mut params = make_install_params("dev", binary, bin_dir.clone(), false, false);
+        params.dry_run = true;
+        let mut out = Vec::new();
+        let outcome = cmd_install(&mut out, &params).unwrap();
+        assert!(matches!(outcome, InstallOutcome::DryRun));
+
+        // Manifest untouched; bin-dir not even created.
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), original);
+        assert!(!bin_dir.exists());
     }
 
     // tempfile is a dev-dependency of bmux_slots; surface it here via

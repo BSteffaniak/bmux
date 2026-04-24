@@ -77,6 +77,13 @@ enum Command {
         /// Do not modify disk; just print what would happen.
         #[arg(long)]
         dry_run: bool,
+        /// Replace an existing slot with the same name.
+        #[arg(long)]
+        overwrite: bool,
+        /// Skip interactive confirmation prompts. Requires `--overwrite`
+        /// when a slot with the same name already exists.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Uninstall a slot.
     Uninstall {
@@ -216,6 +223,8 @@ fn run() -> anyhow::Result<u8> {
             bin_dir,
             format,
             dry_run,
+            overwrite,
+            yes,
         } => {
             let params = InstallParams {
                 name,
@@ -225,12 +234,15 @@ fn run() -> anyhow::Result<u8> {
                 bin_dir,
                 format: format.into(),
                 dry_run,
+                overwrite,
+                yes,
             };
             match cmd_install(&mut stdout, &params)? {
                 InstallOutcome::Written | InstallOutcome::DryRun => Ok(0),
                 // Distinct exit code for Nix-style declarative refusal so
                 // automation can detect it cleanly.
                 InstallOutcome::RefusedReadOnly => Ok(77),
+                InstallOutcome::RefusedDuplicate | InstallOutcome::RefusedCancelled => Ok(1),
             }
         }
         Command::Uninstall {

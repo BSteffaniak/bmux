@@ -579,6 +579,10 @@ pub enum SlotCommand {
     /// Writes to `~/.config/bmux/slots.toml` and places `bmux-<name>` into
     /// the bin dir. When the manifest is read-only (e.g. under /nix/store)
     /// prints the block and exits with code 77 without touching disk.
+    ///
+    /// When a slot with the same name already exists, pass `--overwrite`
+    /// to replace it. On an interactive TTY you will be prompted for
+    /// confirmation unless `--yes` is also passed.
     Install {
         /// Slot name (validates as `[A-Za-z0-9._-]+`, not reserved).
         name: String,
@@ -600,6 +604,15 @@ pub enum SlotCommand {
         /// Do not modify disk; only print what would happen.
         #[arg(long)]
         dry_run: bool,
+        /// Replace an existing slot with the same name. Without this flag
+        /// duplicates are refused (after an interactive prompt, if a TTY
+        /// is attached).
+        #[arg(long)]
+        overwrite: bool,
+        /// Skip interactive confirmation prompts. When replacing an
+        /// existing slot, `--overwrite` is still required.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Remove a slot from the manifest and delete its `bmux-<name>` binary.
     Uninstall {

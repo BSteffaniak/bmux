@@ -90,28 +90,48 @@ pub(super) fn run_slot_doctor() -> Result<u8> {
     Ok(u8::from(!ok))
 }
 
-pub(super) fn run_slot_install(
-    name: &str,
-    binary: &str,
-    inherit_base: bool,
-    mode: SlotInstallMode,
-    bin_dir: Option<&Path>,
-    format: SlotOutputFormat,
-    dry_run: bool,
-) -> Result<u8> {
+/// Bundled arguments for [`run_slot_install`]. Grouped into a struct to
+/// keep the call-site readable and avoid `too_many_arguments` /
+/// `fn_params_excessive_bools` clippy noise.
+///
+/// The four bool fields each represent an independent CLI flag
+/// (`--no-inherit-base`, `--dry-run`, `--overwrite`, `--yes`) that the
+/// user can toggle in any combination. Collapsing them into state-machine
+/// enums would obscure the direct CLI-to-struct mapping without improving
+/// clarity, so `struct_excessive_bools` is silenced here.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Copy, Clone)]
+pub(super) struct SlotInstallOptions<'a> {
+    pub name: &'a str,
+    pub binary: &'a str,
+    pub inherit_base: bool,
+    pub mode: SlotInstallMode,
+    pub bin_dir: Option<&'a Path>,
+    pub format: SlotOutputFormat,
+    pub dry_run: bool,
+    /// Replace an existing slot with the same name.
+    pub overwrite: bool,
+    /// Skip interactive confirmation prompts.
+    pub yes: bool,
+}
+
+pub(super) fn run_slot_install(opts: SlotInstallOptions<'_>) -> Result<u8> {
     let params = InstallParams {
-        name: name.to_string(),
-        binary: PathBuf::from(binary),
-        inherit_base,
-        mode: to_env_install_mode(mode),
-        bin_dir: bin_dir.map(Path::to_path_buf),
-        format: to_env_output(format),
-        dry_run,
+        name: opts.name.to_string(),
+        binary: PathBuf::from(opts.binary),
+        inherit_base: opts.inherit_base,
+        mode: to_env_install_mode(opts.mode),
+        bin_dir: opts.bin_dir.map(Path::to_path_buf),
+        format: to_env_output(opts.format),
+        dry_run: opts.dry_run,
+        overwrite: opts.overwrite,
+        yes: opts.yes,
     };
     let mut stdout = std::io::stdout().lock();
     match cmd_install(&mut stdout, &params)? {
         InstallOutcome::Written | InstallOutcome::DryRun => Ok(0),
         InstallOutcome::RefusedReadOnly => Ok(77),
+        InstallOutcome::RefusedDuplicate | InstallOutcome::RefusedCancelled => Ok(1),
     }
 }
 

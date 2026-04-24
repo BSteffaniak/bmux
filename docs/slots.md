@@ -101,6 +101,9 @@ bmux slot install <name> <binary>    # register a slot
   [--bin-dir <dir>]                  # default ~/.local/bin (or $BMUX_SLOTS_BIN_DIR)
   [--format toml|json|nix]           # for the printed block
   [--dry-run]                        # do not touch disk
+  [--overwrite]                      # replace an existing slot with the same name
+  [--yes | -y]                       # skip confirmation prompt (requires --overwrite
+                                     #   when a slot with the same name already exists)
 bmux slot uninstall <name>           # remove slot
   [--purge]                          # also remove config/data/state/log dirs
   [--bin-dir <dir>]

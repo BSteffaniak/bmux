@@ -1873,6 +1873,8 @@ pub(super) async fn dispatch_built_in_command(
                         bin_dir,
                         format,
                         dry_run,
+                        overwrite,
+                        yes,
                     },
             }
             | Command::Env {
@@ -1885,17 +1887,21 @@ pub(super) async fn dispatch_built_in_command(
                         bin_dir,
                         format,
                         dry_run,
+                        overwrite,
+                        yes,
                     },
             },
-        ) => super::slot_cli::run_slot_install(
+        ) => super::slot_cli::run_slot_install(super::slot_cli::SlotInstallOptions {
             name,
             binary,
-            !*no_inherit_base,
-            *mode,
-            bin_dir.as_deref(),
-            *format,
-            *dry_run,
-        ),
+            inherit_base: !*no_inherit_base,
+            mode: *mode,
+            bin_dir: bin_dir.as_deref(),
+            format: *format,
+            dry_run: *dry_run,
+            overwrite: *overwrite,
+            yes: *yes,
+        }),
         (
             BuiltInHandlerId::SlotUninstall,
             Command::Slot {
