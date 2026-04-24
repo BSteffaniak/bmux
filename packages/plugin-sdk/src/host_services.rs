@@ -50,11 +50,13 @@ pub struct RecordingWriteEventResponse {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginCommandOutcome {
-    // Intentionally empty. Cross-domain mutations flow through typed
-    // dispatch (for example the contexts plugin's `select-context`
-    // command sets the context directly) and the attach runtime
-    // retargets based on observing the `before/after current-context`
-    // delta rather than a plugin-emitted effect list. Kept as an empty
-    // struct so `PluginCommandExecution::outcome` retains a stable
-    // shape; drop this type once no consumer references it.
+    /// Error message from the plugin command's `Err` return, if any.
+    ///
+    /// Populated by the SDK's FFI boundary when a `RustPlugin`
+    /// command returns `Err(PluginCommandError)`. Hosts use this to
+    /// log the error and render a user-facing indicator, instead of
+    /// relying on the plugin's stderr (which would corrupt attach
+    /// TTYs for in-process plugins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }

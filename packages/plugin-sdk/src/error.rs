@@ -4,6 +4,42 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, PluginError>;
 
+/// Machine-readable hint describing how to resolve a
+/// [`PluginError::CapabilityAccessDenied`].
+///
+/// Hints are populated by the dispatcher when enough context is
+/// available to suggest an actionable fix (most commonly: the
+/// caller's `required_capabilities` list in `plugin.toml` is
+/// missing the capability that was denied). The host is free to
+/// surface this to the user in a log message, a developer-mode
+/// toast, or a structured error payload.
+///
+/// The type is intentionally `Clone + Debug` and carries owned
+/// strings so it can be cheaply propagated across layers without
+/// borrowing from the original error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityAccessDeniedHint {
+    /// Short, user-facing description of the suggested fix.
+    pub suggested_fix: String,
+    /// Optional identifier of the missing manifest field
+    /// (for tooling: e.g. `"required_capabilities"`).
+    pub manifest_field: Option<String>,
+}
+
+impl CapabilityAccessDeniedHint {
+    /// Build a hint that suggests declaring `capability` in the
+    /// caller's manifest `required_capabilities` array.
+    #[must_use]
+    pub fn declare_required_capability(capability: &str) -> Self {
+        Self {
+            suggested_fix: format!(
+                "declare '{capability}' in the caller plugin's required_capabilities in plugin.toml"
+            ),
+            manifest_field: Some("required_capabilities".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PluginError {
     #[error("invalid plugin id '{id}'")]
@@ -294,6 +330,14 @@ pub enum PluginError {
         plugin_id: String,
         capability: String,
         operation: &'static str,
+        /// Structured, machine-readable hint describing how to
+        /// resolve this error (for example, by declaring the missing
+        /// capability in the plugin's manifest). The `Display` impl
+        /// intentionally does NOT include this field so formatted
+        /// error strings remain stable for existing test assertions
+        /// and log matchers; hosts wishing to render the hint should
+        /// pattern-match on this variant.
+        hint: Option<CapabilityAccessDeniedHint>,
     },
 
     #[error("failed to parse plugin manifest: {0}")]

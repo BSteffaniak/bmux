@@ -249,11 +249,22 @@ impl RustPlugin for WindowsPlugin {
 
 #[allow(clippy::too_many_lines)]
 fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Result<(), String> {
+    // Only emit confirmation text to stdout when invoked from a
+    // standalone CLI (e.g. `bmux window new`). When this plugin is
+    // dispatched from an attach keybinding the host is rendering a
+    // raw-mode TUI and `println!` would paint over pane content; the
+    // attach runtime observes state changes (current context id,
+    // context list) directly and refreshes from those, so silence is
+    // correct there.
+    let emit_to_stdout = matches!(
+        context.invocation_source,
+        bmux_plugin_sdk::NativeCommandInvocationSource::Cli
+    );
     match context.command.as_str() {
         "new-window" => {
             let name = option_value(&context.arguments, "name");
             let ack = create_window(context, name)?;
-            if let Some(context_id) = ack.id {
+            if emit_to_stdout && let Some(context_id) = ack.id {
                 println!("created window context: {context_id}");
             }
             Ok(())
@@ -262,6 +273,13 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             let session_filter = option_value(&context.arguments, "session");
             let as_json = has_flag(&context.arguments, "json");
             let windows = list_windows(context, session_filter.as_deref())?;
+            if !emit_to_stdout {
+                // Rendering list output is only meaningful from the
+                // CLI; attach keybindings don't have a useful surface
+                // for it here and the attach UI refreshes its own
+                // state from the contexts/sessions catalogs.
+                return Ok(());
+            }
             if as_json {
                 let output =
                     serde_json::to_string_pretty(&serde_json::json!({ "windows": windows }))
@@ -292,7 +310,9 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                     force: force_local,
                 })
                 .map_err(|error| error.to_string())?;
-            println!("killed window context: {}", response.id);
+            if emit_to_stdout {
+                println!("killed window context: {}", response.id);
+            }
             Ok(())
         }
         "kill-all-windows" => {
@@ -302,7 +322,9 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 .map_err(|error| error.to_string())?
                 .contexts;
             if contexts.is_empty() {
-                println!("no windows");
+                if emit_to_stdout {
+                    println!("no windows");
+                }
                 return Ok(());
             }
             for context_summary in contexts {
@@ -312,7 +334,9 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                         force: force_local,
                     })
                     .map_err(|error| error.to_string())?;
-                println!("killed window context: {}", response.id);
+                if emit_to_stdout {
+                    println!("killed window context: {}", response.id);
+                }
             }
             Ok(())
         }
@@ -324,7 +348,9 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             let context_id = ack
                 .id
                 .ok_or_else(|| "switch-window did not return selected context id".to_string())?;
-            println!("active window context: {context_id}");
+            if emit_to_stdout {
+                println!("active window context: {context_id}");
+            }
             Ok(())
         }
         "next-window" => {
@@ -333,7 +359,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 WindowCycleDirection::Next,
                 &plugin.last_selected_by_client,
             )?;
-            if let Some(id) = ack.id {
+            if emit_to_stdout && let Some(id) = ack.id {
                 println!("next-window selected context {id}");
             }
             Ok(())
@@ -344,7 +370,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 WindowCycleDirection::Previous,
                 &plugin.last_selected_by_client,
             )?;
-            if let Some(id) = ack.id {
+            if emit_to_stdout && let Some(id) = ack.id {
                 println!("prev-window selected context {id}");
             }
             Ok(())
@@ -355,7 +381,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 WindowCycleDirection::Last,
                 &plugin.last_selected_by_client,
             )?;
-            if let Some(id) = ack.id {
+            if emit_to_stdout && let Some(id) = ack.id {
                 println!("last-window selected context {id}");
             }
             Ok(())
@@ -370,14 +396,14 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 return Err("window index must be 1 or greater".to_string());
             }
             let ack = goto_window_by_index(context, index, &plugin.last_selected_by_client)?;
-            if let Some(id) = ack.id {
+            if emit_to_stdout && let Some(id) = ack.id {
                 println!("goto-window {index} selected context {id}");
             }
             Ok(())
         }
         "close-current-window" => {
             let ack = close_current_window(context, &plugin.last_selected_by_client)?;
-            if let Some(id) = ack.id {
+            if emit_to_stdout && let Some(id) = ack.id {
                 println!("closed current window context {id}");
             }
             Ok(())

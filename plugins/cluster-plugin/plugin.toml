@@ -27,7 +27,11 @@ provided_capabilities = [
 ]
 provided_features = ["bmux.server_clusters"]
 required_capabilities = [
+    "bmux.attach_runtime.write",
+    "bmux.clients.read",
     "bmux.commands",
+    "bmux.contexts.read",
+    "bmux.contexts.write",
     "bmux.pane_runtime.read",
     "bmux.pane_runtime.write",
     "bmux.panes.write",

@@ -854,6 +854,11 @@ pub fn call_service_raw(
             plugin_id: caller_plugin_id.to_string(),
             capability: capability.as_str().to_string(),
             operation: "call_service",
+            hint: Some(
+                bmux_plugin_sdk::CapabilityAccessDeniedHint::declare_required_capability(
+                    capability.as_str(),
+                ),
+            ),
         });
     }
 
@@ -1481,8 +1486,12 @@ impl LoadedPlugin {
             match &self.backend {
                 PluginBackend::Static(vtable) => {
                     begin_command_outcome_capture();
+                    let _ = bmux_plugin_sdk::take_last_command_error();
                     let status = (vtable.run_command_with_context)(payload.as_ptr(), payload.len());
-                    let outcome = finish_command_outcome_capture();
+                    let mut outcome = finish_command_outcome_capture();
+                    if let Some(error) = bmux_plugin_sdk::take_last_command_error() {
+                        outcome.error_message = Some(error.message);
+                    }
                     return Ok((status, outcome));
                 }
                 PluginBackend::Dynamic(library) => {
@@ -1492,8 +1501,12 @@ impl LoadedPlugin {
                         )
                     } {
                         begin_command_outcome_capture();
+                        let _ = bmux_plugin_sdk::take_last_command_error();
                         let status = unsafe { command_symbol(payload.as_ptr(), payload.len()) };
-                        let outcome = finish_command_outcome_capture();
+                        let mut outcome = finish_command_outcome_capture();
+                        if let Some(error) = bmux_plugin_sdk::take_last_command_error() {
+                            outcome.error_message = Some(error.message);
+                        }
                         return Ok((status, outcome));
                     }
                 }
@@ -2817,6 +2830,7 @@ minimum = "1.0"
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
         };
 
@@ -2861,6 +2875,7 @@ minimum = "1.0"
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
         };
 
@@ -2919,6 +2934,7 @@ minimum = "1.0"
             settings: None,
             plugin_settings_map,
             caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
         };
 
@@ -2991,6 +3007,7 @@ minimum = "1.0"
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
         };
 
@@ -3062,6 +3079,7 @@ minimum = "1.0"
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
         };
 
@@ -3116,6 +3134,7 @@ minimum = "1.0"
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3169,6 +3188,7 @@ minimum = "1.0"
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3229,6 +3249,7 @@ minimum = "1.0"
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
@@ -3283,6 +3304,7 @@ minimum = "1.0"
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 

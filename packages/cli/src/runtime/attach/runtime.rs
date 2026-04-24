@@ -2008,7 +2008,14 @@ pub async fn handle_attach_runtime_action(
                 ATTACH_WELCOME_STATUS_TTL,
             );
             if !view_state.can_write {
-                println!("read-only attach: input disabled");
+                // Raw mode is active inside `handle_attach_runtime_action`;
+                // `println!` would paint over pane content. Surface the
+                // notice through the transient status line instead.
+                view_state.set_transient_status(
+                    "read-only attach: input disabled".to_string(),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
             }
         }
         _ => {}
@@ -2288,7 +2295,7 @@ pub async fn handle_attach_plugin_command_action(
                 "attach.plugin_command.run_failed"
             );
             view_state.set_transient_status(
-                format!("plugin action failed: {error}"),
+                format!("plugin action failed ({plugin_id}:{command_name}) — see logs"),
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
@@ -2296,17 +2303,42 @@ pub async fn handle_attach_plugin_command_action(
         Ok(execution) => {
             let status = execution.status;
             if status != 0 {
-                warn!(
-                    plugin_id = %plugin_id,
-                    command_name = %command_name,
-                    status,
-                    before_context_id = ?before_context_id,
-                    attached_context_id = ?view_state.attached_context_id,
-                    attached_session_id = %view_state.attached_id,
-                    "attach.plugin_command.nonzero_status"
-                );
+                // Route the plugin's error text (captured by the SDK
+                // into `PluginCommandOutcome.error_message` instead of
+                // the stderr-corrupting `eprintln!` path) to the log
+                // file at `warn` level. The attach status line shows
+                // only a concise, non-corrupting indicator so pane
+                // rendering stays intact.
+                let error_detail = execution.outcome.error_message.as_deref();
+                if let Some(detail) = error_detail {
+                    warn!(
+                        plugin_id = %plugin_id,
+                        command_name = %command_name,
+                        status,
+                        error = %detail,
+                        before_context_id = ?before_context_id,
+                        attached_context_id = ?view_state.attached_context_id,
+                        attached_session_id = %view_state.attached_id,
+                        "attach.plugin_command.nonzero_status"
+                    );
+                } else {
+                    warn!(
+                        plugin_id = %plugin_id,
+                        command_name = %command_name,
+                        status,
+                        before_context_id = ?before_context_id,
+                        attached_context_id = ?view_state.attached_context_id,
+                        attached_session_id = %view_state.attached_id,
+                        "attach.plugin_command.nonzero_status"
+                    );
+                }
+                let status_text = if error_detail.is_some() {
+                    format!("plugin action failed ({plugin_id}:{command_name}) — see logs")
+                } else {
+                    format!("plugin action failed ({plugin_id}:{command_name}) exit {status}")
+                };
                 view_state.set_transient_status(
-                    format!("plugin action failed ({plugin_id}:{command_name}) exit {status}"),
+                    status_text,
                     Instant::now(),
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
@@ -5081,14 +5113,27 @@ pub async fn handle_attach_server_event(
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
             if !view_state.can_write {
-                println!("read-only attach: input disabled");
+                // Route the read-only notice to the status line — raw
+                // mode is active here and `println!` would overwrite
+                // pane content.
+                view_state.set_transient_status(
+                    "read-only attach: input disabled".to_string(),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
             }
         }
         bmux_client::ServerEvent::FollowTargetGone {
             former_leader_client_id,
             ..
         } if Some(former_leader_client_id) == follow_target_id => {
-            println!("follow target disconnected; staying on current session");
+            // Surface the detach notice through the status line; raw
+            // mode is active and `println!` would corrupt rendering.
+            view_state.set_transient_status(
+                "follow target disconnected; staying on current session".to_string(),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
         }
         bmux_client::ServerEvent::ControlCatalogChanged {
             revision,
@@ -5330,7 +5375,13 @@ pub async fn handle_attach_terminal_event(
                     continue;
                 }
                 if let Err(error) = handle_attach_runtime_action(client, action, view_state).await {
-                    println!("attach action failed: {}", map_attach_client_error(error));
+                    let mapped = map_attach_client_error(error);
+                    warn!(error = %mapped, "attach.action.runtime_failed");
+                    view_state.set_transient_status(
+                        format!("attach action failed: {mapped}"),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
                 } else {
                     view_state.dirty.status_needs_redraw = true;
                     view_state.dirty.layout_needs_refresh = true;
@@ -5430,7 +5481,13 @@ pub async fn handle_attach_terminal_event(
                     RuntimeAction::Quit | RuntimeAction::CloseFocusedPane
                 );
                 if let Err(error) = handle_attach_ui_action(client, action, view_state).await {
-                    println!("attach action failed: {}", map_attach_client_error(error));
+                    let mapped = map_attach_client_error(error);
+                    warn!(error = %mapped, "attach.action.ui_failed");
+                    view_state.set_transient_status(
+                        format!("attach action failed: {mapped}"),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
                 } else if prompt_only_action && view_state.prompt.is_active() {
                     view_state.dirty.overlay_needs_redraw = true;
                 } else {

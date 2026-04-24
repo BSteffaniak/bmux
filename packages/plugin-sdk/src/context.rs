@@ -187,9 +187,53 @@ pub struct NativeCommandContext {
     /// associated.
     #[serde(default)]
     pub caller_client_id: Option<uuid::Uuid>,
+    /// How the host dispatched this command.
+    ///
+    /// Plugins use this to decide whether writing to `stdout` is
+    /// safe. For [`NativeCommandInvocationSource::Cli`] the host
+    /// stdout is the user's terminal in cooked mode and writes are
+    /// appropriate. For
+    /// [`NativeCommandInvocationSource::AttachKeybinding`] the host
+    /// terminal is in raw mode rendering a TUI; direct writes would
+    /// corrupt pane content and plugins should return their output as
+    /// structured data (or stay silent and rely on host-side state
+    /// observation).
+    #[serde(default)]
+    pub invocation_source: NativeCommandInvocationSource,
     /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,
+}
+
+/// How a plugin command was dispatched by the host.
+///
+/// This tells the plugin which surfaces are safe to write to:
+/// `stdout`/`stderr` are TTY-safe for [`Self::Cli`], but the same
+/// writes corrupt pane rendering when the host is in attach mode
+/// ([`Self::AttachKeybinding`]).
+///
+/// The default is [`Self::Unknown`] so pre-existing serialized
+/// contexts (or hosts that haven't been updated) round-trip
+/// without changing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCommandInvocationSource {
+    /// The invocation source was not communicated by the host. Plugins
+    /// should treat this as "assume stdout may be a TTY in raw mode"
+    /// and avoid direct writes for safety.
+    #[default]
+    Unknown,
+    /// Dispatched from a standalone CLI invocation
+    /// (`bmux <plugin> <command>`). The host stdout is an ordinary
+    /// terminal or pipe; `println!` is appropriate.
+    Cli,
+    /// Dispatched from a keybinding while the host is rendering the
+    /// attach TUI in raw mode. Plugins must not write to stdout/stderr.
+    AttachKeybinding,
+    /// Dispatched via host-internal automation (tests, bridges). The
+    /// plugin should follow the same silence rules as
+    /// [`Self::AttachKeybinding`].
+    Internal,
 }
 
 /// Context passed to [`RustPlugin::invoke_service`].

@@ -212,20 +212,33 @@ impl RustPlugin for PermissionsPlugin {
 
 #[allow(clippy::too_many_lines)]
 fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
+    // Gate stdout writes on invocation source: attach keybindings run
+    // inside a raw-mode TUI, where `println!` would corrupt pane
+    // rendering. The `permissions-current` command (bound to shift+p
+    // in the default runtime keymap) is the one that can reach this
+    // function from a keybinding; the others are CLI-only but
+    // following the same rule uniformly is simpler and avoids future
+    // drift.
+    let emit_to_stdout = matches!(
+        context.invocation_source,
+        bmux_plugin_sdk::NativeCommandInvocationSource::Cli
+    );
     match context.command.as_str() {
         "permissions" => {
             let session = required_option_value(&context.arguments, "session")?;
             let as_json = has_flag(&context.arguments, "json");
             let entries = list_entries(context, &session)?;
-            if as_json {
-                let output = serde_json::to_string_pretty(&ListPermissionsResponse { entries })
-                    .map_err(|error| error.to_string())?;
-                println!("{output}");
-            } else if entries.is_empty() {
-                println!("no explicit permissions for session {session}");
-            } else {
-                for entry in entries {
-                    println!("{}\t{}", entry.client_id, entry.role);
+            if emit_to_stdout {
+                if as_json {
+                    let output = serde_json::to_string_pretty(&ListPermissionsResponse { entries })
+                        .map_err(|error| error.to_string())?;
+                    println!("{output}");
+                } else if entries.is_empty() {
+                    println!("no explicit permissions for session {session}");
+                } else {
+                    for entry in entries {
+                        println!("{}\t{}", entry.client_id, entry.role);
+                    }
                 }
             }
             Ok(())
@@ -234,15 +247,17 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
             let session = resolve_current_session(context)?;
             let as_json = has_flag(&context.arguments, "json");
             let entries = list_entries(context, &session)?;
-            if as_json {
-                let output = serde_json::to_string_pretty(&ListPermissionsResponse { entries })
-                    .map_err(|error| error.to_string())?;
-                println!("{output}");
-            } else if entries.is_empty() {
-                println!("no explicit permissions for session {session}");
-            } else {
-                for entry in entries {
-                    println!("{}\t{}", entry.client_id, entry.role);
+            if emit_to_stdout {
+                if as_json {
+                    let output = serde_json::to_string_pretty(&ListPermissionsResponse { entries })
+                        .map_err(|error| error.to_string())?;
+                    println!("{output}");
+                } else if entries.is_empty() {
+                    println!("no explicit permissions for session {session}");
+                } else {
+                    for entry in entries {
+                        println!("{}\t{}", entry.client_id, entry.role);
+                    }
                 }
             }
             Ok(())
@@ -254,7 +269,9 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 role: required_option_value(&context.arguments, "role")?,
             };
             grant_entry(context, request)?;
-            println!("granted permission");
+            if emit_to_stdout {
+                println!("granted permission");
+            }
             Ok(())
         }
         "revoke" => {
@@ -263,7 +280,9 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 client: required_option_value(&context.arguments, "client")?,
             };
             revoke_entry(context, &request)?;
-            println!("revoked permission");
+            if emit_to_stdout {
+                println!("revoked permission");
+            }
             Ok(())
         }
         "grant-hot-path-override" => {
@@ -276,7 +295,9 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 context: option_value(&context.arguments, "context"),
             };
             grant_hot_path_override(context, request)?;
-            println!("granted hot-path override");
+            if emit_to_stdout {
+                println!("granted hot-path override");
+            }
             Ok(())
         }
         "revoke-hot-path-override" => {
@@ -289,7 +310,9 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 context: option_value(&context.arguments, "context"),
             };
             revoke_hot_path_override(context, &request)?;
-            println!("revoked hot-path override");
+            if emit_to_stdout {
+                println!("revoked hot-path override");
+            }
             Ok(())
         }
         "list-hot-path-overrides" => {
@@ -298,27 +321,29 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 context: option_value(&context.arguments, "context"),
             };
             let response = list_hot_path_overrides(context, request)?;
-            if has_flag(&context.arguments, "json") {
-                let output =
-                    serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?;
-                println!("{output}");
-            } else if response.entries.is_empty() {
-                println!("no hot-path overrides configured");
-            } else {
-                for entry in response.entries {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}",
-                        entry.plugin_id,
-                        entry.capability,
-                        entry.execution_class,
-                        entry.scope,
-                        entry
-                            .session_id
-                            .map_or_else(|| "-".to_string(), |id| id.to_string()),
-                        entry
-                            .context_id
-                            .map_or_else(|| "-".to_string(), |id| id.to_string())
-                    );
+            if emit_to_stdout {
+                if has_flag(&context.arguments, "json") {
+                    let output = serde_json::to_string_pretty(&response)
+                        .map_err(|error| error.to_string())?;
+                    println!("{output}");
+                } else if response.entries.is_empty() {
+                    println!("no hot-path overrides configured");
+                } else {
+                    for entry in response.entries {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            entry.plugin_id,
+                            entry.capability,
+                            entry.execution_class,
+                            entry.scope,
+                            entry
+                                .session_id
+                                .map_or_else(|| "-".to_string(), |id| id.to_string()),
+                            entry
+                                .context_id
+                                .map_or_else(|| "-".to_string(), |id| id.to_string())
+                        );
+                    }
                 }
             }
             Ok(())
@@ -350,15 +375,20 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 .transpose()?
                 .unwrap_or_else(|| usize::from(!watch));
 
-            watch_hot_path_policy_decision(
-                context,
-                &request,
-                as_json,
-                compact,
-                watch,
-                interval_ms,
-                iterations,
-            )?;
+            // `hot-path-policy` is CLI-only (no default keybinding).
+            // Still guard to be safe if that changes in future — the
+            // watch loop writes to stdout repeatedly.
+            if emit_to_stdout {
+                watch_hot_path_policy_decision(
+                    context,
+                    &request,
+                    as_json,
+                    compact,
+                    watch,
+                    interval_ms,
+                    iterations,
+                )?;
+            }
             Ok(())
         }
         _ => Err(format!("unsupported command '{}'", context.command)),

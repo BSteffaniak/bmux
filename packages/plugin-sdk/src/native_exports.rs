@@ -3,6 +3,7 @@ use crate::{
     ServiceEnvelopeKind, ServiceResponse, TypedServiceRegistry, decode_service_envelope,
     encode_service_envelope,
 };
+use std::cell::RefCell;
 use std::ffi::{CString, c_char};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
@@ -25,9 +26,12 @@ pub const EXIT_UNAVAILABLE: i32 = 70;
 
 /// Error type for plugin command and lifecycle methods.
 ///
-/// Carries an exit code and a human-readable message.  When a plugin method
-/// returns `Err(PluginCommandError)`, the SDK prints the message to stderr
-/// and passes the exit code back to the host.
+/// Carries an exit code and a human-readable message. When a plugin
+/// method returns `Err(PluginCommandError)`, the SDK captures the
+/// error for the host to retrieve via [`take_last_command_error`] and
+/// returns the error's exit code to the host. The error message is
+/// never written to stderr — `native_fast` plugins share stderr with an
+/// interactive attach TUI and raw writes would corrupt pane rendering.
 ///
 /// Implements `From<String>` and `From<&str>` for easy use with the `?`
 /// operator — string errors map to [`EXIT_ERROR`].
@@ -125,15 +129,47 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for PluginCommandError {
 /// Convert a plugin Result into an FFI exit code.
 ///
 /// - `Ok(code)` → returns `code`
-/// - `Err(e)` → prints `e.message` to stderr, returns `e.code`
+/// - `Err(e)` → returns `e.code`
+///
+/// The error's message is not written to stderr: `native_fast` plugins
+/// execute in-process alongside an interactive attach TUI, and writing
+/// to stderr corrupts the attached terminal. Hosts that need the error
+/// text read [`take_last_command_error`] after the FFI call returns.
 fn result_to_exit_code(result: Result<i32, PluginCommandError>) -> i32 {
     match result {
         Ok(code) => code,
-        Err(error) => {
-            eprintln!("{}", error.message);
-            error.code
-        }
+        Err(error) => error.code,
     }
+}
+
+thread_local! {
+    /// Slot populated by [`run_command_export`] when a plugin command
+    /// returns `Err`. The host reads this via [`take_last_command_error`]
+    /// immediately after the FFI call and routes the message to logs /
+    /// status line instead of the raw tty.
+    static LAST_COMMAND_ERROR: RefCell<Option<PluginCommandError>> = const { RefCell::new(None) };
+}
+
+/// Retrieve and clear the most recent plugin command error captured by
+/// the SDK's FFI boundary.
+///
+/// Hosts call this immediately after `bmux_plugin_run_command_v1` /
+/// `bmux_plugin_run_command_with_context_v1` returns to fetch the
+/// structured error (if any) the plugin produced.
+///
+/// Returns `None` when the last command succeeded or when no command
+/// has been invoked on the current thread.
+#[must_use]
+pub fn take_last_command_error() -> Option<PluginCommandError> {
+    LAST_COMMAND_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
+/// Store a pending command error so the host can retrieve it via
+/// [`take_last_command_error`]. Overwrites any previously-stored error.
+fn store_last_command_error(error: PluginCommandError) {
+    LAST_COMMAND_ERROR.with(|slot| {
+        *slot.borrow_mut() = Some(error);
+    });
 }
 
 // ── Internal FFI status codes (not exposed to plugin authors) ────────────────
@@ -160,9 +196,11 @@ const SERVICE_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
 /// ## Error patterns
 ///
 /// Commands and lifecycle hooks return `Result<i32, PluginCommandError>` where
-/// the `i32` is an exit code (use [`EXIT_OK`], [`EXIT_ERROR`], etc.).  On
-/// `Err`, the SDK prints the error message to stderr and returns the error's
-/// exit code to the host.
+/// the `i32` is an exit code (use [`EXIT_OK`], [`EXIT_ERROR`], etc.). On
+/// `Err`, the SDK captures the error for the host to retrieve via
+/// [`take_last_command_error`] and returns the error's exit code to the
+/// host. The error message is never written to stderr — that would corrupt
+/// an attached TUI for `native_fast` plugins running in-process.
 ///
 /// Service handlers return [`ServiceResponse`] directly — a structured RPC
 /// response with an optional error payload.  Use [`handle_service`](crate::handle_service)
@@ -328,7 +366,11 @@ pub fn run_command_export<P: RustPlugin>(
         |code| code,
         |payload| {
             instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
-                result_to_exit_code(plugin.run_command(payload))
+                let result = plugin.run_command(payload);
+                if let Err(error) = &result {
+                    store_last_command_error(error.clone());
+                }
+                result_to_exit_code(result)
             })
         },
     )

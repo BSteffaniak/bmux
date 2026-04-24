@@ -786,6 +786,7 @@ pub(super) fn plugin_command_context(
     enabled_plugins: Vec<String>,
     plugin_search_roots: Vec<String>,
     registered_plugins: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
+    invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
 ) -> NativeCommandContext {
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeCommandContext {
@@ -816,6 +817,7 @@ pub(super) fn plugin_command_context(
             .cloned(),
         plugin_settings_map: config.plugins.settings.clone(),
         caller_client_id: None,
+        invocation_source,
         host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
             host_kernel_bridge,
         )),
@@ -1520,8 +1522,25 @@ pub(super) async fn run_plugin_command(
     command_name: &str,
     args: &[String],
 ) -> Result<u8> {
-    let status = run_plugin_command_internal(plugin_id, command_name, args, None)?.status;
-    Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
+    let execution = run_plugin_command_internal(
+        plugin_id,
+        command_name,
+        args,
+        None,
+        bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
+    )?;
+    // Standalone CLI context: the process has no interactive TUI so
+    // writing the plugin's error text to this process's stderr is the
+    // natural user-facing surface. (The SDK intentionally does not
+    // write to its own stderr anymore so attach-mode in-process
+    // plugins can't corrupt an interactive terminal; see
+    // `native_exports::take_last_command_error`.)
+    if execution.status != 0
+        && let Some(error) = execution.outcome.error_message.as_deref()
+    {
+        eprintln!("{error}");
+    }
+    Ok(execution.status.clamp(0, i32::from(u8::MAX)) as u8)
 }
 
 pub(super) fn run_plugin_keybinding_command(
@@ -1530,7 +1549,13 @@ pub(super) fn run_plugin_keybinding_command(
     args: &[String],
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<PluginCommandExecution> {
-    run_plugin_command_internal(plugin_id, command_name, args, kernel_client_factory)
+    run_plugin_command_internal(
+        plugin_id,
+        command_name,
+        args,
+        kernel_client_factory,
+        bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1589,6 +1614,7 @@ pub(super) fn run_plugin_command_internal(
     command_name: &str,
     args: &[String],
     kernel_client_factory: Option<&KernelClientFactory>,
+    invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
 ) -> Result<PluginCommandExecution> {
     let state = runtime_command_state()?;
     let config = &state.config;
@@ -1622,6 +1648,7 @@ pub(super) fn run_plugin_command_internal(
         enabled_plugins,
         plugin_search_roots,
         state.registered_plugin_infos.clone(),
+        invocation_source,
     );
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
     let _host_kernel_factory_guard =
@@ -2466,6 +2493,7 @@ mod tests {
             vec!["provider.plugin".to_string()],
             vec!["/plugins".to_string()],
             Vec::new(),
+            bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
         );
 
         assert_eq!(context.plugin_id, "provider.plugin");

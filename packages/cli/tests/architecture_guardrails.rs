@@ -1721,3 +1721,412 @@ fn pane_runtime_plugin_owns_orchestration() {
         );
     }
 }
+
+// ── Capability-declaration guardrail ─────────────────────────────────────────
+//
+// Typed `call_service` / `call_service_raw` invocations are gated on
+// the caller plugin's `required_capabilities` (see
+// `packages/plugin/src/loader.rs::call_service_raw`). When a plugin
+// acquires a new cross-plugin call site without updating its
+// `plugin.toml`, the error materializes only at runtime as
+// `CapabilityAccessDenied`. Before this guardrail landed, that drift
+// shipped undetected (see plugin.toml fixes in this branch).
+//
+// The test walks every plugin's `src/**/*.rs`, extracts the first
+// argument of each `call_service` / `call_service_raw` call (both
+// string literals and `*_CAPABILITIES` const references), and
+// asserts every captured capability is either declared in that
+// plugin's `required_capabilities` or is self-provided through
+// `provided_capabilities`. A small map of capability const names →
+// literal capability strings is harvested from
+// `plugins/*-plugin-api/src/lib.rs::capabilities` modules so the
+// check doesn't drift when consts are renamed.
+
+fn repo_root() -> std::path::PathBuf {
+    // CARGO_MANIFEST_DIR = packages/cli, so walk two levels up.
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("repo root must exist two levels above packages/cli")
+        .to_path_buf()
+}
+
+fn iter_plugin_dirs() -> Vec<std::path::PathBuf> {
+    let plugins_dir = repo_root().join("plugins");
+    let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&plugins_dir)
+        .expect("plugins dir should be readable")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("plugin.toml").exists())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// All crates under `plugins/`, including `*-plugin-api` ones that
+/// don't carry a `plugin.toml`. Used for harvesting capability
+/// constants that both host plugins and peer plugins reference.
+fn iter_plugin_crate_dirs() -> Vec<std::path::PathBuf> {
+    let plugins_dir = repo_root().join("plugins");
+    let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&plugins_dir)
+        .expect("plugins dir should be readable")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("Cargo.toml").exists())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Walk `plugin_dir/src` recursively and return every `.rs` file.
+fn rust_source_files(plugin_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn visit(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(read) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let src = plugin_dir.join("src");
+    if src.exists() {
+        visit(&src, &mut out);
+    }
+    out
+}
+
+/// Build the map `plugin-api const name` → capability literal by
+/// parsing `capabilities` modules in every `*-plugin-api` crate. The
+/// regex pattern is:
+///
+/// `pub const NAME: CapabilityId = CapabilityId::from_static("bmux.X.Y");`
+fn build_capability_const_map() -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for plugin_dir in iter_plugin_crate_dirs() {
+        let lib_path = plugin_dir.join("src").join("lib.rs");
+        if !lib_path.exists() {
+            continue;
+        }
+        // Only `*-plugin-api` crates define capabilities; we scan all
+        // plugin dirs but the pattern only matches where relevant.
+        let Ok(source) = std::fs::read_to_string(&lib_path) else {
+            continue;
+        };
+        for line in source.lines() {
+            // Match either `pub const FOO: CapabilityId = CapabilityId::from_static("bmux.x.y");`
+            // or `pub const FOO: HostScope = HostScope::from_static("bmux.x.y");`
+            if let Some((const_name, literal)) = extract_capability_const(line) {
+                map.insert(const_name.to_string(), literal.to_string());
+            }
+        }
+    }
+    map
+}
+
+fn extract_capability_const(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("pub const ")?;
+    let (const_name, after_name) = rest.split_once(':')?;
+    let const_name = const_name.trim();
+    let literal_start = after_name.find("from_static(\"")?;
+    let literal_rest = &after_name[literal_start + "from_static(\"".len()..];
+    let literal_end = literal_rest.find('"')?;
+    let literal = &literal_rest[..literal_end];
+    if literal.starts_with("bmux.") {
+        Some((const_name, literal))
+    } else {
+        None
+    }
+}
+
+/// Scan `source` for capability arguments to `call_service` /
+/// `call_service_raw` and return the set of resolved capability
+/// strings. Supports both `"bmux.foo.bar"` string literals (via
+/// `.as_str()` or bare) and `some_api::capabilities::NAME.as_str()`
+/// const references (resolved through `const_map`).
+fn extract_used_capabilities(
+    source: &str,
+    const_map: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    // Process each occurrence of `call_service(` / `call_service_raw(`
+    // and grab the first argument token up to the first comma. This is
+    // line-oriented to tolerate multi-line calls.
+    let mut cursor = 0usize;
+    let needles = ["call_service_raw(", "call_service(", "call_service::<"];
+    while cursor < source.len() {
+        let Some((start_rel, needle)) = needles
+            .iter()
+            .filter_map(|n| source[cursor..].find(n).map(|i| (i, *n)))
+            .min_by_key(|(i, _)| *i)
+        else {
+            break;
+        };
+        let start = cursor + start_rel + needle.len();
+        // For `call_service::<...>(` we need to skip past the
+        // turbofish generic list to find the argument-list `(`. Match
+        // nested `<>` depth so `::<Foo<Bar>, Baz>(` is handled too.
+        let open_paren = if needle.ends_with('(') {
+            start
+        } else if needle.ends_with("::<") {
+            let bytes = source.as_bytes();
+            let mut depth = 1i32;
+            let mut idx = start;
+            let mut found = None;
+            while idx < bytes.len() {
+                match bytes[idx] {
+                    b'<' => depth += 1,
+                    b'>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            // Next non-whitespace char should be `(`.
+                            let mut j = idx + 1;
+                            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                                j += 1;
+                            }
+                            if j < bytes.len() && bytes[j] == b'(' {
+                                found = Some(j + 1);
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+            let Some(pos) = found else {
+                cursor = start;
+                continue;
+            };
+            pos
+        } else if let Some(offset) = source[start..].find('(') {
+            start + offset + 1
+        } else {
+            cursor = start;
+            continue;
+        };
+        // Find the first argument token. We want the capability
+        // expression which ends at the first top-level comma.
+        let Some(first_arg) = first_top_level_arg(&source[open_paren..]) else {
+            cursor = open_paren;
+            continue;
+        };
+        let arg = first_arg.trim().trim_start_matches('&');
+
+        if let Some(literal) = extract_string_literal(arg) {
+            if literal.starts_with("bmux.") {
+                out.insert(literal.to_string());
+            }
+        } else if let Some(cap) = resolve_const_reference(arg, const_map) {
+            out.insert(cap);
+        }
+
+        cursor = open_paren + first_arg.len();
+    }
+    out
+}
+
+fn first_top_level_arg(body: &str) -> Option<&str> {
+    let bytes = body.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b')' | b']' | b'}' | b'>' => depth -= 1,
+            b',' if depth == 0 => return Some(&body[..i]),
+            _ => {}
+        }
+        if depth < 0 {
+            return Some(&body[..i]);
+        }
+    }
+    None
+}
+
+fn extract_string_literal(expr: &str) -> Option<&str> {
+    let trimmed = expr.trim();
+    let stripped = trimmed.strip_prefix('"')?;
+    let end = stripped.find('"')?;
+    Some(&stripped[..end])
+}
+
+fn resolve_const_reference(
+    expr: &str,
+    const_map: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    // Strip common adornments: `.as_str()`, trailing whitespace.
+    let mut core = expr.trim();
+    for suffix in [".as_str()", ".into()", ".to_string()"] {
+        if let Some(stripped) = core.strip_suffix(suffix) {
+            core = stripped;
+        }
+    }
+    core = core.trim();
+    // Match trailing path segment against the const map.
+    let last_segment = core.rsplit("::").next()?;
+    // Defensive: avoid matching arbitrary identifiers that happen to
+    // collide with a capability const name — require a `::capabilities::`
+    // segment somewhere in the path.
+    if !core.contains("::capabilities::") {
+        return None;
+    }
+    const_map.get(last_segment).cloned()
+}
+
+/// Parse `required_capabilities` + `provided_capabilities` from a
+/// plugin.toml. Returns a set of capability strings declared in the
+/// manifest.
+fn declared_capabilities(plugin_toml_path: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let source = std::fs::read_to_string(plugin_toml_path)
+        .unwrap_or_else(|err| panic!("failed reading {}: {err}", plugin_toml_path.display()));
+    let parsed: toml::Value = toml::from_str(&source).unwrap_or_else(|err| {
+        panic!("failed parsing {}: {err}", plugin_toml_path.display());
+    });
+    let mut out = std::collections::BTreeSet::new();
+    for key in ["required_capabilities", "provided_capabilities"] {
+        if let Some(array) = parsed.get(key).and_then(|v| v.as_array()) {
+            for item in array {
+                if let Some(s) = item.as_str() {
+                    out.insert(s.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn every_plugin_declares_capabilities_it_calls() {
+    let const_map = build_capability_const_map();
+    let mut failures: Vec<String> = Vec::new();
+
+    for plugin_dir in iter_plugin_dirs() {
+        let plugin_toml = plugin_dir.join("plugin.toml");
+        let declared = declared_capabilities(&plugin_toml);
+
+        let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for src in rust_source_files(&plugin_dir) {
+            let Ok(source) = std::fs::read_to_string(&src) else {
+                continue;
+            };
+            // Skip test-only modules so test scaffolding doesn't
+            // influence capability requirements.
+            let prod = production_section(&source);
+            for cap in extract_used_capabilities(prod, &const_map) {
+                used.insert(cap);
+            }
+        }
+
+        let missing: Vec<String> = used
+            .iter()
+            .filter(|cap| !declared.contains(*cap))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            failures.push(format!(
+                "plugin '{}' calls capabilities {missing:?} but declares only {declared:?} in plugin.toml",
+                plugin_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?"),
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "capability-declaration drift detected:\n  - {}\n\n\
+         Fix: for each plugin listed above, add the missing capability literals to \
+         `required_capabilities` in that plugin's plugin.toml.",
+        failures.join("\n  - ")
+    );
+}
+
+#[cfg(test)]
+mod capability_guardrail_helpers {
+    use super::{
+        extract_capability_const, extract_string_literal, extract_used_capabilities,
+        first_top_level_arg, resolve_const_reference,
+    };
+
+    #[test]
+    fn extract_capability_const_parses_from_static_line() {
+        let line = "    pub const SESSIONS_WRITE: CapabilityId = CapabilityId::from_static(\"bmux.sessions.write\");";
+        let (name, literal) = extract_capability_const(line).expect("should parse");
+        assert_eq!(name, "SESSIONS_WRITE");
+        assert_eq!(literal, "bmux.sessions.write");
+    }
+
+    #[test]
+    fn extract_capability_const_ignores_unrelated_const() {
+        let line = "pub const EXIT_OK: i32 = 0;";
+        assert!(extract_capability_const(line).is_none());
+    }
+
+    #[test]
+    fn extract_string_literal_returns_inner() {
+        assert_eq!(
+            extract_string_literal("\"bmux.sessions.write\""),
+            Some("bmux.sessions.write")
+        );
+        assert_eq!(extract_string_literal("foo"), None);
+    }
+
+    #[test]
+    fn first_top_level_arg_splits_on_top_comma_only() {
+        let body = "\"a\", b::c(x, y), 3)";
+        assert_eq!(first_top_level_arg(body), Some("\"a\""));
+    }
+
+    #[test]
+    fn resolve_const_reference_requires_capabilities_segment() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "SESSIONS_WRITE".to_string(),
+            "bmux.sessions.write".to_string(),
+        );
+        assert_eq!(
+            resolve_const_reference(
+                "bmux_sessions_plugin_api::capabilities::SESSIONS_WRITE.as_str()",
+                &map,
+            )
+            .as_deref(),
+            Some("bmux.sessions.write"),
+        );
+        assert!(resolve_const_reference("other::mod::SESSIONS_WRITE", &map).is_none());
+    }
+
+    #[test]
+    fn extract_used_capabilities_picks_up_literal_and_const_forms() {
+        let source = r#"
+            caller.call_service_raw("bmux.sessions.write", kind, iface, op, payload);
+            caller.call_service(bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(), k, i, o, p);
+            let _ = call_service::<(), ()>("bmux.contexts.read", k, i, o, p);
+        "#;
+        let mut const_map = std::collections::BTreeMap::new();
+        const_map.insert("CLIENTS_READ".to_string(), "bmux.clients.read".to_string());
+        let out = extract_used_capabilities(source, &const_map);
+        assert!(out.contains("bmux.sessions.write"), "got {out:?}");
+        assert!(out.contains("bmux.clients.read"), "got {out:?}");
+        assert!(out.contains("bmux.contexts.read"), "got {out:?}");
+    }
+}

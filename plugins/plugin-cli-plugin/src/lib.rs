@@ -301,6 +301,7 @@ mod tests {
             settings: None,
             plugin_settings_map: BTreeMap::new(),
             caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
         }
     }

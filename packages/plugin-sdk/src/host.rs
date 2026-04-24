@@ -166,6 +166,11 @@ pub trait PluginHost: Send + Sync {
                 plugin_id: self.plugin_id().to_string(),
                 capability: capability.as_str().to_string(),
                 operation: "resolve_service",
+                hint: Some(
+                    crate::CapabilityAccessDeniedHint::declare_required_capability(
+                        capability.as_str(),
+                    ),
+                ),
             });
         }
 

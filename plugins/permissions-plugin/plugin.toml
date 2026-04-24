@@ -19,9 +19,10 @@ provided_capabilities = [
 ]
 provided_features = ["bmux.permissions"]
 required_capabilities = [
-    "bmux.commands",
-    "bmux.sessions.read",
     "bmux.clients.read",
+    "bmux.commands",
+    "bmux.contexts.read",
+    "bmux.sessions.read",
     "bmux.storage",
 ]
 version = "0.0.1-alpha.0"
