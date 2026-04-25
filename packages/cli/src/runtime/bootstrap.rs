@@ -2,16 +2,19 @@ use anyhow::{Context, Result};
 use bmux_cli_schema::{LogLevel, RecordingEventKindArg, RecordingProfileArg};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_contexts_plugin_api::contexts_commands::{
+    ContextAck as ContextAckRecord, CreateContextError,
+};
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
 use bmux_server::BmuxServer;
-use bmux_sessions_plugin_api::sessions_commands::{NewSessionError, SessionAck};
 use bmux_sessions_plugin_api::sessions_state::SessionSummary;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use tracing::{Level, warn};
 use uuid::Uuid;
 
-use super::typed_sessions;
+use super::{typed_contexts, typed_sessions};
 
 use super::{
     ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_WRITER_GUARD,
@@ -173,10 +176,26 @@ pub(super) async fn ensure_server_running_for_default_attach(
 pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Result<Uuid> {
     let sessions = typed_list_sessions_for_bootstrap(client).await?;
 
+    // Fresh-server path: no sessions means no contexts either. Create
+    // a context via contexts-plugin; it allocates a session atomically
+    // (contexts own session lifecycle). The returned ack carries the
+    // new session id, which is what the attach runtime needs.
+    //
+    // Going through `create-context` (rather than `new-session` +
+    // press-`c`-later) gives the user a ready-to-use tab on first
+    // attach with zero UX steps. The alternative — a bare session with
+    // no context — landed the user in an empty view and required them
+    // to manually create a tab before anything was interactive.
     if sessions.is_empty() {
         let name = next_default_tab_name(&sessions);
-        let ack = typed_new_session_for_bootstrap(client, Some(name)).await?;
-        return Ok(ack.id);
+        let ack = typed_create_context_for_bootstrap(client, Some(name)).await?;
+        let session_id = ack.session_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "contexts-plugin create-context returned no session_id; contexts-plugin \
+                 is required to allocate a session atomically"
+            )
+        })?;
+        return Ok(session_id);
     }
 
     let _client_id = bmux_clients_plugin_api::typed_client::whoami(client).await?;
@@ -184,8 +203,14 @@ pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Re
 
     if writable_sessions.is_empty() {
         let name = next_default_tab_name(&sessions);
-        let ack = typed_new_session_for_bootstrap(client, Some(name)).await?;
-        return Ok(ack.id);
+        let ack = typed_create_context_for_bootstrap(client, Some(name)).await?;
+        let session_id = ack.session_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "contexts-plugin create-context returned no session_id; contexts-plugin \
+                 is required to allocate a session atomically"
+            )
+        })?;
+        return Ok(session_id);
     }
 
     let mut sorted = writable_sessions;
@@ -221,29 +246,35 @@ async fn typed_list_sessions_for_bootstrap(client: &mut BmuxClient) -> Result<Ve
     bmux_codec::from_bytes::<Vec<SessionSummary>>(&bytes).context("decoding list-sessions response")
 }
 
-/// Typed dispatch wrapper for `sessions-commands:new-session`.
-async fn typed_new_session_for_bootstrap(
+/// Typed dispatch wrapper for `contexts-commands:create-context`.
+///
+/// Used by the default-attach bootstrap to atomically create a
+/// context-and-session pair on a fresh server. Going through
+/// contexts-plugin (which owns context lifecycle) instead of calling
+/// sessions-plugin directly ensures the user lands in a usable tab
+/// without having to press `c` manually.
+async fn typed_create_context_for_bootstrap(
     client: &mut BmuxClient,
     name: Option<String>,
-) -> Result<SessionAck> {
-    #[derive(serde::Serialize)]
-    struct Args {
-        name: Option<String>,
-    }
-    let payload = bmux_codec::to_vec(&Args { name }).context("encoding new-session args")?;
+) -> Result<ContextAckRecord> {
+    let payload = bmux_codec::to_vec(&typed_contexts::CreateContextArgs {
+        name,
+        attributes: BTreeMap::new(),
+    })
+    .context("encoding create-context args")?;
     let bytes = client
         .invoke_service_raw(
-            typed_sessions::SESSIONS_WRITE_CAPABILITY.as_str(),
-            typed_sessions::COMMAND_KIND,
-            typed_sessions::SESSIONS_COMMANDS_INTERFACE.as_str(),
-            typed_sessions::OP_NEW_SESSION,
+            typed_contexts::CONTEXTS_WRITE_CAPABILITY.as_str(),
+            typed_contexts::COMMAND_KIND,
+            typed_contexts::CONTEXTS_COMMANDS_INTERFACE.as_str(),
+            typed_contexts::OP_CREATE_CONTEXT,
             payload,
         )
         .await
         .map_err(map_cli_client_error)?;
-    let outcome = bmux_codec::from_bytes::<Result<SessionAck, NewSessionError>>(&bytes)
-        .context("decoding new-session response")?;
-    outcome.map_err(|err| anyhow::anyhow!("failed to create session: {err:?}"))
+    let outcome = bmux_codec::from_bytes::<Result<ContextAckRecord, CreateContextError>>(&bytes)
+        .context("decoding create-context response")?;
+    outcome.map_err(|err| anyhow::anyhow!("failed to create context: {err:?}"))
 }
 
 pub(super) fn next_default_tab_name(sessions: &[SessionSummary]) -> String {

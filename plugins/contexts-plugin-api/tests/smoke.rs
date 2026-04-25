@@ -42,6 +42,7 @@ fn context_selector_allows_id_or_name() {
 fn context_ack_and_error_variants_serialize() {
     let ack = ContextAck {
         id: uuid::Uuid::nil(),
+        session_id: None,
     };
     assert!(serde_json::to_string(&ack).expect("ack").contains("id"));
 

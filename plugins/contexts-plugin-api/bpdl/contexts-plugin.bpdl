@@ -77,8 +77,16 @@ interface contexts-commands {
     // carries the target context id after the operation (the newly
     // created one for `create-context`, or the resolved selector for
     // `select-context` / `close-context`).
+    //
+    // `session-id` carries the session bound to the context after
+    // the operation, when knowable. `create-context` always sets it
+    // (context creation allocates a session atomically).
+    // `select-context` / `close-context` may set it when the
+    // selector resolves to a session-bound context; otherwise
+    // `None`.
     record context-ack {
         id: uuid,
+        session-id: uuid?,
     }
 
     command create-context(name: string?, attributes: map<string, string>)

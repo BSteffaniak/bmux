@@ -1762,6 +1762,7 @@ mod tests {
                             bmux_contexts_plugin_api::contexts_commands::CreateContextError,
                         > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
                             id: Uuid::new_v4(),
+                            session_id: None,
                         });
                         encode_service_message(&ok)
                     }
@@ -1782,6 +1783,7 @@ mod tests {
                             bmux_contexts_plugin_api::contexts_commands::CloseContextError,
                         > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
                             id: Uuid::new_v4(),
+                            session_id: None,
                         });
                         encode_service_message(&ok)
                     }
@@ -1791,6 +1793,7 @@ mod tests {
                             bmux_contexts_plugin_api::contexts_commands::SelectContextError,
                         > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
                             id: Uuid::new_v4(),
+                            session_id: None,
                         });
                         encode_service_message(&ok)
                     }
@@ -2065,6 +2068,7 @@ mod tests {
                         bmux_contexts_plugin_api::contexts_commands::CreateContextError,
                     > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
                         id: Uuid::new_v4(),
+                        session_id: None,
                     });
                     encode_service_message(&ok)
                 }
@@ -2123,6 +2127,7 @@ mod tests {
                         bmux_contexts_plugin_api::contexts_commands::CloseContextError,
                     > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
                         id: resolved_id,
+                        session_id: None,
                     });
                     encode_service_message(&ok)
                 }
@@ -2185,6 +2190,7 @@ mod tests {
                         bmux_contexts_plugin_api::contexts_commands::SelectContextError,
                     > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
                         id: selected,
+                        session_id: None,
                     });
                     encode_service_message(&ok)
                 }

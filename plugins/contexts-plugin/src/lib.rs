@@ -636,6 +636,7 @@ fn create_context_local(
     );
     Ok(ContextAck {
         id: context_summary.id,
+        session_id: Some(session_id.0),
     })
 }
 
@@ -717,7 +718,10 @@ fn select_context_local(
             },
         );
     }
-    Ok(ContextAck { id: context.id })
+    Ok(ContextAck {
+        id: context.id,
+        session_id: session_after_select.map(|s| s.0),
+    })
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -833,7 +837,10 @@ fn close_context_local(
         }
     }
 
-    Ok(ContextAck { id: removed_id })
+    Ok(ContextAck {
+        id: removed_id,
+        session_id: bound_session_id.map(|s| s.0),
+    })
 }
 
 /// Result of `mutate_state_close`, extending `ContextState::close` with

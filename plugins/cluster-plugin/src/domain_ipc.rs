@@ -487,6 +487,8 @@ pub trait KernelOps: ServiceCaller {
         #[derive(serde::Deserialize)]
         struct Ack {
             id: ::uuid::Uuid,
+            #[allow(dead_code)]
+            session_id: Option<::uuid::Uuid>,
         }
         #[derive(serde::Deserialize, Debug)]
         #[serde(rename_all = "snake_case")]
@@ -544,6 +546,8 @@ pub trait KernelOps: ServiceCaller {
         #[derive(serde::Deserialize)]
         struct Ack {
             id: ::uuid::Uuid,
+            #[allow(dead_code)]
+            session_id: Option<::uuid::Uuid>,
         }
         // Mirror of the BPDL-generated `SelectContextError` shape so
         // we can decode without pulling in the contexts-plugin-api
@@ -606,6 +610,8 @@ pub trait KernelOps: ServiceCaller {
         #[derive(serde::Deserialize)]
         struct Ack {
             id: ::uuid::Uuid,
+            #[allow(dead_code)]
+            session_id: Option<::uuid::Uuid>,
         }
         #[derive(serde::Deserialize, Debug)]
         #[serde(rename_all = "snake_case")]
