@@ -381,6 +381,10 @@ const fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
             "pulse-demo",
             include_str!("../assets/themes/pulse-demo.toml"),
         ),
+        (
+            "rainbow-snake",
+            include_str!("../assets/themes/rainbow-snake.toml"),
+        ),
     ]
 }
 

@@ -1,0 +1,52 @@
+# Rainbow-snake theme - focused pane border gets a chasing rainbow block trail.
+
+background           = "#050510"
+cursor               = "#ffffff"
+foreground           = "#d8e8ff"
+name                 = "rainbow-snake"
+selection_background = "#26324a"
+
+[border]
+active   = "#ffffff"
+inactive = "#384052"
+
+[status]
+active_window  = "#ff5fd7"
+background     = "#090a14"
+foreground     = "#d8e8ff"
+mode_indicator = "#5fffff"
+
+[plugins."bmux.decoration"]
+script = "rainbow_snake"
+
+[plugins."bmux.decoration".unfocused]
+bg            = ""
+fg            = "#384052"
+glyphs_custom = []
+gradient_from = ""
+gradient_to   = ""
+style         = "rounded"
+
+[plugins."bmux.decoration".focused]
+bg            = ""
+fg            = "#ffffff"
+glyphs_custom = []
+gradient_from = "#ff5fd7"
+gradient_to   = "#5fffff"
+style         = "thick"
+
+[plugins."bmux.decoration".zoomed]
+bg            = ""
+fg            = "#ffd75f"
+glyphs_custom = []
+gradient_from = "#ffd75f"
+gradient_to   = "#ff5f5f"
+style         = "double"
+
+[plugins."bmux.decoration".badges]
+exited  = "◇"
+running = "◆"
+
+[plugins."bmux.decoration".animation]
+hz   = 30
+kind = "rainbow_snake"
