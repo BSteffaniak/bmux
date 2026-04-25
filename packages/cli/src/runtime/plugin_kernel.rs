@@ -761,6 +761,16 @@ pub(super) fn service_descriptors_from_declarations<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{MutexGuard, OnceLock};
+
+    static HOST_KERNEL_FALLBACK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn host_kernel_fallback_test_guard() -> MutexGuard<'static, ()> {
+        HOST_KERNEL_FALLBACK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("host kernel fallback test lock poisoned")
+    }
 
     fn connection(label: &str) -> HostConnectionInfo {
         HostConnectionInfo {
@@ -774,6 +784,7 @@ mod tests {
 
     #[test]
     fn host_kernel_connection_fallback_outlives_thread_local_guard() {
+        let _lock = host_kernel_fallback_test_guard();
         clear_host_kernel_fallbacks_for_test();
         {
             let _guard = enter_host_kernel_connection(connection("async-plugin"));
@@ -792,6 +803,7 @@ mod tests {
 
     #[test]
     fn host_kernel_client_factory_fallback_outlives_thread_local_guard() {
+        let _lock = host_kernel_fallback_test_guard();
         clear_host_kernel_fallbacks_for_test();
         let factory: KernelClientFactory = Arc::new(|| Box::pin(async { unreachable!() }));
         let expected = Arc::as_ptr(&factory);

@@ -174,7 +174,7 @@ fn queue_gradient_run<W: io::Write>(
     col: u16,
     row: u16,
     text: &str,
-    _axis: GradientAxis,
+    axis: GradientAxis,
     from_style: &Style,
     to_style: &Style,
 ) -> Result<()> {
@@ -194,8 +194,27 @@ fn queue_gradient_run<W: io::Write>(
         #[allow(clippy::cast_precision_loss)]
         let t = i as f32 / denom;
         let style = interpolate_style(from_style, to_style, t);
-        queue_styled_text(stdout, col.saturating_add(offset), row, grapheme, &style)?;
-        offset = offset.saturating_add(u16::try_from(grapheme_width(grapheme)).unwrap_or(1));
+        match axis {
+            GradientAxis::Horizontal => {
+                queue_styled_text(stdout, col.saturating_add(offset), row, grapheme, &style)?;
+                offset =
+                    offset.saturating_add(u16::try_from(grapheme_width(grapheme)).unwrap_or(1));
+            }
+            GradientAxis::Vertical => {
+                queue_styled_text(stdout, col, row.saturating_add(offset), grapheme, &style)?;
+                offset = offset.saturating_add(1);
+            }
+            GradientAxis::Diagonal => {
+                queue_styled_text(
+                    stdout,
+                    col.saturating_add(offset),
+                    row.saturating_add(offset),
+                    grapheme,
+                    &style,
+                )?;
+                offset = offset.saturating_add(1);
+            }
+        }
     }
     Ok(())
 }
@@ -500,6 +519,27 @@ mod tests {
         assert!(
             rendered.contains('\u{256d}'),
             "top-left rounded glyph missing: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn apply_paint_command_vertical_gradient_advances_rows() {
+        let mut out = Vec::new();
+        let cmd = PaintCommand::GradientRun {
+            col: 2,
+            row: 3,
+            z: 0,
+            text: "abc".to_string(),
+            axis: GradientAxis::Vertical,
+            from_style: default_style(),
+            to_style: default_style(),
+        };
+
+        assert!(apply_paint_command(&mut out, &cmd).expect("paints"));
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("\x1b[4;3Ha\x1b[5;3Hb\x1b[6;3Hc"),
+            "vertical gradient should keep the column and advance rows: {rendered:?}"
         );
     }
 }
