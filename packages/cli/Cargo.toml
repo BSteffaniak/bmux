@@ -61,6 +61,8 @@ bmux_control_catalog_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
 bmux_decoration_plugin = { workspace = true, optional = true, features = [
+    "bundled-decoration-scripts",
+    "scripting-luau",
     "static-bundled",
 ] }
 bmux_decoration_plugin_renderer = { workspace = true, optional = true }

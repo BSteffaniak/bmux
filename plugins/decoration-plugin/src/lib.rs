@@ -1658,6 +1658,12 @@ struct NotifyPaneEventArgs {
 /// keeps working.
 fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
     let Some(script) = script else {
+        state.script_backend = None;
+        state.script_path = None;
+        state.script_started_at = None;
+        state.script_frame = 0;
+        state.script_perf = None;
+        state.script_first_invoke_logged = false;
         return;
     };
     let backend = crate::scripting::make_backend();
@@ -2216,6 +2222,31 @@ mod tests {
         if let Ok(mut state) = plugin.state.inner.lock() {
             state.current_theme = Some(theme);
         }
+    }
+
+    fn decoration_extension_from_theme(theme: &str) -> DecorationThemeExtension {
+        let parsed = toml::from_str::<toml::Value>(theme).expect("theme TOML parses");
+        parsed
+            .get("plugins")
+            .and_then(|plugins| plugins.get("bmux.decoration"))
+            .expect("theme contains bmux.decoration plugin slice")
+            .clone()
+            .try_into()
+            .expect("bmux.decoration plugin slice matches schema")
+    }
+
+    fn install_extension_with_script(
+        plugin: &DecorationPlugin,
+        extension: DecorationThemeExtension,
+    ) {
+        let script = extension
+            .script
+            .as_deref()
+            .and_then(|spec| resolve_decoration_script(&[], spec));
+        let mut state = plugin.state.inner.lock().expect("lock");
+        state.animation_hz = extension.animation.as_ref().map(|animation| animation.hz);
+        state.current_theme = Some(extension);
+        install_script_backend(&mut state, script);
     }
 
     fn box_border_of(scene: &DecorationScene, pane: &Uuid) -> PaintCommand {
@@ -3020,6 +3051,63 @@ exited = ""
     }
 
     #[test]
+    fn pulse_demo_theme_slice_installs_and_runs_bundled_script() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xf001);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, true, false);
+
+        let theme = include_str!("../../theme-plugin/assets/themes/pulse-demo.toml");
+        let extension = decoration_extension_from_theme(theme);
+        install_extension_with_script(&plugin, extension);
+
+        {
+            let state = plugin.state.inner.lock().expect("lock");
+            assert!(state.script_backend.is_some(), "script backend installed");
+            assert_eq!(
+                state.script_path.as_deref(),
+                Some(Path::new("bundled:pulse"))
+            );
+        }
+
+        let scene = plugin.build_scene();
+        let surface = scene.surfaces.get(&pane).expect("surface emitted");
+        let has_script_border = surface.paint_commands.iter().any(|cmd| {
+            matches!(cmd, PaintCommand::BoxBorder { z: 10, glyphs, .. } if *glyphs == BorderGlyphs::Thick)
+        });
+        assert!(has_script_border, "pulse script border command emitted");
+    }
+
+    #[test]
+    fn rainbow_snake_theme_slice_installs_and_runs_bundled_script() {
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(0xf002);
+        seed_geometry(&plugin, pane, 20, 5);
+        set_activity(&plugin, pane, true, false);
+
+        let theme = include_str!("../../theme-plugin/assets/themes/rainbow-snake.toml");
+        let extension = decoration_extension_from_theme(theme);
+        install_extension_with_script(&plugin, extension);
+
+        {
+            let state = plugin.state.inner.lock().expect("lock");
+            assert!(state.script_backend.is_some(), "script backend installed");
+            assert_eq!(
+                state.script_path.as_deref(),
+                Some(Path::new("bundled:rainbow_snake")),
+            );
+        }
+
+        let scene = plugin.build_scene();
+        let surface = scene.surfaces.get(&pane).expect("surface emitted");
+        let has_snake_text = surface
+            .paint_commands
+            .iter()
+            .any(|cmd| matches!(cmd, PaintCommand::Text { z: 20, text, .. } if text == "█"));
+        assert!(has_snake_text, "rainbow snake text command emitted");
+    }
+
+    #[test]
     fn tick_thread_exits_cleanly_when_plugin_is_dropped() {
         let plugin = DecorationPlugin::new();
         let weak = Arc::downgrade(&plugin.state.inner);
@@ -3044,8 +3132,30 @@ exited = ""
         install_script_backend(&mut state, None);
         assert!(
             state.script_backend.is_none(),
-            "install_script_backend must be a no-op when script is None",
+            "install_script_backend must leave no backend when script is None",
         );
+    }
+
+    #[test]
+    fn install_script_backend_none_clears_existing_backend() {
+        let plugin = DecorationPlugin::new();
+        let mut state = plugin.state.inner.lock().expect("lock");
+        install_script_backend(
+            &mut state,
+            Some(ResolvedScript {
+                path: PathBuf::from("bundled:test"),
+                source: "function decorate(ctx) return {} end".into(),
+            }),
+        );
+        assert!(state.script_backend.is_some(), "backend installed first");
+
+        install_script_backend(&mut state, None);
+
+        assert!(state.script_backend.is_none(), "backend cleared");
+        assert!(state.script_path.is_none(), "script path cleared");
+        assert!(state.script_started_at.is_none(), "start instant cleared");
+        assert!(state.script_perf.is_none(), "perf tracker cleared");
+        assert_eq!(state.script_frame, 0, "frame reset");
     }
 
     #[test]

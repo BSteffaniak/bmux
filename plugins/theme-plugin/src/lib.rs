@@ -7,11 +7,12 @@ use bmux_appearance::{
     RUNTIME_APPEARANCE_STATE_KIND, RuntimeAppearance, RuntimeBorderAppearance,
     RuntimeStatusAppearance,
 };
+use bmux_ipc::{InvokeServiceKind, Request as IpcRequest, ResponsePayload};
 use bmux_plugin::prompt;
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    PromptEvent, PromptResponse, PromptValue, ServiceKind, StorageGetRequest, StorageSetRequest,
+    PromptEvent, PromptResponse, PromptValue, StorageGetRequest, StorageSetRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -464,15 +465,38 @@ fn apply_theme_extensions(
             continue;
         };
         let capability = format!("{plugin_id}.write");
-        if let Err(error) = context.call_service_raw(
-            &capability,
-            ServiceKind::Command,
-            "theme-extension",
-            "apply",
-            payload,
-        ) {
-            debug!(%error, plugin_id = %plugin_id, "theme extension apply skipped");
+        if let Err(error) = execute_theme_extension_apply(context, &capability, payload) {
+            warn!(
+                %error,
+                plugin_id = %plugin_id,
+                capability = %capability,
+                interface = "theme-extension",
+                operation = "apply",
+                "theme extension apply failed",
+            );
         }
+    }
+}
+
+fn execute_theme_extension_apply(
+    context: &impl ServiceCaller,
+    capability: &str,
+    payload: Vec<u8>,
+) -> std::result::Result<(), String> {
+    let response = context
+        .execute_kernel_request(IpcRequest::InvokeService {
+            capability: capability.to_string(),
+            kind: InvokeServiceKind::Command,
+            interface_id: "theme-extension".to_string(),
+            operation: "apply".to_string(),
+            payload,
+        })
+        .map_err(|error| error.to_string())?;
+    match response {
+        ResponsePayload::ServiceInvoked { .. } => Ok(()),
+        other => Err(format!(
+            "unexpected response applying theme extension: {other:?}"
+        )),
     }
 }
 

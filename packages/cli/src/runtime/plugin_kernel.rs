@@ -14,7 +14,7 @@ use clap::Parser;
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::Level;
 
 /// A factory that produces a connected [`BmuxClient`] on demand.
@@ -38,6 +38,11 @@ thread_local! {
     static HOST_KERNEL_CONNECTION: RefCell<Option<HostConnectionInfo>> = const { RefCell::new(None) };
     static HOST_KERNEL_CLIENT_FACTORY: RefCell<Option<KernelClientFactory>> = const { RefCell::new(None) };
 }
+
+static HOST_KERNEL_CONNECTION_FALLBACK: OnceLock<Mutex<Option<HostConnectionInfo>>> =
+    OnceLock::new();
+static HOST_KERNEL_CLIENT_FACTORY_FALLBACK: OnceLock<Mutex<Option<KernelClientFactory>>> =
+    OnceLock::new();
 
 pub(super) struct ServiceKernelContextGuard;
 pub(super) struct HostKernelConnectionGuard;
@@ -84,6 +89,7 @@ pub(super) fn enter_service_kernel_context(
 pub(super) fn enter_host_kernel_connection(
     connection: HostConnectionInfo,
 ) -> HostKernelConnectionGuard {
+    set_host_kernel_connection_fallback(connection.clone());
     HOST_KERNEL_CONNECTION.with(|slot| {
         *slot.borrow_mut() = Some(connection);
     });
@@ -93,10 +99,61 @@ pub(super) fn enter_host_kernel_connection(
 pub(super) fn enter_host_kernel_client_factory(
     factory: KernelClientFactory,
 ) -> HostKernelClientFactoryGuard {
+    set_host_kernel_client_factory_fallback(Arc::clone(&factory));
     HOST_KERNEL_CLIENT_FACTORY.with(|slot| {
         *slot.borrow_mut() = Some(factory);
     });
     HostKernelClientFactoryGuard
+}
+
+fn set_host_kernel_connection_fallback(connection: HostConnectionInfo) {
+    if let Ok(mut slot) = HOST_KERNEL_CONNECTION_FALLBACK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *slot = Some(connection);
+    }
+}
+
+fn host_kernel_connection_fallback() -> Option<HostConnectionInfo> {
+    HOST_KERNEL_CONNECTION_FALLBACK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+fn set_host_kernel_client_factory_fallback(factory: KernelClientFactory) {
+    if let Ok(mut slot) = HOST_KERNEL_CLIENT_FACTORY_FALLBACK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *slot = Some(factory);
+    }
+}
+
+fn host_kernel_client_factory_fallback() -> Option<KernelClientFactory> {
+    HOST_KERNEL_CLIENT_FACTORY_FALLBACK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+#[cfg(test)]
+fn clear_host_kernel_fallbacks_for_test() {
+    if let Ok(mut slot) = HOST_KERNEL_CONNECTION_FALLBACK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *slot = None;
+    }
+    if let Ok(mut slot) = HOST_KERNEL_CLIENT_FACTORY_FALLBACK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *slot = None;
+    }
 }
 
 // Cross-domain mutations flow through typed plugin-to-plugin dispatch
@@ -171,6 +228,32 @@ fn call_host_kernel_via_factory(factory: &KernelClientFactory, payload: &[u8]) -
     bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
 }
 
+fn call_host_kernel_bridge_payload(payload: &[u8]) -> Result<Vec<u8>> {
+    if let Some(context) = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone()) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async { context.execute_raw(payload.to_vec()).await })
+            })
+        } else {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed creating kernel bridge runtime")?;
+            runtime.block_on(async { context.execute_raw(payload.to_vec()).await })
+        }
+    } else if let Some(factory) = HOST_KERNEL_CLIENT_FACTORY.with(|slot| slot.borrow().clone()) {
+        call_host_kernel_via_factory(&factory, payload)
+    } else if let Some(connection) = HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().clone()) {
+        call_host_kernel_via_client(&connection, payload)
+    } else if let Some(factory) = host_kernel_client_factory_fallback() {
+        call_host_kernel_via_factory(&factory, payload)
+    } else if let Some(connection) = host_kernel_connection_fallback() {
+        call_host_kernel_via_client(&connection, payload)
+    } else {
+        anyhow::bail!("no host kernel route is available")
+    }
+}
+
 pub(super) unsafe extern "C" fn host_kernel_bridge(
     input_ptr: *const u8,
     input_len: usize,
@@ -243,29 +326,7 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
         return 0;
     }
 
-    let payload = if let Some(context) = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone()) {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async { context.execute_raw(request.payload).await })
-            })
-        } else {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return 5;
-            };
-            runtime.block_on(async { context.execute_raw(request.payload).await })
-        }
-    } else if let Some(factory) = HOST_KERNEL_CLIENT_FACTORY.with(|slot| slot.borrow().clone()) {
-        call_host_kernel_via_factory(&factory, &request.payload)
-    } else if let Some(connection) = HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().clone()) {
-        call_host_kernel_via_client(&connection, &request.payload)
-    } else {
-        return 5;
-    };
-
-    let response = match payload {
+    let response = match call_host_kernel_bridge_payload(&request.payload) {
         Ok(payload) => bmux_plugin_sdk::HostKernelBridgeResponse { payload },
         Err(_) => return 5,
     };
@@ -695,4 +756,54 @@ pub(super) fn service_descriptors_from_declarations<'a>(
             })
     }));
     services
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connection(label: &str) -> HostConnectionInfo {
+        HostConnectionInfo {
+            config_dir: format!("/{label}/config"),
+            config_dir_candidates: vec![format!("/{label}/config")],
+            runtime_dir: format!("/{label}/runtime"),
+            data_dir: format!("/{label}/data"),
+            state_dir: format!("/{label}/state"),
+        }
+    }
+
+    #[test]
+    fn host_kernel_connection_fallback_outlives_thread_local_guard() {
+        clear_host_kernel_fallbacks_for_test();
+        {
+            let _guard = enter_host_kernel_connection(connection("async-plugin"));
+            assert_eq!(
+                HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().clone()),
+                Some(connection("async-plugin")),
+            );
+        }
+
+        assert!(HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().is_none()));
+        assert_eq!(
+            host_kernel_connection_fallback(),
+            Some(connection("async-plugin")),
+        );
+    }
+
+    #[test]
+    fn host_kernel_client_factory_fallback_outlives_thread_local_guard() {
+        clear_host_kernel_fallbacks_for_test();
+        let factory: KernelClientFactory = Arc::new(|| Box::pin(async { unreachable!() }));
+        let expected = Arc::as_ptr(&factory);
+
+        {
+            let _guard = enter_host_kernel_client_factory(Arc::clone(&factory));
+            let current = HOST_KERNEL_CLIENT_FACTORY.with(|slot| slot.borrow().clone());
+            assert!(current.is_some());
+        }
+
+        assert!(HOST_KERNEL_CLIENT_FACTORY.with(|slot| slot.borrow().is_none()));
+        let fallback = host_kernel_client_factory_fallback().expect("fallback factory is retained");
+        assert!(std::ptr::addr_eq(Arc::as_ptr(&fallback), expected));
+    }
 }

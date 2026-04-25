@@ -6,6 +6,10 @@ provided_features     = ["bmux.theme"]
 required_capabilities = ["bmux.storage", "bmux.decoration.write"]
 version               = "0.0.1-alpha.0"
 
+[[dependencies]]
+plugin_id   = "bmux.decoration"
+version_req = ">=0.0.1-alpha.0"
+
 [[commands]]
 accepts_repeat = false
 expose_in_cli  = false
