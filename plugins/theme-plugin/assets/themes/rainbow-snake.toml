@@ -48,5 +48,5 @@ exited  = "◇"
 running = "◆"
 
 [plugins."bmux.decoration".animation]
-hz   = 30
+hz   = 12
 kind = "rainbow_snake"

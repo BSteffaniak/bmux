@@ -3103,7 +3103,7 @@ exited = ""
         let has_snake_text = surface
             .paint_commands
             .iter()
-            .any(|cmd| matches!(cmd, PaintCommand::Text { z: 20, text, .. } if text == "█"));
+            .any(|cmd| matches!(cmd, PaintCommand::Text { z: 20, text, .. } if text == "◆"));
         assert!(has_snake_text, "rainbow snake text command emitted");
     }
 
