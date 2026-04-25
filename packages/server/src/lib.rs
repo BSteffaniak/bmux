@@ -5596,6 +5596,26 @@ async fn handle_request(
             };
             let _span_guard = span.enter();
             let started_at = std::time::Instant::now();
+            // Explicit observable entry log for Command-kind typed
+            // dispatches only. Query kind fires too frequently
+            // (catalog polls, current-context reads) to log per-call
+            // at `info`; they still participate in the surrounding
+            // `trace_span!` for context when someone enables trace.
+            //
+            // Counting `invoke command` lines per keystroke answers
+            // "did a single user action fan out into the expected
+            // number of mutating calls?" without dragging in the
+            // query noise.
+            if matches!(kind, bmux_ipc::InvokeServiceKind::Command) {
+                tracing::info!(
+                    target: "bmux_server::invoke_service",
+                    capability = %capability,
+                    interface = %interface_id,
+                    operation = %operation,
+                    client_id = ?client_id,
+                    "invoke command",
+                );
+            }
             // Typed service calls don't acquire the global operation
             // lock here: many handlers re-enter `handle_request`
             // through `execute_kernel_request`, which takes the lock
@@ -5656,8 +5676,28 @@ async fn handle_request(
                 })
             };
             #[allow(clippy::cast_possible_truncation)]
-            {
-                span.record("elapsed_ms", started_at.elapsed().as_millis() as u64);
+            let elapsed_ms = started_at.elapsed().as_millis() as u64;
+            span.record("elapsed_ms", elapsed_ms);
+            // Companion completion log for Command-kind dispatches so
+            // pair-up analysis ("which invoke begin matches which
+            // outcome?") is direct without needing span-close events
+            // from the fmt layer.
+            if matches!(kind, bmux_ipc::InvokeServiceKind::Command) {
+                let outcome_str = match &response {
+                    Response::Ok(_) => "ok",
+                    Response::Err(err) if err.code == ErrorCode::NotFound => "err:not_found",
+                    Response::Err(_) => "err:internal",
+                };
+                tracing::info!(
+                    target: "bmux_server::invoke_service",
+                    capability = %capability,
+                    interface = %interface_id,
+                    operation = %operation,
+                    client_id = ?client_id,
+                    elapsed_ms,
+                    outcome = outcome_str,
+                    "invoke command complete",
+                );
             }
             response
         }

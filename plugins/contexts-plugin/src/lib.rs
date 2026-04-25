@@ -551,6 +551,18 @@ fn create_context_local(
 ) -> Result<ContextAck, CreateContextError> {
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| CreateContextError::Failed { reason })?;
+    // Pair this entry log with the `ContextState::create` debug log
+    // emitted from the state layer. The entry log proves a plugin
+    // command actually reached `create_context_local`; the state log
+    // proves a context mutation actually happened. Their 1:1
+    // relationship should hold; if not, the divergence points at the
+    // bug.
+    tracing::debug!(
+        target: "bmux_contexts_plugin::lifecycle",
+        client_id = %client_id.0,
+        name = %name.as_deref().unwrap_or("<unnamed>"),
+        "create_context_local begin",
+    );
 
     // Cross-plugin orchestration: ask the sessions plugin to allocate
     // a session runtime for this context. We go via typed dispatch so

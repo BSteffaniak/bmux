@@ -18,6 +18,7 @@ use bmux_context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, RuntimeContext};
 use bmux_ipc::{ContextSelector, ContextSummary};
 use bmux_session_models::{ClientId, SessionId};
 use std::collections::{BTreeMap, VecDeque};
+use tracing::debug;
 use uuid::Uuid;
 
 /// Authoritative tracking of runtime contexts, their session bindings,
@@ -65,6 +66,18 @@ impl ContextState {
         self.contexts.insert(id, context.clone());
         self.selected_by_client.insert(client_id, id);
         self.touch_mru(id);
+        // Authoritative diagnostic signal: exactly one emission per
+        // real context mutation. Count these in the log to answer
+        // "how many contexts did this tap actually create?" without
+        // needing to trace the dispatch path.
+        debug!(
+            target: "bmux_contexts_plugin::state",
+            id = %id,
+            client_id = %client_id.0,
+            name = %context.name.as_deref().unwrap_or("<unnamed>"),
+            total_contexts = self.contexts.len(),
+            "context_state.create",
+        );
         Self::to_summary(&context)
     }
 
