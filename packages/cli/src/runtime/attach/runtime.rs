@@ -67,6 +67,8 @@ use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
+const RUNTIME_THEME_EVENT_KIND: bmux_plugin_sdk::PluginEventKind =
+    bmux_plugin_sdk::PluginEventKind::from_static("bmux.appearance/theme");
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
 /// progress output burst to complete (e.g. when the server indicates
 /// `output_still_pending` or the inner application is mid-synchronized-
@@ -955,13 +957,18 @@ pub async fn run_session_attach_with_client(
     let mut rendered_frame_count = 0_u64;
     let mut first_frame_emitted = false;
     let mut interactive_ready_emitted = false;
-    let global_theme = match attach_config.load_theme_from_paths(&attach_config_paths) {
+    let mut global_theme = match attach_config.load_theme_from_paths(&attach_config_paths) {
         Ok(theme) => theme,
         Err(error) => {
             tracing::warn!("failed loading attach theme, using default: {error}");
             bmux_config::ThemeConfig::default()
         }
     };
+    let _ = bmux_plugin::global_event_bus()
+        .register_channel::<bmux_config::ThemeConfig>(RUNTIME_THEME_EVENT_KIND);
+    let mut runtime_theme_rx = bmux_plugin::global_event_bus()
+        .subscribe::<bmux_config::ThemeConfig>(&RUNTIME_THEME_EVENT_KIND)
+        .ok();
 
     if let Some(leader_client_id) = follow_target_id {
         client
@@ -1562,6 +1569,23 @@ pub async fn run_session_attach_with_client(
                     }
                 }
             }
+
+            runtime_theme = async {
+                match runtime_theme_rx.as_mut() {
+                    Some(rx) => rx.recv().await.ok(),
+                    None => None,
+                }
+            }, if runtime_theme_rx.is_some() => {
+                if let Some(theme) = runtime_theme {
+                    global_theme = (*theme).clone();
+                    view_state.cached_status_line = None;
+                    view_state.dirty.status_needs_redraw = true;
+                    view_state.dirty.full_pane_redraw = true;
+                    view_state.dirty.overlay_needs_redraw = true;
+                } else {
+                    runtime_theme_rx = None;
+                }
+            },
 
             // Scene events pushed on the local event bus. The
             // PluginBusEvent handler above emits incoming scenes
@@ -5411,6 +5435,22 @@ pub async fn handle_attach_terminal_event(
                 return Ok(AttachLoopControl::Continue);
             }
             Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => {
+                if let Event::Mouse(mouse) = terminal_event {
+                    match view_state.prompt.handle_mouse_event(mouse) {
+                        PromptKeyDisposition::Completed(completion) => {
+                            if let Some(control) =
+                                handle_attach_prompt_completion(client, view_state, completion)
+                                    .await?
+                            {
+                                return Ok(control);
+                            }
+                        }
+                        PromptKeyDisposition::Consumed => {
+                            view_state.dirty.overlay_needs_redraw = true;
+                        }
+                        PromptKeyDisposition::NotActive => {}
+                    }
+                }
                 return Ok(AttachLoopControl::Continue);
             }
             _ => {}

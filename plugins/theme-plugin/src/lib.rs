@@ -15,6 +15,8 @@ use std::path::Path;
 use tracing::{debug, warn};
 
 const STORAGE_SELECTED_THEME: &str = "selected_theme";
+const RUNTIME_THEME_EVENT_KIND: bmux_plugin_sdk::PluginEventKind =
+    bmux_plugin_sdk::PluginEventKind::from_static("bmux.appearance/theme");
 
 #[derive(Default)]
 pub struct ThemePlugin;
@@ -61,6 +63,10 @@ fn pick_theme(context: &NativeCommandContext) -> Result<i32, PluginCommandError>
     Ok(EXIT_OK)
 }
 
+fn publish_runtime_theme(theme: &bmux_config::ThemeConfig) {
+    let _ = bmux_plugin::global_event_bus().emit(&RUNTIME_THEME_EVENT_KIND, theme.clone());
+}
+
 async fn run_theme_picker(context: NativeCommandContext) {
     let settings = parse_settings(context.settings.as_ref());
     let catalog = load_theme_catalog(&context);
@@ -75,6 +81,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     };
     let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
+    publish_runtime_theme(&original_theme);
     apply_theme_extensions(&context, &original_theme, &all_plugin_ids);
 
     let request = bmux_plugin_sdk::PromptRequest::single_select(
@@ -104,6 +111,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
                 if let Some(PromptEvent::SelectionChanged { value, .. }) = event
                     && let Some(theme) = theme_by_name(&catalog, &value)
                 {
+                    publish_runtime_theme(theme);
                     apply_theme_extensions(&context, theme, &all_plugin_ids);
                 }
             }
@@ -113,6 +121,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
     if let Some(name) = selected_name
         && let Some(theme) = theme_by_name(&catalog, &name)
     {
+        publish_runtime_theme(theme);
         apply_theme_extensions(&context, theme, &all_plugin_ids);
         if matches!(
             settings.persistence,
@@ -124,6 +133,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     }
 
+    publish_runtime_theme(&original_theme);
     apply_theme_extensions(&context, &original_theme, &all_plugin_ids);
 }
 

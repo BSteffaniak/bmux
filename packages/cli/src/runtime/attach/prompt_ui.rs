@@ -6,7 +6,9 @@ use crate::runtime::prompt::{
 use anyhow::{Context, Result};
 use bmux_ipc::{AttachLayer as SurfaceLayer, AttachRect, AttachSurface, AttachSurfaceKind};
 use crossterm::cursor::MoveTo;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::queue;
 use crossterm::style::Print;
 use crossterm::terminal;
@@ -410,6 +412,76 @@ impl AttachPromptState {
 
         if let Some(response) = completion {
             return self.complete_active(response);
+        }
+
+        PromptKeyDisposition::Consumed
+    }
+
+    pub fn handle_mouse_event(&mut self, mouse: MouseEvent) -> PromptKeyDisposition {
+        let Some(layout) =
+            prompt_overlay_layout(self.active.as_ref().map(|active| &active.envelope.request))
+        else {
+            return PromptKeyDisposition::NotActive;
+        };
+        let Some(active) = self.active.as_mut() else {
+            return PromptKeyDisposition::NotActive;
+        };
+
+        let PromptField::SingleSelect {
+            options,
+            live_preview,
+            ..
+        } = &active.envelope.request.field
+        else {
+            return PromptKeyDisposition::Consumed;
+        };
+        let PromptWidgetState::SingleSelect { selected, scroll } = &mut active.state else {
+            return PromptKeyDisposition::Consumed;
+        };
+        if options.is_empty() {
+            return PromptKeyDisposition::Consumed;
+        }
+
+        let width = usize::from(layout.surface.rect.w);
+        let height = usize::from(layout.surface.rect.h);
+        let x = usize::from(layout.surface.rect.x);
+        let text_width = width.saturating_sub(4);
+        let body_rows = height.saturating_sub(4).max(1);
+        let message_rows = active
+            .envelope
+            .request
+            .message
+            .as_ref()
+            .map_or(0, |message| wrap_lines(message, text_width).len());
+        let field_rows = body_rows.saturating_sub(message_rows).max(1);
+        *scroll = adjust_scroll(*scroll, *selected, options.len(), field_rows);
+
+        let body_y = usize::from(layout.surface.rect.y).saturating_add(1);
+        let field_y = body_y.saturating_add(message_rows);
+        let column = usize::from(mouse.column);
+        if column <= x || column >= x.saturating_add(width).saturating_sub(1) {
+            return PromptKeyDisposition::Consumed;
+        }
+        let row = usize::from(mouse.row);
+        if row < field_y || row >= field_y.saturating_add(field_rows) {
+            return PromptKeyDisposition::Consumed;
+        }
+        let option_index = scroll.saturating_add(row.saturating_sub(field_y));
+        if option_index >= options.len() {
+            return PromptKeyDisposition::Consumed;
+        }
+
+        let previous = *selected;
+        *selected = option_index;
+        if *live_preview && previous != *selected {
+            emit_selection_changed(&active.envelope, *selected);
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let value = options
+                .get(*selected)
+                .map_or_else(String::new, |option| option.value.clone());
+            return self.complete_active(PromptResponse::Submitted(PromptValue::Single(value)));
         }
 
         PromptKeyDisposition::Consumed
