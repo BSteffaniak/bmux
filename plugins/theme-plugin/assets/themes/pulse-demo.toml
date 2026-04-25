@@ -1,26 +1,25 @@
-# Hacker theme — lime-green matrix aesthetic.
-# Copy/move to ~/.config/bmux/themes/hacker.toml (or use `bmux theme install hacker`)
-# and select via `appearance.theme = "hacker"` in bmux.toml.
+# Pulse-demo theme - showcases the decoration plugin's Lua scripting
+# surface. The focused pane's border breathes between lime-green and
+# cyan every two seconds; unfocused panes get a static dim border.
 
 background           = "#000000"
 cursor               = "#39ff14"
-foreground           = "#39ff14"
-name                 = "hacker"
-selection_background = "#004400"
+foreground           = "#e6ffe6"
+name                 = "pulse-demo"
+selection_background = "#003311"
 
 [border]
 active   = "#39ff14"
 inactive = "#1a4d1a"
 
 [status]
-active_window  = "#00ff00"
+active_window  = "#39ff14"
 background     = "#000000"
-foreground     = "#39ff14"
-mode_indicator = "#ffff00"
+foreground     = "#cfffcf"
+mode_indicator = "#ffd700"
 
-# Decoration plugin extension.
-# Animation is off by default; uncomment `animation` to enable shimmering.
 [plugins."bmux.decoration"]
+script = "pulse"
 
 [plugins."bmux.decoration".unfocused]
 bg            = ""
@@ -28,14 +27,14 @@ fg            = "#1a4d1a"
 glyphs_custom = []
 gradient_from = ""
 gradient_to   = ""
-style         = "rounded"
+style         = "single-line"
 
 [plugins."bmux.decoration".focused]
 bg            = ""
 fg            = "#39ff14"
 glyphs_custom = []
-gradient_from = "#39ff14"
-gradient_to   = "#00ffc8"
+gradient_from = ""
+gradient_to   = ""
 style         = "thick"
 
 [plugins."bmux.decoration".zoomed]
@@ -47,9 +46,9 @@ gradient_to   = ""
 style         = "double"
 
 [plugins."bmux.decoration".badges]
-exited  = "✓"
+exited  = "✗"
 running = "▶"
 
-# [plugins."bmux.decoration".animation]
-# kind = "shimmer"
-# hz   = 20
+[plugins."bmux.decoration".animation]
+hz   = 30
+kind = "pulse"

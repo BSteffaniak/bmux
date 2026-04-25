@@ -56,10 +56,8 @@ struct State {
     /// Incremented every time internal state changes so consumers can
     /// discard stale snapshots cheaply.
     scene_revision: u64,
-    /// Currently-loaded theme extension. Populated at activation
-    /// from `[plugins."bmux.decoration"]` inside the user's theme
-    /// file; `None` means "no theme extension observed; paint with
-    /// built-in ASCII defaults".
+    /// Currently-loaded extension supplied through `theme-extension:apply`;
+    /// `None` means "no extension observed; paint with built-in ASCII defaults".
     current_theme: Option<DecorationThemeExtension>,
     /// Compiled decoration script, if any. `None` means the theme
     /// did not request a script, or scripting was disabled at build
@@ -77,6 +75,8 @@ struct State {
     /// Optional perf tracker that emits a `WARN` log when the script's
     /// P95 invoke time drifts above the threshold.
     script_perf: Option<PerfTracker>,
+    /// Active animation tick rate. Threads exit when this value changes.
+    animation_hz: Option<u16>,
     /// Diagnostic flag flipped on the first frame where the script was
     /// actually invoked against at least one pane's geometry. Paired
     /// with a one-shot info log so we can confirm the full
@@ -98,6 +98,7 @@ impl std::fmt::Debug for State {
             .field("current_theme", &self.current_theme)
             .field("script_path", &self.script_path)
             .field("script_frame", &self.script_frame)
+            .field("animation_hz", &self.animation_hz)
             .finish_non_exhaustive()
     }
 }
@@ -693,6 +694,7 @@ fn apply_theme_extension_toml(
     if text.trim().is_empty() {
         if let Ok(mut state) = state.lock() {
             state.current_theme = None;
+            state.animation_hz = None;
             install_script_backend(&mut state, None);
             bump_revision(&mut state);
         }
@@ -716,10 +718,17 @@ fn apply_theme_extension_toml(
         .script
         .as_deref()
         .and_then(|spec| resolve_decoration_script(config_dir_candidates, spec));
+    let animation_hz = extension.animation.as_ref().map(|animation| animation.hz);
     if let Ok(mut state) = state.lock() {
         state.current_theme = Some(extension);
+        state.animation_hz = animation_hz;
         install_script_backend(&mut state, script);
         bump_revision(&mut state);
+    }
+    if let Some(hz) = animation_hz
+        && hz > 0
+    {
+        spawn_animation_tick_thread(Arc::downgrade(state), hz);
     }
     Ok(())
 }
@@ -1374,81 +1383,8 @@ fn resolve_decoration_script(
     None
 }
 
-/// Load the decoration theme extension from the active theme file
-/// resolved via the user's config directory. Reads `bmux.toml`,
-/// extracts `appearance.theme`, reads `themes/{name}.toml`, then
-/// pulls `[plugins."bmux.decoration"]` and parses it against the
-/// `DecorationThemeExtension` schema.
-///
-/// When the extension names a `script`, the corresponding source is
-/// resolved and returned alongside the parsed extension. Returns
-/// `None` when any step fails — the plugin should fall back to its
-/// built-in defaults and not crash on a malformed user config.
-#[cfg(test)]
-fn load_theme_extension_from_config_dir(
-    config_dir: &std::path::Path,
-) -> Option<DecorationThemeExtension> {
-    load_theme_from_config_dir(&[config_dir.to_path_buf()]).map(|(extension, _)| extension)
-}
-
-/// Variant of [`load_theme_extension_from_config_dir`] that also
-/// returns the resolved script source when the theme specifies one.
-/// Kept as a sibling so legacy call sites (tests, read-only queries)
-/// don't have to deal with the script tuple.
-///
-/// The candidate chain is probed in order for each filesystem lookup
-/// (`bmux.toml`, the theme file under `themes/`, and scripts). The
-/// first candidate that carries a readable `bmux.toml` anchors the
-/// theme lookup — once we commit to a candidate we keep reading from
-/// that same dir for the theme file before falling back to bundled
-/// presets.
-fn load_theme_from_config_dir(
-    config_dir_candidates: &[PathBuf],
-) -> Option<(DecorationThemeExtension, Option<ResolvedScript>)> {
-    // Step 1: probe each candidate for a parseable bmux.toml. The
-    // first hit wins and we remember which dir served it so steps 2
-    // and 3 stay anchored there.
-    let (anchor_dir, main_toml) = config_dir_candidates.iter().find_map(|dir| {
-        let text = std::fs::read_to_string(dir.join("bmux.toml")).ok()?;
-        let value: toml::Value = toml::from_str(&text).ok()?;
-        Some((dir.clone(), value))
-    })?;
-    let theme_name = main_toml
-        .get("appearance")
-        .and_then(|a| a.get("theme"))
-        .and_then(toml::Value::as_str)
-        .unwrap_or("default")
-        .to_string();
-    if theme_name.is_empty() {
-        return None;
-    }
-    // Step 2: load the theme file from the anchor dir; if it's not
-    // on the filesystem there, fall back to any bundled preset with
-    // the same name. (We intentionally don't probe every candidate
-    // for the theme file — users who separate bmux.toml from their
-    // themes dir can install a symlink, and this keeps behaviour
-    // predictable.)
-    let theme_path = anchor_dir.join("themes").join(format!("{theme_name}.toml"));
-    let theme_text = match std::fs::read_to_string(&theme_path) {
-        Ok(text) => text,
-        Err(_) => bundled_theme_presets()
-            .iter()
-            .find_map(|(n, text)| (*n == theme_name.as_str()).then(|| (*text).to_string()))?,
-    };
-    let theme_toml: toml::Value = toml::from_str(&theme_text).ok()?;
-    // Step 3: extract `plugins."bmux.decoration"` and parse.
-    let plugins_table = theme_toml.get("plugins")?;
-    let decoration_table = plugins_table.get("bmux.decoration")?.clone();
-    let extension: DecorationThemeExtension = decoration_table.try_into().ok()?;
-    let script = extension
-        .script
-        .as_deref()
-        .and_then(|spec| resolve_decoration_script(config_dir_candidates, spec));
-    Some((extension, script))
-}
-
 impl RustPlugin for DecorationPlugin {
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+    fn activate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         // Register the typed scene-event channel before any mutator
         // (including the initial revision bump below) tries to emit.
         // Failure is non-fatal — the channel may already exist from a
@@ -1457,39 +1393,9 @@ impl RustPlugin for DecorationPlugin {
             .register_channel::<bmux_scene_protocol::scene_protocol::EventPayload>(
                 bmux_scene_protocol::scene_protocol::EVENT_KIND,
             );
-        // Load the decoration theme extension from the user's active
-        // theme file, if any. Errors are logged but non-fatal — the
-        // plugin falls back to its built-in defaults. We respect the
-        // host's candidate-chain so XDG-style config dirs (e.g.
-        // `~/.config/bmux` on macOS when the native path is
-        // `~/Library/Application Support/bmux`) resolve correctly.
-        let config_dir_candidates = context.connection.config_dir_candidate_paths();
-        let loaded = load_theme_from_config_dir(&config_dir_candidates);
-        tracing::debug!(
-            candidates = ?config_dir_candidates,
-            theme_loaded = loaded.is_some(),
-            script_resolved = ?loaded
-                .as_ref()
-                .and_then(|(_, s)| s.as_ref())
-                .map(|s| s.path.display().to_string()),
-            "decoration plugin theme loader result",
-        );
-        let (theme_extension, resolved_script) = match loaded {
-            Some((ext, script)) => (Some(ext), script),
-            None => (None, None),
-        };
-        let animation_hz = theme_extension
-            .as_ref()
-            .and_then(|t| t.animation.as_ref())
-            .map(|a| a.hz);
         let mut summary_theme_loaded = false;
         let mut summary_script_loaded = false;
         if let Ok(mut state) = self.state.inner.lock() {
-            state.current_theme = theme_extension;
-            // Install the script backend (if any) before the first
-            // revision bump so subscribers see the very first scene
-            // with script output already merged.
-            install_script_backend(&mut state, resolved_script);
             summary_theme_loaded = state.current_theme.is_some();
             summary_script_loaded = state.script_backend.is_some();
             // Bump the scene revision so the first build_scene() call
@@ -1502,7 +1408,6 @@ impl RustPlugin for DecorationPlugin {
         tracing::debug!(
             theme_loaded = summary_theme_loaded,
             script_loaded = summary_script_loaded,
-            animation_hz = ?animation_hz,
             "decoration plugin activate complete",
         );
         // Spawn the windows-plugin pane-event broadcast subscriber.
@@ -1536,14 +1441,6 @@ impl RustPlugin for DecorationPlugin {
                 },
             );
         spawn_attach_layout_subscriber(self.state.clone_arc());
-        // Spawn the animation tick thread when the theme requests a
-        // non-zero hz and a script is compiled. The thread holds a
-        // `Weak` so it exits cleanly when the plugin is dropped.
-        if let Some(hz) = animation_hz
-            && hz > 0
-        {
-            spawn_animation_tick_thread(Arc::downgrade(&self.state.inner), hz);
-        }
         Ok(EXIT_OK)
     }
 
@@ -1817,6 +1714,9 @@ fn spawn_animation_tick_thread(state: Weak<Mutex<State>>, hz: u16) {
             let Ok(mut guard) = arc.lock() else {
                 return;
             };
+            if guard.animation_hz != Some(hz) {
+                return;
+            }
             // Skip the tick entirely if the script was unloaded
             // between frames — avoids a useless revision bump.
             if guard.script_backend.is_some() {
@@ -2135,36 +2035,6 @@ pub fn sample_event_for_pane(pane_id: Uuid) -> DecorationEvent {
 /// Name of the readiness signal the decoration plugin fires after
 /// publishing its first [`DecorationScene`].
 pub const SCENE_PUBLISHED_SIGNAL: &str = "scene-published";
-
-/// Bundled theme presets shipped with the decoration plugin. Each
-/// entry is `(name, toml_text)` — `name` is the file stem under
-/// `~/.config/bmux/themes/<name>.toml`, `toml_text` is the file
-/// contents.
-///
-/// Tooling (e.g. a future `bmux theme install` CLI subcommand)
-/// walks this list and writes any missing preset to the user's
-/// themes directory. Presets are enabled behind the `bundled-themes`
-/// cargo feature on the decoration plugin crate; when disabled the
-/// list is empty and users must install themes manually.
-#[must_use]
-pub fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
-    #[cfg(feature = "bundled-themes")]
-    {
-        &[
-            ("hacker", include_str!("../assets/themes/hacker.toml")),
-            ("cyberpunk", include_str!("../assets/themes/cyberpunk.toml")),
-            ("minimal", include_str!("../assets/themes/minimal.toml")),
-            (
-                "pulse-demo",
-                include_str!("../assets/themes/pulse-demo.toml"),
-            ),
-        ]
-    }
-    #[cfg(not(feature = "bundled-themes"))]
-    {
-        &[]
-    }
-}
 
 // Runtime assertion (executed once at the top of the test suite) that
 // the interface ids hardcoded in `plugin.toml` and the typed-service
@@ -2966,107 +2836,54 @@ mod tests {
     }
 
     #[test]
-    fn bundled_theme_presets_parse_against_schema() {
-        for (name, toml_text) in bundled_theme_presets() {
-            // Each bundled theme's `[plugins."bmux.decoration"]` section
-            // must validate against the DecorationThemeExtension
-            // schema — otherwise we'd ship themes nobody can use.
-            let theme: toml::Value =
-                toml::from_str(toml_text).unwrap_or_else(|e| panic!("{name} parses: {e}"));
-            let plugins_table = theme
-                .get("plugins")
-                .unwrap_or_else(|| panic!("{name} missing [plugins] table"));
-            let decoration_table = plugins_table
-                .get("bmux.decoration")
-                .unwrap_or_else(|| panic!("{name} missing [plugins.\"bmux.decoration\"]"));
-            // Pretty-print the extracted table so validate_theme_extension_toml can parse it.
-            let extension_toml = toml::to_string(&decoration_table)
-                .unwrap_or_else(|e| panic!("{name} re-serialize: {e}"));
-            let result = validate_theme_extension_toml(&extension_toml);
-            assert_eq!(
-                result,
-                ValidationResult::Ok,
-                "bundled theme `{name}` failed schema validation: {result:?}\n{extension_toml}",
-            );
-        }
-    }
-
-    #[test]
     fn current_theme_extension_returns_none_on_fresh_plugin() {
         let plugin = DecorationPlugin::new();
         let handle = DecorationServiceHandle::new(plugin.state.clone_arc());
         assert!(block_on(handle.current_theme_extension()).is_none());
     }
 
-    #[test]
-    fn load_theme_extension_from_config_dir_returns_none_on_missing_config() {
-        let tmp =
-            std::env::temp_dir().join(format!("bmux-decoration-test-{}", uuid::Uuid::new_v4()));
-        assert!(load_theme_extension_from_config_dir(&tmp).is_none());
-    }
-
-    #[test]
-    fn load_theme_extension_from_config_dir_reads_plugin_section() {
-        let tmp =
-            std::env::temp_dir().join(format!("bmux-decoration-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(tmp.join("themes")).expect("mkdir");
-
-        let main_toml = r#"
-[appearance]
-theme = "hacker"
-"#;
-        std::fs::write(tmp.join("bmux.toml"), main_toml).expect("write main");
-        std::fs::write(
-            tmp.join("themes/hacker.toml"),
-            include_str!("../assets/themes/hacker.toml"),
-        )
-        .expect("write theme");
-
-        let ext = load_theme_extension_from_config_dir(&tmp)
-            .expect("loading decoration theme extension should succeed");
-        assert_eq!(ext.focused.style, "thick");
-        assert_eq!(ext.focused.fg, "#39ff14");
-        assert_eq!(ext.badges.running, "▶");
-    }
-
     // ─── PR 5: Luau scripting ─────────────────────────────────────
 
     #[test]
     fn theme_without_script_field_still_parses() {
-        // The existing `hacker.toml` bundle does not specify `script`
-        // — regression guard for the schema addition being additive.
-        let ext = validate_theme_extension_toml(include_str!("../assets/themes/hacker.toml"));
-        // The bundled theme contains non-decoration fields at the
-        // top level; validate just the decoration section.
-        let _ = ext;
-        let toml_text = include_str!("../assets/themes/hacker.toml");
-        let value: toml::Value = toml::from_str(toml_text).expect("parse hacker toml");
-        let decoration_table = value
-            .get("plugins")
-            .and_then(|p| p.get("bmux.decoration"))
-            .expect("hacker.toml must carry a decoration section");
-        let extension: DecorationThemeExtension = decoration_table.clone().try_into().expect(
-            "hacker.toml decoration section must round-trip through DecorationThemeExtension",
-        );
+        let extension: DecorationThemeExtension = toml::from_str::<toml::Value>(
+            r##"
+[unfocused]
+style = "rounded"
+fg = "#606060"
+bg = ""
+gradient_from = ""
+gradient_to = ""
+glyphs_custom = []
+
+[focused]
+style = "thick"
+fg = "#e0e0e0"
+bg = ""
+gradient_from = ""
+gradient_to = ""
+glyphs_custom = []
+
+[zoomed]
+style = "double"
+fg = "#ffffff"
+bg = ""
+gradient_from = ""
+gradient_to = ""
+glyphs_custom = []
+
+[badges]
+running = ""
+exited = ""
+"##,
+        )
+        .expect("parse extension")
+        .try_into()
+        .expect("extension parses");
         assert!(
             extension.script.is_none(),
-            "hacker.toml does not declare a script"
+            "extension does not declare a script"
         );
-    }
-
-    #[test]
-    fn pulse_demo_bundled_theme_includes_script_reference() {
-        let toml_text = include_str!("../assets/themes/pulse-demo.toml");
-        let value: toml::Value = toml::from_str(toml_text).expect("parse pulse-demo toml");
-        let decoration_table = value
-            .get("plugins")
-            .and_then(|p| p.get("bmux.decoration"))
-            .expect("pulse-demo.toml must carry a decoration section");
-        let extension: DecorationThemeExtension = decoration_table
-            .clone()
-            .try_into()
-            .expect("pulse-demo.toml decoration section must parse");
-        assert_eq!(extension.script.as_deref(), Some("pulse"));
     }
 
     #[test]
@@ -3100,67 +2917,6 @@ theme = "hacker"
         let tmp = std::env::temp_dir().join(format!("bmux-script-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("mkdir");
         assert!(resolve_decoration_script(std::slice::from_ref(&tmp), "no-such-script").is_none());
-    }
-
-    #[test]
-    fn load_theme_from_config_dir_resolves_script_when_present() {
-        let tmp = std::env::temp_dir().join(format!("bmux-decoration-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(tmp.join("themes")).expect("mkdir themes");
-        std::fs::create_dir_all(tmp.join("decorations")).expect("mkdir decorations");
-        std::fs::write(
-            tmp.join("bmux.toml"),
-            r#"
-[appearance]
-theme = "with-script"
-"#,
-        )
-        .expect("write main");
-        std::fs::write(
-            tmp.join("themes/with-script.toml"),
-            r#"
-[plugins."bmux.decoration"]
-script = "decorations/demo.lua"
-
-[plugins."bmux.decoration".unfocused]
-style = "rounded"
-fg = ""
-bg = ""
-gradient_from = ""
-gradient_to = ""
-glyphs_custom = []
-
-[plugins."bmux.decoration".focused]
-style = "thick"
-fg = ""
-bg = ""
-gradient_from = ""
-gradient_to = ""
-glyphs_custom = []
-
-[plugins."bmux.decoration".zoomed]
-style = "double"
-fg = ""
-bg = ""
-gradient_from = ""
-gradient_to = ""
-glyphs_custom = []
-
-[plugins."bmux.decoration".badges]
-running = ""
-exited = ""
-"#,
-        )
-        .expect("write theme");
-        std::fs::write(
-            tmp.join("decorations/demo.lua"),
-            "function decorate(ctx) return {} end\n",
-        )
-        .expect("write script");
-        let (ext, script) = load_theme_from_config_dir(std::slice::from_ref(&tmp))
-            .expect("loader must find theme + script");
-        assert_eq!(ext.script.as_deref(), Some("decorations/demo.lua"));
-        let script = script.expect("script must resolve");
-        assert!(script.source.contains("function decorate"));
     }
 
     #[test]
@@ -3292,36 +3048,6 @@ exited = ""
         );
     }
 
-    // ─── Candidate-chain probing ─────────────────────────────────
-
-    #[test]
-    fn load_theme_from_config_dir_probes_secondary_candidate_when_primary_missing() {
-        let base = std::env::temp_dir().join(format!("bmux-chain-test-{}", Uuid::new_v4()));
-        let primary = base.join("primary");
-        let secondary = base.join("secondary");
-        std::fs::create_dir_all(&primary).expect("mkdir primary");
-        std::fs::create_dir_all(secondary.join("themes")).expect("mkdir secondary themes");
-
-        // Only the secondary dir has bmux.toml + the theme file.
-        std::fs::write(
-            secondary.join("bmux.toml"),
-            r#"
-[appearance]
-theme = "hacker"
-"#,
-        )
-        .expect("write bmux.toml in secondary");
-        std::fs::write(
-            secondary.join("themes/hacker.toml"),
-            include_str!("../assets/themes/hacker.toml"),
-        )
-        .expect("write theme in secondary");
-
-        let (ext, _script) = load_theme_from_config_dir(&[primary.clone(), secondary.clone()])
-            .expect("loader must succeed using the secondary candidate");
-        assert_eq!(ext.focused.style, "thick");
-    }
-
     #[test]
     fn resolve_decoration_script_probes_all_candidates_for_filesystem_paths() {
         let base = std::env::temp_dir().join(format!("bmux-chain-test-{}", Uuid::new_v4()));
@@ -3341,48 +3067,6 @@ theme = "hacker"
         .expect("loader must succeed using the secondary candidate");
         assert_eq!(resolved.source, body);
         assert!(resolved.path.starts_with(&secondary));
-    }
-
-    #[test]
-    fn load_theme_from_config_dir_prefers_primary_when_both_candidates_have_bmux_toml() {
-        let base = std::env::temp_dir().join(format!("bmux-chain-test-{}", Uuid::new_v4()));
-        let primary = base.join("primary");
-        let secondary = base.join("secondary");
-        std::fs::create_dir_all(primary.join("themes")).expect("mkdir primary themes");
-        std::fs::create_dir_all(secondary.join("themes")).expect("mkdir secondary themes");
-
-        // Two bmux.tomls pointing at two different themes.
-        std::fs::write(
-            primary.join("bmux.toml"),
-            r#"
-[appearance]
-theme = "hacker"
-"#,
-        )
-        .expect("write primary bmux.toml");
-        std::fs::write(
-            secondary.join("bmux.toml"),
-            r#"
-[appearance]
-theme = "cyberpunk"
-"#,
-        )
-        .expect("write secondary bmux.toml");
-        std::fs::write(
-            primary.join("themes/hacker.toml"),
-            include_str!("../assets/themes/hacker.toml"),
-        )
-        .expect("write primary theme");
-        std::fs::write(
-            secondary.join("themes/cyberpunk.toml"),
-            include_str!("../assets/themes/cyberpunk.toml"),
-        )
-        .expect("write secondary theme");
-
-        let (ext, _) = load_theme_from_config_dir(&[primary.clone(), secondary.clone()])
-            .expect("loader must succeed");
-        // Primary's theme is "hacker" -> focused style = "thick".
-        assert_eq!(ext.focused.style, "thick");
     }
 
     #[test]

@@ -3,6 +3,10 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
+use bmux_appearance::{
+    RUNTIME_APPEARANCE_STATE_KIND, RuntimeAppearance, RuntimeBorderAppearance,
+    RuntimeStatusAppearance,
+};
 use bmux_plugin::prompt;
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
@@ -10,22 +14,111 @@ use bmux_plugin_sdk::{
     PromptEvent, PromptResponse, PromptValue, ServiceKind, StorageGetRequest, StorageSetRequest,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tracing::{debug, warn};
 
-const STORAGE_SELECTED_THEME: &str = "selected_theme";
-const RUNTIME_THEME_EVENT_KIND: bmux_plugin_sdk::PluginEventKind =
-    bmux_plugin_sdk::PluginEventKind::from_static("bmux.appearance/theme");
+const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
 
 #[derive(Default)]
 pub struct ThemePlugin;
 
 impl RustPlugin for ThemePlugin {
+    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        apply_configured_appearance(&context);
+        Ok(EXIT_OK)
+    }
+
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
             "pick-theme" => pick_theme(&context),
         })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct ThemeConfig {
+    name: String,
+    foreground: String,
+    background: String,
+    cursor: String,
+    selection_background: String,
+    border: BorderColors,
+    status: StatusColors,
+    #[serde(rename = "plugins", skip_serializing_if = "BTreeMap::is_empty")]
+    plugins: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct BorderColors {
+    active: String,
+    inactive: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct StatusColors {
+    background: String,
+    foreground: String,
+    active_window: String,
+    mode_indicator: String,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            foreground: "#ffffff".to_string(),
+            background: "#000000".to_string(),
+            cursor: "#ffffff".to_string(),
+            selection_background: "#404040".to_string(),
+            border: BorderColors::default(),
+            status: StatusColors::default(),
+            plugins: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for BorderColors {
+    fn default() -> Self {
+        Self {
+            active: "#00ff00".to_string(),
+            inactive: "#808080".to_string(),
+        }
+    }
+}
+
+impl Default for StatusColors {
+    fn default() -> Self {
+        Self {
+            background: "#1e1e1e".to_string(),
+            foreground: "#ffffff".to_string(),
+            active_window: "#00ff00".to_string(),
+            mode_indicator: "#ffff00".to_string(),
+        }
+    }
+}
+
+impl From<&ThemeConfig> for RuntimeAppearance {
+    fn from(theme: &ThemeConfig) -> Self {
+        Self {
+            foreground: theme.foreground.clone(),
+            background: theme.background.clone(),
+            cursor: theme.cursor.clone(),
+            selection_background: theme.selection_background.clone(),
+            border: RuntimeBorderAppearance {
+                active: theme.border.active.clone(),
+                inactive: theme.border.inactive.clone(),
+            },
+            status: RuntimeStatusAppearance {
+                background: theme.status.background.clone(),
+                foreground: theme.status.foreground.clone(),
+                active_window: theme.status.active_window.clone(),
+                mode_indicator: theme.status.mode_indicator.clone(),
+            },
+        }
     }
 }
 
@@ -40,13 +133,15 @@ enum ThemePersistence {
 #[derive(Debug, Default, Deserialize)]
 struct ThemePluginSettings {
     #[serde(default)]
+    theme: Option<String>,
+    #[serde(default)]
     persistence: ThemePersistence,
 }
 
 #[derive(Debug, Clone)]
 struct ThemeCatalogEntry {
     name: String,
-    theme: bmux_config::ThemeConfig,
+    theme: ThemeConfig,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,26 +158,56 @@ fn pick_theme(context: &NativeCommandContext) -> Result<i32, PluginCommandError>
     Ok(EXIT_OK)
 }
 
-fn publish_runtime_theme(theme: &bmux_config::ThemeConfig) {
-    let _ = bmux_plugin::global_event_bus().emit(&RUNTIME_THEME_EVENT_KIND, theme.clone());
+fn apply_configured_appearance(context: &NativeLifecycleContext) {
+    let settings = parse_settings(context.settings.as_ref());
+    let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
+    let declared_name = declared_theme_name(&settings);
+    let active_name = active_theme_name(context, settings.persistence, &catalog, &declared_name);
+    let Some(theme) = theme_by_name(&catalog, &active_name) else {
+        return;
+    };
+    let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
+    publish_runtime_appearance(theme);
+    apply_theme_extensions(
+        context,
+        theme,
+        &all_plugin_ids,
+        &context.connection.config_dir_candidates,
+    );
+}
+
+fn publish_runtime_appearance(theme: &ThemeConfig) {
+    let appearance = RuntimeAppearance::from(theme);
+    if bmux_plugin::global_event_bus()
+        .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance.clone())
+        .is_err()
+    {
+        let _ = bmux_plugin::global_event_bus()
+            .register_state_channel::<RuntimeAppearance>(RUNTIME_APPEARANCE_STATE_KIND, appearance);
+    }
 }
 
 async fn run_theme_picker(context: NativeCommandContext) {
     let settings = parse_settings(context.settings.as_ref());
-    let catalog = load_theme_catalog(&context);
+    let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
     if catalog.is_empty() {
         warn!("theme picker opened with empty catalog");
         return;
     }
 
-    let declared_name = declared_theme_name(&context);
+    let declared_name = declared_theme_name(&settings);
     let active_name = active_theme_name(&context, settings.persistence, &catalog, &declared_name);
     let Some(original_theme) = theme_by_name(&catalog, &active_name).cloned() else {
         return;
     };
     let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
-    publish_runtime_theme(&original_theme);
-    apply_theme_extensions(&context, &original_theme, &all_plugin_ids);
+    publish_runtime_appearance(&original_theme);
+    apply_theme_extensions(
+        &context,
+        &original_theme,
+        &all_plugin_ids,
+        &context.connection.config_dir_candidates,
+    );
 
     let request = bmux_plugin_sdk::PromptRequest::single_select(
         "Select Theme",
@@ -111,8 +236,13 @@ async fn run_theme_picker(context: NativeCommandContext) {
                 if let Some(PromptEvent::SelectionChanged { value, .. }) = event
                     && let Some(theme) = theme_by_name(&catalog, &value)
                 {
-                    publish_runtime_theme(theme);
-                    apply_theme_extensions(&context, theme, &all_plugin_ids);
+                    publish_runtime_appearance(theme);
+                    apply_theme_extensions(
+                        &context,
+                        theme,
+                        &all_plugin_ids,
+                        &context.connection.config_dir_candidates,
+                    );
                 }
             }
         }
@@ -121,8 +251,13 @@ async fn run_theme_picker(context: NativeCommandContext) {
     if let Some(name) = selected_name
         && let Some(theme) = theme_by_name(&catalog, &name)
     {
-        publish_runtime_theme(theme);
-        apply_theme_extensions(&context, theme, &all_plugin_ids);
+        publish_runtime_appearance(theme);
+        apply_theme_extensions(
+            &context,
+            theme,
+            &all_plugin_ids,
+            &context.connection.config_dir_candidates,
+        );
         if matches!(
             settings.persistence,
             ThemePersistence::PersistBetweenConnects
@@ -133,8 +268,13 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     }
 
-    publish_runtime_theme(&original_theme);
-    apply_theme_extensions(&context, &original_theme, &all_plugin_ids);
+    publish_runtime_appearance(&original_theme);
+    apply_theme_extensions(
+        &context,
+        &original_theme,
+        &all_plugin_ids,
+        &context.connection.config_dir_candidates,
+    );
 }
 
 fn parse_settings(settings: Option<&toml::Value>) -> ThemePluginSettings {
@@ -144,25 +284,15 @@ fn parse_settings(settings: Option<&toml::Value>) -> ThemePluginSettings {
         .unwrap_or_default()
 }
 
-fn declared_theme_name(context: &NativeCommandContext) -> String {
-    let Some(config) = context.connection.probe_config_file("bmux.toml") else {
-        return "default".to_string();
-    };
-    let Ok(text) = std::fs::read_to_string(config) else {
-        return "default".to_string();
-    };
-    let Ok(value) = text.parse::<toml::Value>() else {
-        return "default".to_string();
-    };
-    value
-        .get("appearance")
-        .and_then(|appearance| appearance.get("theme"))
-        .and_then(toml::Value::as_str)
+fn declared_theme_name(settings: &ThemePluginSettings) -> String {
+    settings
+        .theme
+        .as_deref()
         .map_or_else(|| "default".to_string(), normalized_theme_name)
 }
 
 fn active_theme_name(
-    context: &NativeCommandContext,
+    context: &(impl HostRuntimeApi + ?Sized),
     persistence: ThemePersistence,
     catalog: &[ThemeCatalogEntry],
     declared_name: &str,
@@ -180,10 +310,10 @@ fn active_theme_name(
     }
 }
 
-fn read_persisted_theme_name(context: &NativeCommandContext) -> Option<String> {
+fn read_persisted_theme_name(context: &(impl HostRuntimeApi + ?Sized)) -> Option<String> {
     let response = context
         .storage_get(&StorageGetRequest {
-            key: STORAGE_SELECTED_THEME.to_string(),
+            key: STORAGE_SELECTED_APPEARANCE.to_string(),
         })
         .ok()?;
     let value = response.value?;
@@ -192,9 +322,9 @@ fn read_persisted_theme_name(context: &NativeCommandContext) -> Option<String> {
         .map(|name| normalized_theme_name(&name))
 }
 
-fn persist_theme_name(context: &NativeCommandContext, name: &str) {
+fn persist_theme_name(context: &impl HostRuntimeApi, name: &str) {
     let result = context.storage_set(&StorageSetRequest {
-        key: STORAGE_SELECTED_THEME.to_string(),
+        key: STORAGE_SELECTED_APPEARANCE.to_string(),
         value: name.as_bytes().to_vec(),
     });
     if let Err(error) = result {
@@ -202,13 +332,13 @@ fn persist_theme_name(context: &NativeCommandContext, name: &str) {
     }
 }
 
-fn load_theme_catalog(context: &NativeCommandContext) -> Vec<ThemeCatalogEntry> {
+fn load_theme_catalog(config_dir_candidates: &[std::path::PathBuf]) -> Vec<ThemeCatalogEntry> {
     let mut entries = vec![ThemeCatalogEntry {
         name: "default".to_string(),
-        theme: bmux_config::ThemeConfig::default(),
+        theme: ThemeConfig::default(),
     }];
 
-    for dir in context.connection.config_dir_candidate_paths() {
+    for dir in config_dir_candidates {
         let themes_dir = dir.join("themes");
         let Ok(read_dir) = std::fs::read_dir(themes_dir) else {
             continue;
@@ -222,7 +352,7 @@ fn load_theme_catalog(context: &NativeCommandContext) -> Vec<ThemeCatalogEntry> 
     }
 
     for (name, text) in bundled_theme_presets() {
-        if let Ok(theme) = toml::from_str::<bmux_config::ThemeConfig>(text) {
+        if let Ok(theme) = toml::from_str::<ThemeConfig>(text) {
             upsert_theme_catalog_entry(&mut entries, (*name).to_string(), theme);
         }
     }
@@ -236,7 +366,7 @@ fn load_theme_file(path: &Path, entries: &mut Vec<ThemeCatalogEntry>) {
         return;
     };
     if let Ok(text) = std::fs::read_to_string(path)
-        && let Ok(theme) = toml::from_str::<bmux_config::ThemeConfig>(&text)
+        && let Ok(theme) = toml::from_str::<ThemeConfig>(&text)
     {
         upsert_theme_catalog_entry(entries, name.to_string(), theme);
     }
@@ -244,21 +374,12 @@ fn load_theme_file(path: &Path, entries: &mut Vec<ThemeCatalogEntry>) {
 
 const fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
     &[
-        (
-            "hacker",
-            include_str!("../../decoration-plugin/assets/themes/hacker.toml"),
-        ),
-        (
-            "cyberpunk",
-            include_str!("../../decoration-plugin/assets/themes/cyberpunk.toml"),
-        ),
-        (
-            "minimal",
-            include_str!("../../decoration-plugin/assets/themes/minimal.toml"),
-        ),
+        ("hacker", include_str!("../assets/themes/hacker.toml")),
+        ("cyberpunk", include_str!("../assets/themes/cyberpunk.toml")),
+        ("minimal", include_str!("../assets/themes/minimal.toml")),
         (
             "pulse-demo",
-            include_str!("../../decoration-plugin/assets/themes/pulse-demo.toml"),
+            include_str!("../assets/themes/pulse-demo.toml"),
         ),
     ]
 }
@@ -266,7 +387,7 @@ const fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
 fn upsert_theme_catalog_entry(
     entries: &mut Vec<ThemeCatalogEntry>,
     name: String,
-    mut theme: bmux_config::ThemeConfig,
+    mut theme: ThemeConfig,
 ) {
     theme.name.clone_from(&name);
     if let Some(existing) = entries.iter_mut().find(|entry| entry.name == name) {
@@ -312,10 +433,7 @@ fn selected_index(catalog: &[ThemeCatalogEntry], active_name: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn theme_by_name<'a>(
-    catalog: &'a [ThemeCatalogEntry],
-    name: &str,
-) -> Option<&'a bmux_config::ThemeConfig> {
+fn theme_by_name<'a>(catalog: &'a [ThemeCatalogEntry], name: &str) -> Option<&'a ThemeConfig> {
     catalog
         .iter()
         .find(|entry| entry.name == name)
@@ -323,9 +441,10 @@ fn theme_by_name<'a>(
 }
 
 fn apply_theme_extensions(
-    context: &NativeCommandContext,
-    theme: &bmux_config::ThemeConfig,
+    context: &impl ServiceCaller,
+    theme: &ThemeConfig,
     plugin_ids: &[String],
+    config_dir_candidates: &[String],
 ) {
     for plugin_id in plugin_ids {
         let toml = theme
@@ -335,7 +454,7 @@ fn apply_theme_extensions(
             .unwrap_or_default();
         let request = ApplyThemeExtensionArgs {
             toml,
-            config_dir_candidates: context.connection.config_dir_candidates.clone(),
+            config_dir_candidates: config_dir_candidates.to_vec(),
         };
         let Ok(payload) = bmux_plugin_sdk::encode_service_message(&request) else {
             continue;

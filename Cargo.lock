@@ -978,6 +978,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_appearance"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_sdk",
+ "serde",
+]
+
+[[package]]
 name = "bmux_attach_layout_protocol"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1029,6 +1037,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
+ "bmux_appearance",
  "bmux_attach_layout_protocol",
  "bmux_attach_pipeline",
  "bmux_cli_output",
@@ -1939,7 +1948,7 @@ dependencies = [
 name = "bmux_theme_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_config",
+ "bmux_appearance",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "serde",

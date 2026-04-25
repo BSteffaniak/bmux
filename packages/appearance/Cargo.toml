@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Generic runtime appearance primitives for bmux renderers"
+edition     = { workspace = true }
+keywords    = ["bmux", "appearance", "runtime"]
+license     = { workspace = true }
+name        = "bmux_appearance"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_plugin_sdk = { workspace = true }
+serde           = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = ["bmux_plugin_sdk/fail-on-warnings"]

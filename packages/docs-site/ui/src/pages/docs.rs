@@ -8,7 +8,7 @@
 use clap::CommandFactory;
 use clap::builder::ValueHint;
 
-use bmux_config::{BmuxConfig, ConfigDocSchema, ENV_OVERRIDE_DOCS, ThemeConfig};
+use bmux_config::{BmuxConfig, ConfigDocSchema, ENV_OVERRIDE_DOCS};
 use std::collections::BTreeMap;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -71,10 +71,6 @@ pub(crate) fn generate_config_reference() -> String {
             section.defaults,
         ));
 
-        if section.section_name == "appearance" {
-            doc.push_str(&render_theme_file_reference());
-        }
-
         if section.section_name == "status_bar" {
             doc.push_str(&render_status_preset_examples());
         }
@@ -106,26 +102,6 @@ fn root_config_sections() -> Vec<RootConfigSection> {
     }
 
     sections
-}
-
-fn render_theme_file_reference() -> String {
-    let mut s = String::from(
-        "## `themes/<name>.toml`\n\n\
-         Named theme files live under the bmux config directory (for example, \
-         `~/.config/bmux/themes/solarized.toml`) and are selected via \
-         `appearance.theme = \"solarized\"`.\n\n\
-         Keys below are top-level fields in the theme file.\n\n",
-    );
-
-    let (fields, defaults) =
-        flatten_field_docs(ThemeConfig::field_docs(), ThemeConfig::default_values(), "");
-    s.push_str(&render_fields_table(
-        "theme_file",
-        "theme",
-        fields,
-        defaults,
-    ));
-    s
 }
 
 fn render_path_env_overrides_section() -> String {
@@ -214,11 +190,11 @@ bold_active = false\n\
 underline_active = false\n\
 ```\n\n",
     );
-    s.push_str("### Status Theme Override (partial)\n\n");
+    s.push_str("### Status Color Override (partial)\n\n");
     s.push_str(
         "```toml\n\
-[status_bar.theme]\n\
-# Unset fields inherit from the global appearance theme defaults\n\
+[status_bar.colors]\n\
+# Unset fields inherit from the runtime appearance defaults\n\
 tab_active_bg = \"#7aa2f7\"\n\
 tab_active_fg = \"#1a1b26\"\n\
 tab_inactive_bg = \"#2a2f45\"\n\
@@ -768,21 +744,12 @@ mod tests {
         assert!(doc.contains("export.cursor"));
         assert!(doc.contains("layout.density"));
         assert!(doc.contains("style.separator_set"));
-        assert!(doc.contains("theme.tab_active_bg"));
+        assert!(doc.contains("colors.tab_active_bg"));
         assert!(doc.contains("routing.conflict_mode"));
         assert!(doc.contains("routing.required_paths.<index>.path"));
         assert!(doc.contains("routing.required_namespaces.<index>.namespace"));
         assert!(doc.contains("rolling_event_kinds"));
         assert!(doc.contains("pane_input_raw"));
-    }
-
-    #[test]
-    fn config_reference_documents_theme_file_schema() {
-        let doc = generate_config_reference();
-
-        assert!(doc.contains("## `themes/<name>.toml`"));
-        assert!(doc.contains("border.active"));
-        assert!(doc.contains("status.mode_indicator"));
     }
 
     #[test]

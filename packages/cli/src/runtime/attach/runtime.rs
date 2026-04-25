@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use bmux_appearance::{RUNTIME_APPEARANCE_STATE_KIND, RuntimeAppearance};
 use bmux_attach_layout_protocol::attach_layout_protocol::{
     AttachLayoutSnapshot, AttachSurfaceSummary, STATE_KIND as ATTACH_LAYOUT_STATE_KIND,
 };
@@ -31,7 +32,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
@@ -67,8 +68,6 @@ use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
-const RUNTIME_THEME_EVENT_KIND: bmux_plugin_sdk::PluginEventKind =
-    bmux_plugin_sdk::PluginEventKind::from_static("bmux.appearance/theme");
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
 /// progress output burst to complete (e.g. when the server indicates
 /// `output_still_pending` or the inner application is mid-synchronized-
@@ -923,14 +922,6 @@ pub async fn run_session_attach_with_client(
         None => None,
     };
 
-    let mut attach_config_paths = ConfigPaths::default();
-    if let Some(config_parent) = std::env::var_os(bmux_config::BMUX_CONFIG_ENV)
-        .map(PathBuf::from)
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-    {
-        attach_config_paths.prepend_config_dir_candidate(config_parent);
-    }
-
     let attach_config = match BmuxConfig::load() {
         Ok(config) => config,
         Err(error) => {
@@ -957,18 +948,18 @@ pub async fn run_session_attach_with_client(
     let mut rendered_frame_count = 0_u64;
     let mut first_frame_emitted = false;
     let mut interactive_ready_emitted = false;
-    let mut global_theme = match attach_config.load_theme_from_paths(&attach_config_paths) {
-        Ok(theme) => theme,
-        Err(error) => {
-            tracing::warn!("failed loading attach theme, using default: {error}");
-            bmux_config::ThemeConfig::default()
-        }
-    };
-    let _ = bmux_plugin::global_event_bus()
-        .register_channel::<bmux_config::ThemeConfig>(RUNTIME_THEME_EVENT_KIND);
-    let mut runtime_theme_rx = bmux_plugin::global_event_bus()
-        .subscribe::<bmux_config::ThemeConfig>(&RUNTIME_THEME_EVENT_KIND)
-        .ok();
+    let (initial_appearance, mut appearance_rx) = bmux_plugin::global_event_bus()
+        .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
+        .unwrap_or_else(|_| {
+            let _ = bmux_plugin::global_event_bus().register_state_channel::<RuntimeAppearance>(
+                RUNTIME_APPEARANCE_STATE_KIND,
+                RuntimeAppearance::default(),
+            );
+            bmux_plugin::global_event_bus()
+                .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
+                .expect("runtime appearance state channel was just registered")
+        });
+    let mut runtime_appearance = (*initial_appearance).clone();
 
     if let Some(leader_client_id) = follow_target_id {
         client
@@ -1570,21 +1561,14 @@ pub async fn run_session_attach_with_client(
                 }
             }
 
-            runtime_theme = async {
-                match runtime_theme_rx.as_mut() {
-                    Some(rx) => rx.recv().await.ok(),
-                    None => None,
+            appearance_changed = appearance_rx.changed() => {
+                if appearance_changed.is_ok() {
+                    runtime_appearance = (**appearance_rx.borrow()).clone();
                 }
-            }, if runtime_theme_rx.is_some() => {
-                if let Some(theme) = runtime_theme {
-                    global_theme = (*theme).clone();
-                    view_state.cached_status_line = None;
-                    view_state.dirty.status_needs_redraw = true;
-                    view_state.dirty.full_pane_redraw = true;
-                    view_state.dirty.overlay_needs_redraw = true;
-                } else {
-                    runtime_theme_rx = None;
-                }
+                view_state.cached_status_line = None;
+                view_state.dirty.status_needs_redraw = true;
+                view_state.dirty.full_pane_redraw = true;
+                view_state.dirty.overlay_needs_redraw = true;
             },
 
             // Scene events pushed on the local event bus. The
@@ -1766,7 +1750,7 @@ pub async fn run_session_attach_with_client(
                 &mut view_state,
                 &layout_state,
                 &attach_config.status_bar,
-                &global_theme,
+                &runtime_appearance,
                 follow_target_id,
                 global,
                 &attach_keymap,
@@ -1996,7 +1980,7 @@ pub async fn run_session_attach_with_client(
             &mut view_state,
             &layout_state,
             &attach_config.status_bar,
-            &global_theme,
+            &runtime_appearance,
             follow_target_id,
             global,
             &attach_keymap,
@@ -3306,7 +3290,7 @@ pub fn build_attach_status_line_for_draw(
     _client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
-    global_theme: &bmux_config::ThemeConfig,
+    runtime_appearance: &RuntimeAppearance,
     context_id: Option<Uuid>,
     session_id: Uuid,
     can_write: bool,
@@ -3384,7 +3368,7 @@ pub fn build_attach_status_line_for_draw(
     build_attach_status_line(
         cols,
         status_config,
-        global_theme,
+        runtime_appearance,
         &session_label,
         session_count,
         &current_context_label,
@@ -3878,7 +3862,7 @@ pub fn render_attach_frame(
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
     status_config: &bmux_config::StatusBarConfig,
-    global_theme: &bmux_config::ThemeConfig,
+    runtime_appearance: &RuntimeAppearance,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
     keymap: &crate::input::Keymap,
@@ -3893,7 +3877,7 @@ pub fn render_attach_frame(
             client,
             view_state,
             status_config,
-            global_theme,
+            runtime_appearance,
             view_state.attached_context_id,
             view_state.attached_id,
             view_state.can_write,

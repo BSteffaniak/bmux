@@ -697,19 +697,19 @@ mod tests {
     #[test]
     fn resolve_dotted_key_traverses_nested_tables() {
         let input: toml::Value = toml::from_str(
-            r#"
-            [appearance]
-            theme = "night"
+            r"
+            [status_bar]
+            max_tabs = 8
             [behavior]
             [behavior.mouse]
             enabled = true
-            "#,
+            ",
         )
         .unwrap();
 
         assert_eq!(
-            resolve_dotted_key(&input, "appearance.theme"),
-            Some(&toml::Value::String("night".to_string()))
+            resolve_dotted_key(&input, "status_bar.max_tabs"),
+            Some(&toml::Value::Integer(8))
         );
         assert_eq!(
             resolve_dotted_key(&input, "behavior.mouse.enabled"),
@@ -734,13 +734,13 @@ mod tests {
         let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
         set_dotted_key(
             &mut doc,
-            "appearance.theme",
+            "status_bar.colors.tab_active_bg",
             toml_edit::value("dark").into_value().unwrap(),
         )
         .unwrap();
         let output = doc.to_string();
-        assert!(output.contains("[appearance]"));
-        assert!(output.contains("theme = \"dark\""));
+        assert!(output.contains("[status_bar.colors]"));
+        assert!(output.contains("tab_active_bg = \"dark\""));
     }
 
     #[test]

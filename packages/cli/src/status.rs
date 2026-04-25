@@ -1,6 +1,7 @@
+use bmux_appearance::RuntimeAppearance;
 use bmux_config::{
     StatusAlignActive, StatusBarConfig, StatusBarPreset, StatusDensity, StatusHintPolicy,
-    StatusOverflowStyle, StatusSeparatorSet, ThemeConfig,
+    StatusOverflowStyle, StatusSeparatorSet,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
@@ -28,7 +29,7 @@ pub struct AttachStatusLine {
 pub fn build_attach_status_line(
     width: u16,
     config: &StatusBarConfig,
-    global_theme: &ThemeConfig,
+    runtime_appearance: &RuntimeAppearance,
     session_label: &str,
     session_count: usize,
     current_context_label: &str,
@@ -47,7 +48,7 @@ pub fn build_attach_status_line(
     }
 
     let style = StatusRenderStyle::from_config(config);
-    let resolved_theme = ResolvedStatusTheme::resolve(config, global_theme);
+    let resolved_appearance = ResolvedStatusAppearance::resolve(config, runtime_appearance);
     let mut left = String::new();
     let mut tab_hitboxes = Vec::new();
     let mut overflow_ranges = Vec::new();
@@ -107,7 +108,7 @@ pub fn build_attach_status_line(
         &composed.rendered,
         width,
         config,
-        &resolved_theme,
+        &resolved_appearance,
         tabs,
         &tab_hitboxes,
         &overflow_ranges,
@@ -391,7 +392,7 @@ struct SegmentStyle {
     underline: bool,
 }
 
-struct ResolvedStatusTheme {
+struct ResolvedStatusAppearance {
     base: SegmentStyle,
     active_tab: SegmentStyle,
     inactive_tab: SegmentStyle,
@@ -399,89 +400,90 @@ struct ResolvedStatusTheme {
     overflow: SegmentStyle,
 }
 
-impl ResolvedStatusTheme {
+impl ResolvedStatusAppearance {
     #[allow(clippy::similar_names, clippy::too_many_lines)] // bg/fg pairs are intentionally parallel names
-    fn resolve(config: &StatusBarConfig, global_theme: &ThemeConfig) -> Self {
+    fn resolve(config: &StatusBarConfig, runtime_appearance: &RuntimeAppearance) -> Self {
         let fallback_bar_bg =
-            parse_hex_color(&global_theme.status.background).unwrap_or(RgbColor {
+            parse_hex_color(&runtime_appearance.status.background).unwrap_or(RgbColor {
                 r: 30,
                 g: 30,
                 b: 30,
             });
         let fallback_bar_fg =
-            parse_hex_color(&global_theme.status.foreground).unwrap_or(RgbColor {
+            parse_hex_color(&runtime_appearance.status.foreground).unwrap_or(RgbColor {
                 r: 220,
                 g: 220,
                 b: 220,
             });
-        let fallback_active_bg =
-            parse_hex_color(&global_theme.status.active_window).unwrap_or(RgbColor {
+        let fallback_active_bg = parse_hex_color(&runtime_appearance.status.active_window)
+            .unwrap_or(RgbColor {
                 r: 110,
                 g: 170,
                 b: 240,
             });
-        let fallback_active_fg = parse_hex_color(&global_theme.background).unwrap_or(RgbColor {
-            r: 20,
-            g: 20,
-            b: 20,
-        });
+        let fallback_active_fg =
+            parse_hex_color(&runtime_appearance.background).unwrap_or(RgbColor {
+                r: 20,
+                g: 20,
+                b: 20,
+            });
 
         let bar_bg = config
-            .theme
+            .colors
             .bar_bg
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or(fallback_bar_bg);
         let bar_fg = config
-            .theme
+            .colors
             .bar_fg
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or(fallback_bar_fg);
         let active_bg = config
-            .theme
+            .colors
             .tab_active_bg
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or(fallback_active_bg);
         let active_fg = config
-            .theme
+            .colors
             .tab_active_fg
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or(fallback_active_fg);
         let inactive_bg = config
-            .theme
+            .colors
             .tab_inactive_bg
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or_else(|| adjust_rgb(bar_bg, 18));
         let inactive_fg = config
-            .theme
+            .colors
             .tab_inactive_fg
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or(bar_fg);
         let module_bg = config
-            .theme
+            .colors
             .module_bg
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or_else(|| adjust_rgb(bar_bg, 10));
         let module_fg = config
-            .theme
+            .colors
             .module_fg
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or(bar_fg);
         let overflow_bg = config
-            .theme
+            .colors
             .overflow_bg
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or_else(|| adjust_rgb(bar_bg, 26));
         let overflow_fg = config
-            .theme
+            .colors
             .overflow_fg
             .as_deref()
             .and_then(parse_hex_color)
@@ -532,7 +534,7 @@ fn stylize_status_line(
     rendered_plain: &str,
     width: u16,
     config: &StatusBarConfig,
-    theme: &ResolvedStatusTheme,
+    appearance: &ResolvedStatusAppearance,
     tabs: &[AttachTab],
     hitboxes: &[AttachStatusTabHitbox],
     overflow_ranges: &[(usize, usize)],
@@ -589,7 +591,7 @@ fn stylize_status_line(
         if col >= width {
             break;
         }
-        let style = style_for_segment(segments[col], config, theme);
+        let style = style_for_segment(segments[col], config, appearance);
         if current_style != Some(segments[col]) {
             rendered.push_str(&style_sgr(style));
             current_style = Some(segments[col]);
@@ -604,14 +606,14 @@ fn stylize_status_line(
 const fn style_for_segment(
     segment: SegmentKind,
     _config: &StatusBarConfig,
-    theme: &ResolvedStatusTheme,
+    appearance: &ResolvedStatusAppearance,
 ) -> SegmentStyle {
     match segment {
-        SegmentKind::Base => theme.base,
-        SegmentKind::ActiveTab => theme.active_tab,
-        SegmentKind::InactiveTab => theme.inactive_tab,
-        SegmentKind::Module => theme.module,
-        SegmentKind::Overflow => theme.overflow,
+        SegmentKind::Base => appearance.base,
+        SegmentKind::ActiveTab => appearance.active_tab,
+        SegmentKind::InactiveTab => appearance.inactive_tab,
+        SegmentKind::Module => appearance.module,
+        SegmentKind::Overflow => appearance.overflow,
     }
 }
 

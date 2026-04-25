@@ -1,0 +1,54 @@
+# Hacker theme - lime-green matrix aesthetic.
+# Select with:
+# [plugins.settings."bmux.theme"]
+# theme = "hacker"
+
+background           = "#000000"
+cursor               = "#39ff14"
+foreground           = "#39ff14"
+name                 = "hacker"
+selection_background = "#004400"
+
+[border]
+active   = "#39ff14"
+inactive = "#1a4d1a"
+
+[status]
+active_window  = "#00ff00"
+background     = "#000000"
+foreground     = "#39ff14"
+mode_indicator = "#ffff00"
+
+[plugins."bmux.decoration"]
+
+[plugins."bmux.decoration".unfocused]
+bg            = ""
+fg            = "#1a4d1a"
+glyphs_custom = []
+gradient_from = ""
+gradient_to   = ""
+style         = "rounded"
+
+[plugins."bmux.decoration".focused]
+bg            = ""
+fg            = "#39ff14"
+glyphs_custom = []
+gradient_from = "#39ff14"
+gradient_to   = "#00ffc8"
+style         = "thick"
+
+[plugins."bmux.decoration".zoomed]
+bg            = ""
+fg            = "#ffd700"
+glyphs_custom = []
+gradient_from = ""
+gradient_to   = ""
+style         = "double"
+
+[plugins."bmux.decoration".badges]
+exited  = "✓"
+running = "▶"
+
+# [plugins."bmux.decoration".animation]
+# kind = "shimmer"
+# hz   = 20

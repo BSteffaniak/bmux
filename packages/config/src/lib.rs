@@ -56,12 +56,10 @@ impl ConfigLoadOverrides {
 
 pub mod keybind;
 pub mod paths;
-pub mod theme;
 
 pub use bmux_config_doc::{ConfigDocSchema, FieldDoc};
 pub use keybind::{KeyBindingConfig, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, ResolvedTimeout};
 pub use paths::{ConfigPaths, ENV_OVERRIDE_DOCS, EnvOverrideDoc};
-pub use theme::ThemeConfig;
 
 fn process_config_overrides() -> &'static std::sync::RwLock<Option<ConfigLoadOverrides>> {
     static OVERRIDES: std::sync::OnceLock<std::sync::RwLock<Option<ConfigLoadOverrides>>> =
@@ -664,7 +662,7 @@ pub struct BmuxConfig {
     /// Core session defaults: shell, scrollback depth, and server connection settings
     #[config_doc(nested)]
     pub general: GeneralConfig,
-    /// Visual styling: color theme, pane borders, status bar placement, and window titles
+    /// Visual styling: pane borders, status bar placement, and window titles
     #[config_doc(nested)]
     pub appearance: AppearanceConfig,
     /// Runtime behavior toggles for terminal protocol handling, layout persistence, and build compatibility
@@ -1297,13 +1295,11 @@ impl Default for GeneralConfig {
     }
 }
 
-/// Visual styling: color theme, pane borders, status bar placement, and window titles
+/// Visual styling: pane borders, status bar placement, and window titles
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[config_doc(section = "appearance")]
 #[serde(default)]
 pub struct AppearanceConfig {
-    /// Name of the color theme to apply. Empty string uses the default theme.
-    pub theme: String,
     /// Where to render the status bar. TOP places it above panes, BOTTOM below
     /// panes, and OFF hides it entirely.
     pub status_position: StatusPosition,
@@ -1778,7 +1774,7 @@ pub struct StatusBarConfig {
     pub style: StatusBarStyleConfig,
     /// Optional status-specific color overrides.
     #[config_doc(nested)]
-    pub theme: StatusBarThemeConfig,
+    pub colors: StatusBarColorConfig,
     /// Maximum number of tabs shown in the tab strip before overflow is collapsed.
     pub max_tabs: usize,
     /// Maximum display width for each tab label.
@@ -1812,7 +1808,7 @@ impl Default for StatusBarConfig {
             preset: StatusBarPreset::TabRail,
             layout: StatusBarLayoutConfig::default(),
             style: StatusBarStyleConfig::default(),
-            theme: StatusBarThemeConfig::default(),
+            colors: StatusBarColorConfig::default(),
             max_tabs: 12,
             tab_label_max_width: 20,
             show_tab_index: true,
@@ -1831,7 +1827,7 @@ impl Default for StatusBarConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc, Default)]
 #[serde(default)]
-pub struct StatusBarThemeConfig {
+pub struct StatusBarColorConfig {
     /// Bar background color (hex `#RRGGBB`).
     pub bar_bg: Option<String>,
     /// Bar foreground color (hex `#RRGGBB`).
@@ -1854,7 +1850,7 @@ pub struct StatusBarThemeConfig {
     pub overflow_fg: Option<String>,
 }
 
-impl StatusBarThemeConfig {
+impl StatusBarColorConfig {
     #[must_use]
     pub const fn config_doc_values() -> &'static [&'static str] {
         &[]
@@ -2382,44 +2378,6 @@ impl BmuxConfig {
     ) -> Result<(Self, CompositionExplain)> {
         let paths = ConfigPaths::default();
         Self::load_from_path_with_explain_and_overrides(&paths.config_file(), profile_id, overrides)
-    }
-
-    /// Load the configured global theme.
-    ///
-    /// Returns the built-in default theme when `appearance.theme` is empty or
-    /// set to `default`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the named theme file cannot be read or parsed.
-    pub fn load_theme(&self) -> Result<ThemeConfig> {
-        let paths = ConfigPaths::default();
-        self.load_theme_from_paths(&paths)
-    }
-
-    /// Load the configured global theme using explicit config paths.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the named theme file cannot be read or parsed.
-    pub fn load_theme_from_paths(&self, paths: &ConfigPaths) -> Result<ThemeConfig> {
-        let theme_name = self.appearance.theme.trim();
-        if theme_name.is_empty() || theme_name.eq_ignore_ascii_case("default") {
-            return Ok(ThemeConfig::default());
-        }
-
-        let path = paths.resolve_theme_file(theme_name);
-        if !path.exists() {
-            return Err(ConfigError::FileNotFound { path });
-        }
-
-        let contents = std::fs::read_to_string(&path).map_err(|e| ConfigError::ReadError {
-            error: e.to_string(),
-        })?;
-
-        toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
-            error: e.to_string(),
-        })
     }
 
     /// Load configuration from a specific path
@@ -4043,69 +4001,6 @@ timeout_profile = "missing"
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
-    }
-
-    #[test]
-    fn load_theme_uses_default_when_appearance_theme_is_empty() {
-        let config = BmuxConfig::default();
-        let paths = ConfigPaths::new(
-            std::path::PathBuf::from("/config"),
-            std::path::PathBuf::from("/runtime"),
-            std::path::PathBuf::from("/data"),
-            std::path::PathBuf::from("/state"),
-        );
-
-        let theme = config
-            .load_theme_from_paths(&paths)
-            .expect("default theme loads");
-        assert_eq!(theme.name, "default");
-    }
-
-    #[test]
-    fn load_theme_reads_named_theme_from_themes_directory() {
-        let path = temp_config_path();
-        let dir = path.parent().expect("temp dir").to_path_buf();
-        let themes_dir = dir.join("themes");
-        std::fs::create_dir_all(&themes_dir).expect("create themes dir");
-        std::fs::write(
-            themes_dir.join("night.toml"),
-            "name = 'night'\nforeground = '#eeeeee'\nbackground = '#101010'\n",
-        )
-        .expect("write theme file");
-
-        let mut config = BmuxConfig::default();
-        config.appearance.theme = "night".to_string();
-        let paths = ConfigPaths::new(
-            dir.clone(),
-            std::path::PathBuf::from("/runtime"),
-            std::path::PathBuf::from("/data"),
-            std::path::PathBuf::from("/state"),
-        );
-
-        let theme = config
-            .load_theme_from_paths(&paths)
-            .expect("named theme loads");
-        assert_eq!(theme.name, "night");
-        assert_eq!(theme.background, "#101010");
-
-        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
-    }
-
-    #[test]
-    fn load_theme_errors_when_named_theme_is_missing() {
-        let mut config = BmuxConfig::default();
-        config.appearance.theme = "missing-theme".to_string();
-        let paths = ConfigPaths::new(
-            std::path::PathBuf::from("/config"),
-            std::path::PathBuf::from("/runtime"),
-            std::path::PathBuf::from("/data"),
-            std::path::PathBuf::from("/state"),
-        );
-
-        let error = config
-            .load_theme_from_paths(&paths)
-            .expect_err("missing theme should error");
-        assert!(matches!(error, crate::ConfigError::FileNotFound { .. }));
     }
 
     #[test]

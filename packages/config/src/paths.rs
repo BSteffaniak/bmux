@@ -155,21 +155,6 @@ impl ConfigPaths {
         self.resolve("bmux.toml")
     }
 
-    /// Get the themes directory path (primary, for directory creation).
-    #[must_use]
-    pub fn themes_dir(&self) -> PathBuf {
-        self.config_dir.join("themes")
-    }
-
-    /// Resolve a theme file by name through the candidate chain.
-    ///
-    /// Checks `themes/{name}.toml` in each candidate directory and returns
-    /// the first that exists, or the primary path if none match.
-    #[must_use]
-    pub fn resolve_theme_file(&self, name: &str) -> PathBuf {
-        self.resolve(format!("themes/{name}.toml"))
-    }
-
     /// Add a config directory candidate ahead of existing candidates.
     pub fn prepend_config_dir_candidate(&mut self, path: PathBuf) {
         self.config_dir_candidates
@@ -300,7 +285,6 @@ impl ConfigPaths {
         std::fs::create_dir_all(self.plugins_dir())?;
         std::fs::create_dir_all(self.sessions_dir())?;
         std::fs::create_dir_all(self.logs_dir())?;
-        std::fs::create_dir_all(self.config_dir.join("themes"))?;
         Ok(())
     }
 }
@@ -800,22 +784,21 @@ mod tests {
         let primary = tmp.join("primary");
         let fallback = tmp.join("fallback");
 
-        std::fs::create_dir_all(primary.join("themes")).unwrap();
-        std::fs::create_dir_all(fallback.join("themes")).unwrap();
-        // Theme only in fallback
-        std::fs::write(fallback.join("themes").join("night.toml"), "name='night'").unwrap();
+        std::fs::create_dir_all(primary.join("profiles")).unwrap();
+        std::fs::create_dir_all(fallback.join("profiles")).unwrap();
+        std::fs::write(fallback.join("profiles").join("dev.toml"), "name='dev'").unwrap();
 
         let paths = paths_with_candidates(vec![primary.clone(), fallback.clone()]);
         assert_eq!(
-            paths.resolve("themes/night.toml"),
-            fallback.join("themes").join("night.toml")
+            paths.resolve("profiles/dev.toml"),
+            fallback.join("profiles").join("dev.toml")
         );
 
-        // Now also create in primary — primary should win.
-        std::fs::write(primary.join("themes").join("night.toml"), "name='night'").unwrap();
+        // Now also create in primary; primary should win.
+        std::fs::write(primary.join("profiles").join("dev.toml"), "name='dev'").unwrap();
         assert_eq!(
-            paths.resolve("themes/night.toml"),
-            primary.join("themes").join("night.toml")
+            paths.resolve("profiles/dev.toml"),
+            primary.join("profiles").join("dev.toml")
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -834,26 +817,6 @@ mod tests {
 
         let paths = paths_with_candidates(vec![primary, fallback.clone()]);
         assert_eq!(paths.config_file(), fallback.join("bmux.toml"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn resolve_theme_file_uses_resolve() {
-        let tmp = std::env::temp_dir().join("bmux_test_resolve_theme");
-        let _ = std::fs::remove_dir_all(&tmp);
-        let primary = tmp.join("primary");
-        let fallback = tmp.join("fallback");
-
-        std::fs::create_dir_all(primary.join("themes")).unwrap();
-        std::fs::create_dir_all(fallback.join("themes")).unwrap();
-        std::fs::write(fallback.join("themes").join("dracula.toml"), "").unwrap();
-
-        let paths = paths_with_candidates(vec![primary, fallback.clone()]);
-        assert_eq!(
-            paths.resolve_theme_file("dracula"),
-            fallback.join("themes").join("dracula.toml")
-        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
