@@ -7,6 +7,8 @@ local apple_index = nil
 local apple_key = nil
 local rng_state = nil
 local state_total = nil
+local death_started_ms = nil
+local death_segments = nil
 
 local function len_border(rect)
     local w = rect.w
@@ -128,6 +130,34 @@ local function insert_apple(cmds, rect)
     })
 end
 
+local function reset_game(total)
+    snake_size = math.min(INITIAL_SNAKE_SIZE, total)
+    apple_index = nil
+    apple_key = nil
+    death_started_ms = nil
+    death_segments = nil
+end
+
+local function render_death_flash(cmds, ctx, total)
+    if death_started_ms == nil or death_segments == nil then
+        return false
+    end
+
+    local elapsed = ctx.time_ms - death_started_ms
+    if elapsed >= 900 then
+        reset_game(total)
+        return false
+    end
+
+    local flash_on = math.floor(elapsed / 150) % 2 == 0
+    if flash_on then
+        for _, segment in ipairs(death_segments) do
+            insert_diamond(cmds, segment.col, segment.row, 20, 255, 95, 95)
+        end
+    end
+    return true
+end
+
 local function collect_snake_cells(rect, head, visual_total, vertical_aspect, segment_visual_spacing, total)
     local occupied = {}
     local segments = {}
@@ -169,17 +199,13 @@ function decorate(ctx)
     local segment_visual_spacing = 2.0
 
     if state_total ~= total then
-        snake_size = math.min(INITIAL_SNAKE_SIZE, total)
-        apple_index = nil
-        apple_key = nil
+        reset_game(total)
         rng_state = nil
         state_total = total
     end
 
-    if snake_size * segment_visual_spacing >= visual_total - segment_visual_spacing then
-        snake_size = math.min(INITIAL_SNAKE_SIZE, total)
-        apple_index = nil
-        apple_key = nil
+    if render_death_flash(cmds, ctx, total) then
+        return cmds
     end
 
     local occupied, segments = collect_snake_cells(
@@ -212,6 +238,15 @@ function decorate(ctx)
         spawn_apple(ctx, occupied, total)
     elseif occupied[apple_key] then
         spawn_apple(ctx, occupied, total)
+    end
+
+    if snake_size * segment_visual_spacing >= visual_total - segment_visual_spacing then
+        death_started_ms = ctx.time_ms
+        death_segments = segments
+        apple_index = nil
+        apple_key = nil
+        render_death_flash(cmds, ctx, total)
+        return cmds
     end
 
     insert_apple(cmds, ctx.rect)
