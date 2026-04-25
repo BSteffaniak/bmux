@@ -17,7 +17,6 @@ use super::prompt_ui::AttachPromptState;
 
 pub enum AttachEventAction {
     Send(Vec<u8>),
-    Runtime(RuntimeAction),
     PluginCommand {
         plugin_id: String,
         command_name: String,

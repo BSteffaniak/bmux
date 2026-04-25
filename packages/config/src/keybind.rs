@@ -174,7 +174,6 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
 
 fn default_runtime_bindings() -> BTreeMap<String, String> {
     let mut map = action_bindings(&[
-        ("shift+c", RuntimeAction::NewSession),
         ("o", RuntimeAction::FocusNext),
         ("h", RuntimeAction::FocusLeft),
         ("l", RuntimeAction::FocusRight),
@@ -228,6 +227,14 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     map.insert(
         "^".to_string(),
         "plugin:bmux.windows:last-window".to_string(),
+    );
+    // New session via the sessions plugin. Creation/naming is owned
+    // by the plugin so windows-plugin's contexts-events subscriber
+    // observes the resulting Created event and maintains
+    // `windows.order` in insertion order.
+    map.insert(
+        "shift+c".to_string(),
+        "plugin:bmux.sessions:new-session".to_string(),
     );
     map
 }

@@ -4473,6 +4473,105 @@ impl BmuxServer {
         Ok(())
     }
 
+    /// Spawn a forwarder for a plugin state channel (the `@state
+    /// events` variant in BPDL). Mirrors
+    /// [`Self::spawn_plugin_bus_forwarder`] but drives off
+    /// [`tokio::sync::watch::Receiver::changed`] so every snapshot
+    /// replacement fans out as an [`Event::PluginBusEvent`].
+    ///
+    /// Emits the state channel's currently-retained value immediately
+    /// so late-connecting streaming clients see the current snapshot
+    /// without waiting for the next mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event bus rejects the state
+    /// subscription (unregistered channel, wrong payload type, or
+    /// delivery-mode mismatch — a broadcast channel registered under
+    /// this kind would fail here loudly rather than silently misroute).
+    pub fn spawn_plugin_bus_state_forwarder<T>(
+        &self,
+        kind: &bmux_plugin_sdk::PluginEventKind,
+    ) -> Result<()>
+    where
+        T: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let (initial, mut rx) = bmux_plugin::global_event_bus()
+            .subscribe_state::<T>(kind)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed subscribing to plugin bus state kind {kind:?} for streaming forward: \
+                     {error}"
+                )
+            })?;
+        let kind_string = kind.as_str().to_string();
+        let state = Arc::downgrade(&self.state);
+
+        // Emit the retained snapshot synchronously so any streaming
+        // clients already connected see the current state without
+        // having to wait for the next mutation. This mirrors the
+        // `subscribe_state` contract on the local bus (subscribers see
+        // the current value first, then watch for changes).
+        if let Some(state_ref) = state.upgrade() {
+            match serde_json::to_vec(initial.as_ref()) {
+                Ok(encoded) => {
+                    if let Err(error) = emit_event(
+                        &state_ref,
+                        Event::PluginBusEvent {
+                            kind: kind_string.clone(),
+                            payload: encoded,
+                        },
+                    ) {
+                        tracing::warn!(
+                            kind = %kind_string,
+                            error = %error,
+                            "failed emitting initial plugin bus state snapshot",
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind_string,
+                        error = %error,
+                        "failed encoding initial plugin bus state snapshot; dropping",
+                    );
+                }
+            }
+        }
+
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let Some(state_ref) = state.upgrade() else {
+                    return;
+                };
+                let snapshot = rx.borrow().clone();
+                let encoded = match serde_json::to_vec(snapshot.as_ref()) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(
+                            kind = %kind_string,
+                            error = %error,
+                            "failed encoding plugin bus state payload; dropping",
+                        );
+                        continue;
+                    }
+                };
+                let event = Event::PluginBusEvent {
+                    kind: kind_string.clone(),
+                    payload: encoded,
+                };
+                if let Err(error) = emit_event(&state_ref, event) {
+                    tracing::warn!(
+                        kind = %kind_string,
+                        error = %error,
+                        "failed emitting forwarded plugin bus state event",
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Run the server accept loop until shutdown is requested.
     ///
     /// # Errors

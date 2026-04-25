@@ -2180,8 +2180,6 @@ const RUNTIME_ACTION_ALLOWLIST: &[&str] = &[
     // DOMAIN-leaking variants pending migration. Each should move to
     // a `plugin:bmux.<plugin>:<cmd>` invocation before deletion.
     // See `docs/runtime-action-migration.md` for the plan.
-    "NewWindow",
-    "NewSession",
     "FocusNext",
     "FocusPrev",
     "FocusLeft",

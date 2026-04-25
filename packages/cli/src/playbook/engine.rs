@@ -2593,10 +2593,6 @@ async fn apply_attach_runtime_actions(
                     runtime.state.scrollback_offset = 0;
                 }
             }
-            crate::input::RuntimeAction::NewSession | crate::input::RuntimeAction::NewWindow => {
-                let new_sid = typed_new_session_playbook(client, None).await?;
-                runtime.state.attached_id = new_sid;
-            }
             crate::input::RuntimeAction::PluginCommand { .. }
             | crate::input::RuntimeAction::Quit
             | crate::input::RuntimeAction::ToggleSplitDirection

@@ -254,14 +254,157 @@ impl RustPlugin for WindowsPlugin {
         );
 
         let state: Arc<dyn WindowsStateService + Send + Sync> =
-            Arc::new(WindowsStateHandle::new(shared));
+            Arc::new(WindowsStateHandle::new(shared.clone()));
         registry.insert_typed::<dyn WindowsStateService + Send + Sync>(
             read_cap,
             ServiceKind::Query,
             windows_state::INTERFACE_ID,
             state,
         );
+
+        // Spawn the contexts-events subscriber. The windows plugin is
+        // an authoritative projection of context lifecycle: every
+        // Created/Closed/Selected/SessionActiveContextChanged event
+        // flows through here and updates `windows.order` + the
+        // `windows-list` state channel.
+        //
+        // Subscription happens here (not in `activate`) because
+        // `TypedServiceCaller::from_registration_context` needs the
+        // typed registration context that `activate` does not receive.
+        spawn_contexts_events_subscriber(shared);
     }
+}
+
+/// Spawn a dedicated thread that subscribes to `contexts-events` and
+/// drives windows-plugin state transitions.
+///
+/// The thread owns a current-thread tokio runtime so it can `await`
+/// on the subscription's `recv` without interfering with host
+/// scheduling. It runs until the plugin process terminates.
+fn spawn_contexts_events_subscriber(shared: WindowsSharedState) {
+    use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
+
+    let subscribe_result =
+        bmux_plugin::global_event_bus().subscribe::<ContextEvent>(&contexts_events::EVENT_KIND);
+    let mut rx = if let Ok(rx) = subscribe_result {
+        rx
+    } else {
+        // contexts-plugin hasn't registered its channel yet
+        // (unusual — should be a load-order issue). We retry once
+        // on a short delay; if that fails too, give up. Without
+        // the subscription, windows.order only updates when the
+        // user invokes windows-plugin commands directly.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let Ok(rx) =
+            bmux_plugin::global_event_bus().subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)
+        else {
+            return;
+        };
+        rx
+    };
+
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            while let Ok(event) = rx.recv().await {
+                handle_context_event(&shared, &event);
+            }
+        });
+    });
+}
+
+/// Dispatch a single `ContextEvent` against the windows-plugin's
+/// persisted window order + active marker. Every handler ends with a
+/// `publish_window_list_snapshot` so subscribers of the `windows-list`
+/// state channel see the update without polling.
+fn handle_context_event(
+    shared: &WindowsSharedState,
+    event: &bmux_contexts_plugin_api::contexts_events::ContextEvent,
+) {
+    use bmux_contexts_plugin_api::contexts_events::ContextEvent;
+
+    let caller = shared.caller.as_ref();
+    match event {
+        ContextEvent::Created { context_id, .. } => {
+            let _ = append_context_to_window_order(caller, *context_id);
+            publish_window_list_snapshot(caller);
+        }
+        ContextEvent::Closed { context_id } => {
+            let _ = remove_context_from_window_order(caller, *context_id);
+            publish_window_list_snapshot(caller);
+        }
+        ContextEvent::Selected { context_id }
+        | ContextEvent::SessionActiveContextChanged { context_id, .. } => {
+            let _ = mark_context_active(caller, *context_id);
+            publish_window_list_snapshot(caller);
+        }
+    }
+}
+
+/// Append `context_id` to the persisted `windows.order` list when it
+/// is not already present. Preserves the existing order of every
+/// already-known entry — new contexts land at the end, matching the
+/// creation order of the `ContextEvent::Created` stream.
+fn append_context_to_window_order(
+    caller: &impl HostRuntimeApi,
+    context_id: Uuid,
+) -> Result<(), String> {
+    let mut order_ids = get_stored_window_order_ids(caller)?;
+    if order_ids.contains(&context_id) {
+        return Ok(());
+    }
+    order_ids.push(context_id);
+    set_stored_window_order_ids(caller, &order_ids)
+}
+
+/// Remove `context_id` from the persisted `windows.order` list.
+/// No-op when the id is not present. Also clears the active marker
+/// if it was pointing at the removed context.
+fn remove_context_from_window_order(
+    caller: &impl HostRuntimeApi,
+    context_id: Uuid,
+) -> Result<(), String> {
+    let mut order_ids = get_stored_window_order_ids(caller)?;
+    let len_before = order_ids.len();
+    order_ids.retain(|id| *id != context_id);
+    if order_ids.len() == len_before {
+        // Not in list — nothing to persist. Still clear active if it
+        // matches, below.
+    } else {
+        set_stored_window_order_ids(caller, &order_ids)?;
+    }
+    // Clear active marker if it points at the removed context.
+    if let Ok(Some(active)) = get_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)
+        && active == context_id
+    {
+        let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, None);
+    }
+    if let Ok(Some(previous)) = get_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY)
+        && previous == context_id
+    {
+        let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, None);
+    }
+    Ok(())
+}
+
+/// Update `ACTIVE_WINDOW_CONTEXT_KEY` to `context_id`, moving the
+/// previous active context (if any and different) into
+/// `PREVIOUS_WINDOW_CONTEXT_KEY` so `last-window` still works.
+fn mark_context_active(caller: &impl HostRuntimeApi, context_id: Uuid) -> Result<(), String> {
+    let previous = get_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)
+        .ok()
+        .flatten();
+    if let Some(previous) = previous
+        && previous != context_id
+    {
+        let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
+    }
+    set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -422,6 +565,13 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             let ack = close_current_window(context, &plugin.last_selected_by_client)?;
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("closed current window context {id}");
+            }
+            Ok(())
+        }
+        "reset-order" => {
+            let count = reset_window_order(context)?;
+            if emit_to_stdout {
+                println!("reset window order; rebuilt {count} windows");
             }
             Ok(())
         }
@@ -600,6 +750,29 @@ fn publish_window_list_snapshot(caller: &impl HostRuntimeApi) {
     let snapshot = bmux_windows_plugin_api::windows_list::WindowListSnapshot { windows, revision };
     let _ = bmux_plugin::global_event_bus()
         .publish_state(&bmux_windows_plugin_api::windows_list::STATE_KIND, snapshot);
+}
+
+/// Clear persisted `windows.order` and rebuild deterministically from
+/// the current context list.
+///
+/// Serves as an escape hatch for users whose windows.order got
+/// scrambled by pre-event-driven code paths (legacy bug). Ordering is
+/// reconstructed from the context list sorted by UUID, so every
+/// invocation produces the same result given the same input — but it
+/// is NOT guaranteed to match creation order. Users who want exact
+/// creation order should recreate their contexts after reset.
+///
+/// Returns the count of contexts written to the new order.
+fn reset_window_order(caller: &impl HostRuntimeApi) -> Result<usize, String> {
+    let contexts = caller
+        .context_list()
+        .map_err(|error| error.to_string())?
+        .contexts;
+    let mut ids: Vec<Uuid> = contexts.iter().map(|context| context.id).collect();
+    ids.sort_by_key(uuid::Uuid::as_u128);
+    set_stored_window_order_ids(caller, &ids)?;
+    publish_window_list_snapshot(caller);
+    Ok(ids.len())
 }
 
 fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<WindowAck, String> {
@@ -964,6 +1137,19 @@ fn resolve_window_order_ids(
     }
 
     let mut known_ids = order_ids.iter().copied().collect::<HashSet<_>>();
+    // Append any context that isn't in the stored order yet, in the
+    // insertion order of the caller-supplied `contexts` slice. In
+    // the event-driven model this path is only hit as a safety net —
+    // the authoritative source of insertion order is the
+    // `ContextEvent::Created` stream via
+    // `append_context_to_window_order`. When something slips past that
+    // (e.g. a context existed before the subscriber was installed),
+    // we preserve whatever order the caller presented rather than
+    // reshuffling by UUID. The MRU-flavored ordering of the contexts
+    // list is unfortunate but acceptable for the safety-net path;
+    // users who want deterministic order should invoke
+    // `plugin:bmux.windows:reset-order` (which sorts by UUID) or
+    // recreate the contexts through the event-driven path.
     for context in contexts {
         if known_ids.insert(context.id) {
             order_ids.push(context.id);
@@ -3139,5 +3325,113 @@ mod tests {
         let _commands = commands_handle
             .provider_as_trait::<dyn WindowsCommandsService + Send + Sync>()
             .expect("commands handle downcasts to typed trait");
+    }
+
+    /// Simulates three `ContextEvent::Created` events arriving in
+    /// sequence on the contexts-events channel — exactly the stream
+    /// the real subscriber receives. The expected post-state is that
+    /// `windows.order` contains A, B, C in that exact order.
+    #[test]
+    fn append_context_to_window_order_preserves_arrival_sequence() {
+        let host = MockHost::with_sessions(Vec::new());
+        let a = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+        let b = Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
+        let c = Uuid::from_u128(0x3333_3333_3333_3333_3333_3333_3333_3333);
+
+        append_context_to_window_order(&host, a).expect("append A");
+        append_context_to_window_order(&host, b).expect("append B");
+        append_context_to_window_order(&host, c).expect("append C");
+
+        let order = get_stored_window_order_ids(&host).expect("order readable");
+        assert_eq!(order, vec![a, b, c]);
+    }
+
+    /// Duplicate `Created` events for the same id must not push
+    /// duplicates into `windows.order`.
+    #[test]
+    fn append_context_to_window_order_is_idempotent() {
+        let host = MockHost::with_sessions(Vec::new());
+        let a = Uuid::from_u128(0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
+
+        append_context_to_window_order(&host, a).expect("first append");
+        append_context_to_window_order(&host, a).expect("second append");
+
+        let order = get_stored_window_order_ids(&host).expect("order readable");
+        assert_eq!(order, vec![a]);
+    }
+
+    /// Simulates a `ContextEvent::Closed` for a middle entry. The
+    /// remaining entries preserve their relative order.
+    #[test]
+    fn remove_context_from_window_order_preserves_surrounding_order() {
+        let host = MockHost::with_sessions(Vec::new());
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let c = Uuid::from_u128(3);
+
+        set_stored_window_order_ids(&host, &[a, b, c]).expect("seed order");
+        remove_context_from_window_order(&host, b).expect("remove B");
+
+        let order = get_stored_window_order_ids(&host).expect("order readable");
+        assert_eq!(order, vec![a, c]);
+    }
+
+    /// Closing the currently active context also clears the
+    /// `ACTIVE_WINDOW_CONTEXT_KEY` marker so stale pointers don't
+    /// linger.
+    #[test]
+    fn remove_context_from_window_order_clears_stale_active_marker() {
+        let host = MockHost::with_sessions(Vec::new());
+        let a = Uuid::from_u128(42);
+
+        set_stored_window_order_ids(&host, &[a]).expect("seed order");
+        set_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY, Some(a)).expect("set active");
+        remove_context_from_window_order(&host, a).expect("remove A");
+
+        let active =
+            get_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY).expect("active readable");
+        assert!(active.is_none());
+    }
+
+    /// `Selected` event promotes the target into
+    /// `ACTIVE_WINDOW_CONTEXT_KEY` and demotes the previous active
+    /// into `PREVIOUS_WINDOW_CONTEXT_KEY` so `last-window` still works.
+    #[test]
+    fn mark_context_active_promotes_previous_to_last_window_slot() {
+        let host = MockHost::with_sessions(Vec::new());
+        let a = Uuid::from_u128(11);
+        let b = Uuid::from_u128(22);
+
+        set_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY, Some(a)).expect("seed active = A");
+        mark_context_active(&host, b).expect("mark B active");
+
+        assert_eq!(
+            get_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY).expect("active readable"),
+            Some(b)
+        );
+        assert_eq!(
+            get_stored_context_id(&host, PREVIOUS_WINDOW_CONTEXT_KEY).expect("previous readable"),
+            Some(a)
+        );
+    }
+
+    /// Re-selecting the already-active context is a no-op on the
+    /// previous-window slot (no spurious swap to itself).
+    #[test]
+    fn mark_context_active_is_idempotent_when_already_active() {
+        let host = MockHost::with_sessions(Vec::new());
+        let a = Uuid::from_u128(7);
+
+        set_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY, Some(a)).expect("seed active");
+        mark_context_active(&host, a).expect("re-mark active");
+
+        assert_eq!(
+            get_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY).expect("active readable"),
+            Some(a)
+        );
+        assert_eq!(
+            get_stored_context_id(&host, PREVIOUS_WINDOW_CONTEXT_KEY).expect("previous readable"),
+            None
+        );
     }
 }

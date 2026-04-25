@@ -13,6 +13,7 @@ owns_namespaces = [
     "last-window",
     "goto-window",
     "close-current-window",
+    "reset-order",
     "focus-pane-in-direction",
     "split-pane",
     "resize-pane",
@@ -51,6 +52,15 @@ kind         = "command"
 capability   = "bmux.windows.read"
 interface_id = "windows-events"
 kind         = "event"
+
+# Reactive state channel carrying the ordered window list. The server
+# forwards every retained-value replacement as a
+# `ServerEvent::PluginBusEvent` so the attach tab bar sees the exact
+# order the plugin maintains — no polling, no round-trip per frame.
+[[event_publications]]
+delivery                     = "state"
+forward_to_streaming_clients = true
+kind                         = "bmux.windows/windows-list"
 
 [[commands]]
 aliases       = [["window", "new"]]
@@ -200,6 +210,13 @@ expose_in_cli = true
 name          = "close-current-window"
 path          = ["close-current-window"]
 summary       = "Close the current workspace window"
+
+[[commands]]
+aliases       = [["window", "reset-order"]]
+expose_in_cli = true
+name          = "reset-order"
+path          = ["reset-order"]
+summary       = "Reset the persisted window order and rebuild deterministically from current contexts"
 
 # ── Pane-level commands ──────────────────────────────────────────────
 # These commands were previously exposed only as typed-service

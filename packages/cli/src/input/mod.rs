@@ -100,8 +100,7 @@ struct PendingChord {
 
 impl Keymap {
     pub(crate) fn default_runtime() -> Self {
-        let runtime = [
-            ("shift+c", RuntimeAction::NewSession),
+        let runtime: BTreeMap<String, String> = [
             ("o", RuntimeAction::FocusNext),
             ("h", RuntimeAction::FocusLeft),
             ("l", RuntimeAction::FocusRight),
@@ -142,6 +141,10 @@ impl Keymap {
         ]
         .into_iter()
         .map(|(key, action)| (key.to_string(), action_to_name(&action).to_string()))
+        .chain(std::iter::once((
+            "shift+c".to_string(),
+            "plugin:bmux.sessions:new-session".to_string(),
+        )))
         .collect();
 
         let global = BTreeMap::new();
@@ -1121,7 +1124,11 @@ mod tests {
         assert_eq!(actions, vec![RuntimeAction::RestartFocusedPane]);
         assert_eq!(
             processor.process_chunk(&[0x01, b'C']),
-            vec![RuntimeAction::NewSession]
+            vec![RuntimeAction::PluginCommand {
+                plugin_id: "bmux.sessions".to_string(),
+                command_name: "new-session".to_string(),
+                args: Vec::new(),
+            }]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, b'd']),
@@ -1137,8 +1144,12 @@ mod tests {
     fn primary_binding_displays_shifted_letter_as_uppercase() {
         let keymap = Keymap::default_runtime();
         let binding = keymap
-            .primary_binding_for_action(&RuntimeAction::NewSession)
-            .expect("new_session should be bound by default");
+            .primary_binding_for_action(&RuntimeAction::PluginCommand {
+                plugin_id: "bmux.sessions".to_string(),
+                command_name: "new-session".to_string(),
+                args: Vec::new(),
+            })
+            .expect("new-session should be bound by default");
         assert_eq!(binding, "Ctrl-A C");
     }
 

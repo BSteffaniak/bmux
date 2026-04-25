@@ -422,26 +422,39 @@ pub(super) async fn run_server_start(
             if !publication.forward_to_streaming_clients {
                 continue;
             }
-            let spawn_result = if publication.kind.as_str()
-                == bmux_scene_protocol::scene_protocol::EVENT_KIND.as_str()
-            {
-                server.spawn_plugin_bus_forwarder::<
-                    bmux_scene_protocol::scene_protocol::EventPayload,
-                >(&publication.kind)
-            } else if publication.kind.as_str()
-                == bmux_contexts_plugin_api::contexts_events::EVENT_KIND.as_str()
-            {
-                server.spawn_plugin_bus_forwarder::<
-                    bmux_contexts_plugin_api::contexts_events::ContextEvent,
-                >(&publication.kind)
-            } else {
-                tracing::warn!(
-                    plugin_id = plugin.declaration.id.as_str(),
-                    kind = publication.kind.as_str(),
-                    "no plugin-bus forwarder specialization registered for this kind; \
-                     streaming clients will miss emissions until one is added in bootstrap",
-                );
-                continue;
+            let kind = &publication.kind;
+            let spawn_result = match (kind.as_str(), publication.delivery) {
+                (k, bmux_plugin_sdk::PluginEventDelivery::Broadcast)
+                    if k == bmux_scene_protocol::scene_protocol::EVENT_KIND.as_str() =>
+                {
+                    server.spawn_plugin_bus_forwarder::<
+                        bmux_scene_protocol::scene_protocol::EventPayload,
+                    >(kind)
+                }
+                (k, bmux_plugin_sdk::PluginEventDelivery::Broadcast)
+                    if k == bmux_contexts_plugin_api::contexts_events::EVENT_KIND.as_str() =>
+                {
+                    server.spawn_plugin_bus_forwarder::<
+                        bmux_contexts_plugin_api::contexts_events::ContextEvent,
+                    >(kind)
+                }
+                (k, bmux_plugin_sdk::PluginEventDelivery::State)
+                    if k == bmux_windows_plugin_api::windows_list::STATE_KIND.as_str() =>
+                {
+                    server.spawn_plugin_bus_state_forwarder::<
+                        bmux_windows_plugin_api::windows_list::WindowListSnapshot,
+                    >(kind)
+                }
+                _ => {
+                    tracing::warn!(
+                        plugin_id = plugin.declaration.id.as_str(),
+                        kind = kind.as_str(),
+                        delivery = ?publication.delivery,
+                        "no plugin-bus forwarder specialization registered for this kind; \
+                         streaming clients will miss emissions until one is added in bootstrap",
+                    );
+                    continue;
+                }
             };
             if let Err(error) = spawn_result {
                 tracing::warn!(

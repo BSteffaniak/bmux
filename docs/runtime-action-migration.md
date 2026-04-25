@@ -52,9 +52,8 @@ single generic escape hatch — rather than hardcoded variants.
 The following domain variants remain in `RuntimeAction` for backward
 compatibility with the existing `default_runtime` keymap, profile
 TOMLs (`tmux_compat.toml`, `zellij_compat.toml`), and the legacy
-`handle_attach_runtime_action` / `handle_attach_ui_action` branches
-that call into typed dispatch directly instead of going through the
-plugin-command path.
+`handle_attach_ui_action` branches that call into typed dispatch
+directly instead of going through the plugin-command path.
 
 Variants to delete once their behavior is fully migrated:
 

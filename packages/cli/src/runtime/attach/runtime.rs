@@ -211,57 +211,6 @@ async fn typed_list_contexts_bmux(
     })
 }
 
-/// Typed dispatch wrapper for `contexts-commands:create-context`.
-async fn typed_create_context_attach(
-    client: &mut StreamingBmuxClient,
-    name: Option<String>,
-    attributes: std::collections::BTreeMap<String, String>,
-) -> std::result::Result<ContextSummary, ClientError> {
-    #[derive(serde::Serialize)]
-    struct Args {
-        name: Option<String>,
-        attributes: std::collections::BTreeMap<String, String>,
-    }
-    let payload = bmux_codec::to_vec(&Args { name, attributes }).map_err(|error| {
-        ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("encoding create-context args: {error}"),
-        }
-    })?;
-    let response_bytes = client
-        .invoke_service_raw(
-            typed_contexts::CONTEXTS_WRITE_CAPABILITY.as_str(),
-            typed_contexts::COMMAND_KIND,
-            typed_contexts::CONTEXTS_COMMANDS_INTERFACE.as_str(),
-            typed_contexts::OP_CREATE_CONTEXT,
-            payload,
-        )
-        .await?;
-    let outcome: std::result::Result<
-        bmux_contexts_plugin_api::contexts_commands::ContextAck,
-        bmux_contexts_plugin_api::contexts_commands::CreateContextError,
-    > = bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding create-context response: {error}"),
-    })?;
-    match outcome {
-        Ok(ack) => {
-            // Typed contract returns only the id; reconstruct a
-            // minimal `ContextSummary` since the host runtime doesn't
-            // surface the newly created context's full details here.
-            Ok(ContextSummary {
-                id: ack.id,
-                name: None,
-                attributes: std::collections::BTreeMap::new(),
-            })
-        }
-        Err(err) => Err(ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("create-context failed: {err:?}"),
-        }),
-    }
-}
-
 /// Typed dispatch wrapper for `contexts-commands:select-context`.
 async fn typed_select_context_attach(
     client: &mut StreamingBmuxClient,
@@ -1087,6 +1036,25 @@ pub async fn run_session_attach_with_client(
         },
     );
 
+    // Register the windows-plugin's `windows-list` state channel in
+    // this attach process's event bus. The windows plugin publishes
+    // into the server process's bus; the server's
+    // `spawn_plugin_bus_state_forwarder` forwards each snapshot
+    // replacement as `Event::PluginBusEvent`, which this process
+    // decodes and re-publishes onto the local channel (see
+    // `PluginBusEvent` handler below). The local `subscribe_state`
+    // call a few lines down reads from this channel.
+    //
+    // Re-registration is a no-op, so harmless if this runs twice.
+    let _ = bmux_plugin::global_event_bus()
+        .register_state_channel::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
+        bmux_windows_plugin_api::windows_list::STATE_KIND,
+        bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+            windows: Vec::new(),
+            revision: 0,
+        },
+    );
+
     // Honour any startup gates plugins have self-registered via
     // `bmux_plugin::register_startup_ready_gate`. Attach startup
     // blocks briefly for each gate so subsystems like the
@@ -1389,6 +1357,34 @@ pub async fn run_session_attach_with_client(
                                     kind = %kind,
                                     error = %error,
                                     "decoding forwarded contexts-events payload",
+                                );
+                            }
+                        }
+                    } else if kind.as_str()
+                        == bmux_windows_plugin_api::windows_list::STATE_KIND.as_str()
+                    {
+                        // Server-forwarded windows-list snapshot.
+                        // Decode and republish on the local state
+                        // channel. The attach loop's
+                        // `subscribe_state::<WindowListSnapshot>`
+                        // arm wakes and refreshes
+                        // `cached_window_list`, which the tab-bar
+                        // renderer reads on the next draw.
+                        match serde_json::from_slice::<
+                            bmux_windows_plugin_api::windows_list::WindowListSnapshot,
+                        >(payload)
+                        {
+                            Ok(snapshot) => {
+                                let _ = bmux_plugin::global_event_bus().publish_state(
+                                    &bmux_windows_plugin_api::windows_list::STATE_KIND,
+                                    snapshot,
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    kind = %kind,
+                                    error = %error,
+                                    "decoding forwarded windows-list payload",
                                 );
                             }
                         }
@@ -1980,76 +1976,6 @@ pub async fn run_session_attach_with_client(
 pub struct AttachRunOutcome {
     pub status_code: u8,
     pub exit_reason: AttachExitReason,
-}
-
-pub async fn handle_attach_runtime_action(
-    client: &mut StreamingBmuxClient,
-    action: RuntimeAction,
-    view_state: &mut AttachViewState,
-) -> std::result::Result<(), ClientError> {
-    match action {
-        RuntimeAction::NewWindow | RuntimeAction::NewSession => {
-            // The windows-plugin owns tab-N naming via its own
-            // `new-window` command + `publish_window_list_snapshot`.
-            // When core's `NewWindow`/`NewSession` variant is
-            // eventually removed (see docs/runtime-action-migration.md),
-            // this branch goes away entirely and keybindings dispatch
-            // directly to `plugin:bmux.windows:new-window`.
-            //
-            // Until then: pick a `tab-N` default locally by scanning
-            // existing context names so the numbering stays contiguous.
-            let default_name = typed_list_contexts_attach(client)
-                .await
-                .ok()
-                .map(|contexts| {
-                    let mut next = 1_u32;
-                    loop {
-                        let candidate = format!("tab-{next}");
-                        if contexts
-                            .iter()
-                            .all(|context| context.name.as_deref() != Some(candidate.as_str()))
-                        {
-                            return candidate;
-                        }
-                        next = next.saturating_add(1);
-                    }
-                });
-            let context = typed_create_context_attach(
-                client,
-                default_name,
-                std::collections::BTreeMap::new(),
-            )
-            .await?;
-            let attach_info = open_attach_for_context(client, context.id).await?;
-            view_state.attached_id = attach_info.session_id;
-            view_state.attached_context_id = attach_info.context_id.or(Some(context.id));
-            view_state.can_write = attach_info.can_write;
-            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
-                .await?;
-            hydrate_attach_state_from_snapshot(client, view_state).await?;
-            refresh_attach_status_catalog_best_effort(client, view_state).await;
-            let status = attach_context_status_from_catalog(view_state);
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_WELCOME_STATUS_TTL,
-            );
-            if !view_state.can_write {
-                // Raw mode is active inside `handle_attach_runtime_action`;
-                // `println!` would paint over pane content. Surface the
-                // notice through the transient status line instead.
-                view_state.set_transient_status(
-                    "read-only attach: input disabled".to_string(),
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            }
-        }
-        _ => {}
-    }
-
-    Ok(())
 }
 
 /// Apply a plugin-command outcome against the attach view state.
@@ -2858,9 +2784,6 @@ pub async fn handle_attach_ui_action(
                 "Zoom exited"
             };
             view_state.set_transient_status(status, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
-        }
-        RuntimeAction::NewWindow | RuntimeAction::NewSession => {
-            handle_attach_runtime_action(client, action, view_state).await?;
         }
         RuntimeAction::RestartFocusedPane => {
             #[derive(serde::Serialize)]
@@ -4570,7 +4493,7 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
 
     for entry in effective_attach_keybindings(config) {
         let category = match entry.action {
-            RuntimeAction::NewSession | RuntimeAction::Detach | RuntimeAction::Quit => "Session",
+            RuntimeAction::Detach | RuntimeAction::Quit => "Session",
             RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
             | RuntimeAction::FocusNext
@@ -4682,8 +4605,6 @@ pub const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
         action,
         RuntimeAction::Detach
             | RuntimeAction::Quit
-            | RuntimeAction::NewWindow
-            | RuntimeAction::NewSession
             | RuntimeAction::EnterWindowMode
             | RuntimeAction::ExitMode
             | RuntimeAction::EnterScrollMode
@@ -5458,25 +5379,6 @@ pub async fn handle_attach_terminal_event(
                     display_capture.record_activity(bmux_ipc::DisplayActivityKind::Input);
                 }
             }
-            AttachEventAction::Runtime(action) => {
-                if view_state.help_overlay_open || view_state.prompt.is_active() {
-                    continue;
-                }
-                if let Err(error) = handle_attach_runtime_action(client, action, view_state).await {
-                    let mapped = map_attach_client_error(error);
-                    warn!(error = %mapped, "attach.action.runtime_failed");
-                    view_state.set_transient_status(
-                        format!("attach action failed: {mapped}"),
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                } else {
-                    view_state.dirty.status_needs_redraw = true;
-                    view_state.dirty.layout_needs_refresh = true;
-                    view_state.dirty.full_pane_redraw = true;
-                }
-                attach_input_processor.set_scroll_mode(view_state.scrollback_active);
-            }
             AttachEventAction::PluginCommand {
                 plugin_id,
                 command_name,
@@ -5728,24 +5630,6 @@ async fn handle_attach_action_dispatch(
                     .await
             {
                 return Err(map_attach_client_error(error));
-            }
-        }
-        AttachEventAction::Runtime(runtime_action) => {
-            if let Err(error) =
-                handle_attach_runtime_action(client, runtime_action, view_state).await
-            {
-                view_state.set_transient_status(
-                    format!(
-                        "dispatched action failed: {}",
-                        map_attach_client_error(error)
-                    ),
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            } else {
-                view_state.dirty.status_needs_redraw = true;
-                view_state.dirty.layout_needs_refresh = true;
-                view_state.dirty.full_pane_redraw = true;
             }
         }
         AttachEventAction::PluginCommand {
@@ -6413,20 +6297,6 @@ pub async fn handle_attach_mouse_gesture_action(
             .await?;
             Ok(true)
         }
-        AttachEventAction::Runtime(action) => {
-            if let Err(error) = handle_attach_runtime_action(client, action, view_state).await {
-                view_state.set_transient_status(
-                    format!("mouse action failed: {}", map_attach_client_error(error)),
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            } else {
-                view_state.dirty.status_needs_redraw = true;
-                view_state.dirty.layout_needs_refresh = true;
-                view_state.dirty.full_pane_redraw = true;
-            }
-            Ok(true)
-        }
         AttachEventAction::Ui(action) => {
             if let Err(error) = handle_attach_ui_action(client, action, view_state).await {
                 view_state.set_transient_status(
@@ -6685,8 +6555,6 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         // Mutating and mode-switching — never repeat.
         RuntimeAction::Quit
         | RuntimeAction::Detach
-        | RuntimeAction::NewWindow
-        | RuntimeAction::NewSession
         | RuntimeAction::ToggleSplitDirection
         | RuntimeAction::SplitFocusedVertical
         | RuntimeAction::SplitFocusedHorizontal
@@ -6722,7 +6590,6 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
     match action {
         RuntimeAction::Detach => AttachEventAction::Detach,
         RuntimeAction::ForwardToPane(bytes) => AttachEventAction::Send(bytes),
-        RuntimeAction::NewWindow | RuntimeAction::NewSession => AttachEventAction::Runtime(action),
         RuntimeAction::PluginCommand {
             plugin_id,
             command_name,
@@ -7168,8 +7035,6 @@ mod tests {
 
     #[test]
     fn action_supports_repeat_denies_mutating_actions() {
-        assert!(!super::action_supports_repeat(&RuntimeAction::NewWindow));
-        assert!(!super::action_supports_repeat(&RuntimeAction::NewSession));
         assert!(!super::action_supports_repeat(
             &RuntimeAction::CloseFocusedPane
         ));
@@ -7244,12 +7109,6 @@ mod tests {
         )
         .expect("repeat should parse");
         for action in &repeat {
-            if let AttachEventAction::Runtime(a) = action {
-                assert!(
-                    super::action_supports_repeat(a),
-                    "Repeat emitted a repeat-unsafe runtime action",
-                );
-            }
             assert!(
                 !matches!(action, AttachEventAction::PluginCommand { .. }),
                 "Repeat must never emit a PluginCommand",
@@ -8294,9 +8153,11 @@ mod tests {
         .expect("attach key action should parse");
         assert!(matches!(
             new_session.first(),
-            Some(AttachEventAction::Runtime(
-                crate::input::RuntimeAction::NewSession
-            ))
+            Some(AttachEventAction::PluginCommand {
+                plugin_id,
+                command_name,
+                ..
+            }) if plugin_id == "bmux.sessions" && command_name == "new-session"
         ));
     }
 
@@ -8460,10 +8321,10 @@ mod tests {
     #[test]
     fn attach_keybindings_allow_global_override_of_default_session_key() {
         let mut config = BmuxConfig::default();
-        config
-            .keybindings
-            .global
-            .insert("ctrl+t".to_string(), "new_session".to_string());
+        config.keybindings.global.insert(
+            "ctrl+t".to_string(),
+            "plugin:bmux.sessions:new-session".to_string(),
+        );
 
         let mut processor = InputProcessor::new(attach_keymap_from_config(&config), false);
         let actions = attach_key_event_actions(
@@ -8479,9 +8340,11 @@ mod tests {
 
         assert!(matches!(
             actions.first(),
-            Some(AttachEventAction::Runtime(
-                crate::input::RuntimeAction::NewSession
-            ))
+            Some(AttachEventAction::PluginCommand {
+                plugin_id,
+                command_name,
+                ..
+            }) if plugin_id == "bmux.sessions" && command_name == "new-session"
         ));
     }
 

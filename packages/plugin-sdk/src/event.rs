@@ -108,6 +108,30 @@ impl PluginEventSubscription {
     }
 }
 
+/// Delivery semantics for a published plugin event kind.
+///
+/// Distinguishes transient broadcast events from reactive state
+/// channels. The server's forwarder needs to know which mode the
+/// plugin publishes under so it subscribes via the matching API
+/// ([`crate::EventBus::subscribe`] vs `subscribe_state`). The
+/// plugin-manifest loader surfaces this as an opt-in string
+/// (`"broadcast"` or `"state"`); missing values default to
+/// [`PluginEventDelivery::Broadcast`] to match the historical
+/// behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginEventDelivery {
+    /// Transient broadcast — every emission fans out to every live
+    /// subscriber exactly once. Late subscribers miss prior events.
+    /// Corresponds to `events <type>;` in the BPDL schema.
+    #[default]
+    Broadcast,
+    /// Reactive state — the last published value is retained and
+    /// replayed synchronously to new subscribers. Corresponds to
+    /// `@state events <type>;` in the BPDL schema.
+    State,
+}
+
 /// A declaration that a plugin publishes events of a given kind, with
 /// hints about how the host should route them.
 ///
@@ -128,15 +152,35 @@ pub struct PluginEventPublication {
     /// to avoid paying the IPC cost.
     #[serde(default)]
     pub forward_to_streaming_clients: bool,
+    /// Delivery mode — `"broadcast"` (default) for transient events,
+    /// `"state"` for reactive state channels. The server's forwarder
+    /// must pick the matching subscription API; a mismatch would
+    /// return [`crate::EventBusError::ChannelDeliveryMismatch`] at
+    /// spawn time.
+    #[serde(default)]
+    pub delivery: PluginEventDelivery,
 }
 
 impl PluginEventPublication {
-    /// Construct a publication entry for `kind` with forwarding on.
+    /// Construct a broadcast publication entry for `kind` with
+    /// forwarding on.
     #[must_use]
     pub const fn streaming(kind: PluginEventKind) -> Self {
         Self {
             kind,
             forward_to_streaming_clients: true,
+            delivery: PluginEventDelivery::Broadcast,
+        }
+    }
+
+    /// Construct a state-channel publication entry for `kind` with
+    /// forwarding on.
+    #[must_use]
+    pub const fn streaming_state(kind: PluginEventKind) -> Self {
+        Self {
+            kind,
+            forward_to_streaming_clients: true,
+            delivery: PluginEventDelivery::State,
         }
     }
 }

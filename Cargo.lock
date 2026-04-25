@@ -1948,6 +1948,7 @@ dependencies = [
  "bmux_windows_plugin_api",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
