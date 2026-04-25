@@ -14,8 +14,9 @@
 pub mod glyphs;
 pub mod scripting;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
@@ -66,6 +67,10 @@ struct State {
     /// Display path of the active script (used for perf + error
     /// messages). `None` when no script is loaded.
     script_path: Option<PathBuf>,
+    /// Fingerprint of the active script source. Used to preserve the
+    /// live Lua VM when a theme preview and final selection apply the
+    /// same script back-to-back.
+    script_source_hash: Option<u64>,
     /// Monotonic start instant used to populate `DecorateContext::time_ms`.
     /// Set when the first script is installed so relative timings are
     /// stable across reloads.
@@ -97,6 +102,7 @@ impl std::fmt::Debug for State {
             .field("scene_revision", &self.scene_revision)
             .field("current_theme", &self.current_theme)
             .field("script_path", &self.script_path)
+            .field("script_source_hash", &self.script_source_hash)
             .field("script_frame", &self.script_frame)
             .field("animation_hz", &self.animation_hz)
             .finish_non_exhaustive()
@@ -1660,12 +1666,24 @@ fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
     let Some(script) = script else {
         state.script_backend = None;
         state.script_path = None;
+        state.script_source_hash = None;
         state.script_started_at = None;
         state.script_frame = 0;
         state.script_perf = None;
         state.script_first_invoke_logged = false;
         return;
     };
+    let source_hash = script_source_hash(&script.path, &script.source);
+    if state.script_backend.is_some()
+        && state.script_path.as_ref() == Some(&script.path)
+        && state.script_source_hash == Some(source_hash)
+    {
+        tracing::debug!(
+            script = ?script.path,
+            "decoration script unchanged; preserving existing backend",
+        );
+        return;
+    }
     let backend = crate::scripting::make_backend();
     if !backend.is_functional() {
         tracing::warn!(
@@ -1686,6 +1704,7 @@ fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
     }
     state.script_backend = Some(backend);
     state.script_path = Some(script.path.clone());
+    state.script_source_hash = Some(source_hash);
     state.script_started_at = Some(Instant::now());
     state.script_frame = 0;
     state.script_perf = Some(PerfTracker::new(
@@ -1700,6 +1719,13 @@ fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
             .map_or("none", |b| b.name()),
         "decoration script compiled and installed",
     );
+}
+
+fn script_source_hash(path: &std::path::Path, source: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    source.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Background timer that re-invokes the decoration script at `hz`
@@ -2971,7 +2997,32 @@ exited = ""
                 Some(Path::new("bundled:test"))
             );
             assert!(state.script_started_at.is_some());
+            assert!(state.script_source_hash.is_some());
         }
+    }
+
+    #[test]
+    fn install_script_backend_preserves_identical_script_backend() {
+        let plugin = DecorationPlugin::new();
+        let mut state = plugin.state.inner.lock().expect("lock");
+        let script = ResolvedScript {
+            path: PathBuf::from("bundled:test"),
+            source: "function decorate(ctx) return {} end".into(),
+        };
+        install_script_backend(&mut state, Some(script.clone()));
+        let started_at = state
+            .script_started_at
+            .expect("initial install records start instant");
+        let source_hash = state
+            .script_source_hash
+            .expect("initial install records source hash");
+        state.script_frame = 42;
+
+        install_script_backend(&mut state, Some(script));
+
+        assert_eq!(state.script_started_at, Some(started_at));
+        assert_eq!(state.script_source_hash, Some(source_hash));
+        assert_eq!(state.script_frame, 42, "frame is preserved");
     }
 
     #[test]
@@ -3153,6 +3204,7 @@ exited = ""
 
         assert!(state.script_backend.is_none(), "backend cleared");
         assert!(state.script_path.is_none(), "script path cleared");
+        assert!(state.script_source_hash.is_none(), "source hash cleared");
         assert!(state.script_started_at.is_none(), "start instant cleared");
         assert!(state.script_perf.is_none(), "perf tracker cleared");
         assert_eq!(state.script_frame, 0, "frame reset");
