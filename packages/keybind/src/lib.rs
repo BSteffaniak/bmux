@@ -10,8 +10,6 @@ pub enum RuntimeAction {
     Detach,
     NewWindow,
     NewSession,
-    SessionPrev,
-    SessionNext,
     FocusNext,
     FocusPrev,
     FocusLeft,
@@ -77,8 +75,6 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::Detach => "detach",
         RuntimeAction::NewWindow => "new_window",
         RuntimeAction::NewSession => "new_session",
-        RuntimeAction::SessionPrev => "session_prev",
-        RuntimeAction::SessionNext => "session_next",
         RuntimeAction::FocusNext => "focus_next_pane",
         RuntimeAction::FocusPrev => "focus_previous_pane",
         RuntimeAction::FocusLeft => "focus_left_pane",
@@ -184,8 +180,21 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
         "detach" => Ok(RuntimeAction::Detach),
         "new_window" => Ok(RuntimeAction::NewWindow),
         "new_session" => Ok(RuntimeAction::NewSession),
-        "session_prev" => Ok(RuntimeAction::SessionPrev),
-        "session_next" => Ok(RuntimeAction::SessionNext),
+        // Legacy aliases: `session_prev` / `session_next` used to
+        // cycle contexts in core. Tab navigation now belongs entirely
+        // to the windows plugin; accept the old names as aliases for
+        // the canonical plugin commands so existing user configs
+        // continue to parse.
+        "session_prev" => Ok(RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "prev-window".to_string(),
+            args: Vec::new(),
+        }),
+        "session_next" => Ok(RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "next-window".to_string(),
+            args: Vec::new(),
+        }),
         "focus_next_pane" => Ok(RuntimeAction::FocusNext),
         "focus_previous_pane" | "focus_prev_pane" => Ok(RuntimeAction::FocusPrev),
         "focus_left_pane" => Ok(RuntimeAction::FocusLeft),

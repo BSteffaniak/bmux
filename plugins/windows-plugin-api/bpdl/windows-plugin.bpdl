@@ -2,10 +2,12 @@
 // depend on `bmux_windows_plugin_api` import these interfaces rather
 // than the windows plugin implementation itself.
 //
-// Three interfaces:
+// Four interfaces:
 // - `windows-state` — read-only queries about panes and windows.
 // - `windows-commands` — mutating operations on panes and windows.
 // - `windows-events` — event stream of window/pane lifecycle changes.
+// - `windows-list` — reactive state channel carrying the ordered
+//   window list for tab-bar rendering + positional navigation.
 
 plugin bmux.windows version 1;
 
@@ -203,4 +205,42 @@ interface windows-events {
     }
 
     events pane-event;
+}
+
+// Reactive state channel carrying the ordered list of windows in the
+// order consumers should render them (and navigate through). The
+// windows plugin owns the authoritative window order (persisted in its
+// plugin-local storage under `windows.order`) and publishes a fresh
+// snapshot on every mutation: new-window, switch-window, kill-window,
+// kill-all-windows, goto-window, close-current-window, next/prev/last
+// window.
+//
+// Subscribers (notably the attach tab bar) consume this via
+// `EventBus::subscribe_state::<WindowListSnapshot>` to observe the
+// current ordered list synchronously plus a live-update receiver.
+// This lets the tab bar render the exact order the plugin maintains
+// and lets next/prev navigation walk the same order without a
+// round-trip query per frame.
+//
+// Payload semantics:
+// - `windows` is the ordered list of live windows; consumers render
+//   positional indices (`1:`, `2:`, …) from this order.
+// - `active` on each entry is `true` for the current active window
+//   (as resolved by the plugin's effective-current-context logic) and
+//   `false` otherwise.
+// - `revision` is a monotonic counter advancing on every publish;
+//   consumers can use it to deduplicate or order updates.
+interface windows-list {
+    record window-list-snapshot {
+        windows: list<window-list-entry>,
+        revision: u64,
+    }
+
+    record window-list-entry {
+        id: uuid,
+        name: string,
+        active: bool,
+    }
+
+    @state events window-list-snapshot;
 }

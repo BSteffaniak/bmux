@@ -51,6 +51,23 @@ impl RustPlugin for WindowsPlugin {
             .register_channel::<bmux_windows_plugin_api::windows_events::PaneEvent>(
                 bmux_windows_plugin_api::windows_events::EVENT_KIND,
             );
+
+        // Register the reactive state channel carrying the ordered
+        // window list. The attach tab bar subscribes via
+        // `subscribe_state::<WindowListSnapshot>` and observes every
+        // order mutation without polling. Seed with an empty snapshot
+        // — the first real publish happens on the first mutation
+        // (new-window / switch-window / …). If a consumer activates
+        // before the first mutation they see an empty list, which
+        // correctly reflects that no windows exist yet.
+        bmux_plugin::global_event_bus()
+            .register_state_channel::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
+                bmux_windows_plugin_api::windows_list::STATE_KIND,
+                bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+                    windows: Vec::new(),
+                    revision: 0,
+                },
+            );
         Ok(EXIT_OK)
     }
 
@@ -543,6 +560,48 @@ fn list_windows(
         .collect())
 }
 
+/// Monotonic counter for the windows-list state channel.
+///
+/// Advanced once per [`publish_window_list_snapshot`] call so
+/// subscribers can deduplicate or order updates without relying on
+/// wall-clock time.
+static WINDOW_LIST_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Publish the current ordered window list on the `windows-list`
+/// state channel.
+///
+/// Called by every window-order-mutating code path (`create_window`,
+/// `switch_window`, `kill_window`, `kill_all_windows`,
+/// `goto_window_by_index`, `cycle_window`, `close_current_window`) so
+/// subscribers (the attach tab bar, future UI plugins) observe the
+/// current order synchronously on `subscribe_state` and receive live
+/// updates on every mutation — no polling.
+///
+/// Silently no-ops when the underlying `list_windows` call fails or
+/// when the state channel has not been registered (plugin not yet
+/// activated). The channel is seeded empty in `activate`, so once the
+/// plugin is active this publish always succeeds.
+fn publish_window_list_snapshot(caller: &impl HostRuntimeApi) {
+    let Ok(entries) = list_windows(caller, None) else {
+        return;
+    };
+    let windows: Vec<bmux_windows_plugin_api::windows_list::WindowListEntry> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let id = Uuid::parse_str(&entry.id).ok()?;
+            Some(bmux_windows_plugin_api::windows_list::WindowListEntry {
+                id,
+                name: entry.name,
+                active: entry.active,
+            })
+        })
+        .collect();
+    let revision = WINDOW_LIST_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let snapshot = bmux_windows_plugin_api::windows_list::WindowListSnapshot { windows, revision };
+    let _ = bmux_plugin::global_event_bus()
+        .publish_state(&bmux_windows_plugin_api::windows_list::STATE_KIND, snapshot);
+}
+
 fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<WindowAck, String> {
     let resolved_name = name.or_else(|| {
         caller
@@ -564,6 +623,7 @@ fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<W
         let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
     }
     let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
+    publish_window_list_snapshot(caller);
     Ok(WindowAck {
         ok: true,
         id: Some(context_id.to_string()),
@@ -595,6 +655,7 @@ fn kill_window(
             force: force_local,
         })
         .map_err(|error| error.to_string())?;
+    publish_window_list_snapshot(caller);
     Ok(WindowAck {
         ok: true,
         id: Some(response.id.to_string()),
@@ -614,6 +675,7 @@ fn kill_all_windows(caller: &impl HostRuntimeApi, force_local: bool) -> Result<W
             })
             .map_err(|error| error.to_string())?;
     }
+    publish_window_list_snapshot(caller);
     Ok(WindowAck { ok: true, id: None })
 }
 
@@ -647,6 +709,7 @@ fn switch_window(
         let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
     }
     let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
+    publish_window_list_snapshot(caller);
     Ok(WindowAck {
         ok: true,
         id: Some(context_id.to_string()),
@@ -779,6 +842,7 @@ fn close_current_window(
         })
         .map_err(|error| error.to_string())?;
 
+    publish_window_list_snapshot(caller);
     Ok(WindowAck {
         ok: true,
         id: Some(current_id.to_string()),

@@ -211,19 +211,6 @@ async fn typed_list_contexts_bmux(
     })
 }
 
-/// Convert a typed `ContextSummary` (from `bmux_contexts_plugin_api`)
-/// to the IPC `ContextSummary` used throughout the attach runtime.
-/// Field layouts are identical so this is a straightforward move.
-fn typed_to_ipc_context_summary(
-    typed: bmux_contexts_plugin_api::contexts_state::ContextSummary,
-) -> ContextSummary {
-    ContextSummary {
-        id: typed.id,
-        name: typed.name,
-        attributes: typed.attributes,
-    }
-}
-
 /// Typed dispatch wrapper for `contexts-commands:create-context`.
 async fn typed_create_context_attach(
     client: &mut StreamingBmuxClient,
@@ -1213,6 +1200,25 @@ pub async fn run_session_attach_with_client(
         )
         .ok();
 
+    // Subscribe to the windows-plugin `windows-list` state channel so
+    // the attach tab bar can render the authoritative plugin-owned
+    // window order without polling. Seeds `view_state.cached_window_list`
+    // synchronously with the current value (if any), then drives live
+    // updates through a `tokio::select!` arm below. When the plugin
+    // has not registered the channel (plugin absent / not yet
+    // activated), the tab bar falls back to `cached_contexts` in raw
+    // server order — baseline behavior per AGENTS.md.
+    let mut window_list_rx = match bmux_plugin::global_event_bus()
+        .subscribe_state::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
+        &bmux_windows_plugin_api::windows_list::STATE_KIND,
+    ) {
+        Ok((initial, rx)) => {
+            view_state.cached_window_list = Some(initial);
+            Some(rx)
+        }
+        Err(_) => None,
+    };
+
     loop {
         // ── Event-driven select: sleep until something happens ────────
         tokio::select! {
@@ -1500,6 +1506,28 @@ pub async fn run_session_attach_with_client(
                 } else {
                     // Broadcast lagged/closed — drop subscription.
                     scene_event_rx = None;
+                }
+            }
+
+            // Windows-plugin published a new ordered window list.
+            // The tab bar reads `cached_window_list` on every render;
+            // capturing the latest value here + marking the status as
+            // needing redraw is all the work required — no polling,
+            // no re-invocation, no round-trip.
+            window_list_result = async {
+                match &mut window_list_rx {
+                    Some(rx) => rx.changed().await.ok().map(|()| rx.borrow().clone()),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(snapshot) = window_list_result {
+                    view_state.cached_window_list = Some(snapshot);
+                    view_state.dirty.status_needs_redraw = true;
+                } else {
+                    // Channel closed — drop subscription; fallback
+                    // path in build_attach_tabs_from_catalog covers
+                    // the plugin-absent case.
+                    window_list_rx = None;
                 }
             }
 
@@ -1961,15 +1989,30 @@ pub async fn handle_attach_runtime_action(
 ) -> std::result::Result<(), ClientError> {
     match action {
         RuntimeAction::NewWindow | RuntimeAction::NewSession => {
+            // The windows-plugin owns tab-N naming via its own
+            // `new-window` command + `publish_window_list_snapshot`.
+            // When core's `NewWindow`/`NewSession` variant is
+            // eventually removed (see docs/runtime-action-migration.md),
+            // this branch goes away entirely and keybindings dispatch
+            // directly to `plugin:bmux.windows:new-window`.
+            //
+            // Until then: pick a `tab-N` default locally by scanning
+            // existing context names so the numbering stays contiguous.
             let default_name = typed_list_contexts_attach(client)
                 .await
                 .ok()
                 .map(|contexts| {
-                    let ipc: Vec<ContextSummary> = contexts
-                        .into_iter()
-                        .map(typed_to_ipc_context_summary)
-                        .collect();
-                    next_default_tab_name_for_contexts(&ipc)
+                    let mut next = 1_u32;
+                    loop {
+                        let candidate = format!("tab-{next}");
+                        if contexts
+                            .iter()
+                            .all(|context| context.name.as_deref() != Some(candidate.as_str()))
+                        {
+                            return candidate;
+                        }
+                        next = next.saturating_add(1);
+                    }
                 });
             let context = typed_create_context_attach(
                 client,
@@ -2657,30 +2700,6 @@ pub async fn handle_attach_ui_action(
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
-        RuntimeAction::SessionPrev => {
-            view_state.exit_scrollback();
-            switch_attach_session_relative(client, view_state, -1).await?;
-            refresh_attach_status_catalog_best_effort(client, view_state).await;
-            let status = attach_context_status_from_catalog(view_state);
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-        }
-        RuntimeAction::SessionNext => {
-            view_state.exit_scrollback();
-            switch_attach_session_relative(client, view_state, 1).await?;
-            refresh_attach_status_catalog_best_effort(client, view_state).await;
-            let status = attach_context_status_from_catalog(view_state);
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-        }
         RuntimeAction::Quit => {
             if view_state.prompt.is_busy() {
                 view_state.set_transient_status(
@@ -3247,93 +3266,11 @@ pub fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(u
         })
 }
 
-pub async fn switch_attach_session_relative(
-    client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
-    step: isize,
-) -> std::result::Result<(), ClientError> {
-    if view_state.cached_contexts.is_empty() && view_state.cached_sessions.is_empty() {
-        refresh_attach_status_catalog_best_effort(client, view_state).await;
-    }
-
-    if let Some(current_context_id) = view_state.attached_context_id
-        && let Some(target_context_id) =
-            relative_context_id(&view_state.cached_contexts, current_context_id, step)
-    {
-        typed_select_context_attach(client, target_context_id).await?;
-        let attach_info = open_attach_for_context(client, target_context_id).await?;
-        view_state.attached_id = attach_info.session_id;
-        view_state.attached_context_id = attach_info.context_id.or(Some(target_context_id));
-        view_state.can_write = attach_info.can_write;
-        update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
-        hydrate_attach_state_from_snapshot(client, view_state).await?;
-        return Ok(());
-    }
-
-    let Some(target_session_id) =
-        relative_session_id(&view_state.cached_sessions, view_state.attached_id, step)
-    else {
-        return Ok(());
-    };
-
-    let attach_info = open_attach_for_session(client, target_session_id).await?;
-    view_state.attached_id = attach_info.session_id;
-    view_state.attached_context_id = attach_info.context_id;
-    view_state.can_write = attach_info.can_write;
-    update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
-    hydrate_attach_state_from_snapshot(client, view_state).await?;
-    Ok(())
-}
-
-pub fn relative_session_id(
-    sessions: &[SessionSummary],
-    current_session_id: Uuid,
-    step: isize,
-) -> Option<Uuid> {
-    if sessions.is_empty() {
-        return None;
-    }
-
-    let current_index = sessions
-        .iter()
-        .position(|session| session.id == current_session_id)
-        .unwrap_or(0);
-    let len = sessions.len().cast_signed();
-    let mut target_index = current_index.cast_signed() + step;
-    while target_index < 0 {
-        target_index += len;
-    }
-    target_index %= len;
-    sessions
-        .get(target_index.cast_unsigned())
-        .map(|session| session.id)
-}
-
-pub fn relative_context_id(
-    contexts: &[ContextSummary],
-    current_context_id: Uuid,
-    step: isize,
-) -> Option<Uuid> {
-    if contexts.is_empty() {
-        return None;
-    }
-
-    let current_index = contexts
-        .iter()
-        .position(|context| context.id == current_context_id)
-        .unwrap_or(0);
-    let len = contexts.len().cast_signed();
-    let mut target_index = current_index.cast_signed() + step;
-    while target_index < 0 {
-        target_index += len;
-    }
-    target_index %= len;
-    contexts
-        .get(target_index.cast_unsigned())
-        .map(|context| context.id)
-}
-
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::needless_pass_by_ref_mut
+)]
 pub fn build_attach_status_line_for_draw(
     _client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -3434,8 +3371,24 @@ pub fn attach_mode_hint(mode_id: &str, _ui_mode: AttachUiMode, keymap: &Keymap) 
     let quit = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::Quit);
     let help = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::ShowHelp);
     let restart = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::RestartFocusedPane);
-    let prev = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::SessionPrev);
-    let next = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::SessionNext);
+    let prev = key_hint_or_unbound(
+        keymap,
+        mode_id,
+        &RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "prev-window".to_string(),
+            args: Vec::new(),
+        },
+    );
+    let next = key_hint_or_unbound(
+        keymap,
+        mode_id,
+        &RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "next-window".to_string(),
+            args: Vec::new(),
+        },
+    );
     format!(
         "{prev}/{next} tabs | {detach} detach | {restart} restart pane | {quit} quit | {help} help"
     )
@@ -4093,7 +4046,118 @@ pub fn render_attach_frame(
 
 pub fn build_attach_tabs_from_catalog(
     contexts: &[ContextSummary],
-    view_state: &mut AttachViewState,
+    view_state: &AttachViewState,
+    status_config: &bmux_config::StatusBarConfig,
+    context_id: Option<Uuid>,
+    session_id: Uuid,
+) -> Vec<AttachTab> {
+    // Prefer the windows-plugin's authoritative ordered window list
+    // whenever it has been published. The plugin owns tab ordering
+    // (`windows.order` persisted storage) and publishes a fresh
+    // snapshot on every mutation via the `windows-list` state channel.
+    // Subscribing to that channel (see attach main loop) keeps
+    // `cached_window_list` live without polling.
+    //
+    // Two opt-out paths remain for MRU-flavored status-bar configs so
+    // existing semantics survive the migration:
+    //   - `tab_scope = Mru` and `tab_order = Mru` — use the raw MRU
+    //     order from `cached_contexts`.
+    //   - `tab_scope = SessionContexts` — filter the plugin list
+    //     (if the plugin filtered view is empty, fall back to the full
+    //     plugin list).
+    let use_mru = matches!(status_config.tab_scope, bmux_config::StatusTabScope::Mru)
+        || matches!(status_config.tab_order, bmux_config::StatusTabOrder::Mru);
+
+    if !use_mru && let Some(snapshot) = view_state.cached_window_list.as_ref() {
+        return build_attach_tabs_from_plugin_snapshot(
+            snapshot,
+            contexts,
+            status_config,
+            context_id,
+            session_id,
+        );
+    }
+
+    build_attach_tabs_from_raw_contexts(contexts, status_config, context_id, session_id)
+}
+
+/// Project the windows-plugin's authoritative ordered window list onto
+/// the attach tab-bar view. Called whenever `cached_window_list` has
+/// been populated from the `windows-list` state channel.
+fn build_attach_tabs_from_plugin_snapshot(
+    snapshot: &bmux_windows_plugin_api::windows_list::WindowListSnapshot,
+    contexts: &[ContextSummary],
+    status_config: &bmux_config::StatusBarConfig,
+    context_id: Option<Uuid>,
+    session_id: Uuid,
+) -> Vec<AttachTab> {
+    if snapshot.windows.is_empty() {
+        return vec![AttachTab {
+            label: "terminal".to_string(),
+            active: true,
+            context_id: None,
+        }];
+    }
+
+    // Filter to this session's contexts if the user asked for
+    // `SessionContexts` scope. Cross-reference `cached_contexts` to
+    // locate the `bmux.session_id` attribute for each window.
+    let filtered: Vec<&bmux_windows_plugin_api::windows_list::WindowListEntry> = if matches!(
+        status_config.tab_scope,
+        bmux_config::StatusTabScope::SessionContexts
+    ) {
+        let session_match: Vec<_> = snapshot
+            .windows
+            .iter()
+            .filter(|entry| {
+                contexts
+                    .iter()
+                    .find(|context| context.id == entry.id)
+                    .is_some_and(|context| {
+                        context
+                            .attributes
+                            .get("bmux.session_id")
+                            .is_some_and(|value| value == &session_id.to_string())
+                    })
+            })
+            .collect();
+        if session_match.is_empty() {
+            snapshot.windows.iter().collect()
+        } else {
+            session_match
+        }
+    } else {
+        snapshot.windows.iter().collect()
+    };
+
+    let current_id = context_id.or_else(|| {
+        contexts
+            .iter()
+            .find(|context| {
+                context
+                    .attributes
+                    .get("bmux.session_id")
+                    .is_some_and(|value| value == &session_id.to_string())
+            })
+            .map(|context| context.id)
+    });
+
+    filtered
+        .into_iter()
+        .map(|entry| AttachTab {
+            label: entry.name.clone(),
+            active: entry.active || current_id == Some(entry.id),
+            context_id: Some(entry.id),
+        })
+        .collect()
+}
+
+/// Baseline tab-bar renderer when no plugin snapshot is available
+/// (plugin absent, not yet activated, or user opted into MRU mode).
+/// Renders `cached_contexts` in the order the server delivered them.
+/// Core does not stabilize or reorder — that's the plugin's job.
+fn build_attach_tabs_from_raw_contexts(
+    contexts: &[ContextSummary],
     status_config: &bmux_config::StatusBarConfig,
     context_id: Option<Uuid>,
     session_id: Uuid,
@@ -4129,14 +4193,6 @@ pub fn build_attach_tabs_from_catalog(
         }
     };
 
-    let tab_contexts = if matches!(status_config.tab_scope, bmux_config::StatusTabScope::Mru)
-        || matches!(status_config.tab_order, bmux_config::StatusTabOrder::Mru)
-    {
-        tab_contexts
-    } else {
-        stabilize_tab_order(tab_contexts, &mut view_state.cached_tab_order)
-    };
-
     let current_context_id = context_id.or_else(|| {
         tab_contexts
             .iter()
@@ -4157,28 +4213,6 @@ pub fn build_attach_tabs_from_catalog(
             active: current_context_id == Some(context.id),
             context_id: Some(context.id),
         })
-        .collect()
-}
-
-pub fn stabilize_tab_order(
-    contexts: Vec<ContextSummary>,
-    cached_tab_order: &mut Vec<Uuid>,
-) -> Vec<ContextSummary> {
-    let mut by_id = BTreeMap::new();
-    for context in contexts {
-        by_id.insert(context.id, context);
-    }
-
-    cached_tab_order.retain(|id| by_id.contains_key(id));
-    for id in by_id.keys() {
-        if !cached_tab_order.contains(id) {
-            cached_tab_order.push(*id);
-        }
-    }
-
-    cached_tab_order
-        .iter()
-        .filter_map(|id| by_id.remove(id))
         .collect()
 }
 
@@ -4217,20 +4251,6 @@ pub fn context_summary_label(context: &ContextSummary, fallback_index: Option<us
             || fallback_index.map_or_else(|| "tab".to_string(), |index| format!("tab-{index}")),
             ToString::to_string,
         )
-}
-
-pub fn next_default_tab_name_for_contexts(contexts: &[ContextSummary]) -> String {
-    let mut next = 1_u32;
-    loop {
-        let candidate = format!("tab-{next}");
-        if contexts
-            .iter()
-            .all(|context| context.name.as_deref() != Some(candidate.as_str()))
-        {
-            return candidate;
-        }
-        next = next.saturating_add(1);
-    }
 }
 
 pub fn resolve_attach_session_label_and_count_from_catalog(
@@ -4550,11 +4570,7 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
 
     for entry in effective_attach_keybindings(config) {
         let category = match entry.action {
-            RuntimeAction::NewSession
-            | RuntimeAction::SessionPrev
-            | RuntimeAction::SessionNext
-            | RuntimeAction::Detach
-            | RuntimeAction::Quit => "Session",
+            RuntimeAction::NewSession | RuntimeAction::Detach | RuntimeAction::Quit => "Session",
             RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
             | RuntimeAction::FocusNext
@@ -4668,8 +4684,6 @@ pub const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::Quit
             | RuntimeAction::NewWindow
             | RuntimeAction::NewSession
-            | RuntimeAction::SessionPrev
-            | RuntimeAction::SessionNext
             | RuntimeAction::EnterWindowMode
             | RuntimeAction::ExitMode
             | RuntimeAction::EnterScrollMode
@@ -6645,8 +6659,6 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         | RuntimeAction::FocusRight
         | RuntimeAction::FocusUp
         | RuntimeAction::FocusDown
-        | RuntimeAction::SessionNext
-        | RuntimeAction::SessionPrev
         | RuntimeAction::WindowNext
         | RuntimeAction::WindowPrev
         | RuntimeAction::ScrollUpLine
@@ -6720,9 +6732,7 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
             command_name,
             args,
         },
-        RuntimeAction::SessionPrev
-        | RuntimeAction::SessionNext
-        | RuntimeAction::EnterWindowMode
+        RuntimeAction::EnterWindowMode
         | RuntimeAction::SplitFocusedVertical
         | RuntimeAction::SplitFocusedHorizontal
         | RuntimeAction::FocusNext
@@ -6806,7 +6816,7 @@ mod tests {
     use bmux_config::{BmuxConfig, MouseClickPropagation, MouseWheelPropagation};
     use bmux_ipc::{
         AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        AttachViewComponent, PaneLayoutNode, PaneState, PaneSummary, SessionSummary,
+        AttachViewComponent, PaneLayoutNode, PaneState, PaneSummary,
     };
 
     use crossterm::event::{
@@ -8519,37 +8529,6 @@ mod tests {
         let hint = attach_mode_hint("normal", AttachUiMode::Normal, &keymap);
         assert!(hint.contains("Ctrl-A d quit") || hint.contains("q quit"));
         assert!(hint.contains("detach"));
-    }
-
-    #[test]
-    fn relative_session_id_wraps_between_sessions() {
-        let session_a = Uuid::from_u128(1);
-        let session_b = Uuid::from_u128(2);
-        let sessions = vec![
-            SessionSummary {
-                id: session_a,
-                name: Some("a".to_string()),
-                client_count: 1,
-            },
-            SessionSummary {
-                id: session_b,
-                name: Some("b".to_string()),
-                client_count: 1,
-            },
-        ];
-
-        assert_eq!(
-            relative_session_id(&sessions, session_a, -1),
-            Some(session_b)
-        );
-        assert_eq!(
-            relative_session_id(&sessions, session_a, 1),
-            Some(session_b)
-        );
-        assert_eq!(
-            relative_session_id(&sessions, session_b, 1),
-            Some(session_a)
-        );
     }
 
     #[test]

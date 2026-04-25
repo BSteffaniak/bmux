@@ -58,21 +58,20 @@ plugin-command path.
 
 Variants to delete once their behavior is fully migrated:
 
-| Variant                             | Replacement                                                     | Blocker                                                                         |
-| ----------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `NewWindow`                         | `plugin:bmux.windows:new-window`                                | Default keymap still uses the bare name                                         |
-| `NewSession`                        | `plugin:bmux.sessions:new-session`                              | Same                                                                            |
-| `SessionPrev` / `SessionNext`       | `plugin:bmux.sessions:prev-session` / `next-session`            | sessions-plugin needs these commands + port of `switch_attach_session_relative` |
-| `FocusNext/Prev/Left/Right/Up/Down` | `plugin:bmux.windows:focus-pane-in-direction --direction <dir>` | Default keymap + test rewrites                                                  |
-| `SplitFocusedVertical/Horizontal`   | `plugin:bmux.windows:split-pane --direction <dir>`              | Same                                                                            |
-| `IncreaseSplit/DecreaseSplit`       | `plugin:bmux.windows:resize-pane --direction increase/decrease` | Same                                                                            |
-| `ResizeLeft/Right/Up/Down`          | `plugin:bmux.windows:resize-pane --direction <dir>`             | Same                                                                            |
-| `ZoomPane`                          | `plugin:bmux.windows:zoom-pane`                                 | Same                                                                            |
-| `CloseFocusedPane`                  | attach-runtime prompt → `plugin:bmux.windows:close-active-pane` | Confirm prompt still lives in core; OK                                          |
-| `RestartFocusedPane`                | `plugin:bmux.windows:restart-pane`                              | Underlying pane-runtime primitive is a stub                                     |
-| `ToggleSplitDirection`              | (no replacement; no-op today)                                   | Safe to delete outright                                                         |
-| `EnterWindowMode` / `ExitMode`      | (no replacement; stub status message only)                      | Safe to delete outright                                                         |
-| `WindowPrev/Next/Goto1..9/Close`    | `plugin:bmux.windows:{prev,next,goto,close-current}-window`     | Default keymap + tests only                                                     |
+| Variant                             | Replacement                                                     | Blocker                                     |
+| ----------------------------------- | --------------------------------------------------------------- | ------------------------------------------- |
+| `NewWindow`                         | `plugin:bmux.windows:new-window`                                | Default keymap still uses the bare name     |
+| `NewSession`                        | `plugin:bmux.sessions:new-session`                              | Same                                        |
+| `FocusNext/Prev/Left/Right/Up/Down` | `plugin:bmux.windows:focus-pane-in-direction --direction <dir>` | Default keymap + test rewrites              |
+| `SplitFocusedVertical/Horizontal`   | `plugin:bmux.windows:split-pane --direction <dir>`              | Same                                        |
+| `IncreaseSplit/DecreaseSplit`       | `plugin:bmux.windows:resize-pane --direction increase/decrease` | Same                                        |
+| `ResizeLeft/Right/Up/Down`          | `plugin:bmux.windows:resize-pane --direction <dir>`             | Same                                        |
+| `ZoomPane`                          | `plugin:bmux.windows:zoom-pane`                                 | Same                                        |
+| `CloseFocusedPane`                  | attach-runtime prompt → `plugin:bmux.windows:close-active-pane` | Confirm prompt still lives in core; OK      |
+| `RestartFocusedPane`                | `plugin:bmux.windows:restart-pane`                              | Underlying pane-runtime primitive is a stub |
+| `ToggleSplitDirection`              | (no replacement; no-op today)                                   | Safe to delete outright                     |
+| `EnterWindowMode` / `ExitMode`      | (no replacement; stub status message only)                      | Safe to delete outright                     |
+| `WindowPrev/Next/Goto1..9/Close`    | `plugin:bmux.windows:{prev,next,goto,close-current}-window`     | Default keymap + tests only                 |
 
 ## Next PR outline
 
@@ -82,11 +81,7 @@ Variants to delete once their behavior is fully migrated:
    similarly.
 3. Rewrite `packages/config/src/keybind.rs` default construction to
    bypass `RuntimeAction::*` domain variants.
-4. Port `switch_attach_session_relative` from
-   `packages/cli/src/runtime/attach/runtime.rs:3413` into
-   sessions-plugin, then add `prev-session` / `next-session`
-   `[[commands]]` with handlers.
-5. Delete domain variants from `RuntimeAction`. Fix the resulting
+4. Delete domain variants from `RuntimeAction`. Fix the resulting
    compile errors in:
    - `packages/keybind/src/lib.rs::action_to_name`, `parse_action`,
      `action_to_config_name`.
@@ -96,7 +91,7 @@ Variants to delete once their behavior is fully migrated:
    - `packages/cli/src/playbook/engine.rs:2359-2628` (~250 lines of
      domain pattern matches).
    - Tests throughout: ~30 cases.
-6. Add an architecture guardrail test (see
+5. Add an architecture guardrail test (see
    `packages/cli/tests/architecture_guardrails.rs::runtime_action_has_no_domain_variants`)
    that fails CI if a domain variant sneaks back in.
 

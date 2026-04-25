@@ -2182,8 +2182,6 @@ const RUNTIME_ACTION_ALLOWLIST: &[&str] = &[
     // See `docs/runtime-action-migration.md` for the plan.
     "NewWindow",
     "NewSession",
-    "SessionPrev",
-    "SessionNext",
     "FocusNext",
     "FocusPrev",
     "FocusLeft",

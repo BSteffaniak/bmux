@@ -6,8 +6,10 @@ pub use bmux_attach_pipeline::{
 use bmux_client::AttachLayoutState;
 use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState, ContextSummary, SessionSummary};
+use bmux_windows_plugin_api::windows_list::WindowListSnapshot;
 use crossterm::event::MouseEvent;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -80,7 +82,13 @@ pub struct AttachViewState {
     pub transient_status: Option<String>,
     pub transient_status_until: Option<Instant>,
     pub control_catalog_revision: u64,
-    pub cached_tab_order: Vec<Uuid>,
+    /// Latest ordered window list received from the windows-plugin
+    /// `windows-list` state channel. `None` until the first snapshot
+    /// arrives (or when the plugin is absent, in which case the tab
+    /// bar falls back to rendering `cached_contexts` in raw server
+    /// order). Updated by the attach loop whenever the plugin
+    /// publishes a new value via `publish_window_list_snapshot`.
+    pub cached_window_list: Option<Arc<WindowListSnapshot>>,
     pub cached_contexts: Vec<ContextSummary>,
     pub cached_sessions: Vec<SessionSummary>,
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
@@ -161,7 +169,7 @@ impl AttachViewState {
             transient_status: None,
             transient_status_until: None,
             control_catalog_revision: 0,
-            cached_tab_order: Vec::new(),
+            cached_window_list: None,
             cached_contexts: Vec::new(),
             cached_sessions: Vec::new(),
             pane_buffers: BTreeMap::new(),

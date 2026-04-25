@@ -108,8 +108,6 @@ impl ResolvedTimeout {
 
 fn default_global_runtime_bindings() -> BTreeMap<String, String> {
     let mut map = action_bindings(&[
-        // Session navigation
-        ("ctrl+o", RuntimeAction::SessionPrev),
         // Pane focus navigation
         ("alt+h", RuntimeAction::FocusLeft),
         ("alt+left", RuntimeAction::FocusLeft),
@@ -129,6 +127,13 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
         // New pane
         ("alt+n", RuntimeAction::SplitFocusedHorizontal),
     ]);
+    // Last-window toggle (ctrl+o). The windows plugin owns all tab
+    // navigation; this key binds to `last-window` (tmux's convention
+    // for "jump back to the previous window").
+    map.insert(
+        "ctrl+o".to_string(),
+        "plugin:bmux.windows:last-window".to_string(),
+    );
     // Window navigation via plugin (no-op if plugin not loaded)
     for i in 1..=9 {
         map.insert(
@@ -207,10 +212,18 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
         ("v", RuntimeAction::BeginSelection),
         ("d", RuntimeAction::Detach),
         ("q", RuntimeAction::Quit),
-        // Session prev/next
-        ("(", RuntimeAction::SessionPrev),
-        (")", RuntimeAction::SessionNext),
     ]);
+    // Window prev/next: (, ) bind via the windows plugin so the tab
+    // bar and navigation stay in lockstep on whatever ordering the
+    // plugin owns.
+    map.insert(
+        "(".to_string(),
+        "plugin:bmux.windows:prev-window".to_string(),
+    );
+    map.insert(
+        ")".to_string(),
+        "plugin:bmux.windows:next-window".to_string(),
+    );
     // Plugin command: toggle last window (no-op if plugin not loaded)
     map.insert(
         "^".to_string(),

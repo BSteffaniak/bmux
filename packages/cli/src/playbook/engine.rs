@@ -2599,8 +2599,6 @@ async fn apply_attach_runtime_actions(
             }
             crate::input::RuntimeAction::PluginCommand { .. }
             | crate::input::RuntimeAction::Quit
-            | crate::input::RuntimeAction::SessionPrev
-            | crate::input::RuntimeAction::SessionNext
             | crate::input::RuntimeAction::ToggleSplitDirection
             | crate::input::RuntimeAction::RestartFocusedPane
             | crate::input::RuntimeAction::ShowHelp
