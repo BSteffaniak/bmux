@@ -21,6 +21,11 @@ interface_id = "decoration-state"
 kind         = "command"
 
 [[services]]
+capability   = "bmux.decoration.write"
+interface_id = "theme-extension"
+kind         = "command"
+
+[[services]]
 capability   = "bmux.decoration.read"
 interface_id = "scene-protocol"
 kind         = "event"

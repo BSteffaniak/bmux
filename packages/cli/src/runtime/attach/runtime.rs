@@ -31,7 +31,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
@@ -52,8 +52,8 @@ use super::super::{
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent};
 use super::prompt_ui::{
-    AttachInternalPromptAction, AttachPromptCompletion, AttachPromptOrigin, PromptKeyDisposition,
-    prompt_accepts_key_kind,
+    AttachInternalPromptAction, AttachPromptCompletion, AttachPromptOrigin, AttachPromptPreview,
+    PromptKeyDisposition, prompt_accepts_key_kind,
 };
 use super::render::{
     AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
@@ -110,6 +110,44 @@ async fn typed_kill_session_attach(
         code: bmux_ipc::ErrorCode::Internal,
         message: format!("decoding kill-session response: {error}"),
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApplyDecorationThemeExtensionArgs {
+    toml: String,
+    config_dir_candidates: Vec<String>,
+}
+
+async fn apply_plugin_theme_extensions(
+    client: &mut StreamingBmuxClient,
+    theme: bmux_config::ThemeConfig,
+    plugin_ids: &[String],
+    config_dir_candidates: &[String],
+) {
+    for plugin_id in plugin_ids {
+        let toml = theme
+            .plugins
+            .get(plugin_id)
+            .and_then(|extension| toml::to_string(extension).ok())
+            .unwrap_or_default();
+        let args = ApplyDecorationThemeExtensionArgs {
+            toml,
+            config_dir_candidates: config_dir_candidates.to_vec(),
+        };
+        let Ok(payload) = bmux_codec::to_vec(&args) else {
+            continue;
+        };
+        let capability = format!("{plugin_id}.write");
+        let _ = client
+            .invoke_service_raw(
+                &capability,
+                InvokeServiceKind::Command,
+                "theme-extension",
+                "apply",
+                payload,
+            )
+            .await;
+    }
 }
 
 /// Typed dispatch wrapper for `contexts-state:list-contexts`.
@@ -628,6 +666,261 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedThemeState {
+    selected_theme: String,
+}
+
+#[derive(Debug, Clone)]
+struct ThemeCatalogEntry {
+    name: String,
+    theme: bmux_config::ThemeConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct AttachThemeState {
+    active_name: String,
+    active_theme: bmux_config::ThemeConfig,
+    declared_name: String,
+    persistence: bmux_config::ThemePersistence,
+    state_file: PathBuf,
+    config_dir_candidates: Vec<String>,
+    theme_plugin_ids: Vec<String>,
+    catalog: Vec<ThemeCatalogEntry>,
+    preview_original: Option<(String, bmux_config::ThemeConfig)>,
+}
+
+impl AttachThemeState {
+    fn new(config: &BmuxConfig, paths: &ConfigPaths) -> Self {
+        let declared_name = normalized_theme_name(&config.appearance.theme);
+        let mut catalog = load_theme_catalog(paths);
+        ensure_theme_catalog_entry(&mut catalog, declared_name.as_str(), paths);
+        let persisted_name = match config.appearance.theme_persistence {
+            bmux_config::ThemePersistence::PersistBetweenConnects => {
+                read_persisted_theme_name(&paths.runtime_theme_state_file())
+            }
+            bmux_config::ThemePersistence::DeclaredOnConnect => None,
+        };
+        let active_name = persisted_name
+            .filter(|name| catalog.iter().any(|entry| entry.name == *name))
+            .unwrap_or_else(|| declared_name.clone());
+        let active_theme = catalog
+            .iter()
+            .find(|entry| entry.name == active_name)
+            .map_or_else(bmux_config::ThemeConfig::default, |entry| {
+                entry.theme.clone()
+            });
+        let theme_plugin_ids = theme_catalog_plugin_ids(&catalog);
+        Self {
+            active_name,
+            active_theme,
+            declared_name,
+            persistence: config.appearance.theme_persistence,
+            state_file: paths.runtime_theme_state_file(),
+            config_dir_candidates: paths
+                .config_dir_candidates()
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect(),
+            theme_plugin_ids,
+            catalog,
+            preview_original: None,
+        }
+    }
+
+    fn selected_index(&self) -> usize {
+        self.catalog
+            .iter()
+            .position(|entry| entry.name == self.active_name)
+            .unwrap_or(0)
+    }
+
+    fn prompt_options(&self) -> Vec<prompt::PromptOption> {
+        self.catalog
+            .iter()
+            .map(|entry| {
+                let mut label = entry.name.clone();
+                if entry.name == self.declared_name {
+                    label.push_str(" (declared)");
+                }
+                if entry.name == self.active_name {
+                    label.push_str(" (active)");
+                }
+                prompt::PromptOption::new(entry.name.as_str(), label)
+            })
+            .collect()
+    }
+
+    fn begin_preview(&mut self) {
+        self.preview_original = Some((self.active_name.clone(), self.active_theme.clone()));
+    }
+
+    fn preview(&mut self, name: &str) -> bool {
+        let Some(entry) = self.catalog.iter().find(|entry| entry.name == name) else {
+            return false;
+        };
+        self.active_name.clone_from(&entry.name);
+        self.active_theme.clone_from(&entry.theme);
+        true
+    }
+
+    fn cancel_preview(&mut self) {
+        if let Some((name, theme)) = self.preview_original.take() {
+            self.active_name = name;
+            self.active_theme = theme;
+        }
+    }
+
+    fn commit_preview(&mut self) {
+        self.preview_original = None;
+        if matches!(
+            self.persistence,
+            bmux_config::ThemePersistence::PersistBetweenConnects
+        ) {
+            persist_theme_name(&self.state_file, &self.active_name);
+        }
+    }
+}
+
+fn normalized_theme_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn read_persisted_theme_name(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let state: PersistedThemeState = serde_json::from_slice(&bytes).ok()?;
+    Some(normalized_theme_name(&state.selected_theme))
+}
+
+fn persist_theme_name(path: &Path, name: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let state = PersistedThemeState {
+        selected_theme: name.to_string(),
+    };
+    if let Ok(bytes) = serde_json::to_vec_pretty(&state) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+fn load_theme_catalog(paths: &ConfigPaths) -> Vec<ThemeCatalogEntry> {
+    let mut entries = vec![ThemeCatalogEntry {
+        name: "default".to_string(),
+        theme: bmux_config::ThemeConfig::default(),
+    }];
+    for dir in paths.config_dir_candidates() {
+        let themes_dir = dir.join("themes");
+        let Ok(read_dir) = std::fs::read_dir(&themes_dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("toml") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(std::ffi::OsStr::to_str) else {
+                continue;
+            };
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(theme) = toml::from_str::<bmux_config::ThemeConfig>(&text)
+            {
+                upsert_theme_catalog_entry(&mut entries, name.to_string(), theme);
+            }
+        }
+    }
+    #[cfg(feature = "bundled-plugin-decoration")]
+    for (name, text) in bmux_decoration_plugin::bundled_theme_presets() {
+        if let Ok(theme) = toml::from_str::<bmux_config::ThemeConfig>(text) {
+            upsert_theme_catalog_entry(&mut entries, (*name).to_string(), theme);
+        }
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
+fn theme_catalog_plugin_ids(catalog: &[ThemeCatalogEntry]) -> Vec<String> {
+    let mut ids = catalog
+        .iter()
+        .flat_map(|entry| entry.theme.plugins.keys().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+fn ensure_theme_catalog_entry(
+    entries: &mut Vec<ThemeCatalogEntry>,
+    name: &str,
+    paths: &ConfigPaths,
+) {
+    if entries.iter().any(|entry| entry.name == name) {
+        return;
+    }
+    if name == "default" {
+        upsert_theme_catalog_entry(
+            entries,
+            name.to_string(),
+            bmux_config::ThemeConfig::default(),
+        );
+        return;
+    }
+    let path = paths.resolve_theme_file(name);
+    if let Ok(text) = std::fs::read_to_string(path)
+        && let Ok(theme) = toml::from_str::<bmux_config::ThemeConfig>(&text)
+    {
+        upsert_theme_catalog_entry(entries, name.to_string(), theme);
+    }
+}
+
+fn upsert_theme_catalog_entry(
+    entries: &mut Vec<ThemeCatalogEntry>,
+    name: String,
+    mut theme: bmux_config::ThemeConfig,
+) {
+    theme.name.clone_from(&name);
+    if let Some(existing) = entries.iter_mut().find(|entry| entry.name == name) {
+        existing.theme = theme;
+    } else {
+        entries.push(ThemeCatalogEntry { name, theme });
+    }
+}
+
+fn open_theme_picker(view_state: &mut AttachViewState, theme_state: &mut AttachThemeState) {
+    if theme_state.catalog.is_empty() {
+        view_state.set_transient_status(
+            "no themes available",
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        return;
+    }
+    theme_state.begin_preview();
+    let persistence = match theme_state.persistence {
+        bmux_config::ThemePersistence::DeclaredOnConnect => "not persisted",
+        bmux_config::ThemePersistence::PersistBetweenConnects => "persisted on accept",
+    };
+    let request = PromptRequest::single_select("Select Theme", theme_state.prompt_options())
+        .message(format!(
+            "Move to preview live. Enter applies. Esc restores previous theme. Persistence: {persistence}."
+        ))
+        .single_default_index(theme_state.selected_index())
+        .single_live_preview(true)
+        .policy(prompt::PromptPolicy::RejectIfBusy)
+        .width_range(48, 96);
+    view_state
+        .prompt
+        .enqueue_internal(request, AttachInternalPromptAction::ThemePicker);
+    view_state.dirty.status_needs_redraw = true;
+    view_state.dirty.overlay_needs_redraw = true;
+}
+
 /// Publish the current attach-layout snapshot on the generic
 /// [`AttachLayoutSnapshot`] state channel. Plugins that need
 /// per-pane geometry (decoration renderers, overlays, etc.)
@@ -921,6 +1214,14 @@ pub async fn run_session_attach_with_client(
         None => None,
     };
 
+    let mut attach_config_paths = ConfigPaths::default();
+    if let Some(config_parent) = std::env::var_os(bmux_config::BMUX_CONFIG_ENV)
+        .map(PathBuf::from)
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    {
+        attach_config_paths.prepend_config_dir_candidate(config_parent);
+    }
+
     let attach_config = match BmuxConfig::load() {
         Ok(config) => config,
         Err(error) => {
@@ -947,16 +1248,7 @@ pub async fn run_session_attach_with_client(
     let mut rendered_frame_count = 0_u64;
     let mut first_frame_emitted = false;
     let mut interactive_ready_emitted = false;
-    let global_theme = match attach_config.load_theme() {
-        Ok(theme) => theme,
-        Err(error) => {
-            eprintln!(
-                "bmux warning: failed loading global theme '{}', using defaults ({error})",
-                attach_config.appearance.theme
-            );
-            bmux_config::ThemeConfig::default()
-        }
-    };
+    let mut theme_state = AttachThemeState::new(&attach_config, &attach_config_paths);
 
     if let Some(leader_client_id) = follow_target_id {
         client
@@ -1063,6 +1355,13 @@ pub async fn run_session_attach_with_client(
     } else {
         StatusPosition::Off
     };
+    apply_plugin_theme_extensions(
+        &mut client,
+        theme_state.active_theme.clone(),
+        &theme_state.theme_plugin_ids,
+        &theme_state.config_dir_candidates,
+    )
+    .await;
 
     // Register the generic attach-layout state channel so any plugin
     // subscribing via `EventBus::subscribe_state::<AttachLayoutSnapshot>`
@@ -1477,6 +1776,7 @@ pub async fn run_session_attach_with_client(
                         global,
                         &attach_help_lines,
                         &mut view_state,
+                        &mut theme_state,
                         &mut display_capture,
                         kernel_client_factory.as_ref(),
                     )
@@ -1513,6 +1813,7 @@ pub async fn run_session_attach_with_client(
                     global,
                     &attach_help_lines,
                     &mut view_state,
+                    &mut theme_state,
                     &mut display_capture,
                     kernel_client_factory.as_ref(),
                 )
@@ -1545,6 +1846,7 @@ pub async fn run_session_attach_with_client(
                         global,
                         &attach_help_lines,
                         &mut view_state,
+                        &mut theme_state,
                         &mut display_capture,
                         kernel_client_factory.as_ref(),
                     )
@@ -1738,7 +2040,7 @@ pub async fn run_session_attach_with_client(
                 &mut view_state,
                 &layout_state,
                 &attach_config.status_bar,
-                &global_theme,
+                &theme_state.active_theme,
                 follow_target_id,
                 global,
                 &attach_keymap,
@@ -1968,7 +2270,7 @@ pub async fn run_session_attach_with_client(
             &mut view_state,
             &layout_state,
             &attach_config.status_bar,
-            &global_theme,
+            &theme_state.active_theme,
             follow_target_id,
             global,
             &attach_keymap,
@@ -4722,6 +5024,7 @@ pub const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::ResizeDown
             | RuntimeAction::CloseFocusedPane
             | RuntimeAction::ZoomPane
+            | RuntimeAction::ThemePicker
             | RuntimeAction::ShowHelp
             | RuntimeAction::EnterMode(_)
     )
@@ -5090,6 +5393,7 @@ pub async fn handle_attach_loop_event(
     global: bool,
     help_lines: &[String],
     view_state: &mut AttachViewState,
+    theme_state: &mut AttachThemeState,
     display_capture: &mut DisplayCaptureFanout,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
@@ -5112,6 +5416,7 @@ pub async fn handle_attach_loop_event(
                 attach_input_processor,
                 help_lines,
                 view_state,
+                theme_state,
                 display_capture,
                 kernel_client_factory,
             )
@@ -5122,6 +5427,7 @@ pub async fn handle_attach_loop_event(
                 client,
                 dispatch_request,
                 view_state,
+                theme_state,
                 kernel_client_factory,
             )
             .await
@@ -5374,12 +5680,14 @@ pub fn attach_view_event_matches_target(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)] // Attach event handling threads shared mutable runtime state through one hot path.
 pub async fn handle_attach_terminal_event(
     client: &mut StreamingBmuxClient,
     terminal_event: Event,
     attach_input_processor: &mut InputProcessor,
     help_lines: &[String],
     view_state: &mut AttachViewState,
+    theme_state: &mut AttachThemeState,
     display_capture: &mut DisplayCaptureFanout,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
@@ -5392,11 +5700,20 @@ pub async fn handle_attach_terminal_event(
             Event::Key(key) if prompt_accepts_key_kind(key.kind) => {
                 match view_state.prompt.handle_key_event(key) {
                     PromptKeyDisposition::Completed(completion) => {
-                        if let Some(control) =
-                            handle_attach_prompt_completion(client, view_state, completion).await?
+                        if let Some(control) = handle_attach_prompt_completion(
+                            client,
+                            view_state,
+                            theme_state,
+                            completion,
+                        )
+                        .await?
                         {
                             return Ok(control);
                         }
+                    }
+                    PromptKeyDisposition::Preview(preview) => {
+                        handle_attach_prompt_preview(client, view_state, theme_state, preview)
+                            .await;
                     }
                     PromptKeyDisposition::Consumed => {
                         view_state.dirty.overlay_needs_redraw = true;
@@ -5530,6 +5847,10 @@ pub async fn handle_attach_terminal_event(
                     view_state.dirty.status_needs_redraw = true;
                     continue;
                 }
+                if matches!(action, RuntimeAction::ThemePicker) {
+                    open_theme_picker(view_state, theme_state);
+                    continue;
+                }
                 if view_state.help_overlay_open {
                     if matches!(action, RuntimeAction::ExitMode)
                         || matches!(action, RuntimeAction::ForwardToPane(_))
@@ -5586,9 +5907,11 @@ pub const fn prompt_response_is_confirmed(response: &PromptResponse) -> bool {
     )
 }
 
+#[allow(clippy::too_many_lines)] // Internal prompt completions are a compact action state machine.
 pub async fn handle_attach_prompt_completion(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
+    theme_state: &mut AttachThemeState,
     completion: AttachPromptCompletion,
 ) -> std::result::Result<Option<AttachLoopControl>, ClientError> {
     match completion.origin {
@@ -5661,12 +5984,69 @@ pub async fn handle_attach_prompt_completion(
                     );
                 }
             }
+            AttachInternalPromptAction::ThemePicker => {
+                if let PromptResponse::Submitted(PromptValue::Single(name)) = completion.response {
+                    if theme_state.preview(&name) {
+                        theme_state.commit_preview();
+                        apply_plugin_theme_extensions(
+                            client,
+                            theme_state.active_theme.clone(),
+                            &theme_state.theme_plugin_ids,
+                            &theme_state.config_dir_candidates,
+                        )
+                        .await;
+                        view_state.set_transient_status(
+                            format!("theme: {}", theme_state.active_name),
+                            Instant::now(),
+                            ATTACH_TRANSIENT_STATUS_TTL,
+                        );
+                    }
+                } else {
+                    theme_state.cancel_preview();
+                    apply_plugin_theme_extensions(
+                        client,
+                        theme_state.active_theme.clone(),
+                        &theme_state.theme_plugin_ids,
+                        &theme_state.config_dir_candidates,
+                    )
+                    .await;
+                    view_state.set_transient_status(
+                        "theme switch canceled",
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
+            }
         },
     }
 
     view_state.dirty.status_needs_redraw = true;
     view_state.dirty.full_pane_redraw = true;
     Ok(None)
+}
+
+async fn handle_attach_prompt_preview(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    theme_state: &mut AttachThemeState,
+    preview: AttachPromptPreview,
+) {
+    match preview {
+        AttachPromptPreview::Theme { name } => {
+            if theme_state.preview(&name) {
+                apply_plugin_theme_extensions(
+                    client,
+                    theme_state.active_theme.clone(),
+                    &theme_state.theme_plugin_ids,
+                    &theme_state.config_dir_candidates,
+                )
+                .await;
+                view_state.dirty.status_needs_redraw = true;
+                view_state.dirty.full_pane_redraw = true;
+                view_state.dirty.overlay_needs_redraw = true;
+            }
+        }
+    }
 }
 
 /// Handle an action dispatch request from async plugin code.
@@ -5677,6 +6057,7 @@ async fn handle_attach_action_dispatch(
     client: &mut StreamingBmuxClient,
     dispatch_request: bmux_plugin_sdk::ActionDispatchRequest,
     view_state: &mut AttachViewState,
+    theme_state: &mut AttachThemeState,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
     let action_str = &dispatch_request.action;
@@ -5733,6 +6114,12 @@ async fn handle_attach_action_dispatch(
             }
         }
         AttachEventAction::Ui(ui_action) => {
+            if matches!(ui_action, RuntimeAction::ThemePicker) {
+                open_theme_picker(view_state, theme_state);
+                view_state.dirty.status_needs_redraw = true;
+                view_state.dirty.overlay_needs_redraw = true;
+                return Ok(AttachLoopControl::Continue);
+            }
             if let Err(error) = handle_attach_ui_action(client, ui_action, view_state).await {
                 view_state.set_transient_status(
                     format!(
@@ -6636,6 +7023,7 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         | RuntimeAction::RestartFocusedPane
         | RuntimeAction::CloseFocusedPane
         | RuntimeAction::ZoomPane
+        | RuntimeAction::ThemePicker
         | RuntimeAction::ShowHelp
         | RuntimeAction::EnterScrollMode
         | RuntimeAction::ExitScrollMode
@@ -6705,6 +7093,7 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
         | RuntimeAction::WindowGoto9
         | RuntimeAction::WindowClose
         | RuntimeAction::Quit
+        | RuntimeAction::ThemePicker
         | RuntimeAction::ShowHelp
         | RuntimeAction::ToggleSplitDirection
         | RuntimeAction::RestartFocusedPane

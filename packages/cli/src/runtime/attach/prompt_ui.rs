@@ -21,6 +21,7 @@ const PROMPT_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(2);
 pub enum AttachInternalPromptAction {
     QuitSession,
     ClosePane { pane_id: Uuid },
+    ThemePicker,
 }
 
 #[derive(Debug)]
@@ -91,6 +92,7 @@ impl ActivePrompt {
             PromptField::SingleSelect {
                 options,
                 default_index,
+                ..
             } => {
                 let selected = if options.is_empty() {
                     0
@@ -137,7 +139,13 @@ pub struct AttachPromptState {
 pub enum PromptKeyDisposition {
     NotActive,
     Consumed,
+    Preview(AttachPromptPreview),
     Completed(AttachPromptCompletion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachPromptPreview {
+    Theme { name: String },
 }
 
 impl AttachPromptState {
@@ -298,9 +306,14 @@ impl AttachPromptState {
                     _ => {}
                 },
                 (
-                    PromptField::SingleSelect { options, .. },
+                    PromptField::SingleSelect {
+                        options,
+                        live_preview,
+                        ..
+                    },
                     PromptWidgetState::SingleSelect { selected, scroll },
                 ) => {
+                    let previous_selected = *selected;
                     if options.is_empty() {
                         if key.code == KeyCode::Enter {
                             completion = Some(PromptResponse::Submitted(PromptValue::Single(
@@ -333,6 +346,12 @@ impl AttachPromptState {
                             _ => {}
                         }
                         *scroll = (*scroll).min(*selected);
+                        if *live_preview
+                            && *selected != previous_selected
+                            && let Some(preview) = active_preview(&active.envelope, *selected)
+                        {
+                            return PromptKeyDisposition::Preview(preview);
+                        }
                     }
                 }
                 (
@@ -552,6 +571,20 @@ pub const fn prompt_accepts_key_kind(kind: KeyEventKind) -> bool {
 fn send_response(origin: AttachPromptOrigin, response: PromptResponse) {
     if let AttachPromptOrigin::External { response_tx } = origin {
         let _ = response_tx.send(response);
+    }
+}
+
+fn active_preview(envelope: &AttachPromptEnvelope, selected: usize) -> Option<AttachPromptPreview> {
+    match (&envelope.origin, &envelope.request.field) {
+        (
+            AttachPromptOrigin::Internal(AttachInternalPromptAction::ThemePicker),
+            PromptField::SingleSelect { options, .. },
+        ) => options
+            .get(selected)
+            .map(|option| AttachPromptPreview::Theme {
+                name: option.value.clone(),
+            }),
+        _ => None,
     }
 }
 

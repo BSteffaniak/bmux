@@ -170,6 +170,16 @@ impl ConfigPaths {
         self.resolve(format!("themes/{name}.toml"))
     }
 
+    /// Add a config directory candidate ahead of existing candidates.
+    pub fn prepend_config_dir_candidate(&mut self, path: PathBuf) {
+        self.config_dir_candidates
+            .retain(|candidate| candidate != &path);
+        self.config_dir_candidates.insert(0, path);
+        if let Some(primary) = self.config_dir_candidates.first() {
+            self.config_dir.clone_from(primary);
+        }
+    }
+
     /// Get the plugins directory path
     #[must_use]
     pub fn plugins_dir(&self) -> PathBuf {
@@ -198,6 +208,12 @@ impl ConfigPaths {
     #[must_use]
     pub fn runtime_layout_state_file(&self) -> PathBuf {
         self.state_dir().join("runtime").join("last-layout.json")
+    }
+
+    /// Get persisted runtime theme override file path.
+    #[must_use]
+    pub fn runtime_theme_state_file(&self) -> PathBuf {
+        self.state_dir().join("runtime").join("theme.json")
     }
 
     /// Get persisted protocol trace file path

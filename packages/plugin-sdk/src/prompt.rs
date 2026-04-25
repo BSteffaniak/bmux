@@ -163,6 +163,9 @@ pub enum PromptField {
     SingleSelect {
         options: Vec<PromptOption>,
         default_index: usize,
+        /// Emit selection-change events while the user moves through the list.
+        /// Hosts can use this for live previews without waiting for submit.
+        live_preview: bool,
     },
     /// Toggle multiple options on/off.
     MultiToggle {
@@ -254,6 +257,7 @@ impl PromptRequest {
             field: PromptField::SingleSelect {
                 options,
                 default_index: 0,
+                live_preview: false,
             },
         }
     }
@@ -393,6 +397,14 @@ impl PromptRequest {
     pub const fn single_default_index(mut self, index: usize) -> Self {
         if let PromptField::SingleSelect { default_index, .. } = &mut self.field {
             *default_index = index;
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn single_live_preview(mut self, enabled: bool) -> Self {
+        if let PromptField::SingleSelect { live_preview, .. } = &mut self.field {
+            *live_preview = enabled;
         }
         self
     }

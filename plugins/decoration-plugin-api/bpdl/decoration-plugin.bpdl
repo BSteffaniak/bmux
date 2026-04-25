@@ -197,6 +197,10 @@ interface decoration-state {
     // Commands.
     command set-pane-border(pane-id: uuid, border: border-style) -> result<unit, set-style-error>;
     command set-default-border(border: border-style) -> result<unit, set-style-error>;
+    // Apply the decoration-owned slice of a runtime-selected theme.
+    // The host passes only `[plugins."bmux.decoration"]` as TOML, so
+    // this plugin remains the sole interpreter of decoration theme data.
+    command apply-theme-extension(toml: string, config-dir-candidates: list<string>) -> result<unit, validation-result>;
     // Notify the plugin of a pane-level event. Today the decoration
     // plugin also subscribes to `bmux.windows/windows-events` via the
     // typed event bus; this typed command exists as an ordered

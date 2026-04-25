@@ -295,6 +295,20 @@ impl DecorationStateService for DecorationServiceHandle {
     ) -> Pin<Box<dyn Future<Output = ValidationResult> + Send + 'a>> {
         Box::pin(async move { validate_theme_extension_toml(&toml_text) })
     }
+
+    fn apply_theme_extension<'a>(
+        &'a self,
+        toml_text: String,
+        config_dir_candidates: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ValidationResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let candidates = config_dir_candidates
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            apply_theme_extension_toml(&self.state, &toml_text, &candidates)
+        })
+    }
 }
 
 /// Apply a [`PaneEvent`] to the shared state. Pulled out so both the
@@ -669,6 +683,45 @@ fn validate_theme_extension_toml(text: &str) -> ValidationResult {
             }],
         },
     }
+}
+
+fn apply_theme_extension_toml(
+    state: &Arc<Mutex<State>>,
+    text: &str,
+    config_dir_candidates: &[PathBuf],
+) -> Result<(), ValidationResult> {
+    if text.trim().is_empty() {
+        if let Ok(mut state) = state.lock() {
+            state.current_theme = None;
+            install_script_backend(&mut state, None);
+            bump_revision(&mut state);
+        }
+        return Ok(());
+    }
+
+    let parsed = toml::from_str::<toml::Value>(text).map_err(|err| ValidationResult::Errors {
+        errors: vec![ValidationError {
+            path: "<root>".to_string(),
+            message: format!("TOML parse error: {err}"),
+        }],
+    })?;
+    let extension: DecorationThemeExtension =
+        parsed.try_into().map_err(|err| ValidationResult::Errors {
+            errors: vec![ValidationError {
+                path: "<schema>".to_string(),
+                message: err.to_string(),
+            }],
+        })?;
+    let script = extension
+        .script
+        .as_deref()
+        .and_then(|spec| resolve_decoration_script(config_dir_candidates, spec));
+    if let Ok(mut state) = state.lock() {
+        state.current_theme = Some(extension);
+        install_script_backend(&mut state, script);
+        bump_revision(&mut state);
+    }
+    Ok(())
 }
 
 /// The decoration plugin's concrete implementation.
@@ -1609,6 +1662,30 @@ impl RustPlugin for DecorationPlugin {
                 })();
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
+            "decoration-state", "apply-theme-extension" => |req: ApplyThemeExtensionArgs, _ctx| {
+                let candidates = req
+                    .config_dir_candidates
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(apply_theme_extension_toml(
+                    &state,
+                    &req.toml,
+                    &candidates,
+                ))
+            },
+            "theme-extension", "apply" => |req: ApplyThemeExtensionArgs, _ctx| {
+                let candidates = req
+                    .config_dir_candidates
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(apply_theme_extension_toml(
+                    &state,
+                    &req.toml,
+                    &candidates,
+                ))
+            },
             "decoration-state", "notify-pane-event" => |req: NotifyPaneEventArgs, _ctx| {
                 let outcome: Result<(), NotifyError> = (|| {
                     let mut state = state
@@ -1661,6 +1738,12 @@ struct SetPaneBorderArgs {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SetDefaultBorderArgs {
     border: BorderStyle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ApplyThemeExtensionArgs {
+    toml: String,
+    config_dir_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
