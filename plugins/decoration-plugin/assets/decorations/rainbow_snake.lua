@@ -3,7 +3,7 @@
 
 local INITIAL_SNAKE_SIZE = 8
 local snake_size = INITIAL_SNAKE_SIZE
-local apple_index = nil
+local apple_u = nil
 local apple_key = nil
 local rng_state = nil
 local state_total = nil
@@ -89,18 +89,25 @@ local function next_random(ctx, max_value)
     return math.floor((rng_state / 233280) * max_value)
 end
 
+local function apple_index_for(total)
+    if apple_u == nil then
+        return nil
+    end
+    return math.floor((apple_u % 1.0) * total) % total
+end
+
 local function spawn_apple(ctx, occupied, total)
     for _ = 1, total do
         local candidate = next_random(ctx, total)
         local col, row = perimeter_cell_raw(ctx.rect, candidate)
         local key = cell_key(col, row)
         if not occupied[key] then
-            apple_index = candidate
+            apple_u = candidate / total
             apple_key = key
             return
         end
     end
-    apple_index = nil
+    apple_u = nil
     apple_key = nil
 end
 
@@ -115,11 +122,22 @@ local function insert_diamond(cmds, col, row, z, r, g, b)
     })
 end
 
-local function insert_apple(cmds, rect)
+local function update_apple_key(rect, total)
+    local apple_index = apple_index_for(total)
     if apple_index == nil then
-        return
+        apple_key = nil
+        return nil
     end
     local col, row = perimeter_cell_raw(rect, apple_index)
+    apple_key = cell_key(col, row)
+    return apple_index, col, row
+end
+
+local function insert_apple(cmds, rect, total)
+    local _, col, row = update_apple_key(rect, total)
+    if col == nil then
+        return
+    end
     table.insert(cmds, {
         kind  = "text",
         col   = col,
@@ -132,7 +150,7 @@ end
 
 local function reset_game(total)
     snake_size = math.min(INITIAL_SNAKE_SIZE, total)
-    apple_index = nil
+    apple_u = nil
     apple_key = nil
     death_started_ms = nil
     death_segments = nil
@@ -199,8 +217,6 @@ function decorate(ctx)
     local segment_visual_spacing = 2.0
 
     if state_total ~= total then
-        reset_game(total)
-        rng_state = nil
         state_total = total
     end
 
@@ -223,7 +239,9 @@ function decorate(ctx)
         head_key = cell_key(head_segment.col, head_segment.row)
     end
 
-    if apple_index == nil or apple_key == nil then
+    update_apple_key(ctx.rect, total)
+
+    if apple_u == nil or apple_key == nil then
         spawn_apple(ctx, occupied, total)
     elseif head_key == apple_key then
         snake_size = math.min(snake_size + 1, total)
@@ -243,13 +261,13 @@ function decorate(ctx)
     if snake_size * segment_visual_spacing >= visual_total - segment_visual_spacing then
         death_started_ms = ctx.time_ms
         death_segments = segments
-        apple_index = nil
+        apple_u = nil
         apple_key = nil
         render_death_flash(cmds, ctx, total)
         return cmds
     end
 
-    insert_apple(cmds, ctx.rect)
+    insert_apple(cmds, ctx.rect, total)
 
     local snake_len = math.max(#segments, 1)
     for i, segment in ipairs(segments) do
