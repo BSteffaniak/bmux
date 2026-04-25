@@ -498,23 +498,12 @@ pub fn new_session_with_runtime(
         .get::<bmux_session_state::SessionManagerHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed_session("session manager handle not registered"))?;
-    let context_handle = global_plugin_state_registry()
-        .get::<bmux_context_state::ContextStateHandle>()
-        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
-        .ok_or_else(|| failed_session("context state handle not registered"))?;
 
-    // Duplicate-name check mirrors server's create_session_runtime helper.
-    if let Some(requested_name) = req.name.as_deref()
-        && session_handle
-            .0
-            .list_sessions()
-            .iter()
-            .any(|s| s.name.as_deref() == Some(requested_name))
-    {
-        return Err(SessionRuntimeCommandError::NameAlreadyExists {
-            name: requested_name.to_string(),
-        });
-    }
+    // Sessions are identified by UUID. Names are display hints that
+    // may be duplicated deliberately by the caller — the handler
+    // does not reject a session just because another session shares
+    // its name. The `name-already-exists` error variant was removed
+    // from the BPDL wire type for this reason.
 
     let session_id = session_handle
         .0
@@ -528,33 +517,16 @@ pub fn new_session_with_runtime(
         )));
     }
 
-    // Create+bind a context for the new session. The caller client id
-    // is not available in this handler context (the typed invoke
-    // context uses `NativeServiceContext` which does carry it, but we
-    // accept the caller-less shape here because every code path that
-    // reaches `new-session-with-runtime` in production goes through
-    // either the sessions-plugin shim or a direct CLI call, both of
-    // which pass through a `NativeServiceContext`). When the caller
-    // id is absent we fall back to `Uuid::nil` which the context
-    // state accepts.
-    let caller_client_id = bmux_session_models::ClientId(uuid::Uuid::nil());
-    let context = context_handle.0.create(
-        caller_client_id,
-        req.name.clone(),
-        std::collections::BTreeMap::new(),
-    );
-    if let Err(message) = context_handle.0.bind_session(context.id, session_id) {
-        let _ = context_handle
-            .0
-            .remove_context_by_id(context.id, Some(caller_client_id));
-        let _ = session_handle.0.remove_session(session_id);
-        if let Some(removed_runtime) = runtime_handle.0.remove_runtime(session_id) {
-            runtime_handle.0.shutdown_removed_runtime(removed_runtime);
-        }
-        return Err(failed_session(format!(
-            "failed creating context for new session: {message}"
-        )));
-    }
+    // NOTE: this handler deliberately does NOT create a context for the
+    // new session. Context lifecycle is owned by `bmux.contexts`
+    // plugin's `create_context_local`, which is the caller that drives
+    // this function via `sessions-commands::new-session` ->
+    // `pane-runtime-commands::new-session-with-runtime`. Creating a
+    // second context here (with a nil caller client id) produced a
+    // "shadow tab" duplicated per keystroke (see the bmux
+    // `context_state.create` trace). Keep this function focused on
+    // session + runtime allocation; let the caller own context
+    // creation.
 
     Ok(SessionAck {
         session_id: session_id.0,

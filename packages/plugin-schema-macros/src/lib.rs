@@ -89,11 +89,21 @@ fn expand(args: &SchemaArgs) -> Result<TokenStream, String> {
         .map_err(|err| format!("CARGO_MANIFEST_DIR not set: {err}"))?;
     let manifest_dir = PathBuf::from(manifest_dir);
 
+    // Collect every BPDL path we touch so the generated code can
+    // reference them via `include_bytes!`. Cargo's dependency
+    // tracker doesn't see `std::fs::read_to_string` at macro-expand
+    // time, so without these markers a BPDL edit wouldn't invalidate
+    // the crate's incremental cache. Emitting `include_bytes!`
+    // paths in the output makes the files first-class compile-time
+    // deps, so any edit to the `.bpdl` triggers a rebuild.
+    let mut tracked_paths: Vec<PathBuf> = Vec::new();
+
     // Resolve imports first so codegen can emit qualified type paths.
     let mut imports = ImportMap::new();
     let mut import_schemas: BTreeMap<String, bmux_plugin_schema::ast::Schema> = BTreeMap::new();
     for import in &args.imports {
         let path = manifest_dir.join(&import.source);
+        tracked_paths.push(path.clone());
         let source = std::fs::read_to_string(&path).map_err(|err| {
             format!(
                 "failed to read imported BPDL schema `{}`: {err}",
@@ -114,13 +124,38 @@ fn expand(args: &SchemaArgs) -> Result<TokenStream, String> {
 
     // Parse the primary schema with imports resolved.
     let path = manifest_dir.join(&args.source);
+    tracked_paths.push(path.clone());
     let source = std::fs::read_to_string(&path)
         .map_err(|err| format!("failed to read BPDL schema `{}`: {err}", path.display()))?;
     let schema = bmux_plugin_schema::compile_with_imports(&source, &import_schemas)
         .map_err(|err| err.to_string())?;
 
     let rust = bmux_plugin_schema::codegen_rust::emit_with_imports(&schema, &imports);
-    rust.parse::<proc_macro2::TokenStream>()
+
+    // Prepend one `const _: &[u8] = include_bytes!("...");` per BPDL
+    // file the macro consumed. These anonymous consts are stripped
+    // from release artifacts (the compiler still parses and embeds
+    // the bytes, but nothing references them), and their sole
+    // purpose is to make the file paths first-class compile-time
+    // dependencies of the generated module. Without this, `cargo`
+    // doesn't notice BPDL edits — the `schema!` invocation tokens
+    // are unchanged, so cargo's incremental fingerprint considers
+    // the crate valid and reuses the old rlib. Re-encountered this
+    // after a BPDL variant removal triggered a non-exhaustive-match
+    // compile error in a consumer crate.
+    let mut tracking_block = String::new();
+    for p in &tracked_paths {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            tracking_block,
+            "const _: &[u8] = include_bytes!({:?});",
+            p.display().to_string(),
+        );
+    }
+    let combined = format!("{tracking_block}{rust}");
+
+    combined
+        .parse::<proc_macro2::TokenStream>()
         .map(Into::into)
         .map_err(|err| format!("bmux_plugin_schema codegen produced invalid Rust: {err}"))
 }

@@ -50,8 +50,12 @@ interface contexts-commands {
     }
 
     // Errors a `create-context` command can produce.
+    //
+    // Names are display hints, not identity: context creation does
+    // not reject duplicate names. Identity is the UUID assigned at
+    // creation. A caller may deliberately create two contexts named
+    // "tab-2" and bmux will honor that.
     variant create-context-error {
-        name-already-exists { name: string },
         invalid-name { reason: string },
         failed { reason: string },
     }

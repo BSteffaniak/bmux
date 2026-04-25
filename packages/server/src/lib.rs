@@ -5579,8 +5579,6 @@ async fn handle_request(
                     operation = %operation,
                     kind = "command",
                     client_id = ?client_id,
-                    elapsed_ms = tracing::field::Empty,
-                    outcome = tracing::field::Empty,
                 ),
                 bmux_ipc::InvokeServiceKind::Query => tracing::trace_span!(
                     target: "bmux_server::invoke_service",
@@ -5590,8 +5588,6 @@ async fn handle_request(
                     operation = %operation,
                     kind = "query",
                     client_id = ?client_id,
-                    elapsed_ms = tracing::field::Empty,
-                    outcome = tracing::field::Empty,
                 ),
             };
             let _span_guard = span.enter();
@@ -5654,20 +5650,13 @@ async fn handle_request(
 
             let response = if let Some(invocation) = invocation {
                 match invocation.await {
-                    Ok(payload) => {
-                        span.record("outcome", "ok");
-                        Response::Ok(ResponsePayload::ServiceInvoked { payload })
-                    }
-                    Err(error) => {
-                        span.record("outcome", "err:internal");
-                        Response::Err(ErrorResponse {
-                            code: ErrorCode::Internal,
-                            message: format!("service invocation failed: {error:#}"),
-                        })
-                    }
+                    Ok(payload) => Response::Ok(ResponsePayload::ServiceInvoked { payload }),
+                    Err(error) => Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!("service invocation failed: {error:#}"),
+                    }),
                 }
             } else {
-                span.record("outcome", "err:not_found");
                 Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!(
@@ -5677,11 +5666,14 @@ async fn handle_request(
             };
             #[allow(clippy::cast_possible_truncation)]
             let elapsed_ms = started_at.elapsed().as_millis() as u64;
-            span.record("elapsed_ms", elapsed_ms);
             // Companion completion log for Command-kind dispatches so
             // pair-up analysis ("which invoke begin matches which
-            // outcome?") is direct without needing span-close events
-            // from the fmt layer.
+            // outcome?") is direct. The surrounding span is retained
+            // for field context on any nested events the handler
+            // emitted; we don't `span.record(...)` the outcome /
+            // elapsed_ms here because the explicit `info!` already
+            // carries them and double-recording produces a noisy
+            // `outcome="ok" outcome="ok"` in the log.
             if matches!(kind, bmux_ipc::InvokeServiceKind::Command) {
                 let outcome_str = match &response {
                     Response::Ok(_) => "ok",

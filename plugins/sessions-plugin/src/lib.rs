@@ -515,18 +515,10 @@ fn new_session_via_ipc(
             let session_id = ack.session_id;
             let _ = global_event_bus().emit(
                 &sessions_events::EVENT_KIND,
-                SessionEvent::Created {
-                    session_id,
-                    name,
-                },
+                SessionEvent::Created { session_id, name },
             );
             Ok(SessionAck { id: session_id })
         }
-        Ok(Err(
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionRuntimeCommandError::NameAlreadyExists {
-                name: existing,
-            },
-        )) => Err(NewSessionError::NameAlreadyExists { name: existing }),
         Ok(Err(err)) => Err(NewSessionError::Failed {
             reason: format!("{err:?}"),
         }),

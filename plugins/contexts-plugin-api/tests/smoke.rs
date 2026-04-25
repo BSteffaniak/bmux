@@ -45,12 +45,15 @@ fn context_ack_and_error_variants_serialize() {
     };
     assert!(serde_json::to_string(&ack).expect("ack").contains("id"));
 
-    let err = CreateContextError::NameAlreadyExists {
-        name: "dup".to_string(),
+    // `CreateContextError` intentionally has no `NameAlreadyExists`
+    // variant: context names are display hints, not identity. Two
+    // contexts may share a name deliberately.
+    let err = CreateContextError::InvalidName {
+        reason: "empty".to_string(),
     };
     let json = serde_json::to_string(&err).expect("err");
-    assert!(json.contains("name_already_exists"));
-    assert!(json.contains("dup"));
+    assert!(json.contains("invalid_name"));
+    assert!(json.contains("empty"));
 
     let close_err = CloseContextError::NotFound;
     assert!(

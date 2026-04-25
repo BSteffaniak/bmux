@@ -61,9 +61,11 @@ interface pane-runtime-commands {
         failed { reason: string },
     }
 
+    // Errors the session-runtime commands can produce. Names are
+    // display hints, not identity: session creation does not reject
+    // duplicate names. Identity is the UUID assigned at creation.
     variant session-runtime-command-error {
         session-not-found,
-        name-already-exists { name: string },
         failed { reason: string },
     }
 

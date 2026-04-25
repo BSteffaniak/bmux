@@ -912,9 +912,6 @@ fn create_session_via_sessions_plugin(
         })?;
     match result {
         Ok(ack) => Ok(SessionId(ack.id)),
-        Err(NewSessionError::NameAlreadyExists { name }) => {
-            Err(CreateContextError::NameAlreadyExists { name })
-        }
         Err(NewSessionError::InvalidName { reason }) => {
             Err(CreateContextError::InvalidName { reason })
         }

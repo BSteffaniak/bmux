@@ -491,14 +491,12 @@ pub trait KernelOps: ServiceCaller {
         #[derive(serde::Deserialize, Debug)]
         #[serde(rename_all = "snake_case")]
         enum CreateErr {
-            NameAlreadyExists { name: String },
             InvalidName { reason: String },
             Failed { reason: String },
         }
         impl std::fmt::Display for CreateErr {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
-                    Self::NameAlreadyExists { name } => write!(f, "name already exists: {name}"),
                     Self::InvalidName { reason } => write!(f, "invalid name: {reason}"),
                     Self::Failed { reason } => write!(f, "{reason}"),
                 }

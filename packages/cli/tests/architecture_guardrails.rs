@@ -2394,3 +2394,89 @@ fn walk_rust_files(dir: &std::path::Path, visitor: &mut impl FnMut(&std::path::P
         }
     }
 }
+
+// ── `new_session_with_runtime` must not create a context ────────────
+//
+// Regression guard for the "multi-tab per keystroke" bug (see
+// `docs/runtime-action-migration.md` et al.). Pre-fix, the
+// pane-runtime handler for `new-session-with-runtime` created a
+// shadow context with `Uuid::nil()` as the caller client id while
+// `contexts-plugin::create_context_local` independently created
+// another context for the real caller. The result: one `c`
+// keypress produced two contexts, both named `tab-N`, sharing the
+// same session.
+//
+// Context lifecycle is solely owned by `contexts-plugin`. The
+// pane-runtime handler is strictly responsible for session +
+// runtime allocation. This test enforces the boundary by scanning
+// the `new_session_with_runtime` body for any method call that
+// looks like context creation.
+
+#[test]
+fn pane_runtime_new_session_with_runtime_does_not_create_context() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("packages/")
+        .parent()
+        .expect("repo root")
+        .join("plugins/pane-runtime-plugin/src/handlers/pane_commands.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+
+    // Extract the body of `pub fn new_session_with_runtime(...)` from
+    // its signature to the matching closing `}`. We search by brace
+    // depth so the walker doesn't get confused by nested blocks.
+    let signature = "pub fn new_session_with_runtime(";
+    let sig_start = source.find(signature).unwrap_or_else(|| {
+        panic!(
+            "new_session_with_runtime signature not found in {}",
+            path.display()
+        )
+    });
+    let body_open = sig_start
+        + source[sig_start..]
+            .find('{')
+            .expect("function body `{` should follow signature");
+    let bytes = source.as_bytes();
+    let mut depth: i32 = 0;
+    let mut body_end = None;
+    for (idx, &byte) in bytes[body_open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    body_end = Some(body_open + idx + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body_end = body_end.expect("new_session_with_runtime body should close");
+    let body = &source[body_open..body_end];
+
+    // Disallowed: any call that looks like writing a new context via
+    // the ContextStateWriter trait. If this test trips, move the
+    // context creation back to `contexts-plugin::create_context_local`
+    // (or plumb it through a typed service dispatch from the plugin
+    // that owns context lifecycle) — do NOT re-introduce a shadow
+    // create with `Uuid::nil()` here.
+    let denied_patterns = [
+        "context_handle.0.create(",
+        "ContextStateHandle",
+        "ContextStateWriter",
+        ".create(caller_client_id",
+    ];
+    for pattern in denied_patterns {
+        assert!(
+            !body.contains(pattern),
+            "`new_session_with_runtime` must not call context mutation \
+             primitives (`{pattern}`). Context lifecycle is owned by \
+             contexts-plugin's `create_context_local`; creating a \
+             context here produces shadow tabs (two contexts per \
+             keystroke) — see the earlier regression in the \
+             multi-tab bug investigation.",
+        );
+    }
+}

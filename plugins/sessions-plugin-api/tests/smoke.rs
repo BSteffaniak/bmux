@@ -43,12 +43,15 @@ fn session_ack_and_error_variants_serialize() {
     };
     assert!(serde_json::to_string(&ack).expect("ack").contains("id"));
 
-    let err = NewSessionError::NameAlreadyExists {
-        name: "dup".to_string(),
+    // `NewSessionError` intentionally has no `NameAlreadyExists`
+    // variant: session names are display hints, not identity. Two
+    // sessions may share a name deliberately.
+    let err = NewSessionError::InvalidName {
+        reason: "empty".to_string(),
     };
     let json = serde_json::to_string(&err).expect("err");
-    assert!(json.contains("name_already_exists"));
-    assert!(json.contains("dup"));
+    assert!(json.contains("invalid_name"));
+    assert!(json.contains("empty"));
 }
 
 #[test]
