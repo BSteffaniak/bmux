@@ -2157,9 +2157,6 @@ const RUNTIME_ACTION_ALLOWLIST: &[&str] = &[
     "Quit",
     "Detach",
     "ShowHelp",
-    // Attach-local generic overlay action; plugin-owned decoration data is still
-    // applied only through plugin typed services.
-    "ThemePicker",
     "EnterScrollMode",
     "ExitScrollMode",
     "ScrollUpLine",

@@ -118,8 +118,8 @@ pub use wire_event_sink::{
 
 // Prompt types — re-exported at the crate root for convenience.
 pub use prompt::{
-    PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValidation,
-    PromptValue, PromptWidth,
+    PromptEvent, PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
+    PromptValidation, PromptValue, PromptWidth,
 };
 
 // Action dispatch types.
@@ -265,6 +265,7 @@ pub mod prelude {
         PluginCommandError,
         // Events
         PluginEvent,
+        PromptEvent,
         // Prompt types
         PromptField,
         PromptOption,

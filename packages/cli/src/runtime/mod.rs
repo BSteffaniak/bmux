@@ -125,8 +125,8 @@ use plugin_runtime::{
     validate_enabled_plugins,
 };
 pub use prompt::{
-    PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError,
-    PromptValidation, PromptValue, PromptWidth,
+    PromptEvent, PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
+    PromptSubmitError, PromptValidation, PromptValue, PromptWidth,
 };
 use recording_cli::{
     recording_event_kind_name, replay_interactive, replay_verify, replay_watch,
@@ -226,10 +226,38 @@ pub fn submit_prompt_request(
     prompt::submit(request)
 }
 
+pub fn submit_prompt_request_with_events(
+    request: PromptRequest,
+) -> std::result::Result<
+    (
+        tokio::sync::oneshot::Receiver<PromptResponse>,
+        tokio::sync::mpsc::UnboundedReceiver<PromptEvent>,
+    ),
+    PromptSubmitError,
+> {
+    prompt::submit_with_events(request)
+}
+
 pub async fn request_prompt_response(
     request: PromptRequest,
 ) -> std::result::Result<PromptResponse, PromptSubmitError> {
     prompt::request(request).await
+}
+
+pub async fn request_prompt_response_with_events(
+    request: PromptRequest,
+) -> std::result::Result<
+    (
+        PromptResponse,
+        tokio::sync::mpsc::UnboundedReceiver<PromptEvent>,
+    ),
+    PromptSubmitError,
+> {
+    let (response_rx, event_rx) = prompt::request_with_events(request)?;
+    let response = response_rx
+        .await
+        .map_err(|_| PromptSubmitError::HostDisconnected)?;
+    Ok((response, event_rx))
 }
 
 pub fn dispatch_action(action: impl Into<String>) -> std::result::Result<(), ActionDispatchError> {

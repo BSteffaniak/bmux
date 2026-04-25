@@ -126,9 +126,11 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
         ("alt+minus", RuntimeAction::DecreaseSplit),
         // New pane
         ("alt+n", RuntimeAction::SplitFocusedHorizontal),
-        // Theme picker with live preview
-        ("ctrl+alt+t", RuntimeAction::ThemePicker),
     ]);
+    map.insert(
+        "ctrl+alt+t".to_string(),
+        "plugin:bmux.theme:pick-theme".to_string(),
+    );
     // Last-window toggle (ctrl+o). The windows plugin owns all tab
     // navigation; this key binds to `last-window` (tmux's convention
     // for "jump back to the previous window").

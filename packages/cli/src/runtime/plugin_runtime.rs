@@ -184,6 +184,10 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/snapshot-plugin/plugin.toml"),
     plugin_type = bmux_snapshot_plugin::SnapshotPlugin;
 
+    feature = "bundled-plugin-theme",
+    manifest = include_str!("../../../../plugins/theme-plugin/plugin.toml"),
+    plugin_type = bmux_theme_plugin::ThemePlugin;
+
     feature = "bundled-plugin-windows",
     manifest = include_str!("../../../../plugins/windows-plugin/plugin.toml"),
     plugin_type = bmux_windows_plugin::WindowsPlugin;

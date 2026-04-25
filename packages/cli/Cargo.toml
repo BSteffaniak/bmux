@@ -87,6 +87,9 @@ bmux_sessions_plugin = { workspace = true, optional = true, features = [
 bmux_snapshot_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
+bmux_theme_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
 bmux_windows_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -182,6 +185,7 @@ fail-on-warnings = [
     "bmux_server/fail-on-warnings",
     "bmux_sessions_plugin?/fail-on-warnings",
     "bmux_snapshot_plugin?/fail-on-warnings",
+    "bmux_theme_plugin?/fail-on-warnings",
     "bmux_terminal_protocol/fail-on-warnings",
     "bmux_windows_plugin?/fail-on-warnings",
     "bmux_decoration_plugin?/fail-on-warnings",
@@ -209,6 +213,7 @@ bundled-plugins = [
     "bundled-plugin-recording",
     "bundled-plugin-sessions",
     "bundled-plugin-snapshot",
+    "bundled-plugin-theme",
     "bundled-plugin-windows",
     "bundled-plugin-decoration",
 ]
@@ -231,6 +236,7 @@ bundled-plugin-prompted-actions = ["dep:bmux_prompted_actions_plugin"]
 bundled-plugin-recording = ["dep:bmux_recording_plugin"]
 bundled-plugin-sessions = ["dep:bmux_sessions_plugin"]
 bundled-plugin-snapshot = ["dep:bmux_snapshot_plugin"]
+bundled-plugin-theme = ["dep:bmux_theme_plugin"]
 bundled-plugin-windows = ["dep:bmux_windows_plugin"]
 
 # Optional features

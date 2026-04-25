@@ -16,8 +16,8 @@ use std::sync::{Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 
 pub use bmux_plugin_sdk::prompt::{
-    PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValidation,
-    PromptValue, PromptWidth,
+    PromptEvent, PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
+    PromptValidation, PromptValue, PromptWidth,
 };
 
 // ── Host request envelope ────────────────────────────────────────────────────
@@ -26,6 +26,7 @@ pub use bmux_plugin_sdk::prompt::{
 pub struct PromptHostRequest {
     pub request: PromptRequest,
     pub response_tx: oneshot::Sender<PromptResponse>,
+    pub event_tx: Option<mpsc::UnboundedSender<PromptEvent>>,
 }
 
 // ── Error ────────────────────────────────────────────────────────────────────
@@ -100,6 +101,33 @@ pub fn register_host(sender: mpsc::UnboundedSender<PromptHostRequest>) -> Prompt
 pub fn submit(
     request: PromptRequest,
 ) -> std::result::Result<oneshot::Receiver<PromptResponse>, PromptSubmitError> {
+    submit_inner(request, None)
+}
+
+/// Submit a prompt request and receive live prompt events.
+///
+/// # Errors
+///
+/// Returns [`PromptSubmitError::HostUnavailable`] if no host is registered,
+/// or [`PromptSubmitError::HostDisconnected`] if the channel is closed.
+pub fn submit_with_events(
+    request: PromptRequest,
+) -> std::result::Result<
+    (
+        oneshot::Receiver<PromptResponse>,
+        mpsc::UnboundedReceiver<PromptEvent>,
+    ),
+    PromptSubmitError,
+> {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let response_rx = submit_inner(request, Some(event_tx))?;
+    Ok((response_rx, event_rx))
+}
+
+fn submit_inner(
+    request: PromptRequest,
+    event_tx: Option<mpsc::UnboundedSender<PromptEvent>>,
+) -> std::result::Result<oneshot::Receiver<PromptResponse>, PromptSubmitError> {
     let guard = host_registry()
         .lock()
         .map_err(|_| PromptSubmitError::HostDisconnected)?;
@@ -114,6 +142,7 @@ pub fn submit(
         .send(PromptHostRequest {
             request,
             response_tx,
+            event_tx,
         })
         .map_err(|_| PromptSubmitError::HostDisconnected)?;
     Ok(response_rx)
@@ -133,6 +162,24 @@ pub async fn request(
     response_rx
         .await
         .map_err(|_| PromptSubmitError::HostDisconnected)
+}
+
+/// Submit a prompt request and receive response and event receivers.
+///
+/// # Errors
+///
+/// Returns [`PromptSubmitError::HostUnavailable`] if no host is registered,
+/// or [`PromptSubmitError::HostDisconnected`] if the channel is closed.
+pub fn request_with_events(
+    request: PromptRequest,
+) -> std::result::Result<
+    (
+        oneshot::Receiver<PromptResponse>,
+        mpsc::UnboundedReceiver<PromptEvent>,
+    ),
+    PromptSubmitError,
+> {
+    submit_with_events(request)
 }
 
 #[cfg(test)]

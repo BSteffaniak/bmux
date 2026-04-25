@@ -456,6 +456,11 @@ pub enum PromptResponse {
     RejectedBusy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromptEvent {
+    SelectionChanged { index: usize, value: String },
+}
+
 impl PromptResponse {
     #[must_use]
     pub const fn submitted_value(&self) -> Option<&PromptValue> {

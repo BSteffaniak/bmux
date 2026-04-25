@@ -3,9 +3,9 @@ use bmux_client::BmuxClient;
 use tokio::sync::oneshot;
 
 pub use crate::runtime::{
-    ActionDispatchError, ActionDispatchRequest, AttachExitReason, AttachRunOutcome, PromptField,
-    PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError, PromptValidation,
-    PromptValue, PromptWidth,
+    ActionDispatchError, ActionDispatchRequest, AttachExitReason, AttachRunOutcome, PromptEvent,
+    PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError,
+    PromptValidation, PromptValue, PromptWidth,
 };
 
 /// Run the attach TUI using an already-connected client.
@@ -31,6 +31,22 @@ pub fn submit_prompt(
     crate::runtime::submit_prompt_request(request)
 }
 
+/// Submit a prompt request and receive live prompt events.
+///
+/// # Errors
+/// Returns an error if no prompt host is available or if host delivery fails.
+pub fn submit_prompt_with_events(
+    request: PromptRequest,
+) -> std::result::Result<
+    (
+        oneshot::Receiver<PromptResponse>,
+        tokio::sync::mpsc::UnboundedReceiver<PromptEvent>,
+    ),
+    PromptSubmitError,
+> {
+    crate::runtime::submit_prompt_request_with_events(request)
+}
+
 /// Submit a prompt request and wait for its response.
 ///
 /// # Errors
@@ -39,6 +55,22 @@ pub async fn request_prompt(
     request: PromptRequest,
 ) -> std::result::Result<PromptResponse, PromptSubmitError> {
     crate::runtime::request_prompt_response(request).await
+}
+
+/// Submit a prompt request, wait for its response, and return live events.
+///
+/// # Errors
+/// Returns an error if no prompt host is available or if host delivery fails.
+pub async fn request_prompt_with_events(
+    request: PromptRequest,
+) -> std::result::Result<
+    (
+        PromptResponse,
+        tokio::sync::mpsc::UnboundedReceiver<PromptEvent>,
+    ),
+    PromptSubmitError,
+> {
+    crate::runtime::request_prompt_response_with_events(request).await
 }
 
 /// Dispatch a runtime action string to the attach loop.

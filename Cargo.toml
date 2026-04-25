@@ -72,6 +72,7 @@ members = [
     "plugins/sessions-plugin-api",
     "plugins/snapshot-plugin",
     "plugins/snapshot-plugin-api",
+    "plugins/theme-plugin",
     "plugins/windows-plugin",
     "plugins/windows-plugin-api",
 ]
@@ -184,6 +185,7 @@ bmux_sessions_plugin            = { version = "0.0.1-alpha.0", default-features 
 bmux_sessions_plugin_api        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/sessions-plugin-api" }
 bmux_snapshot_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/snapshot-plugin" }
 bmux_snapshot_plugin_api        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/snapshot-plugin-api" }
+bmux_theme_plugin               = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/theme-plugin" }
 bmux_windows_plugin             = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/windows-plugin" }
 bmux_windows_plugin_api         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/windows-plugin-api" }
 

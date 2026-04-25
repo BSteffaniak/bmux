@@ -21,13 +21,13 @@ const PROMPT_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(2);
 pub enum AttachInternalPromptAction {
     QuitSession,
     ClosePane { pane_id: Uuid },
-    ThemePicker,
 }
 
 #[derive(Debug)]
 pub enum AttachPromptOrigin {
     External {
         response_tx: oneshot::Sender<PromptResponse>,
+        event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::runtime::prompt::PromptEvent>>,
     },
     Internal(AttachInternalPromptAction),
 }
@@ -139,13 +139,7 @@ pub struct AttachPromptState {
 pub enum PromptKeyDisposition {
     NotActive,
     Consumed,
-    Preview(AttachPromptPreview),
     Completed(AttachPromptCompletion),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttachPromptPreview {
-    Theme { name: String },
 }
 
 impl AttachPromptState {
@@ -180,6 +174,7 @@ impl AttachPromptState {
             request: host_request.request,
             origin: AttachPromptOrigin::External {
                 response_tx: host_request.response_tx,
+                event_tx: host_request.event_tx,
             },
         });
     }
@@ -346,11 +341,8 @@ impl AttachPromptState {
                             _ => {}
                         }
                         *scroll = (*scroll).min(*selected);
-                        if *live_preview
-                            && *selected != previous_selected
-                            && let Some(preview) = active_preview(&active.envelope, *selected)
-                        {
-                            return PromptKeyDisposition::Preview(preview);
+                        if *live_preview && *selected != previous_selected {
+                            emit_selection_changed(&active.envelope, *selected);
                         }
                     }
                 }
@@ -569,22 +561,26 @@ pub const fn prompt_accepts_key_kind(kind: KeyEventKind) -> bool {
 }
 
 fn send_response(origin: AttachPromptOrigin, response: PromptResponse) {
-    if let AttachPromptOrigin::External { response_tx } = origin {
+    if let AttachPromptOrigin::External { response_tx, .. } = origin {
         let _ = response_tx.send(response);
     }
 }
 
-fn active_preview(envelope: &AttachPromptEnvelope, selected: usize) -> Option<AttachPromptPreview> {
-    match (&envelope.origin, &envelope.request.field) {
-        (
-            AttachPromptOrigin::Internal(AttachInternalPromptAction::ThemePicker),
-            PromptField::SingleSelect { options, .. },
-        ) => options
-            .get(selected)
-            .map(|option| AttachPromptPreview::Theme {
-                name: option.value.clone(),
-            }),
-        _ => None,
+fn emit_selection_changed(envelope: &AttachPromptEnvelope, selected: usize) {
+    let AttachPromptOrigin::External {
+        event_tx: Some(event_tx),
+        ..
+    } = &envelope.origin
+    else {
+        return;
+    };
+    if let PromptField::SingleSelect { options, .. } = &envelope.request.field
+        && let Some(option) = options.get(selected)
+    {
+        let _ = event_tx.send(crate::runtime::prompt::PromptEvent::SelectionChanged {
+            index: selected,
+            value: option.value.clone(),
+        });
     }
 }
 

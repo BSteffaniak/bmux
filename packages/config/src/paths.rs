@@ -210,12 +210,6 @@ impl ConfigPaths {
         self.state_dir().join("runtime").join("last-layout.json")
     }
 
-    /// Get persisted runtime theme override file path.
-    #[must_use]
-    pub fn runtime_theme_state_file(&self) -> PathBuf {
-        self.state_dir().join("runtime").join("theme.json")
-    }
-
     /// Get persisted protocol trace file path
     #[must_use]
     pub fn protocol_trace_file(&self) -> PathBuf {

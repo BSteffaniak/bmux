@@ -1070,6 +1070,7 @@ dependencies = [
  "bmux_snapshot_plugin",
  "bmux_snapshot_plugin_api",
  "bmux_terminal_protocol",
+ "bmux_theme_plugin",
  "bmux_windows_plugin",
  "bmux_windows_plugin_api",
  "clap",
@@ -1932,6 +1933,19 @@ name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "bmux_theme_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_config",
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

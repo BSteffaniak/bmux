@@ -1304,8 +1304,6 @@ impl Default for GeneralConfig {
 pub struct AppearanceConfig {
     /// Name of the color theme to apply. Empty string uses the default theme.
     pub theme: String,
-    /// Whether runtime theme switches are remembered across future attaches.
-    pub theme_persistence: ThemePersistence,
     /// Where to render the status bar. TOP places it above panes, BOTTOM below
     /// panes, and OFF hides it entirely.
     pub status_position: StatusPosition,
@@ -1318,16 +1316,6 @@ pub struct AppearanceConfig {
     /// Format string for the outer terminal's title bar. Empty string leaves
     /// the title unset.
     pub window_title_format: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum ThemePersistence {
-    /// Always start each attach with the theme declared in `appearance.theme`.
-    #[default]
-    DeclaredOnConnect,
-    /// Remember accepted runtime theme switches in bmux state, outside config.
-    PersistBetweenConnects,
 }
 
 /// Runtime behavior toggles for terminal protocol handling, layout persistence,

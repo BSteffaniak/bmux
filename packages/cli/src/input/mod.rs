@@ -138,7 +138,6 @@ impl Keymap {
             ("y", RuntimeAction::CopyScrollback),
             ("d", RuntimeAction::Detach),
             ("q", RuntimeAction::Quit),
-            ("ctrl+alt+t", RuntimeAction::ThemePicker),
         ]
         .into_iter()
         .map(|(key, action)| (key.to_string(), action_to_name(&action).to_string()))
