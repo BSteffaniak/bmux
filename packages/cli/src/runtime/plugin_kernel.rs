@@ -12,9 +12,11 @@ use bmux_plugin_sdk::{
 use bmux_server::{BmuxServer, ServiceInvokeContext};
 use clap::Parser;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tracing::Level;
 
 /// A factory that produces a connected [`BmuxClient`] on demand.
@@ -629,6 +631,8 @@ pub(super) fn register_plugin_service_handlers(
         .keys()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
+    let mut loaded_provider_cache: BTreeMap<String, Arc<bmux_plugin::LoadedPlugin>> =
+        BTreeMap::new();
 
     for service in services {
         let Some(invoke_kind) = invoke_kind_from_service_kind(service.kind) else {
@@ -642,9 +646,23 @@ pub(super) fn register_plugin_service_handlers(
             continue;
         };
 
-        let provider = provider.clone();
+        let loaded_provider = if let Some(loaded) = loaded_provider_cache.get(&provider_plugin_id) {
+            Arc::clone(loaded)
+        } else {
+            let host = plugin_host_metadata();
+            let loaded = Arc::new(
+                load_plugin(provider, &host, &available_capabilities).with_context(|| {
+                    format!(
+                        "failed loading service provider plugin '{}'",
+                        provider.declaration.id.as_str()
+                    )
+                })?,
+            );
+            loaded_provider_cache.insert(provider_plugin_id.clone(), Arc::clone(&loaded));
+            loaded
+        };
+        let provider_declaration = provider.declaration.clone();
         let host = plugin_host_metadata();
-        let available_capabilities_for_handler = available_capabilities.clone();
         let services_for_handler = available_service_descriptors(config, registry)?;
         let capability_names_for_handler = available_capability_names.clone();
         let plugin_search_roots_for_handler = plugin_search_roots.clone();
@@ -658,9 +676,9 @@ pub(super) fn register_plugin_service_handlers(
             service.interface_id.clone(),
             "*",
             move |route, invoke_context, payload| {
-                let provider = provider.clone();
+                let loaded_provider = Arc::clone(&loaded_provider);
+                let provider_declaration = provider_declaration.clone();
                 let host = host.clone();
-                let available_capabilities = available_capabilities_for_handler.clone();
                 let services = services_for_handler.clone();
                 let capability_names = capability_names_for_handler.clone();
                 let plugin_search_roots = plugin_search_roots_for_handler.clone();
@@ -668,20 +686,14 @@ pub(super) fn register_plugin_service_handlers(
                 let connection = connection_info_for_handler.clone();
                 let enabled_plugins = enabled_plugins_for_handler.clone();
                 async move {
-                    let loaded = load_plugin(&provider, &host, &available_capabilities)
-                        .with_context(|| {
-                            format!(
-                                "failed loading service provider plugin '{}'",
-                                provider.declaration.id.as_str()
-                            )
-                        })?;
+                    let started_at = Instant::now();
                     let _kernel_context_guard =
                         enter_service_kernel_context(invoke_context.clone());
                     let _host_kernel_connection_guard =
                         enter_host_kernel_connection(connection.clone());
                     let response =
-                        loaded.invoke_service(&bmux_plugin_sdk::NativeServiceContext {
-                            plugin_id: provider.declaration.id.as_str().to_string(),
+                        loaded_provider.invoke_service(&bmux_plugin_sdk::NativeServiceContext {
+                            plugin_id: provider_declaration.id.as_str().to_string(),
                             request: ServiceRequest {
                                 caller_plugin_id: "bmux.core".to_string(),
                                 service: RegisteredService {
@@ -692,20 +704,18 @@ pub(super) fn register_plugin_service_handlers(
                                     },
                                     interface_id: route.interface_id,
                                     provider: bmux_plugin_sdk::ProviderId::Plugin(
-                                        provider.declaration.id.as_str().to_string(),
+                                        provider_declaration.id.as_str().to_string(),
                                     ),
                                 },
                                 operation: route.operation,
                                 payload,
                             },
-                            required_capabilities: provider
-                                .declaration
+                            required_capabilities: provider_declaration
                                 .required_capabilities
                                 .iter()
                                 .map(ToString::to_string)
                                 .collect(),
-                            provided_capabilities: provider
-                                .declaration
+                            provided_capabilities: provider_declaration
                                 .provided_capabilities
                                 .iter()
                                 .map(ToString::to_string)
@@ -719,7 +729,7 @@ pub(super) fn register_plugin_service_handlers(
                             settings: config
                                 .plugins
                                 .settings
-                                .get(provider.declaration.id.as_str())
+                                .get(provider_declaration.id.as_str())
                                 .cloned(),
                             plugin_settings_map: config.plugins.settings.clone(),
                             caller_client_id: Some(invoke_context.client_id().0),
@@ -727,6 +737,13 @@ pub(super) fn register_plugin_service_handlers(
                                 host_kernel_bridge,
                             )),
                         })?;
+                    let elapsed_us = started_at.elapsed().as_micros();
+                    tracing::trace!(
+                        target: "bmux_cli::plugin_service",
+                        plugin_id = provider_declaration.id.as_str(),
+                        elapsed_us,
+                        "plugin service handler dispatched"
+                    );
                     if let Some(error) = response.error {
                         anyhow::bail!(error.message);
                     }

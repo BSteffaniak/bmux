@@ -5738,8 +5738,11 @@ async fn handle_request(
                     ),
                 })
             };
+            let elapsed = started_at.elapsed();
             #[allow(clippy::cast_possible_truncation)]
-            let elapsed_ms = started_at.elapsed().as_millis() as u64;
+            let elapsed_ms = elapsed.as_millis() as u64;
+            #[allow(clippy::cast_possible_truncation)]
+            let dispatch_micros = elapsed.as_micros() as u64;
             // Companion completion log for Command-kind dispatches so
             // pair-up analysis ("which invoke begin matches which
             // outcome?") is direct. The surrounding span is retained
@@ -5761,6 +5764,7 @@ async fn handle_request(
                     operation = %operation,
                     client_id = ?client_id,
                     elapsed_ms,
+                    dispatch_micros,
                     outcome = outcome_str,
                     "invoke command complete",
                 );

@@ -35,7 +35,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::thread;
@@ -60,6 +60,9 @@ const KERNEL_STATUS_OK: i32 = 0;
 const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 const PROCESS_PLUGIN_TIMEOUT_ENV_VAR: &str = "BMUX_PROCESS_PLUGIN_TIMEOUT_MS";
 const PROCESS_PLUGIN_TIMEOUT_DEFAULT_MS: u64 = 30_000;
+
+static LOCAL_STATIC_SERVICE_PROVIDER_CACHE: OnceLock<Mutex<BTreeMap<String, Arc<LoadedPlugin>>>> =
+    OnceLock::new();
 
 /// Backend that a [`LoadedPlugin`] uses to dispatch calls.
 #[derive(Debug)]
@@ -658,6 +661,66 @@ fn deserialize_toml_option<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 
+fn local_static_service_provider_cache() -> &'static Mutex<BTreeMap<String, Arc<LoadedPlugin>>> {
+    LOCAL_STATIC_SERVICE_PROVIDER_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn load_static_service_provider_cached(
+    provider_plugin_id: &str,
+    host: &HostMetadata,
+    available_capability_map: &BTreeMap<HostScope, CapabilityProvider>,
+) -> Result<Option<Arc<LoadedPlugin>>> {
+    let Some(vtable) = crate::static_vtable(provider_plugin_id) else {
+        return Ok(None);
+    };
+
+    if let Ok(cache) = local_static_service_provider_cache().lock()
+        && let Some(loaded) = cache.get(provider_plugin_id)
+    {
+        return Ok(Some(Arc::clone(loaded)));
+    }
+
+    let manifest_ptr = (vtable.entry)();
+    if manifest_ptr.is_null() {
+        return Err(PluginError::NullPluginEntry {
+            plugin_id: provider_plugin_id.to_string(),
+            symbol: "static_vtable::entry".to_string(),
+        });
+    }
+    let manifest_cstr = unsafe { std::ffi::CStr::from_ptr(manifest_ptr) };
+    let manifest_text = manifest_cstr
+        .to_str()
+        .map_err(|_| PluginError::InvalidPluginEntry {
+            plugin_id: provider_plugin_id.to_string(),
+            symbol: "static_vtable::entry".to_string(),
+            details: "embedded manifest is not valid UTF-8".to_string(),
+        })?;
+    let embedded_manifest = crate::PluginManifest::from_toml_str(manifest_text)?;
+    let declaration = embedded_manifest.to_declaration()?;
+    let synthetic = RegisteredPlugin {
+        search_root: PathBuf::new(),
+        manifest_path: PathBuf::new(),
+        manifest: embedded_manifest,
+        declaration,
+        bundled_static: true,
+    };
+    let loaded = Arc::new(load_static_plugin(
+        &synthetic,
+        vtable,
+        host,
+        available_capability_map,
+    )?);
+
+    if let Ok(mut cache) = local_static_service_provider_cache().lock() {
+        let entry = cache
+            .entry(provider_plugin_id.to_string())
+            .or_insert_with(|| Arc::clone(&loaded));
+        return Ok(Some(Arc::clone(entry)));
+    }
+
+    Ok(Some(loaded))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CoreStorageGetRequest {
     key: String,
@@ -916,12 +979,6 @@ pub fn call_service_raw(
         );
     }
 
-    let search_roots = plugin_search_roots
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let registry = discover_registered_plugins_in_roots(&search_roots)?;
-
     let available_capability_map = available_capabilities
         .iter()
         .filter_map(|value| HostScope::new(value).ok())
@@ -934,38 +991,19 @@ pub fn call_service_raw(
         })
         .collect::<BTreeMap<_, _>>();
 
-    // Try the statically-bundled vtable registry first. Bundled
-    // plugins don't appear in filesystem discovery but can still be
-    // reached via their registered vtable. Fall back to the
-    // discovered dynamic registry when no static vtable is present.
-    let loaded = if let Some(vtable) = crate::static_vtable(&provider_plugin_id) {
-        let manifest_ptr = (vtable.entry)();
-        if manifest_ptr.is_null() {
-            return Err(PluginError::NullPluginEntry {
-                plugin_id: provider_plugin_id.clone(),
-                symbol: "static_vtable::entry".to_string(),
-            });
-        }
-        let manifest_cstr = unsafe { std::ffi::CStr::from_ptr(manifest_ptr) };
-        let manifest_text =
-            manifest_cstr
-                .to_str()
-                .map_err(|_| PluginError::InvalidPluginEntry {
-                    plugin_id: provider_plugin_id.clone(),
-                    symbol: "static_vtable::entry".to_string(),
-                    details: "embedded manifest is not valid UTF-8".to_string(),
-                })?;
-        let embedded_manifest = crate::PluginManifest::from_toml_str(manifest_text)?;
-        let declaration = embedded_manifest.to_declaration()?;
-        let synthetic = RegisteredPlugin {
-            search_root: PathBuf::new(),
-            manifest_path: PathBuf::new(),
-            manifest: embedded_manifest,
-            declaration,
-            bundled_static: true,
-        };
-        load_static_plugin(&synthetic, vtable, host, &available_capability_map)?
+    // Bundled static providers are already registered in-process. Keep
+    // them off the filesystem discovery path entirely and reuse the
+    // loaded dispatch wrapper across local plugin-to-plugin calls.
+    let loaded = if let Some(loaded) =
+        load_static_service_provider_cached(&provider_plugin_id, host, &available_capability_map)?
+    {
+        loaded
     } else {
+        let search_roots = plugin_search_roots
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let registry = discover_registered_plugins_in_roots(&search_roots)?;
         let registered = registry.get(&provider_plugin_id).ok_or_else(|| {
             PluginError::MissingServiceProvider {
                 provider_plugin_id: provider_plugin_id.clone(),
@@ -973,7 +1011,11 @@ pub fn call_service_raw(
                 interface_id: service.interface_id.clone(),
             }
         })?;
-        load_registered_plugin(registered, host, &available_capability_map)?
+        Arc::new(load_registered_plugin(
+            registered,
+            host,
+            &available_capability_map,
+        )?)
     };
     let response = loaded.invoke_service(&NativeServiceContext {
         plugin_id: provider_plugin_id,
