@@ -1056,6 +1056,7 @@ pub async fn run_session_attach_with_client(
     }
 
     let mut view_state = AttachViewState::new(attach_info);
+    view_state.self_client_id = Some(self_client_id);
     view_state.mouse.config = attach_config.attach_mouse_config();
     view_state.status_position = if attach_config.status_bar.enabled {
         attach_config.appearance.status_position
@@ -2408,7 +2409,13 @@ pub async fn handle_attach_plugin_command_action(
         );
         return Ok(());
     }
-    match run_plugin_keybinding_command(plugin_id, command_name, args, kernel_client_factory) {
+    match run_plugin_keybinding_command(
+        plugin_id,
+        command_name,
+        args,
+        kernel_client_factory,
+        view_state.self_client_id,
+    ) {
         Err(error) => {
             warn!(
                 plugin_id = %plugin_id,

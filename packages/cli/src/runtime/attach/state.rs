@@ -65,6 +65,7 @@ impl Default for AttachDirtyFlags {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
+    pub self_client_id: Option<Uuid>,
     pub attached_id: Uuid,
     pub attached_context_id: Option<Uuid>,
     pub can_write: bool,
@@ -152,6 +153,7 @@ pub struct AttachMouseState {
 impl AttachViewState {
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
+            self_client_id: None,
             attached_id: attach_info.session_id,
             attached_context_id: attach_info.context_id,
             can_write: attach_info.can_write,

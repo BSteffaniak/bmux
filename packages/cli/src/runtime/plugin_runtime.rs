@@ -804,6 +804,7 @@ pub(super) fn plugin_command_context(
     enabled_plugins: Vec<String>,
     plugin_search_roots: Vec<String>,
     registered_plugins: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
+    caller_client_id: Option<uuid::Uuid>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
 ) -> NativeCommandContext {
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
@@ -834,7 +835,7 @@ pub(super) fn plugin_command_context(
             .get(declaration.id.as_str())
             .cloned(),
         plugin_settings_map: config.plugins.settings.clone(),
-        caller_client_id: None,
+        caller_client_id,
         invocation_source,
         host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
             host_kernel_bridge,
@@ -1399,6 +1400,7 @@ pub(super) async fn run_plugin_command(
         command_name,
         args,
         None,
+        None,
         bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
     )?;
     // Standalone CLI context: the process has no interactive TUI so
@@ -1420,12 +1422,14 @@ pub(super) fn run_plugin_keybinding_command(
     command_name: &str,
     args: &[String],
     kernel_client_factory: Option<&KernelClientFactory>,
+    caller_client_id: Option<uuid::Uuid>,
 ) -> Result<PluginCommandExecution> {
     run_plugin_command_internal(
         plugin_id,
         command_name,
         args,
         kernel_client_factory,
+        caller_client_id,
         bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
     )
 }
@@ -1499,6 +1503,7 @@ pub(super) fn run_plugin_command_internal(
     command_name: &str,
     args: &[String],
     kernel_client_factory: Option<&KernelClientFactory>,
+    caller_client_id: Option<uuid::Uuid>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
 ) -> Result<PluginCommandExecution> {
     let state = runtime_command_state()?;
@@ -1533,6 +1538,7 @@ pub(super) fn run_plugin_command_internal(
         enabled_plugins,
         plugin_search_roots,
         state.registered_plugin_infos.clone(),
+        caller_client_id,
         invocation_source,
     );
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
@@ -2386,6 +2392,7 @@ mod tests {
             vec!["provider.plugin".to_string()],
             vec!["/plugins".to_string()],
             Vec::new(),
+            None,
             bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
         );
 

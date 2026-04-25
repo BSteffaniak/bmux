@@ -812,6 +812,9 @@ fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<W
         })
         .map_err(|error| error.to_string())?;
     let context_id = response.context.id;
+    if let Some(previous) = previous_context {
+        append_context_to_window_order(caller, previous)?;
+    }
     append_context_to_window_order(caller, context_id)?;
     if let Some(previous) = previous_context
         && previous != context_id
@@ -2785,19 +2788,46 @@ mod tests {
 
     #[test]
     fn create_window_calls_session_create() {
-        let host = MockHost::with_sessions(sample_sessions());
+        let sessions = sample_sessions();
+        let first_id = sessions[0].id;
+        let host = MockHost::with_sessions(sessions);
         let ack = create_window(&host, Some("dev".to_string())).expect("create should succeed");
         assert!(ack.ok);
         let created_id = ack.id.expect("create should return context id");
         let created_id = Uuid::parse_str(&created_id).expect("created id should be uuid");
         let stored_order = get_stored_window_order_ids(&host).expect("order lookup should succeed");
-        assert_eq!(stored_order, vec![created_id]);
+        assert_eq!(stored_order, vec![first_id, created_id]);
         let creates: Vec<_> = host
             .creates
             .lock()
             .expect("create log lock should succeed")
             .clone();
         assert_eq!(creates.as_slice(), &[Some("dev".to_string())]);
+    }
+
+    #[test]
+    fn create_window_seeds_current_context_before_new_context() {
+        let sessions = sample_sessions();
+        let first_id = sessions[0].id;
+        let host = MockHost::with_sessions(sessions);
+
+        let ack = create_window(&host, None).expect("create should succeed");
+        let created_id =
+            Uuid::parse_str(ack.id.as_deref().expect("create should return context id"))
+                .expect("created id should be uuid");
+
+        let stored_order = get_stored_window_order_ids(&host).expect("order lookup should succeed");
+        assert_eq!(stored_order, vec![first_id, created_id]);
+
+        let windows = list_windows(&host, None).expect("list should succeed");
+        let ids = windows
+            .iter()
+            .map(|window| window.id.as_str())
+            .collect::<Vec<_>>();
+        let first_text = first_id.to_string();
+        let created_text = created_id.to_string();
+        assert_eq!(ids[0], first_text.as_str());
+        assert_eq!(ids[1], created_text.as_str());
     }
 
     #[test]
@@ -2933,7 +2963,8 @@ mod tests {
     fn next_window_selects_second_session() {
         let sessions = sample_sessions();
         let target_id = sessions[1].id;
-        let host = MockHost::with_sessions(sessions);
+        let host = MockHost::with_sessions(sessions.clone());
+        seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
         let ack = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
@@ -2963,7 +2994,8 @@ mod tests {
             },
         ];
         let target_id = sessions[2].id;
-        let host = MockHost::with_sessions(sessions);
+        let host = MockHost::with_sessions(sessions.clone());
+        seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
         let ack = cycle_window(

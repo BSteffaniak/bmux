@@ -330,6 +330,7 @@ fn run_plugin_bridge_command(request: &PluginCliCommandRequest) -> Result<i32> {
         request.command_name.as_str(),
         &request.arguments,
         None,
+        None,
     )?
     .status;
     Ok(status)
