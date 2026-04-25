@@ -271,7 +271,29 @@ impl RustPlugin for WindowsPlugin {
         // Subscription happens here (not in `activate`) because
         // `TypedServiceCaller::from_registration_context` needs the
         // typed registration context that `activate` does not receive.
-        spawn_contexts_events_subscriber(shared);
+        spawn_contexts_events_subscriber(shared.clone());
+
+        // Publish the initial window-list snapshot populated from the
+        // plugin's persisted `windows.order` storage projected through
+        // the current context list. The `register_state_channel` call
+        // in `activate` registered an empty placeholder because
+        // `activate` has no host access; now that we have a
+        // `TypedServiceCaller` we publish the authoritative state
+        // synchronously so:
+        //
+        //   - The server's `spawn_plugin_bus_state_forwarder` (which
+        //     runs after us in bootstrap) reads the populated value
+        //     when it calls `subscribe_state` to capture `initial`.
+        //   - Attach clients connecting afterward see the correct
+        //     tab order on first frame — no flash of `1:terminal`
+        //     even when the server starts with pre-existing contexts
+        //     restored from a prior session.
+        //
+        // `windows.order` is persisted under
+        // `<data_dir>/plugin-storage/bmux.windows/windows.order.bin`
+        // by the kernel storage service, so the user sees their tab
+        // order exactly as they left it before the server shutdown.
+        publish_window_list_snapshot(shared.caller.as_ref());
     }
 }
 
@@ -790,6 +812,7 @@ fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<W
         })
         .map_err(|error| error.to_string())?;
     let context_id = response.context.id;
+    append_context_to_window_order(caller, context_id)?;
     if let Some(previous) = previous_context
         && previous != context_id
     {
@@ -1113,6 +1136,13 @@ fn resolve_window_order_ids(
     contexts: &[domain_ipc::ContextSummary],
 ) -> Result<Vec<Uuid>, String> {
     let mut order_ids = get_stored_window_order_ids(caller)?;
+    if order_ids.is_empty() && !contexts.is_empty() {
+        order_ids = contexts.iter().map(|context| context.id).collect();
+        order_ids.sort_by_key(uuid::Uuid::as_u128);
+        set_stored_window_order_ids(caller, &order_ids)?;
+        return Ok(order_ids);
+    }
+
     let mut changed = false;
 
     let mut seen = HashSet::new();
@@ -1136,29 +1166,27 @@ fn resolve_window_order_ids(
         changed = true;
     }
 
-    let mut known_ids = order_ids.iter().copied().collect::<HashSet<_>>();
-    // Append any context that isn't in the stored order yet, in the
-    // insertion order of the caller-supplied `contexts` slice. In
-    // the event-driven model this path is only hit as a safety net —
-    // the authoritative source of insertion order is the
-    // `ContextEvent::Created` stream via
-    // `append_context_to_window_order`. When something slips past that
-    // (e.g. a context existed before the subscriber was installed),
-    // we preserve whatever order the caller presented rather than
-    // reshuffling by UUID. The MRU-flavored ordering of the contexts
-    // list is unfortunate but acceptable for the safety-net path;
-    // users who want deterministic order should invoke
-    // `plugin:bmux.windows:reset-order` (which sorts by UUID) or
-    // recreate the contexts through the event-driven path.
-    for context in contexts {
-        if known_ids.insert(context.id) {
-            order_ids.push(context.id);
-            changed = true;
-        }
-    }
-
     if changed {
         set_stored_window_order_ids(caller, &order_ids)?;
+    }
+
+    let mut known_ids = order_ids.iter().copied().collect::<HashSet<_>>();
+    // Append missing contexts only in the returned projection, never
+    // in persisted storage. `contexts` is MRU-first, so persisting
+    // this fallback would reintroduce tab-order shuffling on every
+    // selection. Creation/close event handlers own durable order
+    // mutations; this branch is just a display safety net for contexts
+    // that predate the windows order stream.
+    let mut missing = contexts
+        .iter()
+        .filter(|context| !known_ids.contains(&context.id))
+        .map(|context| context.id)
+        .collect::<Vec<_>>();
+    missing.sort_by_key(uuid::Uuid::as_u128);
+    for id in missing {
+        if known_ids.insert(id) {
+            order_ids.push(id);
+        }
     }
 
     Ok(order_ids)
@@ -2162,6 +2190,7 @@ mod tests {
         current_client_id: Uuid,
         selected_session_id: Mutex<Option<Uuid>>,
         mru_context_ids: Mutex<Vec<Uuid>>,
+        created_contexts: Mutex<Vec<SessionSummary>>,
         creates: Mutex<Vec<Option<String>>>,
         kills: Mutex<Vec<ContextCloseRequest>>,
         selects: Mutex<Vec<Uuid>>,
@@ -2174,6 +2203,7 @@ mod tests {
                 current_client_id: Uuid::new_v4(),
                 selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
                 mru_context_ids: Mutex::new(sessions.iter().map(|session| session.id).collect()),
+                created_contexts: Mutex::new(Vec::new()),
                 sessions,
                 fail_create: false,
                 fail_kill: false,
@@ -2191,6 +2221,7 @@ mod tests {
                 current_client_id: Uuid::new_v4(),
                 selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
                 mru_context_ids: Mutex::new(sessions.iter().map(|session| session.id).collect()),
+                created_contexts: Mutex::new(Vec::new()),
                 sessions,
                 fail_create: false,
                 fail_kill: false,
@@ -2208,6 +2239,7 @@ mod tests {
                 current_client_id: Uuid::new_v4(),
                 selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
                 mru_context_ids: Mutex::new(sessions.iter().map(|session| session.id).collect()),
+                created_contexts: Mutex::new(Vec::new()),
                 sessions,
                 fail_create,
                 fail_kill,
@@ -2244,8 +2276,15 @@ mod tests {
                         .lock()
                         .expect("mru context lock should succeed")
                         .clone();
-                    let mut by_id = self
-                        .sessions
+                    let mut all_sessions = self.sessions.clone();
+                    all_sessions.extend(
+                        self.created_contexts
+                            .lock()
+                            .expect("created contexts lock should succeed")
+                            .iter()
+                            .cloned(),
+                    );
+                    let mut by_id = all_sessions
                         .iter()
                         .cloned()
                         .map(|context| (context.id, context))
@@ -2313,11 +2352,32 @@ mod tests {
                         .lock()
                         .expect("create log lock should succeed")
                         .push(request.name.clone());
+                    let created_id = Uuid::new_v4();
+                    self.created_contexts
+                        .lock()
+                        .expect("created contexts lock should succeed")
+                        .push(SessionSummary {
+                            id: created_id,
+                            name: request.name.clone(),
+                            attributes: BTreeMap::new(),
+                        });
+                    {
+                        let mut mru_context_ids = self
+                            .mru_context_ids
+                            .lock()
+                            .expect("mru context lock should succeed");
+                        mru_context_ids.retain(|id| *id != created_id);
+                        mru_context_ids.insert(0, created_id);
+                    }
+                    *self
+                        .selected_session_id
+                        .lock()
+                        .expect("selected session lock should succeed") = Some(created_id);
                     let ok: Result<
                         bmux_contexts_plugin_api::contexts_commands::ContextAck,
                         bmux_contexts_plugin_api::contexts_commands::CreateContextError,
                     > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
-                        id: Uuid::new_v4(),
+                        id: created_id,
                         session_id: None,
                     });
                     encode_service_message(&ok)
@@ -2641,9 +2701,19 @@ mod tests {
         ]
     }
 
+    fn seed_window_order(host: &MockHost, sessions: &[SessionSummary]) {
+        let ids = sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        set_stored_window_order_ids(host, &ids).expect("seed window order should succeed");
+    }
+
     #[test]
     fn list_windows_projects_sessions_and_marks_first_active() {
-        let host = MockHost::with_sessions(sample_sessions());
+        let sessions = sample_sessions();
+        let host = MockHost::with_sessions(sessions.clone());
+        seed_window_order(&host, &sessions);
         let windows = list_windows(&host, None).expect("list should succeed");
 
         assert_eq!(windows.len(), 2);
@@ -2683,7 +2753,8 @@ mod tests {
                 attributes: BTreeMap::new(),
             },
         ];
-        let host = MockHost::with_sessions(sessions);
+        let host = MockHost::with_sessions(sessions.clone());
+        seed_window_order(&host, &sessions);
 
         let windows = list_windows(&host, None).expect("list should succeed");
         assert_eq!(windows.len(), 2);
@@ -2717,7 +2788,10 @@ mod tests {
         let host = MockHost::with_sessions(sample_sessions());
         let ack = create_window(&host, Some("dev".to_string())).expect("create should succeed");
         assert!(ack.ok);
-        assert!(ack.id.is_some());
+        let created_id = ack.id.expect("create should return context id");
+        let created_id = Uuid::parse_str(&created_id).expect("created id should be uuid");
+        let stored_order = get_stored_window_order_ids(&host).expect("order lookup should succeed");
+        assert_eq!(stored_order, vec![created_id]);
         let creates: Vec<_> = host
             .creates
             .lock()
@@ -2909,7 +2983,8 @@ mod tests {
         let first_id = sessions[0].id;
         let second_id = sessions[1].id;
         let third_id = sessions[2].id;
-        let host = MockHost::with_sessions(sessions);
+        let host = MockHost::with_sessions(sessions.clone());
+        seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
         let next = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
@@ -2947,7 +3022,8 @@ mod tests {
         let first_id = sessions[0].id;
         let second_id = sessions[1].id;
         let third_id = sessions[2].id;
-        let host = MockHost::with_sessions(sessions);
+        let host = MockHost::with_sessions(sessions.clone());
+        seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
         let _ = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
@@ -2974,6 +3050,74 @@ mod tests {
             windows
                 .iter()
                 .any(|window| window.active && window.id == second_text)
+        );
+    }
+
+    #[test]
+    fn empty_window_order_initializes_to_deterministic_order_not_mru() {
+        let first_id = Uuid::from_u128(1);
+        let second_id = Uuid::from_u128(2);
+        let third_id = Uuid::from_u128(3);
+        let sessions = vec![
+            SessionSummary {
+                id: third_id,
+                name: Some("gamma".to_string()),
+                attributes: BTreeMap::new(),
+            },
+            SessionSummary {
+                id: first_id,
+                name: Some("alpha".to_string()),
+                attributes: BTreeMap::new(),
+            },
+            SessionSummary {
+                id: second_id,
+                name: Some("beta".to_string()),
+                attributes: BTreeMap::new(),
+            },
+        ];
+        let host = MockHost::with_sessions(sessions);
+        *host
+            .mru_context_ids
+            .lock()
+            .expect("mru context lock should succeed") = vec![third_id, second_id, first_id];
+
+        let windows = list_windows(&host, None).expect("list should succeed");
+        let ids = windows
+            .iter()
+            .map(|window| window.id.as_str())
+            .collect::<Vec<_>>();
+        let first_text = first_id.to_string();
+        let second_text = second_id.to_string();
+        let third_text = third_id.to_string();
+        assert_eq!(
+            ids,
+            vec![
+                first_text.as_str(),
+                second_text.as_str(),
+                third_text.as_str()
+            ]
+        );
+
+        let stored_order = get_stored_window_order_ids(&host).expect("order lookup should succeed");
+        assert_eq!(stored_order, vec![first_id, second_id, third_id]);
+
+        *host
+            .mru_context_ids
+            .lock()
+            .expect("mru context lock should succeed") = vec![second_id, third_id, first_id];
+
+        let windows = list_windows(&host, None).expect("second list should succeed");
+        let ids = windows
+            .iter()
+            .map(|window| window.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                first_text.as_str(),
+                second_text.as_str(),
+                third_text.as_str()
+            ]
         );
     }
 
@@ -3183,7 +3327,8 @@ mod tests {
     fn goto_window_by_index_selects_first_context() {
         let sessions = sample_sessions();
         let first_id = sessions[0].id;
-        let host = MockHost::with_sessions(sessions);
+        let host = MockHost::with_sessions(sessions.clone());
+        seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
         let ack = goto_window_by_index(&host, 1, &last_selected_by_client)
@@ -3197,7 +3342,8 @@ mod tests {
     fn goto_window_by_index_selects_second_context() {
         let sessions = sample_sessions();
         let second_id = sessions[1].id;
-        let host = MockHost::with_sessions(sessions);
+        let host = MockHost::with_sessions(sessions.clone());
+        seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
         let ack = goto_window_by_index(&host, 2, &last_selected_by_client)

@@ -62,7 +62,7 @@ pub const PERF_WINDOW_FRAMES: usize = 60;
 pub const DEFAULT_WARN_MS: f32 = 8.0;
 
 /// Minimum spacing between consecutive perf warnings per script.
-pub const WARN_COOLDOWN: Duration = Duration::from_secs(60);
+pub const WARN_COOLDOWN: Duration = Duration::from_mins(1);
 
 /// Context passed to a script's `decorate(ctx)` function.
 ///

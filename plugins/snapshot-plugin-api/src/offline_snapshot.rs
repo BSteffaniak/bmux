@@ -625,8 +625,7 @@ fn terminate_process_group(process_group_id: i32) -> bool {
         .arg("-TERM")
         .arg(format!("-{process_group_id}"))
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+        .is_ok_and(|status| status.success());
 
     std::thread::sleep(Duration::from_millis(120));
 
@@ -634,16 +633,14 @@ fn terminate_process_group(process_group_id: i32) -> bool {
         .arg("-0")
         .arg(format!("-{process_group_id}"))
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+        .is_ok_and(|status| status.success());
 
     if group_still_alive {
         return std::process::Command::new("kill")
             .arg("-KILL")
             .arg(format!("-{process_group_id}"))
             .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+            .is_ok_and(|status| status.success())
             || sent_term;
     }
     sent_term

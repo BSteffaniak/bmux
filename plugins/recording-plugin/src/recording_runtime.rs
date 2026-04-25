@@ -269,7 +269,7 @@ impl RecordingRuntime {
                 recordings.push(active);
             }
         }
-        recordings.sort_by(|a, b| b.started_epoch_ms.cmp(&a.started_epoch_ms));
+        recordings.sort_by_key(|r| std::cmp::Reverse(r.started_epoch_ms));
         Ok(recordings)
     }
 
@@ -708,11 +708,7 @@ fn prune_closed_segments(
 fn compute_total_segment_bytes(recording_dir: &Path, segments: &[String]) -> u64 {
     segments
         .iter()
-        .map(|name| {
-            std::fs::metadata(recording_dir.join(name))
-                .map(|m| m.len())
-                .unwrap_or(0)
-        })
+        .map(|name| std::fs::metadata(recording_dir.join(name)).map_or(0, |m| m.len()))
         .sum()
 }
 

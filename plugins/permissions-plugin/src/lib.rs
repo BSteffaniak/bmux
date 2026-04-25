@@ -894,27 +894,16 @@ fn matched_hot_path_override_scope(
             continue;
         }
         let (rank, scope_name) = match candidate.scope.as_str() {
-            "session_context" => {
-                if candidate.session_id == Some(session_id) && candidate.context_id == context_id {
-                    (4, "session_context")
-                } else {
-                    (0, "")
-                }
+            "session_context"
+                if candidate.session_id == Some(session_id)
+                    && candidate.context_id == context_id =>
+            {
+                (4, "session_context")
             }
-            "context" => {
-                if context_id.is_some() && candidate.context_id == context_id {
-                    (3, "context")
-                } else {
-                    (0, "")
-                }
+            "context" if context_id.is_some() && candidate.context_id == context_id => {
+                (3, "context")
             }
-            "session" => {
-                if candidate.session_id == Some(session_id) {
-                    (2, "session")
-                } else {
-                    (0, "")
-                }
-            }
+            "session" if candidate.session_id == Some(session_id) => (2, "session"),
             "global" => (1, "global"),
             _ => (0, ""),
         };

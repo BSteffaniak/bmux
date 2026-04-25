@@ -180,7 +180,7 @@ fn spawn_prune_loop(manual_runtime: Arc<Mutex<RecordingRuntime>>) {
             let _ = runtime.prune(None);
         }
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+            std::thread::sleep(std::time::Duration::from_hours(1));
             if let Ok(runtime) = manual_runtime.lock() {
                 let _ = runtime.prune(None);
             }

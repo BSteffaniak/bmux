@@ -343,8 +343,7 @@ impl bmux_attach_token_state::AttachTokenManagerReader for ServerAttachTokenAdap
     fn contains(&self, token: Uuid) -> bool {
         self.inner
             .lock()
-            .map(|guard| guard.tokens.contains_key(&token))
-            .unwrap_or(false)
+            .is_ok_and(|guard| guard.tokens.contains_key(&token))
     }
 }
 
@@ -578,8 +577,7 @@ fn check_terminfo_available(term: &str) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 async fn shutdown_runtime_handle(removed: RemovedRuntime) {
@@ -2898,8 +2896,7 @@ impl SessionRuntimeManager {
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile);
                     let (initial_rows, initial_cols) = last_requested_size_for_reader
                         .lock()
-                        .map(|size| *size)
-                        .unwrap_or((24, 80));
+                        .map_or((24, 80), |size| *size);
                     let mut cursor_tracker = PaneCursorTracker::new(initial_rows, initial_cols);
                     let mut terminal_mode_tracker = PaneTerminalModeTracker::default();
                     let mut shell_metadata_parser = PaneShellMetadataParser::default();
@@ -2952,8 +2949,7 @@ impl SessionRuntimeManager {
 
                                         let (cpw, cph) = cell_pixel_size_for_reader
                                             .lock()
-                                            .map(|s| *s)
-                                            .unwrap_or((8, 16));
+                                            .map_or((8, 16), |s| *s);
                                         let cpw = if cpw == 0 { 8 } else { cpw };
                                         let cph = if cph == 0 { 16 } else { cph };
                                         if let Ok(mut reg) = image_registry_for_reader.lock() {
@@ -4496,7 +4492,7 @@ impl BmuxServer {
     where
         T: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
     {
-        let (initial, mut rx) = bmux_plugin::global_event_bus()
+        let (_initial, mut rx) = bmux_plugin::global_event_bus()
             .subscribe_state::<T>(kind)
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -4507,37 +4503,16 @@ impl BmuxServer {
         let kind_string = kind.as_str().to_string();
         let state = Arc::downgrade(&self.state);
 
-        // Emit the retained snapshot synchronously so any streaming
-        // clients already connected see the current state without
-        // having to wait for the next mutation. This mirrors the
-        // `subscribe_state` contract on the local bus (subscribers see
-        // the current value first, then watch for changes).
-        if let Some(state_ref) = state.upgrade() {
-            match serde_json::to_vec(initial.as_ref()) {
-                Ok(encoded) => {
-                    if let Err(error) = emit_event(
-                        &state_ref,
-                        Event::PluginBusEvent {
-                            kind: kind_string.clone(),
-                            payload: encoded,
-                        },
-                    ) {
-                        tracing::warn!(
-                            kind = %kind_string,
-                            error = %error,
-                            "failed emitting initial plugin bus state snapshot",
-                        );
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        kind = %kind_string,
-                        error = %error,
-                        "failed encoding initial plugin bus state snapshot; dropping",
-                    );
-                }
-            }
-        }
+        // State-channel current values are pulled by clients on
+        // connect via the plugin's typed query surface (matching the
+        // `ControlCatalogSnapshot` pull-on-connect pattern). We
+        // deliberately do NOT emit `initial` here: the forwarder runs
+        // during server bootstrap, before any attach client has
+        // connected. A broadcast at that moment has zero subscribers
+        // and the message is lost, so emitting it would be pure
+        // waste. The forwarder's job is to propagate subsequent
+        // changes; initial seeding is the client's responsibility via
+        // its plugin query at attach startup.
 
         tokio::spawn(async move {
             while rx.changed().await.is_ok() {

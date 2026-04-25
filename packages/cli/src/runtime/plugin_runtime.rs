@@ -96,12 +96,17 @@ macro_rules! declare_bundled_plugins {
             $(
                 #[cfg(feature = $feature)]
                 if let Err(e) = registry.register_bundled_manifest($manifest) {
-                    let plugin_id = bundled_manifest_plugin_id($manifest)
+                    let plugin_id = bmux_plugin::PluginManifest::from_toml_str($manifest)
+                        .ok()
+                        .map(|parsed| parsed.id)
                         .unwrap_or_else(|| "<unknown-plugin-id>".to_string());
                     tracing::warn!("failed to register bundled plugin '{plugin_id}': {e}");
                 }
                 #[cfg(feature = $feature)]
-                if let Some(plugin_id) = bundled_manifest_plugin_id($manifest) {
+                if let Some(plugin_id) = bmux_plugin::PluginManifest::from_toml_str($manifest)
+                    .ok()
+                    .map(|parsed| parsed.id)
+                {
                     let vtable = bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest);
                     bmux_plugin::register_static_vtable(&plugin_id, vtable);
                 }
@@ -112,7 +117,9 @@ macro_rules! declare_bundled_plugins {
         fn static_bundled_vtable(plugin_id: &str) -> Option<bmux_plugin_sdk::StaticPluginVtable> {
             $(
                 #[cfg(feature = $feature)]
-                if bundled_manifest_plugin_id($manifest)
+                if bmux_plugin::PluginManifest::from_toml_str($manifest)
+                    .ok()
+                    .map(|parsed| parsed.id)
                     .as_deref()
                     .is_some_and(|manifest_plugin_id| manifest_plugin_id == plugin_id)
                 {
@@ -184,12 +191,6 @@ declare_bundled_plugins! {
     feature = "bundled-plugin-decoration",
     manifest = include_str!("../../../../plugins/decoration-plugin/plugin.toml"),
     plugin_type = bmux_decoration_plugin::DecorationPlugin;
-}
-
-fn bundled_manifest_plugin_id(manifest: &str) -> Option<String> {
-    bmux_plugin::PluginManifest::from_toml_str(manifest)
-        .ok()
-        .map(|parsed| parsed.id)
 }
 
 /// Load a registered plugin, using the static vtable path for bundled plugins

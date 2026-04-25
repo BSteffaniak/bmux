@@ -136,6 +136,46 @@ async fn typed_list_contexts_attach(
     })
 }
 
+/// Typed dispatch wrapper for `windows-state:list-windows`.
+///
+/// Pulls the windows-plugin's current ordered window list via the
+/// server's `InvokeService` router. The windows-plugin's state channel
+/// (`windows-list`) is published on the server's local event bus and
+/// forwarded to streaming clients via `Event::PluginBusEvent`, but the
+/// forwarder's initial emit happens before any client connects — the
+/// broadcast has zero subscribers at that moment and the message is
+/// lost. We pull on attach startup to seed our local state channel;
+/// subsequent mutations arrive as `PluginBusEvent`s and drive updates
+/// through the normal subscription path. This matches the
+/// `ControlCatalogSnapshot` pull-on-connect pattern.
+async fn typed_list_windows_attach(
+    client: &mut StreamingBmuxClient,
+) -> std::result::Result<Vec<bmux_windows_plugin_api::windows_state::WindowEntry>, ClientError> {
+    #[derive(serde::Serialize)]
+    struct Args {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    }
+    let payload =
+        bmux_codec::to_vec(&Args { session: None }).map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding list-windows args: {error}"),
+        })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            bmux_windows_plugin_api::capabilities::WINDOWS_READ.as_str(),
+            bmux_ipc::InvokeServiceKind::Query,
+            bmux_windows_plugin_api::windows_state::INTERFACE_ID.as_str(),
+            "list-windows",
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding list-windows response: {error}"),
+    })
+}
+
 /// Typed dispatch wrapper for `contexts-state:current-context`.
 async fn typed_current_context_attach(
     client: &mut StreamingBmuxClient,
@@ -1186,6 +1226,39 @@ pub async fn run_session_attach_with_client(
         }
         Err(_) => None,
     };
+
+    // Pull the current window list from the windows-plugin via typed
+    // dispatch. The server-side state-channel forwarder emits the
+    // initial snapshot before any client connects, so it's always
+    // lost on a fresh attach. Pulling here seeds our local state
+    // channel with the correct current value; subsequent mutations
+    // arrive via `PluginBusEvent` and drive updates through the
+    // `tokio::select!` arm below.
+    //
+    // Silent-failure policy: if the plugin isn't loaded, the
+    // `invoke_service_raw` call errors and we skip. The tab bar then
+    // falls through to the raw-contexts render path, which is the
+    // baseline-fallback behavior per AGENTS.md.
+    if let Ok(entries) = typed_list_windows_attach(&mut client).await {
+        let windows: Vec<bmux_windows_plugin_api::windows_list::WindowListEntry> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let id = Uuid::parse_str(&entry.id).ok()?;
+                Some(bmux_windows_plugin_api::windows_list::WindowListEntry {
+                    id,
+                    name: entry.name,
+                    active: entry.active,
+                })
+            })
+            .collect();
+        let snapshot = bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+            windows,
+            revision: 0,
+        };
+        view_state.cached_window_list = Some(std::sync::Arc::new(snapshot.clone()));
+        let _ = bmux_plugin::global_event_bus()
+            .publish_state(&bmux_windows_plugin_api::windows_list::STATE_KIND, snapshot);
+    }
 
     loop {
         // ── Event-driven select: sleep until something happens ────────
@@ -3991,7 +4064,10 @@ pub fn build_attach_tabs_from_catalog(
     let use_mru = matches!(status_config.tab_scope, bmux_config::StatusTabScope::Mru)
         || matches!(status_config.tab_order, bmux_config::StatusTabOrder::Mru);
 
-    if !use_mru && let Some(snapshot) = view_state.cached_window_list.as_ref() {
+    if !use_mru
+        && let Some(snapshot) = view_state.cached_window_list.as_ref()
+        && !snapshot.windows.is_empty()
+    {
         return build_attach_tabs_from_plugin_snapshot(
             snapshot,
             contexts,
@@ -4014,14 +4090,6 @@ fn build_attach_tabs_from_plugin_snapshot(
     context_id: Option<Uuid>,
     session_id: Uuid,
 ) -> Vec<AttachTab> {
-    if snapshot.windows.is_empty() {
-        return vec![AttachTab {
-            label: "terminal".to_string(),
-            active: true,
-            context_id: None,
-        }];
-    }
-
     // Filter to this session's contexts if the user asked for
     // `SessionContexts` scope. Cross-reference `cached_contexts` to
     // locate the `bmux.session_id` attribute for each window.
