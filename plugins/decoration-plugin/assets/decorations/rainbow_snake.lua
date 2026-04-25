@@ -3,8 +3,7 @@
 
 local INITIAL_SNAKE_SIZE = 8
 local snake_size = INITIAL_SNAKE_SIZE
-local apple_u = nil
-local apple_key = nil
+local apple_v = nil
 local rng_state = nil
 local state_total = nil
 local death_started_ms = nil
@@ -51,30 +50,6 @@ local function perimeter_cell(rect, visual_offset, vertical_aspect)
     return rect.x, rect.y + h - 1 - math.floor(p / vertical_aspect), "left"
 end
 
-local function perimeter_cell_raw(rect, cell_offset)
-    local w = rect.w
-    local h = rect.h
-    local total = len_border(rect)
-    local p = cell_offset % total
-    if p < (w - 1) then
-        return rect.x + math.floor(p), rect.y
-    end
-    p = p - (w - 1)
-    if p < (h - 1) then
-        return rect.x + w - 1, rect.y + math.floor(p)
-    end
-    p = p - (h - 1)
-    if p < (w - 1) then
-        return rect.x + w - 1 - math.floor(p), rect.y + h - 1
-    end
-    p = p - (w - 1)
-    return rect.x, rect.y + h - 1 - math.floor(p)
-end
-
-local function cell_key(col, row)
-    return col .. ":" .. row
-end
-
 local function seed_rng(ctx)
     if rng_state ~= nil then
         return
@@ -89,38 +64,33 @@ local function next_random(ctx, max_value)
     return math.floor((rng_state / 233280) * max_value)
 end
 
-local function apple_index_for(total)
-    if apple_u == nil then
-        return nil
-    end
-    return math.floor((apple_u % 1.0) * total) % total
+local function circular_distance(a, b, total)
+    local d = math.abs((a % total) - (b % total))
+    return math.min(d, total - d)
 end
 
-local function store_apple_candidate(ctx, candidate, occupied)
-    local col, row = perimeter_cell_raw(ctx.rect, candidate)
-    local key = cell_key(col, row)
-    if occupied[key] then
+local function distance_behind_head(head, point, total)
+    return (head - point) % total
+end
+
+local function apple_on_snake(head, apple, snake_len, segment_visual_spacing, visual_total)
+    if apple == nil then
         return false
     end
-    apple_u = candidate / len_border(ctx.rect)
-    apple_key = key
-    return true
+    local body_span = math.max(0, snake_len - 1) * segment_visual_spacing
+    return distance_behind_head(head, apple, visual_total) <= body_span + 0.5
 end
 
-local function spawn_apple(ctx, occupied, total)
-    for _ = 1, total * 2 do
-        local candidate = next_random(ctx, total)
-        if store_apple_candidate(ctx, candidate, occupied) then
-            return
-        end
+local function spawn_apple(ctx, head, snake_len, segment_visual_spacing, visual_total)
+    local body_span = math.max(0, snake_len - 1) * segment_visual_spacing
+    local margin = segment_visual_spacing * 2
+    local free_span = visual_total - body_span - margin * 2
+    if free_span <= 1 then
+        apple_v = nil
+        return
     end
-    for candidate = 0, total - 1 do
-        if store_apple_candidate(ctx, candidate, occupied) then
-            return
-        end
-    end
-    apple_u = nil
-    apple_key = nil
+    local roll = next_random(ctx, 1000000) / 1000000.0
+    apple_v = (head + margin + roll * free_span) % visual_total
 end
 
 local function insert_diamond(cmds, col, row, z, r, g, b)
@@ -134,22 +104,11 @@ local function insert_diamond(cmds, col, row, z, r, g, b)
     })
 end
 
-local function update_apple_key(rect, total)
-    local apple_index = apple_index_for(total)
-    if apple_index == nil then
-        apple_key = nil
-        return nil
-    end
-    local col, row = perimeter_cell_raw(rect, apple_index)
-    apple_key = cell_key(col, row)
-    return apple_index, col, row
-end
-
-local function insert_apple(cmds, rect, total)
-    local _, col, row = update_apple_key(rect, total)
-    if col == nil then
+local function insert_apple(cmds, rect, vertical_aspect)
+    if apple_v == nil then
         return
     end
+    local col, row = perimeter_cell(rect, apple_v, vertical_aspect)
     table.insert(cmds, {
         kind  = "text",
         col   = col,
@@ -160,17 +119,9 @@ local function insert_apple(cmds, rect, total)
     })
 end
 
-local function ensure_apple(ctx, occupied, total)
-    update_apple_key(ctx.rect, total)
-    if apple_u == nil or apple_key == nil or occupied[apple_key] then
-        spawn_apple(ctx, occupied, total)
-    end
-end
-
 local function reset_game(total)
     snake_size = math.min(INITIAL_SNAKE_SIZE, total)
-    apple_u = nil
-    apple_key = nil
+    apple_v = nil
     death_started_ms = nil
     death_segments = nil
 end
@@ -196,27 +147,18 @@ local function render_death_flash(cmds, ctx, total)
 end
 
 local function collect_snake_cells(rect, head, visual_total, vertical_aspect, segment_visual_spacing, total)
-    local occupied = {}
     local segments = {}
     local max_size = math.min(snake_size, total)
-    local emitted = 0
-    local attempts = 0
-    while emitted < max_size and attempts < max_size * 4 do
-        local offset = head - attempts * segment_visual_spacing
+    for i = 0, max_size - 1 do
+        local offset = head - i * segment_visual_spacing
         local col, row = perimeter_cell(rect, offset, vertical_aspect)
-        local key = cell_key(col, row)
-        if not occupied[key] then
-            occupied[key] = true
-            emitted = emitted + 1
-            table.insert(segments, {
-                col = col,
-                row = row,
-                offset = offset,
-            })
-        end
-        attempts = attempts + 1
+        table.insert(segments, {
+            col = col,
+            row = row,
+            offset = offset,
+        })
     end
-    return occupied, segments
+    return segments
 end
 
 function decorate(ctx)
@@ -243,7 +185,7 @@ function decorate(ctx)
         return cmds
     end
 
-    local occupied, segments = collect_snake_cells(
+    local segments = collect_snake_cells(
         ctx.rect,
         head,
         visual_total,
@@ -252,17 +194,15 @@ function decorate(ctx)
         total
     )
 
-    local head_segment = segments[1]
-    local head_key = nil
-    if head_segment ~= nil then
-        head_key = cell_key(head_segment.col, head_segment.row)
+    local effective_snake_size = math.min(snake_size, total)
+    if apple_v == nil or apple_on_snake(head, apple_v, effective_snake_size, segment_visual_spacing, visual_total) then
+        spawn_apple(ctx, head, effective_snake_size, segment_visual_spacing, visual_total)
     end
 
-    update_apple_key(ctx.rect, total)
-
-    if head_key ~= nil and apple_key ~= nil and head_key == apple_key then
+    if apple_v ~= nil and circular_distance(head, apple_v, visual_total) <= 0.75 then
         snake_size = math.min(snake_size + 1, total)
-        occupied, segments = collect_snake_cells(
+        effective_snake_size = math.min(snake_size, total)
+        segments = collect_snake_cells(
             ctx.rect,
             head,
             visual_total,
@@ -270,21 +210,21 @@ function decorate(ctx)
             segment_visual_spacing,
             total
         )
+        spawn_apple(ctx, head, effective_snake_size, segment_visual_spacing, visual_total)
     end
-
-    ensure_apple(ctx, occupied, total)
 
     if snake_size * segment_visual_spacing >= visual_total - segment_visual_spacing then
         death_started_ms = ctx.time_ms
         death_segments = segments
-        apple_u = nil
-        apple_key = nil
+        apple_v = nil
         render_death_flash(cmds, ctx, total)
         return cmds
     end
 
-    ensure_apple(ctx, occupied, total)
-    insert_apple(cmds, ctx.rect, total)
+    if apple_on_snake(head, apple_v, effective_snake_size, segment_visual_spacing, visual_total) then
+        spawn_apple(ctx, head, effective_snake_size, segment_visual_spacing, visual_total)
+    end
+    insert_apple(cmds, ctx.rect, vertical_aspect)
 
     local snake_len = math.max(#segments, 1)
     for i, segment in ipairs(segments) do
