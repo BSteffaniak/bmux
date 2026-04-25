@@ -96,14 +96,26 @@ local function apple_index_for(total)
     return math.floor((apple_u % 1.0) * total) % total
 end
 
+local function store_apple_candidate(ctx, candidate, occupied)
+    local col, row = perimeter_cell_raw(ctx.rect, candidate)
+    local key = cell_key(col, row)
+    if occupied[key] then
+        return false
+    end
+    apple_u = candidate / len_border(ctx.rect)
+    apple_key = key
+    return true
+end
+
 local function spawn_apple(ctx, occupied, total)
-    for _ = 1, total do
+    for _ = 1, total * 2 do
         local candidate = next_random(ctx, total)
-        local col, row = perimeter_cell_raw(ctx.rect, candidate)
-        local key = cell_key(col, row)
-        if not occupied[key] then
-            apple_u = candidate / total
-            apple_key = key
+        if store_apple_candidate(ctx, candidate, occupied) then
+            return
+        end
+    end
+    for candidate = 0, total - 1 do
+        if store_apple_candidate(ctx, candidate, occupied) then
             return
         end
     end
@@ -146,6 +158,13 @@ local function insert_apple(cmds, rect, total)
         text  = "●",
         style = { fg = bmux.rgb(255, 95, 95) },
     })
+end
+
+local function ensure_apple(ctx, occupied, total)
+    update_apple_key(ctx.rect, total)
+    if apple_u == nil or apple_key == nil or occupied[apple_key] then
+        spawn_apple(ctx, occupied, total)
+    end
 end
 
 local function reset_game(total)
@@ -241,9 +260,7 @@ function decorate(ctx)
 
     update_apple_key(ctx.rect, total)
 
-    if apple_u == nil or apple_key == nil then
-        spawn_apple(ctx, occupied, total)
-    elseif head_key == apple_key then
+    if head_key ~= nil and apple_key ~= nil and head_key == apple_key then
         snake_size = math.min(snake_size + 1, total)
         occupied, segments = collect_snake_cells(
             ctx.rect,
@@ -253,10 +270,9 @@ function decorate(ctx)
             segment_visual_spacing,
             total
         )
-        spawn_apple(ctx, occupied, total)
-    elseif occupied[apple_key] then
-        spawn_apple(ctx, occupied, total)
     end
+
+    ensure_apple(ctx, occupied, total)
 
     if snake_size * segment_visual_spacing >= visual_total - segment_visual_spacing then
         death_started_ms = ctx.time_ms
@@ -267,6 +283,7 @@ function decorate(ctx)
         return cmds
     end
 
+    ensure_apple(ctx, occupied, total)
     insert_apple(cmds, ctx.rect, total)
 
     local snake_len = math.max(#segments, 1)
