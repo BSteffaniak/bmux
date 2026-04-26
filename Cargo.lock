@@ -1955,6 +1955,7 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
  "serde",
+ "serde_json",
  "tokio",
  "toml 0.8.23",
  "tracing",

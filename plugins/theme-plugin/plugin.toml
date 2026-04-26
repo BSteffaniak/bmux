@@ -10,6 +10,16 @@ version               = "0.0.1-alpha.0"
 plugin_id   = "bmux.decoration"
 version_req = ">=0.0.1-alpha.0"
 
+[[services]]
+capability   = "bmux.theme.read"
+interface_id = "theme-state"
+kind         = "query"
+
+[[event_publications]]
+delivery                     = "state"
+forward_to_streaming_clients = true
+kind                         = "bmux.runtime/appearance"
+
 [[commands]]
 accepts_repeat = false
 expose_in_cli  = false

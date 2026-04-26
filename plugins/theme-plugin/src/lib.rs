@@ -12,7 +12,8 @@ use bmux_plugin::prompt;
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    PromptEvent, PromptResponse, PromptValue, StorageGetRequest, StorageSetRequest,
+    HostConnectionInfo, NativeServiceContext, PluginEvent, PromptEvent, PromptResponse,
+    PromptValue, ServiceResponse, StorageGetRequest, StorageSetRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,17 +23,39 @@ use tracing::{debug, warn};
 const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
 
 #[derive(Default)]
-pub struct ThemePlugin;
+pub struct ThemePlugin {
+    lifecycle_context: Option<NativeLifecycleContext>,
+}
 
 impl RustPlugin for ThemePlugin {
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        self.lifecycle_context = Some(context.clone());
         apply_configured_appearance(&context);
+        Ok(EXIT_OK)
+    }
+
+    fn handle_event(&mut self, event: PluginEvent) -> Result<i32, PluginCommandError> {
+        if event.kind.as_str() == "bmux.core/server_started"
+            && let Some(context) = self.lifecycle_context.as_ref()
+        {
+            apply_configured_theme_extensions(context);
+        }
         Ok(EXIT_OK)
     }
 
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
             "pick-theme" => pick_theme(&context),
+        })
+    }
+
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        bmux_plugin_sdk::route_service!(context, {
+            "theme-state", "active-appearance" => |_req: (), ctx| {
+                active_runtime_appearance(ctx).ok_or_else(|| {
+                    ServiceResponse::error("theme_not_found", "active theme was not found")
+                })
+            },
         })
     }
 }
@@ -151,6 +174,42 @@ struct ApplyThemeExtensionArgs {
     config_dir_candidates: Vec<String>,
 }
 
+trait ThemeHostContext: HostRuntimeApi {
+    fn settings_value(&self) -> Option<&toml::Value>;
+
+    fn connection_info(&self) -> &HostConnectionInfo;
+}
+
+impl ThemeHostContext for NativeLifecycleContext {
+    fn settings_value(&self) -> Option<&toml::Value> {
+        self.settings.as_ref()
+    }
+
+    fn connection_info(&self) -> &HostConnectionInfo {
+        &self.connection
+    }
+}
+
+impl ThemeHostContext for NativeCommandContext {
+    fn settings_value(&self) -> Option<&toml::Value> {
+        self.settings.as_ref()
+    }
+
+    fn connection_info(&self) -> &HostConnectionInfo {
+        &self.connection
+    }
+}
+
+impl ThemeHostContext for NativeServiceContext {
+    fn settings_value(&self) -> Option<&toml::Value> {
+        self.settings.as_ref()
+    }
+
+    fn connection_info(&self) -> &HostConnectionInfo {
+        &self.connection
+    }
+}
+
 fn pick_theme(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
     let handle = tokio::runtime::Handle::try_current().map_err(|_| {
         PluginCommandError::unavailable("no tokio runtime available; theme picker requires attach")
@@ -160,21 +219,37 @@ fn pick_theme(context: &NativeCommandContext) -> Result<i32, PluginCommandError>
 }
 
 fn apply_configured_appearance(context: &NativeLifecycleContext) {
-    let settings = parse_settings(context.settings.as_ref());
-    let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
-    let declared_name = declared_theme_name(&settings);
-    let active_name = active_theme_name(context, settings.persistence, &catalog, &declared_name);
-    let Some(theme) = theme_by_name(&catalog, &active_name) else {
+    if let Some(theme) = configured_theme(context) {
+        publish_runtime_appearance(&theme);
+    }
+}
+
+fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
+    let Some(theme) = configured_theme(context) else {
         return;
     };
+    let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
     let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
-    publish_runtime_appearance(theme);
     apply_theme_extensions(
         context,
-        theme,
+        &theme,
         &all_plugin_ids,
         &context.connection.config_dir_candidates,
     );
+}
+
+fn active_runtime_appearance(
+    context: &(impl ThemeHostContext + ?Sized),
+) -> Option<RuntimeAppearance> {
+    configured_theme(context).map(|theme| RuntimeAppearance::from(&theme))
+}
+
+fn configured_theme(context: &(impl ThemeHostContext + ?Sized)) -> Option<ThemeConfig> {
+    let settings = parse_settings(context.settings_value());
+    let catalog = load_theme_catalog(&context.connection_info().config_dir_candidate_paths());
+    let declared_name = declared_theme_name(&settings);
+    let active_name = active_theme_name(context, settings.persistence, &catalog, &declared_name);
+    theme_by_name(&catalog, &active_name).cloned()
 }
 
 fn publish_runtime_appearance(theme: &ThemeConfig) {
@@ -184,7 +259,25 @@ fn publish_runtime_appearance(theme: &ThemeConfig) {
         .is_err()
     {
         let _ = bmux_plugin::global_event_bus()
-            .register_state_channel::<RuntimeAppearance>(RUNTIME_APPEARANCE_STATE_KIND, appearance);
+            .register_state_channel_with_decoder::<RuntimeAppearance>(
+                RUNTIME_APPEARANCE_STATE_KIND,
+                appearance,
+            );
+    }
+}
+
+fn publish_runtime_appearance_to_host(context: &impl ServiceCaller, theme: &ThemeConfig) {
+    publish_runtime_appearance(theme);
+    let appearance = RuntimeAppearance::from(theme);
+    let Ok(payload) = serde_json::to_vec(&appearance) else {
+        return;
+    };
+    let response = context.execute_kernel_request(IpcRequest::EmitOnPluginBus {
+        kind: RUNTIME_APPEARANCE_STATE_KIND.as_str().to_string(),
+        payload,
+    });
+    if let Err(error) = response {
+        warn!(%error, "failed relaying runtime appearance to host event bus");
     }
 }
 
@@ -202,7 +295,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     };
     let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
-    publish_runtime_appearance(&original_theme);
+    publish_runtime_appearance_to_host(&context, &original_theme);
     apply_theme_extensions(
         &context,
         &original_theme,
@@ -237,7 +330,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
                 if let Some(PromptEvent::SelectionChanged { value, .. }) = event
                     && let Some(theme) = theme_by_name(&catalog, &value)
                 {
-                    publish_runtime_appearance(theme);
+                    publish_runtime_appearance_to_host(&context, theme);
                     apply_theme_extensions(
                         &context,
                         theme,
@@ -252,7 +345,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
     if let Some(name) = selected_name
         && let Some(theme) = theme_by_name(&catalog, &name)
     {
-        publish_runtime_appearance(theme);
+        publish_runtime_appearance_to_host(&context, theme);
         apply_theme_extensions(
             &context,
             theme,
@@ -269,7 +362,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     }
 
-    publish_runtime_appearance(&original_theme);
+    publish_runtime_appearance_to_host(&context, &original_theme);
     apply_theme_extensions(
         &context,
         &original_theme,
@@ -506,6 +599,72 @@ fn normalized_theme_name(name: &str) -> String {
         "default".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_plugin_sdk::{
+        ApiVersion, HostMetadata, HostScope, ProviderId, RegisteredService, ServiceKind,
+        ServiceRequest, decode_service_message, encode_service_message,
+    };
+
+    #[test]
+    fn active_appearance_service_uses_declared_theme() {
+        let mut plugin = ThemePlugin::default();
+        let context = service_context(Some(toml::Value::Table(toml::map::Map::from_iter([(
+            "theme".to_string(),
+            toml::Value::String("rainbow-snake".to_string()),
+        )]))));
+
+        let response = plugin.invoke_service(context);
+
+        assert!(response.error.is_none(), "unexpected error: {response:?}");
+        let appearance: RuntimeAppearance =
+            decode_service_message(&response.payload).expect("appearance response should decode");
+        assert_eq!(appearance.background, "#050510");
+        assert_eq!(appearance.border.active, "#ffffff");
+    }
+
+    fn service_context(settings: Option<toml::Value>) -> NativeServiceContext {
+        NativeServiceContext {
+            plugin_id: "bmux.theme".to_string(),
+            request: ServiceRequest {
+                caller_plugin_id: "test".to_string(),
+                service: RegisteredService {
+                    capability: HostScope::new("bmux.theme.read").expect("capability should parse"),
+                    kind: ServiceKind::Query,
+                    interface_id: "theme-state".to_string(),
+                    provider: ProviderId::Plugin("bmux.theme".to_string()),
+                },
+                operation: "active-appearance".to_string(),
+                payload: encode_service_message(&()).expect("unit payload should encode"),
+            },
+            required_capabilities: vec!["bmux.storage".to_string()],
+            provided_capabilities: vec!["bmux.theme.read".to_string()],
+            services: Vec::new(),
+            available_capabilities: Vec::new(),
+            enabled_plugins: vec!["bmux.theme".to_string()],
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.0.0-test".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: HostConnectionInfo {
+                config_dir: String::new(),
+                config_dir_candidates: Vec::new(),
+                runtime_dir: String::new(),
+                data_dir: String::new(),
+                state_dir: String::new(),
+            },
+            settings,
+            plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
+            host_kernel_bridge: None,
+        }
     }
 }
 

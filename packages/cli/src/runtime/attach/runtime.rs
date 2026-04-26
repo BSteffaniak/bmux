@@ -221,6 +221,33 @@ async fn typed_list_windows_attach(
     })
 }
 
+/// Pull the theme plugin's retained runtime appearance on attach startup.
+///
+/// Server-side state forwarders only propagate future state changes to
+/// streaming clients; a new attach must seed its local process event bus by
+/// querying the plugin-owned state surface once.
+async fn typed_active_runtime_appearance_attach(
+    client: &mut StreamingBmuxClient,
+) -> std::result::Result<RuntimeAppearance, ClientError> {
+    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("encoding active-appearance args: {error}"),
+    })?;
+    let response_bytes = client
+        .invoke_service_raw(
+            "bmux.theme.read",
+            InvokeServiceKind::Query,
+            "theme-state",
+            "active-appearance",
+            payload,
+        )
+        .await?;
+    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("decoding active runtime appearance response: {error}"),
+    })
+}
+
 /// Typed dispatch wrapper for `contexts-state:current-context`.
 async fn typed_current_context_attach(
     client: &mut StreamingBmuxClient,
@@ -1097,6 +1124,12 @@ pub async fn run_session_attach_with_client(
         .await
         .map_err(map_attach_client_error)?;
 
+    if let Ok(appearance) = typed_active_runtime_appearance_attach(&mut client).await {
+        runtime_appearance = appearance.clone();
+        let _ = bmux_plugin::global_event_bus()
+            .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
+    }
+
     let mut display_capture = DisplayCaptureFanout::default();
     for target in &capture_targets {
         display_capture.open_target(target, self_client_id);
@@ -1505,6 +1538,21 @@ pub async fn run_session_attach_with_client(
                                     kind = %kind,
                                     error = %error,
                                     "decoding forwarded windows-list payload",
+                                );
+                            }
+                        }
+                    } else if kind.as_str() == RUNTIME_APPEARANCE_STATE_KIND.as_str() {
+                        match serde_json::from_slice::<RuntimeAppearance>(payload) {
+                            Ok(appearance) => {
+                                let _ = bmux_plugin::global_event_bus()
+                                    .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
+                                view_state.dirty.full_pane_redraw = true;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    kind = %kind,
+                                    error = %error,
+                                    "decoding forwarded runtime appearance payload",
                                 );
                             }
                         }

@@ -445,6 +445,13 @@ pub(super) async fn run_server_start(
                         bmux_windows_plugin_api::windows_list::WindowListSnapshot,
                     >(kind)
                 }
+                (k, bmux_plugin_sdk::PluginEventDelivery::State)
+                    if k == bmux_appearance::RUNTIME_APPEARANCE_STATE_KIND.as_str() =>
+                {
+                    server.spawn_plugin_bus_state_forwarder::<bmux_appearance::RuntimeAppearance>(
+                        kind,
+                    )
+                }
                 _ => {
                     tracing::warn!(
                         plugin_id = plugin.declaration.id.as_str(),
