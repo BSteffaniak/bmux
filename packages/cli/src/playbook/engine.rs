@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bmux_client::BmuxClient;
-use bmux_ipc::{
-    ContextSelector, InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector,
-};
+use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector};
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
 use bmux_plugin_sdk::{PluginCliCommandRequest, PluginCliCommandResponse};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -38,6 +36,11 @@ use super::types::{
 
 /// Default timeout for waiting for the sandbox server to start.
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const SANDBOX_PHASE_MARKERS: [&str; 3] = [
+    "[bmux-attach-phase-json]",
+    "[bmux-service-phase-json]",
+    "[bmux-ipc-phase-json]",
+];
 
 /// Max bytes to read from attach output per drain cycle.
 const ATTACH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
@@ -782,14 +785,24 @@ async fn retarget_attach_to_current_context_playbook(
     client: &mut BmuxClient,
     inspector: &ScreenInspector,
     runtime: &mut AttachInputRuntime,
+    plugin_id: Option<&str>,
+    command_name: Option<&str>,
 ) -> anyhow::Result<()> {
     let current_started = Instant::now();
     let Some(context) = current_context_playbook(client).await? else {
         return Ok(());
     };
     let current_context_us = current_started.elapsed().as_micros();
-    retarget_attach_to_context_playbook(client, inspector, runtime, context.id, current_context_us)
-        .await
+    retarget_attach_to_context_playbook(
+        client,
+        inspector,
+        runtime,
+        context.id,
+        current_context_us,
+        plugin_id,
+        command_name,
+    )
+    .await
 }
 
 async fn retarget_attach_to_context_playbook(
@@ -798,40 +811,32 @@ async fn retarget_attach_to_context_playbook(
     runtime: &mut AttachInputRuntime,
     context_id: Uuid,
     current_context_us: u128,
+    plugin_id: Option<&str>,
+    command_name: Option<&str>,
 ) -> anyhow::Result<()> {
     let total_started = Instant::now();
     let from_session_id = runtime.state.attached_id;
-    let grant_started = Instant::now();
-    let grant = client
-        .attach_context_grant(ContextSelector::ById(context_id))
-        .await
-        .map_err(|e| anyhow::anyhow!("attach context grant failed: {e}"))?;
-    let grant_us = grant_started.elapsed().as_micros();
-    let open_started = Instant::now();
+    let (cols, rows) = inspector.viewport_size();
     let attach_info = client
-        .open_attach_stream_info(&grant)
+        .retarget_attach_context(context_id, cols, rows)
         .await
-        .map_err(|e| anyhow::anyhow!("attach context open failed: {e}"))?;
-    let open_us = open_started.elapsed().as_micros();
+        .map_err(|e| anyhow::anyhow!("attach context retarget failed: {e}"))?;
+    let retarget_service_us = total_started.elapsed().as_micros();
     runtime.state.attached_id = attach_info.session_id;
     runtime.state.attached_context_id = attach_info.context_id;
-    let (cols, rows) = inspector.viewport_size();
-    let viewport_started = Instant::now();
-    client
-        .attach_set_viewport(attach_info.session_id, cols, rows)
-        .await
-        .map_err(|e| anyhow::anyhow!("set retargeted viewport failed: {e}"))?;
-    let viewport_us = viewport_started.elapsed().as_micros();
     emit_attach_phase_timing(&serde_json::json!({
         "phase": "attach.retarget_context",
+        "plugin_id": plugin_id,
+        "command_name": command_name,
         "from_session_id": from_session_id,
         "to_context_id": context_id,
         "selected_context_id": attach_info.context_id,
         "selected_session_id": attach_info.session_id,
         "current_context_us": current_context_us,
-        "grant_us": grant_us,
-        "open_us": open_us,
-        "viewport_us": viewport_us,
+        "retarget_service_us": retarget_service_us,
+        "grant_us": 0_u128,
+        "open_us": retarget_service_us,
+        "viewport_us": 0_u128,
         "total_us": total_started.elapsed().as_micros(),
     }));
     Ok(())
@@ -1371,6 +1376,10 @@ async fn run_playbook_inner(
         .as_ref()
         .map(|sb| sb.root_dir().to_string_lossy().to_string());
 
+    if let Some(ref sb) = sandbox {
+        forward_sandbox_phase_timing(sb);
+    }
+
     // Shutdown sandbox if we created one.
     if let Some(sb) = sandbox
         && let Err(e) = sb.shutdown(!pass).await
@@ -1389,6 +1398,23 @@ async fn run_playbook_inner(
         error: error_msg,
         sandbox_root: if pass { None } else { sandbox_root },
     })
+}
+
+fn forward_sandbox_phase_timing(sandbox: &SandboxServer) {
+    if std::env::var_os("BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING").is_none() {
+        return;
+    }
+    let Ok(contents) = std::fs::read_to_string(sandbox.stderr_log_path()) else {
+        return;
+    };
+    for line in contents.lines() {
+        if SANDBOX_PHASE_MARKERS
+            .iter()
+            .any(|marker| line.contains(marker))
+        {
+            eprintln!("{line}");
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2990,10 +3016,25 @@ async fn apply_attach_runtime_actions(
                 }
                 let retarget_started = Instant::now();
                 if let Some(context_id) = selected_context_id {
-                    retarget_attach_to_context_playbook(client, inspector, runtime, context_id, 0)
-                        .await?;
+                    retarget_attach_to_context_playbook(
+                        client,
+                        inspector,
+                        runtime,
+                        context_id,
+                        0,
+                        Some(&plugin_id),
+                        Some(&command_name),
+                    )
+                    .await?;
                 } else {
-                    retarget_attach_to_current_context_playbook(client, inspector, runtime).await?;
+                    retarget_attach_to_current_context_playbook(
+                        client,
+                        inspector,
+                        runtime,
+                        Some(&plugin_id),
+                        Some(&command_name),
+                    )
+                    .await?;
                 }
                 let retarget_us = retarget_started.elapsed().as_micros();
                 if plugin_id == "bmux.windows"

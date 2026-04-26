@@ -323,52 +323,6 @@ async fn typed_list_contexts_bmux(
     })
 }
 
-/// Typed dispatch wrapper for `contexts-commands:select-context`.
-async fn typed_select_context_attach(
-    client: &mut StreamingBmuxClient,
-    context_id: uuid::Uuid,
-) -> std::result::Result<(), ClientError> {
-    #[derive(serde::Serialize)]
-    struct Selector {
-        id: Option<uuid::Uuid>,
-        name: Option<String>,
-    }
-    #[derive(serde::Serialize)]
-    struct Args {
-        selector: Selector,
-    }
-    let args = Args {
-        selector: Selector {
-            id: Some(context_id),
-            name: None,
-        },
-    };
-    let payload = bmux_codec::to_vec(&args).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding select-context args: {error}"),
-    })?;
-    let response_bytes = client
-        .invoke_service_raw(
-            typed_contexts::CONTEXTS_WRITE_CAPABILITY.as_str(),
-            typed_contexts::COMMAND_KIND,
-            typed_contexts::CONTEXTS_COMMANDS_INTERFACE.as_str(),
-            typed_contexts::OP_SELECT_CONTEXT,
-            payload,
-        )
-        .await?;
-    let outcome: std::result::Result<
-        bmux_contexts_plugin_api::contexts_commands::ContextAck,
-        bmux_contexts_plugin_api::contexts_commands::SelectContextError,
-    > = bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding select-context response: {error}"),
-    })?;
-    outcome.map(|_| ()).map_err(|err| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("select-context failed: {err:?}"),
-    })
-}
-
 /// Invoke a `windows-commands` typed command by routing through the
 /// server's generic `Request::InvokeService` envelope.
 async fn invoke_windows_command<Req, Resp>(
@@ -2284,18 +2238,26 @@ pub async fn retarget_attach_to_context(
         to_context_id = %context_id,
         "attach.retarget.start"
     );
-    let select_started = Instant::now();
-    typed_select_context_attach(client, context_id).await?;
-    let select_us = select_started.elapsed().as_micros();
-    let open_started = Instant::now();
-    let attach_info = open_attach_for_context(client, context_id).await?;
-    let open_us = open_started.elapsed().as_micros();
+    let retarget_service_started = Instant::now();
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    let (status_top_inset, status_bottom_inset) =
+        status_insets_for_position(view_state.status_position);
+    let attach_info = client
+        .retarget_attach_context_with_insets(
+            context_id,
+            cols,
+            rows,
+            status_top_inset,
+            status_bottom_inset,
+        )
+        .await?;
+    let retarget_service_us = retarget_service_started.elapsed().as_micros();
+    let select_us = 0_u128;
+    let open_us = retarget_service_us;
     view_state.attached_id = attach_info.session_id;
     view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
     view_state.can_write = attach_info.can_write;
-    let viewport_started = Instant::now();
-    update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
-    let viewport_us = viewport_started.elapsed().as_micros();
+    let viewport_us = 0_u128;
     let hydrate_started = Instant::now();
     hydrate_attach_state_from_snapshot(client, view_state).await?;
     let hydrate_us = hydrate_started.elapsed().as_micros();
@@ -2324,6 +2286,7 @@ pub async fn retarget_attach_to_context(
         "to_context_id": context_id,
         "selected_context_id": view_state.attached_context_id,
         "selected_session_id": view_state.attached_id,
+        "retarget_service_us": retarget_service_us,
         "select_us": select_us,
         "open_us": open_us,
         "viewport_us": viewport_us,

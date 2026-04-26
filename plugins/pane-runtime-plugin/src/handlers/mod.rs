@@ -91,6 +91,9 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "attach-runtime-commands", "attach-set-viewport" => |req: attach_commands::AttachSetViewportArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_commands::attach_set_viewport(&req, ctx))
         },
+        "attach-runtime-commands", "attach-retarget-context" => |req: attach_commands::AttachRetargetContextArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::attach_retarget_context(&req, ctx))
+        },
         "attach-runtime-commands", "set-client-attach-policy" => |req: attach_commands::SetClientAttachPolicyArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_commands::set_client_attach_policy(req, ctx))
         },

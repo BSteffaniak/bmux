@@ -41,12 +41,12 @@ enum ServerHandle {
         child: std::process::Child,
         paths: ConfigPaths,
         _stdout_log: PathBuf,
-        _stderr_log: PathBuf,
+        stderr_log: PathBuf,
     },
     Daemon {
         paths: ConfigPaths,
         _stdout_log: PathBuf,
-        _stderr_log: PathBuf,
+        stderr_log: PathBuf,
     },
 }
 
@@ -130,6 +130,15 @@ impl SandboxServer {
     #[must_use]
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
+    }
+
+    /// Return the sandbox server stderr log path.
+    #[must_use]
+    pub fn stderr_log_path(&self) -> &Path {
+        match &self.handle {
+            ServerHandle::Foreground { stderr_log, .. }
+            | ServerHandle::Daemon { stderr_log, .. } => stderr_log,
+        }
     }
 
     /// Gracefully shut down the sandbox server and optionally clean up temp dirs.
@@ -489,7 +498,7 @@ async fn start_foreground(
         child,
         paths: paths.clone(),
         _stdout_log: stdout_log,
-        _stderr_log: stderr_log.clone(),
+        stderr_log: stderr_log.clone(),
     };
 
     match wait_for_server_ready(paths, timeout, handle.child_mut()).await {
@@ -536,7 +545,7 @@ async fn start_daemon(
     Ok(ServerHandle::Daemon {
         paths: paths.clone(),
         _stdout_log: stdout_log,
-        _stderr_log: stderr_log,
+        stderr_log,
     })
 }
 

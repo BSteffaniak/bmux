@@ -535,6 +535,18 @@ struct AttachSetViewportArgs {
     cell_pixel_h: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachRetargetContextArgs {
+    context_id: Uuid,
+    can_write: bool,
+    cols: u16,
+    rows: u16,
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+    cell_pixel_w: u16,
+    cell_pixel_h: u16,
+}
+
 /// Request an attach grant for a session.
 ///
 /// # Errors
@@ -745,6 +757,48 @@ pub async fn attach_set_viewport<C: TypedDispatchClient>(
         "attach-set-viewport",
         &AttachSetViewportArgs {
             session_id,
+            cols,
+            rows,
+            status_top_inset,
+            status_bottom_inset,
+            cell_pixel_w,
+            cell_pixel_h,
+        },
+    )
+    .await
+}
+
+/// Retarget the calling attach client to a context and update its viewport.
+///
+/// # Errors
+///
+/// Returns an error if transport, encoding, or server-side operation fails.
+#[allow(clippy::too_many_arguments)]
+pub async fn attach_retarget_context<C: TypedDispatchClient>(
+    client: &mut C,
+    context_id: Uuid,
+    can_write: bool,
+    cols: u16,
+    rows: u16,
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+    cell_pixel_w: u16,
+    cell_pixel_h: u16,
+) -> Result<
+    core::result::Result<
+        attach_runtime_commands::AttachRetargetReady,
+        attach_runtime_commands::AttachCommandError,
+    >,
+> {
+    invoke(
+        client,
+        ATTACH_RUNTIME_WRITE.as_str(),
+        InvokeServiceKind::Command,
+        attach_runtime_commands::INTERFACE_ID.as_str(),
+        "attach-retarget-context",
+        &AttachRetargetContextArgs {
+            context_id,
+            can_write,
             cols,
             rows,
             status_top_inset,

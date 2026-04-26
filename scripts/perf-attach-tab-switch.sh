@@ -175,9 +175,11 @@ SAMPLE_JSON_FILE="$SANDBOX/sample.json"
 export BMUX_ATTACH_PHASE_TIMING=1
 if [[ "$SERVICE_TIMING" -eq 1 ]]; then
 	export BMUX_SERVICE_PHASE_TIMING=1
+	export BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING=1
 fi
 if [[ "$IPC_TIMING" -eq 1 ]]; then
 	export BMUX_IPC_PHASE_TIMING=1
+	export BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING=1
 fi
 
 echo "benchmarking attach tab-switch playbook"
@@ -230,15 +232,18 @@ phase_report attach.plugin_command retarget_us "$MAX_RETARGET_P99_MS" command_na
 phase_report attach.window_cycle invoke_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
 if [[ "$SERVICE_TIMING" -eq 1 ]]; then
 	phase_report service.client_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation switch-window
+	phase_report service.server_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation switch-window
+	phase_report service.server_invoke invocation_us "$MAX_ATTACH_COMMAND_P99_MS" operation switch-window
 fi
 if [[ "$IPC_TIMING" -eq 1 ]]; then
 	phase_report ipc.client_request total_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
 	phase_report ipc.client_request recv_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
 fi
-phase_report attach.retarget_context total_us "$MAX_RETARGET_P99_MS"
-phase_report attach.retarget_context grant_us "$MAX_RETARGET_P99_MS"
-phase_report attach.retarget_context open_us "$MAX_RETARGET_P99_MS"
-phase_report attach.retarget_context viewport_us "$MAX_RETARGET_P99_MS"
+phase_report attach.retarget_context total_us "$MAX_RETARGET_P99_MS" command_name next-window
+phase_report attach.retarget_context retarget_service_us "$MAX_RETARGET_P99_MS" command_name next-window
+phase_report attach.retarget_context grant_us "$MAX_RETARGET_P99_MS" command_name next-window
+phase_report attach.retarget_context open_us "$MAX_RETARGET_P99_MS" command_name next-window
+phase_report attach.retarget_context viewport_us "$MAX_RETARGET_P99_MS" command_name next-window
 
 if [[ -n "$ARTIFACT_JSON" ]]; then
 	"$BMUX_PERF_TOOLS_BIN" report-json \

@@ -821,6 +821,63 @@ impl BmuxClient {
         }
     }
 
+    /// Retarget this attach client to a context and update its viewport in one service call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn retarget_attach_context(
+        &mut self,
+        context_id: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> Result<AttachOpenInfo> {
+        self.retarget_attach_context_with_insets(context_id, cols, rows, 0, 0)
+            .await
+    }
+
+    /// Retarget this attach client and update viewport insets in one service call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn retarget_attach_context_with_insets(
+        &mut self,
+        context_id: Uuid,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+    ) -> Result<AttachOpenInfo> {
+        match bmux_pane_runtime_plugin_api::typed_client::attach_retarget_context(
+            self,
+            context_id,
+            true,
+            cols,
+            rows,
+            status_top_inset,
+            status_bottom_inset,
+            cell_pixel_width(),
+            cell_pixel_height(),
+        )
+        .await
+        {
+            Ok(Ok(ready)) => Ok(AttachOpenInfo {
+                context_id: ready.context_id,
+                session_id: ready.session_id,
+                can_write: ready.can_write,
+            }),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-retarget-context failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-retarget-context typed dispatch failed: {err}"),
+            }),
+        }
+    }
+
     /// Validate and consume attach grant token.
     ///
     /// # Errors
@@ -1858,6 +1915,48 @@ impl StreamingBmuxClient {
             Err(err) => Err(ClientError::ServerError {
                 code: bmux_ipc::ErrorCode::Internal,
                 message: format!("attach-context typed dispatch failed: {err}"),
+            }),
+        }
+    }
+
+    /// Retarget this attach client to a context and update its viewport in one service call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn retarget_attach_context_with_insets(
+        &mut self,
+        context_id: Uuid,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+    ) -> Result<AttachOpenInfo> {
+        match bmux_pane_runtime_plugin_api::typed_client::attach_retarget_context(
+            self,
+            context_id,
+            true,
+            cols,
+            rows,
+            status_top_inset,
+            status_bottom_inset,
+            cell_pixel_width(),
+            cell_pixel_height(),
+        )
+        .await
+        {
+            Ok(Ok(ready)) => Ok(AttachOpenInfo {
+                context_id: ready.context_id,
+                session_id: ready.session_id,
+                can_write: ready.can_write,
+            }),
+            Ok(Err(err)) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-retarget-context failed: {err:?}"),
+            }),
+            Err(err) => Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("attach-retarget-context typed dispatch failed: {err}"),
             }),
         }
     }

@@ -957,15 +957,19 @@ fn switch_window_with_contexts(
         .map_err(|error| error.to_string())?;
     let context_select_us = select_started.elapsed().as_micros();
     let remember_started = Instant::now();
-    if let Ok(client) = caller.current_client()
+    let remembered_for_client = if let Ok(client) = caller.current_client()
         && let Some(previous) = previous_context
         && previous != context_id
         && let Ok(mut map) = last_selected_by_client.lock()
     {
         map.insert(client.id, previous);
-    }
+        true
+    } else {
+        false
+    };
     if let Some(previous) = previous_context
         && previous != context_id
+        && !remembered_for_client
     {
         let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
     }

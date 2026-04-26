@@ -12,7 +12,7 @@ use bmux_attach_token_state::AttachTokenValidationError;
 use bmux_ipc::{AttachGrant, ContextSelector, Event, SessionSelector};
 use bmux_pane_runtime_plugin_api::attach_runtime_commands::{
     AttachCommandError, AttachGrant as AttachGrantRecord, AttachOutput as AttachOutputRecord,
-    AttachReady, AttachViewportSet,
+    AttachReady, AttachRetargetReady, AttachViewportSet,
 };
 use bmux_pane_runtime_state::SessionRuntimeError;
 use bmux_plugin::global_plugin_state_registry;
@@ -58,6 +58,19 @@ pub struct AttachOutputArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachSetViewportArgs {
     pub session_id: Uuid,
+    pub cols: u16,
+    pub rows: u16,
+    pub status_top_inset: u16,
+    pub status_bottom_inset: u16,
+    pub cell_pixel_width: u16,
+    pub cell_pixel_height: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachRetargetContextArgs {
+    pub context_id: Uuid,
+    #[serde(default)]
+    pub can_write: bool,
     pub cols: u16,
     pub rows: u16,
     pub status_top_inset: u16,
@@ -416,6 +429,118 @@ pub fn attach_set_viewport(
         status_top_inset: top,
         status_bottom_inset: bottom,
         context_id,
+    })
+}
+
+pub fn attach_retarget_context(
+    req: &AttachRetargetContextArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachRetargetReady, AttachCommandError> {
+    let client_id = caller_client_id(ctx)?;
+    let manager = session_manager()?;
+    let contexts = context_state()?;
+    let follow = follow_state()?;
+    let runtime = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+
+    let context = contexts
+        .0
+        .select_for_client(client_id, &ContextSelector::ById(req.context_id))
+        .map_err(|m| failed(m.to_string()))?;
+    let Some(next_session_id) = contexts.0.current_session_for_client(client_id) else {
+        return Err(failed("context has no attached runtime"));
+    };
+
+    let previous_session = follow.0.selected_session(client_id);
+    if let Some(prev) = previous_session
+        && prev != next_session_id
+    {
+        manager.0.remove_client(prev, &client_id);
+    }
+
+    if !manager.0.contains(next_session_id) {
+        let _ = contexts.0.remove_contexts_for_session(next_session_id);
+        return Err(AttachCommandError::SessionNotFound);
+    }
+
+    manager.0.add_client(next_session_id, client_id);
+    follow
+        .0
+        .set_selected_target(client_id, Some(context.id), Some(next_session_id));
+
+    if !runtime.0.session_exists(next_session_id)
+        && let Err(err) = runtime.0.start_runtime(next_session_id)
+    {
+        return Err(failed(format!(
+            "failed restarting missing session runtime {}: {err:#}",
+            next_session_id.0
+        )));
+    }
+
+    let previous_stream = follow.0.attached_stream_session(client_id);
+    if let Some(prev) = previous_stream
+        && prev != next_session_id
+    {
+        runtime.0.end_attach(prev, client_id);
+        publish_event(Event::ClientDetached { id: prev.0 });
+    }
+
+    let begin_result = match runtime.0.begin_attach(next_session_id, client_id) {
+        Ok(()) => Ok(()),
+        Err(SessionRuntimeError::NotFound) => {
+            let _ = runtime.0.start_runtime(next_session_id);
+            runtime.0.begin_attach(next_session_id, client_id)
+        }
+        Err(SessionRuntimeError::Closed) => {
+            if let Some(removed) = runtime.0.remove_runtime(next_session_id) {
+                runtime.0.shutdown_removed_runtime(removed);
+            }
+            let _ = runtime.0.start_runtime(next_session_id);
+            runtime.0.begin_attach(next_session_id, client_id)
+        }
+        Err(err) => Err(err),
+    };
+
+    match begin_result {
+        Ok(()) => {
+            follow
+                .0
+                .set_attached_stream_session(client_id, Some(next_session_id));
+            publish_event(Event::ClientAttached {
+                id: next_session_id.0,
+            });
+            super::publish_focus_state_snapshot();
+        }
+        Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
+            return Err(AttachCommandError::SessionNotFound);
+        }
+        Err(SessionRuntimeError::NotAttached) => {
+            return Err(failed("failed opening attach stream"));
+        }
+    }
+
+    let (cols, rows, top, bottom) = runtime
+        .0
+        .set_attach_viewport(
+            next_session_id,
+            client_id,
+            req.cols,
+            req.rows,
+            req.status_top_inset,
+            req.status_bottom_inset,
+            req.cell_pixel_width,
+            req.cell_pixel_height,
+        )
+        .map_err(|e| failed(format!("failed setting attach viewport: {e:?}")))?;
+
+    Ok(AttachRetargetReady {
+        session_id: next_session_id.0,
+        context_id: Some(context.id),
+        can_write: req.can_write,
+        cols,
+        rows,
+        status_top_inset: top,
+        status_bottom_inset: bottom,
     })
 }
 

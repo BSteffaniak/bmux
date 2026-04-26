@@ -184,6 +184,16 @@ interface attach-runtime-commands {
         context_id: uuid?,
     }
 
+    record attach-retarget-ready {
+        session_id: uuid,
+        context_id: uuid?,
+        can_write: bool,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+    }
+
     record attach-input-accepted {
         bytes: u32,
     }
@@ -229,6 +239,17 @@ interface attach-runtime-commands {
         cell_pixel_w: u16,
         cell_pixel_h: u16,
     ) -> result<attach-viewport-set, attach-command-error>;
+
+    command attach-retarget-context(
+        context_id: uuid,
+        can_write: bool,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+        cell_pixel_w: u16,
+        cell_pixel_h: u16,
+    ) -> result<attach-retarget-ready, attach-command-error>;
 
     command set-client-attach-policy(
         allow_detach: bool,
