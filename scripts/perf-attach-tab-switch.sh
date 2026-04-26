@@ -206,9 +206,14 @@ phase_report() {
 }
 
 phase_report attach.plugin_command total_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
+phase_report attach.plugin_command before_context_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
 phase_report attach.plugin_command run_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
 phase_report attach.plugin_command retarget_us "$MAX_RETARGET_P99_MS" command_name next-window
+phase_report attach.window_cycle invoke_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
 phase_report attach.retarget_context total_us "$MAX_RETARGET_P99_MS"
+phase_report attach.retarget_context grant_us "$MAX_RETARGET_P99_MS"
+phase_report attach.retarget_context open_us "$MAX_RETARGET_P99_MS"
+phase_report attach.retarget_context viewport_us "$MAX_RETARGET_P99_MS"
 
 if [[ -n "$ARTIFACT_JSON" ]]; then
 	"$BMUX_PERF_TOOLS_BIN" report-json \

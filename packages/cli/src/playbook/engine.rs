@@ -607,6 +607,15 @@ async fn switch_window_by_id_playbook(client: &mut BmuxClient, id: Uuid) -> anyh
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct PlaybookWindowCycleTiming {
+    known_contexts: bool,
+    resolve_us: u128,
+    invoke_us: u128,
+    fallback_us: u128,
+    total_us: u128,
+}
+
 async fn cycle_window_playbook(client: &mut BmuxClient, reverse: bool) -> anyhow::Result<()> {
     let contexts = list_contexts_playbook(client).await?;
     if contexts.len() < 2 {
@@ -628,15 +637,26 @@ async fn cycle_known_window_playbook(
     client: &mut BmuxClient,
     runtime: &AttachInputRuntime,
     reverse: bool,
-) -> anyhow::Result<Uuid> {
+) -> anyhow::Result<(Uuid, PlaybookWindowCycleTiming)> {
+    let total_started = Instant::now();
     let contexts = &runtime.state.window_context_ids;
     if contexts.len() < 2 {
+        let fallback_started = Instant::now();
         cycle_window_playbook(client, reverse).await?;
-        return current_context_playbook(client)
+        let context_id = current_context_playbook(client)
             .await?
             .map(|context| context.id)
-            .ok_or_else(|| anyhow::anyhow!("current context unavailable after window switch"));
+            .ok_or_else(|| anyhow::anyhow!("current context unavailable after window switch"))?;
+        return Ok((
+            context_id,
+            PlaybookWindowCycleTiming {
+                fallback_us: fallback_started.elapsed().as_micros(),
+                total_us: total_started.elapsed().as_micros(),
+                ..PlaybookWindowCycleTiming::default()
+            },
+        ));
     }
+    let resolve_started = Instant::now();
     let current_index = runtime
         .state
         .attached_context_id
@@ -648,8 +668,19 @@ async fn cycle_known_window_playbook(
         (current_index + 1) % contexts.len()
     };
     let target_id = contexts[target_index];
+    let resolve_us = resolve_started.elapsed().as_micros();
+    let invoke_started = Instant::now();
     switch_window_by_id_playbook(client, target_id).await?;
-    Ok(target_id)
+    Ok((
+        target_id,
+        PlaybookWindowCycleTiming {
+            known_contexts: true,
+            resolve_us,
+            invoke_us: invoke_started.elapsed().as_micros(),
+            total_us: total_started.elapsed().as_micros(),
+            ..PlaybookWindowCycleTiming::default()
+        },
+    ))
 }
 
 async fn run_known_attach_plugin_command_playbook(
@@ -2868,15 +2899,21 @@ async fn apply_attach_runtime_actions(
             } => {
                 let total_started = Instant::now();
                 let before_session_id = runtime.state.attached_id;
+                let before_context_started = Instant::now();
                 let before_context_id = if plugin_id == "bmux.windows" {
-                    current_context_playbook(client)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|context| context.id)
+                    if runtime.state.attached_context_id.is_some() {
+                        runtime.state.attached_context_id
+                    } else {
+                        current_context_playbook(client)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|context| context.id)
+                    }
                 } else {
                     None
                 };
+                let before_context_us = before_context_started.elapsed().as_micros();
                 if let Some(context_id) = before_context_id {
                     runtime.state.attached_context_id = Some(context_id);
                     if !runtime.state.window_context_ids.contains(&context_id) {
@@ -2885,18 +2922,36 @@ async fn apply_attach_runtime_actions(
                 }
                 let run_started = Instant::now();
                 let mut selected_context_id = None;
+                let mut window_cycle_timing = None;
                 let response = if plugin_id == "bmux.windows" && command_name == "next-window" {
-                    selected_context_id =
-                        Some(cycle_known_window_playbook(client, runtime, false).await?);
+                    let (context_id, timing) =
+                        cycle_known_window_playbook(client, runtime, false).await?;
+                    selected_context_id = Some(context_id);
+                    window_cycle_timing = Some(timing);
                     PluginCliCommandResponse::new(0)
                 } else if plugin_id == "bmux.windows" && command_name == "prev-window" {
-                    selected_context_id =
-                        Some(cycle_known_window_playbook(client, runtime, true).await?);
+                    let (context_id, timing) =
+                        cycle_known_window_playbook(client, runtime, true).await?;
+                    selected_context_id = Some(context_id);
+                    window_cycle_timing = Some(timing);
                     PluginCliCommandResponse::new(0)
                 } else {
                     run_plugin_command_playbook(client, &plugin_id, &command_name, args).await?
                 };
                 let run_us = run_started.elapsed().as_micros();
+                if let Some(timing) = window_cycle_timing {
+                    emit_attach_phase_timing(&serde_json::json!({
+                        "phase": "attach.window_cycle",
+                        "plugin_id": plugin_id,
+                        "command_name": command_name,
+                        "known_contexts": timing.known_contexts,
+                        "before_context_us": before_context_us,
+                        "resolve_us": timing.resolve_us,
+                        "invoke_us": timing.invoke_us,
+                        "fallback_us": timing.fallback_us,
+                        "total_us": timing.total_us,
+                    }));
+                }
                 if let Some(error) = response.error {
                     emit_attach_phase_timing(&serde_json::json!({
                         "phase": "attach.plugin_command",
@@ -2905,6 +2960,7 @@ async fn apply_attach_runtime_actions(
                         "status": "run_error",
                         "before_session_id": before_session_id,
                         "attached_session_id": runtime.state.attached_id,
+                        "before_context_us": before_context_us,
                         "run_us": run_us,
                         "retarget_us": 0_u128,
                         "total_us": total_started.elapsed().as_micros(),
@@ -2922,6 +2978,7 @@ async fn apply_attach_runtime_actions(
                         "status": "nonzero",
                         "before_session_id": before_session_id,
                         "attached_session_id": runtime.state.attached_id,
+                        "before_context_us": before_context_us,
                         "run_us": run_us,
                         "retarget_us": 0_u128,
                         "total_us": total_started.elapsed().as_micros(),
@@ -2953,6 +3010,7 @@ async fn apply_attach_runtime_actions(
                     "status": "ok",
                     "before_session_id": before_session_id,
                     "attached_session_id": runtime.state.attached_id,
+                    "before_context_us": before_context_us,
                     "run_us": run_us,
                     "retarget_us": retarget_us,
                     "total_us": total_started.elapsed().as_micros(),

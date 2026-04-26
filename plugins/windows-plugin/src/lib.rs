@@ -894,6 +894,9 @@ fn switch_window(
     selector: ContextSelector,
     last_selected_by_client: &LastSelectedByClient,
 ) -> Result<WindowAck, String> {
+    if let ContextSelector::ById(context_id) = selector {
+        return switch_window_by_id_fast(caller, context_id, last_selected_by_client);
+    }
     let total_started = Instant::now();
     let list_started = Instant::now();
     let contexts = caller
@@ -909,6 +912,64 @@ fn switch_window(
         context_list_us,
         total_started,
     )
+}
+
+fn switch_window_by_id_fast(
+    caller: &impl HostRuntimeApi,
+    context_id: Uuid,
+    last_selected_by_client: &LastSelectedByClient,
+) -> Result<WindowAck, String> {
+    let total_started = Instant::now();
+    let current_started = Instant::now();
+    let previous_context = caller
+        .context_current()
+        .map_err(|error| error.to_string())?
+        .context
+        .map(|context| context.id);
+    let current_context_us = current_started.elapsed().as_micros();
+    let select_started = Instant::now();
+    caller
+        .context_select(&domain_ipc::ContextSelectRequest {
+            selector: ContextSelector::ById(context_id),
+        })
+        .map_err(|error| error.to_string())?;
+    let context_select_us = select_started.elapsed().as_micros();
+    let remember_started = Instant::now();
+    if let Ok(client) = caller.current_client()
+        && let Some(previous) = previous_context
+        && previous != context_id
+        && let Ok(mut map) = last_selected_by_client.lock()
+    {
+        map.insert(client.id, previous);
+    }
+    if let Some(previous) = previous_context
+        && previous != context_id
+    {
+        let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
+    }
+    let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
+    let remember_us = remember_started.elapsed().as_micros();
+    let publish_started = Instant::now();
+    publish_window_list_snapshot(caller);
+    let publish_us = publish_started.elapsed().as_micros();
+    emit_attach_phase_timing(&serde_json::json!({
+        "phase": "windows.switch_window",
+        "fast_by_id": true,
+        "previous_context_id": previous_context,
+        "selected_context_id": context_id,
+        "context_count": serde_json::Value::Null,
+        "context_list_us": 0_u128,
+        "current_context_us": current_context_us,
+        "resolve_us": 0_u128,
+        "context_select_us": context_select_us,
+        "remember_us": remember_us,
+        "publish_us": publish_us,
+        "total_us": total_started.elapsed().as_micros(),
+    }));
+    Ok(WindowAck {
+        ok: true,
+        id: Some(context_id.to_string()),
+    })
 }
 
 fn switch_window_with_contexts(
@@ -2539,7 +2600,21 @@ mod tests {
                     }
                     let request: Args = decode_service_message(&payload)?;
                     let selected = match (request.selector.id, request.selector.name.as_ref()) {
-                        (Some(id), _) => id,
+                        (Some(id), _) => {
+                            let exists = self.sessions.iter().any(|session| session.id == id)
+                                || self
+                                    .created_contexts
+                                    .lock()
+                                    .expect("created contexts lock should succeed")
+                                    .iter()
+                                    .any(|context| context.id == id);
+                            if !exists {
+                                return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                                    details: "mock select target not found".to_string(),
+                                });
+                            }
+                            id
+                        }
                         (None, Some(name)) => self
                             .sessions
                             .iter()
