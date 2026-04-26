@@ -44,7 +44,7 @@ fn usage() -> &'static str {
   report-latency --input PATH [--max-p95-ms N] [--max-p99-ms N] [--max-avg-ms N] [--max-steady-p95-ms N] [--max-steady-p99-ms N] [--max-steady-avg-ms N]
   report-faults --input PATH [--max-runtime-retries N] [--max-runtime-respawns N] [--max-runtime-timeouts N]
   report-json --input PATH --output PATH [threshold flags]
-  report-phase-file --input PATH --output PATH --phase NAME --field FIELD [--max-p99-ms N] [--max-p95-ms N]
+  report-phase-file --input PATH --output PATH --phase NAME --field FIELD [--filter-key KEY --filter-value VALUE] [--max-p99-ms N] [--max-p95-ms N]
   sample-static-service --iterations N --warmup N --out-json PATH [--max-p99-us N]
   prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
   compare-report --baseline PATH --candidate PATH [--candidate PATH ...] [--warn-regression-ms N] [--json-output PATH]
@@ -59,6 +59,8 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
     let mut output = None;
     let mut phase = None;
     let mut field = None;
+    let mut filter_key = None;
+    let mut filter_value = None;
     let mut max_p99_ms = None;
     let mut max_p95_ms = None;
 
@@ -79,6 +81,14 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
             }
             "--field" => {
                 field = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--filter-key" => {
+                filter_key = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--filter-value" => {
+                filter_value = args.get(index + 1).cloned();
                 index += 2;
             }
             "--max-p99-ms" => {
@@ -109,6 +119,10 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
     let selected = events
         .iter()
         .filter(|event| event.get("phase").and_then(Value::as_str) == Some(phase.as_str()))
+        .filter(|event| match (&filter_key, &filter_value) {
+            (Some(key), Some(value)) => event.get(key).and_then(Value::as_str) == Some(value),
+            _ => true,
+        })
         .cloned()
         .collect::<Vec<_>>();
     let samples_us = selected
@@ -153,6 +167,10 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
     let payload = json!({
         "phase": phase,
         "field": field,
+        "filter": {
+            "key": filter_key,
+            "value": filter_value,
+        },
         "sample_count": samples_us.len(),
         "samples_us": samples_us,
         "latency_us": stats_json(stats_us),

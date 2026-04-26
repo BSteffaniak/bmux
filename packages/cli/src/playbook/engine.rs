@@ -45,6 +45,14 @@ const ATTACH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 const VISUAL_RENDER_INTERVAL: Duration = Duration::from_millis(50);
 const VISUAL_REFRESH_INTERVAL: Duration = Duration::from_millis(60);
 const VISUAL_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(30);
+const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
+
+fn emit_attach_phase_timing(payload: &serde_json::Value) {
+    if std::env::var_os("BMUX_ATTACH_PHASE_TIMING").is_none() {
+        return;
+    }
+    eprintln!("{ATTACH_PHASE_MARKER}{payload}");
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlaybookInteractiveMode {
@@ -509,17 +517,49 @@ pub(super) struct AttachInputRuntime {
 #[derive(Debug, Clone)]
 pub(super) struct AttachInputState {
     attached_id: Uuid,
+    attached_context_id: Option<Uuid>,
+    window_context_ids: Vec<Uuid>,
     scrollback_active: bool,
     scrollback_offset: usize,
 }
 
 impl AttachInputRuntime {
     fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
-        let keymap = crate::input::Keymap::default_runtime();
+        let config = bmux_config::BmuxConfig::default();
+        let timeout_ms = config
+            .keybindings
+            .resolve_timeout()
+            .map(|timeout| timeout.timeout_ms())
+            .unwrap_or(None);
+        let modes = config
+            .keybindings
+            .modes
+            .iter()
+            .map(|(mode_id, mode)| {
+                (
+                    mode_id.clone(),
+                    crate::input::ModalModeConfig {
+                        label: mode.label.clone(),
+                        passthrough: mode.passthrough,
+                        bindings: mode.bindings.clone(),
+                    },
+                )
+            })
+            .collect();
+        let keymap = crate::input::Keymap::from_modal_parts_with_scroll(
+            timeout_ms,
+            &config.keybindings.initial_mode,
+            &modes,
+            &config.keybindings.global,
+            &config.keybindings.scroll,
+        )
+        .unwrap_or_else(|_| crate::input::Keymap::default_runtime());
         Self {
             processor: crate::input::InputProcessor::new(keymap, false),
             state: AttachInputState {
                 attached_id: attach_info.session_id,
+                attached_context_id: attach_info.context_id,
+                window_context_ids: attach_info.context_id.into_iter().collect(),
                 scrollback_active: false,
                 scrollback_offset: 0,
             },
@@ -554,6 +594,93 @@ where
         .map_err(|e| anyhow::anyhow!("client invoke_service_raw failed: {e}"))?;
     bmux_codec::from_bytes::<Resp>(&response_bytes)
         .map_err(|error| anyhow::anyhow!("decoding {operation} response: {error}"))
+}
+
+async fn switch_window_by_id_playbook(client: &mut BmuxClient, id: Uuid) -> anyhow::Result<()> {
+    let _ack =
+        invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::WindowAck>(
+            client,
+            "switch-window",
+            &id.to_string(),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn cycle_window_playbook(client: &mut BmuxClient, reverse: bool) -> anyhow::Result<()> {
+    let contexts = list_contexts_playbook(client).await?;
+    if contexts.len() < 2 {
+        return Err(anyhow::anyhow!("no alternate window available"));
+    }
+    let current_context = current_context_playbook(client).await?;
+    let current_index = current_context
+        .and_then(|current| contexts.iter().position(|context| context.id == current.id))
+        .unwrap_or(0);
+    let target_index = if reverse {
+        (current_index + contexts.len() - 1) % contexts.len()
+    } else {
+        (current_index + 1) % contexts.len()
+    };
+    switch_window_by_id_playbook(client, contexts[target_index].id).await
+}
+
+async fn cycle_known_window_playbook(
+    client: &mut BmuxClient,
+    runtime: &AttachInputRuntime,
+    reverse: bool,
+) -> anyhow::Result<Uuid> {
+    let contexts = &runtime.state.window_context_ids;
+    if contexts.len() < 2 {
+        cycle_window_playbook(client, reverse).await?;
+        return current_context_playbook(client)
+            .await?
+            .map(|context| context.id)
+            .ok_or_else(|| anyhow::anyhow!("current context unavailable after window switch"));
+    }
+    let current_index = runtime
+        .state
+        .attached_context_id
+        .and_then(|current| contexts.iter().position(|context| *context == current))
+        .unwrap_or(0);
+    let target_index = if reverse {
+        (current_index + contexts.len() - 1) % contexts.len()
+    } else {
+        (current_index + 1) % contexts.len()
+    };
+    let target_id = contexts[target_index];
+    switch_window_by_id_playbook(client, target_id).await?;
+    Ok(target_id)
+}
+
+async fn run_known_attach_plugin_command_playbook(
+    client: &mut BmuxClient,
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+) -> anyhow::Result<Option<PluginCliCommandResponse>> {
+    if plugin_id != "bmux.windows" {
+        return Ok(None);
+    }
+    match command_name {
+        "new-window" => {
+            let name = args.first().cloned();
+            let _ack = invoke_windows_command_bmux::<
+                _,
+                bmux_windows_plugin_api::windows_commands::WindowAck,
+            >(client, "new-window", &name)
+            .await?;
+            Ok(Some(PluginCliCommandResponse::new(0)))
+        }
+        "next-window" => {
+            cycle_window_playbook(client, false).await?;
+            Ok(Some(PluginCliCommandResponse::new(0)))
+        }
+        "prev-window" => {
+            cycle_window_playbook(client, true).await?;
+            Ok(Some(PluginCliCommandResponse::new(0)))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Invoke a `sessions-commands` typed operation on a [`BmuxClient`].
@@ -601,28 +728,81 @@ async fn current_context_playbook(
         .map_err(|error| anyhow::anyhow!("decoding current-context response: {error}"))
 }
 
+async fn list_contexts_playbook(
+    client: &mut BmuxClient,
+) -> anyhow::Result<Vec<bmux_contexts_plugin_api::contexts_state::ContextSummary>> {
+    let payload = bmux_codec::to_vec(&())
+        .map_err(|error| anyhow::anyhow!("encoding list-contexts args: {error}"))?;
+    let response_bytes = client
+        .invoke_service_raw(
+            crate::runtime::typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
+            crate::runtime::typed_contexts::QUERY_KIND,
+            crate::runtime::typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
+            crate::runtime::typed_contexts::OP_LIST_CONTEXTS,
+            payload,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("list-contexts failed: {e}"))?;
+    bmux_codec::from_bytes(&response_bytes)
+        .map_err(|error| anyhow::anyhow!("decoding list-contexts response: {error}"))
+}
+
 async fn retarget_attach_to_current_context_playbook(
     client: &mut BmuxClient,
     inspector: &ScreenInspector,
     runtime: &mut AttachInputRuntime,
 ) -> anyhow::Result<()> {
+    let current_started = Instant::now();
     let Some(context) = current_context_playbook(client).await? else {
         return Ok(());
     };
+    let current_context_us = current_started.elapsed().as_micros();
+    retarget_attach_to_context_playbook(client, inspector, runtime, context.id, current_context_us)
+        .await
+}
+
+async fn retarget_attach_to_context_playbook(
+    client: &mut BmuxClient,
+    inspector: &ScreenInspector,
+    runtime: &mut AttachInputRuntime,
+    context_id: Uuid,
+    current_context_us: u128,
+) -> anyhow::Result<()> {
+    let total_started = Instant::now();
+    let from_session_id = runtime.state.attached_id;
+    let grant_started = Instant::now();
     let grant = client
-        .attach_context_grant(ContextSelector::ById(context.id))
+        .attach_context_grant(ContextSelector::ById(context_id))
         .await
         .map_err(|e| anyhow::anyhow!("attach context grant failed: {e}"))?;
+    let grant_us = grant_started.elapsed().as_micros();
+    let open_started = Instant::now();
     let attach_info = client
         .open_attach_stream_info(&grant)
         .await
         .map_err(|e| anyhow::anyhow!("attach context open failed: {e}"))?;
+    let open_us = open_started.elapsed().as_micros();
     runtime.state.attached_id = attach_info.session_id;
+    runtime.state.attached_context_id = attach_info.context_id;
     let (cols, rows) = inspector.viewport_size();
+    let viewport_started = Instant::now();
     client
         .attach_set_viewport(attach_info.session_id, cols, rows)
         .await
         .map_err(|e| anyhow::anyhow!("set retargeted viewport failed: {e}"))?;
+    let viewport_us = viewport_started.elapsed().as_micros();
+    emit_attach_phase_timing(&serde_json::json!({
+        "phase": "attach.retarget_context",
+        "from_session_id": from_session_id,
+        "to_context_id": context_id,
+        "selected_context_id": attach_info.context_id,
+        "selected_session_id": attach_info.session_id,
+        "current_context_us": current_context_us,
+        "grant_us": grant_us,
+        "open_us": open_us,
+        "viewport_us": viewport_us,
+        "total_us": total_started.elapsed().as_micros(),
+    }));
     Ok(())
 }
 
@@ -632,6 +812,11 @@ async fn run_plugin_command_playbook(
     command_name: &str,
     args: Vec<String>,
 ) -> anyhow::Result<PluginCliCommandResponse> {
+    if let Some(response) =
+        run_known_attach_plugin_command_playbook(client, plugin_id, command_name, &args).await?
+    {
+        return Ok(response);
+    }
     let request =
         PluginCliCommandRequest::new(plugin_id.to_string(), command_name.to_string(), args);
     let payload = bmux_plugin_sdk::encode_service_message(&request)
@@ -1707,8 +1892,19 @@ pub(super) async fn execute_step(
             *session_id = Some(sid);
             *attached = true;
             *attach_runtime = Some(AttachInputRuntime::new(attach_info));
+            let current_context_id = current_context_playbook(client)
+                .await
+                .ok()
+                .flatten()
+                .map(|context| context.id);
             if let Some(runtime) = attach_runtime.as_mut() {
                 runtime.state.attached_id = sid;
+                runtime.state.attached_context_id = current_context_id.or(grant.context_id);
+                if let Some(context_id) = runtime.state.attached_context_id
+                    && !runtime.state.window_context_ids.contains(&context_id)
+                {
+                    runtime.state.window_context_ids.push(context_id);
+                }
                 runtime.state.scrollback_active = false;
                 runtime.state.scrollback_offset = 0;
                 runtime.processor.set_scroll_mode(false);
@@ -2670,21 +2866,97 @@ async fn apply_attach_runtime_actions(
                 command_name,
                 args,
             } => {
-                let response =
-                    run_plugin_command_playbook(client, &plugin_id, &command_name, args).await?;
+                let total_started = Instant::now();
+                let before_session_id = runtime.state.attached_id;
+                let before_context_id = if plugin_id == "bmux.windows" {
+                    current_context_playbook(client)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|context| context.id)
+                } else {
+                    None
+                };
+                if let Some(context_id) = before_context_id {
+                    runtime.state.attached_context_id = Some(context_id);
+                    if !runtime.state.window_context_ids.contains(&context_id) {
+                        runtime.state.window_context_ids.push(context_id);
+                    }
+                }
+                let run_started = Instant::now();
+                let mut selected_context_id = None;
+                let response = if plugin_id == "bmux.windows" && command_name == "next-window" {
+                    selected_context_id =
+                        Some(cycle_known_window_playbook(client, runtime, false).await?);
+                    PluginCliCommandResponse::new(0)
+                } else if plugin_id == "bmux.windows" && command_name == "prev-window" {
+                    selected_context_id =
+                        Some(cycle_known_window_playbook(client, runtime, true).await?);
+                    PluginCliCommandResponse::new(0)
+                } else {
+                    run_plugin_command_playbook(client, &plugin_id, &command_name, args).await?
+                };
+                let run_us = run_started.elapsed().as_micros();
                 if let Some(error) = response.error {
+                    emit_attach_phase_timing(&serde_json::json!({
+                        "phase": "attach.plugin_command",
+                        "plugin_id": plugin_id,
+                        "command_name": command_name,
+                        "status": "run_error",
+                        "before_session_id": before_session_id,
+                        "attached_session_id": runtime.state.attached_id,
+                        "run_us": run_us,
+                        "retarget_us": 0_u128,
+                        "total_us": total_started.elapsed().as_micros(),
+                    }));
                     bail!(
                         "plugin command {plugin_id}:{command_name} failed: {error} (exit_code={})",
                         response.exit_code
                     );
                 }
                 if response.exit_code != 0 {
+                    emit_attach_phase_timing(&serde_json::json!({
+                        "phase": "attach.plugin_command",
+                        "plugin_id": plugin_id,
+                        "command_name": command_name,
+                        "status": "nonzero",
+                        "before_session_id": before_session_id,
+                        "attached_session_id": runtime.state.attached_id,
+                        "run_us": run_us,
+                        "retarget_us": 0_u128,
+                        "total_us": total_started.elapsed().as_micros(),
+                    }));
                     bail!(
                         "plugin command {plugin_id}:{command_name} exited with status {}",
                         response.exit_code
                     );
                 }
-                retarget_attach_to_current_context_playbook(client, inspector, runtime).await?;
+                let retarget_started = Instant::now();
+                if let Some(context_id) = selected_context_id {
+                    retarget_attach_to_context_playbook(client, inspector, runtime, context_id, 0)
+                        .await?;
+                } else {
+                    retarget_attach_to_current_context_playbook(client, inspector, runtime).await?;
+                }
+                let retarget_us = retarget_started.elapsed().as_micros();
+                if plugin_id == "bmux.windows"
+                    && command_name == "new-window"
+                    && let Some(context_id) = runtime.state.attached_context_id
+                    && !runtime.state.window_context_ids.contains(&context_id)
+                {
+                    runtime.state.window_context_ids.push(context_id);
+                }
+                emit_attach_phase_timing(&serde_json::json!({
+                    "phase": "attach.plugin_command",
+                    "plugin_id": plugin_id,
+                    "command_name": command_name,
+                    "status": "ok",
+                    "before_session_id": before_session_id,
+                    "attached_session_id": runtime.state.attached_id,
+                    "run_us": run_us,
+                    "retarget_us": retarget_us,
+                    "total_us": total_started.elapsed().as_micros(),
+                }));
             }
             crate::input::RuntimeAction::Quit
             | crate::input::RuntimeAction::ToggleSplitDirection
@@ -2913,6 +3185,58 @@ fn event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_attach_info() -> bmux_client::AttachOpenInfo {
+        bmux_client::AttachOpenInfo {
+            context_id: Some(Uuid::nil()),
+            session_id: Uuid::nil(),
+            can_write: true,
+        }
+    }
+
+    fn key_event(code: CrosstermKeyCode, modifiers: KeyModifiers) -> CrosstermEvent {
+        CrosstermEvent::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    #[test]
+    fn attach_input_uses_default_modal_window_bindings() {
+        let mut runtime = AttachInputRuntime::new(test_attach_info());
+
+        assert_eq!(
+            runtime
+                .processor
+                .process_terminal_event(key_event(CrosstermKeyCode::Char('c'), KeyModifiers::NONE)),
+            vec![crate::input::RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "new-window".to_string(),
+                args: Vec::new(),
+            }]
+        );
+        assert_eq!(runtime.state.attached_context_id, Some(Uuid::nil()));
+        assert_eq!(runtime.state.window_context_ids, vec![Uuid::nil()]);
+    }
+
+    #[test]
+    fn attach_input_maps_ctrl_s_to_next_window_plugin_command() {
+        let mut runtime = AttachInputRuntime::new(test_attach_info());
+
+        assert_eq!(
+            runtime.processor.process_terminal_event(key_event(
+                CrosstermKeyCode::Char('s'),
+                KeyModifiers::CONTROL
+            )),
+            vec![crate::input::RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "next-window".to_string(),
+                args: Vec::new(),
+            }]
+        );
+    }
 
     #[test]
     fn parse_interactive_prompt_command_supports_shortcuts_and_defaults() {
