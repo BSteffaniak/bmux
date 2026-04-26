@@ -2113,6 +2113,27 @@ pub fn load_static_plugin(
     })
 }
 
+/// Load a statically-linked plugin whose declaration was already parsed and
+/// registered by the host from the same embedded manifest.
+///
+/// # Errors
+///
+/// Returns an error when the registered declaration is incompatible with the
+/// current host or declared available capabilities.
+pub fn load_trusted_static_plugin(
+    registered_plugin: &RegisteredPlugin,
+    vtable: StaticPluginVtable,
+    host: &HostMetadata,
+    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
+) -> Result<LoadedPlugin> {
+    PluginRegistry::validate_static_plugin(registered_plugin, host, available_capabilities)?;
+    Ok(LoadedPlugin {
+        registered: registered_plugin.clone(),
+        declaration: registered_plugin.declaration.clone(),
+        backend: PluginBackend::Static(vtable),
+    })
+}
+
 fn load_native_declaration(
     library: &Library,
     registered_plugin: &RegisteredPlugin,

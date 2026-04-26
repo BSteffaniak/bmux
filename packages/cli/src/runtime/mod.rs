@@ -121,8 +121,8 @@ use plugin_runtime::{
     effective_enabled_plugins, load_enabled_plugins, load_plugin, plugin_command_policy_hints,
     plugin_event_bridge_loop, plugin_host_metadata, plugin_system_event,
     registered_plugin_entry_exists, resolve_plugin_search_paths, run_external_plugin_command,
-    run_plugin_command, run_plugin_keybinding_command, scan_available_plugins,
-    validate_enabled_plugins,
+    run_plugin_command, run_plugin_command_with_state, run_plugin_keybinding_command,
+    scan_available_plugins, validate_enabled_plugins,
 };
 pub use prompt::{
     PromptEvent, PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
@@ -373,6 +373,7 @@ pub async fn run() -> Result<u8> {
             plugin_id,
             command_name,
             arguments,
+            command_state,
             config_overrides,
         } => {
             let _config_override_guard = push_process_config_overrides(config_overrides);
@@ -383,7 +384,12 @@ pub async fn run() -> Result<u8> {
             {
                 return Ok(status);
             }
-            run_plugin_command(&plugin_id, &command_name, &arguments).await
+            if let Some(command_state) = command_state.as_ref() {
+                run_plugin_command_with_state(command_state, &plugin_id, &command_name, &arguments)
+                    .await
+            } else {
+                run_plugin_command(&plugin_id, &command_name, &arguments).await
+            }
         }
         ParsedRuntimeCli::ImmediateExit {
             code,

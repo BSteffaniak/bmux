@@ -10,7 +10,7 @@ use bmux_plugin_sdk::{
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,15 +24,15 @@ use super::{
     service_descriptors_from_declarations,
 };
 
-#[derive(Clone)]
-struct RuntimeCommandState {
-    config: BmuxConfig,
-    paths: ConfigPaths,
-    registry: Arc<PluginRegistry>,
-    enabled_plugins: Vec<String>,
-    available_capability_providers: BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
-    plugin_search_roots: Vec<String>,
-    registered_plugin_infos: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
+#[derive(Debug, Clone)]
+pub(super) struct RuntimeCommandState {
+    pub(super) config: BmuxConfig,
+    pub(super) paths: ConfigPaths,
+    pub(super) registry: Arc<PluginRegistry>,
+    pub(super) enabled_plugins: Vec<String>,
+    pub(super) available_capability_providers: BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
+    pub(super) plugin_search_roots: Vec<String>,
+    pub(super) registered_plugin_infos: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
 }
 
 thread_local! {
@@ -88,6 +88,7 @@ pub(super) fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPat
 macro_rules! declare_bundled_plugins {
     ($(
         feature = $feature:literal,
+        id = $plugin_id:literal,
         manifest = $manifest:expr,
         plugin_type = $ty:ty;
     )*) => {
@@ -103,13 +104,10 @@ macro_rules! declare_bundled_plugins {
                     tracing::warn!("failed to register bundled plugin '{plugin_id}': {e}");
                 }
                 #[cfg(feature = $feature)]
-                if let Some(plugin_id) = bmux_plugin::PluginManifest::from_toml_str($manifest)
-                    .ok()
-                    .map(|parsed| parsed.id)
-                {
-                    let vtable = bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest);
-                    bmux_plugin::register_static_vtable(&plugin_id, vtable);
-                }
+                bmux_plugin::register_static_vtable(
+                    $plugin_id,
+                    bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest),
+                );
             )*
         }
 
@@ -117,12 +115,7 @@ macro_rules! declare_bundled_plugins {
         fn static_bundled_vtable(plugin_id: &str) -> Option<bmux_plugin_sdk::StaticPluginVtable> {
             $(
                 #[cfg(feature = $feature)]
-                if bmux_plugin::PluginManifest::from_toml_str($manifest)
-                    .ok()
-                    .map(|parsed| parsed.id)
-                    .as_deref()
-                    .is_some_and(|manifest_plugin_id| manifest_plugin_id == plugin_id)
-                {
+                if plugin_id == $plugin_id {
                     return Some(bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest));
                 }
             )*
@@ -133,66 +126,82 @@ macro_rules! declare_bundled_plugins {
 
 declare_bundled_plugins! {
     feature = "bundled-plugin-clients",
+    id = "bmux.clients",
     manifest = include_str!("../../../../plugins/clients-plugin/plugin.toml"),
     plugin_type = bmux_clients_plugin::ClientsPlugin;
 
     feature = "bundled-plugin-clipboard",
+    id = "bmux.clipboard",
     manifest = include_str!("../../../../plugins/clipboard-plugin/plugin.toml"),
     plugin_type = bmux_clipboard_plugin::ClipboardPlugin;
 
     feature = "bundled-plugin-cluster",
+    id = "bmux.cluster",
     manifest = include_str!("../../../../plugins/cluster-plugin/plugin.toml"),
     plugin_type = bmux_cluster_plugin::ClusterPlugin;
 
     feature = "bundled-plugin-contexts",
+    id = "bmux.contexts",
     manifest = include_str!("../../../../plugins/contexts-plugin/plugin.toml"),
     plugin_type = bmux_contexts_plugin::ContextsPlugin;
 
     feature = "bundled-plugin-control-catalog",
+    id = "bmux.control_catalog",
     manifest = include_str!("../../../../plugins/control-catalog-plugin/plugin.toml"),
     plugin_type = bmux_control_catalog_plugin::ControlCatalogPlugin;
 
     feature = "bundled-plugin-performance",
+    id = "bmux.performance",
     manifest = include_str!("../../../../plugins/performance-plugin/plugin.toml"),
     plugin_type = bmux_performance_plugin::PerformancePlugin;
 
     feature = "bundled-plugin-permissions",
+    id = "bmux.permissions",
     manifest = include_str!("../../../../plugins/permissions-plugin/plugin.toml"),
     plugin_type = bmux_permissions_plugin::PermissionsPlugin;
 
     feature = "bundled-plugin-cli",
+    id = "bmux.plugin_cli",
     manifest = include_str!("../../../../plugins/plugin-cli-plugin/plugin.toml"),
     plugin_type = bmux_plugin_cli_plugin::PluginCliPlugin;
 
     feature = "bundled-plugin-prompted-actions",
+    id = "bmux.prompted_actions",
     manifest = include_str!("../../../../plugins/prompted-actions-plugin/plugin.toml"),
     plugin_type = bmux_prompted_actions_plugin::PromptedActionsPlugin;
 
     feature = "bundled-plugin-recording",
+    id = "bmux.recording",
     manifest = include_str!("../../../../plugins/recording-plugin/plugin.toml"),
     plugin_type = bmux_recording_plugin::RecordingPlugin;
 
     feature = "bundled-plugin-sessions",
+    id = "bmux.sessions",
     manifest = include_str!("../../../../plugins/sessions-plugin/plugin.toml"),
     plugin_type = bmux_sessions_plugin::SessionsPlugin;
 
     feature = "bundled-plugin-pane-runtime",
+    id = "bmux.pane_runtime",
     manifest = include_str!("../../../../plugins/pane-runtime-plugin/plugin.toml"),
     plugin_type = bmux_pane_runtime_plugin::PaneRuntimePlugin;
 
     feature = "bundled-plugin-snapshot",
+    id = "bmux.snapshot",
     manifest = include_str!("../../../../plugins/snapshot-plugin/plugin.toml"),
     plugin_type = bmux_snapshot_plugin::SnapshotPlugin;
 
     feature = "bundled-plugin-theme",
+    id = "bmux.theme",
     manifest = include_str!("../../../../plugins/theme-plugin/plugin.toml"),
     plugin_type = bmux_theme_plugin::ThemePlugin;
 
     feature = "bundled-plugin-windows",
+    id = "bmux.windows",
     manifest = include_str!("../../../../plugins/windows-plugin/plugin.toml"),
     plugin_type = bmux_windows_plugin::WindowsPlugin;
 
     feature = "bundled-plugin-decoration",
+    id = "bmux.decoration",
     manifest = include_str!("../../../../plugins/decoration-plugin/plugin.toml"),
     plugin_type = bmux_decoration_plugin::DecorationPlugin;
 }
@@ -211,7 +220,7 @@ pub(super) fn load_plugin(
                 plugin_id: plugin.declaration.id.as_str().to_string(),
             }
         })?;
-        bmux_plugin::load_static_plugin(plugin, vtable, host, available_capabilities)
+        bmux_plugin::load_trusted_static_plugin(plugin, vtable, host, available_capabilities)
     } else {
         load_native_registered_plugin(plugin, host, available_capabilities)
     }
@@ -228,6 +237,13 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
 
     for report in reports {
         for manifest_path in report.manifest_paths {
+            if workspace_bundled_root
+                .as_ref()
+                .is_some_and(|root| report.search_root == *root)
+                && static_bundled_workspace_manifest_is_registered(&manifest_path)
+            {
+                continue;
+            }
             match PluginManifest::from_path(&manifest_path) {
                 Ok(mut manifest) => {
                     if let Some(entry_path) = manifest.resolve_entry_path(
@@ -283,45 +299,151 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
     Ok(registry)
 }
 
+fn static_bundled_workspace_manifest_is_registered(manifest_path: &Path) -> bool {
+    if manifest_path.file_name().and_then(|name| name.to_str()) != Some("plugin.toml") {
+        return false;
+    }
+    let Some(dir_name) = manifest_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    #[cfg(feature = "bundled-plugin-clients")]
+    if dir_name == "clients-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-clipboard")]
+    if dir_name == "clipboard-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-cluster")]
+    if dir_name == "cluster-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-contexts")]
+    if dir_name == "contexts-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-control-catalog")]
+    if dir_name == "control-catalog-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-performance")]
+    if dir_name == "performance-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-permissions")]
+    if dir_name == "permissions-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-cli")]
+    if dir_name == "plugin-cli-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-prompted-actions")]
+    if dir_name == "prompted-actions-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-recording")]
+    if dir_name == "recording-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-sessions")]
+    if dir_name == "sessions-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-pane-runtime")]
+    if dir_name == "pane-runtime-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-snapshot")]
+    if dir_name == "snapshot-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-theme")]
+    if dir_name == "theme-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-windows")]
+    if dir_name == "windows-plugin" {
+        return true;
+    }
+    #[cfg(feature = "bundled-plugin-decoration")]
+    if dir_name == "decoration-plugin" {
+        return true;
+    }
+    false
+}
+
 fn runtime_command_state() -> Result<RuntimeCommandState> {
     RUNTIME_COMMAND_STATE_CACHE.with(|slot| {
         if let Some(state) = slot.borrow().clone() {
             return Ok(state);
         }
 
+        let config_started = Instant::now();
         let config = BmuxConfig::load()?;
         let paths = ConfigPaths::default();
+        let config_us = config_started.elapsed().as_micros();
+        let scan_started = Instant::now();
         let registry = Arc::new(scan_available_plugins(&config, &paths)?);
-        let enabled_plugins = effective_enabled_plugins(&config, &registry);
-        let available_capability_providers = available_capability_providers(&config, &registry)?;
-        let plugin_search_roots = resolve_plugin_search_paths(&config, &paths)?
-            .into_iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        let registered_plugin_infos = registered_plugin_infos_from_registry(&registry);
-        let state = RuntimeCommandState {
-            config,
-            paths,
-            registry,
-            enabled_plugins,
-            available_capability_providers,
-            plugin_search_roots,
-            registered_plugin_infos,
-        };
-        // Mark every enabled plugin as `Remote` for typed service
-        // dispatch. This is the default view from an attach client or
-        // standalone CLI process: the server owns the activated
-        // providers, so plugin-to-plugin typed calls must forward via
-        // `Request::InvokeService`. `mark_remote` leaves any prior
-        // `Local` entry untouched, which keeps the server's own
-        // activation marks correct when it shares this code path.
-        let locations = bmux_plugin::global_service_locations();
-        for plugin_id in &state.enabled_plugins {
-            locations.mark_remote(plugin_id);
-        }
+        let scan_us = scan_started.elapsed().as_micros();
+        let build_started = Instant::now();
+        let state = build_runtime_command_state(config, paths, registry)?;
+        emit_runtime_state_phase_timing(config_us, scan_us, build_started.elapsed().as_micros());
         *slot.borrow_mut() = Some(state.clone());
         Ok(state)
     })
+}
+
+pub(super) fn build_runtime_command_state(
+    config: BmuxConfig,
+    paths: ConfigPaths,
+    registry: Arc<PluginRegistry>,
+) -> Result<RuntimeCommandState> {
+    let enabled_plugins = effective_enabled_plugins(&config, &registry);
+    let available_capability_providers = available_capability_providers(&config, &registry)?;
+    let plugin_search_roots = resolve_plugin_search_paths(&config, &paths)?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let registered_plugin_infos = registered_plugin_infos_from_registry(&registry);
+    let state = RuntimeCommandState {
+        config,
+        paths,
+        registry,
+        enabled_plugins,
+        available_capability_providers,
+        plugin_search_roots,
+        registered_plugin_infos,
+    };
+    mark_runtime_command_state_remote(&state);
+    Ok(state)
+}
+
+fn mark_runtime_command_state_remote(state: &RuntimeCommandState) {
+    // Standalone CLI processes see enabled plugins as server-owned providers;
+    // server activation can still override entries to Local later.
+    let locations = bmux_plugin::global_service_locations();
+    for plugin_id in &state.enabled_plugins {
+        locations.mark_remote(plugin_id);
+    }
+}
+
+fn emit_runtime_state_phase_timing(config_us: u128, scan_us: u128, build_us: u128) {
+    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "phase": "runtime_command_state",
+        "config_us": config_us,
+        "scan_us": scan_us,
+        "build_us": build_us,
+        "total_us": config_us + scan_us + build_us,
+    });
+    eprintln!("[bmux-plugin-phase-json]{payload}");
 }
 
 pub(super) fn resolve_plugin_search_paths(
@@ -1421,6 +1543,30 @@ pub(super) async fn run_plugin_command(
     Ok(execution.status.clamp(0, i32::from(u8::MAX)) as u8)
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Status clamped to 0..255 before cast
+pub(super) async fn run_plugin_command_with_state(
+    state: &RuntimeCommandState,
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+) -> Result<u8> {
+    let execution = run_plugin_command_internal_with_state(
+        Some(state),
+        plugin_id,
+        command_name,
+        args,
+        None,
+        None,
+        bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
+    )?;
+    if execution.status != 0
+        && let Some(error) = execution.outcome.error_message.as_deref()
+    {
+        eprintln!("{error}");
+    }
+    Ok(execution.status.clamp(0, i32::from(u8::MAX)) as u8)
+}
+
 pub(super) fn run_plugin_keybinding_command(
     plugin_id: &str,
     command_name: &str,
@@ -1510,9 +1656,35 @@ pub(super) fn run_plugin_command_internal(
     caller_client_id: Option<uuid::Uuid>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
 ) -> Result<PluginCommandExecution> {
+    run_plugin_command_internal_with_state(
+        None,
+        plugin_id,
+        command_name,
+        args,
+        kernel_client_factory,
+        caller_client_id,
+        invocation_source,
+    )
+}
+
+fn run_plugin_command_internal_with_state(
+    provided_state: Option<&RuntimeCommandState>,
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+    kernel_client_factory: Option<&KernelClientFactory>,
+    caller_client_id: Option<uuid::Uuid>,
+    invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
+) -> Result<PluginCommandExecution> {
     let total_started = Instant::now();
     let runtime_state_started = Instant::now();
-    let state = runtime_command_state()?;
+    let cached_state;
+    let state = if let Some(state) = provided_state {
+        state
+    } else {
+        cached_state = runtime_command_state()?;
+        &cached_state
+    };
     let runtime_state_us = runtime_state_started.elapsed().as_micros();
     let lookup_started = Instant::now();
     let config = &state.config;
@@ -1530,7 +1702,7 @@ pub(super) fn run_plugin_command_internal(
     let lookup_us = lookup_started.elapsed().as_micros();
 
     let load_started = Instant::now();
-    let loaded = load_cached_plugin(plugin, &state)?;
+    let loaded = load_cached_plugin(plugin, state)?;
     let load_us = load_started.elapsed().as_micros();
     let context_started = Instant::now();
     let plugin_search_roots = state.plugin_search_roots.clone();
@@ -2112,6 +2284,7 @@ mod tests {
             &argv,
             &config,
             &registry,
+            None,
             bmux_config::ConfigLoadOverrides::default(),
         )
         .expect("runtime CLI should parse plugin alias under session namespace");
@@ -2161,6 +2334,7 @@ mod tests {
             &argv,
             &config,
             &registry,
+            None,
             bmux_config::ConfigLoadOverrides::default(),
         )
         .expect("runtime CLI should parse plugin-owned plugin namespace command");
@@ -2205,6 +2379,7 @@ mod tests {
             &argv,
             &config,
             &registry,
+            None,
             bmux_config::ConfigLoadOverrides::default(),
         )
         .expect("runtime CLI should parse bundled plugin command");
@@ -2230,6 +2405,7 @@ mod tests {
             &argv,
             &config,
             &registry,
+            None,
             bmux_config::ConfigLoadOverrides::default(),
         )
         .expect("runtime CLI should parse built-in attach command");

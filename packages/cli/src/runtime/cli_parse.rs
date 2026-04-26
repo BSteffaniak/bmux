@@ -3,11 +3,14 @@ use bmux_cli_schema::{Cli, LogLevel};
 use bmux_config::{BmuxConfig, ConfigLoadOverrides, ConfigPaths, RECORDINGS_DIR_OVERRIDE_ENV};
 use bmux_plugin::PluginRegistry;
 use clap::{CommandFactory, FromArgMatches};
+use std::sync::Arc;
+use std::time::Instant;
 use tracing::Level;
 
 pub(super) const RECORDING_AUTO_EXPORT_OVERRIDE_ENV: &str = "BMUX_RECORDING_AUTO_EXPORT";
 pub(super) const RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV: &str = "BMUX_RECORDING_AUTO_EXPORT_DIR";
 
+use super::plugin_runtime::{RuntimeCommandState, build_runtime_command_state};
 use super::{
     effective_enabled_plugins, plugin_commands, plugin_commands::PluginCommandRegistry,
     scan_available_plugins,
@@ -32,6 +35,7 @@ pub(super) enum ParsedRuntimeCli {
         plugin_id: String,
         command_name: String,
         arguments: Vec<String>,
+        command_state: Option<RuntimeCommandState>,
         config_overrides: ConfigLoadOverrides,
     },
 }
@@ -42,8 +46,12 @@ struct RawRuntimeOverrides {
 }
 
 pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
+    let total_started = Instant::now();
+    let argv_started = Instant::now();
     let argv = std::env::args_os().collect::<Vec<_>>();
     let raw_overrides = apply_runtime_override_from_raw_args(&argv)?;
+    let argv_us = argv_started.elapsed().as_micros();
+    let slot_started = Instant::now();
     // Resolve the active slot (if any) before loading config, so that
     // slot-aware paths / env propagation apply to the rest of bootstrap.
     let slot_state = super::slot::active_slot().clone();
@@ -59,6 +67,8 @@ pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
              Add it to slots.toml or unset BMUX_SLOT_NAME."
         );
     }
+    let slot_us = slot_started.elapsed().as_micros();
+    let config_started = Instant::now();
     let mut config_overrides = ConfigLoadOverrides::from_env_with_cli(raw_overrides.config_path);
     // When a slot is active and `inherit_base = true`, layer the shared
     // `<config_root>/base.toml` underneath the slot's config.
@@ -75,8 +85,57 @@ pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
         let cfg = BmuxConfig::load_with_overrides(&config_overrides)?;
         (cfg, ConfigPaths::default())
     };
-    let registry = scan_available_plugins(&config, &paths)?;
-    parse_runtime_cli_with_registry(&argv, &config, &registry, config_overrides)
+    let config_us = config_started.elapsed().as_micros();
+    let scan_started = Instant::now();
+    let registry = Arc::new(scan_available_plugins(&config, &paths)?);
+    let scan_us = scan_started.elapsed().as_micros();
+    let state_started = Instant::now();
+    let command_state = build_runtime_command_state(config.clone(), paths, Arc::clone(&registry))?;
+    let state_us = state_started.elapsed().as_micros();
+    let parse_started = Instant::now();
+    let parsed = parse_runtime_cli_with_registry(
+        &argv,
+        &config,
+        &registry,
+        Some(command_state),
+        config_overrides,
+    )?;
+    emit_parse_phase_timing(
+        argv_us,
+        slot_us,
+        config_us,
+        scan_us,
+        state_us,
+        parse_started.elapsed().as_micros(),
+        total_started.elapsed().as_micros(),
+    );
+    Ok(parsed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_parse_phase_timing(
+    argv_us: u128,
+    slot_us: u128,
+    config_us: u128,
+    scan_us: u128,
+    state_us: u128,
+    parse_us: u128,
+    total_us: u128,
+) {
+    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "phase": "parse_runtime_cli",
+        "argv_us": argv_us,
+        "slot_us": slot_us,
+        "config_us": config_us,
+        "scan_us": scan_us,
+        "state_us": state_us,
+        "parse_us": parse_us,
+        "total_us": total_us,
+    });
+    eprintln!("[bmux-plugin-phase-json]{payload}");
 }
 
 fn apply_runtime_override_from_raw_args(
@@ -206,16 +265,25 @@ fn validate_runtime_name(value: &str) -> Result<String> {
     anyhow::bail!("runtime name can only include letters, numbers, '-', '_' or '.'")
 }
 
+#[allow(clippy::too_many_lines)] // Single parse flow keeps fast-path/fallback ownership clear.
 pub(super) fn parse_runtime_cli_with_registry(
     argv: &[std::ffi::OsString],
     config: &BmuxConfig,
     registry: &PluginRegistry,
+    command_state: Option<RuntimeCommandState>,
     config_overrides: ConfigLoadOverrides,
 ) -> Result<ParsedRuntimeCli> {
+    let total_started = Instant::now();
     let mut command_config = config.clone();
-    command_config.plugins.enabled = effective_enabled_plugins(config, registry);
+    command_config.plugins.enabled = command_state.as_ref().map_or_else(
+        || effective_enabled_plugins(config, registry),
+        |state| state.enabled_plugins.clone(),
+    );
+    let registry_started = Instant::now();
     let command_registry = PluginCommandRegistry::build(&command_config, registry)
         .context("failed building plugin CLI command registry")?;
+    let registry_us = registry_started.elapsed().as_micros();
+    let resolve_started = Instant::now();
     if let Some(raw_args) = argv
         .iter()
         .skip(1)
@@ -233,18 +301,30 @@ pub(super) fn parse_runtime_cli_with_registry(
             std::env::var("BMUX_LOG_LEVEL").ok().as_deref(),
         );
         if !raw_args.iter().any(|arg| arg == "--core-builtins-only") {
+            emit_parse_with_registry_phase_timing(
+                registry_us,
+                resolve_started.elapsed().as_micros(),
+                0,
+                0,
+                total_started.elapsed().as_micros(),
+            );
             return Ok(ParsedRuntimeCli::Plugin {
                 log_level,
                 plugin_id: resolved.plugin_id,
                 command_name: resolved.command_name,
                 arguments: normalized,
+                command_state,
                 config_overrides,
             });
         }
     }
+    let resolve_us = resolve_started.elapsed().as_micros();
+    let clap_augment_started = Instant::now();
     let clap_command = command_registry
         .augment_clap_command(Cli::command())
         .context("failed augmenting CLI with plugin commands")?;
+    let clap_augment_us = clap_augment_started.elapsed().as_micros();
+    let clap_parse_started = Instant::now();
     let matches = match clap_command.try_get_matches_from(argv.iter().cloned()) {
         Ok(matches) => matches,
         Err(error) => {
@@ -264,6 +344,14 @@ pub(super) fn parse_runtime_cli_with_registry(
             });
         }
     };
+    let clap_parse_us = clap_parse_started.elapsed().as_micros();
+    emit_parse_with_registry_phase_timing(
+        registry_us,
+        resolve_us,
+        clap_augment_us,
+        clap_parse_us,
+        total_started.elapsed().as_micros(),
+    );
     let verbose = matches.get_flag("verbose");
     let log_level = resolve_log_level(
         verbose,
@@ -283,6 +371,7 @@ pub(super) fn parse_runtime_cli_with_registry(
                 plugin_id: resolved.plugin_id,
                 command_name: resolved.command_name,
                 arguments,
+                command_state,
                 config_overrides,
             });
         }
@@ -296,6 +385,27 @@ pub(super) fn parse_runtime_cli_with_registry(
         verbose,
         config_overrides,
     })
+}
+
+fn emit_parse_with_registry_phase_timing(
+    registry_us: u128,
+    resolve_us: u128,
+    clap_augment_us: u128,
+    clap_parse_us: u128,
+    total_us: u128,
+) {
+    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "phase": "parse_runtime_cli_with_registry",
+        "command_registry_us": registry_us,
+        "resolve_us": resolve_us,
+        "clap_augment_us": clap_augment_us,
+        "clap_parse_us": clap_parse_us,
+        "total_us": total_us,
+    });
+    eprintln!("[bmux-plugin-phase-json]{payload}");
 }
 
 pub(super) fn resolve_log_level(
