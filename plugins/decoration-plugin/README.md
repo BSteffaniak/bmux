@@ -14,7 +14,7 @@ The plugin ships four built-in border styles (`none`, `ascii`, `single`,
 matching the characters the core renderer falls back to when no theme is
 active.
 
-## Lua scripting (per-frame `decorate(ctx)`)
+## Lua scripting (`decorate(message)`)
 
 Themes can attach a Lua script that emits paint commands each animation
 tick. The `scripting-luau` feature is enabled by default; consumers that
@@ -43,20 +43,33 @@ The `script = "..."` value is resolved in this order:
    The plugin ships `pulse` and `rainbow_snake`; see
    `assets/decorations/` for the sources.
 
-### The `decorate(ctx)` contract
+### The `decorate(message)` contract
 
-Scripts must define a global `decorate(ctx)` function that returns an
-array of paint-command tables. The runtime passes `ctx` with:
+Scripts must define a global `decorate(message)` function. Render messages
+return paint commands grouped by pane id:
 
-| Field              | Type        | Meaning                        |
-| ------------------ | ----------- | ------------------------------ |
-| `ctx.rect`         | `{x,y,w,h}` | Outer bounds of the pane       |
-| `ctx.content_rect` | `{x,y,w,h}` | PTY interior                   |
-| `ctx.focused`      | `bool`      | Focus bit                      |
-| `ctx.zoomed`       | `bool`      | Zoom bit                       |
-| `ctx.bell`         | `bool`      | Bell observed since last clear |
-| `ctx.time_ms`      | `u64`       | Ms since plugin activation     |
-| `ctx.frame`        | `u64`       | Monotonic frame counter        |
+```lua
+function decorate(message)
+    if message.kind ~= "render" then
+        return nil
+    end
+    return { surfaces = { [message.panes[1].id] = {} } }
+end
+```
+
+Render messages carry:
+
+| Field             | Type       | Meaning                    |
+| ----------------- | ---------- | -------------------------- |
+| `message.kind`    | `"render"` | Message type               |
+| `message.time_ms` | `u64`      | Ms since plugin activation |
+| `message.frame`   | `u64`      | Monotonic frame counter    |
+| `message.panes`   | `array`    | Visible pane snapshots     |
+
+Each pane has `id`, `rect`, `content_rect`, `focused`, `zoomed`, and
+`status`. Event messages use `message.kind = "event"` and carry
+`message.event.kind`, `delivery`, `snapshot`, and `payload` so scripts can
+cache plugin-defined signals.
 
 Paint-command tables carry a `kind` string plus the variant fields; the
 supported kinds are `text`, `filled_rect`, `gradient_run`, `box_border`.
@@ -91,8 +104,8 @@ CPU cost.
 ## Try it
 
 The `pulse-demo` bundled theme exercises the full scripting path.
-Activate it by setting `appearance.theme = "pulse-demo"` in your
-`bmux.toml`; no additional files are required.
+Activate it through the `bmux.theme` plugin; no additional files are
+required.
 
 ## Opting out
 

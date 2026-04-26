@@ -10,15 +10,7 @@ local DEATH_HOLD_MS = 3000
 local SHRINK_BLOCKS_PER_SECOND = 24
 local FLASH_MS = 150
 
-local panes = {}
 local pane_states = {}
-
-local function apply_snapshot(payload)
-    panes = {}
-    for _, pane in ipairs(payload.panes or {}) do
-        panes[pane.id] = pane
-    end
-end
 
 local function new_pane_state()
     return {
@@ -33,8 +25,8 @@ local function new_pane_state()
     }
 end
 
-local function pane_state(ctx)
-    local key = ctx.pane_id or "default"
+local function pane_state(pane)
+    local key = pane.id or "default"
     if pane_states[key] == nil then
         pane_states[key] = new_pane_state()
     end
@@ -75,22 +67,22 @@ local function perimeter_cell(rect, visual_offset, visual_total)
     return rect.x, rect.y + h - 1 - math.floor(p / VERTICAL_ASPECT)
 end
 
-local function seed_rng(state, ctx)
+local function seed_rng(state, pane, message)
     if state.rng_state ~= nil then
         return
     end
-    local rect = ctx.rect
-    state.rng_state = (ctx.frame * 97 + ctx.time_ms + rect.w * 131 + rect.h * 197) % 233280
+    local rect = pane.rect
+    state.rng_state = (message.frame * 97 + message.time_ms + rect.w * 131 + rect.h * 197) % 233280
 end
 
-local function rand(state, ctx, max_value)
-    seed_rng(state, ctx)
+local function rand(state, pane, message, max_value)
+    seed_rng(state, pane, message)
     state.rng_state = (state.rng_state * 9301 + 49297) % 233280
     return math.floor((state.rng_state / 233280) * max_value)
 end
 
-local function unit_rand(state, ctx)
-    return rand(state, ctx, 1000000) / 1000000.0
+local function unit_rand(state, pane, message)
+    return rand(state, pane, message, 1000000) / 1000000.0
 end
 
 local function circular_distance(a, b, total)
@@ -107,9 +99,9 @@ local function apple_on_snake(head, apple, snake_len, visual_total, pad)
     return behind_head <= body_span + (pad or APPLE_PAD)
 end
 
-local function spawn_apple(state, ctx, head, snake_len, visual_total)
+local function spawn_apple(state, pane, message, head, snake_len, visual_total)
     for _ = 1, 32 do
-        local candidate = unit_rand(state, ctx) * visual_total
+        local candidate = unit_rand(state, pane, message) * visual_total
         if not apple_on_snake(head, candidate, snake_len, visual_total, APPLE_PAD) then
             state.apple_v = candidate
             return
@@ -118,7 +110,7 @@ local function spawn_apple(state, ctx, head, snake_len, visual_total)
 
     local step = math.max(0.5, SPACING / 2)
     local scan_count = math.floor(visual_total / step)
-    local start = unit_rand(state, ctx) * visual_total
+    local start = unit_rand(state, pane, message) * visual_total
     for i = 0, scan_count do
         local candidate = (start + i * step) % visual_total
         if not apple_on_snake(head, candidate, snake_len, visual_total, APPLE_PAD) then
@@ -221,19 +213,19 @@ local function render_death(cmds, state, raw_total, visual_total)
     return true
 end
 
-local function render_pane(ctx)
-    local state = pane_state(ctx)
-    if not ctx.focused then
+local function render_pane(pane, message)
+    local state = pane_state(pane)
+    if not pane.focused then
         state.last_focus_ms = nil
         return {}
     end
 
     if state.last_focus_ms ~= nil then
-        state.active_ms = state.active_ms + math.max(0, ctx.time_ms - state.last_focus_ms)
+        state.active_ms = state.active_ms + math.max(0, message.time_ms - state.last_focus_ms)
     end
-    state.last_focus_ms = ctx.time_ms
+    state.last_focus_ms = message.time_ms
 
-    local raw_total, visual_total = border_metrics(ctx.rect)
+    local raw_total, visual_total = border_metrics(pane.rect)
     if raw_total <= 0 or visual_total <= 0 then
         return {}
     end
@@ -245,17 +237,17 @@ local function render_pane(ctx)
 
     local head = (state.head_offset_v + (state.active_ms / 1000.0) * SPEED) % visual_total
     local snake_len = math.min(state.snake_size, raw_total)
-    local segments = snake_segments(ctx.rect, head, snake_len, visual_total)
+    local segments = snake_segments(pane.rect, head, snake_len, visual_total)
 
     if state.apple_v == nil or apple_on_snake(head, state.apple_v, snake_len, visual_total, APPLE_PAD) then
-        spawn_apple(state, ctx, head, snake_len, visual_total)
+        spawn_apple(state, pane, message, head, snake_len, visual_total)
     end
 
     if state.apple_v ~= nil and circular_distance(head, state.apple_v, visual_total) <= EAT_RADIUS then
         state.snake_size = math.min(state.snake_size + 1, raw_total)
         snake_len = math.min(state.snake_size, raw_total)
-        segments = snake_segments(ctx.rect, head, snake_len, visual_total)
-        spawn_apple(state, ctx, head, snake_len, visual_total)
+        segments = snake_segments(pane.rect, head, snake_len, visual_total)
+        spawn_apple(state, pane, message, head, snake_len, visual_total)
     end
 
     local body_span = math.max(0, snake_len - 1) * SPACING
@@ -269,42 +261,26 @@ local function render_pane(ctx)
     end
 
     if apple_on_snake(head, state.apple_v, snake_len, visual_total, APPLE_PAD) then
-        spawn_apple(state, ctx, head, snake_len, visual_total)
+        spawn_apple(state, pane, message, head, snake_len, visual_total)
     end
 
-    render_apple(cmds, state, ctx.rect, visual_total)
+    render_apple(cmds, state, pane.rect, visual_total)
     render_snake(cmds, segments, visual_total, false)
     return cmds
 end
 
 local function render(message)
     local surfaces = {}
-    for pane_id, pane in pairs(panes) do
-        local ctx = {
-            pane_id = pane_id,
-            rect = pane.rect,
-            content_rect = pane.content_rect,
-            focused = pane.focused,
-            zoomed = pane.zoomed,
-            status = pane.status,
-            time_ms = message.time_ms,
-            frame = message.frame,
-        }
-        local commands = render_pane(ctx)
+    for _, pane in ipairs(message.panes or {}) do
+        local commands = render_pane(pane, message)
         if #commands > 0 then
-            surfaces[pane_id] = commands
+            surfaces[pane.id] = commands
         end
     end
     return { surfaces = surfaces }
 end
 
 function decorate(message)
-    if message.kind == "event" then
-        if message.event.kind == "bmux.decoration/panes-snapshot" then
-            apply_snapshot(message.event.payload or {})
-        end
-        return nil
-    end
     if message.kind == "render" then
         return render(message)
     end

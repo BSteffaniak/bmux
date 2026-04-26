@@ -36,8 +36,8 @@ use bmux_scene_protocol::scene_protocol::{
 use uuid::Uuid;
 
 use crate::scripting::{
-    PerfTracker, ScriptBackend, ScriptEventDelivery, ScriptEventMessage, ScriptMessage,
-    ScriptRenderMessage, bundled_decoration_scripts,
+    PerfTracker, ScriptBackend, ScriptEventMessage, ScriptMessage, ScriptRenderMessage,
+    bundled_decoration_scripts,
 };
 
 /// In-memory state store.
@@ -340,7 +340,6 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
             }
             state.activity_mut(*pane_id).focused = true;
             state.sync_focused_mirror(*pane_id, true);
-            queue_script_snapshot(state);
             bump_revision(state);
         }
         PaneEvent::Unfocused { pane_id } => {
@@ -348,31 +347,26 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
                 act.focused = false;
             }
             state.sync_focused_mirror(*pane_id, false);
-            queue_script_snapshot(state);
             bump_revision(state);
         }
         PaneEvent::Zoomed { pane_id } => {
             state.activity_mut(*pane_id).zoomed = true;
-            queue_script_snapshot(state);
             bump_revision(state);
         }
         PaneEvent::Unzoomed { pane_id } => {
             if let Some(act) = state.activity.get_mut(pane_id) {
                 act.zoomed = false;
-                queue_script_snapshot(state);
                 bump_revision(state);
             }
         }
         PaneEvent::Opened { pane_id, .. } => {
             state.activity_mut(*pane_id);
-            queue_script_snapshot(state);
             bump_revision(state);
         }
         PaneEvent::Closed { pane_id } => {
             state.panes.remove(pane_id);
             state.geometry.remove(pane_id);
             state.activity.remove(pane_id);
-            queue_script_snapshot(state);
             bump_revision(state);
         }
         PaneEvent::StatusChanged { pane_id, exited } => {
@@ -382,7 +376,6 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
             } else {
                 PaneLifecycle::Running
             };
-            queue_script_snapshot(state);
             bump_revision(state);
         }
     }
@@ -488,42 +481,10 @@ fn rect_json(rect: &Rect) -> serde_json::Value {
     })
 }
 
-fn queue_script_event(
-    state: &mut State,
-    kind: impl Into<String>,
-    delivery: ScriptEventDelivery,
-    payload: serde_json::Value,
-    snapshot: bool,
-) {
-    state.script_events.push_back(ScriptEventMessage {
-        kind: kind.into(),
-        delivery,
-        payload,
-        snapshot,
-    });
-}
-
-fn queue_script_snapshot(state: &mut State) {
-    let panes = state
-        .geometry
-        .keys()
-        .filter_map(|pane_id| script_pane_payload(state, *pane_id))
-        .collect::<Vec<_>>();
-    queue_script_event(
-        state,
-        "bmux.decoration/panes-snapshot",
-        ScriptEventDelivery::State,
-        serde_json::json!({
-            "revision": state.scene_revision,
-            "panes": panes,
-        }),
-        true,
-    );
-}
-
 /// Deliver pending script events, invoke one render message, and merge returned
-/// surface paint commands. Scripts maintain their own Lua-side state from the
-/// event stream, so render messages stay intentionally small.
+/// surface paint commands. Render messages carry the current panes because pane
+/// geometry/activity are render inputs; event messages remain for plugin-defined
+/// signals that scripts want to cache independently.
 fn merge_script_paint_commands(
     state: &mut State,
     surfaces: &mut BTreeMap<Uuid, SurfaceDecoration>,
@@ -562,6 +523,7 @@ fn merge_script_paint_commands(
     let render = ScriptMessage::Render(ScriptRenderMessage {
         time_ms,
         frame: state.script_frame,
+        panes: script_panes_payload(state),
     });
     let outcome = match backend.invoke(&render) {
         Ok(outcome) => outcome,
@@ -604,6 +566,16 @@ fn merge_script_paint_commands(
             "first decoration script invocation with geometry",
         );
     }
+}
+
+fn script_panes_payload(state: &State) -> serde_json::Value {
+    serde_json::Value::Array(
+        state
+            .geometry
+            .keys()
+            .filter_map(|pane_id| script_pane_payload(state, *pane_id))
+            .collect(),
+    )
 }
 
 fn record_script_perf(state: &State, duration: Duration) {
@@ -1782,7 +1754,6 @@ fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
     ));
     state.script_events.clear();
     state.script_event_subscriptions.clear();
-    queue_script_snapshot(state);
     tracing::debug!(
         script = ?script.path,
         backend = state
@@ -2081,7 +2052,6 @@ fn apply_attach_layout_snapshot(
         changed = true;
     }
     if changed {
-        queue_script_snapshot(state);
         bump_revision(state);
     }
 }
@@ -2262,7 +2232,6 @@ mod tests {
                     },
                 },
             );
-            queue_script_snapshot(&mut state);
         }
     }
 
@@ -2276,7 +2245,6 @@ mod tests {
             });
             entry.focused = focused;
             entry.zoomed = zoomed;
-            queue_script_snapshot(&mut state);
         }
     }
 
@@ -2609,7 +2577,6 @@ mod tests {
                     },
                 },
             );
-            queue_script_snapshot(&mut state);
         }
         block_on(handle.set_pane_border(pane, BorderStyle::Single)).expect("set");
         let scene = plugin.build_scene();
@@ -3128,20 +3095,13 @@ exited = ""
                 Some(ResolvedScript {
                     path: PathBuf::from("bundled:test"),
                     source: r#"
-                        local panes = {}
                         function decorate(message)
-                            if message.kind == "event" then
-                                if message.event.kind == "bmux.decoration/panes-snapshot" then
-                                    panes = {}
-                                    for _, pane in ipairs(message.event.payload.panes or {}) do
-                                        panes[pane.id] = pane
-                                    end
-                                end
+                            if message.kind ~= "render" then
                                 return nil
                             end
                             local surfaces = {}
-                            for pane_id, pane in pairs(panes) do
-                                surfaces[pane_id] = {
+                            for _, pane in ipairs(message.panes or {}) do
+                                surfaces[pane.id] = {
                                     {
                                         kind = "text",
                                         col = pane.rect.x,
@@ -3176,7 +3136,6 @@ exited = ""
                     },
                 },
             );
-            queue_script_snapshot(&mut state);
         }
         let scene = plugin.build_scene();
         let surface = scene.surfaces.get(&pane).expect("surface emitted");

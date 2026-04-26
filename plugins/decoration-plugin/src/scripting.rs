@@ -69,8 +69,8 @@ pub const WARN_COOLDOWN: Duration = Duration::from_mins(1);
 /// Message passed to a script's `decorate(message)` function.
 ///
 /// Event messages update script-owned Lua state, and render messages request
-/// paint commands derived from that cached state. This avoids serializing full
-/// snapshots or invoking Lua once per pane on every animation frame.
+/// paint commands for the current visible panes. This avoids invoking Lua once
+/// per pane while keeping render inputs explicit.
 #[derive(Debug, Clone)]
 pub enum ScriptMessage {
     Event(ScriptEventMessage),
@@ -95,6 +95,7 @@ pub enum ScriptEventDelivery {
 pub struct ScriptRenderMessage {
     pub time_ms: u64,
     pub frame: u64,
+    pub panes: JsonValue,
 }
 
 /// Errors produced by script compile / invoke paths.
@@ -492,6 +493,7 @@ mod lua_backend {
                 t.set("kind", "render")?;
                 t.set("time_ms", render.time_ms)?;
                 t.set("frame", render.frame)?;
+                t.set("panes", json_to_lua(lua, &render.panes)?)?;
             }
         }
         Ok(t)
@@ -894,30 +896,20 @@ mod tests {
         use serde_json::json;
         use std::path::Path;
 
-        fn event_message() -> ScriptMessage {
-            ScriptMessage::Event(ScriptEventMessage {
-                kind: "bmux.decoration/panes-snapshot".to_string(),
-                delivery: ScriptEventDelivery::State,
-                snapshot: true,
-                payload: json!({
-                    "panes": [
-                        {
-                            "id": "test-pane",
-                            "rect": { "x": 0, "y": 0, "w": 20, "h": 5 },
-                            "content_rect": { "x": 1, "y": 1, "w": 18, "h": 3 },
-                            "focused": true,
-                            "zoomed": false,
-                            "status": "running"
-                        }
-                    ]
-                }),
-            })
-        }
-
         fn render_message() -> ScriptMessage {
             ScriptMessage::Render(ScriptRenderMessage {
                 time_ms: 500,
                 frame: 10,
+                panes: json!([
+                    {
+                        "id": "test-pane",
+                        "rect": { "x": 0, "y": 0, "w": 20, "h": 5 },
+                        "content_rect": { "x": 1, "y": 1, "w": 18, "h": 3 },
+                        "focused": true,
+                        "zoomed": false,
+                        "status": "running"
+                    }
+                ]),
             })
         }
 
@@ -932,17 +924,11 @@ mod tests {
 
         fn compile_event_render_script(backend: &dyn super::super::ScriptBackend) {
             let source = r#"
-                local pane_id = nil
-                local rect = nil
                 local external_value = nil
 
                 function decorate(message)
                     if message.kind == "event" then
-                        if message.event.kind == "bmux.decoration/panes-snapshot" then
-                            local pane = message.event.payload.panes[1]
-                            pane_id = pane.id
-                            rect = pane.rect
-                        elseif message.event.kind == "third.party/custom-event" then
+                        if message.event.kind == "third.party/custom-event" then
                             external_value = message.event.payload.value
                         end
                         return nil
@@ -951,12 +937,13 @@ mod tests {
                     assert(message.kind == "render", "expected render message")
                     assert(message.time_ms == 500, "time_ms should be present")
                     assert(message.frame == 10, "frame should be present")
-                    assert(pane_id == "test-pane", "pane snapshot should be cached")
-                    assert(rect.w == 20, "rect.w should be 20")
+                    local pane = message.panes[1]
+                    assert(pane.id == "test-pane", "pane id should be present")
+                    assert(pane.rect.w == 20, "rect.w should be 20")
                     assert(external_value == "observed", "custom event should be cached")
                     return {
                         surfaces = {
-                            [pane_id] = {
+                            [pane.id] = {
                                 {
                                     kind = "text",
                                     col = 0,
@@ -976,7 +963,6 @@ mod tests {
         }
 
         fn deliver_test_state(backend: &dyn super::super::ScriptBackend) {
-            backend.invoke(&event_message()).expect("event invoke");
             backend
                 .invoke(&broadcast_event_message())
                 .expect("broadcast invoke");
@@ -1005,7 +991,9 @@ mod tests {
             backend
                 .compile(Path::new("<test>"), source)
                 .expect("compile");
-            let outcome = backend.invoke(&event_message()).expect("event invoke");
+            let outcome = backend
+                .invoke(&broadcast_event_message())
+                .expect("event invoke");
             assert!(outcome.surfaces.is_empty());
         }
 

@@ -1,16 +1,7 @@
 -- Pulse decoration -- breathes the focused border between two RGB endpoints.
 
-local panes = {}
-
 local function lerp(a, b, t)
     return a + (b - a) * t
-end
-
-local function apply_snapshot(payload)
-    panes = {}
-    for _, pane in ipairs(payload.panes or {}) do
-        panes[pane.id] = pane
-    end
 end
 
 local function render(message)
@@ -21,9 +12,9 @@ local function render(message)
     local g = lerp(255, 255, t)
     local b = lerp(20, 200, t)
 
-    for pane_id, pane in pairs(panes) do
+    for _, pane in ipairs(message.panes or {}) do
         if pane.focused then
-            surfaces[pane_id] = {
+            surfaces[pane.id] = {
                 {
                     kind = "box_border",
                     rect = pane.rect,
@@ -42,12 +33,6 @@ local function render(message)
 end
 
 function decorate(message)
-    if message.kind == "event" then
-        if message.event.kind == "bmux.decoration/panes-snapshot" then
-            apply_snapshot(message.event.payload or {})
-        end
-        return nil
-    end
     if message.kind == "render" then
         return render(message)
     end
