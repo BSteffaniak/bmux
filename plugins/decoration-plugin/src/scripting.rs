@@ -72,6 +72,8 @@ pub const WARN_COOLDOWN: Duration = Duration::from_mins(1);
 /// should go into Lua globals, not into the ctx object).
 #[derive(Debug, Clone)]
 pub struct DecorateContext {
+    /// Stable pane identifier for per-pane script state.
+    pub pane_id: String,
     /// The attach-global cell coordinates of this pane.
     pub rect: (u16, u16, u16, u16),
     /// The interior rect (excluding decoration cells).
@@ -461,6 +463,7 @@ mod lua_backend {
 
     fn context_to_lua_table(lua: &Lua, ctx: &DecorateContext) -> mlua::Result<Table> {
         let t = lua.create_table()?;
+        t.set("pane_id", ctx.pane_id.as_str())?;
         t.set("rect", rect_tuple_to_table(lua, ctx.rect)?)?;
         t.set("content_rect", rect_tuple_to_table(lua, ctx.content_rect)?)?;
         t.set("focused", ctx.focused)?;
@@ -831,6 +834,7 @@ mod tests {
 
         fn ctx() -> DecorateContext {
             DecorateContext {
+                pane_id: "test-pane".to_string(),
                 rect: (0, 0, 20, 5),
                 content_rect: (1, 1, 18, 3),
                 focused: true,
@@ -906,6 +910,7 @@ mod tests {
             let source = r#"
                 function decorate(ctx)
                     assert(ctx.focused == true, "focused should be true")
+                    assert(ctx.pane_id == "test-pane", "pane_id should be present")
                     assert(ctx.rect.w == 20, "rect.w should be 20")
                     return {}
                 end

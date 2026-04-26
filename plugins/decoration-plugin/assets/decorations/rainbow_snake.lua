@@ -10,12 +10,28 @@ local DEATH_HOLD_MS = 3000
 local SHRINK_BLOCKS_PER_SECOND = 24
 local FLASH_MS = 150
 
-local snake_size = INITIAL_SNAKE_SIZE
-local apple_v = nil
-local rng_state = nil
-local head_offset_v = 0
-local death_started_ms = nil
-local death_segments = nil
+local pane_states = {}
+
+local function new_pane_state()
+    return {
+        snake_size = INITIAL_SNAKE_SIZE,
+        apple_v = nil,
+        rng_state = nil,
+        head_offset_v = 0,
+        death_started_ms = nil,
+        death_segments = nil,
+        active_ms = 0,
+        last_focus_ms = nil,
+    }
+end
+
+local function pane_state(ctx)
+    local key = ctx.pane_id or "default"
+    if pane_states[key] == nil then
+        pane_states[key] = new_pane_state()
+    end
+    return pane_states[key]
+end
 
 local function border_metrics(rect)
     local w = rect.w
@@ -51,22 +67,22 @@ local function perimeter_cell(rect, visual_offset, visual_total)
     return rect.x, rect.y + h - 1 - math.floor(p / VERTICAL_ASPECT)
 end
 
-local function seed_rng(ctx)
-    if rng_state ~= nil then
+local function seed_rng(state, ctx)
+    if state.rng_state ~= nil then
         return
     end
     local rect = ctx.rect
-    rng_state = (ctx.frame * 97 + ctx.time_ms + rect.w * 131 + rect.h * 197) % 233280
+    state.rng_state = (ctx.frame * 97 + ctx.time_ms + rect.w * 131 + rect.h * 197) % 233280
 end
 
-local function rand(ctx, max_value)
-    seed_rng(ctx)
-    rng_state = (rng_state * 9301 + 49297) % 233280
-    return math.floor((rng_state / 233280) * max_value)
+local function rand(state, ctx, max_value)
+    seed_rng(state, ctx)
+    state.rng_state = (state.rng_state * 9301 + 49297) % 233280
+    return math.floor((state.rng_state / 233280) * max_value)
 end
 
-local function unit_rand(ctx)
-    return rand(ctx, 1000000) / 1000000.0
+local function unit_rand(state, ctx)
+    return rand(state, ctx, 1000000) / 1000000.0
 end
 
 local function circular_distance(a, b, total)
@@ -83,27 +99,27 @@ local function apple_on_snake(head, apple, snake_len, visual_total, pad)
     return behind_head <= body_span + (pad or APPLE_PAD)
 end
 
-local function spawn_apple(ctx, head, snake_len, visual_total)
+local function spawn_apple(state, ctx, head, snake_len, visual_total)
     for _ = 1, 32 do
-        local candidate = unit_rand(ctx) * visual_total
+        local candidate = unit_rand(state, ctx) * visual_total
         if not apple_on_snake(head, candidate, snake_len, visual_total, APPLE_PAD) then
-            apple_v = candidate
+            state.apple_v = candidate
             return
         end
     end
 
     local step = math.max(0.5, SPACING / 2)
     local scan_count = math.floor(visual_total / step)
-    local start = unit_rand(ctx) * visual_total
+    local start = unit_rand(state, ctx) * visual_total
     for i = 0, scan_count do
         local candidate = (start + i * step) % visual_total
         if not apple_on_snake(head, candidate, snake_len, visual_total, APPLE_PAD) then
-            apple_v = candidate
+            state.apple_v = candidate
             return
         end
     end
 
-    apple_v = nil
+    state.apple_v = nil
 end
 
 local function put(cmds, col, row, z, text, r, g, b)
@@ -142,55 +158,55 @@ local function render_snake(cmds, segments, visual_total, red)
     end
 end
 
-local function render_apple(cmds, rect, visual_total)
-    if apple_v == nil then
+local function render_apple(cmds, state, rect, visual_total)
+    if state.apple_v == nil then
         return
     end
-    local col, row = perimeter_cell(rect, apple_v, visual_total)
+    local col, row = perimeter_cell(rect, state.apple_v, visual_total)
     put(cmds, col, row, 19, "●", 255, 95, 95)
 end
 
-local function reset_game(raw_total)
-    snake_size = math.min(INITIAL_SNAKE_SIZE, raw_total)
-    apple_v = nil
-    death_started_ms = nil
-    death_segments = nil
+local function reset_game(state, raw_total)
+    state.snake_size = math.min(INITIAL_SNAKE_SIZE, raw_total)
+    state.apple_v = nil
+    state.death_started_ms = nil
+    state.death_segments = nil
 end
 
-local function render_death(cmds, ctx, raw_total, visual_total)
-    if death_started_ms == nil or death_segments == nil then
+local function render_death(cmds, state, raw_total, visual_total)
+    if state.death_started_ms == nil or state.death_segments == nil then
         return false
     end
 
-    local elapsed = ctx.time_ms - death_started_ms
-    local min_count = math.min(INITIAL_SNAKE_SIZE, #death_segments)
+    local elapsed = state.active_ms - state.death_started_ms
+    local min_count = math.min(INITIAL_SNAKE_SIZE, #state.death_segments)
     if elapsed > DEATH_HOLD_MS then
         local shrink_elapsed = (elapsed - DEATH_HOLD_MS) / 1000.0
         local removed = math.floor(shrink_elapsed * SHRINK_BLOCKS_PER_SECOND)
-        if #death_segments - removed <= min_count then
-            local resume_index = math.max(1, #death_segments - min_count + 1)
-            local resume_head_v = death_segments[resume_index].offset
-            head_offset_v = (resume_head_v - (ctx.time_ms / 1000.0) * SPEED) % visual_total
-            reset_game(raw_total)
+        if #state.death_segments - removed <= min_count then
+            local resume_index = math.max(1, #state.death_segments - min_count + 1)
+            local resume_head_v = state.death_segments[resume_index].offset
+            state.head_offset_v = (resume_head_v - (state.active_ms / 1000.0) * SPEED) % visual_total
+            reset_game(state, raw_total)
             return false
         end
     end
 
     if math.floor(elapsed / FLASH_MS) % 2 == 0 then
-        local visible_count = #death_segments
+        local visible_count = #state.death_segments
         if elapsed > DEATH_HOLD_MS then
             local shrink_elapsed = (elapsed - DEATH_HOLD_MS) / 1000.0
             local removed = math.floor(shrink_elapsed * SHRINK_BLOCKS_PER_SECOND)
-            visible_count = math.max(min_count, #death_segments - removed)
+            visible_count = math.max(min_count, #state.death_segments - removed)
         end
 
         local visible_segments = {}
         local start_index = 1
         if elapsed > DEATH_HOLD_MS then
-            start_index = #death_segments - visible_count + 1
+            start_index = #state.death_segments - visible_count + 1
         end
-        for i = start_index, #death_segments do
-            table.insert(visible_segments, death_segments[i])
+        for i = start_index, #state.death_segments do
+            table.insert(visible_segments, state.death_segments[i])
         end
         render_snake(cmds, visible_segments, 1, true)
     end
@@ -198,9 +214,16 @@ local function render_death(cmds, ctx, raw_total, visual_total)
 end
 
 function decorate(ctx)
+    local state = pane_state(ctx)
     if not ctx.focused then
+        state.last_focus_ms = nil
         return {}
     end
+
+    if state.last_focus_ms ~= nil then
+        state.active_ms = state.active_ms + math.max(0, ctx.time_ms - state.last_focus_ms)
+    end
+    state.last_focus_ms = ctx.time_ms
 
     local raw_total, visual_total = border_metrics(ctx.rect)
     if raw_total <= 0 or visual_total <= 0 then
@@ -208,40 +231,40 @@ function decorate(ctx)
     end
 
     local cmds = {}
-    if render_death(cmds, ctx, raw_total, visual_total) then
+    if render_death(cmds, state, raw_total, visual_total) then
         return cmds
     end
 
-    local head = (head_offset_v + (ctx.time_ms / 1000.0) * SPEED) % visual_total
-    local snake_len = math.min(snake_size, raw_total)
+    local head = (state.head_offset_v + (state.active_ms / 1000.0) * SPEED) % visual_total
+    local snake_len = math.min(state.snake_size, raw_total)
     local segments = snake_segments(ctx.rect, head, snake_len, visual_total)
 
-    if apple_v == nil or apple_on_snake(head, apple_v, snake_len, visual_total, APPLE_PAD) then
-        spawn_apple(ctx, head, snake_len, visual_total)
+    if state.apple_v == nil or apple_on_snake(head, state.apple_v, snake_len, visual_total, APPLE_PAD) then
+        spawn_apple(state, ctx, head, snake_len, visual_total)
     end
 
-    if apple_v ~= nil and circular_distance(head, apple_v, visual_total) <= EAT_RADIUS then
-        snake_size = math.min(snake_size + 1, raw_total)
-        snake_len = math.min(snake_size, raw_total)
+    if state.apple_v ~= nil and circular_distance(head, state.apple_v, visual_total) <= EAT_RADIUS then
+        state.snake_size = math.min(state.snake_size + 1, raw_total)
+        snake_len = math.min(state.snake_size, raw_total)
         segments = snake_segments(ctx.rect, head, snake_len, visual_total)
-        spawn_apple(ctx, head, snake_len, visual_total)
+        spawn_apple(state, ctx, head, snake_len, visual_total)
     end
 
     local body_span = math.max(0, snake_len - 1) * SPACING
     local tail_gap = visual_total - body_span
     if tail_gap <= SPACING then
-        death_started_ms = ctx.time_ms
-        death_segments = segments
-        apple_v = nil
-        render_death(cmds, ctx, raw_total, visual_total)
+        state.death_started_ms = state.active_ms
+        state.death_segments = segments
+        state.apple_v = nil
+        render_death(cmds, state, raw_total, visual_total)
         return cmds
     end
 
-    if apple_on_snake(head, apple_v, snake_len, visual_total, APPLE_PAD) then
-        spawn_apple(ctx, head, snake_len, visual_total)
+    if apple_on_snake(head, state.apple_v, snake_len, visual_total, APPLE_PAD) then
+        spawn_apple(state, ctx, head, snake_len, visual_total)
     end
 
-    render_apple(cmds, ctx.rect, visual_total)
+    render_apple(cmds, state, ctx.rect, visual_total)
     render_snake(cmds, segments, visual_total, false)
     return cmds
 end

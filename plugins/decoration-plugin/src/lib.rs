@@ -458,6 +458,7 @@ fn decorate_context_for(state: &State, pane_id: Uuid) -> Option<DecorateContext>
     let started_at = state.script_started_at?;
     let time_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     Some(DecorateContext {
+        pane_id: pane_id.to_string(),
         rect: (geom.rect.x, geom.rect.y, geom.rect.w, geom.rect.h),
         content_rect: (
             geom.content_rect.x,
