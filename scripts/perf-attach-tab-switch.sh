@@ -18,6 +18,9 @@ BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
 SERVICE_TIMING=0
 IPC_TIMING=0
 STORAGE_TIMING=0
+PROFILE="${PROFILE:-normal}"
+ATTACH_LIMIT_SET=0
+RETARGET_LIMIT_SET=0
 
 usage() {
 	cat <<'USAGE'
@@ -41,6 +44,7 @@ Options:
   --service-timing                Include generic InvokeService client timing
   --ipc-timing                    Include generic IPC request timing
   --storage-timing                Include generic plugin storage/volatile-state timing
+  --profile NAME                  normal|diagnostic|ci|stress (default: normal)
   --max-p99-ms N                  Fail if whole playbook p99 exceeds N ms
   --max-attach-command-p99-ms N   Fail if attach.plugin_command total p99 exceeds N ms (default: 8)
   --max-retarget-p99-ms N         Fail if attach.retarget_context total p99 exceeds N ms (default: 8)
@@ -99,16 +103,22 @@ while (($# > 0)); do
 		STORAGE_TIMING=1
 		shift
 		;;
+	--profile)
+		PROFILE="$2"
+		shift 2
+		;;
 	--max-p99-ms)
 		MAX_P99_MS="$2"
 		shift 2
 		;;
 	--max-attach-command-p99-ms)
 		MAX_ATTACH_COMMAND_P99_MS="$2"
+		ATTACH_LIMIT_SET=1
 		shift 2
 		;;
 	--max-retarget-p99-ms)
 		MAX_RETARGET_P99_MS="$2"
+		RETARGET_LIMIT_SET=1
 		shift 2
 		;;
 	-h | --help)
@@ -122,6 +132,35 @@ while (($# > 0)); do
 		;;
 	esac
 done
+
+case "$PROFILE" in
+normal | ci)
+	;;
+diagnostic)
+	SERVICE_TIMING=1
+	IPC_TIMING=1
+	STORAGE_TIMING=1
+	if [[ "$ATTACH_LIMIT_SET" -eq 0 ]]; then
+		MAX_ATTACH_COMMAND_P99_MS=1000000
+	fi
+	if [[ "$RETARGET_LIMIT_SET" -eq 0 ]]; then
+		MAX_RETARGET_P99_MS=1000000
+	fi
+	;;
+stress)
+	if [[ "$ATTACH_LIMIT_SET" -eq 0 ]]; then
+		MAX_ATTACH_COMMAND_P99_MS=1000000
+	fi
+	if [[ "$RETARGET_LIMIT_SET" -eq 0 ]]; then
+		MAX_RETARGET_P99_MS=1000000
+	fi
+	;;
+*)
+	echo "unknown --profile: $PROFILE" >&2
+	usage
+	exit 2
+	;;
+esac
 
 require_number "$ITERATIONS" "--iterations"
 require_number "$WARMUP" "--warmup"
@@ -250,7 +289,7 @@ if [[ "$STORAGE_TIMING" -eq 1 ]]; then
 fi
 
 echo "benchmarking attach tab-switch playbook"
-echo "iterations=${ITERATIONS} warmup=${WARMUP} windows=${WINDOWS} switches=${SWITCHES} scenario=${SCENARIO}"
+echo "iterations=${ITERATIONS} warmup=${WARMUP} windows=${WINDOWS} switches=${SWITCHES} scenario=${SCENARIO} profile=${PROFILE}"
 
 for ((i = 0; i < WARMUP; i += 1)); do
 	"$BMUX_BIN" playbook run "$PLAYBOOK" --json >/dev/null 2>&1

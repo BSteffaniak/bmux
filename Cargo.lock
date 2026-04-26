@@ -1574,6 +1574,7 @@ dependencies = [
 name = "bmux_perf_telemetry"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "serde",
  "serde_json",
 ]
 

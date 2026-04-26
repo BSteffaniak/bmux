@@ -8,6 +8,10 @@ WARMUP="${WARMUP:-100}"
 ARTIFACT_JSON="${ARTIFACT_JSON:-}"
 BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
 MAX_P99_US="${MAX_P99_US:-}"
+CONFIG_PATH="${CONFIG_PATH:-$ROOT_DIR/perf/core-services.toml}"
+PHASE_REPORT_DIR="${PHASE_REPORT_DIR:-}"
+PROFILE="${PROFILE:-normal}"
+MAX_P99_SET=0
 
 usage() {
 	cat <<'USAGE'
@@ -22,6 +26,9 @@ Options:
   --warmup N              Warmup iterations (default: 100)
   --artifact-json PATH    Write machine-readable JSON artifact
   --max-p99-us N          Fail if any scenario p99 exceeds N us
+  --config PATH           Phase validation config (default: perf/core-services.toml)
+  --phase-report-dir PATH Write per-report phase artifacts to PATH
+  --profile NAME          normal|diagnostic|ci|stress (default: normal)
   -h, --help              Show this help message
 USAGE
 }
@@ -51,6 +58,19 @@ while (($# > 0)); do
 		;;
 	--max-p99-us)
 		MAX_P99_US="$2"
+		MAX_P99_SET=1
+		shift 2
+		;;
+	--config)
+		CONFIG_PATH="$2"
+		shift 2
+		;;
+	--phase-report-dir)
+		PHASE_REPORT_DIR="$2"
+		shift 2
+		;;
+	--profile)
+		PROFILE="$2"
 		shift 2
 		;;
 	-h | --help)
@@ -64,6 +84,21 @@ while (($# > 0)); do
 		;;
 	esac
 done
+
+case "$PROFILE" in
+normal | ci)
+	;;
+diagnostic | stress)
+	if [[ "$MAX_P99_SET" -eq 0 ]]; then
+		MAX_P99_US=1000000000
+	fi
+	;;
+*)
+	echo "unknown --profile: $PROFILE" >&2
+	usage
+	exit 2
+	;;
+esac
 
 require_number "$ITERATIONS" "--iterations"
 require_number "$WARMUP" "--warmup"
@@ -85,6 +120,9 @@ fi
 if [[ -z "$ARTIFACT_JSON" ]]; then
 	ARTIFACT_JSON="$(mktemp "${TMPDIR:-/tmp}/bmux-core-services.XXXXXX.json")"
 fi
+if [[ -z "$PHASE_REPORT_DIR" ]]; then
+	PHASE_REPORT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bmux-core-services-phases.XXXXXX")"
+fi
 
 cmd=(
 	"$BMUX_PERF_TOOLS_BIN" sample-core-services
@@ -92,9 +130,19 @@ cmd=(
 	--warmup "$WARMUP"
 	--out-json "$ARTIFACT_JSON"
 )
-if [[ -n "$MAX_P99_US" ]]; then
-	cmd+=(--max-p99-us "$MAX_P99_US")
-fi
 
 "${cmd[@]}"
+
+validate_cmd=(
+	"$BMUX_PERF_TOOLS_BIN" validate-phase-config
+	--input "$ARTIFACT_JSON"
+	--config "$CONFIG_PATH"
+	--output-dir "$PHASE_REPORT_DIR"
+)
+if [[ -n "$MAX_P99_US" ]]; then
+	MAX_P99_MS="$((MAX_P99_US / 1000)).$(printf '%03d' "$((MAX_P99_US % 1000))")"
+	validate_cmd+=(--limit "core_service=$MAX_P99_MS")
+fi
+"${validate_cmd[@]}"
 echo "artifact_json=$ARTIFACT_JSON"
+echo "phase_report_dir=$PHASE_REPORT_DIR"

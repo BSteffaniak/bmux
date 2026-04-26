@@ -1,0 +1,44 @@
+[limit]
+core_service = 1
+
+[[reports]]
+phase = "core_service"
+field = "total_us"
+limit = "core_service"
+filter = { key = "scenario", value = "storage.cold_get" }
+
+[[reports]]
+phase = "core_service"
+field = "total_us"
+limit = "core_service"
+filter = { key = "scenario", value = "storage.cached_get" }
+
+[[reports]]
+phase = "core_service"
+field = "total_us"
+limit = "core_service"
+filter = { key = "scenario", value = "storage.set" }
+
+[[reports]]
+phase = "core_service"
+field = "total_us"
+limit = "core_service"
+filter = { key = "scenario", value = "volatile.get" }
+
+[[reports]]
+phase = "core_service"
+field = "total_us"
+limit = "core_service"
+filter = { key = "scenario", value = "volatile.set" }
+
+[[reports]]
+phase = "core_service"
+field = "total_us"
+limit = "core_service"
+filter = { key = "scenario", value = "volatile.clear" }
+
+[[reports]]
+phase = "core_service"
+field = "total_us"
+limit = "core_service"
+filter = { key = "scenario", value = "static_service.direct" }

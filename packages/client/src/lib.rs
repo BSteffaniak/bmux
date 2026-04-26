@@ -18,7 +18,7 @@ use bmux_ipc::{
     ResponsePayload, ServerSnapshotStatus, SessionSelector, decode, default_supported_capabilities,
     encode,
 };
-use bmux_perf_telemetry::{PhaseChannel, PhaseTimer, emit as emit_phase_timing};
+use bmux_perf_telemetry::{PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing};
 use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -513,16 +513,15 @@ impl BmuxClient {
             ResponsePayload::ServiceInvoked { payload } => {
                 emit_phase_timing(
                     PhaseChannel::Service,
-                    &serde_json::json!({
-                        "phase": "service.client_invoke",
-                        "capability": capability,
-                        "kind": format!("{kind:?}"),
-                        "interface_id": interface_id,
-                        "operation": operation,
-                        "payload_len": payload_len,
-                        "response_len": payload.len(),
-                        "total_us": total_timer.elapsed_us(),
-                    }),
+                    &service_client_invoke_phase_payload(
+                        &capability,
+                        kind,
+                        &interface_id,
+                        &operation,
+                        payload_len,
+                        payload.len(),
+                        total_timer.elapsed_us(),
+                    ),
                 );
                 Ok(payload)
             }
@@ -2258,16 +2257,15 @@ impl StreamingBmuxClient {
             ResponsePayload::ServiceInvoked { payload } => {
                 emit_phase_timing(
                     PhaseChannel::Service,
-                    &serde_json::json!({
-                        "phase": "service.client_invoke",
-                        "capability": capability,
-                        "kind": format!("{kind:?}"),
-                        "interface_id": interface_id,
-                        "operation": operation,
-                        "payload_len": payload_len,
-                        "response_len": payload.len(),
-                        "total_us": total_timer.elapsed_us(),
-                    }),
+                    &service_client_invoke_phase_payload(
+                        &capability,
+                        kind,
+                        &interface_id,
+                        &operation,
+                        payload_len,
+                        payload.len(),
+                        total_timer.elapsed_us(),
+                    ),
                 );
                 Ok(payload)
             }
@@ -2446,26 +2444,38 @@ fn emit_ipc_request_timing(
     );
 }
 
+fn service_client_invoke_phase_payload(
+    capability: &str,
+    kind: InvokeServiceKind,
+    interface_id: &str,
+    operation: &str,
+    payload_len: usize,
+    response_len: usize,
+    total_us: u128,
+) -> serde_json::Value {
+    PhasePayload::new("service.client_invoke")
+        .service_fields(capability, format!("{kind:?}"), interface_id, operation)
+        .field("payload_len", payload_len)
+        .field("response_len", response_len)
+        .field("total_us", total_us)
+        .finish()
+}
+
 fn ipc_client_request_phase_payload(
     request: &Request,
     request_id: u64,
     response: &'static str,
     timing: IpcClientTiming,
 ) -> serde_json::Value {
-    let mut payload = serde_json::Map::from_iter([
-        ("phase".to_string(), serde_json::json!("ipc.client_request")),
-        (
-            "request".to_string(),
-            serde_json::json!(request_kind_name(request)),
-        ),
-        ("request_id".to_string(), serde_json::json!(request_id)),
-        ("response".to_string(), serde_json::json!(response)),
-        ("encode_us".to_string(), serde_json::json!(timing.encode)),
-        ("send_us".to_string(), serde_json::json!(timing.send)),
-        ("recv_us".to_string(), serde_json::json!(timing.recv)),
-        ("decode_us".to_string(), serde_json::json!(timing.decode)),
-        ("total_us".to_string(), serde_json::json!(timing.total)),
-    ]);
+    let mut payload = PhasePayload::new("ipc.client_request")
+        .field("request", request_kind_name(request))
+        .field("request_id", request_id)
+        .field("response", response)
+        .field("encode_us", timing.encode)
+        .field("send_us", timing.send)
+        .field("recv_us", timing.recv)
+        .field("decode_us", timing.decode)
+        .field("total_us", timing.total);
     if let Request::InvokeService {
         capability,
         kind,
@@ -2474,16 +2484,11 @@ fn ipc_client_request_phase_payload(
         payload: service_payload,
     } = request
     {
-        payload.insert("capability".to_string(), serde_json::json!(capability));
-        payload.insert("kind".to_string(), serde_json::json!(format!("{kind:?}")));
-        payload.insert("interface_id".to_string(), serde_json::json!(interface_id));
-        payload.insert("operation".to_string(), serde_json::json!(operation));
-        payload.insert(
-            "service_payload_len".to_string(),
-            serde_json::json!(service_payload.len()),
-        );
+        payload = payload
+            .service_fields(capability, format!("{kind:?}"), interface_id, operation)
+            .field("service_payload_len", service_payload.len());
     }
-    serde_json::Value::Object(payload)
+    payload.finish()
 }
 
 const fn response_kind_name(response: &Response) -> &'static str {

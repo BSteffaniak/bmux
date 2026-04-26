@@ -26,7 +26,7 @@ use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
     PaneLayoutNode, PaneResurrectionSnapshot, PaneRuntimeMeta, SessionRuntimeError,
 };
-use bmux_perf_telemetry::{PhaseChannel, emit as emit_phase_timing};
+use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::{SessionManagerHandle, SessionManagerSnapshot};
@@ -5814,18 +5814,14 @@ async fn handle_request(
             }
             emit_phase_timing(
                 PhaseChannel::Service,
-                &serde_json::json!({
-                    "phase": "service.server_invoke",
-                    "capability": capability,
-                    "kind": format!("{kind:?}"),
-                    "interface_id": interface_id,
-                    "operation": operation,
-                    "client_id": client_id,
-                    "registry_us": registry_us,
-                    "resolver_us": resolver_us,
-                    "invocation_us": invocation_us,
-                    "total_us": elapsed.as_micros(),
-                }),
+                &PhasePayload::new("service.server_invoke")
+                    .service_fields(capability, format!("{kind:?}"), interface_id, operation)
+                    .field("client_id", client_id)
+                    .field("registry_us", registry_us)
+                    .field("resolver_us", resolver_us)
+                    .field("invocation_us", invocation_us)
+                    .field("total_us", elapsed.as_micros())
+                    .finish(),
             );
             response
         }
@@ -5927,7 +5923,6 @@ const fn response_kind_name(response: &Response) -> &'static str {
 }
 
 fn ipc_service_request_metadata(request: &Request) -> serde_json::Map<String, serde_json::Value> {
-    let mut metadata = serde_json::Map::new();
     if let Request::InvokeService {
         capability,
         kind,
@@ -5936,16 +5931,15 @@ fn ipc_service_request_metadata(request: &Request) -> serde_json::Map<String, se
         payload,
     } = request
     {
-        metadata.insert("capability".to_string(), serde_json::json!(capability));
-        metadata.insert("kind".to_string(), serde_json::json!(format!("{kind:?}")));
-        metadata.insert("interface_id".to_string(), serde_json::json!(interface_id));
-        metadata.insert("operation".to_string(), serde_json::json!(operation));
-        metadata.insert(
-            "service_payload_len".to_string(),
-            serde_json::json!(payload.len()),
-        );
+        return PhasePayload::new("unused")
+            .service_fields(capability, format!("{kind:?}"), interface_id, operation)
+            .field("service_payload_len", payload.len())
+            .into_fields()
+            .into_iter()
+            .filter(|(key, _)| key.as_str() != "phase")
+            .collect();
     }
-    metadata
+    serde_json::Map::new()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5962,39 +5956,19 @@ fn server_ipc_request_phase_payload(
     response_send_us: u128,
     total_us: u128,
 ) -> serde_json::Value {
-    let mut payload = serde_json::Map::from_iter([
-        ("phase".to_string(), serde_json::json!("ipc.server_request")),
-        ("request".to_string(), serde_json::json!(request_kind)),
-        ("request_id".to_string(), serde_json::json!(request_id)),
-        (
-            "response".to_string(),
-            serde_json::json!(response_kind_name(response)),
-        ),
-        (
-            "request_record_encode_us".to_string(),
-            serde_json::json!(request_record_encode_us),
-        ),
-        (
-            "request_record_us".to_string(),
-            serde_json::json!(request_record_us),
-        ),
-        ("handle_us".to_string(), serde_json::json!(handle_us)),
-        (
-            "response_record_encode_us".to_string(),
-            serde_json::json!(response_record_encode_us),
-        ),
-        (
-            "response_record_us".to_string(),
-            serde_json::json!(response_record_us),
-        ),
-        (
-            "response_send_us".to_string(),
-            serde_json::json!(response_send_us),
-        ),
-        ("total_us".to_string(), serde_json::json!(total_us)),
-    ]);
-    payload.extend(service_metadata);
-    serde_json::Value::Object(payload)
+    PhasePayload::new("ipc.server_request")
+        .field("request", request_kind)
+        .field("request_id", request_id)
+        .field("response", response_kind_name(response))
+        .field("request_record_encode_us", request_record_encode_us)
+        .field("request_record_us", request_record_us)
+        .field("handle_us", handle_us)
+        .field("response_record_encode_us", response_record_encode_us)
+        .field("response_record_us", response_record_us)
+        .field("response_send_us", response_send_us)
+        .field("total_us", total_us)
+        .extend(service_metadata)
+        .finish()
 }
 
 fn all_recording_event_kinds() -> Vec<RecordingEventKind> {

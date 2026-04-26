@@ -9,7 +9,7 @@ use bmux_ipc::{
     InvokeServiceKind, Request as IpcRequest, Response as IpcResponse,
     ResponsePayload as IpcResponsePayload,
 };
-use bmux_perf_telemetry::{PhaseChannel, emit as emit_phase_timing};
+use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use bmux_plugin_sdk::{
     CORE_CLI_BRIDGE_PROTOCOL_V1, CORE_CLI_COMMAND_INTERFACE_V1,
     CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
@@ -1152,19 +1152,18 @@ fn handle_core_service_call(
             let encode_us = encode_started.elapsed().as_micros();
             emit_phase_timing(
                 PhaseChannel::Storage,
-                &serde_json::json!({
-                    "phase": "storage.get",
-                    "plugin_id": caller_plugin_id,
-                    "key": request.key,
-                    "cache_hit": cache_hit,
-                    "value_len": value.as_ref().map_or(0, Vec::len),
-                    "decode_us": decode_us,
-                    "validate_us": validate_us,
-                    "cache_us": cache_us,
-                    "fs_us": fs_us,
-                    "encode_us": encode_us,
-                    "total_us": total_started.elapsed().as_micros(),
-                }),
+                &PhasePayload::new("storage.get")
+                    .field("plugin_id", caller_plugin_id)
+                    .field("key", request.key.as_str())
+                    .field("cache_hit", cache_hit)
+                    .field("value_len", value.as_ref().map_or(0, Vec::len))
+                    .field("decode_us", decode_us)
+                    .field("validate_us", validate_us)
+                    .field("cache_us", cache_us)
+                    .field("fs_us", fs_us)
+                    .field("encode_us", encode_us)
+                    .field("total_us", total_started.elapsed().as_micros())
+                    .finish(),
             );
             response
         }
@@ -1200,18 +1199,17 @@ fn handle_core_service_call(
             let encode_us = encode_started.elapsed().as_micros();
             emit_phase_timing(
                 PhaseChannel::Storage,
-                &serde_json::json!({
-                    "phase": "storage.set",
-                    "plugin_id": caller_plugin_id,
-                    "key": request.key,
-                    "value_len": request.value.len(),
-                    "decode_us": decode_us,
-                    "validate_us": validate_us,
-                    "fs_us": fs_us,
-                    "cache_us": cache_us,
-                    "encode_us": encode_us,
-                    "total_us": total_started.elapsed().as_micros(),
-                }),
+                &PhasePayload::new("storage.set")
+                    .field("plugin_id", caller_plugin_id)
+                    .field("key", request.key.as_str())
+                    .field("value_len", request.value.len())
+                    .field("decode_us", decode_us)
+                    .field("validate_us", validate_us)
+                    .field("fs_us", fs_us)
+                    .field("cache_us", cache_us)
+                    .field("encode_us", encode_us)
+                    .field("total_us", total_started.elapsed().as_micros())
+                    .finish(),
             );
             response
         }
@@ -1235,14 +1233,13 @@ fn handle_core_service_call(
             });
             emit_phase_timing(
                 PhaseChannel::Storage,
-                &serde_json::json!({
-                    "phase": "volatile_state.get",
-                    "plugin_id": caller_plugin_id,
-                    "key": request.key,
-                    "value_len": value.as_ref().map_or(0, Vec::len),
-                    "map_us": map_us,
-                    "total_us": total_started.elapsed().as_micros(),
-                }),
+                &PhasePayload::new("volatile_state.get")
+                    .field("plugin_id", caller_plugin_id)
+                    .field("key", request.key.as_str())
+                    .field("value_len", value.as_ref().map_or(0, Vec::len))
+                    .field("map_us", map_us)
+                    .field("total_us", total_started.elapsed().as_micros())
+                    .finish(),
             );
             response
         }
@@ -1262,14 +1259,13 @@ fn handle_core_service_call(
             let response = encode_service_message(&());
             emit_phase_timing(
                 PhaseChannel::Storage,
-                &serde_json::json!({
-                    "phase": "volatile_state.set",
-                    "plugin_id": caller_plugin_id,
-                    "key": request.key,
-                    "value_len": request.value.len(),
-                    "map_us": map_us,
-                    "total_us": total_started.elapsed().as_micros(),
-                }),
+                &PhasePayload::new("volatile_state.set")
+                    .field("plugin_id", caller_plugin_id)
+                    .field("key", request.key.as_str())
+                    .field("value_len", request.value.len())
+                    .field("map_us", map_us)
+                    .field("total_us", total_started.elapsed().as_micros())
+                    .finish(),
             );
             response
         }
@@ -1290,13 +1286,12 @@ fn handle_core_service_call(
             let response = encode_service_message(&());
             emit_phase_timing(
                 PhaseChannel::Storage,
-                &serde_json::json!({
-                    "phase": "volatile_state.clear",
-                    "plugin_id": caller_plugin_id,
-                    "key": request.key,
-                    "map_us": map_us,
-                    "total_us": total_started.elapsed().as_micros(),
-                }),
+                &PhasePayload::new("volatile_state.clear")
+                    .field("plugin_id", caller_plugin_id)
+                    .field("key", request.key.as_str())
+                    .field("map_us", map_us)
+                    .field("total_us", total_started.elapsed().as_micros())
+                    .finish(),
             );
             response
         }
@@ -2034,22 +2029,23 @@ impl LoadedPlugin {
         let decode_us = decode_started.elapsed().as_micros();
         emit_phase_timing(
             PhaseChannel::Service,
-            &serde_json::json!({
-                "phase": "plugin.native_service_invoke",
-                "plugin_id": self.declaration.id.as_str(),
-                "backend": backend,
-                "capability": context.request.service.capability.as_str(),
-                "kind": format!("{:?}", context.request.service.kind),
-                "interface_id": context.request.service.interface_id,
-                "operation": context.request.operation,
-                "request_payload_len": context.request.payload.len(),
-                "encoded_request_len": payload.len(),
-                "encoded_response_len": output_len,
-                "encode_us": encode_us,
-                "call_us": call_us,
-                "decode_us": decode_us,
-                "total_us": total_started.elapsed().as_micros(),
-            }),
+            &PhasePayload::new("plugin.native_service_invoke")
+                .field("plugin_id", self.declaration.id.as_str())
+                .field("backend", backend)
+                .service_fields(
+                    context.request.service.capability.as_str(),
+                    format!("{:?}", context.request.service.kind),
+                    context.request.service.interface_id.as_str(),
+                    context.request.operation.as_str(),
+                )
+                .field("request_payload_len", context.request.payload.len())
+                .field("encoded_request_len", payload.len())
+                .field("encoded_response_len", output_len)
+                .field("encode_us", encode_us)
+                .field("call_us", call_us)
+                .field("decode_us", decode_us)
+                .field("total_us", total_started.elapsed().as_micros())
+                .finish(),
         );
         Ok(response)
     }

@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhaseChannel {
@@ -44,6 +45,60 @@ pub fn emit(channel: PhaseChannel, payload: &Value) {
     if channel.enabled() {
         eprintln!("{}{payload}", channel.marker());
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct PhasePayload {
+    fields: Map<String, Value>,
+}
+
+impl PhasePayload {
+    #[must_use]
+    pub fn new(phase: impl Into<String>) -> Self {
+        let mut fields = Map::new();
+        fields.insert("phase".to_string(), Value::String(phase.into()));
+        Self { fields }
+    }
+
+    #[must_use]
+    pub fn field(mut self, key: impl Into<String>, value: impl Serialize) -> Self {
+        self.fields.insert(key.into(), to_value(value));
+        self
+    }
+
+    #[must_use]
+    pub fn service_fields(
+        self,
+        capability: impl Serialize,
+        kind: impl Serialize,
+        interface_id: impl Serialize,
+        operation: impl Serialize,
+    ) -> Self {
+        self.field("capability", capability)
+            .field("kind", kind)
+            .field("interface_id", interface_id)
+            .field("operation", operation)
+    }
+
+    #[must_use]
+    pub fn extend(mut self, fields: Map<String, Value>) -> Self {
+        self.fields.extend(fields);
+        self
+    }
+
+    #[must_use]
+    pub fn finish(self) -> Value {
+        Value::Object(self.fields)
+    }
+
+    #[must_use]
+    pub fn into_fields(self) -> Map<String, Value> {
+        self.fields
+    }
+}
+
+fn to_value(value: impl Serialize) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
 }
 
 #[derive(Debug, Clone)]

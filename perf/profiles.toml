@@ -1,0 +1,19 @@
+[[profiles]]
+name = "normal"
+description = "User-facing latency validation with low-overhead phase collection only."
+enforce_slo = true
+
+[[profiles]]
+name = "diagnostic"
+description = "Attribution mode with service, IPC, and storage timing enabled; timings may be perturbed."
+enforce_slo = false
+
+[[profiles]]
+name = "ci"
+description = "Stable validation profile for automated checks; use conservative SLOs and deterministic scenarios."
+enforce_slo = true
+
+[[profiles]]
+name = "stress"
+description = "High-iteration or high-scale exploration; artifacts are for trend analysis, not hard gating."
+enforce_slo = false

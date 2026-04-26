@@ -636,6 +636,10 @@ fn run_sample_core_services(args: Vec<String>) -> Result<(), String> {
             core_service_scenario_json("volatile.clear", volatile_clear, max_p99_us),
             core_service_scenario_json("static_service.direct", static_service_samples, max_p99_us),
         ];
+        let events = scenarios
+            .iter()
+            .flat_map(core_service_phase_events)
+            .collect::<Vec<_>>();
         let violations = scenarios
             .iter()
             .filter_map(|scenario| scenario.get("violation").and_then(Value::as_str))
@@ -664,6 +668,7 @@ fn run_sample_core_services(args: Vec<String>) -> Result<(), String> {
             "iterations": iterations,
             "warmup": warmup,
             "scenarios": scenarios,
+            "events": events,
             "limits": { "max_p99_us": max_p99_us },
             "passed": passed,
             "violations": violations,
@@ -686,6 +691,27 @@ fn run_sample_core_services(args: Vec<String>) -> Result<(), String> {
         return Err(format!("failed cleaning benchmark sandbox: {error}"));
     }
     result
+}
+
+fn core_service_phase_events(scenario: &Value) -> Vec<Value> {
+    let scenario_name = scenario
+        .get("scenario")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    scenario
+        .get("samples_us")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_f64)
+        .map(|total_us| {
+            json!({
+                "phase": "core_service",
+                "scenario": scenario_name,
+                "total_us": total_us,
+            })
+        })
+        .collect()
 }
 
 struct CoreServiceBenchContext {
@@ -1142,6 +1168,9 @@ fn parse_phase_events_input(input: &str) -> Vec<Value> {
                 .iter()
                 .flat_map(|sample| sample.as_array().into_iter().flatten().cloned())
                 .collect();
+        }
+        if let Some(events) = value.get("events").and_then(Value::as_array) {
+            return events.clone();
         }
     }
     parse_phase_events(input)
