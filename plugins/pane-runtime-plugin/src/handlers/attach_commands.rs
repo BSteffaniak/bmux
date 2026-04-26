@@ -19,7 +19,10 @@ use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::{NativeServiceContext, WireEventSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use uuid::Uuid;
+
+const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
 
 // ── Wire-format argument structs ─────────────────────────────────
 
@@ -108,6 +111,122 @@ fn publish_event(event: Event) {
     {
         let _ = sink.0.publish(event);
     }
+}
+
+fn emit_attach_phase_timing(payload: &serde_json::Value) {
+    if std::env::var_os("BMUX_ATTACH_PHASE_TIMING").is_none() {
+        return;
+    }
+    eprintln!("{ATTACH_PHASE_MARKER}{payload}");
+}
+
+struct AttachRetargetTiming {
+    context_id: Uuid,
+    selected_session_id: SessionId,
+    previous_session: Option<SessionId>,
+    previous_stream: Option<SessionId>,
+    runtime_start_attempted: bool,
+    handle_lookup_us: u128,
+    context_select_us: u128,
+    membership_us: u128,
+    runtime_check_us: u128,
+    stream_detach_us: u128,
+    stream_begin_us: u128,
+    focus_publish_us: u128,
+    viewport_set_us: u128,
+    total_us: u128,
+}
+
+struct AttachStreamTiming {
+    previous_stream: Option<SessionId>,
+    runtime_start_attempted: bool,
+    stream_detach_us: u128,
+    stream_begin_us: u128,
+    focus_publish_us: u128,
+}
+
+fn emit_attach_retarget_timing(timing: &AttachRetargetTiming) {
+    emit_attach_phase_timing(&serde_json::json!({
+        "phase": "attach.retarget_service",
+        "context_id": timing.context_id,
+        "selected_session_id": timing.selected_session_id.0,
+        "previous_session_id": timing.previous_session.map(|id| id.0),
+        "previous_stream_session_id": timing.previous_stream.map(|id| id.0),
+        "runtime_start_attempted": timing.runtime_start_attempted,
+        "handle_lookup_us": timing.handle_lookup_us,
+        "context_select_us": timing.context_select_us,
+        "membership_us": timing.membership_us,
+        "runtime_check_us": timing.runtime_check_us,
+        "stream_detach_us": timing.stream_detach_us,
+        "stream_begin_us": timing.stream_begin_us,
+        "focus_publish_us": timing.focus_publish_us,
+        "viewport_set_us": timing.viewport_set_us,
+        "total_us": timing.total_us,
+    }));
+}
+
+fn begin_attach_stream_for_retarget(
+    runtime: &bmux_pane_runtime_state::SessionRuntimeManagerHandle,
+    follow: &bmux_client_state::FollowStateHandle,
+    client_id: ClientId,
+    next_session_id: SessionId,
+    mut runtime_start_attempted: bool,
+) -> Result<AttachStreamTiming, AttachCommandError> {
+    let detach_started = Instant::now();
+    let previous_stream = follow.0.attached_stream_session(client_id);
+    if let Some(prev) = previous_stream
+        && prev != next_session_id
+    {
+        runtime.0.end_attach(prev, client_id);
+        publish_event(Event::ClientDetached { id: prev.0 });
+    }
+    let stream_detach_us = detach_started.elapsed().as_micros();
+
+    let begin_started = Instant::now();
+    let begin_result = match runtime.0.begin_attach(next_session_id, client_id) {
+        Ok(()) => Ok(()),
+        Err(SessionRuntimeError::NotFound) => {
+            runtime_start_attempted = true;
+            let _ = runtime.0.start_runtime(next_session_id);
+            runtime.0.begin_attach(next_session_id, client_id)
+        }
+        Err(SessionRuntimeError::Closed) => {
+            if let Some(removed) = runtime.0.remove_runtime(next_session_id) {
+                runtime.0.shutdown_removed_runtime(removed);
+            }
+            runtime_start_attempted = true;
+            let _ = runtime.0.start_runtime(next_session_id);
+            runtime.0.begin_attach(next_session_id, client_id)
+        }
+        Err(err) => Err(err),
+    };
+    let stream_begin_us = begin_started.elapsed().as_micros();
+
+    let publish_started = Instant::now();
+    match begin_result {
+        Ok(()) => {
+            follow
+                .0
+                .set_attached_stream_session(client_id, Some(next_session_id));
+            publish_event(Event::ClientAttached {
+                id: next_session_id.0,
+            });
+            super::publish_focus_state_snapshot();
+        }
+        Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
+            return Err(AttachCommandError::SessionNotFound);
+        }
+        Err(SessionRuntimeError::NotAttached) => {
+            return Err(failed("failed opening attach stream"));
+        }
+    }
+    Ok(AttachStreamTiming {
+        previous_stream,
+        runtime_start_attempted,
+        stream_detach_us,
+        stream_begin_us,
+        focus_publish_us: publish_started.elapsed().as_micros(),
+    })
 }
 
 fn session_manager() -> Result<bmux_session_state::SessionManagerHandle, AttachCommandError> {
@@ -436,13 +555,18 @@ pub fn attach_retarget_context(
     req: &AttachRetargetContextArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachRetargetReady, AttachCommandError> {
+    let total_started = Instant::now();
     let client_id = caller_client_id(ctx)?;
+
+    let handle_started = Instant::now();
     let manager = session_manager()?;
     let contexts = context_state()?;
     let follow = follow_state()?;
     let runtime = super::session_runtime_handle()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let handle_lookup_us = handle_started.elapsed().as_micros();
 
+    let select_started = Instant::now();
     let context = contexts
         .0
         .select_for_client(client_id, &ContextSelector::ById(req.context_id))
@@ -450,7 +574,9 @@ pub fn attach_retarget_context(
     let Some(next_session_id) = contexts.0.current_session_for_client(client_id) else {
         return Err(failed("context has no attached runtime"));
     };
+    let context_select_us = select_started.elapsed().as_micros();
 
+    let membership_started = Instant::now();
     let previous_session = follow.0.selected_session(client_id);
     if let Some(prev) = previous_session
         && prev != next_session_id
@@ -467,58 +593,30 @@ pub fn attach_retarget_context(
     follow
         .0
         .set_selected_target(client_id, Some(context.id), Some(next_session_id));
+    let membership_us = membership_started.elapsed().as_micros();
 
-    if !runtime.0.session_exists(next_session_id)
-        && let Err(err) = runtime.0.start_runtime(next_session_id)
-    {
-        return Err(failed(format!(
-            "failed restarting missing session runtime {}: {err:#}",
-            next_session_id.0
-        )));
-    }
-
-    let previous_stream = follow.0.attached_stream_session(client_id);
-    if let Some(prev) = previous_stream
-        && prev != next_session_id
-    {
-        runtime.0.end_attach(prev, client_id);
-        publish_event(Event::ClientDetached { id: prev.0 });
-    }
-
-    let begin_result = match runtime.0.begin_attach(next_session_id, client_id) {
-        Ok(()) => Ok(()),
-        Err(SessionRuntimeError::NotFound) => {
-            let _ = runtime.0.start_runtime(next_session_id);
-            runtime.0.begin_attach(next_session_id, client_id)
-        }
-        Err(SessionRuntimeError::Closed) => {
-            if let Some(removed) = runtime.0.remove_runtime(next_session_id) {
-                runtime.0.shutdown_removed_runtime(removed);
-            }
-            let _ = runtime.0.start_runtime(next_session_id);
-            runtime.0.begin_attach(next_session_id, client_id)
-        }
-        Err(err) => Err(err),
-    };
-
-    match begin_result {
-        Ok(()) => {
-            follow
-                .0
-                .set_attached_stream_session(client_id, Some(next_session_id));
-            publish_event(Event::ClientAttached {
-                id: next_session_id.0,
-            });
-            super::publish_focus_state_snapshot();
-        }
-        Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
-            return Err(AttachCommandError::SessionNotFound);
-        }
-        Err(SessionRuntimeError::NotAttached) => {
-            return Err(failed("failed opening attach stream"));
+    let runtime_started = Instant::now();
+    let mut runtime_start_attempted = false;
+    if !runtime.0.session_exists(next_session_id) {
+        runtime_start_attempted = true;
+        if let Err(err) = runtime.0.start_runtime(next_session_id) {
+            return Err(failed(format!(
+                "failed restarting missing session runtime {}: {err:#}",
+                next_session_id.0
+            )));
         }
     }
+    let runtime_check_us = runtime_started.elapsed().as_micros();
 
+    let stream_timing = begin_attach_stream_for_retarget(
+        &runtime,
+        &follow,
+        client_id,
+        next_session_id,
+        runtime_start_attempted,
+    )?;
+
+    let viewport_started = Instant::now();
     let (cols, rows, top, bottom) = runtime
         .0
         .set_attach_viewport(
@@ -532,6 +630,24 @@ pub fn attach_retarget_context(
             req.cell_pixel_height,
         )
         .map_err(|e| failed(format!("failed setting attach viewport: {e:?}")))?;
+    let viewport_set_us = viewport_started.elapsed().as_micros();
+
+    emit_attach_retarget_timing(&AttachRetargetTiming {
+        context_id: req.context_id,
+        selected_session_id: next_session_id,
+        previous_session,
+        previous_stream: stream_timing.previous_stream,
+        runtime_start_attempted: stream_timing.runtime_start_attempted,
+        handle_lookup_us,
+        context_select_us,
+        membership_us,
+        runtime_check_us,
+        stream_detach_us: stream_timing.stream_detach_us,
+        stream_begin_us: stream_timing.stream_begin_us,
+        focus_publish_us: stream_timing.focus_publish_us,
+        viewport_set_us,
+        total_us: total_started.elapsed().as_micros(),
+    });
 
     Ok(AttachRetargetReady {
         session_id: next_session_id.0,

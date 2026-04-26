@@ -53,12 +53,20 @@ use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 const SERVICE_PHASE_MARKER: &str = "[bmux-service-phase-json]";
+const IPC_PHASE_MARKER: &str = "[bmux-ipc-phase-json]";
 
 fn emit_service_phase_timing(payload: &serde_json::Value) {
     if std::env::var_os("BMUX_SERVICE_PHASE_TIMING").is_none() {
         return;
     }
     eprintln!("{SERVICE_PHASE_MARKER}{payload}");
+}
+
+fn emit_ipc_phase_timing(payload: &serde_json::Value) {
+    if std::env::var_os("BMUX_IPC_PHASE_TIMING").is_none() {
+        return;
+    }
+    eprintln!("{IPC_PHASE_MARKER}{payload}");
 }
 
 // `CONTEXT_SESSION_ID_ATTRIBUTE` lives in `bmux_contexts_plugin::context_state`.
@@ -4841,11 +4849,14 @@ async fn handle_connection(
         let is_enable_push = matches!(request, Request::EnableEventPush);
 
         let request_kind = request_kind_name(&request);
+        let service_metadata = ipc_service_request_metadata(&request);
         let exclusive = request_requires_exclusive(&request);
+        let request_record_encode_started = Instant::now();
         let request_data = bmux_codec::to_vec(&request).unwrap_or_else(|e| {
             tracing::warn!("failed to serialize request for recording: {e}");
             vec![]
         });
+        let request_record_encode_us = request_record_encode_started.elapsed().as_micros();
         let started_at = Instant::now();
         debug!(
             client_id = %client_id.0,
@@ -4854,6 +4865,7 @@ async fn handle_connection(
             exclusive,
             "server.request.start"
         );
+        let request_record_started = Instant::now();
         record_to_all_runtimes(
             RecordingEventKind::RequestStart,
             RecordingPayload::RequestStart {
@@ -4868,7 +4880,9 @@ async fn handle_connection(
                 client_id: Some(client_id.0),
             },
         );
+        let request_record_us = request_record_started.elapsed().as_micros();
 
+        let handle_started = Instant::now();
         let response = handle_request(
             &state,
             &shutdown_tx,
@@ -4878,13 +4892,17 @@ async fn handle_connection(
             request,
         )
         .await?;
+        let handle_us = handle_started.elapsed().as_micros();
         let elapsed_ms = started_at.elapsed().as_millis();
-        match &response {
+        let (response_record_encode_us, response_record_us) = match &response {
             Response::Ok(payload) => {
+                let response_record_encode_started = Instant::now();
                 let response_data = bmux_codec::to_vec(payload).unwrap_or_else(|e| {
                     tracing::warn!("failed to serialize response for recording: {e}");
                     vec![]
                 });
+                let response_record_encode_us =
+                    response_record_encode_started.elapsed().as_micros();
                 debug!(
                     client_id = %client_id.0,
                     request_id = envelope.request_id,
@@ -4893,6 +4911,7 @@ async fn handle_connection(
                     elapsed_ms,
                     "server.request.done"
                 );
+                let response_record_started = Instant::now();
                 record_to_all_runtimes(
                     RecordingEventKind::RequestDone,
                     RecordingPayload::RequestDone {
@@ -4910,6 +4929,10 @@ async fn handle_connection(
                         client_id: Some(client_id.0),
                     },
                 );
+                (
+                    response_record_encode_us,
+                    response_record_started.elapsed().as_micros(),
+                )
             }
             Response::Err(error) => {
                 warn!(
@@ -4921,6 +4944,7 @@ async fn handle_connection(
                     elapsed_ms,
                     "server.request.error"
                 );
+                let response_record_started = Instant::now();
                 record_to_all_runtimes(
                     RecordingEventKind::RequestError,
                     RecordingPayload::RequestError {
@@ -4937,8 +4961,10 @@ async fn handle_connection(
                         client_id: Some(client_id.0),
                     },
                 );
+                (0_u128, response_record_started.elapsed().as_micros())
             }
-        }
+        };
+        let response_send_started = Instant::now();
         match send_response_via_channel(
             &frame_tx,
             envelope.request_id,
@@ -4962,6 +4988,20 @@ async fn handle_connection(
             }
             Err(err) => return Err(err),
         }
+        let response_send_us = response_send_started.elapsed().as_micros();
+        emit_ipc_phase_timing(&server_ipc_request_phase_payload(
+            request_kind,
+            service_metadata,
+            envelope.request_id,
+            &response,
+            request_record_encode_us,
+            request_record_us,
+            handle_us,
+            response_record_encode_us,
+            response_record_us,
+            response_send_us,
+            started_at.elapsed().as_micros(),
+        ));
 
         // After responding to EnableEventPush, spawn the event push task.
         // It receives events from the broadcast channel and forwards them
@@ -5886,6 +5926,84 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::EnableEventPush => "enable_event_push",
         Request::SubscribeEvents => "subscribe_events",
     }
+}
+
+const fn response_kind_name(response: &Response) -> &'static str {
+    match response {
+        Response::Ok(payload) => response_payload_kind_name(payload),
+        Response::Err(_) => "error",
+    }
+}
+
+fn ipc_service_request_metadata(request: &Request) -> serde_json::Map<String, serde_json::Value> {
+    let mut metadata = serde_json::Map::new();
+    if let Request::InvokeService {
+        capability,
+        kind,
+        interface_id,
+        operation,
+        payload,
+    } = request
+    {
+        metadata.insert("capability".to_string(), serde_json::json!(capability));
+        metadata.insert("kind".to_string(), serde_json::json!(format!("{kind:?}")));
+        metadata.insert("interface_id".to_string(), serde_json::json!(interface_id));
+        metadata.insert("operation".to_string(), serde_json::json!(operation));
+        metadata.insert(
+            "service_payload_len".to_string(),
+            serde_json::json!(payload.len()),
+        );
+    }
+    metadata
+}
+
+#[allow(clippy::too_many_arguments)]
+fn server_ipc_request_phase_payload(
+    request_kind: &str,
+    service_metadata: serde_json::Map<String, serde_json::Value>,
+    request_id: u64,
+    response: &Response,
+    request_record_encode_us: u128,
+    request_record_us: u128,
+    handle_us: u128,
+    response_record_encode_us: u128,
+    response_record_us: u128,
+    response_send_us: u128,
+    total_us: u128,
+) -> serde_json::Value {
+    let mut payload = serde_json::Map::from_iter([
+        ("phase".to_string(), serde_json::json!("ipc.server_request")),
+        ("request".to_string(), serde_json::json!(request_kind)),
+        ("request_id".to_string(), serde_json::json!(request_id)),
+        (
+            "response".to_string(),
+            serde_json::json!(response_kind_name(response)),
+        ),
+        (
+            "request_record_encode_us".to_string(),
+            serde_json::json!(request_record_encode_us),
+        ),
+        (
+            "request_record_us".to_string(),
+            serde_json::json!(request_record_us),
+        ),
+        ("handle_us".to_string(), serde_json::json!(handle_us)),
+        (
+            "response_record_encode_us".to_string(),
+            serde_json::json!(response_record_encode_us),
+        ),
+        (
+            "response_record_us".to_string(),
+            serde_json::json!(response_record_us),
+        ),
+        (
+            "response_send_us".to_string(),
+            serde_json::json!(response_send_us),
+        ),
+        ("total_us".to_string(), serde_json::json!(total_us)),
+    ]);
+    payload.extend(service_metadata);
+    serde_json::Value::Object(payload)
 }
 
 fn all_recording_event_kinds() -> Vec<RecordingEventKind> {

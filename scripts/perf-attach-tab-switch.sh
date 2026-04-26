@@ -302,10 +302,33 @@ if [[ "$SERVICE_TIMING" -eq 1 ]]; then
 	phase_report service.client_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
 	phase_report service.server_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
 	phase_report service.server_invoke invocation_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
+	phase_report plugin.native_service_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
+	phase_report plugin.native_service_invoke encode_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
+	phase_report plugin.native_service_invoke call_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
+	phase_report plugin.native_service_invoke decode_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
+	phase_report attach.retarget_service total_us "$MAX_RETARGET_P99_MS"
+	phase_report attach.retarget_service context_select_us "$MAX_RETARGET_P99_MS"
+	phase_report attach.retarget_service membership_us "$MAX_RETARGET_P99_MS"
+	phase_report attach.retarget_service runtime_check_us "$MAX_RETARGET_P99_MS"
+	phase_report attach.retarget_service stream_detach_us "$MAX_RETARGET_P99_MS"
+	phase_report attach.retarget_service stream_begin_us "$MAX_RETARGET_P99_MS"
+	phase_report attach.retarget_service focus_publish_us "$MAX_RETARGET_P99_MS"
+	phase_report attach.retarget_service viewport_set_us "$MAX_RETARGET_P99_MS"
+	phase_report plugin.native_service_invoke total_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+	phase_report plugin.native_service_invoke encode_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+	phase_report plugin.native_service_invoke call_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+	phase_report plugin.native_service_invoke decode_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
 fi
 if [[ "$IPC_TIMING" -eq 1 ]]; then
 	phase_report ipc.client_request total_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
 	phase_report ipc.client_request recv_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
+	phase_report ipc.client_request total_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+	phase_report ipc.client_request recv_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+	phase_report ipc.server_request total_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+	phase_report ipc.server_request handle_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+	phase_report ipc.server_request response_send_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+	phase_report ipc.server_request request_record_encode_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+	phase_report ipc.server_request response_record_encode_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
 fi
 if [[ "$STORAGE_TIMING" -eq 1 ]]; then
 	phase_report storage.get total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows

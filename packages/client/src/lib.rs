@@ -668,17 +668,16 @@ impl BmuxClient {
             duration_ms = started_at.elapsed().as_millis(),
             "ipc.request.done"
         );
-        emit_ipc_phase_timing(&serde_json::json!({
-            "phase": "ipc.client_request",
-            "request": request_kind,
-            "request_id": request_id,
-            "response": response_kind_name(&response),
-            "encode_us": encode_us,
-            "send_us": send_us,
-            "recv_us": recv_us,
-            "decode_us": decode_us,
-            "total_us": started_at.elapsed().as_micros(),
-        }));
+        emit_ipc_phase_timing(&ipc_client_request_phase_payload(
+            &request,
+            request_id,
+            response_kind_name(&response),
+            encode_us,
+            send_us,
+            recv_us,
+            decode_us,
+            started_at.elapsed().as_micros(),
+        ));
         Ok(response)
     }
 
@@ -1691,17 +1690,16 @@ impl StreamingBmuxClient {
             duration_ms = started_at.elapsed().as_millis(),
             "streaming_ipc.request.done"
         );
-        emit_ipc_phase_timing(&serde_json::json!({
-            "phase": "ipc.client_request",
-            "request": request_kind,
-            "request_id": request_id,
-            "response": response_kind_name(&response),
-            "encode_us": encode_us,
-            "send_us": send_us,
-            "recv_us": recv_us,
-            "decode_us": 0_u128,
-            "total_us": started_at.elapsed().as_micros(),
-        }));
+        emit_ipc_phase_timing(&ipc_client_request_phase_payload(
+            &request,
+            request_id,
+            response_kind_name(&response),
+            encode_us,
+            send_us,
+            recv_us,
+            0_u128,
+            started_at.elapsed().as_micros(),
+        ));
         Ok(response)
     }
 
@@ -2421,6 +2419,51 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ipc_client_request_phase_payload(
+    request: &Request,
+    request_id: u64,
+    response: &'static str,
+    encode_us: u128,
+    send_us: u128,
+    recv_us: u128,
+    decode_us: u128,
+    total_us: u128,
+) -> serde_json::Value {
+    let mut payload = serde_json::Map::from_iter([
+        ("phase".to_string(), serde_json::json!("ipc.client_request")),
+        (
+            "request".to_string(),
+            serde_json::json!(request_kind_name(request)),
+        ),
+        ("request_id".to_string(), serde_json::json!(request_id)),
+        ("response".to_string(), serde_json::json!(response)),
+        ("encode_us".to_string(), serde_json::json!(encode_us)),
+        ("send_us".to_string(), serde_json::json!(send_us)),
+        ("recv_us".to_string(), serde_json::json!(recv_us)),
+        ("decode_us".to_string(), serde_json::json!(decode_us)),
+        ("total_us".to_string(), serde_json::json!(total_us)),
+    ]);
+    if let Request::InvokeService {
+        capability,
+        kind,
+        interface_id,
+        operation,
+        payload: service_payload,
+    } = request
+    {
+        payload.insert("capability".to_string(), serde_json::json!(capability));
+        payload.insert("kind".to_string(), serde_json::json!(format!("{kind:?}")));
+        payload.insert("interface_id".to_string(), serde_json::json!(interface_id));
+        payload.insert("operation".to_string(), serde_json::json!(operation));
+        payload.insert(
+            "service_payload_len".to_string(),
+            serde_json::json!(service_payload.len()),
+        );
+    }
+    serde_json::Value::Object(payload)
 }
 
 const fn response_kind_name(response: &Response) -> &'static str {

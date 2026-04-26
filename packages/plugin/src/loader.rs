@@ -747,6 +747,7 @@ struct PluginStateKey {
 static STORAGE_CACHE: OnceLock<Mutex<BTreeMap<PluginStateKey, Option<Vec<u8>>>>> = OnceLock::new();
 static VOLATILE_STATE: OnceLock<Mutex<BTreeMap<PluginStateKey, Vec<u8>>>> = OnceLock::new();
 const STORAGE_PHASE_MARKER: &str = "[bmux-storage-phase-json]";
+const SERVICE_PHASE_MARKER: &str = "[bmux-service-phase-json]";
 
 fn storage_cache() -> &'static Mutex<BTreeMap<PluginStateKey, Option<Vec<u8>>>> {
     STORAGE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -769,6 +770,13 @@ fn emit_storage_phase_timing(payload: &serde_json::Value) {
         return;
     }
     eprintln!("{STORAGE_PHASE_MARKER}{payload}");
+}
+
+fn emit_service_phase_timing(payload: &serde_json::Value) {
+    if std::env::var_os("BMUX_SERVICE_PHASE_TIMING").is_none() {
+        return;
+    }
+    eprintln!("{SERVICE_PHASE_MARKER}{payload}");
 }
 
 impl ServiceCaller for NativeCommandContext {
@@ -1940,7 +1948,15 @@ impl LoadedPlugin {
     }
 
     fn invoke_native_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
+        let total_started = Instant::now();
+        let backend = match &self.backend {
+            PluginBackend::Static(_) => "static",
+            PluginBackend::Dynamic(_) => "dynamic",
+            PluginBackend::Process(_) => "process",
+        };
+        let encode_started = Instant::now();
         let payload = encode_service_envelope(0, ServiceEnvelopeKind::Request, context)?;
+        let encode_us = encode_started.elapsed().as_micros();
 
         let resolved_symbol = match &self.backend {
             PluginBackend::Dynamic(library) => {
@@ -1986,11 +2002,13 @@ impl LoadedPlugin {
 
         let mut output = vec![0_u8; 4096];
         let mut output_len = 0_usize;
+        let call_started = Instant::now();
         let mut status = call_service(&payload, &mut output, &mut output_len);
         if status == NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL {
             output.resize(output_len.max(output.len() * 2), 0);
             status = call_service(&payload, &mut output, &mut output_len);
         }
+        let call_us = call_started.elapsed().as_micros();
 
         if status != NATIVE_SERVICE_STATUS_OK {
             return Err(PluginError::NativeServiceInvocation {
@@ -2010,8 +2028,26 @@ impl LoadedPlugin {
         }
         output.truncate(output_len);
 
+        let decode_started = Instant::now();
         let (_, response) =
             decode_service_envelope::<ServiceResponse>(&output, ServiceEnvelopeKind::Response)?;
+        let decode_us = decode_started.elapsed().as_micros();
+        emit_service_phase_timing(&serde_json::json!({
+            "phase": "plugin.native_service_invoke",
+            "plugin_id": self.declaration.id.as_str(),
+            "backend": backend,
+            "capability": context.request.service.capability.as_str(),
+            "kind": format!("{:?}", context.request.service.kind),
+            "interface_id": context.request.service.interface_id,
+            "operation": context.request.operation,
+            "request_payload_len": context.request.payload.len(),
+            "encoded_request_len": payload.len(),
+            "encoded_response_len": output_len,
+            "encode_us": encode_us,
+            "call_us": call_us,
+            "decode_us": decode_us,
+            "total_us": total_started.elapsed().as_micros(),
+        }));
         Ok(response)
     }
 
