@@ -1,3 +1,22 @@
+[benchmark]
+name = "core-services"
+kind = "core-services"
+
+[defaults]
+iterations = 1000
+warmup = 100
+core_service_limit_ms = 1
+
+[profiles.normal]
+
+[profiles.diagnostic]
+loosen_slo = true
+
+[profiles.ci]
+
+[profiles.stress]
+loosen_slo = true
+
 [limit]
 core_service = 1
 

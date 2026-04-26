@@ -30,6 +30,7 @@ fn run() -> Result<(), String> {
         "report-json" => run_report_json(args),
         "report-phase-file" => run_report_phase_file(args),
         "validate-phase-config" => run_validate_phase_config(args),
+        "run-benchmark" => run_benchmark(args),
         "sample-static-service" => run_sample_static_service(args),
         "sample-core-services" => run_sample_core_services(args),
         "prepare-scale-fixture" => run_prepare_scale_fixture(args),
@@ -51,6 +52,7 @@ fn usage() -> &'static str {
   report-json --input PATH --output PATH [threshold flags]
   report-phase-file --input PATH --output PATH --phase NAME --field FIELD [--filter-key KEY --filter-value VALUE] [--max-p99-ms N] [--max-p95-ms N]
   validate-phase-config --input PATH --config PATH --output-dir PATH [--tag TAG] [--limit NAME=MS] [--var NAME=VALUE]
+  run-benchmark --manifest PATH [--profile NAME] [--artifact-json PATH] [--phase-report-dir PATH] [benchmark overrides]
   sample-static-service --iterations N --warmup N --out-json PATH [--max-p99-us N]
   sample-core-services --iterations N --warmup N --out-json PATH [--max-p99-us N]
   prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
@@ -104,6 +106,636 @@ struct PhaseReportRequest<'a> {
     filter_value: Option<&'a str>,
     max_p99_ms: Option<f64>,
     max_p95_ms: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchmarkManifest {
+    benchmark: BenchmarkSpec,
+    #[serde(default)]
+    defaults: BenchmarkDefaults,
+    #[serde(default)]
+    profiles: BTreeMap<String, BenchmarkProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchmarkSpec {
+    name: String,
+    kind: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BenchmarkDefaults {
+    iterations: Option<usize>,
+    warmup: Option<usize>,
+    scenario: Option<String>,
+    windows: Option<usize>,
+    switches: Option<usize>,
+    max_p99_ms: Option<f64>,
+    attach_command_limit_ms: Option<f64>,
+    retarget_limit_ms: Option<f64>,
+    core_service_limit_ms: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BenchmarkProfile {
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    service_timing: bool,
+    #[serde(default)]
+    ipc_timing: bool,
+    #[serde(default)]
+    storage_timing: bool,
+    #[serde(default)]
+    loosen_slo: bool,
+}
+
+#[derive(Debug, Default)]
+struct BenchmarkRunOptions {
+    manifest: Option<String>,
+    profile: String,
+    artifact_json: Option<String>,
+    phase_report_dir: Option<String>,
+    bmux_bin: Option<String>,
+    iterations: Option<usize>,
+    warmup: Option<usize>,
+    scenario: Option<String>,
+    windows: Option<usize>,
+    switches: Option<usize>,
+    max_p99_ms: Option<f64>,
+    tags: Vec<String>,
+    limits: BTreeMap<String, f64>,
+    vars: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct BenchmarkResolvedOptions {
+    manifest_path: String,
+    profile: String,
+    artifact_json: Option<String>,
+    phase_report_dir: String,
+    bmux_bin: Option<String>,
+    iterations: usize,
+    warmup: usize,
+    scenario: String,
+    windows: usize,
+    switches: usize,
+    max_p99_ms: Option<f64>,
+    tags: Vec<String>,
+    limits: BTreeMap<String, f64>,
+    vars: BTreeMap<String, String>,
+    service_timing: bool,
+    ipc_timing: bool,
+    storage_timing: bool,
+    loosen_slo: bool,
+}
+
+struct SampleCommandRequest<'a> {
+    iterations: usize,
+    command: &'a [String],
+    envs: &'a [(String, String)],
+    out_json: &'a str,
+    allow_nonzero: bool,
+}
+
+fn run_benchmark(args: Vec<String>) -> Result<(), String> {
+    let cli = parse_benchmark_run_options(args)?;
+    let manifest_path = cli
+        .manifest
+        .clone()
+        .ok_or_else(|| "--manifest is required".to_string())?;
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("failed reading benchmark manifest {manifest_path}: {error}"))?;
+    let manifest: BenchmarkManifest = toml::from_str(&manifest_text)
+        .map_err(|error| format!("failed parsing benchmark manifest: {error}"))?;
+    let options = resolve_benchmark_options(cli, &manifest, manifest_path)?;
+    match manifest.benchmark.kind.as_str() {
+        "core-services" => run_core_services_benchmark(&manifest, &options),
+        "attach-tab-switch" => run_attach_tab_switch_benchmark(&manifest, &options),
+        other => Err(format!("unsupported benchmark kind '{other}'")),
+    }
+}
+
+fn parse_benchmark_run_options(args: Vec<String>) -> Result<BenchmarkRunOptions, String> {
+    let mut options = BenchmarkRunOptions {
+        profile: "normal".to_string(),
+        ..BenchmarkRunOptions::default()
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--manifest" => {
+                options.manifest = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--profile" => {
+                options.profile = require_arg(&args, index, "--profile")?.to_string();
+                index += 2;
+            }
+            "--artifact-json" => {
+                options.artifact_json = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--phase-report-dir" => {
+                options.phase_report_dir = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--bmux-bin" => {
+                options.bmux_bin = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--iterations" => {
+                options.iterations = Some(parse_usize_arg(&args, index, "--iterations")?);
+                index += 2;
+            }
+            "--warmup" => {
+                options.warmup = Some(parse_usize_arg(&args, index, "--warmup")?);
+                index += 2;
+            }
+            "--scenario" => {
+                options.scenario = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--windows" => {
+                options.windows = Some(parse_usize_arg(&args, index, "--windows")?);
+                index += 2;
+            }
+            "--switches" => {
+                options.switches = Some(parse_usize_arg(&args, index, "--switches")?);
+                index += 2;
+            }
+            "--max-p99-ms" => {
+                options.max_p99_ms = Some(parse_f64(
+                    require_arg(&args, index, "--max-p99-ms")?,
+                    "--max-p99-ms",
+                )?);
+                index += 2;
+            }
+            "--tag" => {
+                options
+                    .tags
+                    .push(require_arg(&args, index, "--tag")?.to_string());
+                index += 2;
+            }
+            "--limit" => {
+                let value = require_arg(&args, index, "--limit")?;
+                let Some((name, limit)) = value.split_once('=') else {
+                    return Err("--limit requires NAME=MS".to_string());
+                };
+                options
+                    .limits
+                    .insert(name.to_string(), parse_f64(limit, "--limit")?);
+                index += 2;
+            }
+            "--var" => {
+                let value = require_arg(&args, index, "--var")?;
+                let Some((name, value)) = value.split_once('=') else {
+                    return Err("--var requires NAME=VALUE".to_string());
+                };
+                options.vars.insert(name.to_string(), value.to_string());
+                index += 2;
+            }
+            other => return Err(format!("unknown argument for run-benchmark: {other}")),
+        }
+    }
+    Ok(options)
+}
+
+fn require_arg<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str, String> {
+    args.get(index + 1)
+        .map(String::as_str)
+        .ok_or_else(|| format!("{name} requires a value"))
+}
+
+fn parse_usize_arg(args: &[String], index: usize, name: &str) -> Result<usize, String> {
+    let value = parse_u64(require_arg(args, index, name)?, name)?;
+    usize::try_from(value).map_err(|_| format!("{name} is too large"))
+}
+
+fn resolve_benchmark_options(
+    cli: BenchmarkRunOptions,
+    manifest: &BenchmarkManifest,
+    manifest_path: String,
+) -> Result<BenchmarkResolvedOptions, String> {
+    let profile = manifest
+        .profiles
+        .get(&cli.profile)
+        .ok_or_else(|| format!("profile '{}' not found in manifest", cli.profile))?;
+    let phase_report_dir = cli.phase_report_dir.unwrap_or_else(|| {
+        env::temp_dir()
+            .join(format!("bmux-{}-phase-reports", manifest.benchmark.name))
+            .display()
+            .to_string()
+    });
+    let mut tags = profile.tags.clone();
+    tags.extend(cli.tags);
+    let mut limits = cli.limits;
+    if let Some(limit) = manifest.defaults.attach_command_limit_ms {
+        limits.entry("attach_command".to_string()).or_insert(limit);
+    }
+    if let Some(limit) = manifest.defaults.retarget_limit_ms {
+        limits.entry("retarget".to_string()).or_insert(limit);
+    }
+    if let Some(limit) = manifest.defaults.core_service_limit_ms {
+        limits.entry("core_service".to_string()).or_insert(limit);
+    }
+    if profile.loosen_slo {
+        for value in limits.values_mut() {
+            *value = 1_000_000.0;
+        }
+    }
+    Ok(BenchmarkResolvedOptions {
+        manifest_path,
+        profile: cli.profile,
+        artifact_json: cli.artifact_json,
+        phase_report_dir,
+        bmux_bin: cli.bmux_bin,
+        iterations: cli
+            .iterations
+            .or(manifest.defaults.iterations)
+            .unwrap_or(30),
+        warmup: cli.warmup.or(manifest.defaults.warmup).unwrap_or(0),
+        scenario: cli
+            .scenario
+            .or_else(|| manifest.defaults.scenario.clone())
+            .unwrap_or_else(|| "default".to_string()),
+        windows: cli.windows.or(manifest.defaults.windows).unwrap_or(4),
+        switches: cli.switches.or(manifest.defaults.switches).unwrap_or(4),
+        max_p99_ms: cli.max_p99_ms.or(manifest.defaults.max_p99_ms),
+        tags,
+        limits,
+        vars: cli.vars,
+        service_timing: profile.service_timing,
+        ipc_timing: profile.ipc_timing,
+        storage_timing: profile.storage_timing,
+        loosen_slo: profile.loosen_slo,
+    })
+}
+
+fn run_core_services_benchmark(
+    manifest: &BenchmarkManifest,
+    options: &BenchmarkResolvedOptions,
+) -> Result<(), String> {
+    let artifact_json = options.artifact_json.clone().unwrap_or_else(|| {
+        env::temp_dir()
+            .join("bmux-core-services.json")
+            .display()
+            .to_string()
+    });
+    run_sample_core_services(vec![
+        "--iterations".to_string(),
+        options.iterations.to_string(),
+        "--warmup".to_string(),
+        options.warmup.to_string(),
+        "--out-json".to_string(),
+        artifact_json.clone(),
+    ])?;
+    validate_benchmark_phases(&artifact_json, options)?;
+    write_standard_benchmark_artifact(manifest, options, &artifact_json, &artifact_json)?;
+    println!("artifact_json={artifact_json}");
+    println!("phase_report_dir={}", options.phase_report_dir);
+    Ok(())
+}
+
+fn run_attach_tab_switch_benchmark(
+    manifest: &BenchmarkManifest,
+    options: &BenchmarkResolvedOptions,
+) -> Result<(), String> {
+    let bmux_bin = options
+        .bmux_bin
+        .clone()
+        .ok_or_else(|| "attach-tab-switch requires --bmux-bin".to_string())?;
+    validate_attach_options(options)?;
+    let scenario = attach_scenario(&options.scenario)?;
+    let sandbox = create_temp_dir("bmux-attach-benchmark")?;
+    let playbook = sandbox.join("tab-switch.dsl");
+    let sample_json = sandbox.join("sample.json");
+    write_attach_playbook(&playbook, options, &scenario)?;
+    let envs = attach_envs(options);
+    for _ in 0..options.warmup {
+        run_command_once(
+            &[
+                bmux_bin.clone(),
+                "playbook".to_string(),
+                "run".to_string(),
+                playbook.display().to_string(),
+                "--json".to_string(),
+            ],
+            &envs,
+        )?;
+    }
+    let command = vec![
+        bmux_bin,
+        "playbook".to_string(),
+        "run".to_string(),
+        playbook.display().to_string(),
+        "--json".to_string(),
+    ];
+    sample_command(SampleCommandRequest {
+        iterations: options.iterations,
+        command: &command,
+        envs: &envs,
+        out_json: &sample_json.display().to_string(),
+        allow_nonzero: false,
+    })?;
+    report_latency_if_needed(&sample_json.display().to_string(), options.max_p99_ms)?;
+    let mut vars = options.vars.clone();
+    vars.entry("command_name".to_string())
+        .or_insert(scenario.command_name.to_string());
+    vars.entry("service_operation".to_string())
+        .or_insert(scenario.service_operation.to_string());
+    validate_benchmark_phases_with_vars(&sample_json.display().to_string(), options, vars)?;
+    let artifact_json = options.artifact_json.clone().unwrap_or_else(|| {
+        env::temp_dir()
+            .join("bmux-attach-tab-switch.json")
+            .display()
+            .to_string()
+    });
+    write_standard_benchmark_artifact(
+        manifest,
+        options,
+        &sample_json.display().to_string(),
+        &artifact_json,
+    )?;
+    let _ = fs::remove_dir_all(&sandbox);
+    println!("artifact_json={artifact_json}");
+    println!("phase_report_dir={}", options.phase_report_dir);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachScenario {
+    command_name: &'static str,
+    service_operation: &'static str,
+    prime_key: &'static str,
+}
+
+fn attach_scenario(name: &str) -> Result<AttachScenario, String> {
+    match name {
+        "next-window" => Ok(AttachScenario {
+            command_name: "next-window",
+            service_operation: "switch-window",
+            prime_key: "ctrl+h",
+        }),
+        "prev-window" => Ok(AttachScenario {
+            command_name: "prev-window",
+            service_operation: "switch-window",
+            prime_key: "ctrl+s",
+        }),
+        "goto-window" => Ok(AttachScenario {
+            command_name: "goto-window",
+            service_operation: "switch-window",
+            prime_key: "alt+1",
+        }),
+        "new-window" => Ok(AttachScenario {
+            command_name: "new-window",
+            service_operation: "new-window",
+            prime_key: "",
+        }),
+        other => Err(format!("unknown attach scenario '{other}'")),
+    }
+}
+
+fn validate_attach_options(options: &BenchmarkResolvedOptions) -> Result<(), String> {
+    if options.windows < 2 {
+        return Err("attach benchmark requires at least 2 windows".to_string());
+    }
+    if options.switches < 1 {
+        return Err("attach benchmark requires at least 1 switch".to_string());
+    }
+    if options.scenario == "goto-window" && options.windows < 3 {
+        return Err("goto-window scenario requires at least 3 windows".to_string());
+    }
+    Ok(())
+}
+
+fn write_attach_playbook(
+    path: &Path,
+    options: &BenchmarkResolvedOptions,
+    scenario: &AttachScenario,
+) -> Result<(), String> {
+    let mut lines = vec![
+        "@timeout 30000".to_string(),
+        "@shell sh".to_string(),
+        "@viewport cols=120 rows=40".to_string(),
+        "new-session".to_string(),
+    ];
+    for _ in 1..=options.windows {
+        lines.push("send-attach key=c".to_string());
+    }
+    if !scenario.prime_key.is_empty() {
+        lines.push(format!("send-attach key={}", scenario.prime_key));
+    }
+    for index in 1..=options.switches {
+        let key = match options.scenario.as_str() {
+            "next-window" => "ctrl+s",
+            "prev-window" => "ctrl+h",
+            "goto-window" if index % 2 == 0 => "alt+2",
+            "goto-window" => "alt+3",
+            "new-window" => "c",
+            _ => return Err(format!("unknown attach scenario '{}'", options.scenario)),
+        };
+        lines.push(format!("send-attach key={key}"));
+    }
+    lines.push("screen".to_string());
+    fs::write(path, format!("{}\n", lines.join("\n")))
+        .map_err(|error| format!("failed writing attach playbook {}: {error}", path.display()))
+}
+
+fn attach_envs(options: &BenchmarkResolvedOptions) -> Vec<(String, String)> {
+    let mut envs = vec![("BMUX_ATTACH_PHASE_TIMING".to_string(), "1".to_string())];
+    if options.service_timing {
+        envs.push(("BMUX_SERVICE_PHASE_TIMING".to_string(), "1".to_string()));
+        envs.push((
+            "BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING".to_string(),
+            "1".to_string(),
+        ));
+    }
+    if options.ipc_timing {
+        envs.push(("BMUX_IPC_PHASE_TIMING".to_string(), "1".to_string()));
+        envs.push((
+            "BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING".to_string(),
+            "1".to_string(),
+        ));
+    }
+    if options.storage_timing {
+        envs.push((
+            "BMUX_PLUGIN_STORAGE_PHASE_TIMING".to_string(),
+            "1".to_string(),
+        ));
+        envs.push((
+            "BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING".to_string(),
+            "1".to_string(),
+        ));
+    }
+    envs
+}
+
+fn create_temp_dir(prefix: &str) -> Result<std::path::PathBuf, String> {
+    let path = env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock is before unix epoch: {error}"))?
+            .as_nanos()
+    ));
+    fs::create_dir_all(&path)
+        .map_err(|error| format!("failed creating temp dir {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+fn run_command_once(command: &[String], envs: &[(String, String)]) -> Result<(), String> {
+    let Some((command_name, command_args)) = command.split_first() else {
+        return Err("command is empty".to_string());
+    };
+    let status = Command::new(command_name)
+        .args(command_args)
+        .envs(envs.iter().map(|(key, value)| (key, value)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("failed executing command: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "command exited with non-zero status: {}",
+            status.code().unwrap_or(1)
+        ))
+    }
+}
+
+fn sample_command(request: SampleCommandRequest<'_>) -> Result<(), String> {
+    let Some((command_name, command_args)) = request.command.split_first() else {
+        return Err("sample requires command args".to_string());
+    };
+    let mut samples_ms = Vec::with_capacity(request.iterations);
+    let mut retries = 0_u64;
+    let mut respawns = 0_u64;
+    let mut timeouts = 0_u64;
+    let mut phase_samples = Vec::with_capacity(request.iterations);
+    for _ in 0..request.iterations {
+        let started = Instant::now();
+        let output = Command::new(command_name)
+            .args(command_args)
+            .envs(request.envs.iter().map(|(key, value)| (key, value)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("failed executing sampled command: {error}"))?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if !request.allow_nonzero && !output.status.success() {
+            return Err(format!(
+                "command exited with non-zero status: {}",
+                output.status.code().unwrap_or(1)
+            ));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let faults = count_runtime_faults(&stderr);
+        retries += faults.retries;
+        respawns += faults.respawns;
+        timeouts += faults.timeouts;
+        phase_samples.push(parse_phase_events(&stderr));
+        samples_ms.push(elapsed_ms);
+    }
+    let payload = json!({
+        "samples_ms": samples_ms,
+        "runtime_faults": {
+            "retries": retries,
+            "respawns": respawns,
+            "timeouts": timeouts,
+        },
+        "phase_samples": phase_samples,
+    });
+    let encoded = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("failed encoding sample json: {error}"))?;
+    fs::write(request.out_json, encoded)
+        .map_err(|error| format!("failed writing sample json: {error}"))
+}
+
+fn report_latency_if_needed(input: &str, max_p99_ms: Option<f64>) -> Result<(), String> {
+    let mut args = vec!["--input".to_string(), input.to_string()];
+    if let Some(limit) = max_p99_ms {
+        args.push("--max-p99-ms".to_string());
+        args.push(format_f64_arg(limit));
+    }
+    run_report_latency(args)
+}
+
+fn validate_benchmark_phases(
+    input: &str,
+    options: &BenchmarkResolvedOptions,
+) -> Result<(), String> {
+    validate_benchmark_phases_with_vars(input, options, options.vars.clone())
+}
+
+fn validate_benchmark_phases_with_vars(
+    input: &str,
+    options: &BenchmarkResolvedOptions,
+    vars: BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut args = vec![
+        "--input".to_string(),
+        input.to_string(),
+        "--config".to_string(),
+        options.manifest_path.clone(),
+        "--output-dir".to_string(),
+        options.phase_report_dir.clone(),
+    ];
+    for tag in &options.tags {
+        args.push("--tag".to_string());
+        args.push(tag.clone());
+    }
+    for (name, limit) in &options.limits {
+        args.push("--limit".to_string());
+        args.push(format!("{name}={}", format_f64_arg(*limit)));
+    }
+    for (name, value) in vars {
+        args.push("--var".to_string());
+        args.push(format!("{name}={value}"));
+    }
+    run_validate_phase_config(args)
+}
+
+fn write_standard_benchmark_artifact(
+    manifest: &BenchmarkManifest,
+    options: &BenchmarkResolvedOptions,
+    input: &str,
+    output: &str,
+) -> Result<(), String> {
+    let payload = read_json_file(input)?;
+    let events = parse_phase_events_input(&serde_json::to_string(&payload).unwrap_or_default());
+    let latency = parse_samples_ms(&payload)
+        .ok()
+        .map(|samples| stats_json(compute_latency_stats(&samples)));
+    let artifact = json!({
+        "benchmark": manifest.benchmark.name,
+        "kind": manifest.benchmark.kind,
+        "profile": options.profile,
+        "scenario": options.scenario,
+        "iterations": options.iterations,
+        "warmup": options.warmup,
+        "phase_report_dir": options.phase_report_dir,
+        "limits": options.limits,
+        "tags": options.tags,
+        "loosen_slo": options.loosen_slo,
+        "latency_ms": latency,
+        "events": events,
+        "raw": payload,
+    });
+    let encoded = serde_json::to_vec_pretty(&artifact)
+        .map_err(|error| format!("failed encoding benchmark artifact: {error}"))?;
+    fs::write(output, encoded)
+        .map_err(|error| format!("failed writing benchmark artifact {output}: {error}"))
+}
+
+fn format_f64_arg(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        value.to_string()
+    }
 }
 
 fn run_validate_phase_config(args: Vec<String>) -> Result<(), String> {
@@ -1092,55 +1724,13 @@ fn run_sample(args: Vec<String>) -> Result<(), String> {
     let iterations = iterations.ok_or_else(|| "--iterations is required".to_string())?;
     let out_json = out_json.ok_or_else(|| "--out-json is required".to_string())?;
 
-    let mut samples_ms = Vec::with_capacity(iterations);
-    let mut retries = 0_u64;
-    let mut respawns = 0_u64;
-    let mut timeouts = 0_u64;
-    let mut phase_samples = Vec::with_capacity(iterations);
-
-    let command_name = &command[0];
-    let command_args = &command[1..];
-
-    for _ in 0..iterations {
-        let started = Instant::now();
-        let output = Command::new(command_name)
-            .args(command_args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| format!("failed executing sampled command: {error}"))?;
-        let elapsed = started.elapsed();
-        let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-
-        if !allow_nonzero && !output.status.success() {
-            return Err(format!(
-                "command exited with non-zero status: {}",
-                output.status.code().unwrap_or(1)
-            ));
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let faults = count_runtime_faults(&stderr);
-        retries += faults.retries;
-        respawns += faults.respawns;
-        timeouts += faults.timeouts;
-        phase_samples.push(parse_phase_events(&stderr));
-        samples_ms.push(elapsed_ms);
-    }
-
-    let payload = json!({
-        "samples_ms": samples_ms,
-        "runtime_faults": {
-            "retries": retries,
-            "respawns": respawns,
-            "timeouts": timeouts,
-        },
-        "phase_samples": phase_samples,
-    });
-    let encoded = serde_json::to_vec_pretty(&payload)
-        .map_err(|error| format!("failed encoding sample json: {error}"))?;
-    fs::write(out_json, encoded).map_err(|error| format!("failed writing sample json: {error}"))?;
-    Ok(())
+    sample_command(SampleCommandRequest {
+        iterations,
+        command: &command,
+        envs: &[],
+        out_json: &out_json,
+        allow_nonzero,
+    })
 }
 
 fn parse_phase_events(stderr: &str) -> Vec<Value> {

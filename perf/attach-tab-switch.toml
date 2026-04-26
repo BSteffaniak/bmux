@@ -1,3 +1,33 @@
+[benchmark]
+name = "attach-tab-switch"
+kind = "attach-tab-switch"
+
+[defaults]
+iterations = 30
+warmup = 5
+windows = 4
+switches = 4
+scenario = "next-window"
+attach_command_limit_ms = 8
+retarget_limit_ms = 8
+
+[profiles.normal]
+tags = ["navigation"]
+
+[profiles.diagnostic]
+tags = ["navigation", "service", "ipc", "storage"]
+service_timing = true
+ipc_timing = true
+storage_timing = true
+loosen_slo = true
+
+[profiles.ci]
+tags = ["navigation"]
+
+[profiles.stress]
+tags = ["navigation"]
+loosen_slo = true
+
 [limit]
 attach_command = 8
 retarget = 8

@@ -3,8 +3,8 @@
 Perf coverage is built from three reusable pieces:
 
 1. Runtime code emits phase events through `bmux_perf_telemetry`.
-2. Benchmark scripts create fixtures and collect one artifact.
-3. `bmux-perf-tools validate-phase-config` reads a TOML config and writes per-report summaries.
+2. `perf/*.toml` manifests define benchmark defaults, profiles, SLOs, and phase reports.
+3. `bmux-perf-tools run-benchmark` executes the benchmark and writes one standard artifact.
 
 ## Phase Events
 
@@ -30,6 +30,24 @@ Common fields should keep stable names:
 
 Benchmark SLOs and reports belong in `perf/*.toml`, not runtime code and not shell loops.
 
+Each benchmark config starts with manifest metadata:
+
+```toml
+[benchmark]
+name = "core-services"
+kind = "core-services"
+
+[defaults]
+iterations = 1000
+warmup = 100
+core_service_limit_ms = 1
+
+[profiles.normal]
+
+[profiles.diagnostic]
+loosen_slo = true
+```
+
 Each report selects a phase and numeric field:
 
 ```toml
@@ -45,6 +63,15 @@ filter = { key = "scenario", value = "storage.cached_get" }
 
 Use `tags` for expensive diagnostic reports so normal runs can skip them unless the script enables the tag.
 
+Run manifests directly with:
+
+```sh
+bmux-perf-tools run-benchmark --manifest perf/core-services.toml --profile normal
+bmux-perf-tools run-benchmark --manifest perf/attach-tab-switch.toml --profile normal --bmux-bin target/debug/bmux
+```
+
+The scripts in `scripts/perf-*.sh` are compatibility wrappers around `run-benchmark`.
+
 ## Profiles
 
 Profile metadata lives in `perf/profiles.toml`.
@@ -57,10 +84,17 @@ Profile metadata lives in `perf/profiles.toml`.
 ## Adding a Benchmark
 
 1. Add runtime phase events only through shared telemetry helpers.
-2. Make the runner produce one JSON artifact containing phase events, either marker logs parsed by `bmux-perf-tools` or an `events` array.
-3. Add a `perf/<benchmark>.toml` config with reports and limits.
-4. Keep the shell script focused on fixture setup, command execution, and one `validate-phase-config` call.
+2. Add a `perf/<benchmark>.toml` manifest with `[benchmark]`, `[defaults]`, `[profiles.*]`, `[limit]`, and `[[reports]]` sections.
+3. Prefer implementing the runner in `bmux-perf-tools run-benchmark`; keep shell scripts as wrappers only.
+4. Make the runner produce one standard artifact containing `benchmark`, `kind`, `profile`, `scenario`, `events`, `limits`, `latency_ms`, and `raw`.
 5. Run a normal-mode benchmark for SLO validation and a diagnostic-mode benchmark only for attribution.
+
+## Registry
+
+| Benchmark         | Manifest                      | Runner Kind         | Normal SLO                                                |
+| ----------------- | ----------------------------- | ------------------- | --------------------------------------------------------- |
+| Attach tab switch | `perf/attach-tab-switch.toml` | `attach-tab-switch` | `attach.plugin_command` p99 \<= 8ms, retarget p99 \<= 8ms |
+| Core services     | `perf/core-services.toml`     | `core-services`     | core service p99 \<= 1ms                                  |
 
 ## Maintenance Checklist
 
@@ -69,4 +103,5 @@ Profile metadata lives in `perf/profiles.toml`.
 - No command-specific fast path added only to satisfy a benchmark.
 - No plugin-domain convenience helper added to core architecture.
 - No diagnostic timing mode used as the only source for user-facing SLOs.
-- Every new benchmark has a config file and records its artifact path.
+- Every new benchmark has a manifest and records its artifact path.
+- Shell scripts should not duplicate benchmark setup or phase validation logic.
