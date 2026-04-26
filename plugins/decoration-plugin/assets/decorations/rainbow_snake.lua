@@ -13,6 +13,7 @@ local FLASH_MS = 150
 local snake_size = INITIAL_SNAKE_SIZE
 local apple_v = nil
 local rng_state = nil
+local head_offset_v = 0
 local death_started_ms = nil
 local death_segments = nil
 
@@ -156,13 +157,17 @@ local function reset_game(raw_total)
     death_segments = nil
 end
 
-local function render_death(cmds, ctx, raw_total)
+local function render_death(cmds, ctx, raw_total, visual_total)
     if death_started_ms == nil or death_segments == nil then
         return false
     end
 
     local elapsed = ctx.time_ms - death_started_ms
     if elapsed >= DEATH_HOLD_MS + DEATH_SHRINK_MS then
+        local min_count = math.min(INITIAL_SNAKE_SIZE, #death_segments)
+        local resume_index = math.max(1, #death_segments - min_count + 1)
+        local resume_head_v = death_segments[resume_index].offset
+        head_offset_v = (resume_head_v - (ctx.time_ms / 1000.0) * SPEED) % visual_total
         reset_game(raw_total)
         return false
     end
@@ -202,11 +207,11 @@ function decorate(ctx)
     end
 
     local cmds = {}
-    if render_death(cmds, ctx, raw_total) then
+    if render_death(cmds, ctx, raw_total, visual_total) then
         return cmds
     end
 
-    local head = ((ctx.time_ms / 1000.0) * SPEED) % visual_total
+    local head = (head_offset_v + (ctx.time_ms / 1000.0) * SPEED) % visual_total
     local snake_len = math.min(snake_size, raw_total)
     local segments = snake_segments(ctx.rect, head, snake_len, visual_total)
 
@@ -227,7 +232,7 @@ function decorate(ctx)
         death_started_ms = ctx.time_ms
         death_segments = segments
         apple_v = nil
-        render_death(cmds, ctx, raw_total)
+        render_death(cmds, ctx, raw_total, visual_total)
         return cmds
     end
 
