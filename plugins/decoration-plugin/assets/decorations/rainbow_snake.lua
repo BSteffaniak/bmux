@@ -7,7 +7,7 @@ local SPACING = 2.0
 local EAT_RADIUS = 0.75
 local APPLE_PAD = 0.75
 local DEATH_HOLD_MS = 3000
-local DEATH_SHRINK_MS = 1200
+local DEATH_SHRINK_MS = 3000
 local FLASH_MS = 150
 
 local snake_size = INITIAL_SNAKE_SIZE
@@ -179,8 +179,12 @@ local function render_death(cmds, ctx, raw_total)
         end
 
         local visible_segments = {}
-        for i = 1, visible_count do
-            visible_segments[i] = death_segments[i]
+        local start_index = 1
+        if elapsed > DEATH_HOLD_MS then
+            start_index = #death_segments - visible_count + 1
+        end
+        for i = start_index, #death_segments do
+            table.insert(visible_segments, death_segments[i])
         end
         render_snake(cmds, visible_segments, 1, true)
     end
