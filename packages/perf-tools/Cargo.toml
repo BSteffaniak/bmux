@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 bmux_plugin     = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
+serde           = { workspace = true }
 serde_json      = { workspace = true }
 
 [features]

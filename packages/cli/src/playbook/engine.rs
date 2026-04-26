@@ -687,6 +687,46 @@ async fn cycle_known_window_playbook(
     ))
 }
 
+async fn goto_known_window_playbook(
+    client: &mut BmuxClient,
+    runtime: &AttachInputRuntime,
+    args: &[String],
+) -> anyhow::Result<(Uuid, PlaybookWindowCycleTiming)> {
+    let total_started = Instant::now();
+    let target_index = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("goto-window requires an index argument"))?
+        .parse::<usize>()
+        .map_err(|error| anyhow::anyhow!("invalid goto-window index: {error}"))?
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("goto-window index must be at least 1"))?;
+    let contexts = &runtime.state.window_context_ids;
+    if contexts.is_empty() {
+        return Err(anyhow::anyhow!("known window context list is empty"));
+    }
+    let resolve_started = Instant::now();
+    let Some(target_id) = contexts.get(target_index).copied() else {
+        return Err(anyhow::anyhow!(
+            "goto-window index {} is out of range for {} known windows",
+            target_index + 1,
+            contexts.len()
+        ));
+    };
+    let resolve_us = resolve_started.elapsed().as_micros();
+    let invoke_started = Instant::now();
+    switch_window_by_id_playbook(client, target_id).await?;
+    Ok((
+        target_id,
+        PlaybookWindowCycleTiming {
+            known_contexts: true,
+            resolve_us,
+            invoke_us: invoke_started.elapsed().as_micros(),
+            total_us: total_started.elapsed().as_micros(),
+            ..PlaybookWindowCycleTiming::default()
+        },
+    ))
+}
+
 async fn run_known_attach_plugin_command_playbook(
     client: &mut BmuxClient,
     plugin_id: &str,
@@ -2959,6 +2999,12 @@ async fn apply_attach_runtime_actions(
                 } else if plugin_id == "bmux.windows" && command_name == "prev-window" {
                     let (context_id, timing) =
                         cycle_known_window_playbook(client, runtime, true).await?;
+                    selected_context_id = Some(context_id);
+                    window_cycle_timing = Some(timing);
+                    PluginCliCommandResponse::new(0)
+                } else if plugin_id == "bmux.windows" && command_name == "goto-window" {
+                    let (context_id, timing) =
+                        goto_known_window_playbook(client, runtime, &args).await?;
                     selected_context_id = Some(context_id);
                     window_cycle_timing = Some(timing);
                     PluginCliCommandResponse::new(0)

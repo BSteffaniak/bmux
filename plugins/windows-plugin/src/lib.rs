@@ -394,6 +394,25 @@ fn append_context_to_window_order(
     set_stored_window_order_ids(caller, &order_ids)
 }
 
+fn append_contexts_to_window_order(
+    caller: &impl HostRuntimeApi,
+    context_ids: impl IntoIterator<Item = Uuid>,
+) -> Result<(), String> {
+    let mut order_ids = get_stored_window_order_ids(caller)?;
+    let mut known_ids = order_ids.iter().copied().collect::<HashSet<_>>();
+    let mut changed = false;
+    for context_id in context_ids {
+        if known_ids.insert(context_id) {
+            order_ids.push(context_id);
+            changed = true;
+        }
+    }
+    if changed {
+        set_stored_window_order_ids(caller, &order_ids)?;
+    }
+    Ok(())
+}
+
 /// Remove `context_id` from the persisted `windows.order` list.
 /// No-op when the id is not present. Also clears the active marker
 /// if it was pointing at the removed context.
@@ -836,13 +855,14 @@ fn reset_window_order(caller: &impl HostRuntimeApi) -> Result<usize, String> {
 }
 
 fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<WindowAck, String> {
-    let resolved_name = name.or_else(|| {
-        caller
-            .context_list()
-            .ok()
-            .map(|response| next_default_tab_name_for_contexts(&response.contexts))
-    });
-    let previous_context = resolve_effective_current_context(caller).ok().flatten();
+    let mut contexts = caller
+        .context_list()
+        .map_err(|error| error.to_string())?
+        .contexts;
+    let resolved_name = name.or_else(|| Some(next_default_tab_name_for_contexts(&contexts)));
+    let previous_context = resolve_effective_current_context_with_contexts(caller, &contexts)
+        .ok()
+        .flatten();
     let response = caller
         .context_create(&ContextCreateRequest {
             name: resolved_name,
@@ -850,10 +870,13 @@ fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<W
         })
         .map_err(|error| error.to_string())?;
     let context_id = response.context.id;
+    contexts.push(response.context);
+    let mut order_appends = Vec::with_capacity(2);
     if let Some(previous) = previous_context {
-        append_context_to_window_order(caller, previous)?;
+        order_appends.push(previous);
     }
-    append_context_to_window_order(caller, context_id)?;
+    order_appends.push(context_id);
+    append_contexts_to_window_order(caller, order_appends)?;
     if let Some(previous) = previous_context
         && previous != context_id
     {
@@ -861,7 +884,7 @@ fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<W
     }
     let _ = set_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
     let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
-    publish_window_list_snapshot(caller);
+    publish_window_list_snapshot_from_contexts(caller, &contexts, Some(context_id));
     Ok(WindowAck {
         ok: true,
         id: Some(context_id.to_string()),
@@ -1165,14 +1188,6 @@ fn resolve_context_id_from_contexts(
         })
         .map(|context| context.id)
         .ok_or_else(|| "target context not found".to_string())
-}
-
-fn resolve_effective_current_context(caller: &impl HostRuntimeApi) -> Result<Option<Uuid>, String> {
-    let contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
-    resolve_effective_current_context_with_contexts(caller, &contexts)
 }
 
 fn resolve_effective_current_context_with_contexts(

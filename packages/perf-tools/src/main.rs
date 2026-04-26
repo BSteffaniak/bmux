@@ -4,7 +4,9 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::{self, Command, Stdio};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use bmux_plugin::ServiceCaller;
 
 fn main() {
     if let Err(error) = run() {
@@ -27,6 +29,7 @@ fn run() -> Result<(), String> {
         "report-json" => run_report_json(args),
         "report-phase-file" => run_report_phase_file(args),
         "sample-static-service" => run_sample_static_service(args),
+        "sample-core-services" => run_sample_core_services(args),
         "prepare-scale-fixture" => run_prepare_scale_fixture(args),
         "compare-report" => run_compare_report(args),
         "discover-run-candidate" => run_discover_run_candidate(args),
@@ -46,6 +49,7 @@ fn usage() -> &'static str {
   report-json --input PATH --output PATH [threshold flags]
   report-phase-file --input PATH --output PATH --phase NAME --field FIELD [--filter-key KEY --filter-value VALUE] [--max-p99-ms N] [--max-p95-ms N]
   sample-static-service --iterations N --warmup N --out-json PATH [--max-p99-us N]
+  sample-core-services --iterations N --warmup N --out-json PATH [--max-p99-us N]
   prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
   compare-report --baseline PATH --candidate PATH [--candidate PATH ...] [--warn-regression-ms N] [--json-output PATH]
   discover-run-candidate --bmux-bin PATH"
@@ -283,6 +287,384 @@ fn run_sample_static_service(args: Vec<String>) -> Result<(), String> {
     fs::write(out_json, encoded)
         .map_err(|error| format!("failed writing static service sample json: {error}"))?;
     Ok(())
+}
+
+fn run_sample_core_services(args: Vec<String>) -> Result<(), String> {
+    let mut iterations = None;
+    let mut warmup = 0_usize;
+    let mut out_json = None;
+    let mut max_p99_us = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--iterations" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--iterations requires a value".to_string());
+                };
+                iterations = Some(parse_u64(value, "--iterations")? as usize);
+                index += 2;
+            }
+            "--warmup" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--warmup requires a value".to_string());
+                };
+                warmup = parse_u64(value, "--warmup")? as usize;
+                index += 2;
+            }
+            "--out-json" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--out-json requires a value".to_string());
+                };
+                out_json = Some(value.clone());
+                index += 2;
+            }
+            "--max-p99-us" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--max-p99-us requires a value".to_string());
+                };
+                max_p99_us = Some(parse_u64(value, "--max-p99-us")? as f64);
+                index += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument for sample-core-services: {other}"
+                ));
+            }
+        }
+    }
+
+    let iterations = iterations.ok_or_else(|| "--iterations is required".to_string())?;
+    let out_json = out_json.ok_or_else(|| "--out-json is required".to_string())?;
+
+    let sandbox = env::temp_dir().join(format!(
+        "bmux-core-service-perf-{}-{}",
+        process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock is before unix epoch: {error}"))?
+            .as_nanos()
+    ));
+    let data_dir = sandbox.join("data");
+    fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("failed creating benchmark data dir: {error}"))?;
+    let connection = bmux_plugin_sdk::HostConnectionInfo {
+        config_dir: sandbox.join("config").display().to_string(),
+        config_dir_candidates: Vec::new(),
+        runtime_dir: sandbox.join("runtime").display().to_string(),
+        data_dir: data_dir.display().to_string(),
+        state_dir: sandbox.join("state").display().to_string(),
+    };
+    let context = CoreServiceBenchContext::new(connection);
+
+    let result = (|| {
+        for index in 0..warmup {
+            context.storage_set("warmup", b"warmup")?;
+            let _: Option<Vec<u8>> = context.storage_get("warmup")?;
+            context.volatile_set("warmup", b"warmup")?;
+            let _: Option<Vec<u8>> = context.volatile_get("warmup")?;
+            context.volatile_clear("warmup")?;
+            context.prepare_storage_file(&format!("warmup-cold-{index}"), b"warmup")?;
+        }
+
+        context.storage_set("cached", b"cached-value")?;
+        let _: Option<Vec<u8>> = context.storage_get("cached")?;
+        context.volatile_set("volatile", b"volatile-value")?;
+
+        let storage_cold_get = sample_core_service_operation(iterations, |index| {
+            let key = format!("cold-get-{index}");
+            context.prepare_storage_file(&key, b"cold-value")?;
+            let _: Option<Vec<u8>> = context.storage_get(&key)?;
+            Ok(())
+        })?;
+        let storage_cached_get = sample_core_service_operation(iterations, |_| {
+            let _: Option<Vec<u8>> = context.storage_get("cached")?;
+            Ok(())
+        })?;
+        let storage_set = sample_core_service_operation(iterations, |index| {
+            context.storage_set(&format!("set-{index}"), b"set-value")
+        })?;
+        let volatile_get = sample_core_service_operation(iterations, |_| {
+            let _: Option<Vec<u8>> = context.volatile_get("volatile")?;
+            Ok(())
+        })?;
+        let volatile_set = sample_core_service_operation(iterations, |index| {
+            context.volatile_set(&format!("volatile-set-{index}"), b"volatile-value")
+        })?;
+        let volatile_clear = sample_core_service_operation(iterations, |index| {
+            let key = format!("volatile-clear-{index}");
+            context.volatile_set(&key, b"volatile-value")?;
+            context.volatile_clear(&key)
+        })?;
+
+        let static_service_path = sandbox.join("static-service.json");
+        run_sample_static_service(vec![
+            "--iterations".to_string(),
+            iterations.to_string(),
+            "--warmup".to_string(),
+            warmup.to_string(),
+            "--out-json".to_string(),
+            static_service_path.display().to_string(),
+        ])?;
+        let static_service_payload = fs::read_to_string(&static_service_path)
+            .map_err(|error| format!("failed reading static service sample json: {error}"))?;
+        let static_service_json: Value = serde_json::from_str(&static_service_payload)
+            .map_err(|error| format!("failed decoding static service sample json: {error}"))?;
+        let static_service_samples = static_service_json
+            .get("samples_us")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "static service sample json missing samples_us".to_string())?
+            .iter()
+            .filter_map(Value::as_f64)
+            .collect::<Vec<_>>();
+
+        let scenarios = vec![
+            core_service_scenario_json("storage.cold_get", storage_cold_get, max_p99_us),
+            core_service_scenario_json("storage.cached_get", storage_cached_get, max_p99_us),
+            core_service_scenario_json("storage.set", storage_set, max_p99_us),
+            core_service_scenario_json("volatile.get", volatile_get, max_p99_us),
+            core_service_scenario_json("volatile.set", volatile_set, max_p99_us),
+            core_service_scenario_json("volatile.clear", volatile_clear, max_p99_us),
+            core_service_scenario_json("static_service.direct", static_service_samples, max_p99_us),
+        ];
+        let violations = scenarios
+            .iter()
+            .filter_map(|scenario| scenario.get("violation").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        for scenario in &scenarios {
+            let stats = scenario
+                .get("latency_us")
+                .ok_or_else(|| "scenario missing latency_us".to_string())?;
+            println!(
+                "{} p50={:.3}us p95={:.3}us p99={:.3}us avg={:.3}us max={:.3}us",
+                scenario
+                    .get("scenario")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                stats.get("p50").and_then(Value::as_f64).unwrap_or(0.0),
+                stats.get("p95").and_then(Value::as_f64).unwrap_or(0.0),
+                stats.get("p99").and_then(Value::as_f64).unwrap_or(0.0),
+                stats.get("avg").and_then(Value::as_f64).unwrap_or(0.0),
+                stats.get("max").and_then(Value::as_f64).unwrap_or(0.0),
+            );
+        }
+        let passed = violations.is_empty();
+        let payload = json!({
+            "scenario": "core-services",
+            "iterations": iterations,
+            "warmup": warmup,
+            "scenarios": scenarios,
+            "limits": { "max_p99_us": max_p99_us },
+            "passed": passed,
+            "violations": violations,
+        });
+        let encoded = serde_json::to_vec_pretty(&payload)
+            .map_err(|error| format!("failed encoding core service sample json: {error}"))?;
+        fs::write(&out_json, encoded)
+            .map_err(|error| format!("failed writing core service sample json: {error}"))?;
+        if passed {
+            Ok(())
+        } else {
+            Err("core service SLO failed".to_string())
+        }
+    })();
+
+    let cleanup_result = fs::remove_dir_all(&sandbox);
+    if let Err(error) = cleanup_result
+        && result.is_ok()
+    {
+        return Err(format!("failed cleaning benchmark sandbox: {error}"));
+    }
+    result
+}
+
+struct CoreServiceBenchContext {
+    connection: bmux_plugin_sdk::HostConnectionInfo,
+    caller: bmux_plugin::TypedServiceCaller,
+}
+
+impl CoreServiceBenchContext {
+    fn new(connection: bmux_plugin_sdk::HostConnectionInfo) -> Self {
+        let storage = bmux_plugin_sdk::HostScope::new("bmux.storage")
+            .expect("storage capability should parse");
+        let services = vec![
+            bmux_plugin_sdk::RegisteredService {
+                capability: storage.clone(),
+                kind: bmux_plugin_sdk::ServiceKind::Query,
+                interface_id: "storage-query/v1".to_string(),
+                provider: bmux_plugin_sdk::ProviderId::Host,
+            },
+            bmux_plugin_sdk::RegisteredService {
+                capability: storage.clone(),
+                kind: bmux_plugin_sdk::ServiceKind::Command,
+                interface_id: "storage-command/v1".to_string(),
+                provider: bmux_plugin_sdk::ProviderId::Host,
+            },
+            bmux_plugin_sdk::RegisteredService {
+                capability: storage.clone(),
+                kind: bmux_plugin_sdk::ServiceKind::Query,
+                interface_id: "volatile-state-query/v1".to_string(),
+                provider: bmux_plugin_sdk::ProviderId::Host,
+            },
+            bmux_plugin_sdk::RegisteredService {
+                capability: storage,
+                kind: bmux_plugin_sdk::ServiceKind::Command,
+                interface_id: "volatile-state-command/v1".to_string(),
+                provider: bmux_plugin_sdk::ProviderId::Host,
+            },
+        ];
+        let host = bmux_plugin_sdk::HostMetadata {
+            product_name: "bmux".to_string(),
+            product_version: env!("CARGO_PKG_VERSION").to_string(),
+            plugin_api_version: bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION,
+            plugin_abi_version: bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION,
+        };
+        let required_capabilities = vec!["bmux.storage".to_string()];
+        let available_capabilities = vec!["bmux.storage".to_string()];
+        let enabled_plugins = vec!["bmux.perf-tools".to_string()];
+        let plugin_search_roots = Vec::new();
+        let plugin_settings_map = BTreeMap::new();
+        let registration_context = bmux_plugin_sdk::TypedServiceRegistrationContext {
+            plugin_id: "bmux.perf-tools",
+            host_kernel_bridge: None,
+            required_capabilities: &required_capabilities,
+            provided_capabilities: &[],
+            services: &services,
+            available_capabilities: &available_capabilities,
+            enabled_plugins: &enabled_plugins,
+            plugin_search_roots: &plugin_search_roots,
+            host: &host,
+            connection: &connection,
+            plugin_settings_map: &plugin_settings_map,
+        };
+        let caller =
+            bmux_plugin::TypedServiceCaller::from_registration_context(&registration_context);
+        Self { connection, caller }
+    }
+
+    fn prepare_storage_file(&self, key: &str, value: &[u8]) -> Result<(), String> {
+        let path = Path::new(&self.connection.data_dir)
+            .join("plugin-storage")
+            .join("bmux.perf-tools")
+            .join(format!("{key}.bin"));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed creating storage fixture dir: {error}"))?;
+        }
+        fs::write(path, value).map_err(|error| format!("failed writing storage fixture: {error}"))
+    }
+
+    fn storage_get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        let request = bmux_plugin_sdk::StorageGetRequest {
+            key: key.to_string(),
+        };
+        self.call(
+            bmux_plugin_sdk::ServiceKind::Query,
+            "storage-query/v1",
+            "get",
+            &request,
+        )
+        .map(|response: bmux_plugin_sdk::StorageGetResponse| response.value)
+    }
+
+    fn storage_set(&self, key: &str, value: &[u8]) -> Result<(), String> {
+        let request = bmux_plugin_sdk::StorageSetRequest {
+            key: key.to_string(),
+            value: value.to_vec(),
+        };
+        self.call(
+            bmux_plugin_sdk::ServiceKind::Command,
+            "storage-command/v1",
+            "set",
+            &request,
+        )
+    }
+
+    fn volatile_get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        let request = bmux_plugin_sdk::VolatileStateGetRequest {
+            key: key.to_string(),
+        };
+        self.call(
+            bmux_plugin_sdk::ServiceKind::Query,
+            "volatile-state-query/v1",
+            "get",
+            &request,
+        )
+        .map(|response: bmux_plugin_sdk::VolatileStateGetResponse| response.value)
+    }
+
+    fn volatile_set(&self, key: &str, value: &[u8]) -> Result<(), String> {
+        let request = bmux_plugin_sdk::VolatileStateSetRequest {
+            key: key.to_string(),
+            value: value.to_vec(),
+        };
+        self.call(
+            bmux_plugin_sdk::ServiceKind::Command,
+            "volatile-state-command/v1",
+            "set",
+            &request,
+        )
+    }
+
+    fn volatile_clear(&self, key: &str) -> Result<(), String> {
+        let request = bmux_plugin_sdk::VolatileStateClearRequest {
+            key: key.to_string(),
+        };
+        self.call(
+            bmux_plugin_sdk::ServiceKind::Command,
+            "volatile-state-command/v1",
+            "clear",
+            &request,
+        )
+    }
+
+    fn call<Request, Response>(
+        &self,
+        kind: bmux_plugin_sdk::ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        request: &Request,
+    ) -> Result<Response, String>
+    where
+        Request: serde::Serialize,
+        Response: serde::de::DeserializeOwned,
+    {
+        let payload = bmux_plugin_sdk::encode_service_message(request)
+            .map_err(|error| format!("failed encoding request: {error}"))?;
+        let response = self
+            .caller
+            .call_service_raw("bmux.storage", kind, interface_id, operation, payload)
+            .map_err(|error| format!("core service call failed: {error}"))?;
+        bmux_plugin_sdk::decode_service_message(&response)
+            .map_err(|error| format!("failed decoding response: {error}"))
+    }
+}
+
+fn sample_core_service_operation(
+    iterations: usize,
+    mut operation: impl FnMut(usize) -> Result<(), String>,
+) -> Result<Vec<f64>, String> {
+    let mut samples = Vec::with_capacity(iterations);
+    for index in 0..iterations {
+        let started = Instant::now();
+        operation(index)?;
+        samples.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+    Ok(samples)
+}
+
+fn core_service_scenario_json(name: &str, samples_us: Vec<f64>, max_p99_us: Option<f64>) -> Value {
+    let stats = compute_latency_stats(&samples_us);
+    let violation = max_p99_us.and_then(|limit| {
+        (stats.p99 > limit).then(|| format!("{name} p99 {:.3}us > {:.3}us", stats.p99, limit))
+    });
+    json!({
+        "scenario": name,
+        "samples_us": samples_us,
+        "latency_us": stats_json(stats),
+        "violation": violation,
+    })
 }
 
 fn load_performance_plugin() -> Result<bmux_plugin::LoadedPlugin, String> {

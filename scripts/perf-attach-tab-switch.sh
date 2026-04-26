@@ -7,6 +7,7 @@ ITERATIONS="${ITERATIONS:-30}"
 WARMUP="${WARMUP:-5}"
 WINDOWS="${WINDOWS:-4}"
 SWITCHES="${SWITCHES:-4}"
+SCENARIO="${SCENARIO:-next-window}"
 MAX_P99_MS="${MAX_P99_MS:-}"
 MAX_ATTACH_COMMAND_P99_MS="${MAX_ATTACH_COMMAND_P99_MS:-8}"
 MAX_RETARGET_P99_MS="${MAX_RETARGET_P99_MS:-8}"
@@ -33,6 +34,7 @@ Options:
   --warmup N                      Warmup iterations (default: 5)
   --windows N                     Number of windows/tabs in each playbook run (default: 4)
   --switches N                    Number of ctrl+s switches per playbook run (default: 4)
+  --scenario NAME                 next-window|prev-window|goto-window|new-window (default: next-window)
   --bmux-bin PATH                 Use an explicit bmux executable path
   --artifact-json PATH            Write machine-readable JSON artifact
   --service-timing                Include generic InvokeService client timing
@@ -70,6 +72,10 @@ while (($# > 0)); do
 		;;
 	--switches)
 		SWITCHES="$2"
+		shift 2
+		;;
+	--scenario)
+		SCENARIO="$2"
 		shift 2
 		;;
 	--bmux-bin)
@@ -134,6 +140,37 @@ if [[ "$SWITCHES" -lt 1 ]]; then
 	exit 2
 fi
 
+MEASURED_COMMAND_NAME=""
+SERVICE_OPERATION="switch-window"
+case "$SCENARIO" in
+next-window)
+	MEASURED_COMMAND_NAME="next-window"
+	STEADY_PRIME_KEY="ctrl+h"
+	;;
+prev-window)
+	MEASURED_COMMAND_NAME="prev-window"
+	STEADY_PRIME_KEY="ctrl+s"
+	;;
+goto-window)
+	MEASURED_COMMAND_NAME="goto-window"
+	STEADY_PRIME_KEY="alt+1"
+	if [[ "$WINDOWS" -lt 3 ]]; then
+		echo "--scenario goto-window requires --windows at least 3" >&2
+		exit 2
+	fi
+	;;
+new-window)
+	MEASURED_COMMAND_NAME="new-window"
+	SERVICE_OPERATION="new-window"
+	STEADY_PRIME_KEY=""
+	;;
+*)
+	echo "unknown --scenario: $SCENARIO" >&2
+	usage
+	exit 2
+	;;
+esac
+
 cd "$ROOT_DIR"
 
 if [[ -z "$BMUX_PERF_TOOLS_BIN" ]]; then
@@ -168,12 +205,31 @@ SAMPLE_JSON_FILE="$SANDBOX/sample.json"
 	printf '@shell sh\n'
 	printf '@viewport cols=120 rows=40\n'
 	printf 'new-session\n'
-	for ((i = 2; i <= WINDOWS; i += 1)); do
+	for ((i = 1; i <= WINDOWS; i += 1)); do
 		printf 'send-attach key=%q\n' 'c'
 	done
-	printf 'send-attach key=%q\n' 'ctrl+h'
+	if [[ -n "$STEADY_PRIME_KEY" ]]; then
+		printf 'send-attach key=%q\n' "$STEADY_PRIME_KEY"
+	fi
 	for ((i = 1; i <= SWITCHES; i += 1)); do
-		printf 'send-attach key=%q\n' 'ctrl+s'
+		case "$SCENARIO" in
+		next-window)
+			printf 'send-attach key=%q\n' 'ctrl+s'
+			;;
+		prev-window)
+			printf 'send-attach key=%q\n' 'ctrl+h'
+			;;
+		goto-window)
+			if ((i % 2 == 0)); then
+				printf 'send-attach key=%q\n' 'alt+2'
+			else
+				printf 'send-attach key=%q\n' 'alt+3'
+			fi
+			;;
+		new-window)
+			printf 'send-attach key=%q\n' 'c'
+			;;
+		esac
 	done
 	printf 'screen\n'
 } >"$PLAYBOOK"
@@ -193,7 +249,7 @@ if [[ "$STORAGE_TIMING" -eq 1 ]]; then
 fi
 
 echo "benchmarking attach tab-switch playbook"
-echo "iterations=${ITERATIONS} warmup=${WARMUP} windows=${WINDOWS} switches=${SWITCHES}"
+echo "iterations=${ITERATIONS} warmup=${WARMUP} windows=${WINDOWS} switches=${SWITCHES} scenario=${SCENARIO}"
 
 for ((i = 0; i < WARMUP; i += 1)); do
 	"$BMUX_BIN" playbook run "$PLAYBOOK" --json >/dev/null 2>&1
@@ -235,15 +291,17 @@ phase_report() {
 	"${cmd[@]}"
 }
 
-phase_report attach.plugin_command total_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
-phase_report attach.plugin_command before_context_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
-phase_report attach.plugin_command run_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
-phase_report attach.plugin_command retarget_us "$MAX_RETARGET_P99_MS" command_name next-window
-phase_report attach.window_cycle invoke_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
+phase_report attach.plugin_command total_us "$MAX_ATTACH_COMMAND_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+phase_report attach.plugin_command before_context_us "$MAX_ATTACH_COMMAND_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+phase_report attach.plugin_command run_us "$MAX_ATTACH_COMMAND_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+phase_report attach.plugin_command retarget_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+if [[ "$SCENARIO" == "next-window" || "$SCENARIO" == "prev-window" || "$SCENARIO" == "goto-window" ]]; then
+	phase_report attach.window_cycle invoke_us "$MAX_ATTACH_COMMAND_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+fi
 if [[ "$SERVICE_TIMING" -eq 1 ]]; then
-	phase_report service.client_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation switch-window
-	phase_report service.server_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation switch-window
-	phase_report service.server_invoke invocation_us "$MAX_ATTACH_COMMAND_P99_MS" operation switch-window
+	phase_report service.client_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
+	phase_report service.server_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
+	phase_report service.server_invoke invocation_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
 fi
 if [[ "$IPC_TIMING" -eq 1 ]]; then
 	phase_report ipc.client_request total_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
@@ -255,11 +313,11 @@ if [[ "$STORAGE_TIMING" -eq 1 ]]; then
 	phase_report volatile_state.get total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows
 	phase_report volatile_state.set total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows
 fi
-phase_report attach.retarget_context total_us "$MAX_RETARGET_P99_MS" command_name next-window
-phase_report attach.retarget_context retarget_service_us "$MAX_RETARGET_P99_MS" command_name next-window
-phase_report attach.retarget_context grant_us "$MAX_RETARGET_P99_MS" command_name next-window
-phase_report attach.retarget_context open_us "$MAX_RETARGET_P99_MS" command_name next-window
-phase_report attach.retarget_context viewport_us "$MAX_RETARGET_P99_MS" command_name next-window
+phase_report attach.retarget_context total_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+phase_report attach.retarget_context retarget_service_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+phase_report attach.retarget_context grant_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+phase_report attach.retarget_context open_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+phase_report attach.retarget_context viewport_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
 
 if [[ -n "$ARTIFACT_JSON" ]]; then
 	"$BMUX_PERF_TOOLS_BIN" report-json \
