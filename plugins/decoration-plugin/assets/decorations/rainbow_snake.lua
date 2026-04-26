@@ -73,24 +73,35 @@ local function distance_behind_head(head, point, total)
     return (head - point) % total
 end
 
-local function apple_on_snake(head, apple, snake_len, segment_visual_spacing, visual_total)
+local function apple_on_snake(head, apple, snake_len, segment_visual_spacing, visual_total, pad)
     if apple == nil then
         return false
     end
     local body_span = math.max(0, snake_len - 1) * segment_visual_spacing
-    return distance_behind_head(head, apple, visual_total) <= body_span + 0.5
+    return distance_behind_head(head, apple, visual_total) <= body_span + (pad or 0.5)
 end
 
 local function spawn_apple(ctx, head, snake_len, segment_visual_spacing, visual_total)
-    local body_span = math.max(0, snake_len - 1) * segment_visual_spacing
-    local margin = segment_visual_spacing * 2
-    local free_span = visual_total - body_span - margin * 2
-    if free_span <= 1 then
-        apple_v = nil
-        return
+    for _ = 1, 32 do
+        local candidate = (next_random(ctx, 1000000) / 1000000.0) * visual_total
+        if not apple_on_snake(head, candidate, snake_len, segment_visual_spacing, visual_total, 0.75) then
+            apple_v = candidate
+            return
+        end
     end
-    local roll = next_random(ctx, 1000000) / 1000000.0
-    apple_v = (head + margin + roll * free_span) % visual_total
+
+    local step = math.max(0.5, segment_visual_spacing / 2)
+    local scan_count = math.floor(visual_total / step)
+    local start = (next_random(ctx, 1000000) / 1000000.0) * visual_total
+    for i = 0, scan_count do
+        local candidate = (start + i * step) % visual_total
+        if not apple_on_snake(head, candidate, snake_len, segment_visual_spacing, visual_total, 0.75) then
+            apple_v = candidate
+            return
+        end
+    end
+
+    apple_v = nil
 end
 
 local function insert_diamond(cmds, col, row, z, r, g, b)
