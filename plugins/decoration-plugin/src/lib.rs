@@ -14,7 +14,7 @@
 pub mod glyphs;
 pub mod scripting;
 
-use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -35,7 +35,10 @@ use bmux_scene_protocol::scene_protocol::{
 };
 use uuid::Uuid;
 
-use crate::scripting::{DecorateContext, PerfTracker, ScriptBackend, bundled_decoration_scripts};
+use crate::scripting::{
+    PerfTracker, ScriptBackend, ScriptEventDelivery, ScriptEventMessage, ScriptMessage,
+    ScriptRenderMessage, bundled_decoration_scripts,
+};
 
 /// In-memory state store.
 #[derive(Default)]
@@ -71,7 +74,7 @@ struct State {
     /// live Lua VM when a theme preview and final selection apply the
     /// same script back-to-back.
     script_source_hash: Option<u64>,
-    /// Monotonic start instant used to populate `DecorateContext::time_ms`.
+    /// Monotonic start instant used to populate render-message `time_ms`.
     /// Set when the first script is installed so relative timings are
     /// stable across reloads.
     script_started_at: Option<Instant>,
@@ -80,6 +83,10 @@ struct State {
     /// Optional perf tracker that emits a `WARN` log when the script's
     /// P95 invoke time drifts above the threshold.
     script_perf: Option<PerfTracker>,
+    /// Pending event messages to deliver into the Lua VM before the next render.
+    script_events: VecDeque<ScriptEventMessage>,
+    /// External plugin event kinds the active script asked to receive.
+    script_event_subscriptions: Vec<String>,
     /// Active animation tick rate. Threads exit when this value changes.
     animation_hz: Option<u16>,
     /// Diagnostic flag flipped on the first frame where the script was
@@ -333,6 +340,7 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
             }
             state.activity_mut(*pane_id).focused = true;
             state.sync_focused_mirror(*pane_id, true);
+            queue_script_snapshot(state);
             bump_revision(state);
         }
         PaneEvent::Unfocused { pane_id } => {
@@ -340,26 +348,31 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
                 act.focused = false;
             }
             state.sync_focused_mirror(*pane_id, false);
+            queue_script_snapshot(state);
             bump_revision(state);
         }
         PaneEvent::Zoomed { pane_id } => {
             state.activity_mut(*pane_id).zoomed = true;
+            queue_script_snapshot(state);
             bump_revision(state);
         }
         PaneEvent::Unzoomed { pane_id } => {
             if let Some(act) = state.activity.get_mut(pane_id) {
                 act.zoomed = false;
+                queue_script_snapshot(state);
                 bump_revision(state);
             }
         }
         PaneEvent::Opened { pane_id, .. } => {
             state.activity_mut(*pane_id);
+            queue_script_snapshot(state);
             bump_revision(state);
         }
         PaneEvent::Closed { pane_id } => {
             state.panes.remove(pane_id);
             state.geometry.remove(pane_id);
             state.activity.remove(pane_id);
+            queue_script_snapshot(state);
             bump_revision(state);
         }
         PaneEvent::StatusChanged { pane_id, exited } => {
@@ -369,6 +382,7 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
             } else {
                 PaneLifecycle::Running
             };
+            queue_script_snapshot(state);
             bump_revision(state);
         }
     }
@@ -447,37 +461,69 @@ fn build_scene(state: &mut State) -> DecorationScene {
     }
 }
 
-/// Build a `DecorateContext` from the plugin's cached geometry /
-/// activity for `pane_id`. Returns `None` if geometry is not known
-/// yet — the script has nothing concrete to paint until the attach
-/// runtime reports layout.
-fn decorate_context_for(state: &State, pane_id: Uuid) -> Option<DecorateContext> {
+fn script_pane_payload(state: &State, pane_id: Uuid) -> Option<serde_json::Value> {
     let geom = state.geometry.get(&pane_id)?;
     let activity = state.activity.get(&pane_id);
     let (focused, zoomed) = activity.map_or((false, false), |a| (a.focused, a.zoomed));
-    let started_at = state.script_started_at?;
-    let time_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    Some(DecorateContext {
-        pane_id: pane_id.to_string(),
-        rect: (geom.rect.x, geom.rect.y, geom.rect.w, geom.rect.h),
-        content_rect: (
-            geom.content_rect.x,
-            geom.content_rect.y,
-            geom.content_rect.w,
-            geom.content_rect.h,
-        ),
-        focused,
-        zoomed,
-        bell: false,
-        time_ms,
-        frame: state.script_frame,
+    let status = activity.map_or(PaneLifecycle::Running, |a| a.status);
+    Some(serde_json::json!({
+        "id": pane_id.to_string(),
+        "rect": rect_json(&geom.rect),
+        "content_rect": rect_json(&geom.content_rect),
+        "focused": focused,
+        "zoomed": zoomed,
+        "status": match status {
+            PaneLifecycle::Running => "running",
+            PaneLifecycle::Exited => "exited",
+        },
+    }))
+}
+
+fn rect_json(rect: &Rect) -> serde_json::Value {
+    serde_json::json!({
+        "x": rect.x,
+        "y": rect.y,
+        "w": rect.w,
+        "h": rect.h,
     })
 }
 
-/// Invoke the compiled script (if any) for each pane that has
-/// geometry cached and merge its paint commands into `surfaces`.
-/// Panes without an existing surface entry get one lazily so script
-/// output still reaches the renderer.
+fn queue_script_event(
+    state: &mut State,
+    kind: impl Into<String>,
+    delivery: ScriptEventDelivery,
+    payload: serde_json::Value,
+    snapshot: bool,
+) {
+    state.script_events.push_back(ScriptEventMessage {
+        kind: kind.into(),
+        delivery,
+        payload,
+        snapshot,
+    });
+}
+
+fn queue_script_snapshot(state: &mut State) {
+    let panes = state
+        .geometry
+        .keys()
+        .filter_map(|pane_id| script_pane_payload(state, *pane_id))
+        .collect::<Vec<_>>();
+    queue_script_event(
+        state,
+        "bmux.decoration/panes-snapshot",
+        ScriptEventDelivery::State,
+        serde_json::json!({
+            "revision": state.scene_revision,
+            "panes": panes,
+        }),
+        true,
+    );
+}
+
+/// Deliver pending script events, invoke one render message, and merge returned
+/// surface paint commands. Scripts maintain their own Lua-side state from the
+/// event stream, so render messages stay intentionally small.
 fn merge_script_paint_commands(
     state: &mut State,
     surfaces: &mut BTreeMap<Uuid, SurfaceDecoration>,
@@ -485,79 +531,62 @@ fn merge_script_paint_commands(
     let Some(backend) = state.script_backend.as_ref() else {
         return;
     };
-    // Advance the frame counter once per build — every pane sees the
-    // same frame number within a single scene publication.
     state.script_frame = state.script_frame.saturating_add(1);
     let is_first_frame = state.script_frame == 1;
-    // Snapshot the set of panes we want to paint. We can't iterate
-    // `state.geometry` while also reading from `state.activity` /
-    // mutating `state.script_perf`, so collect the pane ids first.
-    let pane_ids: Vec<Uuid> = state.geometry.keys().copied().collect();
-    let geometry_count = pane_ids.len();
+    let geometry_count = state.geometry.len();
     let mut invoked = 0_usize;
     let mut commands_merged = 0_usize;
-    for pane_id in pane_ids {
-        let Some(ctx) = decorate_context_for(state, pane_id) else {
-            continue;
-        };
+
+    while let Some(event) = state.script_events.pop_front() {
         invoked += 1;
-        let outcome = match backend.invoke(&ctx) {
+        let message = ScriptMessage::Event(event);
+        let outcome = match backend.invoke(&message) {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(
                     target: "decoration.script",
-                    pane_id = %pane_id,
                     error = %e,
-                    "decoration script invocation failed",
+                    "decoration script event invocation failed",
                 );
                 continue;
             }
         };
-        if let Some(tracker) = state.script_perf.as_ref()
-            && let Some(msg) = tracker.record(outcome.duration)
-        {
-            tracing::warn!(target: "decoration.script", "{msg}");
-        }
-        if outcome.commands.is_empty() {
-            continue;
-        }
-        commands_merged += outcome.commands.len();
-        // Get-or-create the surface entry for this pane. Defensive
-        // path — `build_scene` pre-populates every pane with known
-        // geometry, so this branch only fires when a script's own
-        // observation includes a pane that isn't in `state.geometry`
-        // (shouldn't happen given `decorate_context_for` already
-        // requires geometry, but the code is resilient to it).
-        let surface = surfaces.entry(pane_id).or_insert_with(|| {
-            let (rect, content_rect) = state.geometry.get(&pane_id).map_or_else(
-                || {
-                    (
-                        Rect {
-                            x: 0,
-                            y: 0,
-                            w: 0,
-                            h: 0,
-                        },
-                        Rect {
-                            x: 0,
-                            y: 0,
-                            w: 0,
-                            h: 0,
-                        },
-                    )
-                },
-                |g| (g.rect.clone(), g.content_rect.clone()),
-            );
-            SurfaceDecoration {
-                surface_id: pane_id,
-                rect,
-                content_rect,
-                paint_commands: Vec::new(),
-                interactive_regions: Vec::new(),
-            }
-        });
-        surface.paint_commands.extend(outcome.commands);
+        record_script_perf(state, outcome.duration);
     }
+
+    let started_at = state.script_started_at;
+    let time_ms = started_at.map_or(0, |started_at| {
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    });
+    invoked += 1;
+    let render = ScriptMessage::Render(ScriptRenderMessage {
+        time_ms,
+        frame: state.script_frame,
+    });
+    let outcome = match backend.invoke(&render) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(
+                target: "decoration.script",
+                error = %error,
+                "decoration script render invocation failed",
+            );
+            return;
+        }
+    };
+    record_script_perf(state, outcome.duration);
+    for (pane_id, commands) in outcome.surfaces {
+        let Ok(pane_id) = pane_id.parse::<Uuid>() else {
+            tracing::warn!(target: "decoration.script", pane_id, "script returned unknown pane id");
+            continue;
+        };
+        commands_merged += commands.len();
+        let surface = surfaces
+            .entry(pane_id)
+            .or_insert_with(|| empty_surface_for(state, pane_id));
+        surface.paint_commands.extend(commands);
+    }
+
     if is_first_frame {
         tracing::debug!(
             geometry_count = geometry_count,
@@ -574,6 +603,43 @@ fn merge_script_paint_commands(
             commands_merged = commands_merged,
             "first decoration script invocation with geometry",
         );
+    }
+}
+
+fn record_script_perf(state: &State, duration: Duration) {
+    if let Some(tracker) = state.script_perf.as_ref()
+        && let Some(msg) = tracker.record(duration)
+    {
+        tracing::warn!(target: "decoration.script", "{msg}");
+    }
+}
+
+fn empty_surface_for(state: &State, pane_id: Uuid) -> SurfaceDecoration {
+    let (rect, content_rect) = state.geometry.get(&pane_id).map_or_else(
+        || {
+            (
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                },
+            )
+        },
+        |g| (g.rect.clone(), g.content_rect.clone()),
+    );
+    SurfaceDecoration {
+        surface_id: pane_id,
+        rect,
+        content_rect,
+        paint_commands: Vec::new(),
+        interactive_regions: Vec::new(),
     }
 }
 
@@ -1671,6 +1737,8 @@ fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
         state.script_started_at = None;
         state.script_frame = 0;
         state.script_perf = None;
+        state.script_events.clear();
+        state.script_event_subscriptions.clear();
         state.script_first_invoke_logged = false;
         return;
     };
@@ -1712,6 +1780,9 @@ fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
         script.path.clone(),
         crate::scripting::DEFAULT_WARN_MS,
     ));
+    state.script_events.clear();
+    state.script_event_subscriptions.clear();
+    queue_script_snapshot(state);
     tracing::debug!(
         script = ?script.path,
         backend = state
@@ -1820,9 +1891,8 @@ fn spawn_pane_runtime_focus_state_subscriber(state: Arc<Mutex<State>>) {
             return;
         }
     };
-    // Apply the initial snapshot immediately so any pane already
-    // carrying state sees the correct focus before the first
-    // `decorate(ctx)` invocation.
+    // Apply the initial snapshot immediately so scripts see the correct focus
+    // before their first render message.
     tracing::debug!(
         entries = initial.entries.len(),
         revision = initial.revision,
@@ -2011,6 +2081,7 @@ fn apply_attach_layout_snapshot(
         changed = true;
     }
     if changed {
+        queue_script_snapshot(state);
         bump_revision(state);
     }
 }
@@ -2191,6 +2262,7 @@ mod tests {
                     },
                 },
             );
+            queue_script_snapshot(&mut state);
         }
     }
 
@@ -2204,6 +2276,7 @@ mod tests {
             });
             entry.focused = focused;
             entry.zoomed = zoomed;
+            queue_script_snapshot(&mut state);
         }
     }
 
@@ -2536,6 +2609,7 @@ mod tests {
                     },
                 },
             );
+            queue_script_snapshot(&mut state);
         }
         block_on(handle.set_pane_border(pane, BorderStyle::Single)).expect("set");
         let scene = plugin.build_scene();
@@ -2962,7 +3036,7 @@ exited = ""
         let tmp = std::env::temp_dir().join(format!("bmux-script-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(tmp.join("decorations")).expect("mkdir");
         let rel = "decorations/test.lua";
-        let body = "function decorate(ctx) return {} end\n";
+        let body = "function decorate(message) return {} end\n";
         std::fs::write(tmp.join(rel), body).expect("write script");
         let resolved = resolve_decoration_script(std::slice::from_ref(&tmp), rel)
             .expect("filesystem script must resolve against config_dir");
@@ -2986,7 +3060,7 @@ exited = ""
                 &mut state,
                 Some(ResolvedScript {
                     path: PathBuf::from("bundled:test"),
-                    source: "function decorate(ctx) return {} end".into(),
+                    source: "function decorate(message) return {} end".into(),
                 }),
             );
             assert!(
@@ -3008,7 +3082,7 @@ exited = ""
         let mut state = plugin.state.inner.lock().expect("lock");
         let script = ResolvedScript {
             path: PathBuf::from("bundled:test"),
-            source: "function decorate(ctx) return {} end".into(),
+            source: "function decorate(message) return {} end".into(),
         };
         install_script_backend(&mut state, Some(script.clone()));
         let started_at = state
@@ -3054,17 +3128,31 @@ exited = ""
                 Some(ResolvedScript {
                     path: PathBuf::from("bundled:test"),
                     source: r#"
-                        function decorate(ctx)
-                            return {
-                                {
-                                    kind = "text",
-                                    col = ctx.rect.x,
-                                    row = ctx.rect.y,
-                                    z = 5,
-                                    text = "hi",
-                                    style = {},
-                                },
-                            }
+                        local panes = {}
+                        function decorate(message)
+                            if message.kind == "event" then
+                                if message.event.kind == "bmux.decoration/panes-snapshot" then
+                                    panes = {}
+                                    for _, pane in ipairs(message.event.payload.panes or {}) do
+                                        panes[pane.id] = pane
+                                    end
+                                end
+                                return nil
+                            end
+                            local surfaces = {}
+                            for pane_id, pane in pairs(panes) do
+                                surfaces[pane_id] = {
+                                    {
+                                        kind = "text",
+                                        col = pane.rect.x,
+                                        row = pane.rect.y,
+                                        z = 5,
+                                        text = "hi",
+                                        style = {},
+                                    },
+                                }
+                            end
+                            return { surfaces = surfaces }
                         end
                     "#
                     .into(),
@@ -3088,6 +3176,7 @@ exited = ""
                     },
                 },
             );
+            queue_script_snapshot(&mut state);
         }
         let scene = plugin.build_scene();
         let surface = scene.surfaces.get(&pane).expect("surface emitted");
@@ -3196,7 +3285,7 @@ exited = ""
             &mut state,
             Some(ResolvedScript {
                 path: PathBuf::from("bundled:test"),
-                source: "function decorate(ctx) return {} end".into(),
+                source: "function decorate(message) return {} end".into(),
             }),
         );
         assert!(state.script_backend.is_some(), "backend installed first");
@@ -3219,7 +3308,7 @@ exited = ""
         std::fs::create_dir_all(&primary).expect("mkdir primary");
         std::fs::create_dir_all(secondary.join("decorations"))
             .expect("mkdir secondary decorations");
-        let body = "function decorate(ctx) return {} end\n";
+        let body = "function decorate(message) return {} end\n";
         std::fs::write(secondary.join("decorations/custom.lua"), body).expect("write script");
 
         // Primary dir lacks the script; secondary has it.

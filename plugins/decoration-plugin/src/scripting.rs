@@ -4,10 +4,10 @@
 //! their theme's `[plugins."bmux.decoration"]` section. When one or
 //! more of the `scripting-*` cargo features is enabled, the
 //! decoration plugin compiles the script via [`mlua`], caches the
-//! compiled representation, and invokes a global `decorate(ctx)`
-//! function per animation tick. The return value is a list of paint
-//! commands the plugin inserts into its surface list before
-//! publishing the next [`DecorationScene`].
+//! compiled representation, and invokes a global `decorate(message)`
+//! function. Event messages let Lua maintain its own state; render
+//! messages ask Lua for per-surface paint commands before publishing
+//! the next [`DecorationScene`].
 //!
 //! ## Backend selection
 //!
@@ -51,6 +51,8 @@
 )] // Bounded numeric casts + trait-method doc noise are out of scope for this module's style.
 
 use bmux_scene_protocol::scene_protocol::PaintCommand;
+use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -64,32 +66,34 @@ pub const DEFAULT_WARN_MS: f32 = 8.0;
 /// Minimum spacing between consecutive perf warnings per script.
 pub const WARN_COOLDOWN: Duration = Duration::from_mins(1);
 
-/// Context passed to a script's `decorate(ctx)` function.
+/// Message passed to a script's `decorate(message)` function.
 ///
-/// Fields are populated from the decoration plugin's live state at
-/// the moment of invocation. Scripts receive a fresh context per
-/// call; they cannot retain handles across frames (storing data
-/// should go into Lua globals, not into the ctx object).
+/// Event messages update script-owned Lua state, and render messages request
+/// paint commands derived from that cached state. This avoids serializing full
+/// snapshots or invoking Lua once per pane on every animation frame.
 #[derive(Debug, Clone)]
-pub struct DecorateContext {
-    /// Stable pane identifier for per-pane script state.
-    pub pane_id: String,
-    /// The attach-global cell coordinates of this pane.
-    pub rect: (u16, u16, u16, u16),
-    /// The interior rect (excluding decoration cells).
-    pub content_rect: (u16, u16, u16, u16),
-    /// Whether this pane currently has focus.
-    pub focused: bool,
-    /// Whether this pane is zoomed to fill the viewport.
-    pub zoomed: bool,
-    /// Whether a bell has been observed for this pane since the last
-    /// clear. (Bell is reserved for a future wire; currently always
-    /// false.)
-    pub bell: bool,
-    /// Milliseconds since the attach started. Scripts consume this to
-    /// compute time-varying effects.
+pub enum ScriptMessage {
+    Event(ScriptEventMessage),
+    Render(ScriptRenderMessage),
+}
+
+#[derive(Debug, Clone)]
+pub struct ScriptEventMessage {
+    pub kind: String,
+    pub delivery: ScriptEventDelivery,
+    pub payload: JsonValue,
+    pub snapshot: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptEventDelivery {
+    Broadcast,
+    State,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScriptRenderMessage {
     pub time_ms: u64,
-    /// Monotonic frame counter since the attach started.
     pub frame: u64,
 }
 
@@ -99,7 +103,7 @@ pub enum ScriptError {
     /// Script source failed to compile.
     #[error("failed to compile decoration script {path:?}: {message}")]
     Compile { path: PathBuf, message: String },
-    /// Script raised an error during `decorate(ctx)`.
+    /// Script raised an error during `decorate(message)`.
     #[error("decoration script {path:?} runtime error: {message}")]
     Runtime { path: PathBuf, message: String },
     /// The bundled backend is a no-op stub (no `scripting-*` feature
@@ -117,12 +121,12 @@ pub enum ScriptError {
     },
 }
 
-/// Result of a `decorate(ctx)` invocation. `commands` is the list of
+/// Result of a `decorate(message)` invocation. `surfaces` maps pane ids to the
 /// paint commands the script wants applied; `duration` is the
 /// wall-clock time the invocation consumed (used for perf tracking).
 #[derive(Debug)]
 pub struct DecorateOutcome {
-    pub commands: Vec<PaintCommand>,
+    pub surfaces: BTreeMap<String, Vec<PaintCommand>>,
     pub duration: Duration,
 }
 
@@ -137,8 +141,8 @@ pub trait ScriptBackend: Send + Sync {
     /// reporting). On success the backend stores the compiled
     /// script; subsequent [`Self::invoke`] calls run it.
     fn compile(&self, path: &Path, source: &str) -> Result<(), ScriptError>;
-    /// Invoke the last-compiled script's global `decorate(ctx)`.
-    fn invoke(&self, ctx: &DecorateContext) -> Result<DecorateOutcome, ScriptError>;
+    /// Invoke the last-compiled script's global `decorate(message)`.
+    fn invoke(&self, message: &ScriptMessage) -> Result<DecorateOutcome, ScriptError>;
     /// Short backend name ("luajit", "luau", "lua54", "stub").
     fn name(&self) -> &'static str;
     /// Whether this backend is a functional Lua runtime (as opposed
@@ -264,7 +268,7 @@ impl ScriptBackend for StubBackend {
         Err(ScriptError::NotAvailable)
     }
 
-    fn invoke(&self, _ctx: &DecorateContext) -> Result<DecorateOutcome, ScriptError> {
+    fn invoke(&self, _message: &ScriptMessage) -> Result<DecorateOutcome, ScriptError> {
         Err(ScriptError::NotAvailable)
     }
 
@@ -288,11 +292,13 @@ mod lua_backend {
     //! across the life of the plugin; scripts are re-compiled on
     //! theme / script file changes.
 
-    use super::{DecorateContext, DecorateOutcome, ScriptBackend, ScriptError};
+    use super::{DecorateOutcome, ScriptBackend, ScriptError, ScriptEventDelivery, ScriptMessage};
     use bmux_scene_protocol::scene_protocol::{
         Color, GradientAxis, NamedColor, PaintCommand, Rect, Style,
     };
     use mlua::{Function, Lua, LuaOptions, StdLib, Table, Value};
+    use serde_json::Value as JsonValue;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::Instant;
@@ -400,7 +406,7 @@ mod lua_backend {
             Ok(())
         }
 
-        fn invoke(&self, ctx: &DecorateContext) -> Result<DecorateOutcome, ScriptError> {
+        fn invoke(&self, message: &ScriptMessage) -> Result<DecorateOutcome, ScriptError> {
             let inner = self.inner.lock().map_err(|_| ScriptError::Runtime {
                 path: PathBuf::new(),
                 message: "script state mutex poisoned".into(),
@@ -423,21 +429,23 @@ mod lua_backend {
                         path: path.clone(),
                         message: format!("registry read failed: {e}"),
                     })?;
-            let ctx_table =
-                context_to_lua_table(&inner.lua, ctx).map_err(|e| ScriptError::Runtime {
+            let message_table =
+                message_to_lua_table(&inner.lua, message).map_err(|e| ScriptError::Runtime {
                     path: path.clone(),
-                    message: format!("building ctx table: {e}"),
+                    message: format!("building script message table: {e}"),
                 })?;
             let started_at = Instant::now();
-            let result: Value = decorate.call(ctx_table).map_err(|e| ScriptError::Runtime {
-                path: path.clone(),
-                message: e.to_string(),
-            })?;
+            let result: Value = decorate
+                .call(message_table)
+                .map_err(|e| ScriptError::Runtime {
+                    path: path.clone(),
+                    message: e.to_string(),
+                })?;
             let duration = started_at.elapsed();
-            let commands = match result {
-                Value::Nil => Vec::new(),
+            let surfaces = match result {
+                Value::Nil => BTreeMap::new(),
                 Value::Table(t) => {
-                    table_to_paint_commands(&t).map_err(|e| ScriptError::Runtime {
+                    result_table_to_surfaces(&t).map_err(|e| ScriptError::Runtime {
                         path: path.clone(),
                         message: format!("converting result: {e}"),
                     })?
@@ -445,11 +453,11 @@ mod lua_backend {
                 other => {
                     return Err(ScriptError::Runtime {
                         path,
-                        message: format!("expected table of paint commands, got {other:?}"),
+                        message: format!("expected render result table, got {other:?}"),
                     });
                 }
             };
-            Ok(DecorateOutcome { commands, duration })
+            Ok(DecorateOutcome { surfaces, duration })
         }
 
         fn name(&self) -> &'static str {
@@ -461,17 +469,55 @@ mod lua_backend {
         }
     }
 
-    fn context_to_lua_table(lua: &Lua, ctx: &DecorateContext) -> mlua::Result<Table> {
+    fn message_to_lua_table(lua: &Lua, message: &ScriptMessage) -> mlua::Result<Table> {
         let t = lua.create_table()?;
-        t.set("pane_id", ctx.pane_id.as_str())?;
-        t.set("rect", rect_tuple_to_table(lua, ctx.rect)?)?;
-        t.set("content_rect", rect_tuple_to_table(lua, ctx.content_rect)?)?;
-        t.set("focused", ctx.focused)?;
-        t.set("zoomed", ctx.zoomed)?;
-        t.set("bell", ctx.bell)?;
-        t.set("time_ms", ctx.time_ms)?;
-        t.set("frame", ctx.frame)?;
+        t.set("api_version", 1_u16)?;
+        match message {
+            ScriptMessage::Event(event) => {
+                t.set("kind", "event")?;
+                let event_table = lua.create_table()?;
+                event_table.set("kind", event.kind.as_str())?;
+                event_table.set(
+                    "delivery",
+                    match event.delivery {
+                        ScriptEventDelivery::Broadcast => "broadcast",
+                        ScriptEventDelivery::State => "state",
+                    },
+                )?;
+                event_table.set("snapshot", event.snapshot)?;
+                event_table.set("payload", json_to_lua(lua, &event.payload)?)?;
+                t.set("event", event_table)?;
+            }
+            ScriptMessage::Render(render) => {
+                t.set("kind", "render")?;
+                t.set("time_ms", render.time_ms)?;
+                t.set("frame", render.frame)?;
+            }
+        }
         Ok(t)
+    }
+
+    fn json_to_lua(lua: &Lua, value: &JsonValue) -> mlua::Result<Value> {
+        match value {
+            JsonValue::Null => Ok(Value::Nil),
+            JsonValue::Bool(value) => Ok(Value::Boolean(*value)),
+            JsonValue::Number(number) => Ok(Value::Number(number.as_f64().unwrap_or_default())),
+            JsonValue::String(value) => Ok(Value::String(lua.create_string(value)?)),
+            JsonValue::Array(values) => {
+                let table = lua.create_table()?;
+                for (index, item) in values.iter().enumerate() {
+                    table.set(index + 1, json_to_lua(lua, item)?)?;
+                }
+                Ok(Value::Table(table))
+            }
+            JsonValue::Object(values) => {
+                let table = lua.create_table()?;
+                for (key, item) in values {
+                    table.set(key.as_str(), json_to_lua(lua, item)?)?;
+                }
+                Ok(Value::Table(table))
+            }
+        }
     }
 
     fn rect_tuple_to_table(lua: &Lua, rect: (u16, u16, u16, u16)) -> mlua::Result<Table> {
@@ -559,6 +605,18 @@ mod lua_backend {
     /// typed `PaintCommand` enum. Scripts construct entries as plain
     /// tables with a `kind` string field plus the variant fields;
     /// unknown kinds are skipped with a warning log.
+    fn result_table_to_surfaces(t: &Table) -> mlua::Result<BTreeMap<String, Vec<PaintCommand>>> {
+        let mut out = BTreeMap::new();
+        let Some(surfaces): Option<Table> = t.get("surfaces")? else {
+            return Ok(out);
+        };
+        for pair in surfaces.pairs::<String, Table>() {
+            let (pane_id, commands) = pair?;
+            out.insert(pane_id, table_to_paint_commands(&commands)?);
+        }
+        Ok(out)
+    }
+
     fn table_to_paint_commands(t: &Table) -> mlua::Result<Vec<PaintCommand>> {
         let mut out = Vec::new();
         for pair in t.sequence_values::<Table>() {
@@ -829,35 +887,85 @@ mod tests {
         feature = "scripting-lua54"
     ))]
     mod lua_integration {
-        use super::super::{DecorateContext, make_backend};
+        use super::super::{
+            ScriptEventDelivery, ScriptEventMessage, ScriptMessage, ScriptRenderMessage,
+            make_backend,
+        };
+        use serde_json::json;
         use std::path::Path;
 
-        fn ctx() -> DecorateContext {
-            DecorateContext {
-                pane_id: "test-pane".to_string(),
-                rect: (0, 0, 20, 5),
-                content_rect: (1, 1, 18, 3),
-                focused: true,
-                zoomed: false,
-                bell: false,
-                time_ms: 500,
-                frame: 10,
-            }
+        fn event_message() -> ScriptMessage {
+            ScriptMessage::Event(ScriptEventMessage {
+                kind: "bmux.decoration/panes-snapshot".to_string(),
+                delivery: ScriptEventDelivery::State,
+                snapshot: true,
+                payload: json!({
+                    "panes": [
+                        {
+                            "id": "test-pane",
+                            "rect": { "x": 0, "y": 0, "w": 20, "h": 5 },
+                            "content_rect": { "x": 1, "y": 1, "w": 18, "h": 3 },
+                            "focused": true,
+                            "zoomed": false,
+                            "status": "running"
+                        }
+                    ]
+                }),
+            })
         }
 
-        #[test]
-        fn minimal_script_returns_single_text_paint_command() {
-            let backend = make_backend();
+        fn render_message() -> ScriptMessage {
+            ScriptMessage::Render(ScriptRenderMessage {
+                time_ms: 500,
+                frame: 10,
+            })
+        }
+
+        fn broadcast_event_message() -> ScriptMessage {
+            ScriptMessage::Event(ScriptEventMessage {
+                kind: "third.party/custom-event".to_string(),
+                delivery: ScriptEventDelivery::Broadcast,
+                snapshot: false,
+                payload: json!({ "value": "observed" }),
+            })
+        }
+
+        fn compile_event_render_script(backend: &dyn super::super::ScriptBackend) {
             let source = r#"
-                function decorate(ctx)
+                local pane_id = nil
+                local rect = nil
+                local external_value = nil
+
+                function decorate(message)
+                    if message.kind == "event" then
+                        if message.event.kind == "bmux.decoration/panes-snapshot" then
+                            local pane = message.event.payload.panes[1]
+                            pane_id = pane.id
+                            rect = pane.rect
+                        elseif message.event.kind == "third.party/custom-event" then
+                            external_value = message.event.payload.value
+                        end
+                        return nil
+                    end
+
+                    assert(message.kind == "render", "expected render message")
+                    assert(message.time_ms == 500, "time_ms should be present")
+                    assert(message.frame == 10, "frame should be present")
+                    assert(pane_id == "test-pane", "pane snapshot should be cached")
+                    assert(rect.w == 20, "rect.w should be 20")
+                    assert(external_value == "observed", "custom event should be cached")
                     return {
-                        {
-                            kind = "text",
-                            col = 0,
-                            row = 0,
-                            z = 0,
-                            text = "hello",
-                            style = { fg = bmux.rgb(255, 0, 0), bold = true },
+                        surfaces = {
+                            [pane_id] = {
+                                {
+                                    kind = "text",
+                                    col = 0,
+                                    row = 0,
+                                    z = 0,
+                                    text = "hello",
+                                    style = { fg = bmux.rgb(255, 0, 0), bold = true },
+                                },
+                            },
                         },
                     }
                 end
@@ -865,8 +973,55 @@ mod tests {
             backend
                 .compile(Path::new("<test>"), source)
                 .expect("compile");
-            let outcome = backend.invoke(&ctx()).expect("invoke");
-            assert_eq!(outcome.commands.len(), 1);
+        }
+
+        fn deliver_test_state(backend: &dyn super::super::ScriptBackend) {
+            backend.invoke(&event_message()).expect("event invoke");
+            backend
+                .invoke(&broadcast_event_message())
+                .expect("broadcast invoke");
+        }
+
+        #[test]
+        fn event_render_script_returns_single_text_paint_command() {
+            let backend = make_backend();
+            compile_event_render_script(backend.as_ref());
+            deliver_test_state(backend.as_ref());
+            let outcome = backend.invoke(&render_message()).expect("render invoke");
+            assert_eq!(outcome.surfaces["test-pane"].len(), 1);
+        }
+
+        #[test]
+        fn event_invocation_may_return_nil() {
+            let backend = make_backend();
+            let source = r#"
+                function decorate(message)
+                    if message.kind == "event" then
+                        return nil
+                    end
+                    return { surfaces = {} }
+                end
+            "#;
+            backend
+                .compile(Path::new("<test>"), source)
+                .expect("compile");
+            let outcome = backend.invoke(&event_message()).expect("event invoke");
+            assert!(outcome.surfaces.is_empty());
+        }
+
+        #[test]
+        fn render_result_may_omit_surfaces() {
+            let backend = make_backend();
+            let source = r"
+                function decorate(message)
+                    return {}
+                end
+            ";
+            backend
+                .compile(Path::new("<test>"), source)
+                .expect("compile");
+            let outcome = backend.invoke(&render_message()).expect("render invoke");
+            assert!(outcome.surfaces.is_empty());
         }
 
         #[test]
@@ -887,38 +1042,21 @@ mod tests {
             // `io` and `os` should not be reachable. We expect the
             // script to throw a runtime error when it tries to read.
             let source = r#"
-                function decorate(ctx)
+                function decorate(message)
                     local f = io.open("/etc/passwd", "r")
-                    return {}
+                    return { surfaces = {} }
                 end
             "#;
             backend
                 .compile(Path::new("<test>"), source)
                 .expect("compile");
             let err = backend
-                .invoke(&ctx())
+                .invoke(&render_message())
                 .expect_err("io.open must not be reachable in sandbox");
             match err {
                 super::super::ScriptError::Runtime { .. } => {}
                 other => panic!("expected Runtime error, got {other:?}"),
             }
-        }
-
-        #[test]
-        fn context_fields_are_observable_from_lua() {
-            let backend = make_backend();
-            let source = r#"
-                function decorate(ctx)
-                    assert(ctx.focused == true, "focused should be true")
-                    assert(ctx.pane_id == "test-pane", "pane_id should be present")
-                    assert(ctx.rect.w == 20, "rect.w should be 20")
-                    return {}
-                end
-            "#;
-            backend
-                .compile(Path::new("<test>"), source)
-                .expect("compile");
-            backend.invoke(&ctx()).expect("invoke");
         }
     }
 }

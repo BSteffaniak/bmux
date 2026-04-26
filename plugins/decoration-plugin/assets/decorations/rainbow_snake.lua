@@ -10,7 +10,15 @@ local DEATH_HOLD_MS = 3000
 local SHRINK_BLOCKS_PER_SECOND = 24
 local FLASH_MS = 150
 
+local panes = {}
 local pane_states = {}
+
+local function apply_snapshot(payload)
+    panes = {}
+    for _, pane in ipairs(payload.panes or {}) do
+        panes[pane.id] = pane
+    end
+end
 
 local function new_pane_state()
     return {
@@ -213,7 +221,7 @@ local function render_death(cmds, state, raw_total, visual_total)
     return true
 end
 
-function decorate(ctx)
+local function render_pane(ctx)
     local state = pane_state(ctx)
     if not ctx.focused then
         state.last_focus_ms = nil
@@ -267,4 +275,38 @@ function decorate(ctx)
     render_apple(cmds, state, ctx.rect, visual_total)
     render_snake(cmds, segments, visual_total, false)
     return cmds
+end
+
+local function render(message)
+    local surfaces = {}
+    for pane_id, pane in pairs(panes) do
+        local ctx = {
+            pane_id = pane_id,
+            rect = pane.rect,
+            content_rect = pane.content_rect,
+            focused = pane.focused,
+            zoomed = pane.zoomed,
+            status = pane.status,
+            time_ms = message.time_ms,
+            frame = message.frame,
+        }
+        local commands = render_pane(ctx)
+        if #commands > 0 then
+            surfaces[pane_id] = commands
+        end
+    end
+    return { surfaces = surfaces }
+end
+
+function decorate(message)
+    if message.kind == "event" then
+        if message.event.kind == "bmux.decoration/panes-snapshot" then
+            apply_snapshot(message.event.payload or {})
+        end
+        return nil
+    end
+    if message.kind == "render" then
+        return render(message)
+    end
+    return nil
 end
