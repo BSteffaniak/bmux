@@ -424,11 +424,11 @@ pub(super) async fn run_server_start(
             }
             let kind = &publication.kind;
             let spawn_result = match (kind.as_str(), publication.delivery) {
-                (k, bmux_plugin_sdk::PluginEventDelivery::Broadcast)
-                    if k == bmux_scene_protocol::scene_protocol::EVENT_KIND.as_str() =>
+                (k, bmux_plugin_sdk::PluginEventDelivery::State)
+                    if k == bmux_scene_protocol::scene_protocol::STATE_KIND.as_str() =>
                 {
-                    server.spawn_plugin_bus_forwarder::<
-                        bmux_scene_protocol::scene_protocol::EventPayload,
+                    server.spawn_plugin_bus_state_forwarder::<
+                        bmux_scene_protocol::scene_protocol::DecorationScene,
                     >(kind)
                 }
                 (k, bmux_plugin_sdk::PluginEventDelivery::Broadcast)

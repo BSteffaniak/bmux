@@ -90,7 +90,10 @@ struct ServerState {
     pane_exit_rx: AsyncMutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
     service_registry: Mutex<ServiceRegistry>,
     service_resolver: Mutex<Option<Arc<ServiceResolverHandler>>>,
+    plugin_state_replayers: Mutex<Vec<PluginStateReplayer>>,
 }
+
+type PluginStateReplayer = Arc<dyn Fn() -> Option<Event> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ServiceRoute {
@@ -4241,6 +4244,7 @@ impl BmuxServer {
                 pane_exit_rx: AsyncMutex::new(pane_exit_rx),
                 service_registry: Mutex::new(ServiceRegistry::default()),
                 service_resolver: Mutex::new(None),
+                plugin_state_replayers: Mutex::new(Vec::new()),
             }),
             shutdown_tx,
         }
@@ -4477,9 +4481,9 @@ impl BmuxServer {
     /// [`tokio::sync::watch::Receiver::changed`] so every snapshot
     /// replacement fans out as an [`Event::PluginBusEvent`].
     ///
-    /// Emits the state channel's currently-retained value immediately
-    /// so late-connecting streaming clients see the current snapshot
-    /// without waiting for the next mutation.
+    /// Registers a replay hook for the state channel's currently-retained value
+    /// so late-connecting streaming clients see the current snapshot when they
+    /// enable event push, without waiting for the next mutation.
     ///
     /// # Errors
     ///
@@ -4504,17 +4508,35 @@ impl BmuxServer {
             })?;
         let kind_string = kind.as_str().to_string();
         let state = Arc::downgrade(&self.state);
+        let replay_kind = kind.clone();
+        let replay_kind_string = kind_string.clone();
+        if let Ok(mut replayers) = self.state.plugin_state_replayers.lock() {
+            replayers.push(Arc::new(move || {
+                let (current, _rx) = bmux_plugin::global_event_bus()
+                    .subscribe_state::<T>(&replay_kind)
+                    .ok()?;
+                let encoded = match serde_json::to_vec(current.as_ref()) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(
+                            kind = %replay_kind_string,
+                            error = %error,
+                            "failed encoding retained plugin bus state for client replay",
+                        );
+                        return None;
+                    }
+                };
+                Some(Event::PluginBusEvent {
+                    kind: replay_kind_string.clone(),
+                    payload: encoded,
+                })
+            }));
+        }
 
-        // State-channel current values are pulled by clients on
-        // connect via the plugin's typed query surface (matching the
-        // `ControlCatalogSnapshot` pull-on-connect pattern). We
-        // deliberately do NOT emit `initial` here: the forwarder runs
-        // during server bootstrap, before any attach client has
-        // connected. A broadcast at that moment has zero subscribers
-        // and the message is lost, so emitting it would be pure
-        // waste. The forwarder's job is to propagate subsequent
-        // changes; initial seeding is the client's responsibility via
-        // its plugin query at attach startup.
+        // Do not emit `_initial` here: this forwarder starts during server
+        // bootstrap, before attach clients have connected. Instead, register a
+        // replay closure above so each client receives the retained value when
+        // it enables event-push delivery, then forward live changes below.
 
         tokio::spawn(async move {
             while rx.changed().await.is_ok() {
@@ -5001,6 +5023,11 @@ async fn handle_connection(
         // round-trip `AttachPaneOutputBatch` request the client would
         // otherwise need, reducing output latency to a single one-way push.
         if is_enable_push && event_push_task.is_none() {
+            replay_retained_plugin_state_to_client(
+                &state,
+                &frame_tx,
+                negotiated_frame_codec.as_deref(),
+            );
             let mut event_rx = state.event_broadcast.subscribe();
             let push_frame_tx = frame_tx.clone();
             let push_frame_codec = negotiated_frame_codec.clone();
@@ -5261,6 +5288,28 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?
         .emit(event);
     Ok(())
+}
+
+fn replay_retained_plugin_state_to_client(
+    state: &Arc<ServerState>,
+    frame_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
+) {
+    let replayers = state
+        .plugin_state_replayers
+        .lock()
+        .map_or_else(|_| Vec::new(), |guard| guard.clone());
+    for replayer in replayers {
+        let Some(event) = replayer() else {
+            continue;
+        };
+        let Some(frame) = encode_event_frame(&event, frame_codec) else {
+            continue;
+        };
+        if frame_tx.send(frame).is_err() {
+            return;
+        }
+    }
 }
 
 /// Concrete `WireEventSink` impl that pipes plugin-published wire

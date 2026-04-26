@@ -683,19 +683,20 @@ fn empty_scene() -> DecorationScene {
     }
 }
 
-/// Bump the scene revision and emit the updated [`DecorationScene`]
-/// on the typed plugin event bus. Called from every mutator so
+/// Bump the scene revision and publish the updated [`DecorationScene`] as
+/// retained state on the typed plugin event bus. Called from every mutator so
 /// consumers (e.g. the attach runtime) can refresh their scene cache
-/// incrementally without polling. Emission silently no-ops if the
-/// event-bus channel has not been registered yet (the decoration
-/// plugin registers it in [`DecorationPlugin::activate`]).
+/// incrementally while late subscribers can still hydrate from the current
+/// value. Publication silently no-ops if the event-bus channel has not been
+/// registered yet (the decoration plugin registers it in
+/// [`DecorationPlugin::activate`]).
 fn bump_revision(state: &mut State) {
     state.scene_revision = state.scene_revision.saturating_add(1);
-    // Build + publish while we still hold the lock: this keeps the
-    // revision monotonic from subscribers' perspective.
+    // Build + publish while we still hold the lock: this keeps the revision
+    // monotonic from subscribers' perspective.
     let scene = build_scene(state);
     let _ = bmux_plugin::global_event_bus()
-        .emit(&bmux_scene_protocol::scene_protocol::EVENT_KIND, scene);
+        .publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
 }
 
 /// Parse a TOML string against the [`DecorationThemeExtension`]
@@ -1430,13 +1431,14 @@ fn resolve_decoration_script(
 
 impl RustPlugin for DecorationPlugin {
     fn activate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        // Register the typed scene-event channel before any mutator
-        // (including the initial revision bump below) tries to emit.
-        // Failure is non-fatal — the channel may already exist from a
-        // prior load; `bump_revision` tolerates a missing channel.
+        // Register the retained scene channel before any mutator (including
+        // the initial revision bump below) tries to publish. Failure is
+        // non-fatal — the channel may already exist from a prior load;
+        // `bump_revision` tolerates a missing channel.
         let _ = bmux_plugin::global_event_bus()
-            .register_channel::<bmux_scene_protocol::scene_protocol::EventPayload>(
-                bmux_scene_protocol::scene_protocol::EVENT_KIND,
+            .register_state_channel::<bmux_scene_protocol::scene_protocol::DecorationScene>(
+                bmux_scene_protocol::scene_protocol::STATE_KIND,
+                empty_scene(),
             );
         let mut summary_theme_loaded = false;
         let mut summary_script_loaded = false;
@@ -2844,21 +2846,21 @@ mod tests {
         assert_eq!(surface.content_rect, rect(3, 4, 18, 3));
     }
 
-    // PR 3: scene-event emission. The decoration plugin publishes a
-    // `DecorationScene` on the typed event bus every time state
-    // mutates; the attach runtime subscribes and updates its scene
-    // cache in place.
+    // PR 3: scene-state publication. The decoration plugin publishes a
+    // retained `DecorationScene` on the typed event bus every time state
+    // mutates; late attach clients hydrate from the current value.
     #[test]
-    fn bump_revision_emits_scene_on_event_bus_when_channel_registered() {
-        // Register the channel first (as `activate()` would).
+    fn bump_revision_publishes_retained_scene_when_channel_registered() {
+        // Register the state channel first (as `activate()` would).
         let _sender = bmux_plugin::global_event_bus()
-            .register_channel::<bmux_scene_protocol::scene_protocol::EventPayload>(
-            bmux_scene_protocol::scene_protocol::EVENT_KIND,
+            .register_state_channel::<bmux_scene_protocol::scene_protocol::DecorationScene>(
+            bmux_scene_protocol::scene_protocol::STATE_KIND,
+            empty_scene(),
         );
 
-        let mut rx = bmux_plugin::global_event_bus()
-            .subscribe::<bmux_scene_protocol::scene_protocol::EventPayload>(
-                &bmux_scene_protocol::scene_protocol::EVENT_KIND,
+        let (_initial, mut rx) = bmux_plugin::global_event_bus()
+            .subscribe_state::<bmux_scene_protocol::scene_protocol::DecorationScene>(
+                &bmux_scene_protocol::scene_protocol::STATE_KIND,
             )
             .expect("subscribe");
 
@@ -2867,11 +2869,9 @@ mod tests {
         let pane = Uuid::from_u128(900);
         block_on(handle.set_pane_border(pane, BorderStyle::Single)).expect("set");
 
-        // Drain at least one event; the broadcast buffer may replay
-        // newer revisions from earlier tests so we just assert we
-        // observed a non-zero revision.
-        let event = rx.try_recv().expect("scene event was emitted");
-        assert!(event.revision >= 1);
+        assert!(rx.has_changed().expect("state channel open"));
+        let scene = rx.borrow_and_update().clone();
+        assert!(scene.revision >= 1);
     }
 
     // ── PR 4: theme-extension + bundled presets ─────────────────

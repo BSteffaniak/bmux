@@ -270,14 +270,15 @@ interface scene-protocol {
     }
 
     // Snapshot of every decorated surface. Published by the decoration
-    // plugin through the typed event bus whenever its state changes
-    // (focus, theme, per-pane override). Consumers replace their
-    // cached snapshot when `revision` exceeds the one they hold.
+    // plugin as retained typed event-bus state whenever its state changes
+    // (focus, theme, per-pane override). Consumers replace their cached
+    // snapshot when `revision` exceeds the one they hold, and late
+    // subscribers hydrate from the retained value.
     record decoration-scene {
         revision: u64,
         surfaces: map<uuid, surface-decoration>,
         animation: animation-hint?,
     }
 
-    events decoration-scene;
+    @state events decoration-scene;
 }

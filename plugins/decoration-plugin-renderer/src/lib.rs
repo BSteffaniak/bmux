@@ -13,9 +13,10 @@
 //!    [`bmux_plugin::AttachRenderExtension`] and spawns a subscriber
 //!    that listens on the client-side
 //!    [`bmux_plugin::global_event_bus`] for the
-//!    `bmux.scene/scene-protocol` broadcast.
-//! 2. Every incoming scene replaces the extension's cached scene
-//!    (revision-guarded so stale wire events can't downgrade).
+//!    retained `bmux.scene/scene-protocol` state.
+//! 2. The retained scene state seeds the extension's cache immediately, and
+//!    every subsequent scene replacement updates it (revision-guarded so stale
+//!    wire events can't downgrade).
 //! 3. On every attach-render pass, the extension's `apply_surface`
 //!    looks up the matching surface and hands its paint commands to
 //!    [`bmux_scene_protocol_render::paint::apply_paint_commands`].
@@ -35,14 +36,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use bmux_plugin::{AttachRenderExtension, ExtensionRect};
 use bmux_scene_protocol::scene_protocol::{
-    DecorationScene, EVENT_KIND as SCENE_EVENT_KIND, Rect as SceneRect, SurfaceDecoration,
+    DecorationScene, Rect as SceneRect, STATE_KIND as SCENE_STATE_KIND, SurfaceDecoration,
 };
 use bmux_scene_protocol_render::paint::apply_paint_commands;
 use uuid::Uuid;
-
-/// Default broadcast-channel capacity for the client-side
-/// scene-protocol subscription.
-const SCENE_CHANNEL_CAPACITY: usize = 64;
 
 /// Shared cache of the decoration plugin's latest scene. Stored
 /// under `Arc<Mutex<_>>` so both the subscriber thread and the
@@ -124,9 +121,9 @@ fn extension_rect_from_scene(rect: &SceneRect) -> ExtensionRect {
     }
 }
 
-/// Process-wide handle to the installed extension's cache. `install`
-/// stores it on first call; the scene-event relay (living in the
-/// CLI's streaming loop) uses [`push_scene`] to update the cache.
+/// Process-wide handle to the installed extension's cache. `install` stores it
+/// on first call; the retained scene-state relay (living in the CLI's streaming
+/// loop) updates the local state channel that feeds this cache.
 static INSTALLED_CACHE: OnceLock<Arc<Mutex<DecorationRendererCache>>> = OnceLock::new();
 
 /// Install the decoration render extension.
@@ -151,13 +148,17 @@ pub fn install() {
             cache: cache.clone(),
         }) as Arc<dyn AttachRenderExtension>;
         bmux_plugin::register_render_extension(ext);
-        // Register a local broadcast channel for scene events. The
-        // CLI's streaming loop re-publishes IPC-delivered
-        // `PluginBusEvent`s onto this channel so any render
-        // extension can subscribe without touching transport.
-        let _ = bmux_plugin::global_event_bus().register_channel_with_capacity::<DecorationScene>(
-            SCENE_EVENT_KIND,
-            SCENE_CHANNEL_CAPACITY,
+        // Register a local retained state channel for scene updates. The CLI's
+        // streaming loop re-publishes IPC-delivered `PluginBusEvent`s onto this
+        // channel so any render extension can hydrate without touching
+        // transport.
+        let _ = bmux_plugin::global_event_bus().register_state_channel::<DecorationScene>(
+            SCENE_STATE_KIND,
+            DecorationScene {
+                revision: 0,
+                surfaces: BTreeMap::new(),
+                animation: None,
+            },
         );
         tracing::debug!("decoration render extension installed");
         cache
@@ -185,19 +186,22 @@ pub fn push_scene(scene: DecorationScene) -> bool {
 }
 
 fn spawn_scene_subscriber(cache: Arc<Mutex<DecorationRendererCache>>) {
-    let receiver = bmux_plugin::global_event_bus().subscribe::<DecorationScene>(&SCENE_EVENT_KIND);
-    let Ok(mut rx) = receiver else {
+    let receiver =
+        bmux_plugin::global_event_bus().subscribe_state::<DecorationScene>(&SCENE_STATE_KIND);
+    let Ok((initial, mut rx)) = receiver else {
         tracing::warn!(
-            "decoration render extension: scene-protocol broadcast channel not registered; \
+            "decoration render extension: scene-protocol state channel not registered; \
              events pushed via push_scene only"
         );
         return;
     };
+    if let Ok(mut guard) = cache.lock() {
+        guard.replace_if_newer((*initial).clone());
+    }
     std::thread::spawn(move || {
-        // Construct a dedicated current-thread tokio runtime so we
-        // can await the `broadcast::Receiver::recv` future without
-        // requiring the extension crate to be tokio-aware at its
-        // call sites.
+        // Construct a dedicated current-thread tokio runtime so we can await
+        // the watch receiver without requiring the extension crate to be
+        // tokio-aware at its call sites.
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -208,8 +212,8 @@ fn spawn_scene_subscriber(cache: Arc<Mutex<DecorationRendererCache>>) {
             return;
         };
         runtime.block_on(async move {
-            while let Ok(scene) = rx.recv().await {
-                let scene = (*scene).clone();
+            while rx.changed().await.is_ok() {
+                let scene = rx.borrow().as_ref().clone();
                 if let Ok(mut guard) = cache.lock() {
                     guard.replace_if_newer(scene);
                 }

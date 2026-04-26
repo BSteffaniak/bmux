@@ -1,7 +1,7 @@
 //! Typed scene-decoration protocol.
 //!
 //! Plugins that paint chrome around pane surfaces (borders, badges,
-//! focus highlights) publish a [`scene_protocol::DecorationScene`] on
+//! focus highlights) publish a retained [`scene_protocol::DecorationScene`] on
 //! the typed plugin event bus. Core caches the latest snapshot and
 //! consults it during frame assembly to determine each surface's
 //! authoritative `content_rect` and any paint commands to apply.

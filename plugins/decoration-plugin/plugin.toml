@@ -39,5 +39,6 @@ name        = "scene-published"
 # forwards every emission on this kind as
 # `ServerEvent::PluginBusEvent` over the per-client event channel.
 [[event_publications]]
+delivery                     = "state"
 forward_to_streaming_clients = true
 kind                         = "bmux.scene/scene-protocol"

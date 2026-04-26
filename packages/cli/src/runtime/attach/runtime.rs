@@ -1230,17 +1230,18 @@ pub async fn run_session_attach_with_client(
     ))]
     let mut image_fetch_pending = false;
 
-    // Subscribe to the generic scene-protocol broadcast so the
-    // attach runtime can mark the frame dirty whenever a new scene
-    // arrives. Render extensions subscribe to the same channel
-    // independently. When no plugin has registered the channel the
-    // subscription returns `Err` and we run without scene updates —
-    // extensions that aren't loaded simply have nothing to draw.
+    // Subscribe to the generic retained scene-protocol state so the attach
+    // runtime can mark the frame dirty whenever a new scene arrives. Render
+    // extensions subscribe to the same channel independently. When no plugin
+    // has registered the channel the subscription returns `Err` and we run
+    // without scene updates — extensions that aren't loaded simply have
+    // nothing to draw.
     let mut scene_event_rx = bmux_plugin::global_event_bus()
-        .subscribe::<bmux_scene_protocol::scene_protocol::EventPayload>(
-            &bmux_scene_protocol::scene_protocol::EVENT_KIND,
+        .subscribe_state::<bmux_scene_protocol::scene_protocol::DecorationScene>(
+            &bmux_scene_protocol::scene_protocol::STATE_KIND,
         )
-        .ok();
+        .ok()
+        .map(|(_initial, rx)| rx);
 
     // Subscribe to the windows-plugin `windows-list` state channel so
     // the attach tab bar can render the authoritative plugin-owned
@@ -1393,30 +1394,24 @@ pub async fn run_session_attach_with_client(
                     ref payload,
                 } = server_event
                 {
-                    // Server-forwarded plugin event. Decode by kind
-                    // and re-emit onto the local event bus so any
-                    // render extension (decoration, future overlays,
-                    // etc.) subscribing via
-                    // `EventBus::subscribe::<T>` sees the payload.
-                    // Core code does NOT interpret the payload itself
-                    // — extensions own that.
+                    // Server-forwarded plugin event/state payload. Decode by kind
+                    // and re-emit onto the local event bus so any render extension
+                    // (decoration, future overlays, etc.) sees the payload through
+                    // the appropriate delivery mode. Core code does NOT interpret
+                    // the payload itself — extensions own that.
                     if kind.as_str()
-                        == bmux_scene_protocol::scene_protocol::EVENT_KIND.as_str()
+                        == bmux_scene_protocol::scene_protocol::STATE_KIND.as_str()
                     {
                         match serde_json::from_slice::<
-                            bmux_scene_protocol::scene_protocol::EventPayload,
+                            bmux_scene_protocol::scene_protocol::DecorationScene,
                         >(payload)
                         {
                             Ok(scene) => {
-                                // Re-emit on the local event bus so
-                                // render extensions pick it up. When
-                                // no subscriber has registered the
-                                // channel the emit returns
-                                // `ChannelNotRegistered`; we ignore
-                                // that so builds without extensions
-                                // stay silent.
-                                let _ = bmux_plugin::global_event_bus().emit(
-                                    &bmux_scene_protocol::scene_protocol::EVENT_KIND,
+                                // Re-publish retained scene state on the local event
+                                // bus so late-installed render extensions can hydrate
+                                // without waiting for a fresh scene mutation.
+                                let _ = bmux_plugin::global_event_bus().publish_state(
+                                    &bmux_scene_protocol::scene_protocol::STATE_KIND,
                                     scene,
                                 );
                                 // Any new scene makes the frame dirty
@@ -1617,15 +1612,13 @@ pub async fn run_session_attach_with_client(
                 view_state.dirty.overlay_needs_redraw = true;
             },
 
-            // Scene events pushed on the local event bus. The
-            // PluginBusEvent handler above emits incoming scenes
-            // onto the same channel; render extensions subscribe
-            // independently. Core observes the stream only to mark
-            // the frame dirty so the renderer consults extensions
-            // on the next pass.
+            // Scene state pushed on the local event bus. The PluginBusEvent handler
+            // above publishes incoming scenes onto the same retained channel; render
+            // extensions subscribe independently. Core observes changes only to mark
+            // the frame dirty so the renderer consults extensions on the next pass.
             scene_result = async {
                 match &mut scene_event_rx {
-                    Some(rx) => rx.recv().await.ok(),
+                    Some(rx) => rx.changed().await.ok(),
                     None => std::future::pending().await,
                 }
             } => {
