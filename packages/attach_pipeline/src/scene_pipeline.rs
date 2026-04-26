@@ -328,6 +328,7 @@ impl AttachScenePipeline {
             None,
             layout_state.zoomed,
             (self.viewport.cols, self.viewport.rows),
+            &bmux_appearance::RuntimeAppearance::default(),
             &[],
         )?;
         apply_attach_cursor_state(

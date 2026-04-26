@@ -2,6 +2,10 @@ use crate::types::{
     AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
 };
 use anyhow::{Context, Result};
+use bmux_appearance::{
+    RuntimeAppearance, RuntimeContentBlend, RuntimeContentEffect, RuntimeContentEffectBgPredicate,
+    RuntimeContentEffectScope,
+};
 use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use crossterm::cursor::MoveTo;
@@ -148,6 +152,77 @@ fn cell_style(cell: &vt100::Cell) -> CellStyle {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RgbColor {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+fn parse_hex_color(value: &str) -> Option<RgbColor> {
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(RgbColor { r, g, b })
+}
+
+#[allow(clippy::cast_possible_truncation)] // Result is clamped to u8 channel bounds.
+fn blend_channel(base: u8, overlay: u8, amount_permille: u16) -> u8 {
+    let amount = u32::from(amount_permille.min(1000));
+    let blended = (u32::from(base) * (1000 - amount) + u32::from(overlay) * amount) / 1000;
+    blended.min(u32::from(u8::MAX)) as u8
+}
+
+fn blend_rgb(base: RgbColor, overlay: RgbColor, amount_permille: u16) -> RgbColor {
+    RgbColor {
+        r: blend_channel(base.r, overlay.r, amount_permille),
+        g: blend_channel(base.g, overlay.g, amount_permille),
+        b: blend_channel(base.b, overlay.b, amount_permille),
+    }
+}
+
+fn apply_content_effects(mut style: CellStyle, appearance: &RuntimeAppearance) -> CellStyle {
+    for effect in appearance.content_effects.values() {
+        style = apply_content_effect(style, appearance, effect);
+    }
+    style
+}
+
+fn apply_content_effect(
+    mut style: CellStyle,
+    appearance: &RuntimeAppearance,
+    effect: &RuntimeContentEffect,
+) -> CellStyle {
+    if !effect.enabled || !matches!(effect.scope, RuntimeContentEffectScope::Cells) {
+        return style;
+    }
+    if !matches!(effect.when_bg, RuntimeContentEffectBgPredicate::Default)
+        || !matches!(style.bg, vt100::Color::Default)
+    {
+        return style;
+    }
+    let Some(RuntimeContentBlend {
+        color,
+        amount_permille,
+    }) = effect.background_blend.as_ref()
+    else {
+        return style;
+    };
+    let Some(base) = parse_hex_color(&appearance.background) else {
+        return style;
+    };
+    let Some(overlay) = parse_hex_color(color) else {
+        return style;
+    };
+    let blended = blend_rgb(base, overlay, *amount_permille);
+    style.bg = vt100::Color::Rgb(blended.r, blended.g, blended.b);
+    style
+}
+
 fn color_sgr(color: vt100::Color, foreground: bool) -> String {
     match color {
         vt100::Color::Default => {
@@ -280,6 +355,7 @@ pub fn render_attach_scene<W: io::Write>(
     selection_anchor: Option<AttachScrollbackPosition>,
     _zoomed: bool,
     terminal_size: (u16, u16),
+    runtime_appearance: &RuntimeAppearance,
     render_extensions: &[std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>],
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal_size;
@@ -454,6 +530,7 @@ pub fn render_attach_scene<W: io::Write>(
                         } else {
                             cell_style(cell)
                         };
+                        let style = apply_content_effects(style, runtime_appearance);
                         if style != current {
                             line.push_str(&style_sgr(style));
                             current = style;
@@ -539,6 +616,7 @@ mod tests {
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
     };
+    use bmux_appearance::{RuntimeAppearance, RuntimeContentBlend, RuntimeContentEffect};
     use bmux_ipc::{
         AttachFocusTarget, AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface,
         AttachSurfaceKind, PaneState, PaneSummary,
@@ -733,6 +811,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
             &[],
         )
         .expect("render should succeed");
@@ -795,11 +874,88 @@ mod tests {
             Some(AttachScrollbackPosition { row: 0, col: 1 }),
             false,
             (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
             &[],
         )
         .expect("render should succeed");
 
         let _rendered = String::from_utf8(output).expect("render output should be utf8");
+    }
+
+    #[test]
+    fn render_attach_scene_applies_default_background_content_effect() {
+        let pane_id = Uuid::from_u128(31);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(32),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 3,
+                },
+                content_rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 3,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        buffer.parser.screen_mut().set_size(1, 8);
+        buffer.parser.process(b"x");
+        pane_buffers.insert(pane_id, buffer);
+        let mut appearance = RuntimeAppearance {
+            background: "#000000".to_string(),
+            ..RuntimeAppearance::default()
+        };
+        appearance.content_effects.insert(
+            "wash".to_string(),
+            RuntimeContentEffect {
+                background_blend: Some(RuntimeContentBlend {
+                    color: "#ff0000".to_string(),
+                    amount_permille: 100,
+                }),
+                ..RuntimeContentEffect::default()
+            },
+        );
+
+        let mut output = Vec::new();
+        let _ = render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &BTreeSet::from([pane_id]),
+            true,
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (80, 24),
+            &appearance,
+            &[],
+        )
+        .expect("render should succeed");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        assert!(rendered.contains("\x1b[0;39;48;2;25;0;0m"));
     }
 
     #[test]
@@ -931,6 +1087,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
             &extensions,
         )
         .expect("render should succeed");
@@ -1013,6 +1170,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
             &[],
         )
         .expect("initial render should succeed");
@@ -1042,6 +1200,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
             &[],
         )
         .expect("deferred render should succeed");
@@ -1075,6 +1234,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
             &[],
         )
         .expect("completed render should succeed");
@@ -1140,6 +1300,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
             &[],
         )
         .expect("full redraw should succeed despite sync flag");
@@ -1288,6 +1449,7 @@ mod tests {
             None,
             false,
             (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
             &extensions,
         )
         .expect("render should succeed");

@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_appearance             = { workspace = true }
 bmux_attach_pipeline_models = { workspace = true }
 bmux_client                 = { workspace = true }
 bmux_ipc                    = { workspace = true }
@@ -30,6 +31,7 @@ default = []
 
 fail-on-warnings = [
     "bmux_attach_pipeline_models/fail-on-warnings",
+    "bmux_appearance/fail-on-warnings",
     "bmux_client/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",

@@ -18,6 +18,7 @@ pub struct RuntimeAppearance {
     pub selection_background: String,
     pub border: RuntimeBorderAppearance,
     pub status: RuntimeStatusAppearance,
+    pub content_effects: BTreeMap<String, RuntimeContentEffect>,
     pub modes: BTreeMap<String, RuntimeAppearancePatch>,
 }
 
@@ -30,6 +31,53 @@ pub struct RuntimeAppearancePatch {
     pub selection_background: Option<String>,
     pub border: RuntimeBorderAppearancePatch,
     pub status: RuntimeStatusAppearancePatch,
+    pub content_effects: BTreeMap<String, RuntimeContentEffectPatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeContentEffect {
+    pub enabled: bool,
+    pub scope: RuntimeContentEffectScope,
+    pub when_bg: RuntimeContentEffectBgPredicate,
+    pub background_blend: Option<RuntimeContentBlend>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeContentEffectPatch {
+    pub enabled: Option<bool>,
+    pub scope: Option<RuntimeContentEffectScope>,
+    pub when_bg: Option<RuntimeContentEffectBgPredicate>,
+    pub background_blend: RuntimeContentBlendPatch,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeContentEffectScope {
+    #[default]
+    Cells,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeContentEffectBgPredicate {
+    #[default]
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeContentBlend {
+    pub color: String,
+    pub amount_permille: u16,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeContentBlendPatch {
+    pub color: Option<String>,
+    pub amount_permille: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +121,7 @@ impl Default for RuntimeAppearance {
             selection_background: "#404040".to_string(),
             border: RuntimeBorderAppearance::default(),
             status: RuntimeStatusAppearance::default(),
+            content_effects: BTreeMap::new(),
             modes: BTreeMap::new(),
         }
     }
@@ -100,6 +149,12 @@ impl RuntimeAppearance {
         }
         self.border.apply_patch(&patch.border);
         self.status.apply_patch(&patch.status);
+        for (name, effect_patch) in &patch.content_effects {
+            self.content_effects
+                .entry(name.clone())
+                .or_default()
+                .apply_patch(effect_patch);
+        }
     }
 
     #[must_use]
@@ -127,6 +182,92 @@ impl RuntimeAppearancePatch {
         }
         self.border.merge(&other.border);
         self.status.merge(&other.status);
+        for (name, effect) in &other.content_effects {
+            self.content_effects
+                .entry(name.clone())
+                .or_default()
+                .merge(effect);
+        }
+    }
+}
+
+impl Default for RuntimeContentEffect {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scope: RuntimeContentEffectScope::default(),
+            when_bg: RuntimeContentEffectBgPredicate::default(),
+            background_blend: None,
+        }
+    }
+}
+
+impl RuntimeContentEffect {
+    pub fn apply_patch(&mut self, patch: &RuntimeContentEffectPatch) {
+        if let Some(value) = patch.enabled {
+            self.enabled = value;
+        }
+        if let Some(value) = patch.scope {
+            self.scope = value;
+        }
+        if let Some(value) = patch.when_bg {
+            self.when_bg = value;
+        }
+        if patch.background_blend.has_values() {
+            self.background_blend
+                .get_or_insert_with(RuntimeContentBlend::default)
+                .apply_patch(&patch.background_blend);
+        }
+    }
+}
+
+impl RuntimeContentEffectPatch {
+    pub fn merge(&mut self, other: &Self) {
+        if other.enabled.is_some() {
+            self.enabled = other.enabled;
+        }
+        if other.scope.is_some() {
+            self.scope = other.scope;
+        }
+        if other.when_bg.is_some() {
+            self.when_bg = other.when_bg;
+        }
+        self.background_blend.merge(&other.background_blend);
+    }
+}
+
+impl Default for RuntimeContentBlend {
+    fn default() -> Self {
+        Self {
+            color: "#000000".to_string(),
+            amount_permille: 0,
+        }
+    }
+}
+
+impl RuntimeContentBlend {
+    fn apply_patch(&mut self, patch: &RuntimeContentBlendPatch) {
+        if let Some(value) = &patch.color {
+            self.color.clone_from(value);
+        }
+        if let Some(value) = patch.amount_permille {
+            self.amount_permille = value.min(1000);
+        }
+    }
+}
+
+impl RuntimeContentBlendPatch {
+    const fn has_values(&self) -> bool {
+        self.color.is_some() || self.amount_permille.is_some()
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if other.color.is_some() {
+            self.color.clone_from(&other.color);
+        }
+        if other.amount_permille.is_some() {
+            self.amount_permille = other.amount_permille;
+        }
     }
 }
 

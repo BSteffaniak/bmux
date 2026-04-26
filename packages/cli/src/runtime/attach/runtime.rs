@@ -4166,6 +4166,18 @@ pub fn render_attach_frame(
         status_insets_for_position(view_state.status_position);
     let render_scene =
         view_state.dirty.full_pane_redraw || !view_state.dirty.pane_dirty_ids.is_empty();
+    let appearance_mode_id = if view_state.help_overlay_open {
+        "help"
+    } else if view_state.prompt.is_active() {
+        "prompt"
+    } else if view_state.scrollback_active {
+        "scroll"
+    } else if layout_state.zoomed {
+        "zoom"
+    } else {
+        view_state.active_mode_id.as_str()
+    };
+    let active_runtime_appearance = runtime_appearance.for_mode(appearance_mode_id);
     let cursor_state = if render_scene {
         // Snapshot the current set of registered render extensions
         // once per frame. The snapshot is cheap (Arc-clones) and
@@ -4187,6 +4199,7 @@ pub fn render_attach_frame(
             view_state.selection_anchor,
             layout_state.zoomed,
             terminal::size().unwrap_or((0, 0)),
+            &active_runtime_appearance,
             &extensions,
         )?
     } else {

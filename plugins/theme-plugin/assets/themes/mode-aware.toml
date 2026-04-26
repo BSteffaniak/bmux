@@ -6,7 +6,14 @@ name = "mode-aware"
 mode_indicator = "#ffd75f"
 
 [modes.normal.status]
+background     = "#2a1616"
 mode_indicator = "#ff5f5f"
+
+[modes.normal.content_effects.default_bg_wash]
+background_blend = { color = "#ff5f5f", amount = 0.16 }
+enabled          = true
+scope            = "cells"
+when_bg          = "default"
 
 [modes.insert.status]
 mode_indicator = "#5fff87"

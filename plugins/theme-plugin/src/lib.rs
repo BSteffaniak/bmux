@@ -5,7 +5,8 @@
 
 use bmux_appearance::{
     RUNTIME_APPEARANCE_STATE_KIND, RuntimeAppearance, RuntimeAppearancePatch,
-    RuntimeBorderAppearancePatch, RuntimeStatusAppearancePatch,
+    RuntimeBorderAppearancePatch, RuntimeContentBlendPatch, RuntimeContentEffectBgPredicate,
+    RuntimeContentEffectPatch, RuntimeContentEffectScope, RuntimeStatusAppearancePatch,
 };
 use bmux_ipc::{InvokeServiceKind, Request as IpcRequest, ResponsePayload};
 use bmux_plugin::prompt;
@@ -71,6 +72,8 @@ struct ThemeConfig {
     border: BorderColors,
     status: StatusColors,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    content_effects: BTreeMap<String, ThemeContentEffect>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     modes: BTreeMap<String, Self>,
     #[serde(rename = "plugins", skip_serializing_if = "BTreeMap::is_empty")]
     plugins: BTreeMap<String, toml::Value>,
@@ -92,6 +95,23 @@ struct StatusColors {
     mode_indicator: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ThemeContentEffect {
+    enabled: Option<bool>,
+    scope: Option<RuntimeContentEffectScope>,
+    when_bg: Option<RuntimeContentEffectBgPredicate>,
+    background_blend: ThemeContentBlend,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ThemeContentBlend {
+    color: Option<String>,
+    amount: Option<f32>,
+    amount_permille: Option<u16>,
+}
+
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
@@ -102,6 +122,7 @@ impl Default for ThemeConfig {
             selection_background: None,
             border: BorderColors::default(),
             status: StatusColors::default(),
+            content_effects: BTreeMap::new(),
             modes: BTreeMap::new(),
             plugins: BTreeMap::new(),
         }
@@ -125,8 +146,40 @@ impl From<&ThemeConfig> for RuntimeAppearancePatch {
                 active_window: theme.status.active_window.clone(),
                 mode_indicator: theme.status.mode_indicator.clone(),
             },
+            content_effects: theme
+                .content_effects
+                .iter()
+                .map(|(name, effect)| (name.clone(), RuntimeContentEffectPatch::from(effect)))
+                .collect(),
         }
     }
+}
+
+impl From<&ThemeContentEffect> for RuntimeContentEffectPatch {
+    fn from(effect: &ThemeContentEffect) -> Self {
+        Self {
+            enabled: effect.enabled,
+            scope: effect.scope,
+            when_bg: effect.when_bg,
+            background_blend: RuntimeContentBlendPatch::from(&effect.background_blend),
+        }
+    }
+}
+
+impl From<&ThemeContentBlend> for RuntimeContentBlendPatch {
+    fn from(blend: &ThemeContentBlend) -> Self {
+        Self {
+            color: blend.color.clone(),
+            amount_permille: blend
+                .amount_permille
+                .or_else(|| blend.amount.map(amount_to_permille)),
+        }
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Value is clamped to 0..=1000 before casting.
+fn amount_to_permille(amount: f32) -> u16 {
+    (amount.clamp(0.0, 1.0) * 1000.0).round() as u16
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -736,6 +789,12 @@ mod tests {
 
             [modes.normal.status]
             mode_indicator = "#777777"
+
+            [modes.normal.content_effects.default_bg_wash]
+            enabled = true
+            scope = "cells"
+            when_bg = "default"
+            background_blend = { color = "#ff0000", amount = 0.16 }
             "##,
         )
         .expect("overlay theme parses");
@@ -762,6 +821,64 @@ mod tests {
             resolved.appearance.for_mode("normal").status.mode_indicator,
             "#777777"
         );
+        let normal = resolved.appearance.for_mode("normal");
+        let effect = normal
+            .content_effects
+            .get("default_bg_wash")
+            .expect("normal mode wash effect should resolve");
+        assert!(effect.enabled);
+        let blend = effect
+            .background_blend
+            .as_ref()
+            .expect("background blend should resolve");
+        assert_eq!(blend.color, "#ff0000");
+        assert_eq!(blend.amount_permille, 160);
+    }
+
+    #[test]
+    fn content_effect_layers_merge_by_name() {
+        let lower: ThemeConfig = toml::from_str(
+            r##"
+            [content_effects.default_bg_wash]
+            enabled = true
+            scope = "cells"
+            when_bg = "default"
+            background_blend = { color = "#ff0000", amount = 0.16 }
+            "##,
+        )
+        .expect("lower theme parses");
+        let upper: ThemeConfig = toml::from_str(
+            r"
+            [content_effects.default_bg_wash]
+            background_blend = { amount = 0.08 }
+            ",
+        )
+        .expect("upper theme parses");
+        let catalog = vec![
+            ThemeCatalogEntry {
+                name: "lower".to_string(),
+                theme: lower,
+            },
+            ThemeCatalogEntry {
+                name: "upper".to_string(),
+                theme: upper,
+            },
+        ];
+
+        let resolved = resolve_theme_stack(&catalog, &["lower".to_string(), "upper".to_string()])
+            .expect("stack resolves");
+        let effect = resolved
+            .appearance
+            .content_effects
+            .get("default_bg_wash")
+            .expect("effect should resolve");
+        let blend = effect
+            .background_blend
+            .as_ref()
+            .expect("background blend should resolve");
+
+        assert_eq!(blend.color, "#ff0000");
+        assert_eq!(blend.amount_permille, 80);
     }
 
     #[test]
