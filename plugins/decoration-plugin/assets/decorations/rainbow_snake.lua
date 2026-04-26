@@ -202,7 +202,9 @@ function decorate(ctx)
         spawn_apple(ctx, head, snake_len, visual_total)
     end
 
-    if snake_size * SPACING >= visual_total - SPACING then
+    local body_span = math.max(0, snake_len - 1) * SPACING
+    local tail_gap = visual_total - body_span
+    if tail_gap <= SPACING then
         death_started_ms = ctx.time_ms
         death_segments = segments
         apple_v = nil
