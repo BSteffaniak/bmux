@@ -1,3 +1,11 @@
+mod benchmark_manifest;
+mod phase_schema;
+
+use benchmark_manifest::{
+    BenchmarkManifest, BenchmarkResolvedOptions, BenchmarkRunOptions, read_manifest,
+    resolve_benchmark_options,
+};
+use phase_schema::validate_phase_schema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -30,6 +38,8 @@ fn run() -> Result<(), String> {
         "report-json" => run_report_json(args),
         "report-phase-file" => run_report_phase_file(args),
         "validate-phase-config" => run_validate_phase_config(args),
+        "validate-phase-schema" => run_validate_phase_schema(args),
+        "list-benchmarks" => run_list_benchmarks(args),
         "run-benchmark" => run_benchmark(args),
         "sample-static-service" => run_sample_static_service(args),
         "sample-core-services" => run_sample_core_services(args),
@@ -52,6 +62,8 @@ fn usage() -> &'static str {
   report-json --input PATH --output PATH [threshold flags]
   report-phase-file --input PATH --output PATH --phase NAME --field FIELD [--filter-key KEY --filter-value VALUE] [--max-p99-ms N] [--max-p95-ms N]
   validate-phase-config --input PATH --config PATH --output-dir PATH [--tag TAG] [--limit NAME=MS] [--var NAME=VALUE]
+  validate-phase-schema --input PATH
+  list-benchmarks [--dir PATH]
   run-benchmark --manifest PATH [--profile NAME] [--artifact-json PATH] [--phase-report-dir PATH] [benchmark overrides]
   sample-static-service --iterations N --warmup N --out-json PATH [--max-p99-us N]
   sample-core-services --iterations N --warmup N --out-json PATH [--max-p99-us N]
@@ -108,88 +120,6 @@ struct PhaseReportRequest<'a> {
     max_p95_ms: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct BenchmarkManifest {
-    benchmark: BenchmarkSpec,
-    #[serde(default)]
-    defaults: BenchmarkDefaults,
-    #[serde(default)]
-    profiles: BTreeMap<String, BenchmarkProfile>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BenchmarkSpec {
-    name: String,
-    kind: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct BenchmarkDefaults {
-    iterations: Option<usize>,
-    warmup: Option<usize>,
-    scenario: Option<String>,
-    windows: Option<usize>,
-    switches: Option<usize>,
-    max_p99_ms: Option<f64>,
-    attach_command_limit_ms: Option<f64>,
-    retarget_limit_ms: Option<f64>,
-    core_service_limit_ms: Option<f64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct BenchmarkProfile {
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    service_timing: bool,
-    #[serde(default)]
-    ipc_timing: bool,
-    #[serde(default)]
-    storage_timing: bool,
-    #[serde(default)]
-    loosen_slo: bool,
-}
-
-#[derive(Debug, Default)]
-struct BenchmarkRunOptions {
-    manifest: Option<String>,
-    profile: String,
-    artifact_json: Option<String>,
-    phase_report_dir: Option<String>,
-    bmux_bin: Option<String>,
-    iterations: Option<usize>,
-    warmup: Option<usize>,
-    scenario: Option<String>,
-    windows: Option<usize>,
-    switches: Option<usize>,
-    max_p99_ms: Option<f64>,
-    tags: Vec<String>,
-    limits: BTreeMap<String, f64>,
-    vars: BTreeMap<String, String>,
-}
-
-#[derive(Debug)]
-struct BenchmarkResolvedOptions {
-    manifest_path: String,
-    profile: String,
-    artifact_json: Option<String>,
-    phase_report_dir: String,
-    bmux_bin: Option<String>,
-    iterations: usize,
-    warmup: usize,
-    scenario: String,
-    windows: usize,
-    switches: usize,
-    max_p99_ms: Option<f64>,
-    tags: Vec<String>,
-    limits: BTreeMap<String, f64>,
-    vars: BTreeMap<String, String>,
-    service_timing: bool,
-    ipc_timing: bool,
-    storage_timing: bool,
-    loosen_slo: bool,
-}
-
 struct SampleCommandRequest<'a> {
     iterations: usize,
     command: &'a [String],
@@ -204,14 +134,12 @@ fn run_benchmark(args: Vec<String>) -> Result<(), String> {
         .manifest
         .clone()
         .ok_or_else(|| "--manifest is required".to_string())?;
-    let manifest_text = fs::read_to_string(&manifest_path)
-        .map_err(|error| format!("failed reading benchmark manifest {manifest_path}: {error}"))?;
-    let manifest: BenchmarkManifest = toml::from_str(&manifest_text)
-        .map_err(|error| format!("failed parsing benchmark manifest: {error}"))?;
+    let manifest = read_manifest(&manifest_path)?;
     let options = resolve_benchmark_options(cli, &manifest, manifest_path)?;
     match manifest.benchmark.kind.as_str() {
         "core-services" => run_core_services_benchmark(&manifest, &options),
         "attach-tab-switch" => run_attach_tab_switch_benchmark(&manifest, &options),
+        "plugin-hot-path" => run_plugin_hot_path_benchmark(&manifest, &options),
         other => Err(format!("unsupported benchmark kind '{other}'")),
     }
 }
@@ -312,66 +240,6 @@ fn parse_usize_arg(args: &[String], index: usize, name: &str) -> Result<usize, S
     usize::try_from(value).map_err(|_| format!("{name} is too large"))
 }
 
-fn resolve_benchmark_options(
-    cli: BenchmarkRunOptions,
-    manifest: &BenchmarkManifest,
-    manifest_path: String,
-) -> Result<BenchmarkResolvedOptions, String> {
-    let profile = manifest
-        .profiles
-        .get(&cli.profile)
-        .ok_or_else(|| format!("profile '{}' not found in manifest", cli.profile))?;
-    let phase_report_dir = cli.phase_report_dir.unwrap_or_else(|| {
-        env::temp_dir()
-            .join(format!("bmux-{}-phase-reports", manifest.benchmark.name))
-            .display()
-            .to_string()
-    });
-    let mut tags = profile.tags.clone();
-    tags.extend(cli.tags);
-    let mut limits = cli.limits;
-    if let Some(limit) = manifest.defaults.attach_command_limit_ms {
-        limits.entry("attach_command".to_string()).or_insert(limit);
-    }
-    if let Some(limit) = manifest.defaults.retarget_limit_ms {
-        limits.entry("retarget".to_string()).or_insert(limit);
-    }
-    if let Some(limit) = manifest.defaults.core_service_limit_ms {
-        limits.entry("core_service".to_string()).or_insert(limit);
-    }
-    if profile.loosen_slo {
-        for value in limits.values_mut() {
-            *value = 1_000_000.0;
-        }
-    }
-    Ok(BenchmarkResolvedOptions {
-        manifest_path,
-        profile: cli.profile,
-        artifact_json: cli.artifact_json,
-        phase_report_dir,
-        bmux_bin: cli.bmux_bin,
-        iterations: cli
-            .iterations
-            .or(manifest.defaults.iterations)
-            .unwrap_or(30),
-        warmup: cli.warmup.or(manifest.defaults.warmup).unwrap_or(0),
-        scenario: cli
-            .scenario
-            .or_else(|| manifest.defaults.scenario.clone())
-            .unwrap_or_else(|| "default".to_string()),
-        windows: cli.windows.or(manifest.defaults.windows).unwrap_or(4),
-        switches: cli.switches.or(manifest.defaults.switches).unwrap_or(4),
-        max_p99_ms: cli.max_p99_ms.or(manifest.defaults.max_p99_ms),
-        tags,
-        limits,
-        vars: cli.vars,
-        service_timing: profile.service_timing,
-        ipc_timing: profile.ipc_timing,
-        storage_timing: profile.storage_timing,
-        loosen_slo: profile.loosen_slo,
-    })
-}
-
 fn run_core_services_benchmark(
     manifest: &BenchmarkManifest,
     options: &BenchmarkResolvedOptions,
@@ -383,6 +251,31 @@ fn run_core_services_benchmark(
             .to_string()
     });
     run_sample_core_services(vec![
+        "--iterations".to_string(),
+        options.iterations.to_string(),
+        "--warmup".to_string(),
+        options.warmup.to_string(),
+        "--out-json".to_string(),
+        artifact_json.clone(),
+    ])?;
+    validate_benchmark_phases(&artifact_json, options)?;
+    write_standard_benchmark_artifact(manifest, options, &artifact_json, &artifact_json)?;
+    println!("artifact_json={artifact_json}");
+    println!("phase_report_dir={}", options.phase_report_dir);
+    Ok(())
+}
+
+fn run_plugin_hot_path_benchmark(
+    manifest: &BenchmarkManifest,
+    options: &BenchmarkResolvedOptions,
+) -> Result<(), String> {
+    let artifact_json = options.artifact_json.clone().unwrap_or_else(|| {
+        env::temp_dir()
+            .join("bmux-plugin-hot-path.json")
+            .display()
+            .to_string()
+    });
+    run_sample_static_service(vec![
         "--iterations".to_string(),
         options.iterations.to_string(),
         "--warmup".to_string(),
@@ -710,8 +603,14 @@ fn write_standard_benchmark_artifact(
         .ok()
         .map(|samples| stats_json(compute_latency_stats(&samples)));
     let artifact = json!({
+        "schema_version": 1,
         "benchmark": manifest.benchmark.name,
         "kind": manifest.benchmark.kind,
+        "started_at_unix_ms": unix_now_ms(),
+        "git_rev": git_output(&["rev-parse", "HEAD"]),
+        "git_dirty": git_dirty(),
+        "manifest_path": options.manifest_path,
+        "command": format!("run-benchmark --manifest {} --profile {}", options.manifest_path, options.profile),
         "profile": options.profile,
         "scenario": options.scenario,
         "iterations": options.iterations,
@@ -728,6 +627,31 @@ fn write_standard_benchmark_artifact(
         .map_err(|error| format!("failed encoding benchmark artifact: {error}"))?;
     fs::write(output, encoded)
         .map_err(|error| format!("failed writing benchmark artifact {output}: {error}"))
+}
+
+fn unix_now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_dirty() -> Option<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(!output.stdout.is_empty())
 }
 
 fn format_f64_arg(value: f64) -> String {
@@ -863,6 +787,69 @@ fn run_validate_phase_config(args: Vec<String>) -> Result<(), String> {
     } else {
         Err(failures.join("\n"))
     }
+}
+
+fn run_validate_phase_schema(args: Vec<String>) -> Result<(), String> {
+    let mut input = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--input" => {
+                input = args.get(index + 1).cloned();
+                index += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument for validate-phase-schema: {other}"
+                ));
+            }
+        }
+    }
+    let input = input.ok_or_else(|| "--input is required".to_string())?;
+    let text = fs::read_to_string(&input)
+        .map_err(|error| format!("failed reading phase input {input}: {error}"))?;
+    let events = parse_phase_events_input(&text);
+    validate_phase_schema(&events).map_err(|errors| errors.join("\n"))?;
+    println!("phase schema validation passed: {} events", events.len());
+    Ok(())
+}
+
+fn run_list_benchmarks(args: Vec<String>) -> Result<(), String> {
+    let mut dir = "perf".to_string();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dir" => {
+                dir = require_arg(&args, index, "--dir")?.to_string();
+                index += 2;
+            }
+            other => return Err(format!("unknown argument for list-benchmarks: {other}")),
+        }
+    }
+    let mut entries = fs::read_dir(&dir)
+        .map_err(|error| format!("failed reading benchmark dir {dir}: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
+        .collect::<Vec<_>>();
+    entries.sort();
+    println!("benchmark\tkind\tprofiles\tmanifest");
+    for path in entries {
+        let path_text = path.display().to_string();
+        if let Ok(manifest) = read_manifest(&path_text) {
+            let profiles = manifest
+                .profiles
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "{}\t{}\t{}\t{}",
+                manifest.benchmark.name, manifest.benchmark.kind, profiles, path_text
+            );
+        }
+    }
+    Ok(())
 }
 
 fn expand_report_vars(value: &str, vars: &BTreeMap<String, String>) -> String {
@@ -1119,6 +1106,13 @@ fn run_sample_static_service(args: Vec<String>) -> Result<(), String> {
     let payload = json!({
         "scenario": "static-performance-get-settings",
         "samples_us": samples_us,
+        "events": samples_us.iter().map(|total_us| {
+            json!({
+                "phase": "static_service.direct",
+                "scenario": "static_service.direct",
+                "total_us": total_us,
+            })
+        }).collect::<Vec<_>>(),
         "latency_us": stats_json(stats),
         "limits": { "max_p99_us": max_p99_us },
         "passed": true,

@@ -1,0 +1,27 @@
+[benchmark]
+name = "plugin-hot-path"
+kind = "plugin-hot-path"
+
+[defaults]
+iterations = 1000
+warmup = 100
+static_service_limit_ms = 5
+
+[profiles.normal]
+
+[profiles.diagnostic]
+loosen_slo = true
+
+[profiles.ci]
+
+[profiles.stress]
+loosen_slo = true
+
+[limit]
+static_service = 5
+
+[[reports]]
+phase = "static_service.direct"
+field = "total_us"
+limit = "static_service"
+filter = { key = "scenario", value = "static_service.direct" }
