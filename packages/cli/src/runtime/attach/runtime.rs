@@ -4401,7 +4401,7 @@ fn build_attach_tabs_from_plugin_snapshot(
         .into_iter()
         .map(|entry| AttachTab {
             label: entry.name.clone(),
-            active: entry.active || current_id == Some(entry.id),
+            active: current_id.map_or(entry.active, |id| id == entry.id),
             context_id: Some(entry.id),
         })
         .collect()
@@ -6074,7 +6074,8 @@ pub async fn handle_attach_mouse_event(
     }
 
     if matches!(mouse_event.kind, MouseEventKind::Down(MouseButton::Left))
-        && handle_attach_status_tab_click(client, view_state, mouse_event).await?
+        && handle_attach_status_tab_click(client, view_state, mouse_event, kernel_client_factory)
+            .await?
     {
         return Ok(());
     }
@@ -6560,6 +6561,7 @@ pub async fn handle_attach_status_tab_click(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
+    kernel_client_factory: Option<&KernelClientFactory>,
 ) -> std::result::Result<bool, ClientError> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols == 0 || rows == 0 {
@@ -6603,7 +6605,15 @@ pub async fn handle_attach_status_tab_click(
 
     debug!(target_context_id = %target_context_id, "attach.status_click.retarget");
 
-    retarget_attach_to_context(client, view_state, target_context_id).await?;
+    handle_attach_plugin_command_action(
+        client,
+        "bmux.windows",
+        "switch-window",
+        &[target_context_id.to_string()],
+        view_state,
+        kernel_client_factory,
+    )
+    .await?;
     view_state.dirty.status_needs_redraw = true;
     view_state.dirty.layout_needs_refresh = true;
     view_state.dirty.full_pane_redraw = true;
@@ -6737,10 +6747,14 @@ pub async fn focus_attach_pane(
         return Ok(());
     }
 
+    let selector = attached_session_selector(view_state);
     let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
         client,
-        "focus-pane",
-        &windows_cmd_args::FocusPane { id: pane_id },
+        "focus-pane-by-selector",
+        &windows_cmd_args::FocusPaneBySelector {
+            session: Some(ipc_to_typed_selector(selector)),
+            target: typed_windows::pane_selector_by_id(pane_id),
+        },
     )
     .await?;
 
@@ -7111,6 +7125,71 @@ mod tests {
             });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
         view_state
+    }
+
+    #[test]
+    fn plugin_window_snapshot_uses_attached_context_as_active() {
+        let session_id = Uuid::new_v4();
+        let stale_active = Uuid::new_v4();
+        let attached_context = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: Some(attached_context),
+            session_id,
+            can_write: true,
+        });
+        view_state.cached_window_list = Some(std::sync::Arc::new(
+            bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+                windows: vec![
+                    bmux_windows_plugin_api::windows_list::WindowListEntry {
+                        id: stale_active,
+                        name: "old".to_string(),
+                        active: true,
+                    },
+                    bmux_windows_plugin_api::windows_list::WindowListEntry {
+                        id: attached_context,
+                        name: "new".to_string(),
+                        active: false,
+                    },
+                ],
+                revision: 1,
+            },
+        ));
+        let contexts = vec![
+            ContextSummary {
+                id: stale_active,
+                name: Some("old".to_string()),
+                attributes: BTreeMap::from([(
+                    "bmux.session_id".to_string(),
+                    session_id.to_string(),
+                )]),
+            },
+            ContextSummary {
+                id: attached_context,
+                name: Some("new".to_string()),
+                attributes: BTreeMap::from([(
+                    "bmux.session_id".to_string(),
+                    session_id.to_string(),
+                )]),
+            },
+        ];
+
+        let tabs = build_attach_tabs_from_catalog(
+            &contexts,
+            &view_state,
+            &BmuxConfig::default().status_bar,
+            Some(attached_context),
+            session_id,
+        );
+
+        assert_eq!(tabs.iter().filter(|tab| tab.active).count(), 1);
+        assert!(
+            tabs.iter()
+                .any(|tab| tab.context_id == Some(attached_context) && tab.active)
+        );
+        assert!(
+            tabs.iter()
+                .any(|tab| tab.context_id == Some(stale_active) && !tab.active)
+        );
     }
 
     #[test]
