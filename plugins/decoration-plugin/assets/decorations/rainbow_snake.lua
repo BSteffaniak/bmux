@@ -6,7 +6,8 @@ local SPEED = 12
 local SPACING = 2.0
 local EAT_RADIUS = 0.75
 local APPLE_PAD = 0.75
-local DEATH_MS = 900
+local DEATH_HOLD_MS = 3000
+local DEATH_SHRINK_MS = 1200
 local FLASH_MS = 150
 
 local snake_size = INITIAL_SNAKE_SIZE
@@ -161,13 +162,27 @@ local function render_death(cmds, ctx, raw_total)
     end
 
     local elapsed = ctx.time_ms - death_started_ms
-    if elapsed >= DEATH_MS then
+    if elapsed >= DEATH_HOLD_MS + DEATH_SHRINK_MS then
         reset_game(raw_total)
         return false
     end
 
     if math.floor(elapsed / FLASH_MS) % 2 == 0 then
-        render_snake(cmds, death_segments, 1, true)
+        local visible_count = #death_segments
+        if elapsed > DEATH_HOLD_MS then
+            local t = (elapsed - DEATH_HOLD_MS) / DEATH_SHRINK_MS
+            local min_count = math.min(INITIAL_SNAKE_SIZE, #death_segments)
+            visible_count = math.max(
+                min_count,
+                math.ceil(#death_segments - (#death_segments - min_count) * t)
+            )
+        end
+
+        local visible_segments = {}
+        for i = 1, visible_count do
+            visible_segments[i] = death_segments[i]
+        end
+        render_snake(cmds, visible_segments, 1, true)
     end
     return true
 end
