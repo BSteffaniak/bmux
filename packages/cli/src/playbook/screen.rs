@@ -145,6 +145,11 @@ impl ScreenInspector {
         self.needs_bootstrap = true;
     }
 
+    #[must_use]
+    pub const fn viewport_size(&self) -> (u16, u16) {
+        (self.viewport_cols, self.viewport_rows)
+    }
+
     /// Synchronize layout/output and update parsed pane state.
     /// # Errors
     ///

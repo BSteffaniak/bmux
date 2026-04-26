@@ -68,6 +68,7 @@ use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
+const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
 /// progress output burst to complete (e.g. when the server indicates
 /// `output_still_pending` or the inner application is mid-synchronized-
@@ -75,6 +76,49 @@ const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 /// naturally yields CPU time to the PTY reader thread, so no explicit
 /// sleep/yield is needed between rounds.
 const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
+
+fn emit_attach_phase_timing(payload: &serde_json::Value) {
+    if std::env::var_os("BMUX_ATTACH_PHASE_TIMING").is_none() {
+        return;
+    }
+    eprintln!("{ATTACH_PHASE_MARKER}{payload}");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_attach_plugin_command_timing(
+    plugin_id: &str,
+    command_name: &str,
+    status: &str,
+    before_context_id: Option<Uuid>,
+    after_context_id: Option<Uuid>,
+    attached_context_id: Option<Uuid>,
+    attached_session_id: Uuid,
+    before_us: u128,
+    policy_us: u128,
+    run_us: u128,
+    outcome_us: u128,
+    after_us: u128,
+    retarget_us: u128,
+    total_us: u128,
+) {
+    emit_attach_phase_timing(&serde_json::json!({
+        "phase": "attach.plugin_command",
+        "plugin_id": plugin_id,
+        "command_name": command_name,
+        "status": status,
+        "before_context_id": before_context_id,
+        "after_context_id": after_context_id,
+        "attached_context_id": attached_context_id,
+        "attached_session_id": attached_session_id,
+        "before_us": before_us,
+        "policy_us": policy_us,
+        "run_us": run_us,
+        "outcome_us": outcome_us,
+        "after_us": after_us,
+        "retarget_us": retarget_us,
+        "total_us": total_us,
+    }));
+}
 
 use super::super::{typed_clients, typed_contexts, typed_sessions, typed_windows};
 
@@ -2184,20 +2228,32 @@ pub async fn retarget_attach_to_context(
     context_id: Uuid,
 ) -> std::result::Result<(), ClientError> {
     let started_at = Instant::now();
+    let from_context_id = view_state.attached_context_id;
+    let from_session_id = view_state.attached_id;
     debug!(
-        from_context_id = ?view_state.attached_context_id,
-        from_session_id = %view_state.attached_id,
+        from_context_id = ?from_context_id,
+        from_session_id = %from_session_id,
         to_context_id = %context_id,
         "attach.retarget.start"
     );
+    let select_started = Instant::now();
     typed_select_context_attach(client, context_id).await?;
+    let select_us = select_started.elapsed().as_micros();
+    let open_started = Instant::now();
     let attach_info = open_attach_for_context(client, context_id).await?;
+    let open_us = open_started.elapsed().as_micros();
     view_state.attached_id = attach_info.session_id;
     view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
     view_state.can_write = attach_info.can_write;
+    let viewport_started = Instant::now();
     update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
+    let viewport_us = viewport_started.elapsed().as_micros();
+    let hydrate_started = Instant::now();
     hydrate_attach_state_from_snapshot(client, view_state).await?;
+    let hydrate_us = hydrate_started.elapsed().as_micros();
+    let catalog_started = Instant::now();
     refresh_attach_status_catalog_best_effort(client, view_state).await;
+    let catalog_us = catalog_started.elapsed().as_micros();
     view_state.ui_mode = AttachUiMode::Normal;
     let status = attach_context_status_from_catalog(view_state);
     set_attach_context_status(
@@ -2213,6 +2269,20 @@ pub async fn retarget_attach_to_context(
         elapsed_ms = started_at.elapsed().as_millis(),
         "attach.retarget.done"
     );
+    emit_attach_phase_timing(&serde_json::json!({
+        "phase": "attach.retarget_context",
+        "from_context_id": from_context_id,
+        "from_session_id": from_session_id,
+        "to_context_id": context_id,
+        "selected_context_id": view_state.attached_context_id,
+        "selected_session_id": view_state.attached_id,
+        "select_us": select_us,
+        "open_us": open_us,
+        "viewport_us": viewport_us,
+        "hydrate_us": hydrate_us,
+        "catalog_us": catalog_us,
+        "total_us": started_at.elapsed().as_micros(),
+    }));
     Ok(())
 }
 
@@ -2377,6 +2447,8 @@ pub async fn handle_attach_plugin_command_action(
     view_state: &mut AttachViewState,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> std::result::Result<(), ClientError> {
+    let total_started = Instant::now();
+    let before_started = Instant::now();
     let before_context_id = typed_current_context_attach(client)
         .await
         .map_or(None, |context| context.map(|entry| entry.id));
@@ -2389,6 +2461,7 @@ pub async fn handle_attach_plugin_command_action(
                 .map(|context| context.id)
                 .collect::<std::collections::BTreeSet<_>>()
         });
+    let before_us = before_started.elapsed().as_micros();
     debug!(
         plugin_id = %plugin_id,
         command_name = %command_name,
@@ -2397,6 +2470,7 @@ pub async fn handle_attach_plugin_command_action(
         attached_session_id = %view_state.attached_id,
         "attach.plugin_command.start"
     );
+    let policy_started = Instant::now();
     if let Err(error) = enforce_hot_path_plugin_policy(
         client,
         plugin_id,
@@ -2406,6 +2480,7 @@ pub async fn handle_attach_plugin_command_action(
     )
     .await
     {
+        let policy_us = policy_started.elapsed().as_micros();
         warn!(
             plugin_id = %plugin_id,
             command_name = %command_name,
@@ -2419,8 +2494,26 @@ pub async fn handle_attach_plugin_command_action(
             Instant::now(),
             ATTACH_TRANSIENT_STATUS_TTL,
         );
+        emit_attach_plugin_command_timing(
+            plugin_id,
+            command_name,
+            "policy_denied",
+            before_context_id,
+            None,
+            view_state.attached_context_id,
+            view_state.attached_id,
+            before_us,
+            policy_us,
+            0,
+            0,
+            0,
+            0,
+            total_started.elapsed().as_micros(),
+        );
         return Ok(());
     }
+    let policy_us = policy_started.elapsed().as_micros();
+    let run_started = Instant::now();
     match run_plugin_keybinding_command(
         plugin_id,
         command_name,
@@ -2429,6 +2522,7 @@ pub async fn handle_attach_plugin_command_action(
         view_state.self_client_id,
     ) {
         Err(error) => {
+            let run_us = run_started.elapsed().as_micros();
             warn!(
                 plugin_id = %plugin_id,
                 command_name = %command_name,
@@ -2440,8 +2534,25 @@ pub async fn handle_attach_plugin_command_action(
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
+            emit_attach_plugin_command_timing(
+                plugin_id,
+                command_name,
+                "run_error",
+                before_context_id,
+                None,
+                view_state.attached_context_id,
+                view_state.attached_id,
+                before_us,
+                policy_us,
+                run_us,
+                0,
+                0,
+                0,
+                total_started.elapsed().as_micros(),
+            );
         }
         Ok(execution) => {
+            let run_us = run_started.elapsed().as_micros();
             let status = execution.status;
             if status != 0 {
                 // Route the plugin's error text (captured by the SDK
@@ -2483,13 +2594,31 @@ pub async fn handle_attach_plugin_command_action(
                     Instant::now(),
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
+                emit_attach_plugin_command_timing(
+                    plugin_id,
+                    command_name,
+                    "nonzero",
+                    before_context_id,
+                    None,
+                    view_state.attached_context_id,
+                    view_state.attached_id,
+                    before_us,
+                    policy_us,
+                    run_us,
+                    0,
+                    0,
+                    0,
+                    total_started.elapsed().as_micros(),
+                );
                 return Ok(());
             }
 
+            let outcome_started = Instant::now();
             let outcome_applied =
                 match apply_plugin_command_outcome(client, view_state, execution.outcome).await {
                     Ok(applied) => applied,
                     Err(error) => {
+                        let outcome_us = outcome_started.elapsed().as_micros();
                         view_state.set_transient_status(
                             format!(
                                 "plugin outcome apply failed: {}",
@@ -2498,10 +2627,28 @@ pub async fn handle_attach_plugin_command_action(
                             Instant::now(),
                             ATTACH_TRANSIENT_STATUS_TTL,
                         );
+                        emit_attach_plugin_command_timing(
+                            plugin_id,
+                            command_name,
+                            "outcome_error",
+                            before_context_id,
+                            None,
+                            view_state.attached_context_id,
+                            view_state.attached_id,
+                            before_us,
+                            policy_us,
+                            run_us,
+                            outcome_us,
+                            0,
+                            0,
+                            total_started.elapsed().as_micros(),
+                        );
                         return Ok(());
                     }
                 };
+            let outcome_us = outcome_started.elapsed().as_micros();
 
+            let after_started = Instant::now();
             let after_context_id = typed_current_context_attach(client)
                 .await
                 .map_or(None, |context| context.map(|entry| entry.id));
@@ -2514,6 +2661,7 @@ pub async fn handle_attach_plugin_command_action(
                         .map(|context| context.id)
                         .collect::<std::collections::BTreeSet<_>>()
                 });
+            let after_us = after_started.elapsed().as_micros();
             debug!(
                 plugin_id = %plugin_id,
                 command_name = %command_name,
@@ -2537,9 +2685,11 @@ pub async fn handle_attach_plugin_command_action(
                     fallback_context_id = %fallback_context_id,
                     "attach.plugin_command.fallback_retarget"
                 );
+                let retarget_started = Instant::now();
                 if let Err(error) =
                     retarget_attach_to_context(client, view_state, fallback_context_id).await
                 {
+                    let retarget_us = retarget_started.elapsed().as_micros();
                     warn!(
                         plugin_id = %plugin_id,
                         command_name = %command_name,
@@ -2555,8 +2705,25 @@ pub async fn handle_attach_plugin_command_action(
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
+                    emit_attach_plugin_command_timing(
+                        plugin_id,
+                        command_name,
+                        "fallback_retarget_error",
+                        before_context_id,
+                        after_context_id,
+                        view_state.attached_context_id,
+                        view_state.attached_id,
+                        before_us,
+                        policy_us,
+                        run_us,
+                        outcome_us,
+                        after_us,
+                        retarget_us,
+                        total_started.elapsed().as_micros(),
+                    );
                     return Ok(());
                 }
+                let retarget_us = retarget_started.elapsed().as_micros();
                 view_state.set_transient_status(
                     format!("plugin action: {plugin_id}:{command_name} (fallback retarget)"),
                     Instant::now(),
@@ -2564,6 +2731,22 @@ pub async fn handle_attach_plugin_command_action(
                 );
                 view_state.dirty.layout_needs_refresh = true;
                 view_state.dirty.full_pane_redraw = true;
+                emit_attach_plugin_command_timing(
+                    plugin_id,
+                    command_name,
+                    "fallback_retarget",
+                    before_context_id,
+                    after_context_id,
+                    view_state.attached_context_id,
+                    view_state.attached_id,
+                    before_us,
+                    policy_us,
+                    run_us,
+                    outcome_us,
+                    after_us,
+                    retarget_us,
+                    total_started.elapsed().as_micros(),
+                );
                 return Ok(());
             }
 
@@ -2580,9 +2763,11 @@ pub async fn handle_attach_plugin_command_action(
                     fallback_context_id = %fallback_context_id,
                     "attach.plugin_command.new_context_fallback_retarget"
                 );
+                let retarget_started = Instant::now();
                 if let Err(error) =
                     retarget_attach_to_context(client, view_state, fallback_context_id).await
                 {
+                    let retarget_us = retarget_started.elapsed().as_micros();
                     warn!(
                         plugin_id = %plugin_id,
                         command_name = %command_name,
@@ -2598,8 +2783,25 @@ pub async fn handle_attach_plugin_command_action(
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
+                    emit_attach_plugin_command_timing(
+                        plugin_id,
+                        command_name,
+                        "fallback_new_retarget_error",
+                        before_context_id,
+                        after_context_id,
+                        view_state.attached_context_id,
+                        view_state.attached_id,
+                        before_us,
+                        policy_us,
+                        run_us,
+                        outcome_us,
+                        after_us,
+                        retarget_us,
+                        total_started.elapsed().as_micros(),
+                    );
                     return Ok(());
                 }
+                let retarget_us = retarget_started.elapsed().as_micros();
                 view_state.set_transient_status(
                     format!("plugin action: {plugin_id}:{command_name} (new context retarget)"),
                     Instant::now(),
@@ -2607,6 +2809,22 @@ pub async fn handle_attach_plugin_command_action(
                 );
                 view_state.dirty.layout_needs_refresh = true;
                 view_state.dirty.full_pane_redraw = true;
+                emit_attach_plugin_command_timing(
+                    plugin_id,
+                    command_name,
+                    "fallback_new_retarget",
+                    before_context_id,
+                    after_context_id,
+                    view_state.attached_context_id,
+                    view_state.attached_id,
+                    before_us,
+                    policy_us,
+                    run_us,
+                    outcome_us,
+                    after_us,
+                    retarget_us,
+                    total_started.elapsed().as_micros(),
+                );
                 return Ok(());
             }
 
@@ -2617,6 +2835,22 @@ pub async fn handle_attach_plugin_command_action(
             );
             view_state.dirty.layout_needs_refresh = true;
             view_state.dirty.full_pane_redraw = true;
+            emit_attach_plugin_command_timing(
+                plugin_id,
+                command_name,
+                "ok",
+                before_context_id,
+                after_context_id,
+                view_state.attached_context_id,
+                view_state.attached_id,
+                before_us,
+                policy_us,
+                run_us,
+                outcome_us,
+                after_us,
+                0,
+                total_started.elapsed().as_micros(),
+            );
         }
     }
 

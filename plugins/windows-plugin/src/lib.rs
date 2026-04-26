@@ -22,11 +22,20 @@ use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use uuid::Uuid;
 
 const ACTIVE_WINDOW_CONTEXT_KEY: &str = "windows.active_context_id";
 const PREVIOUS_WINDOW_CONTEXT_KEY: &str = "windows.previous_context_id";
 const WINDOW_ORDER_KEY: &str = "windows.order";
+const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
+
+fn emit_attach_phase_timing(payload: &serde_json::Value) {
+    if std::env::var_os("BMUX_ATTACH_PHASE_TIMING").is_none() {
+        return;
+    }
+    eprintln!("{ATTACH_PHASE_MARKER}{payload}");
+}
 
 /// Shared "last selected pane per client" map. Mutated by the
 /// byte-encoded `switch-window` handler (via the plugin's mutable
@@ -690,6 +699,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
     }
 }
 
+#[derive(Debug)]
 enum WindowCycleDirection {
     Next,
     Previous,
@@ -884,17 +894,43 @@ fn switch_window(
     selector: ContextSelector,
     last_selected_by_client: &LastSelectedByClient,
 ) -> Result<WindowAck, String> {
+    let total_started = Instant::now();
+    let list_started = Instant::now();
     let contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
-    let previous_context = resolve_effective_current_context_with_contexts(caller, &contexts)?;
-    let context_id = resolve_context_id_from_contexts(&contexts, &selector)?;
+    let context_list_us = list_started.elapsed().as_micros();
+    switch_window_with_contexts(
+        caller,
+        &selector,
+        last_selected_by_client,
+        &contexts,
+        context_list_us,
+        total_started,
+    )
+}
+
+fn switch_window_with_contexts(
+    caller: &impl HostRuntimeApi,
+    selector: &ContextSelector,
+    last_selected_by_client: &LastSelectedByClient,
+    contexts: &[domain_ipc::ContextSummary],
+    context_list_us: u128,
+    total_started: Instant,
+) -> Result<WindowAck, String> {
+    let resolve_started = Instant::now();
+    let previous_context = resolve_effective_current_context_with_contexts(caller, contexts)?;
+    let context_id = resolve_context_id_from_contexts(contexts, selector)?;
+    let resolve_us = resolve_started.elapsed().as_micros();
+    let select_started = Instant::now();
     caller
         .context_select(&domain_ipc::ContextSelectRequest {
             selector: ContextSelector::ById(context_id),
         })
         .map_err(|error| error.to_string())?;
+    let context_select_us = select_started.elapsed().as_micros();
+    let remember_started = Instant::now();
     if let Ok(client) = caller.current_client()
         && let Some(previous) = previous_context
         && previous != context_id
@@ -908,7 +944,22 @@ fn switch_window(
         let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
     }
     let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
+    let remember_us = remember_started.elapsed().as_micros();
+    let publish_started = Instant::now();
     publish_window_list_snapshot(caller);
+    let publish_us = publish_started.elapsed().as_micros();
+    emit_attach_phase_timing(&serde_json::json!({
+        "phase": "windows.switch_window",
+        "previous_context_id": previous_context,
+        "selected_context_id": context_id,
+        "context_count": contexts.len(),
+        "context_list_us": context_list_us,
+        "resolve_us": resolve_us,
+        "context_select_us": context_select_us,
+        "remember_us": remember_us,
+        "publish_us": publish_us,
+        "total_us": total_started.elapsed().as_micros(),
+    }));
     Ok(WindowAck {
         ok: true,
         id: Some(context_id.to_string()),
@@ -921,14 +972,20 @@ fn cycle_window(
     direction: WindowCycleDirection,
     last_selected_by_client: &LastSelectedByClient,
 ) -> Result<WindowAck, String> {
+    let total_started = Instant::now();
+    let list_started = Instant::now();
     let contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
+    let context_list_us = list_started.elapsed().as_micros();
+    let order_started = Instant::now();
     let contexts = order_contexts_for_navigation(caller, contexts)?;
+    let order_us = order_started.elapsed().as_micros();
     if contexts.len() < 2 {
         return Err("no alternate window available".to_string());
     }
+    let resolve_started = Instant::now();
     let current_context = resolve_effective_current_context_with_contexts(caller, &contexts)?
         .unwrap_or(contexts[0].id);
     let current_index = contexts
@@ -963,10 +1020,25 @@ fn cycle_window(
             remembered
         }
     };
-    switch_window(
+    let resolve_us = resolve_started.elapsed().as_micros();
+    emit_attach_phase_timing(&serde_json::json!({
+        "phase": "windows.cycle_window",
+        "direction": format!("{direction:?}"),
+        "current_context_id": current_context,
+        "target_context_id": target_id,
+        "context_count": contexts.len(),
+        "context_list_us": context_list_us,
+        "order_us": order_us,
+        "resolve_us": resolve_us,
+        "pre_switch_us": total_started.elapsed().as_micros(),
+    }));
+    switch_window_with_contexts(
         caller,
-        ContextSelector::ById(target_id),
+        &ContextSelector::ById(target_id),
         last_selected_by_client,
+        &contexts,
+        context_list_us,
+        total_started,
     )
 }
 

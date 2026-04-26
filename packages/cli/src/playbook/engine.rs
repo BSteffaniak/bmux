@@ -7,8 +7,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bmux_client::BmuxClient;
-use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector};
+use bmux_ipc::{
+    ContextSelector, InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector,
+};
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
+use bmux_plugin_sdk::{PluginCliCommandRequest, PluginCliCommandResponse};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
@@ -577,6 +580,74 @@ where
         .map_err(|e| anyhow::anyhow!("client invoke_service_raw failed: {e}"))?;
     bmux_codec::from_bytes::<Resp>(&response_bytes)
         .map_err(|error| anyhow::anyhow!("decoding {operation} response: {error}"))
+}
+
+async fn current_context_playbook(
+    client: &mut BmuxClient,
+) -> anyhow::Result<Option<bmux_contexts_plugin_api::contexts_state::ContextSummary>> {
+    let payload = bmux_codec::to_vec(&())
+        .map_err(|error| anyhow::anyhow!("encoding current-context args: {error}"))?;
+    let response_bytes = client
+        .invoke_service_raw(
+            crate::runtime::typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
+            crate::runtime::typed_contexts::QUERY_KIND,
+            crate::runtime::typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
+            crate::runtime::typed_contexts::OP_CURRENT_CONTEXT,
+            payload,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("current-context failed: {e}"))?;
+    bmux_codec::from_bytes(&response_bytes)
+        .map_err(|error| anyhow::anyhow!("decoding current-context response: {error}"))
+}
+
+async fn retarget_attach_to_current_context_playbook(
+    client: &mut BmuxClient,
+    inspector: &ScreenInspector,
+    runtime: &mut AttachInputRuntime,
+) -> anyhow::Result<()> {
+    let Some(context) = current_context_playbook(client).await? else {
+        return Ok(());
+    };
+    let grant = client
+        .attach_context_grant(ContextSelector::ById(context.id))
+        .await
+        .map_err(|e| anyhow::anyhow!("attach context grant failed: {e}"))?;
+    let attach_info = client
+        .open_attach_stream_info(&grant)
+        .await
+        .map_err(|e| anyhow::anyhow!("attach context open failed: {e}"))?;
+    runtime.state.attached_id = attach_info.session_id;
+    let (cols, rows) = inspector.viewport_size();
+    client
+        .attach_set_viewport(attach_info.session_id, cols, rows)
+        .await
+        .map_err(|e| anyhow::anyhow!("set retargeted viewport failed: {e}"))?;
+    Ok(())
+}
+
+async fn run_plugin_command_playbook(
+    client: &mut BmuxClient,
+    plugin_id: &str,
+    command_name: &str,
+    args: Vec<String>,
+) -> anyhow::Result<PluginCliCommandResponse> {
+    let request =
+        PluginCliCommandRequest::new(plugin_id.to_string(), command_name.to_string(), args);
+    let payload = bmux_plugin_sdk::encode_service_message(&request)
+        .context("failed encoding plugin command request")?;
+    let response_payload = client
+        .invoke_service_raw(
+            "bmux.commands",
+            InvokeServiceKind::Command,
+            "cli-command/v1",
+            "run_plugin",
+            payload,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("plugin command bridge failed: {e}"))?;
+    bmux_plugin_sdk::decode_service_message(&response_payload)
+        .context("failed decoding plugin command response")
 }
 
 /// Invoke the typed `sessions-commands:new-session` operation. Returns
@@ -2320,11 +2391,11 @@ async fn execute_attach_chord(
     for stroke in &strokes {
         let event = crossterm_event_from_stroke(*stroke);
         let actions = runtime.processor.process_terminal_event(event);
-        apply_attach_runtime_actions(actions, client, sid, runtime).await?;
+        apply_attach_runtime_actions(actions, client, sid, inspector, runtime).await?;
     }
 
     let trailing_actions = runtime.processor.process_stream_bytes(&[]);
-    apply_attach_runtime_actions(trailing_actions, client, sid, runtime).await?;
+    apply_attach_runtime_actions(trailing_actions, client, sid, inspector, runtime).await?;
 
     *session_id = Some(runtime.state.attached_id);
     *attached = true;
@@ -2343,6 +2414,7 @@ async fn apply_attach_runtime_actions(
     actions: Vec<crate::input::RuntimeAction>,
     client: &mut BmuxClient,
     sid: Uuid,
+    inspector: &ScreenInspector,
     runtime: &mut AttachInputRuntime,
 ) -> Result<()> {
     for runtime_action in actions {
@@ -2593,8 +2665,28 @@ async fn apply_attach_runtime_actions(
                     runtime.state.scrollback_offset = 0;
                 }
             }
-            crate::input::RuntimeAction::PluginCommand { .. }
-            | crate::input::RuntimeAction::Quit
+            crate::input::RuntimeAction::PluginCommand {
+                plugin_id,
+                command_name,
+                args,
+            } => {
+                let response =
+                    run_plugin_command_playbook(client, &plugin_id, &command_name, args).await?;
+                if let Some(error) = response.error {
+                    bail!(
+                        "plugin command {plugin_id}:{command_name} failed: {error} (exit_code={})",
+                        response.exit_code
+                    );
+                }
+                if response.exit_code != 0 {
+                    bail!(
+                        "plugin command {plugin_id}:{command_name} exited with status {}",
+                        response.exit_code
+                    );
+                }
+                retarget_attach_to_current_context_playbook(client, inspector, runtime).await?;
+            }
+            crate::input::RuntimeAction::Quit
             | crate::input::RuntimeAction::ToggleSplitDirection
             | crate::input::RuntimeAction::RestartFocusedPane
             | crate::input::RuntimeAction::ShowHelp

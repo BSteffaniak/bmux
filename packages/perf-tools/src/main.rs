@@ -25,6 +25,7 @@ fn run() -> Result<(), String> {
         "report-latency" => run_report_latency(args),
         "report-faults" => run_report_faults(args),
         "report-json" => run_report_json(args),
+        "report-phase-file" => run_report_phase_file(args),
         "sample-static-service" => run_sample_static_service(args),
         "prepare-scale-fixture" => run_prepare_scale_fixture(args),
         "compare-report" => run_compare_report(args),
@@ -43,6 +44,7 @@ fn usage() -> &'static str {
   report-latency --input PATH [--max-p95-ms N] [--max-p99-ms N] [--max-avg-ms N] [--max-steady-p95-ms N] [--max-steady-p99-ms N] [--max-steady-avg-ms N]
   report-faults --input PATH [--max-runtime-retries N] [--max-runtime-respawns N] [--max-runtime-timeouts N]
   report-json --input PATH --output PATH [threshold flags]
+  report-phase-file --input PATH --output PATH --phase NAME --field FIELD [--max-p99-ms N] [--max-p95-ms N]
   sample-static-service --iterations N --warmup N --out-json PATH [--max-p99-us N]
   prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
   compare-report --baseline PATH --candidate PATH [--candidate PATH ...] [--warn-regression-ms N] [--json-output PATH]
@@ -50,6 +52,129 @@ fn usage() -> &'static str {
 }
 
 const PHASE_MARKER: &str = "[bmux-plugin-phase-json]";
+const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
+
+fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
+    let mut input = None;
+    let mut output = None;
+    let mut phase = None;
+    let mut field = None;
+    let mut max_p99_ms = None;
+    let mut max_p95_ms = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--input" => {
+                input = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--output" => {
+                output = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--phase" => {
+                phase = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--field" => {
+                field = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--max-p99-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--max-p99-ms requires a value".to_string());
+                };
+                max_p99_ms = Some(parse_f64(value, "--max-p99-ms")?);
+                index += 2;
+            }
+            "--max-p95-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--max-p95-ms requires a value".to_string());
+                };
+                max_p95_ms = Some(parse_f64(value, "--max-p95-ms")?);
+                index += 2;
+            }
+            other => return Err(format!("unknown argument for report-phase-file: {other}")),
+        }
+    }
+
+    let input = input.ok_or_else(|| "--input is required".to_string())?;
+    let output = output.ok_or_else(|| "--output is required".to_string())?;
+    let phase = phase.ok_or_else(|| "--phase is required".to_string())?;
+    let field = field.ok_or_else(|| "--field is required".to_string())?;
+    let text = fs::read_to_string(&input)
+        .map_err(|error| format!("failed reading phase input {input}: {error}"))?;
+    let events = parse_phase_events_input(&text);
+    let selected = events
+        .iter()
+        .filter(|event| event.get("phase").and_then(Value::as_str) == Some(phase.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let samples_us = selected
+        .iter()
+        .filter_map(|event| event.get(&field).and_then(Value::as_f64))
+        .collect::<Vec<_>>();
+    if samples_us.is_empty() {
+        return Err(format!(
+            "no numeric samples found for phase '{phase}' field '{field}' in {input}"
+        ));
+    }
+    let samples_ms = samples_us
+        .iter()
+        .map(|sample| sample / 1000.0)
+        .collect::<Vec<_>>();
+    let stats_ms = compute_latency_stats(&samples_ms);
+    let stats_us = compute_latency_stats(&samples_us);
+    println!(
+        "phase={} field={} samples={} p50={:.3}ms p95={:.3}ms p99={:.3}ms avg={:.3}ms max={:.3}ms",
+        phase,
+        field,
+        samples_us.len(),
+        stats_ms.p50,
+        stats_ms.p95,
+        stats_ms.p99,
+        stats_ms.avg,
+        stats_ms.max
+    );
+
+    let mut violations = Vec::new();
+    if let Some(limit) = max_p99_ms
+        && stats_ms.p99 > limit
+    {
+        violations.push(format!("p99 {:.3}ms > {:.3}ms", stats_ms.p99, limit));
+    }
+    if let Some(limit) = max_p95_ms
+        && stats_ms.p95 > limit
+    {
+        violations.push(format!("p95 {:.3}ms > {:.3}ms", stats_ms.p95, limit));
+    }
+    let passed = violations.is_empty();
+    let payload = json!({
+        "phase": phase,
+        "field": field,
+        "sample_count": samples_us.len(),
+        "samples_us": samples_us,
+        "latency_us": stats_json(stats_us),
+        "latency_ms": stats_json(stats_ms),
+        "events": selected,
+        "limits": {
+            "max_p99_ms": max_p99_ms,
+            "max_p95_ms": max_p95_ms,
+        },
+        "passed": passed,
+        "violations": violations,
+    });
+    let encoded = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("failed encoding phase report: {error}"))?;
+    fs::write(&output, encoded)
+        .map_err(|error| format!("failed writing phase report {output}: {error}"))?;
+    if passed {
+        Ok(())
+    } else {
+        Err("phase SLO failed".to_string())
+    }
+}
 
 fn run_sample_static_service(args: Vec<String>) -> Result<(), String> {
     let mut iterations = None;
@@ -385,10 +510,26 @@ fn parse_phase_events(stderr: &str) -> Vec<Value> {
         .lines()
         .filter_map(|line| {
             line.split_once(PHASE_MARKER)
+                .or_else(|| line.split_once(ATTACH_PHASE_MARKER))
                 .map(|(_, payload)| payload.trim())
         })
         .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
         .collect()
+}
+
+fn parse_phase_events_input(input: &str) -> Vec<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(input) {
+        if let Some(events) = value.as_array() {
+            return events.clone();
+        }
+        if let Some(samples) = value.get("phase_samples").and_then(Value::as_array) {
+            return samples
+                .iter()
+                .flat_map(|sample| sample.as_array().into_iter().flatten().cloned())
+                .collect();
+        }
+    }
+    parse_phase_events(input)
 }
 
 fn run_report_latency(args: Vec<String>) -> Result<(), String> {
@@ -1429,6 +1570,16 @@ fn parse_u64(value: &str, flag: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|_| format!("{flag} must be a non-negative integer"))
+}
+
+fn parse_f64(value: &str, flag: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("{flag} must be a non-negative number"))?;
+    if parsed.is_sign_negative() || !parsed.is_finite() {
+        return Err(format!("{flag} must be a non-negative finite number"));
+    }
+    Ok(parsed)
 }
 
 fn parse_samples_ms(payload: &Value) -> Result<Vec<f64>, String> {
