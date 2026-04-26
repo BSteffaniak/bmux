@@ -1,0 +1,30 @@
+# Mode-aware theme layer - highlights modal/runtime states without changing the base theme.
+
+name = "mode-aware"
+
+[status]
+mode_indicator = "#ffd75f"
+
+[modes.normal.status]
+mode_indicator = "#ff5f5f"
+
+[modes.insert.status]
+mode_indicator = "#5fff87"
+
+[modes.visual.status]
+mode_indicator = "#af87ff"
+
+[modes.command.status]
+mode_indicator = "#ffd75f"
+
+[modes.scroll.status]
+mode_indicator = "#5fffff"
+
+[modes.help.status]
+mode_indicator = "#87afff"
+
+[modes.prompt.status]
+mode_indicator = "#ffaf5f"
+
+[modes.zoom.status]
+mode_indicator = "#ff87d7"

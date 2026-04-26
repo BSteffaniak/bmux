@@ -3590,6 +3590,18 @@ pub fn build_attach_status_line_for_draw(
     } else {
         view_state.active_mode_label.as_str()
     };
+    let appearance_mode_id = if help_overlay_open {
+        "help"
+    } else if prompt_active {
+        "prompt"
+    } else if scrollback_active {
+        "scroll"
+    } else if zoomed {
+        "zoom"
+    } else {
+        view_state.active_mode_id.as_str()
+    };
+    let runtime_appearance = runtime_appearance.for_mode(appearance_mode_id);
     let role_label = if can_write { "write" } else { "read-only" };
     let follow_label = follow_target_id.map(|id| {
         if follow_global {
@@ -3613,7 +3625,7 @@ pub fn build_attach_status_line_for_draw(
     build_attach_status_line(
         cols,
         status_config,
-        runtime_appearance,
+        &runtime_appearance,
         &session_label,
         session_count,
         &current_context_label,

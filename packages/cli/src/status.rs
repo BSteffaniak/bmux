@@ -79,24 +79,35 @@ pub fn build_attach_status_line(
     }
 
     let mut right_segments = Vec::new();
+    let mut mode_range = None;
     if config.show_mode {
-        right_segments.push(style.badge(mode_label));
+        append_right_segment(
+            &mut right_segments,
+            &style,
+            style.badge(mode_label),
+            Some(&mut mode_range),
+        );
     }
     if config.show_role {
-        right_segments.push(style.badge(role_label));
+        append_right_segment(&mut right_segments, &style, style.badge(role_label), None);
     }
     if let Some(tab_position_label) = tab_position_label {
-        right_segments.push(style.badge(tab_position_label));
+        append_right_segment(
+            &mut right_segments,
+            &style,
+            style.badge(tab_position_label),
+            None,
+        );
     }
     if config.show_follow
         && let Some(follow) = follow_label
     {
-        right_segments.push(style.badge(follow));
+        append_right_segment(&mut right_segments, &style, style.badge(follow), None);
     }
     if config.show_hint && hint_allowed(config.hint_policy, mode_label) {
-        right_segments.push(style.badge(hint));
+        append_right_segment(&mut right_segments, &style, style.badge(hint), None);
     }
-    let mut right = right_segments.join(&style.module_separator);
+    let mut right = right_segments.concat();
     if config.layout.right_padding > 0 {
         right.push_str(&" ".repeat(config.layout.right_padding));
     }
@@ -112,6 +123,13 @@ pub fn build_attach_status_line(
         tabs,
         &tab_hitboxes,
         &overflow_ranges,
+        mode_range.map(|(start, end)| {
+            let right_start = composed.right_start_col.unwrap_or(0);
+            (
+                right_start.saturating_add(start),
+                right_start.saturating_add(end),
+            )
+        }),
         composed.right_start_col,
     );
 
@@ -328,6 +346,34 @@ fn append_segment(out: &mut String, separator: &str, value: &str) {
     out.push_str(value);
 }
 
+fn append_right_segment(
+    segments: &mut Vec<String>,
+    style: &StatusRenderStyle,
+    value: String,
+    range_out: Option<&mut Option<(usize, usize)>>,
+) {
+    let start = segments
+        .iter()
+        .map(String::as_str)
+        .map(display_width)
+        .sum::<usize>();
+    if !segments.is_empty() {
+        segments.push(style.module_separator.clone());
+    }
+    let value_start = start.saturating_add(if segments.len() > 1 {
+        display_width(&style.module_separator)
+    } else {
+        0
+    });
+    let width = display_width(&value);
+    if let Some(range) = range_out
+        && width > 0
+    {
+        *range = Some((value_start, value_start.saturating_add(width - 1)));
+    }
+    segments.push(value);
+}
+
 struct ComposedStatusLine {
     rendered: String,
     right_start_col: Option<usize>,
@@ -372,6 +418,7 @@ enum SegmentKind {
     Base,
     ActiveTab,
     InactiveTab,
+    Mode,
     Module,
     Overflow,
 }
@@ -396,6 +443,7 @@ struct ResolvedStatusAppearance {
     base: SegmentStyle,
     active_tab: SegmentStyle,
     inactive_tab: SegmentStyle,
+    mode: SegmentStyle,
     module: SegmentStyle,
     overflow: SegmentStyle,
 }
@@ -427,6 +475,8 @@ impl ResolvedStatusAppearance {
                 g: 20,
                 b: 20,
             });
+        let fallback_mode_bg = parse_hex_color(&runtime_appearance.status.mode_indicator)
+            .unwrap_or(fallback_active_bg);
 
         let bar_bg = config
             .colors
@@ -511,6 +561,13 @@ impl ResolvedStatusAppearance {
                 dim: config.style.dim_inactive,
                 underline: false,
             },
+            mode: SegmentStyle {
+                fg: fallback_active_fg,
+                bg: fallback_mode_bg,
+                bold: true,
+                dim: false,
+                underline: false,
+            },
             module: SegmentStyle {
                 fg: module_fg,
                 bg: module_bg,
@@ -538,6 +595,7 @@ fn stylize_status_line(
     tabs: &[AttachTab],
     hitboxes: &[AttachStatusTabHitbox],
     overflow_ranges: &[(usize, usize)],
+    mode_range: Option<(usize, usize)>,
     right_start_col: Option<usize>,
 ) -> String {
     let width = usize::from(width);
@@ -558,6 +616,14 @@ fn stylize_status_line(
         }
         for segment in &mut segments[*start..=(*end).min(width.saturating_sub(1))] {
             *segment = SegmentKind::Overflow;
+        }
+    }
+
+    if let Some((start, end)) = mode_range
+        && start < width
+    {
+        for segment in &mut segments[start..=end.min(width.saturating_sub(1))] {
+            *segment = SegmentKind::Mode;
         }
     }
 
@@ -612,6 +678,7 @@ const fn style_for_segment(
         SegmentKind::Base => appearance.base,
         SegmentKind::ActiveTab => appearance.active_tab,
         SegmentKind::InactiveTab => appearance.inactive_tab,
+        SegmentKind::Mode => appearance.mode,
         SegmentKind::Module => appearance.module,
         SegmentKind::Overflow => appearance.overflow,
     }
@@ -698,4 +765,43 @@ fn clamp_hitboxes_to_width(hitboxes: &mut Vec<AttachStatusTabHitbox>, width: u16
         entry.end_col = entry.end_col.min(max);
         entry.start_col <= entry.end_col
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_badge_uses_mode_indicator_color() {
+        let appearance = RuntimeAppearance {
+            background: "#010203".to_string(),
+            status: bmux_appearance::RuntimeStatusAppearance {
+                mode_indicator: "#112233".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let status = build_attach_status_line(
+            80,
+            &StatusBarConfig::default(),
+            &appearance,
+            "session",
+            1,
+            "context",
+            &[],
+            None,
+            "NORMAL",
+            "write",
+            None,
+            "",
+        );
+
+        assert!(status.rendered.contains("NORMAL"));
+        assert!(
+            status
+                .rendered
+                .contains("\x1b[0;1;38;2;1;2;3;48;2;17;34;51m")
+        );
+    }
 }
