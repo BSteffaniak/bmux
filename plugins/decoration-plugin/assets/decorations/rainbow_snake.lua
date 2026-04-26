@@ -7,7 +7,7 @@ local SPACING = 2.0
 local EAT_RADIUS = 0.75
 local APPLE_PAD = 0.75
 local DEATH_HOLD_MS = 3000
-local DEATH_SHRINK_MS = 3000
+local SHRINK_BLOCKS_PER_SECOND = 24
 local FLASH_MS = 150
 
 local snake_size = INITIAL_SNAKE_SIZE
@@ -163,24 +163,25 @@ local function render_death(cmds, ctx, raw_total, visual_total)
     end
 
     local elapsed = ctx.time_ms - death_started_ms
-    if elapsed >= DEATH_HOLD_MS + DEATH_SHRINK_MS then
-        local min_count = math.min(INITIAL_SNAKE_SIZE, #death_segments)
-        local resume_index = math.max(1, #death_segments - min_count + 1)
-        local resume_head_v = death_segments[resume_index].offset
-        head_offset_v = (resume_head_v - (ctx.time_ms / 1000.0) * SPEED) % visual_total
-        reset_game(raw_total)
-        return false
+    local min_count = math.min(INITIAL_SNAKE_SIZE, #death_segments)
+    if elapsed > DEATH_HOLD_MS then
+        local shrink_elapsed = (elapsed - DEATH_HOLD_MS) / 1000.0
+        local removed = math.floor(shrink_elapsed * SHRINK_BLOCKS_PER_SECOND)
+        if #death_segments - removed <= min_count then
+            local resume_index = math.max(1, #death_segments - min_count + 1)
+            local resume_head_v = death_segments[resume_index].offset
+            head_offset_v = (resume_head_v - (ctx.time_ms / 1000.0) * SPEED) % visual_total
+            reset_game(raw_total)
+            return false
+        end
     end
 
     if math.floor(elapsed / FLASH_MS) % 2 == 0 then
         local visible_count = #death_segments
         if elapsed > DEATH_HOLD_MS then
-            local t = (elapsed - DEATH_HOLD_MS) / DEATH_SHRINK_MS
-            local min_count = math.min(INITIAL_SNAKE_SIZE, #death_segments)
-            visible_count = math.max(
-                min_count,
-                math.ceil(#death_segments - (#death_segments - min_count) * t)
-            )
+            local shrink_elapsed = (elapsed - DEATH_HOLD_MS) / 1000.0
+            local removed = math.floor(shrink_elapsed * SHRINK_BLOCKS_PER_SECOND)
+            visible_count = math.max(min_count, #death_segments - removed)
         end
 
         local visible_segments = {}
