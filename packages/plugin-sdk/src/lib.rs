@@ -80,6 +80,8 @@ pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost, Reso
 pub use host_services::{
     LogWriteLevel, LogWriteRequest, PluginCommandOutcome, RecordingWriteEventRequest,
     RecordingWriteEventResponse, StorageGetRequest, StorageGetResponse, StorageSetRequest,
+    VolatileStateClearRequest, VolatileStateGetRequest, VolatileStateGetResponse,
+    VolatileStateSetRequest,
 };
 pub use ident::{CapabilityId, InterfaceId, OperationId, PluginEventKind};
 pub use native_exports::{

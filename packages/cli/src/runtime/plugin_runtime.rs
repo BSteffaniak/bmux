@@ -2503,7 +2503,7 @@ mod tests {
             context.provided_capabilities,
             vec!["example.provider.write".to_string()]
         );
-        assert_eq!(context.services.len(), 13);
+        assert_eq!(context.services.len(), 15);
         assert!(
             context
                 .services
@@ -2521,6 +2521,18 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "storage-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "volatile-state-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "volatile-state-command/v1")
         );
         assert!(
             context
@@ -2684,7 +2696,7 @@ mod tests {
                 "example.provider.write".to_string()
             ]
         );
-        assert_eq!(context.services.len(), 14);
+        assert_eq!(context.services.len(), 16);
         assert!(
             context
                 .services

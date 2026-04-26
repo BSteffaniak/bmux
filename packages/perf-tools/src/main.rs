@@ -55,6 +55,7 @@ const PHASE_MARKER: &str = "[bmux-plugin-phase-json]";
 const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
 const SERVICE_PHASE_MARKER: &str = "[bmux-service-phase-json]";
 const IPC_PHASE_MARKER: &str = "[bmux-ipc-phase-json]";
+const STORAGE_PHASE_MARKER: &str = "[bmux-storage-phase-json]";
 
 fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
     let mut input = None;
@@ -533,6 +534,7 @@ fn parse_phase_events(stderr: &str) -> Vec<Value> {
                 .or_else(|| line.split_once(ATTACH_PHASE_MARKER))
                 .or_else(|| line.split_once(SERVICE_PHASE_MARKER))
                 .or_else(|| line.split_once(IPC_PHASE_MARKER))
+                .or_else(|| line.split_once(STORAGE_PHASE_MARKER))
                 .map(|(_, payload)| payload.trim())
         })
         .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())

@@ -737,6 +737,40 @@ struct CoreStorageSetRequest {
     value: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PluginStateKey {
+    data_dir: String,
+    plugin_id: String,
+    key: String,
+}
+
+static STORAGE_CACHE: OnceLock<Mutex<BTreeMap<PluginStateKey, Option<Vec<u8>>>>> = OnceLock::new();
+static VOLATILE_STATE: OnceLock<Mutex<BTreeMap<PluginStateKey, Vec<u8>>>> = OnceLock::new();
+const STORAGE_PHASE_MARKER: &str = "[bmux-storage-phase-json]";
+
+fn storage_cache() -> &'static Mutex<BTreeMap<PluginStateKey, Option<Vec<u8>>>> {
+    STORAGE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn volatile_state() -> &'static Mutex<BTreeMap<PluginStateKey, Vec<u8>>> {
+    VOLATILE_STATE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn plugin_state_key(connection: &HostConnectionInfo, plugin_id: &str, key: &str) -> PluginStateKey {
+    PluginStateKey {
+        data_dir: connection.data_dir.clone(),
+        plugin_id: plugin_id.to_string(),
+        key: key.to_string(),
+    }
+}
+
+fn emit_storage_phase_timing(payload: &serde_json::Value) {
+    if std::env::var_os("BMUX_PLUGIN_STORAGE_PHASE_TIMING").is_none() {
+        return;
+    }
+    eprintln!("{STORAGE_PHASE_MARKER}{payload}");
+}
+
 impl ServiceCaller for NativeCommandContext {
     fn call_service_raw(
         &self,
@@ -1082,33 +1116,181 @@ fn handle_core_service_call(
             encode_service_message(&CorePluginSettingsResponse { settings })
         }
         ("storage-query/v1", "get") => {
+            let total_started = Instant::now();
+            let decode_started = Instant::now();
             let request: CoreStorageGetRequest = decode_service_message(payload)?;
+            let decode_us = decode_started.elapsed().as_micros();
+            let validate_started = Instant::now();
             validate_storage_key(&request.key)?;
-            let path = storage_file_path(connection, caller_plugin_id, &request.key);
-            let value = match fs::read(path) {
-                Ok(bytes) => Some(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(PluginError::ServiceProtocol {
-                        details: format!("failed reading storage value: {error}"),
-                    });
+            let validate_us = validate_started.elapsed().as_micros();
+            let cache_key = plugin_state_key(connection, caller_plugin_id, &request.key);
+            let cache_started = Instant::now();
+            let cached = storage_cache()
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&cache_key).cloned());
+            let cache_us = cache_started.elapsed().as_micros();
+            let mut fs_us = 0_u128;
+            let cache_hit = cached.is_some();
+            let value = if let Some(value) = cached {
+                value
+            } else {
+                let fs_started = Instant::now();
+                let path = storage_file_path(connection, caller_plugin_id, &request.key);
+                let value = match fs::read(path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(PluginError::ServiceProtocol {
+                            details: format!("failed reading storage value: {error}"),
+                        });
+                    }
+                };
+                fs_us = fs_started.elapsed().as_micros();
+                if let Ok(mut cache) = storage_cache().lock() {
+                    cache.insert(cache_key, value.clone());
                 }
+                value
             };
-            encode_service_message(&CoreStorageGetResponse { value })
+            let encode_started = Instant::now();
+            let response = encode_service_message(&CoreStorageGetResponse {
+                value: value.clone(),
+            });
+            let encode_us = encode_started.elapsed().as_micros();
+            emit_storage_phase_timing(&serde_json::json!({
+                "phase": "storage.get",
+                "plugin_id": caller_plugin_id,
+                "key": request.key,
+                "cache_hit": cache_hit,
+                "value_len": value.as_ref().map_or(0, Vec::len),
+                "decode_us": decode_us,
+                "validate_us": validate_us,
+                "cache_us": cache_us,
+                "fs_us": fs_us,
+                "encode_us": encode_us,
+                "total_us": total_started.elapsed().as_micros(),
+            }));
+            response
         }
         ("storage-command/v1", "set") => {
+            let total_started = Instant::now();
+            let decode_started = Instant::now();
             let request: CoreStorageSetRequest = decode_service_message(payload)?;
+            let decode_us = decode_started.elapsed().as_micros();
+            let validate_started = Instant::now();
             validate_storage_key(&request.key)?;
+            let validate_us = validate_started.elapsed().as_micros();
+            let fs_started = Instant::now();
             let path = storage_file_path(connection, caller_plugin_id, &request.key);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|error| PluginError::ServiceProtocol {
                     details: format!("failed creating storage directory: {error}"),
                 })?;
             }
-            fs::write(path, request.value).map_err(|error| PluginError::ServiceProtocol {
+            fs::write(path, &request.value).map_err(|error| PluginError::ServiceProtocol {
                 details: format!("failed writing storage value: {error}"),
             })?;
-            encode_service_message(&())
+            let fs_us = fs_started.elapsed().as_micros();
+            let cache_started = Instant::now();
+            if let Ok(mut cache) = storage_cache().lock() {
+                cache.insert(
+                    plugin_state_key(connection, caller_plugin_id, &request.key),
+                    Some(request.value.clone()),
+                );
+            }
+            let cache_us = cache_started.elapsed().as_micros();
+            let encode_started = Instant::now();
+            let response = encode_service_message(&());
+            let encode_us = encode_started.elapsed().as_micros();
+            emit_storage_phase_timing(&serde_json::json!({
+                "phase": "storage.set",
+                "plugin_id": caller_plugin_id,
+                "key": request.key,
+                "value_len": request.value.len(),
+                "decode_us": decode_us,
+                "validate_us": validate_us,
+                "fs_us": fs_us,
+                "cache_us": cache_us,
+                "encode_us": encode_us,
+                "total_us": total_started.elapsed().as_micros(),
+            }));
+            response
+        }
+        ("volatile-state-query/v1", "get") => {
+            let total_started = Instant::now();
+            let request: bmux_plugin_sdk::VolatileStateGetRequest =
+                decode_service_message(payload)?;
+            validate_storage_key(&request.key)?;
+            let map_started = Instant::now();
+            let value = volatile_state().lock().ok().and_then(|map| {
+                map.get(&plugin_state_key(
+                    connection,
+                    caller_plugin_id,
+                    &request.key,
+                ))
+                .cloned()
+            });
+            let map_us = map_started.elapsed().as_micros();
+            let response = encode_service_message(&bmux_plugin_sdk::VolatileStateGetResponse {
+                value: value.clone(),
+            });
+            emit_storage_phase_timing(&serde_json::json!({
+                "phase": "volatile_state.get",
+                "plugin_id": caller_plugin_id,
+                "key": request.key,
+                "value_len": value.as_ref().map_or(0, Vec::len),
+                "map_us": map_us,
+                "total_us": total_started.elapsed().as_micros(),
+            }));
+            response
+        }
+        ("volatile-state-command/v1", "set") => {
+            let total_started = Instant::now();
+            let request: bmux_plugin_sdk::VolatileStateSetRequest =
+                decode_service_message(payload)?;
+            validate_storage_key(&request.key)?;
+            let map_started = Instant::now();
+            if let Ok(mut map) = volatile_state().lock() {
+                map.insert(
+                    plugin_state_key(connection, caller_plugin_id, &request.key),
+                    request.value.clone(),
+                );
+            }
+            let map_us = map_started.elapsed().as_micros();
+            let response = encode_service_message(&());
+            emit_storage_phase_timing(&serde_json::json!({
+                "phase": "volatile_state.set",
+                "plugin_id": caller_plugin_id,
+                "key": request.key,
+                "value_len": request.value.len(),
+                "map_us": map_us,
+                "total_us": total_started.elapsed().as_micros(),
+            }));
+            response
+        }
+        ("volatile-state-command/v1", "clear") => {
+            let total_started = Instant::now();
+            let request: bmux_plugin_sdk::VolatileStateClearRequest =
+                decode_service_message(payload)?;
+            validate_storage_key(&request.key)?;
+            let map_started = Instant::now();
+            if let Ok(mut map) = volatile_state().lock() {
+                map.remove(&plugin_state_key(
+                    connection,
+                    caller_plugin_id,
+                    &request.key,
+                ));
+            }
+            let map_us = map_started.elapsed().as_micros();
+            let response = encode_service_message(&());
+            emit_storage_phase_timing(&serde_json::json!({
+                "phase": "volatile_state.clear",
+                "plugin_id": caller_plugin_id,
+                "key": request.key,
+                "map_us": map_us,
+                "total_us": total_started.elapsed().as_micros(),
+            }));
+            response
         }
         ("logging-command/v1", "write") => {
             let request: bmux_plugin_sdk::LogWriteRequest = decode_service_message(payload)?;

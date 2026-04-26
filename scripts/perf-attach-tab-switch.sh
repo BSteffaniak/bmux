@@ -15,6 +15,7 @@ BMUX_BIN="${BMUX_BIN:-}"
 BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
 SERVICE_TIMING=0
 IPC_TIMING=0
+STORAGE_TIMING=0
 
 usage() {
 	cat <<'USAGE'
@@ -36,6 +37,7 @@ Options:
   --artifact-json PATH            Write machine-readable JSON artifact
   --service-timing                Include generic InvokeService client timing
   --ipc-timing                    Include generic IPC request timing
+  --storage-timing                Include generic plugin storage/volatile-state timing
   --max-p99-ms N                  Fail if whole playbook p99 exceeds N ms
   --max-attach-command-p99-ms N   Fail if attach.plugin_command total p99 exceeds N ms (default: 8)
   --max-retarget-p99-ms N         Fail if attach.retarget_context total p99 exceeds N ms (default: 8)
@@ -84,6 +86,10 @@ while (($# > 0)); do
 		;;
 	--ipc-timing)
 		IPC_TIMING=1
+		shift
+		;;
+	--storage-timing)
+		STORAGE_TIMING=1
 		shift
 		;;
 	--max-p99-ms)
@@ -181,6 +187,10 @@ if [[ "$IPC_TIMING" -eq 1 ]]; then
 	export BMUX_IPC_PHASE_TIMING=1
 	export BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING=1
 fi
+if [[ "$STORAGE_TIMING" -eq 1 ]]; then
+	export BMUX_PLUGIN_STORAGE_PHASE_TIMING=1
+	export BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING=1
+fi
 
 echo "benchmarking attach tab-switch playbook"
 echo "iterations=${ITERATIONS} warmup=${WARMUP} windows=${WINDOWS} switches=${SWITCHES}"
@@ -238,6 +248,12 @@ fi
 if [[ "$IPC_TIMING" -eq 1 ]]; then
 	phase_report ipc.client_request total_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
 	phase_report ipc.client_request recv_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
+fi
+if [[ "$STORAGE_TIMING" -eq 1 ]]; then
+	phase_report storage.get total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows
+	phase_report storage.set total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows
+	phase_report volatile_state.get total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows
+	phase_report volatile_state.set total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows
 fi
 phase_report attach.retarget_context total_us "$MAX_RETARGET_P99_MS" command_name next-window
 phase_report attach.retarget_context retarget_service_us "$MAX_RETARGET_P99_MS" command_name next-window

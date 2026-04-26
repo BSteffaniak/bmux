@@ -511,6 +511,18 @@ pub(super) fn core_service_descriptors() -> Vec<RegisteredService> {
             provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
+            capability: HostScope::new("bmux.storage").expect("capability should parse"),
+            kind: ServiceKind::Query,
+            interface_id: "volatile-state-query/v1".to_string(),
+            provider: bmux_plugin_sdk::ProviderId::Host,
+        },
+        RegisteredService {
+            capability: HostScope::new("bmux.storage").expect("capability should parse"),
+            kind: ServiceKind::Command,
+            interface_id: "volatile-state-command/v1".to_string(),
+            provider: bmux_plugin_sdk::ProviderId::Host,
+        },
+        RegisteredService {
             capability: HostScope::new("bmux.logs.write").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "logging-command/v1".to_string(),

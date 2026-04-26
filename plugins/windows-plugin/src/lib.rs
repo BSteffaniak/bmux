@@ -8,7 +8,8 @@ use bmux_plugin::{HostRuntimeApi, TypedServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     HostScope, StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext,
-    TypedServiceRegistry,
+    TypedServiceRegistry, VolatileStateClearRequest, VolatileStateGetRequest,
+    VolatileStateSetRequest,
 };
 use bmux_windows_plugin_api::windows_commands::{
     self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, PaneZoomAck, Selector,
@@ -410,15 +411,15 @@ fn remove_context_from_window_order(
         set_stored_window_order_ids(caller, &order_ids)?;
     }
     // Clear active marker if it points at the removed context.
-    if let Ok(Some(active)) = get_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)
+    if let Ok(Some(active)) = get_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)
         && active == context_id
     {
-        let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, None);
+        let _ = clear_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY);
     }
-    if let Ok(Some(previous)) = get_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY)
+    if let Ok(Some(previous)) = get_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY)
         && previous == context_id
     {
-        let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, None);
+        let _ = clear_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY);
     }
     Ok(())
 }
@@ -427,14 +428,15 @@ fn remove_context_from_window_order(
 /// previous active context (if any and different) into
 /// `PREVIOUS_WINDOW_CONTEXT_KEY` so `last-window` still works.
 fn mark_context_active(caller: &impl HostRuntimeApi, context_id: Uuid) -> Result<(), String> {
-    let previous = get_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)
+    let previous = get_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)
         .ok()
         .flatten();
     if let Some(previous) = previous
         && previous != context_id
     {
-        let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
+        let _ = set_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
     }
+    set_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id))?;
     set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id))
 }
 
@@ -855,8 +857,9 @@ fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<W
     if let Some(previous) = previous_context
         && previous != context_id
     {
-        let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
+        let _ = set_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
     }
+    let _ = set_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
     let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
     publish_window_list_snapshot(caller);
     Ok(WindowAck {
@@ -971,9 +974,9 @@ fn switch_window_with_contexts(
         && previous != context_id
         && !remembered_for_client
     {
-        let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
+        let _ = set_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
     }
-    let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
+    let _ = set_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
     let remember_us = remember_started.elapsed().as_micros();
     let publish_started = Instant::now();
     publish_window_list_snapshot_from_contexts(caller, contexts, Some(context_id));
@@ -1036,7 +1039,7 @@ fn cycle_window(
             });
             let remembered = remembered_by_client
                 .or_else(|| {
-                    get_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY)
+                    get_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY)
                         .ok()
                         .flatten()
                 })
@@ -1185,7 +1188,7 @@ fn resolve_effective_current_context_with_contexts(
     if current.is_some() {
         return Ok(current);
     }
-    let stored_active = get_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)?
+    let stored_active = get_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)?
         .filter(|id| contexts.iter().any(|context| context.id == *id));
     Ok(stored_active)
 }
@@ -1205,6 +1208,80 @@ fn get_stored_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<Opti
     }
     let id = Uuid::parse_str(text.trim()).map_err(|error| error.to_string())?;
     Ok(Some(id))
+}
+
+fn get_runtime_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<Option<Uuid>, String> {
+    if let Some(id) = get_volatile_context_id(caller, key)? {
+        return Ok(Some(id));
+    }
+    get_stored_context_id(caller, key)
+}
+
+fn get_volatile_context_id(
+    caller: &impl HostRuntimeApi,
+    key: &str,
+) -> Result<Option<Uuid>, String> {
+    let response = caller
+        .call_service::<_, bmux_plugin_sdk::VolatileStateGetResponse>(
+            "bmux.storage",
+            bmux_plugin_sdk::ServiceKind::Query,
+            "volatile-state-query/v1",
+            "get",
+            &VolatileStateGetRequest {
+                key: key.to_string(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let Some(value) = response.value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let text = String::from_utf8(value).map_err(|error| error.to_string())?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let id = Uuid::parse_str(text.trim()).map_err(|error| error.to_string())?;
+    Ok(Some(id))
+}
+
+fn set_runtime_context_id(
+    caller: &impl HostRuntimeApi,
+    key: &str,
+    context_id: Option<Uuid>,
+) -> Result<(), String> {
+    context_id.map_or_else(
+        || clear_runtime_context_id(caller, key),
+        |context_id| {
+            caller
+                .call_service::<_, ()>(
+                    "bmux.storage",
+                    bmux_plugin_sdk::ServiceKind::Command,
+                    "volatile-state-command/v1",
+                    "set",
+                    &VolatileStateSetRequest {
+                        key: key.to_string(),
+                        value: context_id.to_string().into_bytes(),
+                    },
+                )
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn clear_runtime_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<(), String> {
+    caller
+        .call_service::<_, ()>(
+            "bmux.storage",
+            bmux_plugin_sdk::ServiceKind::Command,
+            "volatile-state-command/v1",
+            "clear",
+            &VolatileStateClearRequest {
+                key: key.to_string(),
+            },
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn set_stored_context_id(
@@ -2184,7 +2261,13 @@ mod tests {
                     ("storage-query/v1", "get") => {
                         encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value: None })
                     }
-                    ("storage-command/v1", "set") => encode_service_message(&()),
+                    ("storage-command/v1", "set")
+                    | ("volatile-state-command/v1", "set" | "clear") => encode_service_message(&()),
+                    ("volatile-state-query/v1", "get") => {
+                        encode_service_message(&bmux_plugin_sdk::VolatileStateGetResponse {
+                            value: None,
+                        })
+                    }
                     _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                         operation: "windows_test_router",
                     }),
@@ -2230,6 +2313,18 @@ mod tests {
                 capability: HostScope::new("bmux.storage").expect("capability should parse"),
                 kind: ServiceKind::Command,
                 interface_id: "storage-command/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+            RegisteredService {
+                capability: HostScope::new("bmux.storage").expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "volatile-state-query/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+            RegisteredService {
+                capability: HostScope::new("bmux.storage").expect("capability should parse"),
+                kind: ServiceKind::Command,
+                interface_id: "volatile-state-command/v1".to_string(),
                 provider: ProviderId::Host,
             },
         ];
@@ -2767,6 +2862,32 @@ mod tests {
                         .lock()
                         .expect("storage lock should succeed")
                         .insert(request.key, request.value);
+                    encode_service_message(&())
+                }
+                ("volatile-state-query/v1", "get") => {
+                    let request: VolatileStateGetRequest = decode_service_message(&payload)?;
+                    let value = self
+                        .storage
+                        .lock()
+                        .expect("storage lock should succeed")
+                        .get(&request.key)
+                        .cloned();
+                    encode_service_message(&bmux_plugin_sdk::VolatileStateGetResponse { value })
+                }
+                ("volatile-state-command/v1", "set") => {
+                    let request: VolatileStateSetRequest = decode_service_message(&payload)?;
+                    self.storage
+                        .lock()
+                        .expect("storage lock should succeed")
+                        .insert(request.key, request.value);
+                    encode_service_message(&())
+                }
+                ("volatile-state-command/v1", "clear") => {
+                    let request: VolatileStateClearRequest = decode_service_message(&payload)?;
+                    self.storage
+                        .lock()
+                        .expect("storage lock should succeed")
+                        .remove(&request.key);
                     encode_service_message(&())
                 }
                 _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {

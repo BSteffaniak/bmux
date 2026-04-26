@@ -36,10 +36,11 @@ use super::types::{
 
 /// Default timeout for waiting for the sandbox server to start.
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const SANDBOX_PHASE_MARKERS: [&str; 3] = [
+const SANDBOX_PHASE_MARKERS: [&str; 4] = [
     "[bmux-attach-phase-json]",
     "[bmux-service-phase-json]",
     "[bmux-ipc-phase-json]",
+    "[bmux-storage-phase-json]",
 ];
 
 /// Max bytes to read from attach output per drain cycle.
