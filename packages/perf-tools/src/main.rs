@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::env;
@@ -28,6 +29,7 @@ fn run() -> Result<(), String> {
         "report-faults" => run_report_faults(args),
         "report-json" => run_report_json(args),
         "report-phase-file" => run_report_phase_file(args),
+        "validate-phase-config" => run_validate_phase_config(args),
         "sample-static-service" => run_sample_static_service(args),
         "sample-core-services" => run_sample_core_services(args),
         "prepare-scale-fixture" => run_prepare_scale_fixture(args),
@@ -48,6 +50,7 @@ fn usage() -> &'static str {
   report-faults --input PATH [--max-runtime-retries N] [--max-runtime-respawns N] [--max-runtime-timeouts N]
   report-json --input PATH --output PATH [threshold flags]
   report-phase-file --input PATH --output PATH --phase NAME --field FIELD [--filter-key KEY --filter-value VALUE] [--max-p99-ms N] [--max-p95-ms N]
+  validate-phase-config --input PATH --config PATH --output-dir PATH [--tag TAG] [--limit NAME=MS] [--var NAME=VALUE]
   sample-static-service --iterations N --warmup N --out-json PATH [--max-p99-us N]
   sample-core-services --iterations N --warmup N --out-json PATH [--max-p99-us N]
   prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
@@ -60,6 +63,196 @@ const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
 const SERVICE_PHASE_MARKER: &str = "[bmux-service-phase-json]";
 const IPC_PHASE_MARKER: &str = "[bmux-ipc-phase-json]";
 const STORAGE_PHASE_MARKER: &str = "[bmux-storage-phase-json]";
+
+#[derive(Debug, Deserialize)]
+struct PhaseReportConfig {
+    #[serde(default)]
+    limit: BTreeMap<String, f64>,
+    #[serde(default)]
+    reports: Vec<PhaseReportSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhaseReportSpec {
+    phase: String,
+    field: String,
+    #[serde(default)]
+    filter: Option<PhaseReportFilter>,
+    #[serde(default)]
+    max_p99_ms: Option<f64>,
+    #[serde(default)]
+    max_p95_ms: Option<f64>,
+    #[serde(default)]
+    limit: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhaseReportFilter {
+    key: String,
+    value: String,
+}
+
+struct PhaseReportRequest<'a> {
+    input_label: &'a str,
+    events: &'a [Value],
+    output: &'a str,
+    phase: &'a str,
+    field: &'a str,
+    filter_key: Option<&'a str>,
+    filter_value: Option<&'a str>,
+    max_p99_ms: Option<f64>,
+    max_p95_ms: Option<f64>,
+}
+
+fn run_validate_phase_config(args: Vec<String>) -> Result<(), String> {
+    let mut input = None;
+    let mut config = None;
+    let mut output_dir = None;
+    let mut tags = Vec::new();
+    let mut limit_overrides = BTreeMap::new();
+    let mut vars = BTreeMap::new();
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--input" => {
+                input = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--config" => {
+                config = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--output-dir" => {
+                output_dir = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--tag" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--tag requires a value".to_string());
+                };
+                tags.push(value.clone());
+                index += 2;
+            }
+            "--limit" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--limit requires NAME=MS".to_string());
+                };
+                let Some((name, limit)) = value.split_once('=') else {
+                    return Err("--limit requires NAME=MS".to_string());
+                };
+                limit_overrides.insert(name.to_string(), parse_f64(limit, "--limit")?);
+                index += 2;
+            }
+            "--var" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--var requires NAME=VALUE".to_string());
+                };
+                let Some((name, value)) = value.split_once('=') else {
+                    return Err("--var requires NAME=VALUE".to_string());
+                };
+                vars.insert(name.to_string(), value.to_string());
+                index += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument for validate-phase-config: {other}"
+                ));
+            }
+        }
+    }
+
+    let input = input.ok_or_else(|| "--input is required".to_string())?;
+    let config = config.ok_or_else(|| "--config is required".to_string())?;
+    let output_dir = output_dir.ok_or_else(|| "--output-dir is required".to_string())?;
+    fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("failed creating phase output dir {output_dir}: {error}"))?;
+
+    let input_text = fs::read_to_string(&input)
+        .map_err(|error| format!("failed reading phase input {input}: {error}"))?;
+    let events = parse_phase_events_input(&input_text);
+    let config_text = fs::read_to_string(&config)
+        .map_err(|error| format!("failed reading phase config {config}: {error}"))?;
+    let config: PhaseReportConfig = toml::from_str(&config_text)
+        .map_err(|error| format!("failed parsing phase config: {error}"))?;
+
+    let mut limits = config.limit;
+    limits.extend(limit_overrides);
+    let mut failures = Vec::new();
+    let enabled_tags = tags.iter().map(String::as_str).collect::<Vec<_>>();
+    for (report_index, report) in config.reports.iter().enumerate() {
+        if !report.tags.is_empty()
+            && !report
+                .tags
+                .iter()
+                .any(|tag| enabled_tags.contains(&tag.as_str()))
+        {
+            continue;
+        }
+        let max_p99_ms = if let Some(limit_name) = &report.limit {
+            limits.get(limit_name).copied().or(report.max_p99_ms)
+        } else {
+            report.max_p99_ms
+        };
+        let output = format!(
+            "{}/{}.{}.{}.json",
+            output_dir,
+            report_index,
+            sanitize_report_component(&report.phase),
+            sanitize_report_component(&report.field)
+        );
+        let result = write_phase_report(PhaseReportRequest {
+            input_label: &input,
+            events: &events,
+            output: &output,
+            phase: &report.phase,
+            field: &report.field,
+            filter_key: report.filter.as_ref().map(|filter| filter.key.as_str()),
+            filter_value: report
+                .filter
+                .as_ref()
+                .map(|filter| expand_report_vars(&filter.value, &vars))
+                .as_deref(),
+            max_p99_ms,
+            max_p95_ms: report.max_p95_ms,
+        });
+        if let Err(error) = result {
+            failures.push(format!(
+                "phase={} field={} failed: {error}",
+                report.phase, report.field
+            ));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
+}
+
+fn expand_report_vars(value: &str, vars: &BTreeMap<String, String>) -> String {
+    let mut expanded = value.to_string();
+    for (key, replacement) in vars {
+        expanded = expanded.replace(&format!("${{{key}}}"), replacement);
+    }
+    expanded
+}
+
+fn sanitize_report_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
 
 fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
     let mut input = None;
@@ -123,10 +316,25 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
     let text = fs::read_to_string(&input)
         .map_err(|error| format!("failed reading phase input {input}: {error}"))?;
     let events = parse_phase_events_input(&text);
-    let selected = events
+    write_phase_report(PhaseReportRequest {
+        input_label: &input,
+        events: &events,
+        output: &output,
+        phase: &phase,
+        field: &field,
+        filter_key: filter_key.as_deref(),
+        filter_value: filter_value.as_deref(),
+        max_p99_ms,
+        max_p95_ms,
+    })
+}
+
+fn write_phase_report(request: PhaseReportRequest<'_>) -> Result<(), String> {
+    let selected = request
+        .events
         .iter()
-        .filter(|event| event.get("phase").and_then(Value::as_str) == Some(phase.as_str()))
-        .filter(|event| match (&filter_key, &filter_value) {
+        .filter(|event| event.get("phase").and_then(Value::as_str) == Some(request.phase))
+        .filter(|event| match (request.filter_key, request.filter_value) {
             (Some(key), Some(value)) => event.get(key).and_then(Value::as_str) == Some(value),
             _ => true,
         })
@@ -134,11 +342,12 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
         .collect::<Vec<_>>();
     let samples_us = selected
         .iter()
-        .filter_map(|event| event.get(&field).and_then(Value::as_f64))
+        .filter_map(|event| event.get(request.field).and_then(Value::as_f64))
         .collect::<Vec<_>>();
     if samples_us.is_empty() {
         return Err(format!(
-            "no numeric samples found for phase '{phase}' field '{field}' in {input}"
+            "no numeric samples found for phase '{}' field '{}' in {}",
+            request.phase, request.field, request.input_label
         ));
     }
     let samples_ms = samples_us
@@ -149,8 +358,8 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
     let stats_us = compute_latency_stats(&samples_us);
     println!(
         "phase={} field={} samples={} p50={:.3}ms p95={:.3}ms p99={:.3}ms avg={:.3}ms max={:.3}ms",
-        phase,
-        field,
+        request.phase,
+        request.field,
         samples_us.len(),
         stats_ms.p50,
         stats_ms.p95,
@@ -160,23 +369,23 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
     );
 
     let mut violations = Vec::new();
-    if let Some(limit) = max_p99_ms
+    if let Some(limit) = request.max_p99_ms
         && stats_ms.p99 > limit
     {
         violations.push(format!("p99 {:.3}ms > {:.3}ms", stats_ms.p99, limit));
     }
-    if let Some(limit) = max_p95_ms
+    if let Some(limit) = request.max_p95_ms
         && stats_ms.p95 > limit
     {
         violations.push(format!("p95 {:.3}ms > {:.3}ms", stats_ms.p95, limit));
     }
     let passed = violations.is_empty();
     let payload = json!({
-        "phase": phase,
-        "field": field,
+        "phase": request.phase,
+        "field": request.field,
         "filter": {
-            "key": filter_key,
-            "value": filter_value,
+            "key": request.filter_key,
+            "value": request.filter_value,
         },
         "sample_count": samples_us.len(),
         "samples_us": samples_us,
@@ -184,16 +393,16 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
         "latency_ms": stats_json(stats_ms),
         "events": selected,
         "limits": {
-            "max_p99_ms": max_p99_ms,
-            "max_p95_ms": max_p95_ms,
+            "max_p99_ms": request.max_p99_ms,
+            "max_p95_ms": request.max_p95_ms,
         },
         "passed": passed,
         "violations": violations,
     });
     let encoded = serde_json::to_vec_pretty(&payload)
         .map_err(|error| format!("failed encoding phase report: {error}"))?;
-    fs::write(&output, encoded)
-        .map_err(|error| format!("failed writing phase report {output}: {error}"))?;
+    fs::write(request.output, encoded)
+        .map_err(|error| format!("failed writing phase report {}: {error}", request.output))?;
     if passed {
         Ok(())
     } else {

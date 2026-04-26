@@ -1140,6 +1140,7 @@ dependencies = [
  "bmux_config",
  "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
+ "bmux_perf_telemetry",
  "bmux_plugin_sdk",
  "bmux_server",
  "serde",
@@ -1570,6 +1571,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_perf_telemetry"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "bmux_perf_tools"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1577,6 +1585,7 @@ dependencies = [
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -1629,6 +1638,7 @@ name = "bmux_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_ipc",
+ "bmux_perf_telemetry",
  "bmux_plugin_sdk",
  "bmux_recording_plugin_api",
  "libloading",
@@ -1821,6 +1831,7 @@ dependencies = [
  "bmux_image",
  "bmux_ipc",
  "bmux_pane_runtime_state",
+ "bmux_perf_telemetry",
  "bmux_performance_plugin_api",
  "bmux_performance_state",
  "bmux_plugin",

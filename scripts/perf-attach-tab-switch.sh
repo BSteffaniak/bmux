@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PHASE_CONFIG="$ROOT_DIR/perf/attach-tab-switch.toml"
 
 ITERATIONS="${ITERATIONS:-30}"
 WARMUP="${WARMUP:-5}"
@@ -270,77 +271,29 @@ if [[ -n "$MAX_P99_MS" ]]; then
 fi
 "${latency_cmd[@]}"
 
-phase_report() {
-	local phase="$1"
-	local field="$2"
-	local max_p99_ms="$3"
-	local filter_key="${4:-}"
-	local filter_value="${5:-}"
-	local output="$SANDBOX/${phase}.${field}.json"
-	local cmd=(
-		"$BMUX_PERF_TOOLS_BIN" report-phase-file
-		--input "$SAMPLE_JSON_FILE"
-		--output "$output"
-		--phase "$phase"
-		--field "$field"
-		--max-p99-ms "$max_p99_ms"
-	)
-	if [[ -n "$filter_key" ]]; then
-		cmd+=(--filter-key "$filter_key" --filter-value "$filter_value")
-	fi
-	"${cmd[@]}"
-}
-
-phase_report attach.plugin_command total_us "$MAX_ATTACH_COMMAND_P99_MS" command_name "$MEASURED_COMMAND_NAME"
-phase_report attach.plugin_command before_context_us "$MAX_ATTACH_COMMAND_P99_MS" command_name "$MEASURED_COMMAND_NAME"
-phase_report attach.plugin_command run_us "$MAX_ATTACH_COMMAND_P99_MS" command_name "$MEASURED_COMMAND_NAME"
-phase_report attach.plugin_command retarget_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+phase_config_cmd=(
+    "$BMUX_PERF_TOOLS_BIN" validate-phase-config
+    --input "$SAMPLE_JSON_FILE"
+    --config "$PHASE_CONFIG"
+    --output-dir "$SANDBOX/phase-reports"
+    --limit "attach_command=$MAX_ATTACH_COMMAND_P99_MS"
+    --limit "retarget=$MAX_RETARGET_P99_MS"
+    --var "command_name=$MEASURED_COMMAND_NAME"
+    --var "service_operation=$SERVICE_OPERATION"
+)
 if [[ "$SCENARIO" == "next-window" || "$SCENARIO" == "prev-window" || "$SCENARIO" == "goto-window" ]]; then
-	phase_report attach.window_cycle invoke_us "$MAX_ATTACH_COMMAND_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+    phase_config_cmd+=(--tag navigation)
 fi
 if [[ "$SERVICE_TIMING" -eq 1 ]]; then
-	phase_report service.client_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
-	phase_report service.server_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
-	phase_report service.server_invoke invocation_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
-	phase_report plugin.native_service_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
-	phase_report plugin.native_service_invoke encode_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
-	phase_report plugin.native_service_invoke call_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
-	phase_report plugin.native_service_invoke decode_us "$MAX_ATTACH_COMMAND_P99_MS" operation "$SERVICE_OPERATION"
-	phase_report attach.retarget_service total_us "$MAX_RETARGET_P99_MS"
-	phase_report attach.retarget_service context_select_us "$MAX_RETARGET_P99_MS"
-	phase_report attach.retarget_service membership_us "$MAX_RETARGET_P99_MS"
-	phase_report attach.retarget_service runtime_check_us "$MAX_RETARGET_P99_MS"
-	phase_report attach.retarget_service stream_detach_us "$MAX_RETARGET_P99_MS"
-	phase_report attach.retarget_service stream_begin_us "$MAX_RETARGET_P99_MS"
-	phase_report attach.retarget_service focus_publish_us "$MAX_RETARGET_P99_MS"
-	phase_report attach.retarget_service viewport_set_us "$MAX_RETARGET_P99_MS"
-	phase_report plugin.native_service_invoke total_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
-	phase_report plugin.native_service_invoke encode_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
-	phase_report plugin.native_service_invoke call_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
-	phase_report plugin.native_service_invoke decode_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+    phase_config_cmd+=(--tag service)
 fi
 if [[ "$IPC_TIMING" -eq 1 ]]; then
-	phase_report ipc.client_request total_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
-	phase_report ipc.client_request recv_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
-	phase_report ipc.client_request total_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
-	phase_report ipc.client_request recv_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
-	phase_report ipc.server_request total_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
-	phase_report ipc.server_request handle_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
-	phase_report ipc.server_request response_send_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
-	phase_report ipc.server_request request_record_encode_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
-	phase_report ipc.server_request response_record_encode_us "$MAX_RETARGET_P99_MS" operation attach-retarget-context
+    phase_config_cmd+=(--tag ipc)
 fi
 if [[ "$STORAGE_TIMING" -eq 1 ]]; then
-	phase_report storage.get total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows
-	phase_report storage.set total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows
-	phase_report volatile_state.get total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows
-	phase_report volatile_state.set total_us "$MAX_ATTACH_COMMAND_P99_MS" plugin_id bmux.windows
+    phase_config_cmd+=(--tag storage)
 fi
-phase_report attach.retarget_context total_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
-phase_report attach.retarget_context retarget_service_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
-phase_report attach.retarget_context grant_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
-phase_report attach.retarget_context open_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
-phase_report attach.retarget_context viewport_us "$MAX_RETARGET_P99_MS" command_name "$MEASURED_COMMAND_NAME"
+"${phase_config_cmd[@]}"
 
 if [[ -n "$ARTIFACT_JSON" ]]; then
 	"$BMUX_PERF_TOOLS_BIN" report-json \

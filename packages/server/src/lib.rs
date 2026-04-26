@@ -26,6 +26,7 @@ use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
     PaneLayoutNode, PaneResurrectionSnapshot, PaneRuntimeMeta, SessionRuntimeError,
 };
+use bmux_perf_telemetry::{PhaseChannel, emit as emit_phase_timing};
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::{SessionManagerHandle, SessionManagerSnapshot};
@@ -52,22 +53,6 @@ use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
-const SERVICE_PHASE_MARKER: &str = "[bmux-service-phase-json]";
-const IPC_PHASE_MARKER: &str = "[bmux-ipc-phase-json]";
-
-fn emit_service_phase_timing(payload: &serde_json::Value) {
-    if std::env::var_os("BMUX_SERVICE_PHASE_TIMING").is_none() {
-        return;
-    }
-    eprintln!("{SERVICE_PHASE_MARKER}{payload}");
-}
-
-fn emit_ipc_phase_timing(payload: &serde_json::Value) {
-    if std::env::var_os("BMUX_IPC_PHASE_TIMING").is_none() {
-        return;
-    }
-    eprintln!("{IPC_PHASE_MARKER}{payload}");
-}
 
 // `CONTEXT_SESSION_ID_ATTRIBUTE` lives in `bmux_contexts_plugin::context_state`.
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
@@ -4989,19 +4974,22 @@ async fn handle_connection(
             Err(err) => return Err(err),
         }
         let response_send_us = response_send_started.elapsed().as_micros();
-        emit_ipc_phase_timing(&server_ipc_request_phase_payload(
-            request_kind,
-            service_metadata,
-            envelope.request_id,
-            &response,
-            request_record_encode_us,
-            request_record_us,
-            handle_us,
-            response_record_encode_us,
-            response_record_us,
-            response_send_us,
-            started_at.elapsed().as_micros(),
-        ));
+        emit_phase_timing(
+            PhaseChannel::Ipc,
+            &server_ipc_request_phase_payload(
+                request_kind,
+                service_metadata,
+                envelope.request_id,
+                &response,
+                request_record_encode_us,
+                request_record_us,
+                handle_us,
+                response_record_encode_us,
+                response_record_us,
+                response_send_us,
+                started_at.elapsed().as_micros(),
+            ),
+        );
 
         // After responding to EnableEventPush, spawn the event push task.
         // It receives events from the broadcast channel and forwards them
@@ -5824,18 +5812,21 @@ async fn handle_request(
                     "invoke command complete",
                 );
             }
-            emit_service_phase_timing(&serde_json::json!({
-                "phase": "service.server_invoke",
-                "capability": capability,
-                "kind": format!("{kind:?}"),
-                "interface_id": interface_id,
-                "operation": operation,
-                "client_id": client_id,
-                "registry_us": registry_us,
-                "resolver_us": resolver_us,
-                "invocation_us": invocation_us,
-                "total_us": elapsed.as_micros(),
-            }));
+            emit_phase_timing(
+                PhaseChannel::Service,
+                &serde_json::json!({
+                    "phase": "service.server_invoke",
+                    "capability": capability,
+                    "kind": format!("{kind:?}"),
+                    "interface_id": interface_id,
+                    "operation": operation,
+                    "client_id": client_id,
+                    "registry_us": registry_us,
+                    "resolver_us": resolver_us,
+                    "invocation_us": invocation_us,
+                    "total_us": elapsed.as_micros(),
+                }),
+            );
             response
         }
         Request::EmitOnPluginBus { kind, payload } => {

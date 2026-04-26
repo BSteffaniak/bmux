@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Runtime performance telemetry helpers for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "perf", "telemetry"]
+license     = { workspace = true }
+name        = "bmux_perf_telemetry"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

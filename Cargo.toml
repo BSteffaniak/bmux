@@ -26,6 +26,7 @@ members = [
     "packages/ipc",
     "packages/keybind",
     "packages/performance-state",
+    "packages/perf-telemetry",
     "packages/plugin",
     "packages/plugin-schema",
     "packages/plugin-schema-macros",
@@ -146,6 +147,7 @@ bmux_keyboard               = { version = "0.0.1-alpha.0", default-features = fa
 bmux_mobile_core            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-core" }
 bmux_mobile_ffi             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mobile-ffi" }
 bmux_pane_runtime_state     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/pane-runtime-state" }
+bmux_perf_telemetry         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/perf-telemetry" }
 bmux_performance_state      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/performance-state" }
 bmux_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bmux_plugin_schema          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-schema" }

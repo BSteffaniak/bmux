@@ -1,0 +1,232 @@
+[limit]
+attach_command = 8
+retarget = 8
+
+[[reports]]
+phase = "attach.plugin_command"
+field = "total_us"
+limit = "attach_command"
+filter = { key = "command_name", value = "${command_name}" }
+
+[[reports]]
+phase = "attach.plugin_command"
+field = "before_context_us"
+limit = "attach_command"
+filter = { key = "command_name", value = "${command_name}" }
+
+[[reports]]
+phase = "attach.plugin_command"
+field = "run_us"
+limit = "attach_command"
+filter = { key = "command_name", value = "${command_name}" }
+
+[[reports]]
+phase = "attach.plugin_command"
+field = "retarget_us"
+limit = "retarget"
+filter = { key = "command_name", value = "${command_name}" }
+
+[[reports]]
+phase = "attach.window_cycle"
+field = "invoke_us"
+limit = "attach_command"
+tags = ["navigation"]
+filter = { key = "command_name", value = "${command_name}" }
+
+[[reports]]
+phase = "attach.retarget_context"
+field = "total_us"
+limit = "retarget"
+filter = { key = "command_name", value = "${command_name}" }
+
+[[reports]]
+phase = "attach.retarget_context"
+field = "retarget_service_us"
+limit = "retarget"
+filter = { key = "command_name", value = "${command_name}" }
+
+[[reports]]
+phase = "attach.retarget_context"
+field = "grant_us"
+limit = "retarget"
+filter = { key = "command_name", value = "${command_name}" }
+
+[[reports]]
+phase = "attach.retarget_context"
+field = "open_us"
+limit = "retarget"
+filter = { key = "command_name", value = "${command_name}" }
+
+[[reports]]
+phase = "attach.retarget_context"
+field = "viewport_us"
+limit = "retarget"
+filter = { key = "command_name", value = "${command_name}" }
+
+[[reports]]
+phase = "service.client_invoke"
+field = "total_us"
+limit = "attach_command"
+tags = ["service"]
+filter = { key = "operation", value = "${service_operation}" }
+
+[[reports]]
+phase = "service.server_invoke"
+field = "total_us"
+limit = "attach_command"
+tags = ["service"]
+filter = { key = "operation", value = "${service_operation}" }
+
+[[reports]]
+phase = "service.server_invoke"
+field = "invocation_us"
+limit = "attach_command"
+tags = ["service"]
+filter = { key = "operation", value = "${service_operation}" }
+
+[[reports]]
+phase = "plugin.native_service_invoke"
+field = "total_us"
+limit = "attach_command"
+tags = ["service"]
+filter = { key = "operation", value = "${service_operation}" }
+
+[[reports]]
+phase = "plugin.native_service_invoke"
+field = "encode_us"
+limit = "attach_command"
+tags = ["service"]
+filter = { key = "operation", value = "${service_operation}" }
+
+[[reports]]
+phase = "plugin.native_service_invoke"
+field = "call_us"
+limit = "attach_command"
+tags = ["service"]
+filter = { key = "operation", value = "${service_operation}" }
+
+[[reports]]
+phase = "plugin.native_service_invoke"
+field = "decode_us"
+limit = "attach_command"
+tags = ["service"]
+filter = { key = "operation", value = "${service_operation}" }
+
+[[reports]]
+phase = "plugin.native_service_invoke"
+field = "total_us"
+limit = "retarget"
+tags = ["service"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "plugin.native_service_invoke"
+field = "encode_us"
+limit = "retarget"
+tags = ["service"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "plugin.native_service_invoke"
+field = "call_us"
+limit = "retarget"
+tags = ["service"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "plugin.native_service_invoke"
+field = "decode_us"
+limit = "retarget"
+tags = ["service"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "ipc.client_request"
+field = "total_us"
+limit = "attach_command"
+tags = ["ipc"]
+filter = { key = "request", value = "invoke_service" }
+
+[[reports]]
+phase = "ipc.client_request"
+field = "recv_us"
+limit = "attach_command"
+tags = ["ipc"]
+filter = { key = "request", value = "invoke_service" }
+
+[[reports]]
+phase = "ipc.client_request"
+field = "total_us"
+limit = "retarget"
+tags = ["ipc"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "ipc.client_request"
+field = "recv_us"
+limit = "retarget"
+tags = ["ipc"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "ipc.server_request"
+field = "total_us"
+limit = "retarget"
+tags = ["ipc"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "ipc.server_request"
+field = "handle_us"
+limit = "retarget"
+tags = ["ipc"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "ipc.server_request"
+field = "response_send_us"
+limit = "retarget"
+tags = ["ipc"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "ipc.server_request"
+field = "request_record_encode_us"
+limit = "retarget"
+tags = ["ipc"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "ipc.server_request"
+field = "response_record_encode_us"
+limit = "retarget"
+tags = ["ipc"]
+filter = { key = "operation", value = "attach-retarget-context" }
+
+[[reports]]
+phase = "storage.get"
+field = "total_us"
+limit = "attach_command"
+tags = ["storage"]
+filter = { key = "plugin_id", value = "bmux.windows" }
+
+[[reports]]
+phase = "storage.set"
+field = "total_us"
+limit = "attach_command"
+tags = ["storage"]
+filter = { key = "plugin_id", value = "bmux.windows" }
+
+[[reports]]
+phase = "volatile_state.get"
+field = "total_us"
+limit = "attach_command"
+tags = ["storage"]
+filter = { key = "plugin_id", value = "bmux.windows" }
+
+[[reports]]
+phase = "volatile_state.set"
+field = "total_us"
+limit = "attach_command"
+tags = ["storage"]
+filter = { key = "plugin_id", value = "bmux.windows" }

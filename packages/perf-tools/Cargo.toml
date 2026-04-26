@@ -19,6 +19,7 @@ bmux_plugin     = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
+toml            = { workspace = true, features = ["parse"] }
 
 [features]
 fail-on-warnings = []

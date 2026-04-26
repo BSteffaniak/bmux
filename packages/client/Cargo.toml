@@ -15,6 +15,7 @@ version     = { workspace = true }
 bmux_config                  = { workspace = true }
 bmux_ipc                     = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
+bmux_perf_telemetry          = { workspace = true }
 bmux_plugin_sdk              = { workspace = true }
 
 # External dependencies

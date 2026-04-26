@@ -19,6 +19,7 @@ bmux_context_state          = { workspace = true }
 bmux_image                  = { workspace = true, optional = true }
 bmux_ipc                    = { workspace = true }
 bmux_pane_runtime_state     = { workspace = true }
+bmux_perf_telemetry         = { workspace = true }
 bmux_performance_plugin_api = { workspace = true }
 bmux_performance_state      = { workspace = true }
 bmux_plugin                 = { workspace = true }

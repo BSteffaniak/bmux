@@ -16,6 +16,7 @@ bmux_plugin_sdk = { workspace = true }
 
 # External dependencies (host-side only)
 bmux_ipc                  = { workspace = true }
+bmux_perf_telemetry       = { workspace = true }
 bmux_recording_plugin_api = { workspace = true }
 libloading                = { workspace = true }
 semver                    = { workspace = true }

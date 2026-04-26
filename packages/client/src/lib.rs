@@ -18,6 +18,7 @@ use bmux_ipc::{
     ResponsePayload, ServerSnapshotStatus, SessionSelector, decode, default_supported_capabilities,
     encode,
 };
+use bmux_perf_telemetry::{PhaseChannel, PhaseTimer, emit as emit_phase_timing};
 use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -25,23 +26,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
-
-const SERVICE_PHASE_MARKER: &str = "[bmux-service-phase-json]";
-const IPC_PHASE_MARKER: &str = "[bmux-ipc-phase-json]";
-
-fn emit_service_phase_timing(payload: &serde_json::Value) {
-    if std::env::var_os("BMUX_SERVICE_PHASE_TIMING").is_none() {
-        return;
-    }
-    eprintln!("{SERVICE_PHASE_MARKER}{payload}");
-}
-
-fn emit_ipc_phase_timing(payload: &serde_json::Value) {
-    if std::env::var_os("BMUX_IPC_PHASE_TIMING").is_none() {
-        return;
-    }
-    eprintln!("{IPC_PHASE_MARKER}{payload}");
-}
 
 /// Result type for client operations.
 pub type Result<T> = std::result::Result<T, ClientError>;
@@ -515,7 +499,7 @@ impl BmuxClient {
         let interface_id = interface_id.into();
         let operation = operation.into();
         let payload_len = payload.len();
-        let total_started = std::time::Instant::now();
+        let total_timer = PhaseTimer::start();
         let response = self
             .request(Request::InvokeService {
                 capability: capability.clone(),
@@ -527,16 +511,19 @@ impl BmuxClient {
             .await?;
         match response {
             ResponsePayload::ServiceInvoked { payload } => {
-                emit_service_phase_timing(&serde_json::json!({
-                    "phase": "service.client_invoke",
-                    "capability": capability,
-                    "kind": format!("{kind:?}"),
-                    "interface_id": interface_id,
-                    "operation": operation,
-                    "payload_len": payload_len,
-                    "response_len": payload.len(),
-                    "total_us": total_started.elapsed().as_micros(),
-                }));
+                emit_phase_timing(
+                    PhaseChannel::Service,
+                    &serde_json::json!({
+                        "phase": "service.client_invoke",
+                        "capability": capability,
+                        "kind": format!("{kind:?}"),
+                        "interface_id": interface_id,
+                        "operation": operation,
+                        "payload_len": payload_len,
+                        "response_len": payload.len(),
+                        "total_us": total_timer.elapsed_us(),
+                    }),
+                );
                 Ok(payload)
             }
             _ => Err(ClientError::UnexpectedResponse("expected service invoked")),
@@ -631,32 +618,7 @@ impl BmuxClient {
             })??;
         let recv_us = recv_started.elapsed().as_micros();
 
-        if response_envelope.request_id != request_id {
-            warn!(
-                request_id,
-                request = request_kind,
-                actual_request_id = response_envelope.request_id,
-                duration_ms = started_at.elapsed().as_millis(),
-                "ipc.request.id_mismatch"
-            );
-            return Err(ClientError::RequestIdMismatch {
-                expected: request_id,
-                actual: response_envelope.request_id,
-            });
-        }
-        if response_envelope.kind != EnvelopeKind::Response {
-            warn!(
-                request_id,
-                request = request_kind,
-                actual_kind = ?response_envelope.kind,
-                duration_ms = started_at.elapsed().as_millis(),
-                "ipc.request.unexpected_envelope_kind"
-            );
-            return Err(ClientError::UnexpectedEnvelopeKind {
-                expected: EnvelopeKind::Response,
-                actual: response_envelope.kind,
-            });
-        }
+        validate_response_envelope(&response_envelope, request_id, request_kind, &started_at)?;
 
         let decode_started = std::time::Instant::now();
         let response: Response = decode(&response_envelope.payload).map_err(ClientError::from)?;
@@ -668,16 +630,18 @@ impl BmuxClient {
             duration_ms = started_at.elapsed().as_millis(),
             "ipc.request.done"
         );
-        emit_ipc_phase_timing(&ipc_client_request_phase_payload(
+        emit_ipc_request_timing(
             &request,
             request_id,
             response_kind_name(&response),
-            encode_us,
-            send_us,
-            recv_us,
-            decode_us,
-            started_at.elapsed().as_micros(),
-        ));
+            IpcClientTiming {
+                encode: encode_us,
+                send: send_us,
+                recv: recv_us,
+                decode: decode_us,
+                total: started_at.elapsed().as_micros(),
+            },
+        );
         Ok(response)
     }
 
@@ -1690,16 +1654,18 @@ impl StreamingBmuxClient {
             duration_ms = started_at.elapsed().as_millis(),
             "streaming_ipc.request.done"
         );
-        emit_ipc_phase_timing(&ipc_client_request_phase_payload(
+        emit_ipc_request_timing(
             &request,
             request_id,
             response_kind_name(&response),
-            encode_us,
-            send_us,
-            recv_us,
-            0_u128,
-            started_at.elapsed().as_micros(),
-        ));
+            IpcClientTiming {
+                encode: encode_us,
+                send: send_us,
+                recv: recv_us,
+                decode: 0,
+                total: started_at.elapsed().as_micros(),
+            },
+        );
         Ok(response)
     }
 
@@ -2278,7 +2244,7 @@ impl StreamingBmuxClient {
         let interface_id = interface_id.into();
         let operation = operation.into();
         let payload_len = payload.len();
-        let total_started = std::time::Instant::now();
+        let total_timer = PhaseTimer::start();
         let response = self
             .request(Request::InvokeService {
                 capability: capability.clone(),
@@ -2290,16 +2256,19 @@ impl StreamingBmuxClient {
             .await?;
         match response {
             ResponsePayload::ServiceInvoked { payload } => {
-                emit_service_phase_timing(&serde_json::json!({
-                    "phase": "service.client_invoke",
-                    "capability": capability,
-                    "kind": format!("{kind:?}"),
-                    "interface_id": interface_id,
-                    "operation": operation,
-                    "payload_len": payload_len,
-                    "response_len": payload.len(),
-                    "total_us": total_started.elapsed().as_micros(),
-                }));
+                emit_phase_timing(
+                    PhaseChannel::Service,
+                    &serde_json::json!({
+                        "phase": "service.client_invoke",
+                        "capability": capability,
+                        "kind": format!("{kind:?}"),
+                        "interface_id": interface_id,
+                        "operation": operation,
+                        "payload_len": payload_len,
+                        "response_len": payload.len(),
+                        "total_us": total_timer.elapsed_us(),
+                    }),
+                );
                 Ok(payload)
             }
             _ => Err(ClientError::UnexpectedResponse("expected service invoked")),
@@ -2421,16 +2390,67 @@ const fn request_kind_name(request: &Request) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn validate_response_envelope(
+    response_envelope: &Envelope,
+    request_id: u64,
+    request_kind: &str,
+    started_at: &std::time::Instant,
+) -> Result<()> {
+    if response_envelope.request_id != request_id {
+        warn!(
+            request_id,
+            request = request_kind,
+            actual_request_id = response_envelope.request_id,
+            duration_ms = started_at.elapsed().as_millis(),
+            "ipc.request.id_mismatch"
+        );
+        return Err(ClientError::RequestIdMismatch {
+            expected: request_id,
+            actual: response_envelope.request_id,
+        });
+    }
+    if response_envelope.kind != EnvelopeKind::Response {
+        warn!(
+            request_id,
+            request = request_kind,
+            actual_kind = ?response_envelope.kind,
+            duration_ms = started_at.elapsed().as_millis(),
+            "ipc.request.unexpected_envelope_kind"
+        );
+        return Err(ClientError::UnexpectedEnvelopeKind {
+            expected: EnvelopeKind::Response,
+            actual: response_envelope.kind,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IpcClientTiming {
+    encode: u128,
+    send: u128,
+    recv: u128,
+    decode: u128,
+    total: u128,
+}
+
+fn emit_ipc_request_timing(
+    request: &Request,
+    request_id: u64,
+    response: &'static str,
+    timing: IpcClientTiming,
+) {
+    emit_phase_timing(
+        PhaseChannel::Ipc,
+        &ipc_client_request_phase_payload(request, request_id, response, timing),
+    );
+}
+
 fn ipc_client_request_phase_payload(
     request: &Request,
     request_id: u64,
     response: &'static str,
-    encode_us: u128,
-    send_us: u128,
-    recv_us: u128,
-    decode_us: u128,
-    total_us: u128,
+    timing: IpcClientTiming,
 ) -> serde_json::Value {
     let mut payload = serde_json::Map::from_iter([
         ("phase".to_string(), serde_json::json!("ipc.client_request")),
@@ -2440,11 +2460,11 @@ fn ipc_client_request_phase_payload(
         ),
         ("request_id".to_string(), serde_json::json!(request_id)),
         ("response".to_string(), serde_json::json!(response)),
-        ("encode_us".to_string(), serde_json::json!(encode_us)),
-        ("send_us".to_string(), serde_json::json!(send_us)),
-        ("recv_us".to_string(), serde_json::json!(recv_us)),
-        ("decode_us".to_string(), serde_json::json!(decode_us)),
-        ("total_us".to_string(), serde_json::json!(total_us)),
+        ("encode_us".to_string(), serde_json::json!(timing.encode)),
+        ("send_us".to_string(), serde_json::json!(timing.send)),
+        ("recv_us".to_string(), serde_json::json!(timing.recv)),
+        ("decode_us".to_string(), serde_json::json!(timing.decode)),
+        ("total_us".to_string(), serde_json::json!(timing.total)),
     ]);
     if let Request::InvokeService {
         capability,
