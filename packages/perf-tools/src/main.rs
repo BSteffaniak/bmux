@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -24,6 +25,7 @@ fn run() -> Result<(), String> {
         "report-latency" => run_report_latency(args),
         "report-faults" => run_report_faults(args),
         "report-json" => run_report_json(args),
+        "sample-static-service" => run_sample_static_service(args),
         "prepare-scale-fixture" => run_prepare_scale_fixture(args),
         "compare-report" => run_compare_report(args),
         "discover-run-candidate" => run_discover_run_candidate(args),
@@ -41,9 +43,203 @@ fn usage() -> &'static str {
   report-latency --input PATH [--max-p95-ms N] [--max-p99-ms N] [--max-avg-ms N] [--max-steady-p95-ms N] [--max-steady-p99-ms N] [--max-steady-avg-ms N]
   report-faults --input PATH [--max-runtime-retries N] [--max-runtime-respawns N] [--max-runtime-timeouts N]
   report-json --input PATH --output PATH [threshold flags]
+  sample-static-service --iterations N --warmup N --out-json PATH [--max-p99-us N]
   prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
   compare-report --baseline PATH --candidate PATH [--candidate PATH ...] [--warn-regression-ms N] [--json-output PATH]
   discover-run-candidate --bmux-bin PATH"
+}
+
+const PHASE_MARKER: &str = "[bmux-plugin-phase-json]";
+
+fn run_sample_static_service(args: Vec<String>) -> Result<(), String> {
+    let mut iterations = None;
+    let mut warmup = 0_usize;
+    let mut out_json = None;
+    let mut max_p99_us = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--iterations" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--iterations requires a value".to_string());
+                };
+                iterations = Some(parse_u64(value, "--iterations")? as usize);
+                index += 2;
+            }
+            "--warmup" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--warmup requires a value".to_string());
+                };
+                warmup = parse_u64(value, "--warmup")? as usize;
+                index += 2;
+            }
+            "--out-json" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--out-json requires a value".to_string());
+                };
+                out_json = Some(value.clone());
+                index += 2;
+            }
+            "--max-p99-us" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--max-p99-us requires a value".to_string());
+                };
+                max_p99_us = Some(parse_u64(value, "--max-p99-us")? as f64);
+                index += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument for sample-static-service: {other}"
+                ));
+            }
+        }
+    }
+
+    let iterations = iterations.ok_or_else(|| "--iterations is required".to_string())?;
+    let out_json = out_json.ok_or_else(|| "--out-json is required".to_string())?;
+    let loaded = load_performance_plugin()?;
+
+    for _ in 0..warmup {
+        invoke_performance_get_settings(&loaded)?;
+    }
+
+    let mut samples_us = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let started = Instant::now();
+        invoke_performance_get_settings(&loaded)?;
+        samples_us.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+
+    let stats = compute_latency_stats(&samples_us);
+    println!(
+        "static_service_us min={:.3} p50={:.3} p95={:.3} p99={:.3} avg={:.3} max={:.3}",
+        stats.min, stats.p50, stats.p95, stats.p99, stats.avg, stats.max
+    );
+    if let Some(limit) = max_p99_us
+        && stats.p99 > limit
+    {
+        return Err(format!(
+            "static service SLO failed: p99 {:.3}us > {:.3}us",
+            stats.p99, limit
+        ));
+    }
+
+    let payload = json!({
+        "scenario": "static-performance-get-settings",
+        "samples_us": samples_us,
+        "latency_us": stats_json(stats),
+        "limits": { "max_p99_us": max_p99_us },
+        "passed": true,
+    });
+    let encoded = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("failed encoding static service sample json: {error}"))?;
+    fs::write(out_json, encoded)
+        .map_err(|error| format!("failed writing static service sample json: {error}"))?;
+    Ok(())
+}
+
+fn load_performance_plugin() -> Result<bmux_plugin::LoadedPlugin, String> {
+    const NOOP_MANIFEST: &str = r#"
+id = "bmux.perf-tools.noop"
+name = "bmux Perf Tools Noop"
+version = "0.0.1-alpha.0"
+execution_class = "native_fast"
+provided_capabilities = ["bmux.perf_tools.noop"]
+required_capabilities = []
+
+[[services]]
+capability = "bmux.perf_tools.noop"
+interface_id = "perf-noop/v1"
+kind = "query"
+"#;
+
+    let mut registry = bmux_plugin::PluginRegistry::new();
+    registry
+        .register_bundled_manifest(NOOP_MANIFEST)
+        .map_err(|error| format!("failed registering noop manifest: {error}"))?;
+    let registered = registry
+        .get("bmux.perf-tools.noop")
+        .ok_or_else(|| "noop plugin was not registered".to_string())?;
+    let host = bmux_plugin_sdk::HostMetadata {
+        product_name: "bmux".to_string(),
+        product_version: env!("CARGO_PKG_VERSION").to_string(),
+        plugin_api_version: bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION,
+        plugin_abi_version: bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION,
+    };
+    let vtable = bmux_plugin_sdk::bundled_plugin_vtable!(PerfNoopPlugin, NOOP_MANIFEST);
+    bmux_plugin::load_static_plugin(registered, vtable, &host, &BTreeMap::new())
+        .map_err(|error| format!("failed loading noop plugin: {error}"))
+}
+
+fn invoke_performance_get_settings(loaded: &bmux_plugin::LoadedPlugin) -> Result<(), String> {
+    let payload = bmux_plugin_sdk::encode_service_message(&())
+        .map_err(|error| format!("failed encoding noop request: {error}"))?;
+    let capability = bmux_plugin_sdk::HostScope::new("bmux.perf_tools.noop")
+        .map_err(|error| format!("failed parsing noop capability: {error}"))?;
+    let response = loaded
+        .invoke_service(&bmux_plugin_sdk::NativeServiceContext {
+            plugin_id: "bmux.perf-tools.noop".to_string(),
+            request: bmux_plugin_sdk::ServiceRequest {
+                caller_plugin_id: "bmux.perf-tools".to_string(),
+                service: bmux_plugin_sdk::RegisteredService {
+                    capability,
+                    kind: bmux_plugin_sdk::ServiceKind::Query,
+                    interface_id: "perf-noop/v1".to_string(),
+                    provider: bmux_plugin_sdk::ProviderId::Plugin(
+                        "bmux.perf-tools.noop".to_string(),
+                    ),
+                },
+                operation: "ping".to_string(),
+                payload,
+            },
+            required_capabilities: Vec::new(),
+            provided_capabilities: vec!["bmux.perf_tools.noop".to_string()],
+            services: Vec::new(),
+            available_capabilities: Vec::new(),
+            enabled_plugins: vec!["bmux.perf-tools.noop".to_string()],
+            plugin_search_roots: Vec::new(),
+            host: bmux_plugin_sdk::HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: env!("CARGO_PKG_VERSION").to_string(),
+                plugin_api_version: bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION,
+                plugin_abi_version: bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION,
+            },
+            connection: bmux_plugin_sdk::HostConnectionInfo {
+                config_dir: String::new(),
+                config_dir_candidates: Vec::new(),
+                runtime_dir: String::new(),
+                data_dir: String::new(),
+                state_dir: String::new(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
+            host_kernel_bridge: None,
+        })
+        .map_err(|error| format!("noop service invocation failed: {error}"))?;
+    if let Some(error) = response.error {
+        return Err(format!("noop service returned error: {}", error.message));
+    }
+    bmux_plugin_sdk::decode_service_message::<()>(&response.payload)
+        .map_err(|error| format!("failed decoding noop response: {error}"))?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct PerfNoopPlugin;
+
+impl bmux_plugin_sdk::RustPlugin for PerfNoopPlugin {
+    fn invoke_service(
+        &mut self,
+        context: bmux_plugin_sdk::NativeServiceContext,
+    ) -> bmux_plugin_sdk::ServiceResponse {
+        bmux_plugin_sdk::route_service!(context, {
+            "perf-noop/v1", "ping" => |_req: (), _ctx| {
+                Ok::<(), bmux_plugin_sdk::ServiceResponse>(())
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -137,6 +333,7 @@ fn run_sample(args: Vec<String>) -> Result<(), String> {
     let mut retries = 0_u64;
     let mut respawns = 0_u64;
     let mut timeouts = 0_u64;
+    let mut phase_samples = Vec::with_capacity(iterations);
 
     let command_name = &command[0];
     let command_args = &command[1..];
@@ -164,6 +361,7 @@ fn run_sample(args: Vec<String>) -> Result<(), String> {
         retries += faults.retries;
         respawns += faults.respawns;
         timeouts += faults.timeouts;
+        phase_samples.push(parse_phase_events(&stderr));
         samples_ms.push(elapsed_ms);
     }
 
@@ -173,12 +371,24 @@ fn run_sample(args: Vec<String>) -> Result<(), String> {
             "retries": retries,
             "respawns": respawns,
             "timeouts": timeouts,
-        }
+        },
+        "phase_samples": phase_samples,
     });
     let encoded = serde_json::to_vec_pretty(&payload)
         .map_err(|error| format!("failed encoding sample json: {error}"))?;
     fs::write(out_json, encoded).map_err(|error| format!("failed writing sample json: {error}"))?;
     Ok(())
+}
+
+fn parse_phase_events(stderr: &str) -> Vec<Value> {
+    stderr
+        .lines()
+        .filter_map(|line| {
+            line.split_once(PHASE_MARKER)
+                .map(|(_, payload)| payload.trim())
+        })
+        .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+        .collect()
 }
 
 fn run_report_latency(args: Vec<String>) -> Result<(), String> {
@@ -458,6 +668,10 @@ fn run_report_json(args: Vec<String>) -> Result<(), String> {
     let payload = read_json_file(&input)?;
     let samples = parse_samples_ms(&payload)?;
     let faults = parse_runtime_fault_counts(&payload)?;
+    let phase_samples = payload
+        .get("phase_samples")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
     let breakdown = compute_latency_breakdown(&samples);
     let stats = breakdown.overall;
 
@@ -491,6 +705,7 @@ fn run_report_json(args: Vec<String>) -> Result<(), String> {
             "respawns": faults.respawns,
             "timeouts": faults.timeouts,
         },
+        "phase_samples": phase_samples,
         "limits": {
             "max_p95_ms": latency_thresholds.max_p95_ms,
             "max_p99_ms": latency_thresholds.max_p99_ms,
@@ -1268,6 +1483,17 @@ fn compute_latency_breakdown(samples: &[f64]) -> LatencyBreakdown {
         overall,
         steady_state,
     }
+}
+
+fn stats_json(stats: LatencyStats) -> Value {
+    json!({
+        "min": stats.min,
+        "p50": stats.p50,
+        "p95": stats.p95,
+        "p99": stats.p99,
+        "avg": stats.avg,
+        "max": stats.max,
+    })
 }
 
 fn parse_runtime_fault_counts(payload: &Value) -> Result<RuntimeFaultCounts, String> {

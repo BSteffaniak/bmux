@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, instrument, warn};
 
 use super::{
@@ -1510,7 +1510,11 @@ pub(super) fn run_plugin_command_internal(
     caller_client_id: Option<uuid::Uuid>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
 ) -> Result<PluginCommandExecution> {
+    let total_started = Instant::now();
+    let runtime_state_started = Instant::now();
     let state = runtime_command_state()?;
+    let runtime_state_us = runtime_state_started.elapsed().as_micros();
+    let lookup_started = Instant::now();
     let config = &state.config;
     let paths = &state.paths;
     let registry = &state.registry;
@@ -1523,8 +1527,12 @@ pub(super) fn run_plugin_command_internal(
     if !enabled_plugins.iter().any(|enabled| enabled == plugin_id) {
         anyhow::bail!(format_plugin_not_enabled_message(plugin_id));
     }
+    let lookup_us = lookup_started.elapsed().as_micros();
 
+    let load_started = Instant::now();
     let loaded = load_cached_plugin(plugin, &state)?;
+    let load_us = load_started.elapsed().as_micros();
+    let context_started = Instant::now();
     let plugin_search_roots = state.plugin_search_roots.clone();
     let available_capabilities = state
         .available_capability_providers
@@ -1545,11 +1553,14 @@ pub(super) fn run_plugin_command_internal(
         caller_client_id,
         invocation_source,
     );
+    let context_us = context_started.elapsed().as_micros();
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
     let _host_kernel_factory_guard =
         kernel_client_factory.map(|f| enter_host_kernel_client_factory(Arc::clone(f)));
+    let run_started = Instant::now();
     let run_result =
         loaded.run_command_with_context_and_outcome(command_name, args, Some(&context));
+    let run_us = run_started.elapsed().as_micros();
     let (status, outcome) = run_result.map_err(|error| {
         // Record the error on the current span so structured tracing
         // preserves the full failure shape rather than only the
@@ -1565,7 +1576,47 @@ pub(super) fn run_plugin_command_internal(
     if let Some(msg) = outcome.error_message.as_deref() {
         tracing::Span::current().record("error", msg);
     }
+    emit_plugin_phase_timing(
+        plugin_id,
+        command_name,
+        invocation_source,
+        runtime_state_us,
+        lookup_us,
+        load_us,
+        context_us,
+        run_us,
+        total_started.elapsed().as_micros(),
+    );
     Ok(PluginCommandExecution { status, outcome })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_plugin_phase_timing(
+    plugin_id: &str,
+    command_name: &str,
+    invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
+    runtime_state_us: u128,
+    lookup_us: u128,
+    load_us: u128,
+    context_us: u128,
+    run_us: u128,
+    total_us: u128,
+) {
+    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "plugin_id": plugin_id,
+        "command_name": command_name,
+        "invocation_source": format!("{invocation_source:?}"),
+        "runtime_state_us": runtime_state_us,
+        "lookup_us": lookup_us,
+        "load_us": load_us,
+        "context_us": context_us,
+        "run_us": run_us,
+        "total_us": total_us,
+    });
+    eprintln!("[bmux-plugin-phase-json]{payload}");
 }
 
 fn load_cached_plugin(
@@ -1652,13 +1703,21 @@ pub(super) fn format_plugin_argument_validation_error(
 }
 
 pub(super) async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
+    let total_started = Instant::now();
+    let config_started = Instant::now();
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
+    let config_us = config_started.elapsed().as_micros();
+    let scan_started = Instant::now();
     let registry = scan_available_plugins(&config, &paths)?;
+    let scan_us = scan_started.elapsed().as_micros();
+    let registry_started = Instant::now();
     let mut command_config = config.clone();
     command_config.plugins.enabled = effective_enabled_plugins(&config, &registry);
     let command_registry = PluginCommandRegistry::build(&command_config, &registry)
         .context("failed building plugin CLI command registry")?;
+    let registry_us = registry_started.elapsed().as_micros();
+    let resolve_started = Instant::now();
     let resolved = command_registry
         .resolve(args)
         .with_context(|| unknown_external_command_message(args))?;
@@ -1666,12 +1725,48 @@ pub(super) async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
         PluginCommandRegistry::validate_arguments(&resolved.schema, &resolved.arguments).map_err(
             |error| anyhow::anyhow!(format_plugin_argument_validation_error(args, &error)),
         )?;
-    run_plugin_command(
+    let resolve_us = resolve_started.elapsed().as_micros();
+    let dispatch_started = Instant::now();
+    let status = run_plugin_command(
         &resolved.plugin_id,
         &resolved.command_name,
         &validated_arguments,
     )
-    .await
+    .await?;
+    emit_external_plugin_phase_timing(
+        args,
+        config_us,
+        scan_us,
+        registry_us,
+        resolve_us,
+        dispatch_started.elapsed().as_micros(),
+        total_started.elapsed().as_micros(),
+    );
+    Ok(status)
+}
+
+fn emit_external_plugin_phase_timing(
+    args: &[String],
+    config_us: u128,
+    scan_us: u128,
+    registry_us: u128,
+    resolve_us: u128,
+    dispatch_us: u128,
+    total_us: u128,
+) {
+    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "command_path": args,
+        "config_us": config_us,
+        "scan_us": scan_us,
+        "registry_us": registry_us,
+        "resolve_us": resolve_us,
+        "dispatch_us": dispatch_us,
+        "total_us": total_us,
+    });
+    eprintln!("[bmux-plugin-phase-json]{payload}");
 }
 #[cfg(test)]
 mod tests {

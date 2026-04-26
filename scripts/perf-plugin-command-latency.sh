@@ -15,6 +15,7 @@ MAX_RUNTIME_RETRIES="${MAX_RUNTIME_RETRIES:-}"
 MAX_RUNTIME_RESPAWNS="${MAX_RUNTIME_RESPAWNS:-}"
 MAX_RUNTIME_TIMEOUTS="${MAX_RUNTIME_TIMEOUTS:-}"
 ALLOW_NONZERO="0"
+PHASE_TIMING="0"
 
 BMUX_BIN="${BMUX_BIN:-}"
 BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
@@ -44,6 +45,7 @@ Options:
   --max-runtime-respawns N  Fail if runtime respawn warnings exceed N
   --max-runtime-timeouts N  Fail if runtime timeout warnings exceed N
   --artifact-json PATH      Write machine-readable JSON artifact report
+  --phase-timing            Include plugin command phase timing in artifacts
   --scale-plugin-count N    Generate N synthetic plugin manifests for scale scenarios
   --scale-profile NAME      Synthetic profile: small, medium, or large
   --allow-nonzero     Allow non-zero command exit status during sampling
@@ -104,6 +106,10 @@ parse_args() {
 			;;
 		--allow-nonzero)
 			ALLOW_NONZERO="1"
+			shift
+			;;
+		--phase-timing)
+			PHASE_TIMING="1"
 			shift
 			;;
 		--max-runtime-retries)
@@ -267,6 +273,10 @@ fi
 
 echo "benchmarking: bmux ${TARGET_ARGS[*]}"
 echo "iterations=${ITERATIONS} warmup=${WARMUP}"
+
+if [[ "$PHASE_TIMING" == "1" ]]; then
+	export BMUX_PLUGIN_PHASE_TIMING=1
+fi
 
 for ((i = 0; i < WARMUP; i += 1)); do
 	if [[ "$ALLOW_NONZERO" == "1" ]]; then

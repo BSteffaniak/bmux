@@ -15,13 +15,15 @@ use bmux_plugin_sdk::{
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Default)]
 pub struct PluginCliPlugin;
 
 impl RustPlugin for PluginCliPlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        match context.command.as_str() {
+        let started = Instant::now();
+        let result = match context.command.as_str() {
             "list" => list_cmd::run_list_command(&context).map_err(PluginCommandError::from),
             "run" => run_cmd::run_run_command(&context).map_err(PluginCommandError::from),
             "rebuild" => rebuild::run_rebuild_command(&context).map_err(PluginCommandError::from),
@@ -36,8 +38,23 @@ impl RustPlugin for PluginCliPlugin {
                     )))
                 }
             }
-        }
+        };
+        emit_phase_timing(&context.command, started.elapsed().as_micros(), &result);
+        result
     }
+}
+
+fn emit_phase_timing(command: &str, total_us: u128, result: &Result<i32, PluginCommandError>) {
+    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "plugin_id": "bmux.plugin_cli",
+        "command_name": command,
+        "total_us": total_us,
+        "status": result.as_ref().copied().unwrap_or(1),
+    });
+    eprintln!("[bmux-plugin-phase-json]{payload}");
 }
 
 include!(concat!(env!("OUT_DIR"), "/core_proxy_commands.rs"));

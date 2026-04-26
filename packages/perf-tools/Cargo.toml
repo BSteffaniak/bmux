@@ -15,7 +15,9 @@ name = "bmux-perf-tools"
 path = "src/main.rs"
 
 [dependencies]
-serde_json = { workspace = true }
+bmux_plugin     = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
+serde_json      = { workspace = true }
 
 [features]
 fail-on-warnings = []
