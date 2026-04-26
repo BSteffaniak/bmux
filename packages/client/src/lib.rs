@@ -26,6 +26,23 @@ use thiserror::Error;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
+const SERVICE_PHASE_MARKER: &str = "[bmux-service-phase-json]";
+const IPC_PHASE_MARKER: &str = "[bmux-ipc-phase-json]";
+
+fn emit_service_phase_timing(payload: &serde_json::Value) {
+    if std::env::var_os("BMUX_SERVICE_PHASE_TIMING").is_none() {
+        return;
+    }
+    eprintln!("{SERVICE_PHASE_MARKER}{payload}");
+}
+
+fn emit_ipc_phase_timing(payload: &serde_json::Value) {
+    if std::env::var_os("BMUX_IPC_PHASE_TIMING").is_none() {
+        return;
+    }
+    eprintln!("{IPC_PHASE_MARKER}{payload}");
+}
+
 /// Result type for client operations.
 pub type Result<T> = std::result::Result<T, ClientError>;
 
@@ -494,17 +511,34 @@ impl BmuxClient {
         operation: impl Into<String>,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        match self
+        let capability = capability.into();
+        let interface_id = interface_id.into();
+        let operation = operation.into();
+        let payload_len = payload.len();
+        let total_started = std::time::Instant::now();
+        let response = self
             .request(Request::InvokeService {
-                capability: capability.into(),
+                capability: capability.clone(),
                 kind,
-                interface_id: interface_id.into(),
-                operation: operation.into(),
+                interface_id: interface_id.clone(),
+                operation: operation.clone(),
                 payload,
             })
-            .await?
-        {
-            ResponsePayload::ServiceInvoked { payload } => Ok(payload),
+            .await?;
+        match response {
+            ResponsePayload::ServiceInvoked { payload } => {
+                emit_service_phase_timing(&serde_json::json!({
+                    "phase": "service.client_invoke",
+                    "capability": capability,
+                    "kind": format!("{kind:?}"),
+                    "interface_id": interface_id,
+                    "operation": operation,
+                    "payload_len": payload_len,
+                    "response_len": payload.len(),
+                    "total_us": total_started.elapsed().as_micros(),
+                }));
+                Ok(payload)
+            }
             _ => Err(ClientError::UnexpectedResponse("expected service invoked")),
         }
     }
@@ -553,9 +587,12 @@ impl BmuxClient {
             timeout_ms,
             "ipc.request.start"
         );
+        let encode_started = std::time::Instant::now();
         let payload = encode(&request)?;
+        let encode_us = encode_started.elapsed().as_micros();
         let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
 
+        let send_started = std::time::Instant::now();
         tokio::time::timeout(self.timeout, self.stream.send_envelope(&envelope))
             .await
             .map_err(|_| {
@@ -569,6 +606,7 @@ impl BmuxClient {
                 );
                 ClientError::Timeout(self.timeout)
             })??;
+        let send_us = send_started.elapsed().as_micros();
 
         trace!(
             request_id,
@@ -577,6 +615,7 @@ impl BmuxClient {
             "ipc.request.sent"
         );
 
+        let recv_started = std::time::Instant::now();
         let response_envelope = tokio::time::timeout(self.timeout, self.stream.recv_envelope())
             .await
             .map_err(|_| {
@@ -590,6 +629,7 @@ impl BmuxClient {
                 );
                 ClientError::Timeout(self.timeout)
             })??;
+        let recv_us = recv_started.elapsed().as_micros();
 
         if response_envelope.request_id != request_id {
             warn!(
@@ -618,7 +658,9 @@ impl BmuxClient {
             });
         }
 
+        let decode_started = std::time::Instant::now();
         let response: Response = decode(&response_envelope.payload).map_err(ClientError::from)?;
+        let decode_us = decode_started.elapsed().as_micros();
         debug!(
             request_id,
             request = request_kind,
@@ -626,6 +668,17 @@ impl BmuxClient {
             duration_ms = started_at.elapsed().as_millis(),
             "ipc.request.done"
         );
+        emit_ipc_phase_timing(&serde_json::json!({
+            "phase": "ipc.client_request",
+            "request": request_kind,
+            "request_id": request_id,
+            "response": response_kind_name(&response),
+            "encode_us": encode_us,
+            "send_us": send_us,
+            "recv_us": recv_us,
+            "decode_us": decode_us,
+            "total_us": started_at.elapsed().as_micros(),
+        }));
         Ok(response)
     }
 
@@ -1540,7 +1593,9 @@ impl StreamingBmuxClient {
             "streaming_ipc.request.start"
         );
 
+        let encode_started = std::time::Instant::now();
         let payload = encode(&request)?;
+        let encode_us = encode_started.elapsed().as_micros();
         let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
 
         // Register pending response before sending to avoid races.
@@ -1550,6 +1605,7 @@ impl StreamingBmuxClient {
             map.insert(request_id, tx);
         }
 
+        let send_started = std::time::Instant::now();
         if let Err(e) = tokio::time::timeout(self.timeout, self.writer.send_envelope(&envelope))
             .await
             .map_err(|_| ClientError::Timeout(self.timeout))?
@@ -1557,7 +1613,9 @@ impl StreamingBmuxClient {
             self.pending.lock().await.remove(&request_id);
             return Err(ClientError::Transport(e));
         }
+        let send_us = send_started.elapsed().as_micros();
 
+        let recv_started = std::time::Instant::now();
         let response = tokio::time::timeout(self.timeout, rx)
             .await
             .map_err(|_| ClientError::Timeout(self.timeout))?
@@ -1567,6 +1625,7 @@ impl StreamingBmuxClient {
                     "reader task dropped before response",
                 )))
             })??;
+        let recv_us = recv_started.elapsed().as_micros();
 
         debug!(
             request_id,
@@ -1575,6 +1634,17 @@ impl StreamingBmuxClient {
             duration_ms = started_at.elapsed().as_millis(),
             "streaming_ipc.request.done"
         );
+        emit_ipc_phase_timing(&serde_json::json!({
+            "phase": "ipc.client_request",
+            "request": request_kind,
+            "request_id": request_id,
+            "response": response_kind_name(&response),
+            "encode_us": encode_us,
+            "send_us": send_us,
+            "recv_us": recv_us,
+            "decode_us": 0_u128,
+            "total_us": started_at.elapsed().as_micros(),
+        }));
         Ok(response)
     }
 
@@ -2107,17 +2177,34 @@ impl StreamingBmuxClient {
         operation: impl Into<String>,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        match self
+        let capability = capability.into();
+        let interface_id = interface_id.into();
+        let operation = operation.into();
+        let payload_len = payload.len();
+        let total_started = std::time::Instant::now();
+        let response = self
             .request(Request::InvokeService {
-                capability: capability.into(),
+                capability: capability.clone(),
                 kind,
-                interface_id: interface_id.into(),
-                operation: operation.into(),
+                interface_id: interface_id.clone(),
+                operation: operation.clone(),
                 payload,
             })
-            .await?
-        {
-            ResponsePayload::ServiceInvoked { payload } => Ok(payload),
+            .await?;
+        match response {
+            ResponsePayload::ServiceInvoked { payload } => {
+                emit_service_phase_timing(&serde_json::json!({
+                    "phase": "service.client_invoke",
+                    "capability": capability,
+                    "kind": format!("{kind:?}"),
+                    "interface_id": interface_id,
+                    "operation": operation,
+                    "payload_len": payload_len,
+                    "response_len": payload.len(),
+                    "total_us": total_started.elapsed().as_micros(),
+                }));
+                Ok(payload)
+            }
             _ => Err(ClientError::UnexpectedResponse("expected service invoked")),
         }
     }

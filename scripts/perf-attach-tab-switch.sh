@@ -13,6 +13,8 @@ MAX_RETARGET_P99_MS="${MAX_RETARGET_P99_MS:-8}"
 ARTIFACT_JSON="${ARTIFACT_JSON:-}"
 BMUX_BIN="${BMUX_BIN:-}"
 BMUX_PERF_TOOLS_BIN="${BMUX_PERF_TOOLS_BIN:-}"
+SERVICE_TIMING=0
+IPC_TIMING=0
 
 usage() {
 	cat <<'USAGE'
@@ -32,6 +34,8 @@ Options:
   --switches N                    Number of ctrl+s switches per playbook run (default: 4)
   --bmux-bin PATH                 Use an explicit bmux executable path
   --artifact-json PATH            Write machine-readable JSON artifact
+  --service-timing                Include generic InvokeService client timing
+  --ipc-timing                    Include generic IPC request timing
   --max-p99-ms N                  Fail if whole playbook p99 exceeds N ms
   --max-attach-command-p99-ms N   Fail if attach.plugin_command total p99 exceeds N ms (default: 8)
   --max-retarget-p99-ms N         Fail if attach.retarget_context total p99 exceeds N ms (default: 8)
@@ -73,6 +77,14 @@ while (($# > 0)); do
 	--artifact-json)
 		ARTIFACT_JSON="$2"
 		shift 2
+		;;
+	--service-timing)
+		SERVICE_TIMING=1
+		shift
+		;;
+	--ipc-timing)
+		IPC_TIMING=1
+		shift
 		;;
 	--max-p99-ms)
 		MAX_P99_MS="$2"
@@ -161,6 +173,12 @@ SAMPLE_JSON_FILE="$SANDBOX/sample.json"
 } >"$PLAYBOOK"
 
 export BMUX_ATTACH_PHASE_TIMING=1
+if [[ "$SERVICE_TIMING" -eq 1 ]]; then
+	export BMUX_SERVICE_PHASE_TIMING=1
+fi
+if [[ "$IPC_TIMING" -eq 1 ]]; then
+	export BMUX_IPC_PHASE_TIMING=1
+fi
 
 echo "benchmarking attach tab-switch playbook"
 echo "iterations=${ITERATIONS} warmup=${WARMUP} windows=${WINDOWS} switches=${SWITCHES}"
@@ -210,6 +228,13 @@ phase_report attach.plugin_command before_context_us "$MAX_ATTACH_COMMAND_P99_MS
 phase_report attach.plugin_command run_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
 phase_report attach.plugin_command retarget_us "$MAX_RETARGET_P99_MS" command_name next-window
 phase_report attach.window_cycle invoke_us "$MAX_ATTACH_COMMAND_P99_MS" command_name next-window
+if [[ "$SERVICE_TIMING" -eq 1 ]]; then
+	phase_report service.client_invoke total_us "$MAX_ATTACH_COMMAND_P99_MS" operation switch-window
+fi
+if [[ "$IPC_TIMING" -eq 1 ]]; then
+	phase_report ipc.client_request total_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
+	phase_report ipc.client_request recv_us "$MAX_ATTACH_COMMAND_P99_MS" request invoke_service
+fi
 phase_report attach.retarget_context total_us "$MAX_RETARGET_P99_MS"
 phase_report attach.retarget_context grant_us "$MAX_RETARGET_P99_MS"
 phase_report attach.retarget_context open_us "$MAX_RETARGET_P99_MS"

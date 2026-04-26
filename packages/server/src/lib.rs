@@ -52,6 +52,15 @@ use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
+const SERVICE_PHASE_MARKER: &str = "[bmux-service-phase-json]";
+
+fn emit_service_phase_timing(payload: &serde_json::Value) {
+    if std::env::var_os("BMUX_SERVICE_PHASE_TIMING").is_none() {
+        return;
+    }
+    eprintln!("{SERVICE_PHASE_MARKER}{payload}");
+}
+
 // `CONTEXT_SESSION_ID_ATTRIBUTE` lives in `bmux_contexts_plugin::context_state`.
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
 /// Headroom reserved for envelope framing, layout metadata, pane summaries, and
@@ -5704,6 +5713,7 @@ async fn handle_request(
                 client_id,
                 client_principal_id,
             };
+            let registry_started = std::time::Instant::now();
             let dispatch = {
                 let registry = state
                     .service_registry
@@ -5711,6 +5721,8 @@ async fn handle_request(
                     .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
                 registry.dispatch(&route, invoke_context.clone(), payload.clone())
             };
+            let registry_us = registry_started.elapsed().as_micros();
+            let resolver_started = std::time::Instant::now();
             let invocation = if let Some(invocation) = dispatch {
                 Some(invocation)
             } else {
@@ -5721,7 +5733,9 @@ async fn handle_request(
                     .clone();
                 resolver.map(|resolver| resolver(route.clone(), payload))
             };
+            let resolver_us = resolver_started.elapsed().as_micros();
 
+            let invocation_started = std::time::Instant::now();
             let response = if let Some(invocation) = invocation {
                 match invocation.await {
                     Ok(payload) => Response::Ok(ResponsePayload::ServiceInvoked { payload }),
@@ -5738,6 +5752,7 @@ async fn handle_request(
                     ),
                 })
             };
+            let invocation_us = invocation_started.elapsed().as_micros();
             let elapsed = started_at.elapsed();
             #[allow(clippy::cast_possible_truncation)]
             let elapsed_ms = elapsed.as_millis() as u64;
@@ -5769,6 +5784,18 @@ async fn handle_request(
                     "invoke command complete",
                 );
             }
+            emit_service_phase_timing(&serde_json::json!({
+                "phase": "service.server_invoke",
+                "capability": capability,
+                "kind": format!("{kind:?}"),
+                "interface_id": interface_id,
+                "operation": operation,
+                "client_id": client_id,
+                "registry_us": registry_us,
+                "resolver_us": resolver_us,
+                "invocation_us": invocation_us,
+                "total_us": elapsed.as_micros(),
+            }));
             response
         }
         Request::EmitOnPluginBus { kind, payload } => {
