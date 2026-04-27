@@ -301,71 +301,44 @@ fn static_bundled_workspace_manifest_is_registered(manifest_path: &Path) -> bool
     else {
         return false;
     };
-    #[cfg(feature = "bundled-plugin-clients")]
-    if dir_name == "clients-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-clipboard")]
-    if dir_name == "clipboard-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-cluster")]
-    if dir_name == "cluster-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-contexts")]
-    if dir_name == "contexts-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-control-catalog")]
-    if dir_name == "control-catalog-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-performance")]
-    if dir_name == "performance-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-permissions")]
-    if dir_name == "permissions-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-cli")]
-    if dir_name == "plugin-cli-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-prompted-actions")]
-    if dir_name == "prompted-actions-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-recording")]
-    if dir_name == "recording-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-sessions")]
-    if dir_name == "sessions-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-pane-runtime")]
-    if dir_name == "pane-runtime-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-snapshot")]
-    if dir_name == "snapshot-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-theme")]
-    if dir_name == "theme-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-windows")]
-    if dir_name == "windows-plugin" {
-        return true;
-    }
-    #[cfg(feature = "bundled-plugin-decoration")]
-    if dir_name == "decoration-plugin" {
-        return true;
-    }
-    false
+    static_bundled_workspace_plugin_dirs().contains(&dir_name)
+}
+
+const fn static_bundled_workspace_plugin_dirs() -> &'static [&'static str] {
+    &[
+        #[cfg(feature = "bundled-plugin-clients")]
+        "clients-plugin",
+        #[cfg(feature = "bundled-plugin-clipboard")]
+        "clipboard-plugin",
+        #[cfg(feature = "bundled-plugin-cluster")]
+        "cluster-plugin",
+        #[cfg(feature = "bundled-plugin-contexts")]
+        "contexts-plugin",
+        #[cfg(feature = "bundled-plugin-control-catalog")]
+        "control-catalog-plugin",
+        #[cfg(feature = "bundled-plugin-performance")]
+        "performance-plugin",
+        #[cfg(feature = "bundled-plugin-permissions")]
+        "permissions-plugin",
+        #[cfg(feature = "bundled-plugin-cli")]
+        "plugin-cli-plugin",
+        #[cfg(feature = "bundled-plugin-prompted-actions")]
+        "prompted-actions-plugin",
+        #[cfg(feature = "bundled-plugin-recording")]
+        "recording-plugin",
+        #[cfg(feature = "bundled-plugin-sessions")]
+        "sessions-plugin",
+        #[cfg(feature = "bundled-plugin-pane-runtime")]
+        "pane-runtime-plugin",
+        #[cfg(feature = "bundled-plugin-snapshot")]
+        "snapshot-plugin",
+        #[cfg(feature = "bundled-plugin-theme")]
+        "theme-plugin",
+        #[cfg(feature = "bundled-plugin-windows")]
+        "windows-plugin",
+        #[cfg(feature = "bundled-plugin-decoration")]
+        "decoration-plugin",
+    ]
 }
 
 fn runtime_command_state() -> Result<RuntimeCommandState> {

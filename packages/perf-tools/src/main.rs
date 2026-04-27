@@ -458,7 +458,7 @@ fn attach_scenario(name: &str) -> Result<AttachScenario, String> {
         "goto-window" => Ok(AttachScenario {
             command_name: "goto-window",
             service_operation: "switch-window",
-            prime_key: "alt+1",
+            prime_key: "ctrl+s",
         }),
         "new-window" => Ok(AttachScenario {
             command_name: "new-window",

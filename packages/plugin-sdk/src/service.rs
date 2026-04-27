@@ -1,6 +1,8 @@
 use crate::{HostScope, PluginError, Result};
+use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -108,6 +110,7 @@ pub struct ServiceEnvelope {
     pub version: ServiceProtocolVersion,
     pub request_id: u64,
     pub kind: ServiceEnvelopeKind,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub payload: Vec<u8>,
 }
 
@@ -128,6 +131,7 @@ pub struct ServiceRequest {
     pub caller_plugin_id: String,
     pub service: RegisteredService,
     pub operation: String,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub payload: Vec<u8>,
 }
 
@@ -139,6 +143,7 @@ pub struct ServiceError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceResponse {
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub payload: Vec<u8>,
     pub error: Option<ServiceError>,
 }
@@ -173,9 +178,15 @@ pub fn encode_service_message<T>(message: &T) -> Result<Vec<u8>>
 where
     T: Serialize,
 {
-    bmux_codec::to_vec(message).map_err(|error| PluginError::ServiceProtocol {
+    let timing_enabled = PhaseChannel::Service.enabled();
+    let started_at = timing_enabled.then(Instant::now);
+    let result = bmux_codec::to_vec(message).map_err(|error| PluginError::ServiceProtocol {
         details: error.to_string(),
-    })
+    });
+    if let Some(started_at) = started_at {
+        emit_service_codec_timing::<T>("typed_service.message_encode", started_at, &result);
+    }
+    result
 }
 
 /// Deserialize a service message from binary codec bytes.
@@ -187,9 +198,37 @@ pub fn decode_service_message<T>(payload: &[u8]) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    bmux_codec::from_bytes(payload).map_err(|error| PluginError::ServiceProtocol {
+    let timing_enabled = PhaseChannel::Service.enabled();
+    let started_at = timing_enabled.then(Instant::now);
+    let result = bmux_codec::from_bytes(payload).map_err(|error| PluginError::ServiceProtocol {
         details: error.to_string(),
-    })
+    });
+    if let Some(started_at) = started_at {
+        let total_us = started_at.elapsed().as_micros();
+        let payload = PhasePayload::new("typed_service.message_decode")
+            .field("type_name", std::any::type_name::<T>())
+            .field("input_bytes", payload.len())
+            .field("ok", result.is_ok())
+            .field("total_us", total_us)
+            .finish();
+        emit_phase_timing(PhaseChannel::Service, &payload);
+    }
+    result
+}
+
+fn emit_service_codec_timing<T>(phase: &str, started_at: Instant, result: &Result<Vec<u8>>)
+where
+    T: ?Sized,
+{
+    let total_us = started_at.elapsed().as_micros();
+    let output_bytes = result.as_ref().map_or(0, Vec::len);
+    let payload = PhasePayload::new(phase)
+        .field("type_name", std::any::type_name::<T>())
+        .field("output_bytes", output_bytes)
+        .field("ok", result.is_ok())
+        .field("total_us", total_us)
+        .finish();
+    emit_phase_timing(PhaseChannel::Service, &payload);
 }
 
 /// Encode a typed message into a service envelope with the given request ID and kind.
