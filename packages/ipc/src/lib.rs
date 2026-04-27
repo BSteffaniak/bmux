@@ -1204,6 +1204,84 @@ where
     bmux_codec::from_bytes(bytes)
 }
 
+/// Decode the highest-volume request shapes without constructing the full serde
+/// deserializer state machine.
+///
+/// This preserves the existing wire format and intentionally returns `None`
+/// for any payload it cannot prove is exactly one of the supported layouts;
+/// callers should fall back to [`decode`] for compatibility.
+#[must_use]
+pub fn decode_request_fast(bytes: &[u8]) -> Option<Request> {
+    let mut cursor = FastRequestCursor::new(bytes);
+    let variant = cursor.read_u32()?;
+    let request = match variant {
+        1 => Request::Ping,
+        7 => Request::ServerStop,
+        8 => Request::InvokeService {
+            capability: cursor.read_string()?,
+            kind: match cursor.read_u32()? {
+                0 => InvokeServiceKind::Query,
+                1 => InvokeServiceKind::Command,
+                _ => return None,
+            },
+            interface_id: cursor.read_string()?,
+            operation: cursor.read_string()?,
+            payload: cursor.read_bytes_vec()?,
+        },
+        _ => return None,
+    };
+    cursor.is_finished().then_some(request)
+}
+
+struct FastRequestCursor<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> FastRequestCursor<'a> {
+    const fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn remaining(&self) -> &'a [u8] {
+        &self.input[self.offset..]
+    }
+
+    fn read_u32(&mut self) -> Option<u32> {
+        let (value, consumed) = bmux_codec::varint::decode_u32(self.remaining())?;
+        self.offset = self.offset.checked_add(consumed)?;
+        Some(value)
+    }
+
+    fn read_usize(&mut self) -> Option<usize> {
+        let (value, consumed) = bmux_codec::varint::decode_usize(self.remaining())?;
+        self.offset = self.offset.checked_add(consumed)?;
+        Some(value)
+    }
+
+    fn read_slice(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(len)?;
+        let slice = self.input.get(self.offset..end)?;
+        self.offset = end;
+        Some(slice)
+    }
+
+    fn read_string(&mut self) -> Option<String> {
+        let len = self.read_usize()?;
+        let bytes = self.read_slice(len)?;
+        std::str::from_utf8(bytes).ok().map(ToString::to_string)
+    }
+
+    fn read_bytes_vec(&mut self) -> Option<Vec<u8>> {
+        let len = self.read_usize()?;
+        self.read_slice(len).map(<[u8]>::to_vec)
+    }
+
+    const fn is_finished(&self) -> bool {
+        self.offset == self.input.len()
+    }
+}
+
 // ── Shared display track types for recording files ───────────────────────────
 
 /// Display track event — shared type used by both the attach runtime's
@@ -1358,6 +1436,52 @@ mod tests {
         let bytes = encode(&request).expect("request should encode");
         let decoded: Request = decode(&bytes).expect("request should decode");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn decode_request_fast_accepts_hot_variants() {
+        let requests = [
+            Request::Ping,
+            Request::ServerStop,
+            Request::InvokeService {
+                capability: "bmux.test".into(),
+                kind: InvokeServiceKind::Query,
+                interface_id: "test-query/v1".into(),
+                operation: "get".into(),
+                payload: vec![1, 2, 3, 4],
+            },
+            Request::InvokeService {
+                capability: "bmux.test".into(),
+                kind: InvokeServiceKind::Command,
+                interface_id: "test-command/v1".into(),
+                operation: "set".into(),
+                payload: vec![255; 512],
+            },
+        ];
+
+        for request in requests {
+            let bytes = encode(&request).expect("request should encode");
+            assert_eq!(decode_request_fast(&bytes), Some(request));
+        }
+    }
+
+    #[test]
+    fn decode_request_fast_rejects_unsupported_or_invalid_payloads() {
+        let unsupported = Request::ServerStatus;
+        let mut trailing = encode(&Request::Ping).expect("request should encode");
+        trailing.push(0);
+
+        let mut invalid_utf8 = Vec::new();
+        bmux_codec::varint::encode_u32(&mut invalid_utf8, 8);
+        bmux_codec::varint::encode_usize(&mut invalid_utf8, 1);
+        invalid_utf8.push(0xFF);
+
+        assert_eq!(
+            decode_request_fast(&encode(&unsupported).expect("request should encode")),
+            None
+        );
+        assert_eq!(decode_request_fast(&trailing), None);
+        assert_eq!(decode_request_fast(&invalid_utf8), None);
     }
 
     #[test]

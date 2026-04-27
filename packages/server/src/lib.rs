@@ -20,7 +20,7 @@ use bmux_ipc::{
     PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
     PerformanceRecordingLevel, ProtocolContract, RecordingEventKind, RecordingPayload,
     RecordingRollingStartOptions, Request, Response, ResponsePayload, ServerSnapshotStatus, decode,
-    default_supported_capabilities, encode, negotiate_protocol,
+    decode_request_fast, default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
@@ -6513,6 +6513,9 @@ fn resolve_process_group_id_for_pid(_pid: u32) -> Option<i32> {
 fn parse_request(envelope: &Envelope) -> Result<Request> {
     if envelope.kind != EnvelopeKind::Request {
         anyhow::bail!("expected request envelope kind")
+    }
+    if let Some(request) = decode_request_fast(&envelope.payload) {
+        return Ok(request);
     }
     decode(&envelope.payload).context("failed to decode request payload")
 }
