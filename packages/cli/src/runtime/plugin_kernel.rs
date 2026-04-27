@@ -5,9 +5,10 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::InvokeServiceKind;
 use bmux_plugin::PluginRegistry;
 use bmux_plugin_sdk::{
-    CORE_CLI_COMMAND_CAPABILITY, CORE_CLI_COMMAND_INTERFACE_V1, HostConnectionInfo, HostScope,
+    CORE_CLI_COMMAND_CAPABILITY, CORE_CLI_COMMAND_INTERFACE_V1,
+    CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1, HostConnectionInfo, HostScope,
     PluginCliCommandRequest, PluginCliCommandResponse, RegisteredService, ServiceKind,
-    ServiceRequest,
+    ServiceRequest, decode_service_message, encode_service_message,
 };
 use bmux_server::{BmuxServer, ServiceInvokeContext};
 use clap::Parser;
@@ -388,15 +389,20 @@ fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -
 }
 
 fn run_plugin_bridge_command(request: &PluginCliCommandRequest) -> Result<i32> {
-    let status = run_plugin_keybinding_command(
+    let execution = run_plugin_bridge_command_execution(request)?;
+    Ok(execution.status)
+}
+
+fn run_plugin_bridge_command_execution(
+    request: &PluginCliCommandRequest,
+) -> Result<super::plugin_runtime::PluginCommandExecution> {
+    run_plugin_keybinding_command(
         request.plugin_id.as_str(),
         request.command_name.as_str(),
         &request.arguments,
         None,
         None,
-    )?
-    .status;
-    Ok(status)
+    )
 }
 
 fn run_core_built_in_command_fast_path(
@@ -646,6 +652,31 @@ pub(super) fn register_plugin_service_handlers(
     let mut loaded_provider_cache: BTreeMap<String, Arc<bmux_plugin::LoadedPlugin>> =
         BTreeMap::new();
 
+    server.register_service_handler_with_metadata(
+        CORE_CLI_COMMAND_CAPABILITY,
+        InvokeServiceKind::Command,
+        CORE_CLI_COMMAND_INTERFACE_V1,
+        CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
+        move |_route, _invoke_context, payload| async move {
+            let request: PluginCliCommandRequest = decode_service_message(&payload)?;
+            let execution = run_plugin_bridge_command_execution(&request)?;
+            let response = if execution.status == 0 {
+                PluginCliCommandResponse::new(execution.status)
+            } else {
+                PluginCliCommandResponse::failed(
+                    execution.status,
+                    execution.outcome.error_message.clone().unwrap_or_else(|| {
+                        format!("plugin exited with status {}", execution.status)
+                    }),
+                )
+            };
+            Ok(bmux_server::ServiceInvokeOutput {
+                payload: encode_service_message(&response)?,
+                metadata: execution.outcome.metadata,
+            })
+        },
+    )?;
+
     for service in services {
         let Some(invoke_kind) = invoke_kind_from_service_kind(service.kind) else {
             continue;
@@ -682,7 +713,7 @@ pub(super) fn register_plugin_service_handlers(
         let connection_info_for_handler = connection_info.clone();
         let enabled_plugins_for_handler = enabled_plugins.clone();
 
-        server.register_service_handler(
+        server.register_service_handler_with_metadata(
             service.capability.as_str().to_string(),
             invoke_kind,
             service.interface_id.clone(),
@@ -760,7 +791,10 @@ pub(super) fn register_plugin_service_handlers(
                         anyhow::bail!(error.message);
                     }
 
-                    Ok(response.payload)
+                    Ok(bmux_server::ServiceInvokeOutput {
+                        payload: response.payload,
+                        metadata: BTreeMap::new(),
+                    })
                 }
             },
         )?;

@@ -536,6 +536,7 @@ fn request_to_dsl(
         Request::Ping
         | Request::Hello { .. }
         | Request::HelloV2 { .. }
+        | Request::InvokeServicePipeline { .. }
         | Request::WhoAmIPrincipal
         | Request::SubscribeEvents
         | Request::PollEvents { .. } => RequestDslResult::Skip,

@@ -19,7 +19,8 @@ use bmux_ipc::{
     ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection, PaneLaunchCommand,
     PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
     PerformanceRecordingLevel, ProtocolContract, RecordingEventKind, RecordingPayload,
-    RecordingRollingStartOptions, Request, Response, ResponsePayload, ServerSnapshotStatus, decode,
+    RecordingRollingStartOptions, Request, Response, ResponsePayload, ServerSnapshotStatus,
+    ServicePipelinePayload, ServicePipelineRequest, ServicePipelineStepResult, decode,
     default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_pane_runtime_state::{
@@ -104,7 +105,22 @@ pub struct ServiceRoute {
     pub operation: String,
 }
 
-type ServiceInvokeFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
+#[derive(Debug, Clone, Default)]
+pub struct ServiceInvokeOutput {
+    pub payload: Vec<u8>,
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl From<Vec<u8>> for ServiceInvokeOutput {
+    fn from(payload: Vec<u8>) -> Self {
+        Self {
+            payload,
+            metadata: BTreeMap::new(),
+        }
+    }
+}
+
+type ServiceInvokeFuture = Pin<Box<dyn Future<Output = Result<ServiceInvokeOutput>> + Send>>;
 type ServiceInvokeHandler =
     dyn Fn(ServiceRoute, ServiceInvokeContext, Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
 type ServiceResolverHandler = dyn Fn(ServiceRoute, Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
@@ -181,6 +197,194 @@ impl ServiceInvokeContext {
         let response = self.execute_request(request).await?;
         encode(&response).context("failed encoding kernel bridge response payload")
     }
+}
+
+async fn invoke_service_output(
+    state: &Arc<ServerState>,
+    shutdown_tx: &watch::Sender<bool>,
+    client_id: ClientId,
+    client_principal_id: Uuid,
+    route: ServiceRoute,
+    payload: Vec<u8>,
+) -> Result<ServiceInvokeOutput> {
+    let capability = route.capability.clone();
+    let kind = route.kind;
+    let interface_id = route.interface_id.clone();
+    let operation = route.operation.clone();
+    let invoke_context = ServiceInvokeContext {
+        state: Arc::clone(state),
+        shutdown_tx: shutdown_tx.clone(),
+        client_id,
+        client_principal_id,
+    };
+    let dispatch = {
+        let registry = state
+            .service_registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
+        registry.dispatch(&route, invoke_context, payload.clone())
+    };
+    let invocation = if let Some(invocation) = dispatch {
+        Some(invocation)
+    } else {
+        let resolver = state
+            .service_resolver
+            .lock()
+            .map_err(|_| anyhow::anyhow!("service resolver lock poisoned"))?
+            .clone();
+        resolver.map(|resolver| resolver(route, payload))
+    };
+
+    let Some(invocation) = invocation else {
+        return Err(anyhow::anyhow!(
+            "no provider for service capability='{capability}' kind='{kind:?}' interface='{interface_id}' operation='{operation}'"
+        ));
+    };
+    invocation.await
+}
+
+async fn execute_service_pipeline(
+    state: &Arc<ServerState>,
+    shutdown_tx: &watch::Sender<bool>,
+    client_id: ClientId,
+    client_principal_id: Uuid,
+    pipeline: ServicePipelineRequest,
+) -> Result<Vec<ServicePipelineStepResult>> {
+    let mut results = Vec::with_capacity(pipeline.steps.len());
+    let mut metadata_by_step = Vec::with_capacity(pipeline.steps.len());
+    for step in pipeline.steps {
+        let payload = resolve_pipeline_payload(&step.payload, &pipeline.inputs, &metadata_by_step)?;
+        let route = ServiceRoute {
+            capability: step.capability,
+            kind: step.kind,
+            interface_id: step.interface_id,
+            operation: step.operation,
+        };
+        let output = invoke_service_output(
+            state,
+            shutdown_tx,
+            client_id,
+            client_principal_id,
+            route,
+            payload,
+        )
+        .await?;
+        metadata_by_step.push(output.metadata.clone());
+        results.push(ServicePipelineStepResult {
+            payload: output.payload,
+            metadata: output.metadata,
+        });
+    }
+    Ok(results)
+}
+
+fn resolve_pipeline_payload(
+    payload: &ServicePipelinePayload,
+    inputs: &BTreeMap<String, serde_json::Value>,
+    metadata_by_step: &[BTreeMap<String, serde_json::Value>],
+) -> Result<Vec<u8>> {
+    match payload {
+        ServicePipelinePayload::Encoded { payload } => Ok(payload.clone()),
+        ServicePipelinePayload::JsonTemplate { value, field_order } => {
+            let resolved = resolve_pipeline_template_value(value, inputs, metadata_by_step)?;
+            if let Some(field_order) = field_order {
+                let serde_json::Value::Object(map) = &resolved else {
+                    return Err(anyhow::anyhow!(
+                        "pipeline field_order requires a JSON object template"
+                    ));
+                };
+                return bmux_codec::to_vec(&PipelineStructTemplate { map, field_order })
+                    .context("failed encoding resolved pipeline struct template");
+            }
+            bmux_codec::to_vec(&resolved).context("failed encoding resolved pipeline template")
+        }
+    }
+}
+
+struct PipelineStructTemplate<'a> {
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    field_order: &'a [String],
+}
+
+impl serde::Serialize for PipelineStructTemplate<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::{Error, SerializeStruct};
+
+        let mut state =
+            serializer.serialize_struct("PipelineStructTemplate", self.field_order.len())?;
+        for field in self.field_order {
+            let value = self
+                .map
+                .get(field)
+                .ok_or_else(|| Error::custom(format!("pipeline field '{field}' is missing")))?;
+            state.serialize_field("", value)?;
+        }
+        state.end()
+    }
+}
+
+fn resolve_pipeline_template_value(
+    value: &serde_json::Value,
+    inputs: &BTreeMap<String, serde_json::Value>,
+    metadata_by_step: &[BTreeMap<String, serde_json::Value>],
+) -> Result<serde_json::Value> {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| resolve_pipeline_template_value(value, inputs, metadata_by_step))
+            .collect::<Result<Vec<_>>>()
+            .map(serde_json::Value::Array),
+        serde_json::Value::Object(map) => {
+            if map.len() == 1 {
+                if let Some(reference) = map.get("$metadata") {
+                    let reference = reference
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("$metadata reference must be a string"))?;
+                    return resolve_pipeline_metadata_reference(reference, metadata_by_step);
+                }
+                if let Some(reference) = map.get("$input") {
+                    let reference = reference
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("$input reference must be a string"))?;
+                    return inputs
+                        .get(reference)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("pipeline input '{reference}' is missing"));
+                }
+            }
+            let resolved = map
+                .iter()
+                .map(|(key, value)| {
+                    resolve_pipeline_template_value(value, inputs, metadata_by_step)
+                        .map(|value| (key.clone(), value))
+                })
+                .collect::<Result<serde_json::Map<_, _>>>()?;
+            Ok(serde_json::Value::Object(resolved))
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+fn resolve_pipeline_metadata_reference(
+    reference: &str,
+    metadata_by_step: &[BTreeMap<String, serde_json::Value>],
+) -> Result<serde_json::Value> {
+    let (step_index, key) = reference
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("metadata reference '{reference}' must be STEP:KEY"))?;
+    let step_index = step_index
+        .parse::<usize>()
+        .with_context(|| format!("invalid metadata step index in '{reference}'"))?;
+    let metadata = metadata_by_step
+        .get(step_index)
+        .ok_or_else(|| anyhow::anyhow!("metadata step {step_index} has not run"))?;
+    metadata
+        .get(key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("metadata key '{key}' missing from step {step_index}"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4357,6 +4561,34 @@ impl BmuxServer {
         F: Fn(ServiceRoute, ServiceInvokeContext, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
+        self.register_service_handler_with_metadata(
+            capability,
+            kind,
+            interface_id,
+            operation,
+            move |route, context, payload| {
+                let future = handler(route, context, payload);
+                async move { future.await.map(ServiceInvokeOutput::from) }
+            },
+        )
+    }
+
+    /// Register a generic service invocation handler that can return metadata.
+    ///
+    /// # Errors
+    /// Returns an error if the service registry lock is poisoned.
+    pub fn register_service_handler_with_metadata<F, Fut>(
+        &self,
+        capability: impl Into<String>,
+        kind: bmux_ipc::InvokeServiceKind,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        handler: F,
+    ) -> Result<()>
+    where
+        F: Fn(ServiceRoute, ServiceInvokeContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ServiceInvokeOutput>> + Send + 'static,
+    {
         let route = ServiceRoute {
             capability: capability.into(),
             kind,
@@ -4385,8 +4617,10 @@ impl BmuxServer {
         F: Fn(ServiceRoute, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
-        let wrapped: Arc<ServiceResolverHandler> =
-            Arc::new(move |route, payload| Box::pin(resolver(route, payload)));
+        let wrapped: Arc<ServiceResolverHandler> = Arc::new(move |route, payload| {
+            let future = resolver(route, payload);
+            Box::pin(async move { future.await.map(ServiceInvokeOutput::from) })
+        });
         *self
             .state
             .service_resolver
@@ -5828,7 +6062,9 @@ async fn handle_request(
             let invocation_started = std::time::Instant::now();
             let response = if let Some(invocation) = invocation {
                 match invocation.await {
-                    Ok(payload) => Response::Ok(ResponsePayload::ServiceInvoked { payload }),
+                    Ok(output) => Response::Ok(ResponsePayload::ServiceInvoked {
+                        payload: output.payload,
+                    }),
                     Err(error) => Response::Err(ErrorResponse {
                         code: ErrorCode::Internal,
                         message: format!("service invocation failed: {error:#}"),
@@ -5886,6 +6122,23 @@ async fn handle_request(
                     .finish(),
             );
             response
+        }
+        Request::InvokeServicePipeline { pipeline } => {
+            match execute_service_pipeline(
+                state,
+                shutdown_tx,
+                client_id,
+                client_principal_id,
+                pipeline,
+            )
+            .await
+            {
+                Ok(results) => Response::Ok(ResponsePayload::ServicePipelineInvoked { results }),
+                Err(error) => Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("service pipeline failed: {error:#}"),
+                }),
+            }
         }
         Request::EmitOnPluginBus { kind, payload } => {
             // Relay a wire-encoded payload onto the server's plugin
@@ -5970,6 +6223,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
+        Request::InvokeServicePipeline { .. } => "invoke_service_pipeline",
         Request::EmitOnPluginBus { .. } => "emit_on_plugin_bus",
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
@@ -6231,6 +6485,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::ServerSnapshotRestored { .. } => "server_snapshot_restored",
         ResponsePayload::ServerStopping => "server_stopping",
         ResponsePayload::ServiceInvoked { .. } => "service_invoked",
+        ResponsePayload::ServicePipelineInvoked { .. } => "service_pipeline_invoked",
         ResponsePayload::EventsSubscribed => "events_subscribed",
         ResponsePayload::EventBatch { .. } => "event_batch",
         ResponsePayload::EventPushEnabled => "event_push_enabled",
@@ -7357,6 +7612,48 @@ mod tests {
         reason: Option<String>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct PipelineTemplateTarget {
+        context_id: String,
+        can_write: bool,
+        cols: u16,
+    }
+
+    #[test]
+    fn pipeline_json_template_field_order_encodes_struct_payload() {
+        let payload = ServicePipelinePayload::JsonTemplate {
+            value: serde_json::json!({
+                "context_id": { "$metadata": "0:context_id" },
+                "can_write": true,
+                "cols": { "$input": "cols" },
+            }),
+            field_order: Some(vec![
+                "context_id".to_string(),
+                "can_write".to_string(),
+                "cols".to_string(),
+            ]),
+        };
+        let inputs = BTreeMap::from([("cols".to_string(), serde_json::json!(120))]);
+        let metadata = vec![BTreeMap::from([(
+            "context_id".to_string(),
+            serde_json::json!("ctx-1"),
+        )])];
+
+        let encoded = resolve_pipeline_payload(&payload, &inputs, &metadata)
+            .expect("pipeline template should encode");
+        let decoded: PipelineTemplateTarget =
+            bmux_codec::from_bytes(&encoded).expect("payload should decode as target struct");
+
+        assert_eq!(
+            decoded,
+            PipelineTemplateTarget {
+                context_id: "ctx-1".to_string(),
+                can_write: true,
+                cols: 120,
+            }
+        );
+    }
+
     async fn check_session_policy(
         state: &Arc<ServerState>,
         shutdown_tx: &watch::Sender<bool>,
@@ -7417,15 +7714,16 @@ mod tests {
         let Some(invocation) = invocation else {
             return Ok(None);
         };
-        let payload = invocation.await.map_err(|error| ErrorResponse {
+        let output = invocation.await.map_err(|error| ErrorResponse {
             code: ErrorCode::Internal,
             message: format!("session policy invocation failed: {error:#}"),
         })?;
-        let response =
-            decode::<SessionPolicyCheckResponse>(&payload).map_err(|error| ErrorResponse {
+        let response = decode::<SessionPolicyCheckResponse>(&output.payload).map_err(|error| {
+            ErrorResponse {
                 code: ErrorCode::Internal,
                 message: format!("failed decoding session policy response: {error}"),
-            })?;
+            }
+        })?;
         Ok(Some(response))
     }
 

@@ -15,8 +15,8 @@ use bmux_ipc::{
     AttachPaneMouseProtocol, AttachScene, CORE_PROTOCOL_CAPABILITIES, ContextSelector, Envelope,
     EnvelopeKind, ErrorCode, IncompatibilityReason, InvokeServiceKind, IpcEndpoint,
     NegotiatedProtocol, PaneLayoutNode, PaneSummary, ProtocolContract, Request, Response,
-    ResponsePayload, ServerSnapshotStatus, SessionSelector, decode, default_supported_capabilities,
-    encode,
+    ResponsePayload, ServerSnapshotStatus, ServicePipelineRequest, ServicePipelineStepResult,
+    SessionSelector, decode, default_supported_capabilities, encode,
 };
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing};
 use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult};
@@ -526,6 +526,26 @@ impl BmuxClient {
                 Ok(payload)
             }
             _ => Err(ClientError::UnexpectedResponse("expected service invoked")),
+        }
+    }
+
+    /// Invoke a generic service pipeline over IPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a pipeline step fails or the response shape is unexpected.
+    pub async fn invoke_service_pipeline_raw(
+        &mut self,
+        pipeline: ServicePipelineRequest,
+    ) -> Result<Vec<ServicePipelineStepResult>> {
+        match self
+            .request(Request::InvokeServicePipeline { pipeline })
+            .await?
+        {
+            ResponsePayload::ServicePipelineInvoked { results } => Ok(results),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected service pipeline invoked",
+            )),
         }
     }
 
@@ -2280,6 +2300,26 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Invoke a generic service pipeline over IPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a pipeline step fails or the response shape is unexpected.
+    pub async fn invoke_service_pipeline_raw(
+        &mut self,
+        pipeline: ServicePipelineRequest,
+    ) -> Result<Vec<ServicePipelineStepResult>> {
+        match self
+            .request(Request::InvokeServicePipeline { pipeline })
+            .await?
+        {
+            ResponsePayload::ServicePipelineInvoked { results } => Ok(results),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected service pipeline invoked",
+            )),
+        }
+    }
+
     /// Relay a wire-encoded payload onto the server's plugin event
     /// bus under `kind`. See [`BmuxClient::emit_on_plugin_bus`] for
     /// the full contract.
@@ -2388,6 +2428,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
+        Request::InvokeServicePipeline { .. } => "invoke_service_pipeline",
         Request::EmitOnPluginBus { .. } => "emit_on_plugin_bus",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
@@ -2520,6 +2561,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::ServerSnapshotRestored { .. } => "server_snapshot_restored",
             ResponsePayload::ServerStopping => "server_stopping",
             ResponsePayload::ServiceInvoked { .. } => "service_invoked",
+            ResponsePayload::ServicePipelineInvoked { .. } => "service_pipeline_invoked",
             ResponsePayload::EventsSubscribed => "events_subscribed",
             ResponsePayload::EventBatch { .. } => "event_batch",
             ResponsePayload::EventPushEnabled => "event_push_enabled",

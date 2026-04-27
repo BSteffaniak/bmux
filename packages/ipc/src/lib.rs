@@ -486,6 +486,9 @@ pub enum Request {
         #[serde(with = "bmux_codec::serde_bytes_vec")]
         payload: Vec<u8>,
     },
+    InvokeServicePipeline {
+        pipeline: ServicePipelineRequest,
+    },
     /// Emit a wire-encoded payload onto the server's plugin event bus
     /// under `kind`. The server looks up the registered channel and
     /// invokes its decoder to deserialise the bytes into the channel's
@@ -514,6 +517,36 @@ pub enum Request {
         contract: ProtocolContract,
         client_name: String,
         principal_id: Uuid,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServicePipelineRequest {
+    #[serde(default)]
+    pub inputs: BTreeMap<String, serde_json::Value>,
+    pub steps: Vec<ServicePipelineStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServicePipelineStep {
+    pub capability: String,
+    pub kind: InvokeServiceKind,
+    pub interface_id: String,
+    pub operation: String,
+    pub payload: ServicePipelinePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServicePipelinePayload {
+    Encoded {
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        payload: Vec<u8>,
+    },
+    JsonTemplate {
+        value: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field_order: Option<Vec<String>>,
     },
 }
 
@@ -1034,12 +1067,23 @@ pub enum ResponsePayload {
         #[serde(with = "bmux_codec::serde_bytes_vec")]
         payload: Vec<u8>,
     },
+    ServicePipelineInvoked {
+        results: Vec<ServicePipelineStepResult>,
+    },
     HelloNegotiated {
         negotiated: NegotiatedProtocol,
     },
     HelloIncompatible {
         reason: IncompatibilityReason,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServicePipelineStepResult {
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
+    pub payload: Vec<u8>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 /// Canonical error codes returned over IPC.

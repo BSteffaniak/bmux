@@ -48,7 +48,7 @@ use super::super::{
     effective_enabled_plugins, enter_host_kernel_connection, host_kernel_bridge, load_plugin,
     map_attach_client_error, merged_runtime_keybindings, parse_session_selector, parse_uuid_value,
     plugin_command_policy_hints, plugin_host_metadata, recording, resolve_plugin_search_paths,
-    run_plugin_keybinding_command, scan_available_plugins,
+    scan_available_plugins,
 };
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent};
@@ -2355,6 +2355,88 @@ pub fn plugin_fallback_new_context_id(
     after_context_id.filter(|context_id| new_context_ids.contains(context_id))
 }
 
+fn build_attach_plugin_command_pipeline(
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+) -> std::result::Result<bmux_ipc::ServicePipelineRequest, ClientError> {
+    let request = bmux_plugin_sdk::PluginCliCommandRequest::new(
+        plugin_id.to_string(),
+        command_name.to_string(),
+        args.to_vec(),
+    );
+    let command_payload = bmux_plugin_sdk::encode_service_message(&request).map_err(|error| {
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding plugin command pipeline request: {error}"),
+        }
+    })?;
+    Ok(bmux_ipc::ServicePipelineRequest {
+        inputs: BTreeMap::new(),
+        steps: vec![bmux_ipc::ServicePipelineStep {
+            capability: bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY.to_string(),
+            kind: InvokeServiceKind::Command,
+            interface_id: bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1.to_string(),
+            operation: bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1.to_string(),
+            payload: bmux_ipc::ServicePipelinePayload::Encoded {
+                payload: command_payload,
+            },
+        }],
+    })
+}
+
+struct AttachPluginCommandPipelineExecution {
+    status: i32,
+    outcome: PluginCommandOutcome,
+}
+
+fn decode_attach_plugin_command_pipeline_results(
+    plugin_id: &str,
+    command_name: &str,
+    results: &[bmux_ipc::ServicePipelineStepResult],
+) -> std::result::Result<AttachPluginCommandPipelineExecution, ClientError> {
+    let command_result = results.first().ok_or(ClientError::UnexpectedResponse(
+        "missing plugin command pipeline result",
+    ))?;
+    let command_response: bmux_plugin_sdk::PluginCliCommandResponse =
+        bmux_plugin_sdk::decode_service_message(&command_result.payload).map_err(|error| {
+            ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("decoding plugin command pipeline response: {error}"),
+            }
+        })?;
+    Ok(AttachPluginCommandPipelineExecution {
+        status: command_response.exit_code,
+        outcome: PluginCommandOutcome {
+            error_message: command_response.error.or_else(|| {
+                (command_response.exit_code != 0)
+                    .then(|| format!("plugin action failed ({plugin_id}:{command_name})"))
+            }),
+            metadata: command_result.metadata.clone(),
+        },
+    })
+}
+
+async fn run_attach_plugin_command_pipeline(
+    client: &mut StreamingBmuxClient,
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+) -> std::result::Result<AttachPluginCommandPipelineExecution, ClientError> {
+    let started_at = Instant::now();
+    let pipeline = build_attach_plugin_command_pipeline(plugin_id, command_name, args)?;
+    let results = client.invoke_service_pipeline_raw(pipeline).await?;
+    let execution =
+        decode_attach_plugin_command_pipeline_results(plugin_id, command_name, &results)?;
+    emit_attach_phase_timing(&serde_json::json!({
+        "phase": "attach.plugin_command_pipeline",
+        "plugin_id": plugin_id,
+        "command_name": command_name,
+        "total_us": started_at.elapsed().as_micros(),
+    }));
+    Ok(execution)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct HotPathExecutionPolicyCheckRequest {
     session_id: Uuid,
@@ -2471,7 +2553,7 @@ pub async fn handle_attach_plugin_command_action(
     command_name: &str,
     args: &[String],
     view_state: &mut AttachViewState,
-    kernel_client_factory: Option<&KernelClientFactory>,
+    _kernel_client_factory: Option<&KernelClientFactory>,
 ) -> std::result::Result<(), ClientError> {
     let total_started = Instant::now();
     let before_started = Instant::now();
@@ -2540,23 +2622,17 @@ pub async fn handle_attach_plugin_command_action(
     }
     let policy_us = policy_started.elapsed().as_micros();
     let run_started = Instant::now();
-    match run_plugin_keybinding_command(
-        plugin_id,
-        command_name,
-        args,
-        kernel_client_factory,
-        view_state.self_client_id,
-    ) {
+    match run_attach_plugin_command_pipeline(client, plugin_id, command_name, args).await {
         Err(error) => {
             let run_us = run_started.elapsed().as_micros();
             warn!(
                 plugin_id = %plugin_id,
                 command_name = %command_name,
                 error = %error,
-                "attach.plugin_command.run_failed"
+                "attach.plugin_command.pipeline_failed"
             );
             view_state.set_transient_status(
-                format!("plugin action failed ({plugin_id}:{command_name}) — see logs"),
+                format!("plugin pipeline failed: {}", map_attach_client_error(error)),
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
@@ -7491,6 +7567,56 @@ mod tests {
         );
 
         assert_eq!(selected_context_id_from_command_outcome(&outcome), None);
+    }
+
+    #[test]
+    fn attach_plugin_command_pipeline_is_generic_command_step() {
+        let pipeline = build_attach_plugin_command_pipeline(
+            "example.plugin",
+            "do-thing",
+            &["arg".to_string()],
+        )
+        .expect("pipeline should build");
+
+        assert!(pipeline.inputs.is_empty());
+        assert_eq!(pipeline.steps.len(), 1);
+        let step = &pipeline.steps[0];
+        assert_eq!(
+            step.capability,
+            bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY
+        );
+        assert_eq!(step.kind, InvokeServiceKind::Command);
+        assert_eq!(
+            step.interface_id,
+            bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1
+        );
+        assert_eq!(
+            step.operation,
+            bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1
+        );
+    }
+
+    #[test]
+    fn attach_plugin_command_pipeline_metadata_is_optional() {
+        let response = bmux_plugin_sdk::PluginCliCommandResponse::new(0);
+        let payload =
+            bmux_plugin_sdk::encode_service_message(&response).expect("response should encode");
+        let execution = decode_attach_plugin_command_pipeline_results(
+            "example.plugin",
+            "do-thing",
+            &[bmux_ipc::ServicePipelineStepResult {
+                payload,
+                metadata: BTreeMap::new(),
+            }],
+        )
+        .expect("pipeline result should decode");
+
+        assert_eq!(execution.status, 0);
+        assert!(execution.outcome.metadata.is_empty());
+        assert_eq!(
+            selected_context_id_from_command_outcome(&execution.outcome),
+            None
+        );
     }
 
     #[test]
