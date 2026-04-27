@@ -221,12 +221,34 @@ pub struct PaneFocusResponse {
 pub struct PaneResizeRequest {
     pub session: Option<SessionSelector>,
     pub target: Option<PaneSelector>,
-    pub delta: i16,
+    pub direction: PaneResizeDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneResizeDirection {
+    Increase,
+    Decrease,
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneResizeResponse {
     pub session_id: Uuid,
+}
+
+const fn pane_resize_direction_name(direction: PaneResizeDirection) -> &'static str {
+    match direction {
+        PaneResizeDirection::Increase => "increase",
+        PaneResizeDirection::Decrease => "decrease",
+        PaneResizeDirection::Left => "left",
+        PaneResizeDirection::Right => "right",
+        PaneResizeDirection::Up => "up",
+        PaneResizeDirection::Down => "down",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -915,15 +937,14 @@ pub trait KernelOps: ServiceCaller {
         struct Args {
             session_id: Uuid,
             target: Option<Uuid>,
-            delta_percent: i8,
+            direction: &'static str,
         }
         let session_id = self.resolve_session_uuid(request.session.as_ref())?;
         let target = request.target.as_ref().and_then(|sel| match sel {
             PaneSelector::ById(id) => Some(*id),
             _ => None,
         });
-        let delta_percent =
-            i8::try_from(request.delta).unwrap_or(if request.delta < 0 { -50 } else { 50 });
+        let direction = pane_resize_direction_name(request.direction);
         let result: std::result::Result<
             bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionAck,
             bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
@@ -935,7 +956,7 @@ pub trait KernelOps: ServiceCaller {
             &Args {
                 session_id,
                 target,
-                delta_percent,
+                direction,
             },
         )?;
         match result {

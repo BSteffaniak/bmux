@@ -10,6 +10,7 @@ use bmux_ipc::{PaneFocusDirection, PaneLaunchCommand, PaneSelector, PaneSplitDir
 use bmux_pane_runtime_plugin_api::pane_runtime_commands::{
     PaneAck, PaneCommandError, SessionAck, SessionRuntimeCommandError,
 };
+use bmux_pane_runtime_state::PaneResizeDirection;
 use bmux_session_models::SessionId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -54,7 +55,7 @@ pub struct ResizePaneArgs {
     pub session_id: Uuid,
     #[serde(default)]
     pub target: Option<Uuid>,
-    pub delta_percent: i8,
+    pub direction: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +218,20 @@ fn parse_focus_direction(raw: &str) -> Result<Option<PaneFocusDirection>, PaneCo
     }
 }
 
+fn parse_resize_direction(raw: &str) -> Result<PaneResizeDirection, PaneCommandError> {
+    match raw {
+        "increase" => Ok(PaneResizeDirection::Increase),
+        "decrease" => Ok(PaneResizeDirection::Decrease),
+        "left" => Ok(PaneResizeDirection::Left),
+        "right" => Ok(PaneResizeDirection::Right),
+        "up" => Ok(PaneResizeDirection::Up),
+        "down" => Ok(PaneResizeDirection::Down),
+        other => Err(failed_command(format!(
+            "invalid resize direction: '{other}' (expected increase|decrease|left|right|up|down)"
+        ))),
+    }
+}
+
 fn target_selector(target: Option<Uuid>) -> Option<PaneSelector> {
     target.map(PaneSelector::ById)
 }
@@ -347,13 +362,10 @@ pub fn resize_pane(
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.resize")?;
+    let direction = parse_resize_direction(&req.direction)?;
     handle
         .0
-        .resize_pane(
-            session_id,
-            target_selector(req.target),
-            i16::from(req.delta_percent),
-        )
+        .resize_pane(session_id, target_selector(req.target), direction)
         .map_err(|e| failed_command(e.to_string()))?;
     emit_attach_view_changed_scene(session_id);
     Ok(SessionAck {

@@ -24,7 +24,8 @@ use bmux_ipc::{
 };
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
-    PaneLayoutNode, PaneResurrectionSnapshot, PaneRuntimeMeta, SessionRuntimeError,
+    PaneLayoutNode, PaneResizeDirection, PaneResurrectionSnapshot, PaneRuntimeMeta,
+    SessionRuntimeError,
 };
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
@@ -3487,7 +3488,7 @@ impl SessionRuntimeManager {
         &mut self,
         session_id: SessionId,
         target: Option<PaneSelector>,
-        delta: i16,
+        direction: PaneResizeDirection,
     ) -> Result<()> {
         let session = self
             .runtimes
@@ -3498,8 +3499,10 @@ impl SessionRuntimeManager {
         let pane_id =
             resolve_pane_id_from_selector(session, &target.unwrap_or(PaneSelector::Active))
                 .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
-        let step = f32::from(delta) * 0.05;
-        let _ = session.layout_root.adjust_focused_ratio(pane_id, step);
+        let root = scene_root_from_viewport(session.attach_viewport);
+        let _ = session
+            .layout_root
+            .resize_focused(pane_id, direction, root, 1);
         self.apply_stored_attach_viewport(session_id);
         Ok(())
     }
@@ -6788,9 +6791,9 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         &self,
         session_id: SessionId,
         target: Option<PaneSelector>,
-        delta: i16,
+        direction: PaneResizeDirection,
     ) -> anyhow::Result<()> {
-        self.with_lock(|m| m.resize_pane(session_id, target, delta))
+        self.with_lock(|m| m.resize_pane(session_id, target, direction))
             .ok_or_else(Self::lock_poisoned_anyhow)?
     }
 

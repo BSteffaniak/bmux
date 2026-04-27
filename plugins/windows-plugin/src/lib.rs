@@ -12,8 +12,8 @@ use bmux_plugin_sdk::{
     VolatileStateSetRequest,
 };
 use bmux_windows_plugin_api::windows_commands::{
-    self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, PaneZoomAck, Selector,
-    WindowAck, WindowError, WindowsCommandsService,
+    self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, PaneResizeDirection,
+    PaneZoomAck, Selector, WindowAck, WindowError, WindowsCommandsService,
 };
 use bmux_windows_plugin_api::windows_state::{self, PaneState, WindowEntry, WindowsStateService};
 use domain_ipc::KernelOps;
@@ -208,7 +208,7 @@ impl RustPlugin for WindowsPlugin {
                 let request = domain_ipc::PaneResizeRequest {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: req.target.as_ref().map(selector_to_pane),
-                    delta: req.delta,
+                    direction: typed_resize_to_domain(req.direction),
                 };
                 ctx.pane_resize(&request)
                     .map(|_| PaneAck { ok: true, pane_id: None })
@@ -670,30 +670,14 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
         }
         "resize-pane" => {
             let direction_arg = option_value(&context.arguments, "direction");
-            // Translate direction to a delta:
-            //   - increase / right / down → +1
-            //   - decrease / left / up   → -1
-            // The pane-runtime picks the axis from the focused split;
-            // the delta sign controls grow-vs-shrink.
-            //
-            // Arms are grouped by user intent (one per direction
-            // keyword), not by return value, so we keep them split
-            // rather than collapsing by shared body.
-            #[allow(clippy::match_same_arms)]
-            let delta: i16 = match direction_arg.as_deref() {
-                Some("increase" | "right" | "down") => 1,
-                Some("decrease" | "left" | "up") => -1,
-                Some(other) => {
-                    return Err(format!(
-                        "unknown resize direction '{other}' (expected increase/decrease/left/right/up/down)"
-                    ));
-                }
-                None => 1,
-            };
+            let direction = direction_arg.as_deref().map_or(
+                Ok(domain_ipc::PaneResizeDirection::Increase),
+                parse_pane_resize_direction_arg,
+            )?;
             let request = domain_ipc::PaneResizeRequest {
                 session: None,
                 target: None,
-                delta,
+                direction,
             };
             context.pane_resize(&request).map_err(|e| e.to_string())?;
             Ok(())
@@ -1530,6 +1514,17 @@ const fn pane_direction_to_focus(
     }
 }
 
+const fn typed_resize_to_domain(direction: PaneResizeDirection) -> domain_ipc::PaneResizeDirection {
+    match direction {
+        PaneResizeDirection::Increase => domain_ipc::PaneResizeDirection::Increase,
+        PaneResizeDirection::Decrease => domain_ipc::PaneResizeDirection::Decrease,
+        PaneResizeDirection::Left => domain_ipc::PaneResizeDirection::Left,
+        PaneResizeDirection::Right => domain_ipc::PaneResizeDirection::Right,
+        PaneResizeDirection::Up => domain_ipc::PaneResizeDirection::Up,
+        PaneResizeDirection::Down => domain_ipc::PaneResizeDirection::Down,
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)] // Used as a fn-pointer in `.map_err(...)`; ref-taking would require closures.
 fn map_host_error<E: ToString>(err: E) -> PaneMutationError {
     PaneMutationError::Failed {
@@ -1731,14 +1726,14 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         &'a self,
         session: Option<Selector>,
         target: Option<Selector>,
-        delta: i16,
+        direction: PaneResizeDirection,
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
             let request = domain_ipc::PaneResizeRequest {
                 session: session.as_ref().and_then(selector_to_session),
                 target: target.as_ref().map(selector_to_pane),
-                delta,
+                direction: typed_resize_to_domain(direction),
             };
             caller
                 .pane_resize(&request)
@@ -1953,6 +1948,20 @@ fn parse_pane_direction_arg(value: &str) -> Result<PaneDirection, String> {
     }
 }
 
+fn parse_pane_resize_direction_arg(value: &str) -> Result<domain_ipc::PaneResizeDirection, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "increase" => Ok(domain_ipc::PaneResizeDirection::Increase),
+        "decrease" => Ok(domain_ipc::PaneResizeDirection::Decrease),
+        "left" => Ok(domain_ipc::PaneResizeDirection::Left),
+        "right" => Ok(domain_ipc::PaneResizeDirection::Right),
+        "up" => Ok(domain_ipc::PaneResizeDirection::Up),
+        "down" => Ok(domain_ipc::PaneResizeDirection::Down),
+        other => Err(format!(
+            "unknown resize direction '{other}' (expected increase/decrease/left/right/up/down)"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ListWindowsArgs {
     session: Option<String>,
@@ -2050,7 +2059,7 @@ struct ResizePaneArgs {
     session: Option<Selector>,
     #[serde(default)]
     target: Option<Selector>,
-    delta: i16,
+    direction: PaneResizeDirection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

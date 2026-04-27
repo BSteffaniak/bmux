@@ -45,6 +45,18 @@ pub enum PaneLayoutNode {
     },
 }
 
+/// Directional intent for resizing a focused pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneResizeDirection {
+    Increase,
+    Decrease,
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 impl PaneLayoutNode {
     /// Append every leaf pane id into `out` in left-to-right traversal order.
     pub fn pane_order(&self, out: &mut Vec<Uuid>) {
@@ -130,28 +142,176 @@ impl PaneLayoutNode {
         !matches!(remove_inner(self, target), RemoveResult::NotFound)
     }
 
-    /// Find the deepest split containing `target` and adjust its
-    /// ratio by `delta`, clamped to `[0.1, 0.9]`. Returns the new
-    /// ratio, or `None` if no containing split was found.
-    pub fn adjust_focused_ratio(&mut self, target: Uuid, delta: f32) -> Option<f32> {
+    /// Resize `target` by moving the nearest relevant split boundary.
+    ///
+    /// `Increase` / `Decrease` operate on the deepest containing split,
+    /// growing or shrinking the target pane. Physical directions walk
+    /// outward until they find the nearest boundary on that side.
+    pub fn resize_focused(
+        &mut self,
+        target: Uuid,
+        direction: PaneResizeDirection,
+        rect: LayoutRect,
+        cells: u16,
+    ) -> Option<f32> {
+        match direction {
+            PaneResizeDirection::Increase | PaneResizeDirection::Decrease => {
+                self.resize_focused_automatic(target, direction, rect, cells)
+            }
+            PaneResizeDirection::Left
+            | PaneResizeDirection::Right
+            | PaneResizeDirection::Up
+            | PaneResizeDirection::Down => {
+                self.resize_focused_directional(target, direction, rect, cells)
+            }
+        }
+    }
+
+    fn resize_focused_automatic(
+        &mut self,
+        target: Uuid,
+        direction: PaneResizeDirection,
+        rect: LayoutRect,
+        cells: u16,
+    ) -> Option<f32> {
         match self {
             Self::Leaf { .. } => None,
             Self::Split {
+                direction: split_direction,
                 ratio,
                 first,
                 second,
-                ..
             } => {
-                if contains_pane(first, target) || contains_pane(second, target) {
-                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                let vertical = matches!(split_direction, PaneSplitDirection::Vertical);
+                let (first_rect, second_rect) = split_layout_rect(rect, *ratio, vertical);
+                if contains_pane(first, target) {
+                    if let Some(adjusted) =
+                        first.resize_focused_automatic(target, direction, first_rect, cells)
+                    {
+                        return Some(adjusted);
+                    }
+                    let delta = ratio_delta(rect, vertical, cells);
+                    let signed_delta = if matches!(direction, PaneResizeDirection::Increase) {
+                        delta
+                    } else {
+                        -delta
+                    };
+                    *ratio = (*ratio + signed_delta).clamp(0.1, 0.9);
+                    Some(*ratio)
+                } else if contains_pane(second, target) {
+                    if let Some(adjusted) =
+                        second.resize_focused_automatic(target, direction, second_rect, cells)
+                    {
+                        return Some(adjusted);
+                    }
+                    let delta = ratio_delta(rect, vertical, cells);
+                    let signed_delta = if matches!(direction, PaneResizeDirection::Increase) {
+                        -delta
+                    } else {
+                        delta
+                    };
+                    *ratio = (*ratio + signed_delta).clamp(0.1, 0.9);
                     Some(*ratio)
                 } else {
-                    first
-                        .adjust_focused_ratio(target, delta)
-                        .or_else(|| second.adjust_focused_ratio(target, delta))
+                    None
                 }
             }
         }
+    }
+
+    fn resize_focused_directional(
+        &mut self,
+        target: Uuid,
+        direction: PaneResizeDirection,
+        rect: LayoutRect,
+        cells: u16,
+    ) -> Option<f32> {
+        match self {
+            Self::Leaf { .. } => None,
+            Self::Split {
+                direction: split_direction,
+                ratio,
+                first,
+                second,
+            } => {
+                let vertical = matches!(split_direction, PaneSplitDirection::Vertical);
+                let (first_rect, second_rect) = split_layout_rect(rect, *ratio, vertical);
+                if contains_pane(first, target) {
+                    if let Some(adjusted) =
+                        first.resize_focused_directional(target, direction, first_rect, cells)
+                    {
+                        return Some(adjusted);
+                    }
+                    if vertical && matches!(direction, PaneResizeDirection::Right)
+                        || !vertical && matches!(direction, PaneResizeDirection::Down)
+                    {
+                        *ratio = (*ratio + ratio_delta(rect, vertical, cells)).clamp(0.1, 0.9);
+                        return Some(*ratio);
+                    }
+                } else if contains_pane(second, target) {
+                    if let Some(adjusted) =
+                        second.resize_focused_directional(target, direction, second_rect, cells)
+                    {
+                        return Some(adjusted);
+                    }
+                    if vertical && matches!(direction, PaneResizeDirection::Left)
+                        || !vertical && matches!(direction, PaneResizeDirection::Up)
+                    {
+                        *ratio = (*ratio - ratio_delta(rect, vertical, cells)).clamp(0.1, 0.9);
+                        return Some(*ratio);
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ratio_delta(rect: LayoutRect, vertical: bool, cells: u16) -> f32 {
+    let span = if vertical { rect.w } else { rect.h }.max(1);
+    f32::from(cells) / f32::from(span)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn split_layout_rect(rect: LayoutRect, ratio: f32, vertical: bool) -> (LayoutRect, LayoutRect) {
+    let ratio = ratio.clamp(0.1, 0.9);
+    if vertical {
+        let split = ((f32::from(rect.w) * ratio).round()) as u16;
+        let first_w = split.max(1).min(rect.w.saturating_sub(1).max(1));
+        let second_w = rect.w.saturating_sub(first_w).max(1);
+        (
+            LayoutRect {
+                x: rect.x,
+                y: rect.y,
+                w: first_w,
+                h: rect.h,
+            },
+            LayoutRect {
+                x: rect.x.saturating_add(first_w),
+                y: rect.y,
+                w: second_w,
+                h: rect.h,
+            },
+        )
+    } else {
+        let split = ((f32::from(rect.h) * ratio).round()) as u16;
+        let first_h = split.max(1).min(rect.h.saturating_sub(1).max(1));
+        let second_h = rect.h.saturating_sub(first_h).max(1);
+        (
+            LayoutRect {
+                x: rect.x,
+                y: rect.y,
+                w: rect.w,
+                h: first_h,
+            },
+            LayoutRect {
+                x: rect.x,
+                y: rect.y.saturating_add(first_h),
+                w: rect.w,
+                h: second_h,
+            },
+        )
     }
 }
 
@@ -169,12 +329,21 @@ pub fn contains_pane(node: &PaneLayoutNode, pane_id: Uuid) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LayoutRect, PaneLayoutNode, contains_pane};
+    use super::{LayoutRect, PaneLayoutNode, PaneResizeDirection, contains_pane};
     use bmux_ipc::PaneSplitDirection;
     use uuid::Uuid;
 
     fn leaf(id: Uuid) -> PaneLayoutNode {
         PaneLayoutNode::Leaf { pane_id: id }
+    }
+
+    fn assert_ratio(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < f32::EPSILON);
+    }
+
+    fn assert_resize_ratio(actual: Option<f32>, expected: f32) {
+        let actual = actual.expect("resize should adjust a split");
+        assert_ratio(actual, expected);
     }
 
     #[test]
@@ -233,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn adjust_focused_ratio_clamps_to_range() {
+    fn resize_focused_clamps_to_range() {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let mut root = PaneLayoutNode::Split {
@@ -242,8 +411,109 @@ mod tests {
             first: Box::new(leaf(a)),
             second: Box::new(leaf(b)),
         };
-        assert_eq!(root.adjust_focused_ratio(a, 1.0), Some(0.9));
-        assert_eq!(root.adjust_focused_ratio(a, -5.0), Some(0.1));
+        let rect = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 100,
+        };
+        assert_resize_ratio(
+            root.resize_focused(a, PaneResizeDirection::Increase, rect, 100),
+            0.9,
+        );
+        assert_resize_ratio(
+            root.resize_focused(a, PaneResizeDirection::Decrease, rect, 500),
+            0.1,
+        );
+    }
+
+    #[test]
+    fn resize_focused_automatic_uses_deepest_split() {
+        let left = Uuid::new_v4();
+        let center = Uuid::new_v4();
+        let right = Uuid::new_v4();
+        let mut root = PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.25,
+            first: Box::new(leaf(left)),
+            second: Box::new(PaneLayoutNode::Split {
+                direction: PaneSplitDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(leaf(center)),
+                second: Box::new(leaf(right)),
+            }),
+        };
+        let rect = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 40,
+        };
+
+        assert_resize_ratio(
+            root.resize_focused(center, PaneResizeDirection::Increase, rect, 10),
+            0.633_333_3,
+        );
+        match root {
+            PaneLayoutNode::Split { ratio, second, .. } => {
+                assert_ratio(ratio, 0.25);
+                match *second {
+                    PaneLayoutNode::Split { ratio, .. } => assert_ratio(ratio, 0.633_333_3),
+                    PaneLayoutNode::Leaf { .. } => panic!("expected nested split"),
+                }
+            }
+            PaneLayoutNode::Leaf { .. } => panic!("expected root split"),
+        }
+    }
+
+    #[test]
+    fn resize_focused_grows_second_child_on_increase() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut root = PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(a)),
+            second: Box::new(leaf(b)),
+        };
+        let rect = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 40,
+        };
+        assert_resize_ratio(
+            root.resize_focused(b, PaneResizeDirection::Increase, rect, 10),
+            0.4,
+        );
+    }
+
+    #[test]
+    fn resize_focused_directional_uses_nearest_boundary() {
+        let left = Uuid::new_v4();
+        let center = Uuid::new_v4();
+        let right = Uuid::new_v4();
+        let mut root = PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.25,
+            first: Box::new(leaf(left)),
+            second: Box::new(PaneLayoutNode::Split {
+                direction: PaneSplitDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(leaf(center)),
+                second: Box::new(leaf(right)),
+            }),
+        };
+        let rect = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 40,
+        };
+        assert_resize_ratio(
+            root.resize_focused(center, PaneResizeDirection::Right, rect, 10),
+            0.633_333_3,
+        );
     }
 
     #[test]

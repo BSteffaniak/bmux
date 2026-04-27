@@ -3048,15 +3048,26 @@ pub async fn handle_attach_ui_action(
         | RuntimeAction::ResizeRight
         | RuntimeAction::ResizeUp
         | RuntimeAction::ResizeDown => {
-            let delta = if matches!(
-                action,
-                RuntimeAction::IncreaseSplit
-                    | RuntimeAction::ResizeRight
-                    | RuntimeAction::ResizeDown
-            ) {
-                1
-            } else {
-                -1
+            let direction = match action {
+                RuntimeAction::IncreaseSplit => {
+                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Increase
+                }
+                RuntimeAction::DecreaseSplit => {
+                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Decrease
+                }
+                RuntimeAction::ResizeLeft => {
+                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Left
+                }
+                RuntimeAction::ResizeRight => {
+                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right
+                }
+                RuntimeAction::ResizeUp => {
+                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Up
+                }
+                RuntimeAction::ResizeDown => {
+                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Down
+                }
+                _ => unreachable!("non-resize action reached resize dispatch"),
             };
             let selector = attached_session_selector(view_state);
             let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
@@ -3065,7 +3076,7 @@ pub async fn handle_attach_ui_action(
                 &windows_cmd_args::ResizePane {
                     session: Some(ipc_to_typed_selector(selector)),
                     target: None,
-                    delta,
+                    direction,
                 },
             )
             .await?;

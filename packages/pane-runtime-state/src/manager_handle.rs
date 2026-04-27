@@ -13,7 +13,8 @@
 #![allow(clippy::must_use_candidate)]
 
 use crate::{
-    AttachViewport, FloatingSurfaceRuntime, PaneLayoutNode, PaneRuntimeMeta, SessionRuntimeError,
+    AttachViewport, FloatingSurfaceRuntime, PaneLayoutNode, PaneResizeDirection, PaneRuntimeMeta,
+    SessionRuntimeError,
 };
 use bmux_ipc::{
     AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene, PaneFocusDirection,
@@ -138,7 +139,7 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         &self,
         session_id: SessionId,
         target: Option<PaneSelector>,
-        delta: i16,
+        direction: PaneResizeDirection,
     ) -> anyhow::Result<()>;
 
     fn close_pane(
@@ -420,7 +421,7 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         &self,
         _session_id: SessionId,
         _target: Option<PaneSelector>,
-        _delta: i16,
+        _direction: PaneResizeDirection,
     ) -> anyhow::Result<()> {
         anyhow::bail!("pane-runtime plugin not active")
     }

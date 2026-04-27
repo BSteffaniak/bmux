@@ -168,7 +168,7 @@ struct ResizePaneArgs {
     session_id: Uuid,
     #[serde(default)]
     target: Option<Uuid>,
-    delta_percent: i8,
+    direction: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,7 +307,7 @@ pub async fn resize_pane<C: TypedDispatchClient>(
     client: &mut C,
     session_id: Uuid,
     target: Option<Uuid>,
-    delta_percent: i8,
+    direction: &str,
 ) -> Result<
     core::result::Result<
         pane_runtime_commands::SessionAck,
@@ -323,7 +323,7 @@ pub async fn resize_pane<C: TypedDispatchClient>(
         &ResizePaneArgs {
             session_id,
             target,
-            delta_percent,
+            direction: direction.to_string(),
         },
     )
     .await

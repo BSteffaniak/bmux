@@ -17,7 +17,7 @@ use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, Sessio
 use bmux_plugin_sdk::{CapabilityId, InterfaceId};
 use bmux_windows_plugin_api::{
     capabilities::WINDOWS_WRITE,
-    windows_commands::{self, PaneAck, PaneDirection, Selector},
+    windows_commands::{self, PaneAck, PaneDirection, PaneResizeDirection, Selector},
 };
 use uuid::Uuid;
 
@@ -42,7 +42,7 @@ pub const WINDOWS_COMMANDS_INTERFACE: InterfaceId = windows_commands::INTERFACE_
 /// decoder lands the same values the typed trait method would.
 #[allow(dead_code)] // Not every arg struct is used by every caller.
 pub mod args {
-    use super::{PaneDirection, Selector};
+    use super::{PaneDirection, PaneResizeDirection, Selector};
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
 
@@ -87,7 +87,7 @@ pub mod args {
         pub session: Option<Selector>,
         #[serde(default)]
         pub target: Option<Selector>,
-        pub delta: i16,
+        pub direction: PaneResizeDirection,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -110,6 +110,18 @@ interface windows-commands {
         down,
     }
 
+    // Directional intent for resizing a pane. Increase/decrease grow or
+    // shrink the focused pane automatically; physical directions move
+    // the nearest boundary on that side.
+    enum pane-resize-direction {
+        @default increase,
+        decrease,
+        left,
+        right,
+        up,
+        down,
+    }
+
     // Selector identifying a session or pane. Exactly one of `id`,
     // `name`, or `index` should be populated. `id` wins when multiple
     // are set. `index` is only meaningful for pane selectors scoped
@@ -166,7 +178,7 @@ interface windows-commands {
     command resize-pane(
         session: selector?,
         target: selector?,
-        delta: i16,
+        direction: pane-resize-direction,
     ) -> result<pane-ack, pane-mutation-error>;
 
     command zoom-pane(
