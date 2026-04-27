@@ -33,6 +33,8 @@ pub(super) struct RuntimeCommandState {
     pub(super) registry: Arc<PluginRegistry>,
     pub(super) enabled_plugins: Vec<String>,
     pub(super) available_capability_providers: BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
+    pub(super) available_capability_names: Vec<String>,
+    pub(super) available_services: Vec<RegisteredService>,
     pub(super) plugin_search_roots: Vec<String>,
     pub(super) registered_plugin_infos: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
 }
@@ -402,6 +404,11 @@ pub(super) fn build_runtime_command_state(
 ) -> Result<RuntimeCommandState> {
     let enabled_plugins = effective_enabled_plugins(&config, &registry);
     let available_capability_providers = available_capability_providers(&config, &registry)?;
+    let available_capability_names = available_capability_providers
+        .keys()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let available_services = available_service_descriptors(&config, &registry)?;
     let plugin_search_roots = resolve_plugin_search_paths(&config, &paths)?
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -413,6 +420,8 @@ pub(super) fn build_runtime_command_state(
         registry,
         enabled_plugins,
         available_capability_providers,
+        available_capability_names,
+        available_services,
         plugin_search_roots,
         registered_plugin_infos,
     };
@@ -1817,22 +1826,16 @@ fn run_plugin_command_internal_with_state(
     let loaded = load_cached_plugin(plugin, state)?;
     let load_us = load_started.elapsed().as_micros();
     let context_started = Instant::now();
-    let plugin_search_roots = state.plugin_search_roots.clone();
-    let available_capabilities = state
-        .available_capability_providers
-        .keys()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
     let context = plugin_command_context(
         config,
         paths,
         &plugin.declaration,
         command_name,
         args,
-        available_service_descriptors(config, registry)?,
-        available_capabilities,
+        state.available_services.clone(),
+        state.available_capability_names.clone(),
         enabled_plugins,
-        plugin_search_roots,
+        state.plugin_search_roots.clone(),
         state.registered_plugin_infos.clone(),
         caller_client_id,
         invocation_source,
