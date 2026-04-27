@@ -26,6 +26,8 @@ pub(crate) struct BenchmarkDefaults {
     pub(crate) scenario: Option<String>,
     pub(crate) windows: Option<usize>,
     pub(crate) switches: Option<usize>,
+    pub(crate) previsit_windows: Option<bool>,
+    pub(crate) previsit_rounds: Option<usize>,
     pub(crate) max_p99_ms: Option<f64>,
     pub(crate) attach_command_limit_ms: Option<f64>,
     pub(crate) retarget_limit_ms: Option<f64>,
@@ -79,6 +81,8 @@ pub(crate) struct BenchmarkRunOptions {
     pub(crate) scenario: Option<String>,
     pub(crate) windows: Option<usize>,
     pub(crate) switches: Option<usize>,
+    pub(crate) previsit_windows: Option<bool>,
+    pub(crate) previsit_rounds: Option<usize>,
     pub(crate) max_p99_ms: Option<f64>,
     pub(crate) tags: Vec<String>,
     pub(crate) limits: BTreeMap<String, f64>,
@@ -98,6 +102,8 @@ pub(crate) struct BenchmarkResolvedOptions {
     pub(crate) scenario: String,
     pub(crate) windows: usize,
     pub(crate) switches: usize,
+    pub(crate) previsit_windows: bool,
+    pub(crate) previsit_rounds: usize,
     pub(crate) max_p99_ms: Option<f64>,
     pub(crate) tags: Vec<String>,
     pub(crate) limits: BTreeMap<String, f64>,
@@ -181,6 +187,14 @@ pub(crate) fn resolve_benchmark_options(
             .unwrap_or_else(|| "default".to_string()),
         windows: cli.windows.or(manifest.defaults.windows).unwrap_or(4),
         switches: cli.switches.or(manifest.defaults.switches).unwrap_or(4),
+        previsit_windows: cli
+            .previsit_windows
+            .or(manifest.defaults.previsit_windows)
+            .unwrap_or(false),
+        previsit_rounds: cli
+            .previsit_rounds
+            .or(manifest.defaults.previsit_rounds)
+            .unwrap_or(0),
         max_p99_ms: cli.max_p99_ms.or(manifest.defaults.max_p99_ms),
         tags,
         limits,
@@ -284,6 +298,8 @@ kind = "attach-tab-switch"
 
 [defaults]
 attach_command_execution = "production"
+previsit_windows = true
+previsit_rounds = 2
 
 [profiles.normal]
 
@@ -305,6 +321,8 @@ attach_command_execution = "direct-window-service"
             normal.attach_command_execution,
             AttachCommandExecution::Production
         );
+        assert!(normal.previsit_windows);
+        assert_eq!(normal.previsit_rounds, 2);
 
         let direct = resolve_benchmark_options(
             BenchmarkRunOptions {

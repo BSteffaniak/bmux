@@ -7,6 +7,8 @@ iterations = 30
 warmup = 5
 windows = 4
 switches = 4
+previsit_windows = true
+previsit_rounds = 1
 scenario = "next-window"
 attach_command_execution = "production"
 attach_command_limit_ms = 8
@@ -41,80 +43,122 @@ retarget = 8
 phase = "attach.plugin_command"
 field = "total_us"
 limit = "attach_command"
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
 
 [[reports]]
 phase = "attach.plugin_command"
 field = "before_context_us"
 limit = "attach_command"
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
 
 [[reports]]
 phase = "attach.plugin_command"
 field = "run_us"
 limit = "attach_command"
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
 
 [[reports]]
 phase = "attach.plugin_command_pipeline"
 field = "total_us"
 limit = "attach_command"
 tags = ["production"]
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
+
+[[reports]]
+phase = "attach.plugin_command_pipeline"
+field = "total_us"
+tags = ["production"]
+allow_empty = true
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "cold" },
+]
 
 [[reports]]
 phase = "attach.plugin_command"
 field = "retarget_us"
 limit = "retarget"
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
 
 [[reports]]
 phase = "attach.window_cycle"
 field = "invoke_us"
 limit = "attach_command"
 tags = ["direct-service"]
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
+
+[[reports]]
+phase = "attach.window_cycle"
+field = "invoke_us"
+tags = ["direct-service"]
+allow_empty = true
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "cold" },
+]
 
 [[reports]]
 phase = "attach.retarget_context"
 field = "total_us"
 limit = "retarget"
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
 
 [[reports]]
 phase = "attach.retarget_context"
 field = "retarget_service_us"
 limit = "retarget"
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
 
 [[reports]]
 phase = "attach.retarget_context"
 field = "grant_us"
 limit = "retarget"
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
 
 [[reports]]
 phase = "attach.retarget_context"
 field = "open_us"
 limit = "retarget"
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
 
 [[reports]]
 phase = "attach.retarget_context"
 field = "viewport_us"
 limit = "retarget"
-filter = { key = "command_name", value = "${command_name}" }
-skip_first_per_sample = 1
+filters = [
+  { key = "command_name", value = "${command_name}" },
+  { key = "measurement_stage", value = "warm" },
+]
 
 [[reports]]
 phase = "service.client_invoke"

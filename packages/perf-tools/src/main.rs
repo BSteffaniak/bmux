@@ -97,6 +97,8 @@ struct PhaseReportSpec {
     #[serde(default)]
     filter: Option<PhaseReportFilter>,
     #[serde(default)]
+    filters: Vec<PhaseReportFilter>,
+    #[serde(default)]
     max_p99_ms: Option<f64>,
     #[serde(default)]
     max_p95_ms: Option<f64>,
@@ -106,10 +108,17 @@ struct PhaseReportSpec {
     tags: Vec<String>,
     #[serde(default)]
     skip_first_per_sample: usize,
+    #[serde(default)]
+    allow_empty: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct PhaseReportFilter {
+    key: String,
+    value: String,
+}
+
+struct ResolvedPhaseReportFilter {
     key: String,
     value: String,
 }
@@ -120,11 +129,11 @@ struct PhaseReportRequest<'a> {
     output: &'a str,
     phase: &'a str,
     field: &'a str,
-    filter_key: Option<&'a str>,
-    filter_value: Option<&'a str>,
+    filters: &'a [ResolvedPhaseReportFilter],
     max_p99_ms: Option<f64>,
     max_p95_ms: Option<f64>,
     skip_first_per_sample: usize,
+    allow_empty: bool,
 }
 
 struct SampleCommandRequest<'a> {
@@ -201,6 +210,17 @@ fn parse_benchmark_run_options(args: Vec<String>) -> Result<BenchmarkRunOptions,
                 options.switches = Some(parse_usize_arg(&args, index, "--switches")?);
                 index += 2;
             }
+            "--previsit-windows" => {
+                options.previsit_windows = Some(parse_bool_arg(
+                    require_arg(&args, index, "--previsit-windows")?,
+                    "--previsit-windows",
+                )?);
+                index += 2;
+            }
+            "--previsit-rounds" => {
+                options.previsit_rounds = Some(parse_usize_arg(&args, index, "--previsit-rounds")?);
+                index += 2;
+            }
             "--max-p99-ms" => {
                 options.max_p99_ms = Some(parse_f64(
                     require_arg(&args, index, "--max-p99-ms")?,
@@ -263,6 +283,14 @@ fn require_arg<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a s
 fn parse_usize_arg(args: &[String], index: usize, name: &str) -> Result<usize, String> {
     let value = parse_u64(require_arg(args, index, name)?, name)?;
     usize::try_from(value).map_err(|_| format!("{name} is too large"))
+}
+
+fn parse_bool_arg(value: &str, name: &str) -> Result<bool, String> {
+    match value {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => Err(format!("{name} must be true or false")),
+    }
 }
 
 fn run_core_services_benchmark(
@@ -430,6 +458,7 @@ fn run_attach_tab_switch_benchmark(
         out_json: &sample_json.display().to_string(),
         allow_nonzero: false,
     })?;
+    annotate_attach_tab_switch_sample(&sample_json.display().to_string(), options, &scenario)?;
     report_latency_if_needed(&sample_json.display().to_string(), options.max_p99_ms)?;
     let mut vars = options.vars.clone();
     vars.entry("command_name".to_string())
@@ -461,6 +490,78 @@ fn run_attach_tab_switch_benchmark(
     println!("artifact_json={artifact_json}");
     println!("phase_report_dir={}", options.phase_report_dir);
     Ok(())
+}
+
+fn annotate_attach_tab_switch_sample(
+    path: &str,
+    options: &BenchmarkResolvedOptions,
+    scenario: &AttachScenario,
+) -> Result<(), String> {
+    let mut payload = read_json_file(path)?;
+    let cold_switches = if options.previsit_windows {
+        options.previsit_rounds.saturating_mul(options.windows)
+    } else {
+        0
+    };
+    let samples = payload
+        .get_mut("phase_samples")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| format!("sample json {path} missing phase_samples array"))?;
+    for sample in samples {
+        let Some(events) = sample.as_array_mut() else {
+            continue;
+        };
+        annotate_attach_tab_switch_events(events, scenario.command_name, cold_switches);
+    }
+    let encoded = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("failed encoding annotated sample json: {error}"))?;
+    fs::write(path, encoded)
+        .map_err(|error| format!("failed writing annotated sample json: {error}"))
+}
+
+fn annotate_attach_tab_switch_events(
+    events: &mut [Value],
+    command_name: &str,
+    cold_switches: usize,
+) {
+    let mut switch_index = 0_usize;
+    let mut active_switch_index = None;
+    let mut active_stage = None;
+    for event in events {
+        let phase = event
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let is_target_command =
+            event.get("command_name").and_then(Value::as_str) == Some(command_name);
+        if is_target_command
+            && matches!(
+                phase,
+                "attach.plugin_command_pipeline" | "attach.window_cycle"
+            )
+        {
+            switch_index += 1;
+            active_switch_index = Some(switch_index);
+            active_stage = Some(if switch_index <= cold_switches {
+                "cold"
+            } else {
+                "warm"
+            });
+        }
+
+        if !phase.starts_with("attach.") || !is_target_command {
+            continue;
+        }
+
+        let Some(object) = event.as_object_mut() else {
+            continue;
+        };
+        let stage = active_stage.unwrap_or("setup");
+        object.insert("measurement_stage".to_string(), json!(stage));
+        if let Some(index) = active_switch_index {
+            object.insert("measurement_switch_index".to_string(), json!(index));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -503,6 +604,9 @@ fn validate_attach_options(options: &BenchmarkResolvedOptions) -> Result<(), Str
     if options.switches < 1 {
         return Err("attach benchmark requires at least 1 switch".to_string());
     }
+    if options.previsit_windows && options.previsit_rounds == 0 {
+        return Err("previsit_windows requires previsit_rounds greater than 0".to_string());
+    }
     if options.scenario == "goto-window" && options.windows < 3 {
         return Err("goto-window scenario requires at least 3 windows".to_string());
     }
@@ -526,20 +630,37 @@ fn write_attach_playbook(
     if !scenario.prime_key.is_empty() {
         lines.push(format!("send-attach key={}", scenario.prime_key));
     }
+    if options.previsit_windows {
+        for _ in 0..options.previsit_rounds {
+            for index in 1..=options.windows {
+                lines.push(format!(
+                    "send-attach key={}",
+                    attach_scenario_key(options, index)?
+                ));
+            }
+        }
+    }
     for index in 1..=options.switches {
-        let key = match options.scenario.as_str() {
-            "next-window" => "ctrl+s",
-            "prev-window" => "ctrl+h",
-            "goto-window" if index % 2 == 0 => "alt+2",
-            "goto-window" => "alt+3",
-            "new-window" => "c",
-            _ => return Err(format!("unknown attach scenario '{}'", options.scenario)),
-        };
+        let key = attach_scenario_key(options, index)?;
         lines.push(format!("send-attach key={key}"));
     }
     lines.push("screen".to_string());
     fs::write(path, format!("{}\n", lines.join("\n")))
         .map_err(|error| format!("failed writing attach playbook {}: {error}", path.display()))
+}
+
+fn attach_scenario_key(
+    options: &BenchmarkResolvedOptions,
+    index: usize,
+) -> Result<&'static str, String> {
+    match options.scenario.as_str() {
+        "next-window" => Ok("ctrl+s"),
+        "prev-window" => Ok("ctrl+h"),
+        "goto-window" if index.is_multiple_of(2) => Ok("alt+2"),
+        "goto-window" => Ok("alt+3"),
+        "new-window" => Ok("c"),
+        _ => Err(format!("unknown attach scenario '{}'", options.scenario)),
+    }
 }
 
 fn attach_envs(options: &BenchmarkResolvedOptions) -> Vec<(String, String)> {
@@ -732,6 +853,10 @@ fn write_standard_benchmark_artifact(
         "scenario": options.scenario,
         "iterations": options.iterations,
         "warmup": options.warmup,
+        "windows": options.windows,
+        "switches": options.switches,
+        "previsit_windows": options.previsit_windows,
+        "previsit_rounds": options.previsit_rounds,
         "phase_report_dir": options.phase_report_dir,
         "limits": options.limits,
         "tags": options.tags,
@@ -877,21 +1002,18 @@ fn run_validate_phase_config(args: Vec<String>) -> Result<(), String> {
             sanitize_report_component(&report.phase),
             sanitize_report_component(&report.field)
         );
+        let filters = resolve_phase_report_filters(report, &vars);
         let result = write_phase_report(PhaseReportRequest {
             input_label: &input,
             events: &events,
             output: &output,
             phase: &report.phase,
             field: &report.field,
-            filter_key: report.filter.as_ref().map(|filter| filter.key.as_str()),
-            filter_value: report
-                .filter
-                .as_ref()
-                .map(|filter| expand_report_vars(&filter.value, &vars))
-                .as_deref(),
+            filters: &filters,
             max_p99_ms,
             max_p95_ms: report.max_p95_ms,
             skip_first_per_sample: report.skip_first_per_sample,
+            allow_empty: report.allow_empty,
         });
         if let Err(error) = result {
             failures.push(format!(
@@ -979,6 +1101,21 @@ fn expand_report_vars(value: &str, vars: &BTreeMap<String, String>) -> String {
     expanded
 }
 
+fn resolve_phase_report_filters(
+    report: &PhaseReportSpec,
+    vars: &BTreeMap<String, String>,
+) -> Vec<ResolvedPhaseReportFilter> {
+    report
+        .filter
+        .iter()
+        .chain(report.filters.iter())
+        .map(|filter| ResolvedPhaseReportFilter {
+            key: filter.key.clone(),
+            value: expand_report_vars(&filter.value, vars),
+        })
+        .collect()
+}
+
 fn sanitize_report_component(value: &str) -> String {
     value
         .chars()
@@ -1054,17 +1191,21 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
     let text = fs::read_to_string(&input)
         .map_err(|error| format!("failed reading phase input {input}: {error}"))?;
     let events = parse_phase_events_input(&text);
+    let filters = filter_key
+        .zip(filter_value)
+        .map(|(key, value)| vec![ResolvedPhaseReportFilter { key, value }])
+        .unwrap_or_default();
     write_phase_report(PhaseReportRequest {
         input_label: &input,
         events: &events,
         output: &output,
         phase: &phase,
         field: &field,
-        filter_key: filter_key.as_deref(),
-        filter_value: filter_value.as_deref(),
+        filters: &filters,
         max_p99_ms,
         max_p95_ms,
         skip_first_per_sample: 0,
+        allow_empty: false,
     })
 }
 
@@ -1074,10 +1215,7 @@ fn write_phase_report(request: PhaseReportRequest<'_>) -> Result<(), String> {
             .events
             .iter()
             .filter(|event| event.get("phase").and_then(Value::as_str) == Some(request.phase))
-            .filter(|event| match (request.filter_key, request.filter_value) {
-                (Some(key), Some(value)) => event.get(key).and_then(Value::as_str) == Some(value),
-                _ => true,
-            })
+            .filter(|event| phase_report_filters_match(event, request.filters))
             .cloned()
             .collect::<Vec<_>>(),
         request.skip_first_per_sample,
@@ -1087,6 +1225,33 @@ fn write_phase_report(request: PhaseReportRequest<'_>) -> Result<(), String> {
         .filter_map(|event| event.get(request.field).and_then(Value::as_f64))
         .collect::<Vec<_>>();
     if samples_us.is_empty() {
+        if request.allow_empty {
+            let payload = json!({
+                "phase": request.phase,
+                "field": request.field,
+                "filter": {
+                    "filters": request.filters.iter().map(|filter| json!({
+                        "key": filter.key,
+                        "value": filter.value,
+                    })).collect::<Vec<_>>(),
+                },
+                "sample_count": 0,
+                "samples_us": [],
+                "events": selected,
+                "limits": {
+                    "max_p99_ms": request.max_p99_ms,
+                    "max_p95_ms": request.max_p95_ms,
+                },
+                "passed": true,
+                "violations": [],
+            });
+            let encoded = serde_json::to_vec_pretty(&payload)
+                .map_err(|error| format!("failed encoding phase report: {error}"))?;
+            fs::write(request.output, encoded).map_err(|error| {
+                format!("failed writing phase report {}: {error}", request.output)
+            })?;
+            return Ok(());
+        }
         return Err(format!(
             "no numeric samples found for phase '{}' field '{}' in {}",
             request.phase, request.field, request.input_label
@@ -1126,8 +1291,10 @@ fn write_phase_report(request: PhaseReportRequest<'_>) -> Result<(), String> {
         "phase": request.phase,
         "field": request.field,
         "filter": {
-            "key": request.filter_key,
-            "value": request.filter_value,
+            "filters": request.filters.iter().map(|filter| json!({
+                "key": filter.key,
+                "value": filter.value,
+            })).collect::<Vec<_>>(),
         },
         "sample_count": samples_us.len(),
         "samples_us": samples_us,
@@ -1150,6 +1317,12 @@ fn write_phase_report(request: PhaseReportRequest<'_>) -> Result<(), String> {
     } else {
         Err("phase SLO failed".to_string())
     }
+}
+
+fn phase_report_filters_match(event: &Value, filters: &[ResolvedPhaseReportFilter]) -> bool {
+    filters
+        .iter()
+        .all(|filter| event.get(&filter.key).and_then(Value::as_str) == Some(filter.value.as_str()))
 }
 
 fn skip_first_per_sample(events: Vec<Value>, skip_count: usize) -> Vec<Value> {
@@ -3661,10 +3834,10 @@ fn percentile_nearest_rank(values: &[f64], percentile: f64) -> f64 {
 mod tests {
     use super::{
         LatencyBreakdown, LatencyStats, LatencyThresholds, RuntimeFaultCounts,
-        RuntimeFaultThresholds, classify_variance, compare_delta_stats, count_occurrences,
-        count_runtime_faults, evaluate_fault_thresholds, evaluate_latency_thresholds,
-        parse_report_latency_summary, parse_u64, percentile_nearest_rank,
-        synthetic_plugin_manifest,
+        RuntimeFaultThresholds, annotate_attach_tab_switch_events, classify_variance,
+        compare_delta_stats, count_occurrences, count_runtime_faults, evaluate_fault_thresholds,
+        evaluate_latency_thresholds, parse_report_latency_summary, parse_u64,
+        percentile_nearest_rank, synthetic_plugin_manifest,
     };
     use serde_json::json;
 
@@ -3686,6 +3859,25 @@ mod tests {
         assert_eq!(percentile_nearest_rank(&values, 50.0), 30.0);
         assert_eq!(percentile_nearest_rank(&values, 95.0), 50.0);
         assert_eq!(percentile_nearest_rank(&values, 99.0), 50.0);
+    }
+
+    #[test]
+    fn annotate_attach_events_marks_cold_then_warm_switches() {
+        let mut events = vec![
+            json!({"phase":"attach.plugin_command_pipeline","command_name":"next-window","total_us":10}),
+            json!({"phase":"attach.retarget_context","command_name":"next-window","total_us":1}),
+            json!({"phase":"attach.plugin_command","command_name":"next-window","total_us":11}),
+            json!({"phase":"attach.plugin_command_pipeline","command_name":"next-window","total_us":2}),
+            json!({"phase":"attach.retarget_context","command_name":"next-window","total_us":1}),
+            json!({"phase":"attach.plugin_command","command_name":"next-window","total_us":3}),
+        ];
+
+        annotate_attach_tab_switch_events(&mut events, "next-window", 1);
+
+        assert_eq!(events[0]["measurement_stage"], "cold");
+        assert_eq!(events[2]["measurement_switch_index"], 1);
+        assert_eq!(events[3]["measurement_stage"], "warm");
+        assert_eq!(events[5]["measurement_switch_index"], 2);
     }
 
     #[test]
