@@ -51,6 +51,30 @@ interface decoration-state {
         // config directory; bare names without `/` or `.` match a
         // bundled script (e.g. `"pulse"` -> `pulse.lua`).
         script: string?,
+        // Optional generic plugin access granted to the decoration
+        // script. The decoration plugin does not interpret these
+        // payloads; it subscribes/calls only the declared plugin APIs
+        // and forwards JSON-shaped data into Lua.
+        script-access: script-access-spec?,
+    }
+
+    // Generic plugin access available to a decoration script. Channel
+    // strings are plugin event kinds (for example
+    // `bmux.pane_runtime/pane-runtime-focus`). Service entries must
+    // match exactly at call time.
+    record script-access-spec {
+        state-channels: list<string>,
+        event-channels: list<string>,
+        services: list<script-service-grant>,
+    }
+
+    // One host service operation a script may call. `kind` is
+    // `query` or `command`.
+    record script-service-grant {
+        capability: string,
+        kind: string,
+        interface-id: string,
+        operation: string,
     }
 
     // A user-declared border style: what glyphs, what colour. Matches

@@ -35,6 +35,8 @@
 //! 3. Subscribers call the matching `subscribe` / `subscribe_state`.
 
 use bmux_plugin_sdk::PluginEventKind;
+use serde::Serialize;
+use serde_json::Value as JsonValue;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -57,6 +59,18 @@ pub enum DeliveryMode {
     /// State — last-published value retained and replayed to new
     /// subscribers before they see any live updates.
     State,
+}
+
+/// Type-erased JSON mirror of a typed plugin event.
+///
+/// Typed plugin channels remain the source of truth; this is a
+/// read-only mirror produced from `Serialize` payloads at publish time
+/// for generic consumers such as decoration scripts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonPluginEvent {
+    pub interface: PluginEventKind,
+    pub delivery: DeliveryMode,
+    pub payload: JsonValue,
 }
 
 impl std::fmt::Display for DeliveryMode {
@@ -147,6 +161,11 @@ enum ChannelKind {
     State(Arc<dyn Any + Send + Sync>),
 }
 
+struct JsonMirror {
+    broadcast: broadcast::Sender<Arc<JsonPluginEvent>>,
+    state: Option<watch::Sender<Arc<JsonPluginEvent>>>,
+}
+
 /// Internal handle stored behind an `Arc<dyn Any>`, giving the bus a
 /// uniform type to key on even though each channel's payload type
 /// differs.
@@ -162,6 +181,7 @@ struct ChannelEntry {
     /// [`EventBus::publish_state`] / [`EventBus::emit`] APIs; they
     /// simply can't accept wire-encoded payloads.
     decoder: Option<BytesDecoder>,
+    json: JsonMirror,
 }
 
 /// Error surface for `emit_from_bytes` decoder invocation.
@@ -216,7 +236,7 @@ impl EventBus {
     /// Panics if the registry's internal lock is poisoned.
     pub fn register_channel<E>(&self, interface: PluginEventKind) -> broadcast::Sender<Arc<E>>
     where
-        E: Any + Send + Sync + 'static,
+        E: Any + Send + Sync + Serialize + 'static,
     {
         self.register_channel_with_capacity::<E>(interface, DEFAULT_EVENT_BUS_CAPACITY)
     }
@@ -232,14 +252,19 @@ impl EventBus {
         capacity: usize,
     ) -> broadcast::Sender<Arc<E>>
     where
-        E: Any + Send + Sync + 'static,
+        E: Any + Send + Sync + Serialize + 'static,
     {
         let (sender, _) = broadcast::channel::<Arc<E>>(capacity);
+        let (json_sender, _) = broadcast::channel::<Arc<JsonPluginEvent>>(capacity);
         let entry = ChannelEntry {
             kind: ChannelKind::Broadcast(Arc::new(sender.clone())),
             payload_type_id: TypeId::of::<E>(),
             payload_type_name: std::any::type_name::<E>(),
             decoder: None,
+            json: JsonMirror {
+                broadcast: json_sender,
+                state: None,
+            },
         };
         let mut guard = self.entries.write().expect("event bus lock poisoned");
         guard.insert(interface, entry);
@@ -267,14 +292,28 @@ impl EventBus {
         initial: T,
     ) -> watch::Sender<Arc<T>>
     where
-        T: Any + Send + Sync + 'static,
+        T: Any + Send + Sync + Serialize + 'static,
     {
         let (sender, _) = watch::channel::<Arc<T>>(Arc::new(initial));
+        let initial_payload =
+            serde_json::to_value(sender.borrow().as_ref()).unwrap_or(JsonValue::Null);
+        let initial_json = JsonPluginEvent {
+            interface: interface.clone(),
+            delivery: DeliveryMode::State,
+            payload: initial_payload,
+        };
+        let (json_state_sender, _) = watch::channel::<Arc<JsonPluginEvent>>(Arc::new(initial_json));
+        let (json_broadcast_sender, _) =
+            broadcast::channel::<Arc<JsonPluginEvent>>(DEFAULT_EVENT_BUS_CAPACITY);
         let entry = ChannelEntry {
             kind: ChannelKind::State(Arc::new(sender.clone())),
             payload_type_id: TypeId::of::<T>(),
             payload_type_name: std::any::type_name::<T>(),
             decoder: None,
+            json: JsonMirror {
+                broadcast: json_broadcast_sender,
+                state: Some(json_state_sender),
+            },
         };
         let mut guard = self.entries.write().expect("event bus lock poisoned");
         guard.insert(interface, entry);
@@ -304,7 +343,7 @@ impl EventBus {
         initial: T,
     ) -> watch::Sender<Arc<T>>
     where
-        T: Any + Send + Sync + 'static + serde::de::DeserializeOwned,
+        T: Any + Send + Sync + Serialize + 'static + serde::de::DeserializeOwned,
     {
         let sender = self.register_state_channel::<T>(interface.clone(), initial);
         let bus = Arc::downgrade(self);
@@ -380,10 +419,15 @@ impl EventBus {
     /// model).
     pub fn emit<E>(&self, interface: &PluginEventKind, event: E) -> EventBusResult<usize>
     where
-        E: Any + Send + Sync + 'static,
+        E: Any + Send + Sync + Serialize + 'static,
     {
+        let json_payload = serde_json::to_value(&event).ok();
         let sender = self.broadcast_sender::<E>(interface)?;
-        Ok(sender.send(Arc::new(event)).unwrap_or(0))
+        let count = sender.send(Arc::new(event)).unwrap_or(0);
+        if let Some(payload) = json_payload {
+            self.publish_json_mirror(interface, DeliveryMode::Broadcast, payload);
+        }
+        Ok(count)
     }
 
     /// Publish a new value on the state channel registered for
@@ -399,13 +443,17 @@ impl EventBus {
     /// value is still updated for future subscribers.
     pub fn publish_state<T>(&self, interface: &PluginEventKind, value: T) -> EventBusResult<()>
     where
-        T: Any + Send + Sync + 'static,
+        T: Any + Send + Sync + Serialize + 'static,
     {
+        let json_payload = serde_json::to_value(&value).ok();
         let sender = self.state_sender::<T>(interface)?;
         // `send_replace` always updates the retained value, even when
         // no receivers are live. Using `send` would return an error
         // in that case and leave late subscribers with stale data.
         sender.send_replace(Arc::new(value));
+        if let Some(payload) = json_payload {
+            self.publish_json_mirror(interface, DeliveryMode::State, payload);
+        }
         Ok(())
     }
 
@@ -449,6 +497,79 @@ impl EventBus {
         T: Any + Send + Sync + 'static,
     {
         let sender = self.state_sender::<T>(interface)?;
+        let rx = sender.subscribe();
+        let current = rx.borrow().clone();
+        Ok((current, rx))
+    }
+
+    /// Subscribe to a type-erased JSON mirror of a broadcast channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same registration/delivery errors as typed
+    /// [`Self::subscribe`], but without payload type checks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal lock is poisoned.
+    #[allow(clippy::significant_drop_tightening)] // We clone the sender out while holding the registry guard, then subscribe after the guard drops.
+    pub fn subscribe_json(
+        &self,
+        interface: &PluginEventKind,
+    ) -> EventBusResult<broadcast::Receiver<Arc<JsonPluginEvent>>> {
+        let sender = {
+            let guard = self.entries.read().expect("event bus lock poisoned");
+            let entry =
+                guard
+                    .get(interface)
+                    .ok_or_else(|| EventBusError::ChannelNotRegistered {
+                        interface: interface.as_str().to_string(),
+                    })?;
+            if !matches!(entry.kind, ChannelKind::Broadcast(_)) {
+                return Err(EventBusError::ChannelDeliveryMismatch {
+                    interface: interface.as_str().to_string(),
+                    expected: DeliveryMode::Broadcast,
+                    actual: DeliveryMode::State,
+                });
+            }
+            entry.json.broadcast.clone()
+        };
+        Ok(sender.subscribe())
+    }
+
+    /// Subscribe to a type-erased JSON mirror of a state channel.
+    /// Returns the current retained JSON value plus live updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same registration/delivery errors as typed
+    /// [`Self::subscribe_state`], but without payload type checks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal lock is poisoned.
+    #[allow(clippy::significant_drop_tightening)] // We clone the sender out while holding the registry guard, then subscribe after the guard drops.
+    pub fn subscribe_state_json(
+        &self,
+        interface: &PluginEventKind,
+    ) -> EventBusResult<(Arc<JsonPluginEvent>, watch::Receiver<Arc<JsonPluginEvent>>)> {
+        let sender = {
+            let guard = self.entries.read().expect("event bus lock poisoned");
+            let entry =
+                guard
+                    .get(interface)
+                    .ok_or_else(|| EventBusError::ChannelNotRegistered {
+                        interface: interface.as_str().to_string(),
+                    })?;
+            let Some(sender) = entry.json.state.as_ref() else {
+                return Err(EventBusError::ChannelDeliveryMismatch {
+                    interface: interface.as_str().to_string(),
+                    expected: DeliveryMode::State,
+                    actual: DeliveryMode::Broadcast,
+                });
+            };
+            sender.clone()
+        };
         let rx = sender.subscribe();
         let current = rx.borrow().clone();
         Ok((current, rx))
@@ -521,6 +642,29 @@ impl EventBus {
         Ok((*downcast).clone())
     }
 
+    fn publish_json_mirror(
+        &self,
+        interface: &PluginEventKind,
+        delivery: DeliveryMode,
+        payload: JsonValue,
+    ) {
+        let event = Arc::new(JsonPluginEvent {
+            interface: interface.clone(),
+            delivery,
+            payload,
+        });
+        let Ok(guard) = self.entries.read() else {
+            return;
+        };
+        let Some(entry) = guard.get(interface) else {
+            return;
+        };
+        let _ = entry.json.broadcast.send(event.clone());
+        if let Some(sender) = entry.json.state.as_ref() {
+            sender.send_replace(event);
+        }
+    }
+
     #[allow(clippy::significant_drop_tightening)]
     fn state_sender<T>(&self, interface: &PluginEventKind) -> EventBusResult<watch::Sender<Arc<T>>>
     where
@@ -583,17 +727,17 @@ mod tests {
     use super::*;
     use bmux_plugin_sdk::PluginEventKind;
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     struct SampleEvent {
         payload: u32,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     struct OtherEvent {
         value: String,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     struct FocusSnapshot {
         focused: Option<u64>,
         revision: u64,
@@ -628,6 +772,20 @@ mod tests {
 
         assert_eq!(s1.recv().await.unwrap().payload, 7);
         assert_eq!(s2.recv().await.unwrap().payload, 7);
+    }
+
+    #[tokio::test]
+    async fn broadcast_json_subscriber_receives_serialized_payload() {
+        let bus = EventBus::new();
+        bus.register_channel::<SampleEvent>(TEST_IFACE);
+        let mut rx = bus.subscribe_json(&TEST_IFACE).unwrap();
+
+        bus.emit(&TEST_IFACE, SampleEvent { payload: 99 }).unwrap();
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.interface, TEST_IFACE);
+        assert_eq!(event.delivery, DeliveryMode::Broadcast);
+        assert_eq!(event.payload["payload"], 99);
     }
 
     #[test]
@@ -757,6 +915,35 @@ mod tests {
                 revision: 2,
             },
         );
+    }
+
+    #[tokio::test]
+    async fn state_json_subscriber_receives_initial_and_live_payloads() {
+        let bus = EventBus::new();
+        bus.register_state_channel::<FocusSnapshot>(
+            STATE_IFACE,
+            FocusSnapshot {
+                focused: None,
+                revision: 0,
+            },
+        );
+        let (initial, mut rx) = bus.subscribe_state_json(&STATE_IFACE).unwrap();
+        assert_eq!(initial.delivery, DeliveryMode::State);
+        assert_eq!(initial.payload["revision"], 0);
+
+        bus.publish_state(
+            &STATE_IFACE,
+            FocusSnapshot {
+                focused: Some(12),
+                revision: 1,
+            },
+        )
+        .unwrap();
+
+        rx.changed().await.unwrap();
+        let event = rx.borrow().clone();
+        assert_eq!(event.payload["focused"], 12);
+        assert_eq!(event.payload["revision"], 1);
     }
 
     #[tokio::test]

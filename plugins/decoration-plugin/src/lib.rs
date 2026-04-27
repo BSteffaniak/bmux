@@ -27,8 +27,11 @@ use bmux_decoration_plugin_api::decoration_state::{
     INTERFACE_ID as DECORATION_STATE_INTERFACE_ID, NotifyError, PaneActivity, PaneDecoration,
     PaneEvent, PaneGeometry, PaneLifecycle, SetStyleError, ValidationError, ValidationResult,
 };
+use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_plugin_sdk::{
+    HostScope, ServiceKind, TypedServiceRegistrationContext, TypedServiceRegistry,
+};
 use bmux_scene_protocol::scene_protocol::{
     BorderGlyphs, Color, DecorationScene, GradientAxis, InteractiveRegion, NamedColor,
     PaintCommand, Rect, Style, SurfaceDecoration,
@@ -36,7 +39,8 @@ use bmux_scene_protocol::scene_protocol::{
 use uuid::Uuid;
 
 use crate::scripting::{
-    PerfTracker, ScriptBackend, ScriptEventMessage, ScriptMessage, ScriptRenderMessage,
+    PerfTracker, ScriptBackend, ScriptEventDelivery, ScriptEventMessage, ScriptHostAccess,
+    ScriptMessage, ScriptRenderMessage, ScriptServiceCall, ScriptServiceGrant,
     bundled_decoration_scripts,
 };
 
@@ -87,6 +91,9 @@ struct State {
     script_events: VecDeque<ScriptEventMessage>,
     /// External plugin event kinds the active script asked to receive.
     script_event_subscriptions: Vec<String>,
+    /// Monotonic generation used to stop stale subscription threads
+    /// after a theme/script reload.
+    script_subscription_generation: u64,
     /// Active animation tick rate. Threads exit when this value changes.
     animation_hz: Option<u16>,
     /// Diagnostic flag flipped on the first frame where the script was
@@ -320,7 +327,12 @@ impl DecorationStateService for DecorationServiceHandle {
                 .into_iter()
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
-            apply_theme_extension_toml(&self.state, &toml_text, &candidates)
+            apply_theme_extension_toml(
+                &self.state,
+                &toml_text,
+                &candidates,
+                ScriptHostAccess::default(),
+            )
         })
     }
 }
@@ -736,12 +748,13 @@ fn apply_theme_extension_toml(
     state: &Arc<Mutex<State>>,
     text: &str,
     config_dir_candidates: &[PathBuf],
+    script_host_access: ScriptHostAccess,
 ) -> Result<(), ValidationResult> {
     if text.trim().is_empty() {
         if let Ok(mut state) = state.lock() {
             state.current_theme = None;
             state.animation_hz = None;
-            install_script_backend(&mut state, None);
+            install_script_backend(&mut state, None, ScriptHostAccess::default());
             bump_revision(&mut state);
         }
         return Ok(());
@@ -765,11 +778,19 @@ fn apply_theme_extension_toml(
         .as_deref()
         .and_then(|spec| resolve_decoration_script(config_dir_candidates, spec));
     let animation_hz = extension.animation.as_ref().map(|animation| animation.hz);
+    let script_access = extension.script_access.clone();
+    let mut script_host_access = script_host_access;
+    script_host_access.service_grants = script_service_grants(script_access.as_ref());
+    let mut subscription_generation = None;
     if let Ok(mut state) = state.lock() {
         state.current_theme = Some(extension);
         state.animation_hz = animation_hz;
-        install_script_backend(&mut state, script);
+        install_script_backend(&mut state, script, script_host_access);
+        subscription_generation = Some(state.script_subscription_generation);
         bump_revision(&mut state);
+    }
+    if let Some(generation) = subscription_generation {
+        install_script_event_subscriptions(state, script_access, generation);
     }
     if let Some(hz) = animation_hz
         && hz > 0
@@ -779,10 +800,169 @@ fn apply_theme_extension_toml(
     Ok(())
 }
 
+fn script_service_grants(
+    access: Option<&bmux_decoration_plugin_api::decoration_state::ScriptAccessSpec>,
+) -> Vec<ScriptServiceGrant> {
+    access.map_or_else(Vec::new, |access| {
+        access
+            .services
+            .iter()
+            .map(|grant| ScriptServiceGrant {
+                capability: grant.capability.clone(),
+                kind: grant.kind.clone(),
+                interface: grant.interface_id.clone(),
+                operation: grant.operation.clone(),
+            })
+            .collect()
+    })
+}
+
+fn script_host_access_from_context(context: &NativeServiceContext) -> ScriptHostAccess {
+    let context = context.clone();
+    ScriptHostAccess {
+        service_grants: Vec::new(),
+        service_caller: Some(std::sync::Arc::new(move |call: ScriptServiceCall| {
+            let kind = parse_script_service_kind(&call.kind)?;
+            let payload = bmux_plugin_sdk::encode_service_message(&call.payload)
+                .map_err(|error| error.to_string())?;
+            let response = context
+                .call_service_raw(
+                    &call.capability,
+                    kind,
+                    &call.interface,
+                    &call.operation,
+                    payload,
+                )
+                .map_err(|error| error.to_string())?;
+            bmux_plugin_sdk::decode_service_message::<serde_json::Value>(&response)
+                .map_err(|error| error.to_string())
+        })),
+    }
+}
+
+fn parse_script_service_kind(kind: &str) -> Result<ServiceKind, String> {
+    match kind {
+        "query" => Ok(ServiceKind::Query),
+        "command" => Ok(ServiceKind::Command),
+        "event" => Ok(ServiceKind::Event),
+        other => Err(format!("unsupported service kind {other:?}")),
+    }
+}
+
+const MAX_SCRIPT_EVENT_QUEUE: usize = 256;
+
+fn install_script_event_subscriptions(
+    state: &Arc<Mutex<State>>,
+    access: Option<bmux_decoration_plugin_api::decoration_state::ScriptAccessSpec>,
+    generation: u64,
+) {
+    let Some(access) = access else {
+        return;
+    };
+    if let Ok(mut guard) = state.lock() {
+        guard.script_event_subscriptions = access
+            .state_channels
+            .iter()
+            .chain(access.event_channels.iter())
+            .cloned()
+            .collect();
+    }
+    for kind in &access.state_channels {
+        spawn_script_state_subscription(Arc::clone(state), kind, generation);
+    }
+    for kind in &access.event_channels {
+        spawn_script_broadcast_subscription(Arc::clone(state), kind, generation);
+    }
+}
+
+fn plugin_event_kind_from_string(kind: String) -> bmux_plugin_sdk::PluginEventKind {
+    bmux_plugin_sdk::PluginEventKind::from_static(Box::leak(kind.into_boxed_str()))
+}
+
+fn spawn_script_state_subscription(state: Arc<Mutex<State>>, kind: &str, generation: u64) {
+    let event_kind = plugin_event_kind_from_string(kind.to_string());
+    let Ok((initial, mut rx)) = bmux_plugin::global_event_bus().subscribe_state_json(&event_kind)
+    else {
+        tracing::debug!(
+            kind,
+            "script state subscription skipped; channel unavailable"
+        );
+        return;
+    };
+    enqueue_script_json_event(&state, initial.as_ref(), true, generation);
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            tracing::error!("script state subscriber FAILED to build tokio runtime");
+            return;
+        };
+        rt.block_on(async move {
+            while rx.changed().await.is_ok() {
+                let event = rx.borrow().clone();
+                if !enqueue_script_json_event(&state, event.as_ref(), false, generation) {
+                    break;
+                }
+            }
+        });
+    });
+}
+
+fn spawn_script_broadcast_subscription(state: Arc<Mutex<State>>, kind: &str, generation: u64) {
+    let event_kind = plugin_event_kind_from_string(kind.to_string());
+    let Ok(mut rx) = bmux_plugin::global_event_bus().subscribe_json(&event_kind) else {
+        tracing::debug!(
+            kind,
+            "script event subscription skipped; channel unavailable"
+        );
+        return;
+    };
+    std::thread::spawn(move || {
+        while let Ok(event) = rx.blocking_recv() {
+            if !enqueue_script_json_event(&state, event.as_ref(), false, generation) {
+                break;
+            }
+        }
+    });
+}
+
+fn enqueue_script_json_event(
+    state: &Arc<Mutex<State>>,
+    event: &bmux_plugin::JsonPluginEvent,
+    snapshot: bool,
+    generation: u64,
+) -> bool {
+    let Ok(mut guard) = state.lock() else {
+        return false;
+    };
+    if guard.script_subscription_generation != generation || guard.script_backend.is_none() {
+        return false;
+    }
+    if guard.script_events.len() >= MAX_SCRIPT_EVENT_QUEUE {
+        guard.script_events.pop_front();
+    }
+    let source = event.interface.as_str().to_string();
+    let delivery = match event.delivery {
+        bmux_plugin::DeliveryMode::Broadcast => ScriptEventDelivery::Broadcast,
+        bmux_plugin::DeliveryMode::State => ScriptEventDelivery::State,
+    };
+    guard.script_events.push_back(ScriptEventMessage {
+        source: source.clone(),
+        kind: source,
+        delivery,
+        payload: event.payload.clone(),
+        snapshot,
+    });
+    bump_revision(&mut guard);
+    true
+}
+
 /// The decoration plugin's concrete implementation.
 #[derive(Default)]
 pub struct DecorationPlugin {
     state: SharedState,
+    lifecycle_context: Option<NativeLifecycleContext>,
 }
 
 impl DecorationPlugin {
@@ -791,6 +971,7 @@ impl DecorationPlugin {
     pub fn new() -> Self {
         Self {
             state: SharedState::new(),
+            lifecycle_context: None,
         }
     }
 
@@ -1430,7 +1611,8 @@ fn resolve_decoration_script(
 }
 
 impl RustPlugin for DecorationPlugin {
-    fn activate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        self.lifecycle_context = Some(context);
         // Register the retained scene channel before any mutator (including
         // the initial revision bump below) tries to publish. Failure is
         // non-fatal — the channel may already exist from a prior load;
@@ -1606,7 +1788,7 @@ impl RustPlugin for DecorationPlugin {
                 })();
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
-            "decoration-state", "apply-theme-extension" => |req: ApplyThemeExtensionArgs, _ctx| {
+            "decoration-state", "apply-theme-extension" => |req: ApplyThemeExtensionArgs, ctx| {
                 let candidates = req
                     .config_dir_candidates
                     .into_iter()
@@ -1616,9 +1798,10 @@ impl RustPlugin for DecorationPlugin {
                     &state,
                     &req.toml,
                     &candidates,
+                    script_host_access_from_context(ctx),
                 ))
             },
-            "theme-extension", "apply" => |req: ApplyThemeExtensionArgs, _ctx| {
+            "theme-extension", "apply" => |req: ApplyThemeExtensionArgs, ctx| {
                 let candidates = req
                     .config_dir_candidates
                     .into_iter()
@@ -1628,6 +1811,7 @@ impl RustPlugin for DecorationPlugin {
                     &state,
                     &req.toml,
                     &candidates,
+                    script_host_access_from_context(ctx),
                 ))
             },
             "decoration-state", "notify-pane-event" => |req: NotifyPaneEventArgs, _ctx| {
@@ -1703,7 +1887,12 @@ struct NotifyPaneEventArgs {
 /// feature is compiled in) are logged at `warn` and leave the plugin
 /// in its non-scripted state — the rest of the decoration pipeline
 /// keeps working.
-fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
+fn install_script_backend(
+    state: &mut State,
+    script: Option<ResolvedScript>,
+    host_access: ScriptHostAccess,
+) {
+    state.script_subscription_generation = state.script_subscription_generation.saturating_add(1);
     let Some(script) = script else {
         state.script_backend = None;
         state.script_path = None;
@@ -1720,6 +1909,7 @@ fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
     if state.script_backend.is_some()
         && state.script_path.as_ref() == Some(&script.path)
         && state.script_source_hash == Some(source_hash)
+        && host_access.service_grants.is_empty()
     {
         tracing::debug!(
             script = ?script.path,
@@ -1727,7 +1917,7 @@ fn install_script_backend(state: &mut State, script: Option<ResolvedScript>) {
         );
         return;
     }
-    let backend = crate::scripting::make_backend();
+    let backend = crate::scripting::make_backend(host_access);
     if !backend.is_functional() {
         tracing::warn!(
             target: "decoration.script",
@@ -2132,7 +2322,72 @@ bmux_plugin_sdk::export_plugin!(DecorationPlugin, include_str!("../plugin.toml")
 mod tests {
     use super::*;
     use bmux_scene_protocol::scene_protocol::Rect as SceneRect;
+    use serde_json::json;
+    use std::collections::BTreeMap;
     use std::path::Path;
+
+    struct TestScriptBackend;
+
+    impl ScriptBackend for TestScriptBackend {
+        fn compile(
+            &self,
+            _path: &Path,
+            _source: &str,
+        ) -> Result<(), crate::scripting::ScriptError> {
+            Ok(())
+        }
+
+        fn invoke(
+            &self,
+            _message: &ScriptMessage,
+        ) -> Result<crate::scripting::DecorateOutcome, crate::scripting::ScriptError> {
+            Ok(crate::scripting::DecorateOutcome {
+                surfaces: BTreeMap::new(),
+                duration: Duration::from_millis(0),
+            })
+        }
+
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn is_functional(&self) -> bool {
+            true
+        }
+    }
+
+    struct RecordingScriptBackend {
+        seen: Arc<Mutex<Vec<ScriptMessage>>>,
+    }
+
+    impl ScriptBackend for RecordingScriptBackend {
+        fn compile(
+            &self,
+            _path: &Path,
+            _source: &str,
+        ) -> Result<(), crate::scripting::ScriptError> {
+            Ok(())
+        }
+
+        fn invoke(
+            &self,
+            message: &ScriptMessage,
+        ) -> Result<crate::scripting::DecorateOutcome, crate::scripting::ScriptError> {
+            self.seen.lock().expect("seen lock").push(message.clone());
+            Ok(crate::scripting::DecorateOutcome {
+                surfaces: BTreeMap::new(),
+                duration: Duration::from_millis(0),
+            })
+        }
+
+        fn name(&self) -> &'static str {
+            "recording-test"
+        }
+
+        fn is_functional(&self) -> bool {
+            true
+        }
+    }
 
     fn block_on<F: Future>(fut: F) -> F::Output {
         use std::sync::Arc;
@@ -2285,6 +2540,7 @@ mod tests {
             },
             animation: None,
             script: None,
+            script_access: None,
         }
     }
 
@@ -2305,6 +2561,119 @@ mod tests {
             .expect("bmux.decoration plugin slice matches schema")
     }
 
+    #[test]
+    fn theme_extension_parses_script_access() {
+        let theme = r##"
+            [plugins."bmux.decoration"]
+            script = "pulse"
+
+            [plugins."bmux.decoration".unfocused]
+            bg = ""
+            fg = "#111111"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "single-line"
+
+            [plugins."bmux.decoration".focused]
+            bg = ""
+            fg = "#ffffff"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "thick"
+
+            [plugins."bmux.decoration".zoomed]
+            bg = ""
+            fg = "#ffff00"
+            glyphs_custom = []
+            gradient_from = ""
+            gradient_to = ""
+            style = "double"
+
+            [plugins."bmux.decoration".badges]
+            exited = "x"
+            running = ">"
+
+            [plugins."bmux.decoration".script_access]
+            state_channels = ["third.party/state"]
+            event_channels = ["third.party/events"]
+
+            [[plugins."bmux.decoration".script_access.services]]
+            capability = "third.party.read"
+            kind = "query"
+            interface_id = "metrics"
+            operation = "pane"
+        "##;
+        let extension = decoration_extension_from_theme(theme);
+        let access = extension.script_access.expect("script access parsed");
+        assert_eq!(access.state_channels, vec!["third.party/state"]);
+        assert_eq!(access.event_channels, vec!["third.party/events"]);
+        assert_eq!(access.services[0].interface_id, "metrics");
+    }
+
+    #[test]
+    fn script_state_subscription_enqueues_json_snapshot() {
+        let plugin = DecorationPlugin::new();
+        let kind = format!("test.decoration/state-{}", Uuid::new_v4());
+        let event_kind = plugin_event_kind_from_string(kind.clone());
+        bmux_plugin::global_event_bus()
+            .register_state_channel::<serde_json::Value>(event_kind, json!({ "value": 42 }));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let generation = {
+            let mut state = plugin.state.inner.lock().expect("lock");
+            state.script_backend = Some(Box::new(RecordingScriptBackend {
+                seen: Arc::clone(&seen),
+            }));
+            state.script_subscription_generation = 7;
+            state.script_subscription_generation
+        };
+        install_script_event_subscriptions(
+            &plugin.state.clone_arc(),
+            Some(
+                bmux_decoration_plugin_api::decoration_state::ScriptAccessSpec {
+                    state_channels: vec![kind.clone()],
+                    event_channels: Vec::new(),
+                    services: Vec::new(),
+                },
+            ),
+            generation,
+        );
+        let seen = seen.lock().expect("seen lock");
+        let event = seen
+            .iter()
+            .find_map(|message| match message {
+                ScriptMessage::Event(event) => Some(event),
+                ScriptMessage::Render(_) => None,
+            })
+            .expect("snapshot event delivered to script backend");
+        assert_eq!(event.source, kind);
+        assert_eq!(event.delivery, ScriptEventDelivery::State);
+        assert!(event.snapshot);
+        assert_eq!(event.payload["value"], 42);
+    }
+
+    #[test]
+    fn stale_script_subscription_generation_is_ignored() {
+        let plugin = DecorationPlugin::new();
+        let kind =
+            plugin_event_kind_from_string(format!("test.decoration/stale-{}", Uuid::new_v4()));
+        {
+            let mut state = plugin.state.inner.lock().expect("lock");
+            state.script_backend = Some(Box::new(TestScriptBackend));
+            state.script_subscription_generation = 2;
+        }
+        let event = bmux_plugin::JsonPluginEvent {
+            interface: kind,
+            delivery: bmux_plugin::DeliveryMode::State,
+            payload: json!({ "value": "stale" }),
+        };
+        let accepted = enqueue_script_json_event(&plugin.state.inner, &event, false, 1);
+        assert!(!accepted, "stale subscription generation must stop");
+        let state = plugin.state.inner.lock().expect("lock");
+        assert!(state.script_events.is_empty());
+    }
+
     fn install_extension_with_script(
         plugin: &DecorationPlugin,
         extension: DecorationThemeExtension,
@@ -2316,7 +2685,7 @@ mod tests {
         let mut state = plugin.state.inner.lock().expect("lock");
         state.animation_hz = extension.animation.as_ref().map(|animation| animation.hz);
         state.current_theme = Some(extension);
-        install_script_backend(&mut state, script);
+        install_script_backend(&mut state, script, ScriptHostAccess::default());
     }
 
     fn box_border_of(scene: &DecorationScene, pane: &Uuid) -> PaintCommand {
@@ -3029,6 +3398,7 @@ exited = ""
                     path: PathBuf::from("bundled:test"),
                     source: "function decorate(message) return {} end".into(),
                 }),
+                ScriptHostAccess::default(),
             );
             assert!(
                 state.script_backend.is_some(),
@@ -3051,7 +3421,11 @@ exited = ""
             path: PathBuf::from("bundled:test"),
             source: "function decorate(message) return {} end".into(),
         };
-        install_script_backend(&mut state, Some(script.clone()));
+        install_script_backend(
+            &mut state,
+            Some(script.clone()),
+            ScriptHostAccess::default(),
+        );
         let started_at = state
             .script_started_at
             .expect("initial install records start instant");
@@ -3060,7 +3434,7 @@ exited = ""
             .expect("initial install records source hash");
         state.script_frame = 42;
 
-        install_script_backend(&mut state, Some(script));
+        install_script_backend(&mut state, Some(script), ScriptHostAccess::default());
 
         assert_eq!(state.script_started_at, Some(started_at));
         assert_eq!(state.script_source_hash, Some(source_hash));
@@ -3077,6 +3451,7 @@ exited = ""
                 path: PathBuf::from("bundled:broken"),
                 source: "function decorate(ctx return {}".into(),
             }),
+            ScriptHostAccess::default(),
         );
         assert!(
             state.script_backend.is_none(),
@@ -3117,6 +3492,7 @@ exited = ""
                     "#
                     .into(),
                 }),
+                ScriptHostAccess::default(),
             );
             state.geometry.insert(
                 pane,
@@ -3229,7 +3605,7 @@ exited = ""
     fn script_backend_not_installed_when_theme_has_no_script() {
         let plugin = DecorationPlugin::new();
         let mut state = plugin.state.inner.lock().expect("lock");
-        install_script_backend(&mut state, None);
+        install_script_backend(&mut state, None, ScriptHostAccess::default());
         assert!(
             state.script_backend.is_none(),
             "install_script_backend must leave no backend when script is None",
@@ -3246,10 +3622,11 @@ exited = ""
                 path: PathBuf::from("bundled:test"),
                 source: "function decorate(message) return {} end".into(),
             }),
+            ScriptHostAccess::default(),
         );
         assert!(state.script_backend.is_some(), "backend installed first");
 
-        install_script_backend(&mut state, None);
+        install_script_backend(&mut state, None, ScriptHostAccess::default());
 
         assert!(state.script_backend.is_none(), "backend cleared");
         assert!(state.script_path.is_none(), "script path cleared");

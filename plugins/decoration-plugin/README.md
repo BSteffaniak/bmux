@@ -68,8 +68,8 @@ Render messages carry:
 
 Each pane has `id`, `rect`, `content_rect`, `focused`, `zoomed`, and
 `status`. Event messages use `message.kind = "event"` and carry
-`message.event.kind`, `delivery`, `snapshot`, and `payload` so scripts can
-cache plugin-defined signals.
+`message.event.source`, `kind`, `delivery`, `snapshot`, and `payload` so
+scripts can cache plugin-defined signals.
 
 Paint-command tables carry a `kind` string plus the variant fields; the
 supported kinds are `text`, `filled_rect`, `gradient_run`, `box_border`.
@@ -85,6 +85,59 @@ The sandbox injects a `bmux` global with:
 - `bmux.named(name)` — named-palette color (e.g. `"bright_white"`).
 - `bmux.hsl_to_rgb(h, s, l)` — standard HSL→RGB conversion returning
   a `(r, g, b)` tuple.
+- `bmux.call_service(request)` — calls a declared plugin service and
+  returns its decoded JSON-shaped response table.
+
+### Declaring plugin data access
+
+Decoration scripts do not receive broad plugin access by default. A theme
+must declare the exact state channels, event channels, and service calls the
+script may use under `[plugins."bmux.decoration".script_access]`:
+
+```toml
+[plugins."bmux.decoration"]
+script = "my-decoration"
+
+[plugins."bmux.decoration".script_access]
+state_channels = ["example.metrics/pane-state"]
+event_channels = ["example.metrics/pane-event"]
+
+[[plugins."bmux.decoration".script_access.services]]
+capability = "example.metrics.read"
+kind = "query"
+interface_id = "metrics"
+operation = "pane"
+```
+
+State and event subscriptions are delivered to `decorate(message)` with
+`message.kind == "event"`. The decoration plugin forwards the payloads as
+opaque Lua tables; it does not interpret domain-specific data.
+
+```lua
+local latest = {}
+
+function decorate(message)
+    if message.kind == "event" then
+        latest[message.event.source] = message.event.payload
+        return nil
+    end
+
+    local pane = message.panes[1]
+    local metrics = bmux.call_service({
+        capability = "example.metrics.read",
+        kind = "query",
+        interface = "metrics",
+        operation = "pane",
+        payload = { pane_id = pane.id },
+    })
+
+    return { surfaces = { [pane.id] = {} } }
+end
+```
+
+Service calls are denied unless `capability`, `kind`, `interface`, and
+`operation` exactly match one of the declared grants. This keeps decoration
+scripts generic and lets plugins own their own typed APIs.
 
 ### Sandbox
 

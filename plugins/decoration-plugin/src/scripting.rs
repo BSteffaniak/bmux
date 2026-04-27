@@ -54,6 +54,7 @@ use bmux_scene_protocol::scene_protocol::PaintCommand;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -79,10 +80,37 @@ pub enum ScriptMessage {
 
 #[derive(Debug, Clone)]
 pub struct ScriptEventMessage {
+    pub source: String,
     pub kind: String,
     pub delivery: ScriptEventDelivery,
     pub payload: JsonValue,
     pub snapshot: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptServiceGrant {
+    pub capability: String,
+    pub kind: String,
+    pub interface: String,
+    pub operation: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScriptServiceCall {
+    pub capability: String,
+    pub kind: String,
+    pub interface: String,
+    pub operation: String,
+    pub payload: JsonValue,
+}
+
+pub type ScriptServiceCaller =
+    Arc<dyn Fn(ScriptServiceCall) -> Result<JsonValue, String> + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct ScriptHostAccess {
+    pub service_grants: Vec<ScriptServiceGrant>,
+    pub service_caller: Option<ScriptServiceCaller>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,14 +270,14 @@ fn p95_of(samples: &[u32]) -> u32 {
 /// backend; otherwise it returns a stub whose `invoke` / `compile`
 /// both surface [`ScriptError::NotAvailable`].
 #[must_use]
-pub fn make_backend() -> Box<dyn ScriptBackend> {
+pub fn make_backend(access: ScriptHostAccess) -> Box<dyn ScriptBackend> {
     #[cfg(any(
         feature = "scripting-luajit",
         feature = "scripting-luau",
         feature = "scripting-lua54"
     ))]
     {
-        Box::new(lua_backend::LuaScriptBackend::new())
+        Box::new(lua_backend::LuaScriptBackend::new(access))
     }
     #[cfg(not(any(
         feature = "scripting-luajit",
@@ -257,6 +285,7 @@ pub fn make_backend() -> Box<dyn ScriptBackend> {
         feature = "scripting-lua54"
     )))]
     {
+        let _ = access;
         Box::new(StubBackend)
     }
 }
@@ -293,7 +322,10 @@ mod lua_backend {
     //! across the life of the plugin; scripts are re-compiled on
     //! theme / script file changes.
 
-    use super::{DecorateOutcome, ScriptBackend, ScriptError, ScriptEventDelivery, ScriptMessage};
+    use super::{
+        DecorateOutcome, ScriptBackend, ScriptError, ScriptEventDelivery, ScriptHostAccess,
+        ScriptMessage, ScriptServiceCall, ScriptServiceGrant,
+    };
     use bmux_scene_protocol::scene_protocol::{
         Color, GradientAxis, NamedColor, PaintCommand, Rect, Style,
     };
@@ -339,7 +371,7 @@ mod lua_backend {
 
     impl LuaScriptBackend {
         #[must_use]
-        pub fn new() -> Self {
+        pub fn new(access: ScriptHostAccess) -> Self {
             // Build the sandboxed standard library: disable `io`,
             // `os`, `package`, `debug`, `ffi`. Keep `string`,
             // `math`, `table`, `utf8`, `coroutine`.
@@ -353,7 +385,7 @@ mod lua_backend {
             let _ = lua.globals().set("print", Value::Nil);
             // Install the `bmux.*` helper table scripts use to
             // construct paint commands.
-            install_bmux_helpers(&lua).expect("installing bmux helpers");
+            install_bmux_helpers(&lua, access).expect("installing bmux helpers");
             Self {
                 inner: Mutex::new(LuaInner {
                     lua,
@@ -478,6 +510,7 @@ mod lua_backend {
                 t.set("kind", "event")?;
                 let event_table = lua.create_table()?;
                 event_table.set("kind", event.kind.as_str())?;
+                event_table.set("source", event.source.as_str())?;
                 event_table.set(
                     "delivery",
                     match event.delivery {
@@ -534,7 +567,7 @@ mod lua_backend {
     /// Install the `bmux` helper table into Lua globals. This is the
     /// only scripting surface the sandbox exposes beyond the reduced
     /// stdlib.
-    fn install_bmux_helpers(lua: &Lua) -> mlua::Result<()> {
+    fn install_bmux_helpers(lua: &Lua, access: ScriptHostAccess) -> mlua::Result<()> {
         let bmux = lua.create_table()?;
         // `bmux.log(level, msg)` — routes into tracing via the host
         // plugin log. Level is one of "info"/"warn"/"error"; anything
@@ -576,8 +609,104 @@ mod lua_backend {
             Ok((r, g, b))
         })?;
         bmux.set("hsl_to_rgb", hsl_fn)?;
+        let service_grants = access.service_grants;
+        let service_caller = access.service_caller;
+        let call_service_fn = lua.create_function(move |lua, request: Table| {
+            let call = ScriptServiceCall {
+                capability: request.get("capability")?,
+                kind: request.get("kind")?,
+                interface: request.get("interface")?,
+                operation: request.get("operation")?,
+                payload: table_field_to_json(&request, "payload")?,
+            };
+            if !service_call_is_granted(&service_grants, &call) {
+                return lua_error_table(
+                    lua,
+                    "denied",
+                    "service call was not declared in script_access.services",
+                );
+            }
+            let Some(caller) = service_caller.as_ref() else {
+                return lua_error_table(lua, "unavailable", "host service caller is unavailable");
+            };
+            match caller(call) {
+                Ok(value) => {
+                    let out = lua.create_table()?;
+                    out.set("ok", true)?;
+                    out.set("value", json_to_lua(lua, &value)?)?;
+                    Ok(out)
+                }
+                Err(message) => lua_error_table(lua, "failed", &message),
+            }
+        })?;
+        bmux.set("call_service", call_service_fn)?;
         lua.globals().set("bmux", bmux)?;
         Ok(())
+    }
+
+    fn service_call_is_granted(grants: &[ScriptServiceGrant], call: &ScriptServiceCall) -> bool {
+        grants.iter().any(|grant| {
+            grant.capability == call.capability
+                && grant.kind == call.kind
+                && grant.interface == call.interface
+                && grant.operation == call.operation
+        })
+    }
+
+    fn lua_error_table(lua: &Lua, code: &str, message: &str) -> mlua::Result<Table> {
+        let out = lua.create_table()?;
+        out.set("ok", false)?;
+        out.set("code", code)?;
+        out.set("message", message)?;
+        Ok(out)
+    }
+
+    fn table_field_to_json(table: &Table, field: &str) -> mlua::Result<JsonValue> {
+        match table.get::<Value>(field) {
+            Ok(value) => lua_value_to_json(value),
+            Err(_) => Ok(JsonValue::Null),
+        }
+    }
+
+    fn lua_value_to_json(value: Value) -> mlua::Result<JsonValue> {
+        match value {
+            Value::Boolean(value) => Ok(JsonValue::Bool(value)),
+            Value::Integer(value) => Ok(JsonValue::from(value)),
+            Value::Number(value) => Ok(JsonValue::from(value)),
+            Value::String(value) => Ok(JsonValue::String(value.to_str()?.to_string())),
+            Value::Table(table) => lua_table_to_json(&table),
+            _ => Ok(JsonValue::Null),
+        }
+    }
+
+    fn lua_table_to_json(table: &Table) -> mlua::Result<JsonValue> {
+        let mut array = Vec::new();
+        let mut object = serde_json::Map::new();
+        let mut is_array = true;
+        let mut expected_index = 1_i32;
+        for pair in table.clone().pairs::<Value, Value>() {
+            let (key, value) = pair?;
+            match key {
+                Value::Integer(index) if is_array && index == expected_index => {
+                    array.push(lua_value_to_json(value)?);
+                    expected_index += 1;
+                }
+                Value::String(key) => {
+                    is_array = false;
+                    object.insert(key.to_str()?.to_string(), lua_value_to_json(value)?);
+                }
+                Value::Integer(index) => {
+                    is_array = false;
+                    object.insert(index.to_string(), lua_value_to_json(value)?);
+                }
+                _ => {}
+            }
+        }
+        if is_array {
+            Ok(JsonValue::Array(array))
+        } else {
+            Ok(JsonValue::Object(object))
+        }
     }
 
     /// HSL → RGB. `h` in [0,360), `s`/`l` in [0,1].
@@ -865,7 +994,7 @@ mod tests {
 
     #[test]
     fn make_backend_returns_some_backend() {
-        let b = make_backend();
+        let b = make_backend(ScriptHostAccess::default());
         #[cfg(any(
             feature = "scripting-luajit",
             feature = "scripting-luau",
@@ -890,11 +1019,12 @@ mod tests {
     ))]
     mod lua_integration {
         use super::super::{
-            ScriptEventDelivery, ScriptEventMessage, ScriptMessage, ScriptRenderMessage,
-            make_backend,
+            ScriptEventDelivery, ScriptEventMessage, ScriptHostAccess, ScriptMessage,
+            ScriptRenderMessage, ScriptServiceGrant, make_backend,
         };
         use serde_json::json;
         use std::path::Path;
+        use std::sync::Arc;
 
         fn render_message() -> ScriptMessage {
             ScriptMessage::Render(ScriptRenderMessage {
@@ -915,6 +1045,7 @@ mod tests {
 
         fn broadcast_event_message() -> ScriptMessage {
             ScriptMessage::Event(ScriptEventMessage {
+                source: "third.party/custom-event".to_string(),
                 kind: "third.party/custom-event".to_string(),
                 delivery: ScriptEventDelivery::Broadcast,
                 snapshot: false,
@@ -970,7 +1101,7 @@ mod tests {
 
         #[test]
         fn event_render_script_returns_single_text_paint_command() {
-            let backend = make_backend();
+            let backend = make_backend(ScriptHostAccess::default());
             compile_event_render_script(backend.as_ref());
             deliver_test_state(backend.as_ref());
             let outcome = backend.invoke(&render_message()).expect("render invoke");
@@ -979,7 +1110,7 @@ mod tests {
 
         #[test]
         fn event_invocation_may_return_nil() {
-            let backend = make_backend();
+            let backend = make_backend(ScriptHostAccess::default());
             let source = r#"
                 function decorate(message)
                     if message.kind == "event" then
@@ -999,7 +1130,7 @@ mod tests {
 
         #[test]
         fn render_result_may_omit_surfaces() {
-            let backend = make_backend();
+            let backend = make_backend(ScriptHostAccess::default());
             let source = r"
                 function decorate(message)
                     return {}
@@ -1014,7 +1145,7 @@ mod tests {
 
         #[test]
         fn script_with_syntax_error_returns_compile_error() {
-            let backend = make_backend();
+            let backend = make_backend(ScriptHostAccess::default());
             let err = backend
                 .compile(Path::new("<test>"), "function decorate(ctx return {}")
                 .expect_err("syntax error must surface");
@@ -1026,7 +1157,7 @@ mod tests {
 
         #[test]
         fn script_reading_host_io_is_sandboxed_away() {
-            let backend = make_backend();
+            let backend = make_backend(ScriptHostAccess::default());
             // `io` and `os` should not be reachable. We expect the
             // script to throw a runtime error when it tries to read.
             let source = r#"
@@ -1045,6 +1176,66 @@ mod tests {
                 super::super::ScriptError::Runtime { .. } => {}
                 other => panic!("expected Runtime error, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn undeclared_service_call_returns_denied() {
+            let backend = make_backend(ScriptHostAccess::default());
+            let source = r#"
+                function decorate(message)
+                    local response = bmux.call_service({
+                        capability = "third.party.read",
+                        kind = "query",
+                        interface = "metrics",
+                        operation = "pane",
+                        payload = { pane_id = "p1" },
+                    })
+                    assert(response.ok == false, "undeclared call must be denied")
+                    assert(response.code == "denied", "denied code should be returned")
+                    return { surfaces = {} }
+                end
+            "#;
+            backend
+                .compile(Path::new("<test>"), source)
+                .expect("compile");
+            let outcome = backend.invoke(&render_message()).expect("render invoke");
+            assert!(outcome.surfaces.is_empty());
+        }
+
+        #[test]
+        fn declared_service_call_returns_callback_value() {
+            let access = ScriptHostAccess {
+                service_grants: vec![ScriptServiceGrant {
+                    capability: "third.party.read".to_string(),
+                    kind: "query".to_string(),
+                    interface: "metrics".to_string(),
+                    operation: "pane".to_string(),
+                }],
+                service_caller: Some(Arc::new(|call| {
+                    assert_eq!(call.payload["pane_id"], "p1");
+                    Ok(json!({ "answer": 42 }))
+                })),
+            };
+            let backend = make_backend(access);
+            let source = r#"
+                function decorate(message)
+                    local response = bmux.call_service({
+                        capability = "third.party.read",
+                        kind = "query",
+                        interface = "metrics",
+                        operation = "pane",
+                        payload = { pane_id = "p1" },
+                    })
+                    assert(response.ok == true, "declared call must be allowed")
+                    assert(response.value.answer == 42, "callback value should be returned")
+                    return { surfaces = {} }
+                end
+            "#;
+            backend
+                .compile(Path::new("<test>"), source)
+                .expect("compile");
+            let outcome = backend.invoke(&render_message()).expect("render invoke");
+            assert!(outcome.surfaces.is_empty());
         }
     }
 }
