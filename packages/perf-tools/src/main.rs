@@ -6,7 +6,7 @@ use benchmark_manifest::{
     resolve_benchmark_options,
 };
 use phase_schema::validate_phase_schema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::env;
@@ -41,6 +41,7 @@ fn run() -> Result<(), String> {
         "validate-phase-schema" => run_validate_phase_schema(args),
         "list-benchmarks" => run_list_benchmarks(args),
         "run-benchmark" => run_benchmark(args),
+        "sample-codec-payloads" => run_sample_codec_payloads(args),
         "sample-generic-ipc" => run_sample_generic_ipc(args),
         "sample-static-service" => run_sample_static_service(args),
         "sample-core-services" => run_sample_core_services(args),
@@ -66,6 +67,7 @@ fn usage() -> &'static str {
   validate-phase-schema --input PATH
   list-benchmarks [--dir PATH]
   run-benchmark --manifest PATH [--profile NAME] [--artifact-json PATH] [--phase-report-dir PATH] [benchmark overrides]
+  sample-codec-payloads --iterations N --warmup N --out-json PATH [--max-p99-us N]
   sample-generic-ipc --iterations N --warmup N --out-json PATH
   sample-static-service --iterations N --warmup N --out-json PATH [--max-p99-us N]
   sample-core-services --iterations N --warmup N --out-json PATH [--max-p99-us N]
@@ -140,6 +142,7 @@ fn run_benchmark(args: Vec<String>) -> Result<(), String> {
     let options = resolve_benchmark_options(cli, &manifest, manifest_path)?;
     match manifest.benchmark.kind.as_str() {
         "core-services" => run_core_services_benchmark(&manifest, &options),
+        "codec-payloads" => run_codec_payloads_benchmark(&manifest, &options),
         "generic-ipc" => run_generic_ipc_benchmark(&manifest, &options),
         "attach-tab-switch" => run_attach_tab_switch_benchmark(&manifest, &options),
         "plugin-hot-path" => run_plugin_hot_path_benchmark(&manifest, &options),
@@ -261,6 +264,36 @@ fn run_core_services_benchmark(
         "--out-json".to_string(),
         artifact_json.clone(),
     ])?;
+    validate_benchmark_phases(&artifact_json, options)?;
+    write_standard_benchmark_artifact(manifest, options, &artifact_json, &artifact_json)?;
+    println!("artifact_json={artifact_json}");
+    println!("phase_report_dir={}", options.phase_report_dir);
+    Ok(())
+}
+
+fn run_codec_payloads_benchmark(
+    manifest: &BenchmarkManifest,
+    options: &BenchmarkResolvedOptions,
+) -> Result<(), String> {
+    let artifact_json = options.artifact_json.clone().unwrap_or_else(|| {
+        env::temp_dir()
+            .join("bmux-codec-payloads.json")
+            .display()
+            .to_string()
+    });
+    let mut args = vec![
+        "--iterations".to_string(),
+        options.iterations.to_string(),
+        "--warmup".to_string(),
+        options.warmup.to_string(),
+        "--out-json".to_string(),
+        artifact_json.clone(),
+    ];
+    if let Some(limit) = options.limits.get("codec_payload") {
+        args.push("--max-p99-us".to_string());
+        args.push(format_f64_arg(*limit * 1000.0));
+    }
+    run_sample_codec_payloads(args)?;
     validate_benchmark_phases(&artifact_json, options)?;
     write_standard_benchmark_artifact(manifest, options, &artifact_json, &artifact_json)?;
     println!("artifact_json={artifact_json}");
@@ -1381,6 +1414,245 @@ fn core_service_phase_events(scenario: &Value) -> Vec<Value> {
             json!({
                 "phase": "core_service",
                 "scenario": scenario_name,
+                "total_us": total_us,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodecPlainPayload {
+    name: String,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodecAdaptedPayload {
+    name: String,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodecNestedPayload {
+    interface_id: String,
+    operation: String,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
+    payload: Vec<u8>,
+}
+
+fn run_sample_codec_payloads(args: Vec<String>) -> Result<(), String> {
+    let mut iterations = None;
+    let mut warmup = 0_usize;
+    let mut out_json = None;
+    let mut max_p99_us = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--iterations" => {
+                iterations = Some(parse_usize_arg(&args, index, "--iterations")?);
+                index += 2;
+            }
+            "--warmup" => {
+                warmup = parse_usize_arg(&args, index, "--warmup")?;
+                index += 2;
+            }
+            "--out-json" => {
+                out_json = Some(require_arg(&args, index, "--out-json")?.to_string());
+                index += 2;
+            }
+            "--max-p99-us" => {
+                max_p99_us = Some(parse_f64(
+                    require_arg(&args, index, "--max-p99-us")?,
+                    "--max-p99-us",
+                )?);
+                index += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument for sample-codec-payloads: {other}"
+                ));
+            }
+        }
+    }
+
+    let iterations = iterations.ok_or_else(|| "--iterations is required".to_string())?;
+    let out_json = out_json.ok_or_else(|| "--out-json is required".to_string())?;
+    let medium_payload = vec![9_u8; 4096];
+    let scenarios = vec![
+        codec_payload_scenario_json(
+            "plain.field.decode.medium",
+            sample_codec_decode(
+                iterations,
+                warmup,
+                CodecPlainPayload {
+                    name: "medium".to_string(),
+                    payload: medium_payload.clone(),
+                },
+            )?,
+            None,
+        ),
+        codec_payload_scenario_json(
+            "adapted.field.decode.medium",
+            sample_codec_decode(
+                iterations,
+                warmup,
+                CodecAdaptedPayload {
+                    name: "medium".to_string(),
+                    payload: medium_payload.clone(),
+                },
+            )?,
+            max_p99_us,
+        ),
+        codec_payload_scenario_json(
+            "adapted.field.encode.medium",
+            sample_codec_encode(
+                iterations,
+                warmup,
+                CodecAdaptedPayload {
+                    name: "medium".to_string(),
+                    payload: medium_payload.clone(),
+                },
+            )?,
+            max_p99_us,
+        ),
+        codec_payload_scenario_json(
+            "nested.service.decode.medium",
+            sample_codec_decode(
+                iterations,
+                warmup,
+                CodecNestedPayload {
+                    interface_id: "codec-payload/v1".to_string(),
+                    operation: "echo".to_string(),
+                    payload: medium_payload,
+                },
+            )?,
+            max_p99_us,
+        ),
+    ];
+    let events = scenarios
+        .iter()
+        .flat_map(codec_payload_phase_events)
+        .collect::<Vec<_>>();
+    for scenario in &scenarios {
+        let stats = scenario
+            .get("latency_us")
+            .ok_or_else(|| "codec payload scenario missing latency_us".to_string())?;
+        println!(
+            "{} p50={:.3}us p95={:.3}us p99={:.3}us avg={:.3}us max={:.3}us",
+            scenario
+                .get("scenario")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            stats.get("p50").and_then(Value::as_f64).unwrap_or(0.0),
+            stats.get("p95").and_then(Value::as_f64).unwrap_or(0.0),
+            stats.get("p99").and_then(Value::as_f64).unwrap_or(0.0),
+            stats.get("avg").and_then(Value::as_f64).unwrap_or(0.0),
+            stats.get("max").and_then(Value::as_f64).unwrap_or(0.0),
+        );
+    }
+    let violations = scenarios
+        .iter()
+        .filter_map(|scenario| {
+            let failed = scenario.get("passed").and_then(Value::as_bool) == Some(false);
+            failed.then(|| scenario.get("scenario").cloned().unwrap_or(Value::Null))
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "scenario": "codec-payloads",
+        "iterations": iterations,
+        "warmup": warmup,
+        "scenarios": scenarios,
+        "events": events,
+        "limits": { "max_p99_us": max_p99_us },
+        "passed": violations.is_empty(),
+        "violations": violations,
+    });
+    let encoded = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("failed encoding codec payload sample json: {error}"))?;
+    fs::write(&out_json, encoded)
+        .map_err(|error| format!("failed writing codec payload sample json: {error}"))?;
+    if payload.get("passed").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err("codec payload SLO failed".to_string())
+    }
+}
+
+fn sample_codec_decode<T>(iterations: usize, warmup: usize, value: T) -> Result<Vec<f64>, String>
+where
+    T: Serialize + for<'de> Deserialize<'de> + PartialEq,
+{
+    let bytes = bmux_codec::to_vec(&value)
+        .map_err(|error| format!("failed encoding codec benchmark value: {error}"))?;
+    for _ in 0..warmup {
+        let decoded: T = bmux_codec::from_bytes(&bytes)
+            .map_err(|error| format!("failed warmup decoding codec benchmark value: {error}"))?;
+        if decoded != value {
+            return Err("codec decode warmup returned unexpected value".to_string());
+        }
+    }
+
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let decoded: T = bmux_codec::from_bytes(&bytes)
+            .map_err(|error| format!("failed decoding codec benchmark value: {error}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+        if decoded != value {
+            return Err("codec decode returned unexpected value".to_string());
+        }
+        samples.push(elapsed_us);
+    }
+    Ok(samples)
+}
+
+fn sample_codec_encode<T>(iterations: usize, warmup: usize, value: T) -> Result<Vec<f64>, String>
+where
+    T: Serialize,
+{
+    for _ in 0..warmup {
+        let _ = bmux_codec::to_vec(&value)
+            .map_err(|error| format!("failed warmup encoding codec benchmark value: {error}"))?;
+    }
+
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let _ = bmux_codec::to_vec(&value)
+            .map_err(|error| format!("failed encoding codec benchmark value: {error}"))?;
+        samples.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+    Ok(samples)
+}
+
+fn codec_payload_scenario_json(name: &str, samples_us: Vec<f64>, max_p99_us: Option<f64>) -> Value {
+    let stats = compute_latency_stats(&samples_us);
+    let passed = max_p99_us.is_none_or(|limit| stats.p99 <= limit);
+    json!({
+        "scenario": name,
+        "samples_us": samples_us,
+        "latency_us": stats_json(stats),
+        "limits": { "max_p99_us": max_p99_us },
+        "passed": passed,
+    })
+}
+
+fn codec_payload_phase_events(scenario: &Value) -> Vec<Value> {
+    let Some(name) = scenario.get("scenario").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    scenario
+        .get("samples_us")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_f64)
+        .map(|total_us| {
+            json!({
+                "phase": "codec_payload",
+                "scenario": name,
                 "total_us": total_us,
             })
         })

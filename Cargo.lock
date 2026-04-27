@@ -1551,6 +1551,7 @@ dependencies = [
 name = "bmux_pane_runtime_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_codec",
  "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
@@ -1585,6 +1586,7 @@ name = "bmux_perf_tools"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_client",
+ "bmux_codec",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",

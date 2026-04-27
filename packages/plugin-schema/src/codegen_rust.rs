@@ -107,6 +107,9 @@ fn emit_record(r: &RecordDef, imports: &ImportMap, out: &mut String) {
         if type_has_default(&f.ty) {
             out.push_str("        #[serde(default)]\n");
         }
+        if let Some(adapter) = serde_bytes_adapter(&f.ty) {
+            let _ = writeln!(out, "        #[serde(with = \"{adapter}\")]");
+        }
         let _ = writeln!(out, "        pub {field_name}: {ty},");
     }
     out.push_str("    }\n\n");
@@ -162,6 +165,9 @@ fn emit_variant_case(case: &VariantCase, imports: &ImportMap, out: &mut String) 
         for f in &case.payload {
             let field_name = snake_case(&f.name);
             let ty = rust_type(&f.ty, imports);
+            if let Some(adapter) = serde_bytes_adapter(&f.ty) {
+                let _ = writeln!(out, "            #[serde(with = \"{adapter}\")]");
+            }
             let _ = writeln!(out, "            {field_name}: {ty},");
         }
         out.push_str("        },\n");
@@ -381,6 +387,19 @@ fn rust_type(ty: &TypeRef, imports: &ImportMap) -> String {
     }
 }
 
+fn serde_bytes_adapter(ty: &TypeRef) -> Option<&'static str> {
+    match ty {
+        TypeRef::Primitive(Primitive::Bytes) => Some("bmux_codec::serde_bytes_vec"),
+        TypeRef::List(inner) if matches!(inner.as_ref(), TypeRef::Primitive(Primitive::U8)) => {
+            Some("bmux_codec::serde_bytes_vec")
+        }
+        TypeRef::Option(inner) if serde_bytes_adapter(inner).is_some() => {
+            Some("bmux_codec::serde_bytes_vec::option")
+        }
+        _ => None,
+    }
+}
+
 /// Resolve `alias.type-name` to a concrete Rust path by consulting the
 /// imports table. If the alias is unknown at codegen time we emit a
 /// `::bmux_plugin_schema_unresolved::<alias>::<type>` path that will
@@ -482,6 +501,39 @@ mod tests {
         assert!(rust.contains("Running,"));
         assert!(rust.contains("Exited {"));
         assert!(rust.contains("code: i32"));
+    }
+
+    #[test]
+    fn emits_byte_buffer_adapter_for_raw_byte_fields() {
+        let src = "plugin p version 1;\n\
+                   interface i {\n\
+                     record raw-payload { data: bytes, legacy: list<u8>, maybe: bytes? }\n\
+                     variant event { frame { data: list<u8> } }\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            rust.contains(
+                "#[serde(with = \"bmux_codec::serde_bytes_vec\")]\n        pub data: Vec<u8>"
+            ),
+            "bytes fields should use the codec byte-buffer adapter; got: {rust}"
+        );
+        assert!(
+            rust.contains(
+                "#[serde(with = \"bmux_codec::serde_bytes_vec\")]\n        pub legacy: Vec<u8>"
+            ),
+            "list<u8> fields should use the codec byte-buffer adapter; got: {rust}"
+        );
+        assert!(
+            rust.contains("#[serde(with = \"bmux_codec::serde_bytes_vec::option\")]\n        pub maybe: Option<Vec<u8>>"),
+            "optional bytes fields should use the optional byte-buffer adapter; got: {rust}"
+        );
+        assert!(
+            rust.contains(
+                "#[serde(with = \"bmux_codec::serde_bytes_vec\")]\n            data: Vec<u8>"
+            ),
+            "variant list<u8> payloads should use the codec byte-buffer adapter; got: {rust}"
+        );
     }
 
     #[test]

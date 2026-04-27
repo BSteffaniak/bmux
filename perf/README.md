@@ -67,6 +67,7 @@ Run manifests directly with:
 
 ```sh
 bmux-perf-tools run-benchmark --manifest perf/core-services.toml --profile normal
+bmux-perf-tools run-benchmark --manifest perf/codec-payloads.toml --profile normal
 bmux-perf-tools run-benchmark --manifest perf/generic-ipc.toml --profile normal
 bmux-perf-tools run-benchmark --manifest perf/attach-tab-switch.toml --profile normal --bmux-bin target/debug/bmux
 bmux-perf-tools list-benchmarks --dir perf
@@ -97,6 +98,7 @@ Profile metadata lives in `perf/profiles.toml`.
 | Benchmark         | Manifest                      | Runner Kind         | Normal SLO                                                |
 | ----------------- | ----------------------------- | ------------------- | --------------------------------------------------------- |
 | Attach tab switch | `perf/attach-tab-switch.toml` | `attach-tab-switch` | `attach.plugin_command` p99 \<= 8ms, retarget p99 \<= 8ms |
+| Codec payloads    | `perf/codec-payloads.toml`    | `codec-payloads`    | codec payload p99 \<= 0.08ms                              |
 | Core services     | `perf/core-services.toml`     | `core-services`     | core service p99 \<= 1ms                                  |
 | Generic IPC       | `perf/generic-ipc.toml`       | `generic-ipc`       | ping/invoke p99 \<= 5ms                                   |
 | Plugin hot path   | `perf/plugin-hot-path.toml`   | `plugin-hot-path`   | static service dispatch p99 \<= 5ms                       |

@@ -1,0 +1,42 @@
+[benchmark]
+name = "codec-payloads"
+kind = "codec-payloads"
+
+[defaults]
+iterations = 500
+warmup = 100
+codec_payload_limit_ms = 0.08
+
+[profiles.normal]
+tags = ["codec", "payload"]
+
+[profiles.diagnostic]
+tags = ["codec", "payload", "diagnostic"]
+loosen_slo = true
+
+[[reports]]
+phase = "codec_payload"
+field = "total_us"
+filter = { key = "scenario", value = "plain.field.decode.medium" }
+max_p99_ms = 1.0
+
+[[reports]]
+phase = "codec_payload"
+field = "total_us"
+filter = { key = "scenario", value = "adapted.field.decode.medium" }
+limit = "codec_payload"
+max_p99_ms = 0.08
+
+[[reports]]
+phase = "codec_payload"
+field = "total_us"
+filter = { key = "scenario", value = "adapted.field.encode.medium" }
+limit = "codec_payload"
+max_p99_ms = 0.08
+
+[[reports]]
+phase = "codec_payload"
+field = "total_us"
+filter = { key = "scenario", value = "nested.service.decode.medium" }
+limit = "codec_payload"
+max_p99_ms = 0.08
