@@ -104,6 +104,8 @@ struct PhaseReportSpec {
     limit: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    skip_first_per_sample: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +124,7 @@ struct PhaseReportRequest<'a> {
     filter_value: Option<&'a str>,
     max_p99_ms: Option<f64>,
     max_p95_ms: Option<f64>,
+    skip_first_per_sample: usize,
 }
 
 struct SampleCommandRequest<'a> {
@@ -853,6 +856,7 @@ fn run_validate_phase_config(args: Vec<String>) -> Result<(), String> {
                 .as_deref(),
             max_p99_ms,
             max_p95_ms: report.max_p95_ms,
+            skip_first_per_sample: report.skip_first_per_sample,
         });
         if let Err(error) = result {
             failures.push(format!(
@@ -1025,20 +1029,24 @@ fn run_report_phase_file(args: Vec<String>) -> Result<(), String> {
         filter_value: filter_value.as_deref(),
         max_p99_ms,
         max_p95_ms,
+        skip_first_per_sample: 0,
     })
 }
 
 fn write_phase_report(request: PhaseReportRequest<'_>) -> Result<(), String> {
-    let selected = request
-        .events
-        .iter()
-        .filter(|event| event.get("phase").and_then(Value::as_str) == Some(request.phase))
-        .filter(|event| match (request.filter_key, request.filter_value) {
-            (Some(key), Some(value)) => event.get(key).and_then(Value::as_str) == Some(value),
-            _ => true,
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let selected = skip_first_per_sample(
+        request
+            .events
+            .iter()
+            .filter(|event| event.get("phase").and_then(Value::as_str) == Some(request.phase))
+            .filter(|event| match (request.filter_key, request.filter_value) {
+                (Some(key), Some(value)) => event.get(key).and_then(Value::as_str) == Some(value),
+                _ => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+        request.skip_first_per_sample,
+    );
     let samples_us = selected
         .iter()
         .filter_map(|event| event.get(request.field).and_then(Value::as_f64))
@@ -1107,6 +1115,28 @@ fn write_phase_report(request: PhaseReportRequest<'_>) -> Result<(), String> {
     } else {
         Err("phase SLO failed".to_string())
     }
+}
+
+fn skip_first_per_sample(events: Vec<Value>, skip_count: usize) -> Vec<Value> {
+    if skip_count == 0 {
+        return events;
+    }
+    let mut skipped_by_sample = BTreeMap::<i64, usize>::new();
+    events
+        .into_iter()
+        .filter(|event| {
+            let Some(sample_index) = event.get("sample_index").and_then(Value::as_i64) else {
+                return true;
+            };
+            let skipped = skipped_by_sample.entry(sample_index).or_default();
+            if *skipped < skip_count {
+                *skipped += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
 }
 
 fn run_sample_static_service(args: Vec<String>) -> Result<(), String> {
@@ -2339,7 +2369,22 @@ fn parse_phase_events_input(input: &str) -> Vec<Value> {
         if let Some(samples) = value.get("phase_samples").and_then(Value::as_array) {
             return samples
                 .iter()
-                .flat_map(|sample| sample.as_array().into_iter().flatten().cloned())
+                .enumerate()
+                .flat_map(|(sample_index, sample)| {
+                    sample.as_array().into_iter().flatten().enumerate().map(
+                        move |(sample_event_index, event)| {
+                            let mut event = event.clone();
+                            if let Some(object) = event.as_object_mut() {
+                                object.insert("sample_index".to_string(), json!(sample_index));
+                                object.insert(
+                                    "sample_event_index".to_string(),
+                                    json!(sample_event_index),
+                                );
+                            }
+                            event
+                        },
+                    )
+                })
                 .collect();
         }
         if let Some(events) = value.get("events").and_then(Value::as_array) {

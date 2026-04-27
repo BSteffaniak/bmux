@@ -37,24 +37,28 @@ phase = "attach.plugin_command"
 field = "total_us"
 limit = "attach_command"
 filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
 
 [[reports]]
 phase = "attach.plugin_command"
 field = "before_context_us"
 limit = "attach_command"
 filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
 
 [[reports]]
 phase = "attach.plugin_command"
 field = "run_us"
 limit = "attach_command"
 filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
 
 [[reports]]
 phase = "attach.plugin_command"
 field = "retarget_us"
 limit = "retarget"
 filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
 
 [[reports]]
 phase = "attach.window_cycle"
@@ -62,36 +66,42 @@ field = "invoke_us"
 limit = "attach_command"
 tags = ["navigation"]
 filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
 
 [[reports]]
 phase = "attach.retarget_context"
 field = "total_us"
 limit = "retarget"
 filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
 
 [[reports]]
 phase = "attach.retarget_context"
 field = "retarget_service_us"
 limit = "retarget"
 filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
 
 [[reports]]
 phase = "attach.retarget_context"
 field = "grant_us"
 limit = "retarget"
 filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
 
 [[reports]]
 phase = "attach.retarget_context"
 field = "open_us"
 limit = "retarget"
 filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
 
 [[reports]]
 phase = "attach.retarget_context"
 field = "viewport_us"
 limit = "retarget"
 filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
 
 [[reports]]
 phase = "service.client_invoke"

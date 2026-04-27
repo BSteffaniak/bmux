@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uuid::Uuid;
@@ -44,6 +46,21 @@ fn emit_attach_phase_timing(payload: &serde_json::Value) {
 /// [`WindowsCommandsService::switch_window`] impl (via a clone of the
 /// same [`Arc<Mutex<_>>`]). Both paths observe the same state.
 type LastSelectedByClient = Arc<Mutex<BTreeMap<Uuid, Uuid>>>;
+
+#[cfg(not(test))]
+#[derive(Debug, Default)]
+struct WindowRuntimeState {
+    active_context_id: Option<Uuid>,
+    previous_context_id: Option<Uuid>,
+}
+
+#[cfg(not(test))]
+static WINDOW_RUNTIME_STATE: OnceLock<Mutex<WindowRuntimeState>> = OnceLock::new();
+
+#[cfg(not(test))]
+fn window_runtime_state() -> &'static Mutex<WindowRuntimeState> {
+    WINDOW_RUNTIME_STATE.get_or_init(Mutex::default)
+}
 
 #[derive(Default)]
 pub struct WindowsPlugin {
@@ -111,7 +128,7 @@ impl RustPlugin for WindowsPlugin {
             "windows-commands", "switch-window" => |req: SwitchWindowArgs, ctx| {
                 let selector = parse_selector(&req.target)
                     .map_err(|e| ServiceResponse::error("invalid_request", e))?;
-                switch_window(ctx, selector, &self.last_selected_by_client)
+                switch_window(ctx, selector, &self.last_selected_by_client, ctx.caller_client_id)
                     .map_err(|e| ServiceResponse::error("switch_failed", e))
             },
             "windows-commands", "focus-pane" => |req: FocusPaneArgs, ctx| {
@@ -557,7 +574,12 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             let target = positional_value(&context.arguments)
                 .ok_or_else(|| "missing required TARGET argument".to_string())?;
             let selector = parse_selector(&target)?;
-            let ack = switch_window(context, selector, &plugin.last_selected_by_client)?;
+            let ack = switch_window(
+                context,
+                selector,
+                &plugin.last_selected_by_client,
+                context.caller_client_id,
+            )?;
             let context_id = ack
                 .id
                 .ok_or_else(|| "switch-window did not return selected context id".to_string())?;
@@ -571,6 +593,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 context,
                 WindowCycleDirection::Next,
                 &plugin.last_selected_by_client,
+                context.caller_client_id,
             )?;
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("next-window selected context {id}");
@@ -582,6 +605,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 context,
                 WindowCycleDirection::Previous,
                 &plugin.last_selected_by_client,
+                context.caller_client_id,
             )?;
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("prev-window selected context {id}");
@@ -593,6 +617,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 context,
                 WindowCycleDirection::Last,
                 &plugin.last_selected_by_client,
+                context.caller_client_id,
             )?;
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("last-window selected context {id}");
@@ -608,14 +633,23 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             if index == 0 {
                 return Err("window index must be 1 or greater".to_string());
             }
-            let ack = goto_window_by_index(context, index, &plugin.last_selected_by_client)?;
+            let ack = goto_window_by_index(
+                context,
+                index,
+                &plugin.last_selected_by_client,
+                context.caller_client_id,
+            )?;
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("goto-window {index} selected context {id}");
             }
             Ok(())
         }
         "close-current-window" => {
-            let ack = close_current_window(context, &plugin.last_selected_by_client)?;
+            let ack = close_current_window(
+                context,
+                &plugin.last_selected_by_client,
+                context.caller_client_id,
+            )?;
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("closed current window context {id}");
             }
@@ -785,6 +819,13 @@ fn publish_window_list_snapshot_from_contexts(
     let Ok(contexts) = order_contexts_for_navigation(caller, contexts.to_vec()) else {
         return;
     };
+    publish_window_list_ordered_contexts(contexts, active_context_id);
+}
+
+fn publish_window_list_ordered_contexts(
+    contexts: Vec<domain_ipc::ContextSummary>,
+    active_context_id: Option<Uuid>,
+) {
     let entries = contexts
         .into_iter()
         .enumerate()
@@ -931,6 +972,7 @@ fn switch_window(
     caller: &impl HostRuntimeApi,
     selector: ContextSelector,
     last_selected_by_client: &LastSelectedByClient,
+    caller_client_id: Option<Uuid>,
 ) -> Result<WindowAck, String> {
     let total_started = Instant::now();
     let list_started = Instant::now();
@@ -939,10 +981,12 @@ fn switch_window(
         .map_err(|error| error.to_string())?
         .contexts;
     let context_list_us = list_started.elapsed().as_micros();
+    let contexts = order_contexts_for_navigation(caller, contexts)?;
     switch_window_with_contexts(
         caller,
         &selector,
         last_selected_by_client,
+        caller_client_id,
         &contexts,
         context_list_us,
         total_started,
@@ -953,6 +997,7 @@ fn switch_window_with_contexts(
     caller: &impl HostRuntimeApi,
     selector: &ContextSelector,
     last_selected_by_client: &LastSelectedByClient,
+    caller_client_id: Option<Uuid>,
     contexts: &[domain_ipc::ContextSummary],
     context_list_us: u128,
     total_started: Instant,
@@ -969,12 +1014,12 @@ fn switch_window_with_contexts(
         .map_err(|error| error.to_string())?;
     let context_select_us = select_started.elapsed().as_micros();
     let remember_started = Instant::now();
-    let remembered_for_client = if let Ok(client) = caller.current_client()
+    let remembered_for_client = if let Some(client_id) = caller_client_id
         && let Some(previous) = previous_context
         && previous != context_id
         && let Ok(mut map) = last_selected_by_client.lock()
     {
-        map.insert(client.id, previous);
+        map.insert(client_id, previous);
         true
     } else {
         false
@@ -988,7 +1033,7 @@ fn switch_window_with_contexts(
     let _ = set_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
     let remember_us = remember_started.elapsed().as_micros();
     let publish_started = Instant::now();
-    publish_window_list_snapshot_from_contexts(caller, contexts, Some(context_id));
+    publish_window_list_ordered_contexts(contexts.to_vec(), Some(context_id));
     let publish_us = publish_started.elapsed().as_micros();
     emit_attach_phase_timing(&serde_json::json!({
         "phase": "windows.switch_window",
@@ -1013,6 +1058,7 @@ fn cycle_window(
     caller: &impl HostRuntimeApi,
     direction: WindowCycleDirection,
     last_selected_by_client: &LastSelectedByClient,
+    caller_client_id: Option<Uuid>,
 ) -> Result<WindowAck, String> {
     let total_started = Instant::now();
     let list_started = Instant::now();
@@ -1040,11 +1086,11 @@ fn cycle_window(
             contexts[(current_index + contexts.len() - 1) % contexts.len()].id
         }
         WindowCycleDirection::Last => {
-            let remembered_by_client = caller.current_client().ok().and_then(|client| {
+            let remembered_by_client = caller_client_id.and_then(|client_id| {
                 last_selected_by_client
                     .lock()
                     .ok()
-                    .and_then(|map| map.get(&client.id).copied())
+                    .and_then(|map| map.get(&client_id).copied())
             });
             let remembered = remembered_by_client
                 .or_else(|| {
@@ -1078,6 +1124,7 @@ fn cycle_window(
         caller,
         &ContextSelector::ById(target_id),
         last_selected_by_client,
+        caller_client_id,
         &contexts,
         context_list_us,
         total_started,
@@ -1088,14 +1135,18 @@ fn goto_window_by_index(
     caller: &impl HostRuntimeApi,
     index: usize,
     last_selected_by_client: &LastSelectedByClient,
+    caller_client_id: Option<Uuid>,
 ) -> Result<WindowAck, String> {
+    let total_started = Instant::now();
     if index == 0 {
         return Err("window index must be 1 or greater".to_string());
     }
+    let list_started = Instant::now();
     let contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
+    let context_list_us = list_started.elapsed().as_micros();
     let contexts = order_contexts_for_navigation(caller, contexts)?;
     if contexts.is_empty() {
         return Err("no windows available".to_string());
@@ -1109,16 +1160,21 @@ fn goto_window_by_index(
         ));
     }
     let target_id = contexts[zero_based].id;
-    switch_window(
+    switch_window_with_contexts(
         caller,
-        ContextSelector::ById(target_id),
+        &ContextSelector::ById(target_id),
         last_selected_by_client,
+        caller_client_id,
+        &contexts,
+        context_list_us,
+        total_started,
     )
 }
 
 fn close_current_window(
     caller: &impl HostRuntimeApi,
     last_selected_by_client: &LastSelectedByClient,
+    caller_client_id: Option<Uuid>,
 ) -> Result<WindowAck, String> {
     let contexts = caller
         .context_list()
@@ -1145,6 +1201,7 @@ fn close_current_window(
             caller,
             ContextSelector::ById(fallback_id),
             last_selected_by_client,
+            caller_client_id,
         );
     }
 
@@ -1180,6 +1237,11 @@ fn resolve_effective_current_context_with_contexts(
     caller: &impl HostRuntimeApi,
     contexts: &[domain_ipc::ContextSummary],
 ) -> Result<Option<Uuid>, String> {
+    let stored_active = in_memory_runtime_context_id(ACTIVE_WINDOW_CONTEXT_KEY)
+        .filter(|id| contexts.iter().any(|context| context.id == *id));
+    if stored_active.is_some() {
+        return Ok(stored_active);
+    }
     let current = caller
         .context_current()
         .map_err(|error| error.to_string())?
@@ -1212,10 +1274,28 @@ fn get_stored_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<Opti
 }
 
 fn get_runtime_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<Option<Uuid>, String> {
+    if let Some(context_id) = in_memory_runtime_context_id(key) {
+        return Ok(Some(context_id));
+    }
     if let Some(id) = get_volatile_context_id(caller, key)? {
         return Ok(Some(id));
     }
     get_stored_context_id(caller, key)
+}
+
+#[cfg(test)]
+const fn in_memory_runtime_context_id(_key: &str) -> Option<Uuid> {
+    None
+}
+
+#[cfg(not(test))]
+fn in_memory_runtime_context_id(key: &str) -> Option<Uuid> {
+    let state = window_runtime_state().lock().ok()?;
+    match key {
+        ACTIVE_WINDOW_CONTEXT_KEY => state.active_context_id,
+        PREVIOUS_WINDOW_CONTEXT_KEY => state.previous_context_id,
+        _ => None,
+    }
 }
 
 fn get_volatile_context_id(
@@ -1252,6 +1332,9 @@ fn set_runtime_context_id(
     key: &str,
     context_id: Option<Uuid>,
 ) -> Result<(), String> {
+    if set_in_memory_runtime_context_id(key, context_id) {
+        return Ok(());
+    }
     context_id.map_or_else(
         || clear_runtime_context_id(caller, key),
         |context_id| {
@@ -1271,7 +1354,28 @@ fn set_runtime_context_id(
     )
 }
 
+#[cfg(test)]
+const fn set_in_memory_runtime_context_id(_key: &str, _context_id: Option<Uuid>) -> bool {
+    false
+}
+
+#[cfg(not(test))]
+fn set_in_memory_runtime_context_id(key: &str, context_id: Option<Uuid>) -> bool {
+    let Ok(mut state) = window_runtime_state().lock() else {
+        return false;
+    };
+    match key {
+        ACTIVE_WINDOW_CONTEXT_KEY => state.active_context_id = context_id,
+        PREVIOUS_WINDOW_CONTEXT_KEY => state.previous_context_id = context_id,
+        _ => return false,
+    }
+    true
+}
+
 fn clear_runtime_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<(), String> {
+    if set_in_memory_runtime_context_id(key, None) {
+        return Ok(());
+    }
     caller
         .call_service::<_, ()>(
             "bmux.storage",
@@ -1823,7 +1927,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         Box::pin(async move {
             let selector =
                 parse_selector(&target).map_err(|reason| WindowError::Failed { reason })?;
-            switch_window(&*caller, selector, &last_selected)
+            switch_window(&*caller, selector, &last_selected, None)
                 .map_err(|reason| WindowError::Failed { reason })
         })
     }
@@ -3179,6 +3283,7 @@ mod tests {
             &host,
             SessionSelector::ById(Uuid::new_v4()),
             &last_selected_by_client,
+            None,
         )
         .expect_err("switch should fail when context is missing");
         assert!(error.contains("not found"));
@@ -3195,6 +3300,7 @@ mod tests {
             &host,
             SessionSelector::ById(target_id),
             &last_selected_by_client,
+            None,
         )
         .expect("switch should succeed");
         assert!(ack.ok);
@@ -3223,6 +3329,7 @@ mod tests {
             &host,
             SessionSelector::ById(target_id),
             &last_selected_by_client,
+            None,
         )
         .expect("switch should succeed even if current client query fails");
         assert!(ack.ok);
@@ -3238,8 +3345,13 @@ mod tests {
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
-        let ack = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
-            .expect("next window should succeed");
+        let ack = cycle_window(
+            &host,
+            WindowCycleDirection::Next,
+            &last_selected_by_client,
+            None,
+        )
+        .expect("next window should succeed");
         assert!(ack.ok);
         let target_text = target_id.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
@@ -3273,6 +3385,7 @@ mod tests {
             &host,
             WindowCycleDirection::Previous,
             &last_selected_by_client,
+            None,
         )
         .expect("previous window should succeed");
         assert!(ack.ok);
@@ -3290,13 +3403,23 @@ mod tests {
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
-        let next = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
-            .expect("next window should succeed");
+        let next = cycle_window(
+            &host,
+            WindowCycleDirection::Next,
+            &last_selected_by_client,
+            None,
+        )
+        .expect("next window should succeed");
         let second_text = second_id.to_string();
         assert_eq!(next.id.as_deref(), Some(second_text.as_str()));
 
-        let next_again = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
-            .expect("second next window should succeed");
+        let next_again = cycle_window(
+            &host,
+            WindowCycleDirection::Next,
+            &last_selected_by_client,
+            None,
+        )
+        .expect("second next window should succeed");
         let third_text = third_id.to_string();
         assert_eq!(next_again.id.as_deref(), Some(third_text.as_str()));
 
@@ -3304,6 +3427,7 @@ mod tests {
             &host,
             WindowCycleDirection::Previous,
             &last_selected_by_client,
+            None,
         )
         .expect("previous window should succeed");
         assert_eq!(previous.id.as_deref(), Some(second_text.as_str()));
@@ -3329,8 +3453,13 @@ mod tests {
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
-        let _ = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
-            .expect("next window should succeed");
+        let _ = cycle_window(
+            &host,
+            WindowCycleDirection::Next,
+            &last_selected_by_client,
+            None,
+        )
+        .expect("next window should succeed");
 
         let windows = list_windows(&host, None).expect("list should succeed");
         assert_eq!(windows.len(), 3);
@@ -3433,8 +3562,13 @@ mod tests {
         }];
         let host = MockHost::with_sessions(sessions);
         let last_selected_by_client = LastSelectedByClient::default();
-        let error = cycle_window(&host, WindowCycleDirection::Last, &last_selected_by_client)
-            .expect_err("last window should require alternate session");
+        let error = cycle_window(
+            &host,
+            WindowCycleDirection::Last,
+            &last_selected_by_client,
+            None,
+        )
+        .expect_err("last window should require alternate session");
         assert!(error.contains("no alternate window"));
     }
 
@@ -3445,11 +3579,21 @@ mod tests {
         let host = MockHost::with_sessions(sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
-        let _ = cycle_window(&host, WindowCycleDirection::Next, &last_selected_by_client)
-            .expect("next window should succeed");
+        let _ = cycle_window(
+            &host,
+            WindowCycleDirection::Next,
+            &last_selected_by_client,
+            None,
+        )
+        .expect("next window should succeed");
 
-        let ack = cycle_window(&host, WindowCycleDirection::Last, &last_selected_by_client)
-            .expect("last window should use remembered selection");
+        let ack = cycle_window(
+            &host,
+            WindowCycleDirection::Last,
+            &last_selected_by_client,
+            None,
+        )
+        .expect("last window should use remembered selection");
 
         assert!(ack.ok);
         let target_text = target_id.to_string();
@@ -3492,6 +3636,7 @@ mod tests {
             &host,
             SessionSelector::ById(target),
             &last_selected_by_client,
+            None,
         )
         .expect_err("switch should fail when select fails");
         assert!(error.contains("mock select failure"), "error was: {error}");
@@ -3634,7 +3779,7 @@ mod tests {
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
-        let ack = goto_window_by_index(&host, 1, &last_selected_by_client)
+        let ack = goto_window_by_index(&host, 1, &last_selected_by_client, None)
             .expect("goto index 1 should succeed");
         assert!(ack.ok);
         let first_text = first_id.to_string();
@@ -3649,7 +3794,7 @@ mod tests {
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
-        let ack = goto_window_by_index(&host, 2, &last_selected_by_client)
+        let ack = goto_window_by_index(&host, 2, &last_selected_by_client, None)
             .expect("goto index 2 should succeed");
         assert!(ack.ok);
         let second_text = second_id.to_string();
@@ -3661,7 +3806,7 @@ mod tests {
         let host = MockHost::with_sessions(sample_sessions());
         let last_selected_by_client = LastSelectedByClient::default();
 
-        let error = goto_window_by_index(&host, 0, &last_selected_by_client)
+        let error = goto_window_by_index(&host, 0, &last_selected_by_client, None)
             .expect_err("index 0 should fail");
         assert!(error.contains("1 or greater"));
     }
@@ -3671,7 +3816,7 @@ mod tests {
         let host = MockHost::with_sessions(sample_sessions());
         let last_selected_by_client = LastSelectedByClient::default();
 
-        let error = goto_window_by_index(&host, 99, &last_selected_by_client)
+        let error = goto_window_by_index(&host, 99, &last_selected_by_client, None)
             .expect_err("index 99 should fail");
         assert!(error.contains("out of range"));
     }
@@ -3683,7 +3828,7 @@ mod tests {
         let host = MockHost::with_sessions(sessions);
         let last_selected_by_client = LastSelectedByClient::default();
 
-        let ack = close_current_window(&host, &last_selected_by_client)
+        let ack = close_current_window(&host, &last_selected_by_client, None)
             .expect("close current should succeed");
         assert!(ack.ok);
         let first_text = first_id.to_string();
