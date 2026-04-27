@@ -154,19 +154,18 @@ pub struct AttachMouseState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttachMouseResizeDrag {
-    pub axis: AttachMouseResizeAxis,
-    pub positive_target_pane_id: Uuid,
-    pub positive_direction: PaneResizeDirection,
-    pub negative_target_pane_id: Uuid,
-    pub negative_direction: PaneResizeDirection,
+    pub horizontal: Option<AttachMouseResizeAxisDrag>,
+    pub vertical: Option<AttachMouseResizeAxisDrag>,
     pub last_column: u16,
     pub last_row: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttachMouseResizeAxis {
-    Horizontal,
-    Vertical,
+pub struct AttachMouseResizeAxisDrag {
+    pub positive_target_pane_id: Uuid,
+    pub positive_direction: PaneResizeDirection,
+    pub negative_target_pane_id: Uuid,
+    pub negative_direction: PaneResizeDirection,
 }
 
 impl AttachViewState {

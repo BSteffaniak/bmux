@@ -61,7 +61,7 @@ use super::render::{
     render_attach_scene, visible_scene_pane_ids,
 };
 use super::state::{
-    AttachEventAction, AttachExitReason, AttachMouseResizeAxis, AttachMouseResizeDrag,
+    AttachEventAction, AttachExitReason, AttachMouseResizeAxisDrag, AttachMouseResizeDrag,
     AttachScrollbackCursor, AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRect,
     PaneRenderBuffer,
 };
@@ -6338,12 +6338,25 @@ async fn handle_attach_mouse_resize_drag(
             let Some(mut drag) = view_state.mouse.resize_drag else {
                 return Ok(false);
             };
-            let Some((target, direction, cells)) = resize_drag_delta(drag, mouse_event) else {
+            let horizontal = resize_drag_axis_delta(
+                drag.horizontal,
+                i32::from(mouse_event.column) - i32::from(drag.last_column),
+            );
+            let vertical = resize_drag_axis_delta(
+                drag.vertical,
+                i32::from(mouse_event.row) - i32::from(drag.last_row),
+            );
+            if horizontal.is_none() && vertical.is_none() {
                 return Ok(true);
-            };
-            resize_attach_pane(client, view_state, target, direction, cells).await?;
-            drag.last_column = mouse_event.column;
-            drag.last_row = mouse_event.row;
+            }
+            if let Some((target, direction, cells)) = horizontal {
+                resize_attach_pane(client, view_state, target, direction, cells).await?;
+                drag.last_column = mouse_event.column;
+            }
+            if let Some((target, direction, cells)) = vertical {
+                resize_attach_pane(client, view_state, target, direction, cells).await?;
+                drag.last_row = mouse_event.row;
+            }
             view_state.mouse.resize_drag = Some(drag);
             Ok(true)
         }
@@ -6357,28 +6370,31 @@ async fn handle_attach_mouse_resize_drag(
     }
 }
 
-fn resize_drag_delta(
-    drag: AttachMouseResizeDrag,
-    mouse_event: MouseEvent,
+fn resize_drag_axis_delta(
+    axis_drag: Option<AttachMouseResizeAxisDrag>,
+    delta: i32,
 ) -> Option<(
     Uuid,
     bmux_windows_plugin_api::windows_commands::PaneResizeDirection,
     u16,
 )> {
-    let delta = match drag.axis {
-        AttachMouseResizeAxis::Horizontal => {
-            i32::from(mouse_event.column) - i32::from(drag.last_column)
-        }
-        AttachMouseResizeAxis::Vertical => i32::from(mouse_event.row) - i32::from(drag.last_row),
-    };
+    let axis_drag = axis_drag?;
     if delta == 0 {
         return None;
     }
     let cells = u16::try_from(delta.unsigned_abs()).unwrap_or(u16::MAX);
     if delta > 0 {
-        Some((drag.positive_target_pane_id, drag.positive_direction, cells))
+        Some((
+            axis_drag.positive_target_pane_id,
+            axis_drag.positive_direction,
+            cells,
+        ))
     } else {
-        Some((drag.negative_target_pane_id, drag.negative_direction, cells))
+        Some((
+            axis_drag.negative_target_pane_id,
+            axis_drag.negative_direction,
+            cells,
+        ))
     }
 }
 
@@ -6921,44 +6937,63 @@ pub fn attach_scene_resize_separator_at(
         .filter_map(|surface| surface.pane_id.map(|pane_id| (pane_id, surface.rect)))
         .collect::<Vec<_>>();
 
+    let mut horizontal: Option<AttachMouseResizeAxisDrag> = None;
+    let mut vertical: Option<AttachMouseResizeAxisDrag> = None;
+
     for (first_pane, first_rect) in &pane_surfaces {
         for (second_pane, second_rect) in &pane_surfaces {
             if first_pane == second_pane {
                 continue;
             }
-            if let Some(drag) = vertical_resize_drag(
-                *first_pane,
-                *first_rect,
-                *second_pane,
-                *second_rect,
-                column,
-                row,
-            ) {
-                return Some(drag);
+            if horizontal.is_none()
+                && let Some(drag) = vertical_resize_axis_drag(
+                    *first_pane,
+                    *first_rect,
+                    *second_pane,
+                    *second_rect,
+                    column,
+                    row,
+                )
+            {
+                horizontal = Some(drag);
             }
-            if let Some(drag) = horizontal_resize_drag(
-                *first_pane,
-                *first_rect,
-                *second_pane,
-                *second_rect,
-                column,
-                row,
-            ) {
-                return Some(drag);
+            if vertical.is_none()
+                && let Some(drag) = horizontal_resize_axis_drag(
+                    *first_pane,
+                    *first_rect,
+                    *second_pane,
+                    *second_rect,
+                    column,
+                    row,
+                )
+            {
+                vertical = Some(drag);
+            }
+            if horizontal.is_some() && vertical.is_some() {
+                break;
             }
         }
+        if horizontal.is_some() && vertical.is_some() {
+            break;
+        }
     }
-    None
+
+    (horizontal.is_some() || vertical.is_some()).then_some(AttachMouseResizeDrag {
+        horizontal,
+        vertical,
+        last_column: column,
+        last_row: row,
+    })
 }
 
-fn vertical_resize_drag(
+fn vertical_resize_axis_drag(
     left_pane: Uuid,
     left_rect: bmux_ipc::AttachRect,
     right_pane: Uuid,
     right_rect: bmux_ipc::AttachRect,
     column: u16,
     row: u16,
-) -> Option<AttachMouseResizeDrag> {
+) -> Option<AttachMouseResizeAxisDrag> {
     let left_max_x = rect_max_x(left_rect)?;
     if left_max_x.saturating_add(1) != right_rect.x {
         return None;
@@ -6975,25 +7010,22 @@ fn vertical_resize_drag(
     if column != left_max_x && column != right_rect.x {
         return None;
     }
-    Some(AttachMouseResizeDrag {
-        axis: AttachMouseResizeAxis::Horizontal,
+    Some(AttachMouseResizeAxisDrag {
         positive_target_pane_id: left_pane,
         positive_direction: bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right,
         negative_target_pane_id: right_pane,
         negative_direction: bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Left,
-        last_column: column,
-        last_row: row,
     })
 }
 
-fn horizontal_resize_drag(
+fn horizontal_resize_axis_drag(
     top_pane: Uuid,
     top_rect: bmux_ipc::AttachRect,
     bottom_pane: Uuid,
     bottom_rect: bmux_ipc::AttachRect,
     column: u16,
     row: u16,
-) -> Option<AttachMouseResizeDrag> {
+) -> Option<AttachMouseResizeAxisDrag> {
     let top_max_y = rect_max_y(top_rect)?;
     if top_max_y.saturating_add(1) != bottom_rect.y {
         return None;
@@ -7010,14 +7042,11 @@ fn horizontal_resize_drag(
     if row != top_max_y && row != bottom_rect.y {
         return None;
     }
-    Some(AttachMouseResizeDrag {
-        axis: AttachMouseResizeAxis::Vertical,
+    Some(AttachMouseResizeAxisDrag {
         positive_target_pane_id: top_pane,
         positive_direction: bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Down,
         negative_target_pane_id: bottom_pane,
         negative_direction: bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Up,
-        last_column: column,
-        last_row: row,
     })
 }
 
@@ -8793,15 +8822,16 @@ mod tests {
 
         let drag = attach_scene_resize_separator_at(&view_state, 9, 3)
             .expect("separator should be detected");
-        assert_eq!(drag.axis, AttachMouseResizeAxis::Horizontal);
-        assert_eq!(drag.positive_target_pane_id, left_pane);
+        assert!(drag.vertical.is_none());
+        let horizontal = drag.horizontal.expect("horizontal drag axis");
+        assert_eq!(horizontal.positive_target_pane_id, left_pane);
         assert_eq!(
-            drag.positive_direction,
+            horizontal.positive_direction,
             bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right
         );
-        assert_eq!(drag.negative_target_pane_id, right_pane);
+        assert_eq!(horizontal.negative_target_pane_id, right_pane);
         assert_eq!(
-            drag.negative_direction,
+            horizontal.negative_direction,
             bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Left
         );
         assert!(attach_scene_resize_separator_at(&view_state, 4, 3).is_none());
@@ -8852,44 +8882,109 @@ mod tests {
 
         let drag = attach_scene_resize_separator_at(&view_state, 12, 5)
             .expect("separator should be detected");
-        assert_eq!(drag.axis, AttachMouseResizeAxis::Vertical);
-        assert_eq!(drag.positive_target_pane_id, top_pane);
+        assert!(drag.horizontal.is_none());
+        let vertical = drag.vertical.expect("vertical drag axis");
+        assert_eq!(vertical.positive_target_pane_id, top_pane);
         assert_eq!(
-            drag.positive_direction,
+            vertical.positive_direction,
             bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Down
         );
-        assert_eq!(drag.negative_target_pane_id, bottom_pane);
+        assert_eq!(vertical.negative_target_pane_id, bottom_pane);
         assert_eq!(
-            drag.negative_direction,
+            vertical.negative_direction,
             bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Up
         );
         assert!(attach_scene_resize_separator_at(&view_state, 12, 2).is_none());
     }
 
     #[test]
-    fn resize_drag_delta_maps_motion_to_target_direction_and_cells() {
+    fn attach_scene_resize_separator_detects_corner_boundary() {
+        let session_id = Uuid::new_v4();
+        let top_left = Uuid::new_v4();
+        let top_right = Uuid::new_v4();
+        let bottom_left = Uuid::new_v4();
+        let bottom_right = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: top_left,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id: top_left },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id: top_left },
+                surfaces: vec![
+                    test_pane_surface(
+                        top_left,
+                        AttachRect {
+                            x: 0,
+                            y: 0,
+                            w: 10,
+                            h: 5,
+                        },
+                    ),
+                    test_pane_surface(
+                        top_right,
+                        AttachRect {
+                            x: 10,
+                            y: 0,
+                            w: 10,
+                            h: 5,
+                        },
+                    ),
+                    test_pane_surface(
+                        bottom_left,
+                        AttachRect {
+                            x: 0,
+                            y: 5,
+                            w: 10,
+                            h: 5,
+                        },
+                    ),
+                    test_pane_surface(
+                        bottom_right,
+                        AttachRect {
+                            x: 10,
+                            y: 5,
+                            w: 10,
+                            h: 5,
+                        },
+                    ),
+                ],
+            },
+            zoomed: false,
+        });
+
+        let drag = attach_scene_resize_separator_at(&view_state, 9, 4)
+            .expect("corner separator should be detected");
+        let horizontal = drag.horizontal.expect("horizontal drag axis");
+        let vertical = drag.vertical.expect("vertical drag axis");
+        assert_eq!(horizontal.positive_target_pane_id, top_left);
+        assert_eq!(horizontal.negative_target_pane_id, top_right);
+        assert_eq!(vertical.positive_target_pane_id, top_left);
+        assert_eq!(vertical.negative_target_pane_id, bottom_left);
+    }
+
+    #[test]
+    fn resize_drag_axis_delta_maps_motion_to_target_direction_and_cells() {
         let left_pane = Uuid::new_v4();
         let right_pane = Uuid::new_v4();
-        let drag = AttachMouseResizeDrag {
-            axis: AttachMouseResizeAxis::Horizontal,
+        let drag = AttachMouseResizeAxisDrag {
             positive_target_pane_id: left_pane,
             positive_direction:
                 bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right,
             negative_target_pane_id: right_pane,
             negative_direction:
                 bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Left,
-            last_column: 10,
-            last_row: 4,
         };
 
-        let right_event = MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: 13,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        };
         let (target, direction, cells) =
-            resize_drag_delta(drag, right_event).expect("rightward drag should resize");
+            resize_drag_axis_delta(Some(drag), 3).expect("rightward drag should resize");
         assert_eq!(target, left_pane);
         assert_eq!(
             direction,
@@ -8897,20 +8992,16 @@ mod tests {
         );
         assert_eq!(cells, 3);
 
-        let left_event = MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: 8,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        };
         let (target, direction, cells) =
-            resize_drag_delta(drag, left_event).expect("leftward drag should resize");
+            resize_drag_axis_delta(Some(drag), -2).expect("leftward drag should resize");
         assert_eq!(target, right_pane);
         assert_eq!(
             direction,
             bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Left
         );
         assert_eq!(cells, 2);
+        assert!(resize_drag_axis_delta(Some(drag), 0).is_none());
+        assert!(resize_drag_axis_delta(None, 2).is_none());
     }
 
     #[test]
