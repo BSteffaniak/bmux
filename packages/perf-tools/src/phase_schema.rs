@@ -24,6 +24,17 @@ pub(crate) fn validate_phase_schema(events: &[Value]) -> Result<(), Vec<String>>
 fn required_fields(phase: &str) -> &'static [&'static str] {
     if phase == "plugin.command" {
         &["plugin_id", "command_name", "total_us"]
+    } else if phase == "plugin.command.invoke" {
+        &["plugin_id", "command_name", "backend", "total_us"]
+    } else if phase == "plugin.load" {
+        &["plugin_id", "backend", "total_us"]
+    } else if phase == "plugin.lifecycle.activate"
+        || phase == "plugin.lifecycle.invoke"
+        || phase == "plugin.typed_services.collect"
+    {
+        &["plugin_id", "total_us"]
+    } else if phase == "plugin.process.invoke" {
+        &["plugin_id", "runtime", "operation", "total_us"]
     } else if phase.starts_with("service.") || phase == "plugin.native_service_invoke" {
         &[
             "capability",
@@ -32,6 +43,8 @@ fn required_fields(phase: &str) -> &'static [&'static str] {
             "operation",
             "total_us",
         ]
+    } else if phase.starts_with("plugin.") {
+        &["total_us"]
     } else if phase.starts_with("ipc.") {
         &["request", "response", "total_us"]
     } else if phase.starts_with("storage.") || phase.starts_with("volatile_state.") {
@@ -68,6 +81,28 @@ mod tests {
             "phase": "plugin.command",
             "plugin_id": "bmux.example",
             "command_name": "do-work",
+            "total_us": 1,
+        })];
+        assert!(validate_phase_schema(&events).is_ok());
+    }
+
+    #[test]
+    fn validates_plugin_lifecycle_required_fields() {
+        let events = vec![json!({
+            "phase": "plugin.lifecycle.activate",
+            "plugin_id": "bmux.example",
+            "total_us": 1,
+        })];
+        assert!(validate_phase_schema(&events).is_ok());
+    }
+
+    #[test]
+    fn validates_plugin_command_invoke_required_fields() {
+        let events = vec![json!({
+            "phase": "plugin.command.invoke",
+            "plugin_id": "bmux.example",
+            "command_name": "do-work",
+            "backend": "static",
             "total_us": 1,
         })];
         assert!(validate_phase_schema(&events).is_ok());

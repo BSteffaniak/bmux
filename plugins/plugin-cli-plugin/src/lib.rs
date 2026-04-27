@@ -46,7 +46,7 @@ impl RustPlugin for PluginCliPlugin {
 }
 
 fn emit_phase_timing(command: &str, total_us: u128, result: &Result<i32, PluginCommandError>) {
-    let payload = PhasePayload::new("plugin.command")
+    let payload = PhasePayload::new("bmux.plugin_cli.command")
         .field("plugin_id", "bmux.plugin_cli")
         .field("command_name", command)
         .field("total_us", total_us)

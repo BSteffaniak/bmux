@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_plugin::{
-    PluginManifest, PluginRegistry, load_registered_plugin as load_native_registered_plugin,
+    PluginManifest, PluginRegistry, PluginRuntime,
+    load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
@@ -219,14 +220,30 @@ pub(super) fn load_plugin(
 }
 
 pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<PluginRegistry> {
+    let total_started = Instant::now();
     let workspace_bundled_root = workspace_bundled_plugin_root();
     let search_paths = resolve_plugin_search_paths(config, paths)?;
+    let search_root_count = search_paths.len();
+    let discover_started = Instant::now();
     let reports = bmux_plugin::discover_plugin_manifests_in_roots(&search_paths)?;
+    let discover_us = discover_started.elapsed().as_micros();
+    let manifest_count = reports
+        .iter()
+        .map(|report| report.manifest_paths.len())
+        .sum::<usize>();
     let mut registry = PluginRegistry::new();
 
+    let static_started = Instant::now();
     // Register statically-linked bundled plugins first (behind feature flags).
     register_static_bundled_plugins(&mut registry);
+    let static_register_us = static_started.elapsed().as_micros();
+    let static_bundled_count = registry
+        .iter()
+        .filter(|plugin| plugin.bundled_static)
+        .count();
 
+    let filesystem_started = Instant::now();
+    let mut filesystem_registered_count = 0_usize;
     for report in reports {
         for manifest_path in report.manifest_paths {
             if workspace_bundled_root
@@ -277,6 +294,8 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
                                 manifest_path.display()
                             );
                         }
+                    } else {
+                        filesystem_registered_count += 1;
                     }
                 }
                 Err(error) => {
@@ -288,6 +307,19 @@ pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resul
             }
         }
     }
+    let filesystem_register_us = filesystem_started.elapsed().as_micros();
+    emit_plugin_runtime_phase_timing(
+        &PhasePayload::new("plugin.registry_scan")
+            .field("search_root_count", search_root_count)
+            .field("manifest_count", manifest_count)
+            .field("static_bundled_count", static_bundled_count)
+            .field("filesystem_registered_count", filesystem_registered_count)
+            .field("discover_us", discover_us)
+            .field("static_register_us", static_register_us)
+            .field("filesystem_register_us", filesystem_register_us)
+            .field("total_us", total_started.elapsed().as_micros())
+            .finish(),
+    );
     Ok(registry)
 }
 
@@ -405,6 +437,10 @@ fn emit_runtime_state_phase_timing(config_us: u128, scan_us: u128, build_us: u12
         .field("total_us", config_us + scan_us + build_us)
         .finish();
     emit_phase_timing(PhaseChannel::Plugin, &payload);
+}
+
+fn emit_plugin_runtime_phase_timing(payload: &serde_json::Value) {
+    emit_phase_timing(PhaseChannel::Plugin, payload);
 }
 
 pub(super) fn resolve_plugin_search_paths(
@@ -718,8 +754,16 @@ pub(super) fn load_enabled_plugins(
     config: &BmuxConfig,
     registry: &PluginRegistry,
 ) -> Result<Vec<bmux_plugin::LoadedPlugin>> {
+    let total_started = Instant::now();
     let enabled_plugins = effective_enabled_plugins(config, registry);
     if enabled_plugins.is_empty() {
+        emit_plugin_runtime_phase_timing(
+            &PhasePayload::new("plugin.load_all")
+                .field("enabled_count", 0_usize)
+                .field("loaded_count", 0_usize)
+                .field("total_us", total_started.elapsed().as_micros())
+                .finish(),
+        );
         return Ok(Vec::new());
     }
 
@@ -755,9 +799,36 @@ pub(super) fn load_enabled_plugins(
     let mut loaded_plugins = Vec::with_capacity(ordered_plugins.len());
     for plugin in ordered_plugins {
         let plugin_id = plugin.declaration.id.as_str();
+        let load_started = Instant::now();
+        let backend = if plugin.bundled_static {
+            "static"
+        } else if plugin.manifest.runtime == PluginRuntime::Process {
+            "process"
+        } else {
+            "dynamic"
+        };
         let loaded = match load_plugin(plugin, &host, &available_capabilities) {
-            Ok(loaded) => loaded,
+            Ok(loaded) => {
+                emit_plugin_runtime_phase_timing(
+                    &PhasePayload::new("plugin.load")
+                        .field("plugin_id", plugin_id)
+                        .field("backend", backend)
+                        .field("bundled_static", plugin.bundled_static)
+                        .field("total_us", load_started.elapsed().as_micros())
+                        .finish(),
+                );
+                loaded
+            }
             Err(error) => {
+                emit_plugin_runtime_phase_timing(
+                    &PhasePayload::new("plugin.load")
+                        .field("plugin_id", plugin_id)
+                        .field("backend", backend)
+                        .field("bundled_static", plugin.bundled_static)
+                        .field("error", error.to_string())
+                        .field("total_us", load_started.elapsed().as_micros())
+                        .finish(),
+                );
                 if explicitly_enabled.contains(plugin_id) {
                     return Err(error)
                         .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"));
@@ -768,6 +839,14 @@ pub(super) fn load_enabled_plugins(
         };
         loaded_plugins.push(loaded);
     }
+
+    emit_plugin_runtime_phase_timing(
+        &PhasePayload::new("plugin.load_all")
+            .field("enabled_count", enabled_plugins.len())
+            .field("loaded_count", loaded_plugins.len())
+            .field("total_us", total_started.elapsed().as_micros())
+            .finish(),
+    );
 
     Ok(loaded_plugins)
 }
@@ -972,11 +1051,15 @@ thread_local! {
 /// combined map on the thread-local registry. Also declares each
 /// plugin's ready signals on the thread-local [`ReadyTracker`] so
 /// consumers can wait for specific signals to flip.
+// Kept together so typed-service context construction, registry install, and
+// readiness declaration remain auditable as one startup phase.
+#[allow(clippy::too_many_lines)]
 fn install_typed_service_registry(
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
     config: &BmuxConfig,
     paths: &ConfigPaths,
 ) {
+    let total_started = Instant::now();
     // Build a bridge that plugins may stash inside their typed
     // service handles. It shares the same dispatch function as the
     // per-activation bridge in `plugin_lifecycle_context`, so host
@@ -1033,6 +1116,7 @@ fn install_typed_service_registry(
         bmux_plugin_sdk::TypedServiceHandle,
     > = std::collections::BTreeMap::new();
     for plugin in loaded_plugins {
+        let collect_started = Instant::now();
         let required_caps: Vec<String> = plugin
             .declaration
             .required_capabilities
@@ -1058,10 +1142,20 @@ fn install_typed_service_registry(
             connection: &host_connection,
             plugin_settings_map: &plugin_settings_map,
         };
-        for (key, handle) in plugin.collect_typed_services(context).into_entries() {
+        let entries = plugin.collect_typed_services(context).into_entries();
+        let service_count = entries.len();
+        for (key, handle) in entries {
             map.insert(key, handle);
         }
+        emit_plugin_runtime_phase_timing(
+            &PhasePayload::new("plugin.typed_services.collect")
+                .field("plugin_id", plugin.declaration.id.as_str())
+                .field("service_count", service_count)
+                .field("total_us", collect_started.elapsed().as_micros())
+                .finish(),
+        );
     }
+    let total_service_count = map.len();
     TYPED_SERVICE_REGISTRY.with(|cell| {
         *cell.borrow_mut() = std::sync::Arc::new(map);
     });
@@ -1075,6 +1169,13 @@ fn install_typed_service_registry(
             );
         }
     });
+    emit_plugin_runtime_phase_timing(
+        &PhasePayload::new("plugin.typed_services.collect_all")
+            .field("plugin_count", loaded_plugins.len())
+            .field("service_count", total_service_count)
+            .field("total_us", total_started.elapsed().as_micros())
+            .finish(),
+    );
 }
 
 /// Flip every ready signal declared by `plugin` to
@@ -1202,11 +1303,15 @@ fn block_on_future<T>(
     }
 }
 
+// Kept together so activation, rollback, readiness, and service-location state
+// stay consistent across all plugins.
+#[allow(clippy::too_many_lines)]
 pub(super) fn activate_loaded_plugins(
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
     config: &BmuxConfig,
     paths: &ConfigPaths,
 ) -> Result<()> {
+    let total_started = Instant::now();
     // Snapshot the typed services each plugin exposes before we
     // activate anyone; bundled plugins can have their typed handles
     // harvested without side effects, and consumers that resolve a
@@ -1247,11 +1352,13 @@ pub(super) fn activate_loaded_plugins(
         .map(|plugin| plugin.declaration.id.as_str().to_string())
         .collect::<Vec<_>>();
     let registered_plugins = registered_plugin_infos_from_loaded(loaded_plugins);
+    let mut activated_count = 0_usize;
     for plugin in loaded_plugins {
         if !plugin.declaration.lifecycle.activate_on_startup {
             continue;
         }
 
+        let activate_started = Instant::now();
         let context = plugin_lifecycle_context(
             config,
             paths,
@@ -1264,6 +1371,14 @@ pub(super) fn activate_loaded_plugins(
         );
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
         if let Err(error) = plugin.activate(&context) {
+            emit_plugin_runtime_phase_timing(
+                &PhasePayload::new("plugin.lifecycle.activate")
+                    .field("plugin_id", plugin.declaration.id.as_str())
+                    .field("ready_signal_count", plugin.declaration.ready_signals.len())
+                    .field("error", error.to_string())
+                    .field("total_us", activate_started.elapsed().as_micros())
+                    .finish(),
+            );
             for activated_plugin in activated.into_iter().rev() {
                 let context = plugin_lifecycle_context(
                     config,
@@ -1292,6 +1407,15 @@ pub(super) fn activate_loaded_plugins(
             });
         }
 
+        emit_plugin_runtime_phase_timing(
+            &PhasePayload::new("plugin.lifecycle.activate")
+                .field("plugin_id", plugin.declaration.id.as_str())
+                .field("ready_signal_count", plugin.declaration.ready_signals.len())
+                .field("status", 0_i32)
+                .field("total_us", activate_started.elapsed().as_micros())
+                .finish(),
+        );
+        activated_count += 1;
         activated.push(plugin);
         mark_plugin_ready_signals(plugin);
         // Record that this process holds the activated provider for
@@ -1302,6 +1426,14 @@ pub(super) fn activate_loaded_plugins(
         // here via `Request::InvokeService`.
         bmux_plugin::global_service_locations().mark_local(plugin.declaration.id.as_str());
     }
+
+    emit_plugin_runtime_phase_timing(
+        &PhasePayload::new("plugin.lifecycle.activate_all")
+            .field("plugin_count", loaded_plugins.len())
+            .field("activated_count", activated_count)
+            .field("total_us", total_started.elapsed().as_micros())
+            .finish(),
+    );
 
     Ok(())
 }

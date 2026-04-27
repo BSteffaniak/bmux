@@ -175,6 +175,72 @@ tags = ["plugin"]
 allow_empty = true
 
 [[reports]]
+phase = "plugin.registry_scan"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "plugin.load_all"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "plugin.load"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "plugin.typed_services.collect_all"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "plugin.typed_services.collect"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "bmux.windows.typed_services"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "bmux.windows.typed_services"
+field = "subscriber_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "bmux.windows.typed_services"
+field = "snapshot_publish_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "plugin.lifecycle.activate_all"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "plugin.lifecycle.activate"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "plugin.lifecycle.invoke"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
 phase = "plugin.command"
 field = "total_us"
 tags = ["plugin"]
@@ -182,6 +248,48 @@ filters = [
   { key = "plugin_id", value = "bmux.windows" },
   { key = "command_name", value = "${command_name}" },
 ]
+
+[[reports]]
+phase = "plugin.command.invoke"
+field = "total_us"
+tags = ["plugin"]
+filters = [
+  { key = "plugin_id", value = "bmux.windows" },
+  { key = "command_name", value = "${command_name}" },
+]
+
+[[reports]]
+phase = "plugin.command.invoke"
+field = "encode_us"
+tags = ["plugin"]
+filters = [
+  { key = "plugin_id", value = "bmux.windows" },
+  { key = "command_name", value = "${command_name}" },
+]
+
+[[reports]]
+phase = "plugin.command.invoke"
+field = "call_us"
+tags = ["plugin"]
+filters = [
+  { key = "plugin_id", value = "bmux.windows" },
+  { key = "command_name", value = "${command_name}" },
+]
+
+[[reports]]
+phase = "plugin.command.invoke"
+field = "outcome_us"
+tags = ["plugin"]
+filters = [
+  { key = "plugin_id", value = "bmux.windows" },
+  { key = "command_name", value = "${command_name}" },
+]
+
+[[reports]]
+phase = "plugin.process.invoke"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
 
 [[reports]]
 phase = "plugin.command"

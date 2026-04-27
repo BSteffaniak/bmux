@@ -114,12 +114,13 @@ Profile metadata lives in `perf/profiles.toml`.
 Plugin-owned benchmark coverage should be added without special host code whenever possible:
 
 1. Emit runtime phases through `bmux_plugin_sdk::perf_telemetry` or `bmux_perf_telemetry` directly.
-2. Use `PhaseChannel::Plugin` for plugin command/service internals. The stable command phase is `plugin.command` with `plugin_id`, `command_name`, and `total_us`.
-3. If a plugin has useful internal attribution, emit namespaced phases such as `plugin.<short-name>.<operation>` and include `plugin_id`, `operation`, and `total_us`.
-4. Keep emitters gated by `PhaseChannel::enabled()` or `emit(...)`; never compute expensive diagnostic payloads when the channel is disabled.
-5. Add reports to a `perf/*.toml` manifest using `tags = ["plugin"]` for diagnostic-only attribution.
-6. Keep SLO limits in the manifest. Runtime/plugin code should not contain benchmark thresholds.
-7. Prefer generic setup/previsit/measured stages over benchmark-only command shortcuts. If a cold path matters, report it separately from warmed SLOs.
+2. Use `PhaseChannel::Plugin` for plugin command/service internals. The stable host command phase is `plugin.command` with `plugin_id`, `command_name`, and `total_us`.
+3. Host-owned cold-start phases use generic names such as `plugin.registry_scan`, `plugin.load`, `plugin.typed_services.collect`, `plugin.lifecycle.activate`, `plugin.command.invoke`, and `plugin.process.invoke`.
+4. If a plugin has useful internal attribution, emit namespaced phases such as `bmux.<short-name>.<operation>` and include `plugin_id`, `operation`, and `total_us`.
+5. Keep emitters gated by `PhaseChannel::enabled()` or `emit(...)`; never compute expensive diagnostic payloads when the channel is disabled.
+6. Add reports to a `perf/*.toml` manifest using `tags = ["plugin"]` for diagnostic-only attribution.
+7. Keep SLO limits in the manifest. Runtime/plugin code should not contain benchmark thresholds.
+8. Prefer generic setup/previsit/measured stages over benchmark-only command shortcuts. If a cold path matters, report it separately from warmed SLOs.
 
 The benchmark runner forwards all standard phase channels when their profile enables them. Plugin owners should not need bespoke stderr parsing or shell wrappers for phase collection.
 

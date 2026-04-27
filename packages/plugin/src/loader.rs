@@ -150,10 +150,34 @@ impl ProcessPluginRuntime {
         argv: &[String],
         request: &ProcessInvocationRequest,
     ) -> Result<(Option<ProcessInvocationResponse>, std::process::ExitStatus)> {
-        if self.persistent_worker {
-            return self.invoke_persistent(plugin_id, request);
+        let started = Instant::now();
+        let result = if self.persistent_worker {
+            self.invoke_persistent(plugin_id, request)
+        } else {
+            self.invoke_one_shot(plugin_id, argv, request)
+        };
+        let mut payload = PhasePayload::new("plugin.process.invoke")
+            .field("plugin_id", plugin_id)
+            .field(
+                "runtime",
+                if self.persistent_worker {
+                    "persistent"
+                } else {
+                    "one_shot"
+                },
+            )
+            .field("operation", process_request_operation(request))
+            .field("total_us", started.elapsed().as_micros());
+        match &result {
+            Ok((_response, status)) => {
+                payload = payload.field("status", status.code().unwrap_or(0));
+            }
+            Err(error) => {
+                payload = payload.field("error", error.to_string());
+            }
         }
-        self.invoke_one_shot(plugin_id, argv, request)
+        emit_phase_timing(PhaseChannel::Plugin, &payload.finish());
+        result
     }
 
     // Keep one-shot protocol handling in a single flow so timeout and stderr behavior stay obvious.
@@ -507,6 +531,15 @@ impl ProcessPluginRuntime {
             stdout: BufReader::new(stdout),
             stderr_capture,
         })
+    }
+}
+
+const fn process_request_operation(request: &ProcessInvocationRequest) -> &'static str {
+    match request {
+        ProcessInvocationRequest::Command { .. } => "command",
+        ProcessInvocationRequest::Lifecycle { .. } => "lifecycle",
+        ProcessInvocationRequest::Event { .. } => "event",
+        ProcessInvocationRequest::Service { .. } => "service",
     }
 }
 
@@ -1558,6 +1591,14 @@ pub struct LoadedPlugin {
 }
 
 impl LoadedPlugin {
+    const fn backend_kind(&self) -> &'static str {
+        match &self.backend {
+            PluginBackend::Static(_) => "static",
+            PluginBackend::Dynamic(_) => "dynamic",
+            PluginBackend::Process(_) => "process",
+        }
+    }
+
     /// Collect the typed service registrations exposed by this plugin.
     ///
     /// For statically-linked bundled plugins that share the process
@@ -1672,12 +1713,16 @@ impl LoadedPlugin {
     /// command symbol cannot be loaded, or any command input contains an
     /// interior NUL byte.
     ///
+    // Keep command dispatch in one place so static, dynamic, process, and
+    // legacy-symbol paths share identical validation and telemetry behavior.
+    #[allow(clippy::too_many_lines)]
     pub fn run_command_with_context_and_outcome(
         &self,
         command_name: &str,
         arguments: &[String],
         context: Option<&NativeCommandContext>,
     ) -> Result<(i32, bmux_plugin_sdk::PluginCommandOutcome)> {
+        let total_started = Instant::now();
         if !self.supports_command(command_name) {
             return Err(PluginError::UnknownPluginCommand {
                 plugin_id: self.declaration.id.as_str().to_string(),
@@ -1686,37 +1731,71 @@ impl LoadedPlugin {
         }
 
         if let Some(context) = context {
+            let encode_started = Instant::now();
             let payload = encode_service_message(context).map_err(|_| {
                 PluginError::InvalidNativeCommandInput {
                     plugin_id: self.declaration.id.as_str().to_string(),
                     field: "context",
                 }
             })?;
+            let encode_us = encode_started.elapsed().as_micros();
 
             match &self.backend {
                 PluginBackend::Static(vtable) => {
+                    let call_started = Instant::now();
                     bmux_plugin_sdk::begin_command_outcome_capture();
                     let _ = bmux_plugin_sdk::take_last_command_error();
                     let status = (vtable.run_command_with_context)(payload.as_ptr(), payload.len());
+                    let call_us = call_started.elapsed().as_micros();
+                    let outcome_started = Instant::now();
                     let mut outcome = bmux_plugin_sdk::finish_command_outcome_capture();
                     if let Some(error) = bmux_plugin_sdk::take_last_command_error() {
                         outcome.error_message = Some(error.message);
                     }
+                    emit_plugin_command_invoke_phase(
+                        self,
+                        command_name,
+                        payload.len(),
+                        encode_us,
+                        0,
+                        call_us,
+                        outcome_started.elapsed().as_micros(),
+                        total_started.elapsed().as_micros(),
+                        status,
+                        outcome.error_message.as_deref(),
+                    );
                     return Ok((status, outcome));
                 }
                 PluginBackend::Dynamic(library) => {
+                    let symbol_started = Instant::now();
                     if let Ok(command_symbol) = unsafe {
                         library.get::<NativeRunCommandWithContextFn>(
                             DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL.as_bytes(),
                         )
                     } {
+                        let symbol_resolve_us = symbol_started.elapsed().as_micros();
+                        let call_started = Instant::now();
                         bmux_plugin_sdk::begin_command_outcome_capture();
                         let _ = bmux_plugin_sdk::take_last_command_error();
                         let status = unsafe { command_symbol(payload.as_ptr(), payload.len()) };
+                        let call_us = call_started.elapsed().as_micros();
+                        let outcome_started = Instant::now();
                         let mut outcome = bmux_plugin_sdk::finish_command_outcome_capture();
                         if let Some(error) = bmux_plugin_sdk::take_last_command_error() {
                             outcome.error_message = Some(error.message);
                         }
+                        emit_plugin_command_invoke_phase(
+                            self,
+                            command_name,
+                            payload.len(),
+                            encode_us,
+                            symbol_resolve_us,
+                            call_us,
+                            outcome_started.elapsed().as_micros(),
+                            total_started.elapsed().as_micros(),
+                            status,
+                            outcome.error_message.as_deref(),
+                        );
                         return Ok((status, outcome));
                     }
                 }
@@ -1739,6 +1818,7 @@ impl LoadedPlugin {
             });
         };
 
+        let command_name_for_metrics = command_name;
         let command_name =
             CString::new(command_name).map_err(|_| PluginError::InvalidNativeCommandInput {
                 plugin_id: self.declaration.id.as_str().to_string(),
@@ -1760,6 +1840,7 @@ impl LoadedPlugin {
             .map(|value| value.as_ptr())
             .collect::<Vec<_>>();
 
+        let symbol_started = Instant::now();
         let command_symbol: Symbol<'_, NativeRunCommandFn> = unsafe {
             library.get(DEFAULT_NATIVE_COMMAND_SYMBOL.as_bytes())
         }
@@ -1768,7 +1849,9 @@ impl LoadedPlugin {
             symbol: DEFAULT_NATIVE_COMMAND_SYMBOL.to_string(),
             details: error.to_string(),
         })?;
+        let symbol_resolve_us = symbol_started.elapsed().as_micros();
 
+        let call_started = Instant::now();
         let status = unsafe {
             command_symbol(
                 command_name.as_ptr(),
@@ -1776,6 +1859,20 @@ impl LoadedPlugin {
                 argument_ptrs.as_ptr(),
             )
         };
+        let call_us = call_started.elapsed().as_micros();
+
+        emit_plugin_command_invoke_phase(
+            self,
+            command_name_for_metrics,
+            0,
+            0,
+            symbol_resolve_us,
+            call_us,
+            0,
+            total_started.elapsed().as_micros(),
+            status,
+            None,
+        );
 
         Ok((status, bmux_plugin_sdk::PluginCommandOutcome::default()))
     }
@@ -2034,12 +2131,16 @@ impl LoadedPlugin {
     }
 
     fn run_lifecycle_symbol(&self, symbol: &str, context: &NativeLifecycleContext) -> Result<i32> {
+        let total_started = Instant::now();
+        let encode_started = Instant::now();
         let payload = encode_service_message(context).map_err(|_| {
             PluginError::InvalidNativeLifecycleInput {
                 plugin_id: self.declaration.id.as_str().to_string(),
             }
         })?;
+        let encode_us = encode_started.elapsed().as_micros();
 
+        let call_started = Instant::now();
         let status = match &self.backend {
             PluginBackend::Static(vtable) => {
                 let func = if symbol == DEFAULT_NATIVE_ACTIVATE_SYMBOL {
@@ -2102,6 +2203,21 @@ impl LoadedPlugin {
                 }
             }
         };
+        let call_us = call_started.elapsed().as_micros();
+
+        emit_phase_timing(
+            PhaseChannel::Plugin,
+            &PhasePayload::new("plugin.lifecycle.invoke")
+                .field("plugin_id", self.declaration.id.as_str())
+                .field("hook", lifecycle_hook_name(symbol))
+                .field("backend", self.backend_kind())
+                .field("encoded_context_len", payload.len())
+                .field("encode_us", encode_us)
+                .field("call_us", call_us)
+                .field("status", status)
+                .field("total_us", total_started.elapsed().as_micros())
+                .finish(),
+        );
 
         Ok(status)
     }
@@ -2156,6 +2272,45 @@ impl LoadedPlugin {
             status.code().unwrap_or(1),
             bmux_plugin_sdk::PluginCommandOutcome::default(),
         ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_plugin_command_invoke_phase(
+    plugin: &LoadedPlugin,
+    command_name: &str,
+    encoded_context_len: usize,
+    encode_us: u128,
+    symbol_resolve_us: u128,
+    call_us: u128,
+    outcome_us: u128,
+    total_us: u128,
+    status: i32,
+    error: Option<&str>,
+) {
+    let mut payload = PhasePayload::new("plugin.command.invoke")
+        .field("plugin_id", plugin.declaration.id.as_str())
+        .field("command_name", command_name)
+        .field("backend", plugin.backend_kind())
+        .field("encoded_context_len", encoded_context_len)
+        .field("encode_us", encode_us)
+        .field("symbol_resolve_us", symbol_resolve_us)
+        .field("call_us", call_us)
+        .field("outcome_us", outcome_us)
+        .field("status", status)
+        .field("total_us", total_us);
+    if let Some(error) = error {
+        payload = payload.field("error", error);
+    }
+    emit_phase_timing(PhaseChannel::Plugin, &payload.finish());
+}
+
+#[allow(clippy::missing_const_for_fn)] // const str matching is not stable on this toolchain.
+fn lifecycle_hook_name(symbol: &str) -> &'static str {
+    match symbol {
+        DEFAULT_NATIVE_ACTIVATE_SYMBOL => "activate",
+        DEFAULT_NATIVE_DEACTIVATE_SYMBOL => "deactivate",
+        _ => "unknown",
     }
 }
 

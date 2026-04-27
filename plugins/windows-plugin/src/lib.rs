@@ -10,7 +10,7 @@ use bmux_plugin_sdk::{
     HostScope, StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext,
     TypedServiceRegistry, VolatileStateClearRequest, VolatileStateGetRequest,
     VolatileStateSetRequest,
-    perf_telemetry::{PhaseChannel, emit as emit_phase_timing},
+    perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing},
 };
 use bmux_windows_plugin_api::windows_commands::{
     self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, PaneResizeDirection,
@@ -33,6 +33,10 @@ const WINDOW_ORDER_KEY: &str = "windows.order";
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
+}
+
+fn emit_windows_plugin_phase_timing(payload: &serde_json::Value) {
+    emit_phase_timing(PhaseChannel::Plugin, payload);
 }
 
 /// Shared "last selected pane per client" map. Mutated by the
@@ -252,6 +256,7 @@ impl RustPlugin for WindowsPlugin {
         context: TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
+        let total_started = Instant::now();
         // Provider handles share the same `LastSelectedByClient` map
         // as the byte-encoded path on `WindowsPlugin` so state stays
         // consistent between transports.
@@ -268,6 +273,7 @@ impl RustPlugin for WindowsPlugin {
             return;
         };
 
+        let handles_started = Instant::now();
         let commands: Arc<dyn WindowsCommandsService + Send + Sync> =
             Arc::new(WindowsCommandsHandle::new(shared.clone()));
         registry.insert_typed::<dyn WindowsCommandsService + Send + Sync>(
@@ -285,6 +291,7 @@ impl RustPlugin for WindowsPlugin {
             windows_state::INTERFACE_ID,
             state,
         );
+        let handle_register_us = handles_started.elapsed().as_micros();
 
         // Spawn the contexts-events subscriber. The windows plugin is
         // an authoritative projection of context lifecycle: every
@@ -295,7 +302,9 @@ impl RustPlugin for WindowsPlugin {
         // Subscription happens here (not in `activate`) because
         // `TypedServiceCaller::from_registration_context` needs the
         // typed registration context that `activate` does not receive.
+        let subscriber_started = Instant::now();
         spawn_contexts_events_subscriber(shared.clone());
+        let subscriber_us = subscriber_started.elapsed().as_micros();
 
         // Publish the initial window-list snapshot populated from the
         // plugin's persisted `windows.order` storage projected through
@@ -317,7 +326,18 @@ impl RustPlugin for WindowsPlugin {
         // `<data_dir>/plugin-storage/bmux.windows/windows.order.bin`
         // by the kernel storage service, so the user sees their tab
         // order exactly as they left it before the server shutdown.
+        let snapshot_started = Instant::now();
         publish_window_list_snapshot(shared.caller.as_ref(), &shared.runtime_state);
+        let snapshot_publish_us = snapshot_started.elapsed().as_micros();
+        emit_windows_plugin_phase_timing(
+            &PhasePayload::new("bmux.windows.typed_services")
+                .field("plugin_id", "bmux.windows")
+                .field("handle_register_us", handle_register_us)
+                .field("subscriber_us", subscriber_us)
+                .field("snapshot_publish_us", snapshot_publish_us)
+                .field("total_us", total_started.elapsed().as_micros())
+                .finish(),
+        );
     }
 }
 
@@ -330,26 +350,23 @@ impl RustPlugin for WindowsPlugin {
 fn spawn_contexts_events_subscriber(shared: WindowsSharedState) {
     use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
 
-    let subscribe_result =
-        bmux_plugin::global_event_bus().subscribe::<ContextEvent>(&contexts_events::EVENT_KIND);
-    let mut rx = if let Ok(rx) = subscribe_result {
-        rx
-    } else {
-        // contexts-plugin hasn't registered its channel yet
-        // (unusual — should be a load-order issue). We retry once
-        // on a short delay; if that fails too, give up. Without
-        // the subscription, windows.order only updates when the
-        // user invokes windows-plugin commands directly.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let Ok(rx) =
-            bmux_plugin::global_event_bus().subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)
-        else {
-            return;
-        };
-        rx
-    };
-
     std::thread::spawn(move || {
+        let mut rx = if let Ok(rx) =
+            bmux_plugin::global_event_bus().subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)
+        {
+            rx
+        } else {
+            // Contexts may not have registered the channel yet during
+            // startup. Retry inside this worker so typed-service
+            // registration never pays the sleep on the critical path.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let Ok(rx) = bmux_plugin::global_event_bus()
+                .subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)
+            else {
+                return;
+            };
+            rx
+        };
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
