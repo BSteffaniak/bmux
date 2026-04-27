@@ -283,6 +283,7 @@ pub struct Envelope {
     pub version: ProtocolVersion,
     pub request_id: u64,
     pub kind: EnvelopeKind,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub payload: Vec<u8>,
 }
 
@@ -482,6 +483,7 @@ pub enum Request {
         kind: InvokeServiceKind,
         interface_id: String,
         operation: String,
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         payload: Vec<u8>,
     },
     /// Emit a wire-encoded payload onto the server's plugin event bus
@@ -494,6 +496,7 @@ pub enum Request {
     /// the same wire vocabulary regardless of which process owns it.
     EmitOnPluginBus {
         kind: String,
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         payload: Vec<u8>,
     },
     SubscribeEvents,
@@ -587,6 +590,7 @@ pub enum PaneState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachPaneChunk {
     pub pane_id: Uuid,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub data: Vec<u8>,
     /// Inclusive start offset (in pane output stream bytes) for `data`.
     ///
@@ -625,6 +629,7 @@ pub struct AttachPaneImage {
     pub protocol: AttachImageProtocol,
     /// Raw protocol bytes (sixel body, kitty payload, iTerm2 data),
     /// potentially compressed according to `compression`.
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub raw_data: Vec<u8>,
     /// Compression algorithm applied to `raw_data`.  `None` means the data
     /// is uncompressed.  The receiver must decompress before use.
@@ -912,6 +917,7 @@ pub enum RecordingEventKind {
 #[serde(rename_all = "snake_case")]
 pub enum RecordingPayload {
     Bytes {
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         data: Vec<u8>,
     },
     ServerEvent {
@@ -922,6 +928,7 @@ pub enum RecordingPayload {
         request_kind: String,
         exclusive: bool,
         /// Full request, binary-encoded.
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         request_data: Vec<u8>,
     },
     RequestDone {
@@ -930,8 +937,10 @@ pub enum RecordingPayload {
         response_kind: String,
         elapsed_ms: u64,
         /// Full request, binary-encoded.
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         request_data: Vec<u8>,
         /// Full response payload, binary-encoded.
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         response_data: Vec<u8>,
     },
     RequestError {
@@ -945,6 +954,7 @@ pub enum RecordingPayload {
         source: String,
         name: String,
         /// Pre-serialized JSON payload bytes.
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         payload: Vec<u8>,
     },
     /// A terminal image extracted from pane output.
@@ -958,6 +968,7 @@ pub enum RecordingPayload {
         pixel_width: u32,
         pixel_height: u32,
         /// Raw protocol bytes (sixel body, kitty payload, iTerm2 data).
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         data: Vec<u8>,
     },
 }
@@ -1020,6 +1031,7 @@ pub enum ResponsePayload {
         emitted: bool,
     },
     ServiceInvoked {
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         payload: Vec<u8>,
     },
     HelloNegotiated {
@@ -1115,6 +1127,7 @@ pub enum Event {
     PaneOutput {
         session_id: Uuid,
         pane_id: Uuid,
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         data: Vec<u8>,
         /// Inclusive start offset (in pane output stream bytes) for `data`.
         stream_start: u64,
@@ -1176,6 +1189,7 @@ pub enum Event {
         /// Canonical event kind (e.g. `"bmux.scene/scene-protocol"`).
         kind: String,
         /// `bmux_codec`-encoded typed payload.
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         payload: Vec<u8>,
     },
 }
@@ -1204,84 +1218,6 @@ where
     bmux_codec::from_bytes(bytes)
 }
 
-/// Decode the highest-volume request shapes without constructing the full serde
-/// deserializer state machine.
-///
-/// This preserves the existing wire format and intentionally returns `None`
-/// for any payload it cannot prove is exactly one of the supported layouts;
-/// callers should fall back to [`decode`] for compatibility.
-#[must_use]
-pub fn decode_request_fast(bytes: &[u8]) -> Option<Request> {
-    let mut cursor = FastRequestCursor::new(bytes);
-    let variant = cursor.read_u32()?;
-    let request = match variant {
-        1 => Request::Ping,
-        7 => Request::ServerStop,
-        8 => Request::InvokeService {
-            capability: cursor.read_string()?,
-            kind: match cursor.read_u32()? {
-                0 => InvokeServiceKind::Query,
-                1 => InvokeServiceKind::Command,
-                _ => return None,
-            },
-            interface_id: cursor.read_string()?,
-            operation: cursor.read_string()?,
-            payload: cursor.read_bytes_vec()?,
-        },
-        _ => return None,
-    };
-    cursor.is_finished().then_some(request)
-}
-
-struct FastRequestCursor<'a> {
-    input: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> FastRequestCursor<'a> {
-    const fn new(input: &'a [u8]) -> Self {
-        Self { input, offset: 0 }
-    }
-
-    fn remaining(&self) -> &'a [u8] {
-        &self.input[self.offset..]
-    }
-
-    fn read_u32(&mut self) -> Option<u32> {
-        let (value, consumed) = bmux_codec::varint::decode_u32(self.remaining())?;
-        self.offset = self.offset.checked_add(consumed)?;
-        Some(value)
-    }
-
-    fn read_usize(&mut self) -> Option<usize> {
-        let (value, consumed) = bmux_codec::varint::decode_usize(self.remaining())?;
-        self.offset = self.offset.checked_add(consumed)?;
-        Some(value)
-    }
-
-    fn read_slice(&mut self, len: usize) -> Option<&'a [u8]> {
-        let end = self.offset.checked_add(len)?;
-        let slice = self.input.get(self.offset..end)?;
-        self.offset = end;
-        Some(slice)
-    }
-
-    fn read_string(&mut self) -> Option<String> {
-        let len = self.read_usize()?;
-        let bytes = self.read_slice(len)?;
-        std::str::from_utf8(bytes).ok().map(ToString::to_string)
-    }
-
-    fn read_bytes_vec(&mut self) -> Option<Vec<u8>> {
-        let len = self.read_usize()?;
-        self.read_slice(len).map(<[u8]>::to_vec)
-    }
-
-    const fn is_finished(&self) -> bool {
-        self.offset == self.input.len()
-    }
-}
-
 // ── Shared display track types for recording files ───────────────────────────
 
 /// Display track event — shared type used by both the attach runtime's
@@ -1301,6 +1237,7 @@ pub enum DisplayTrackEvent {
         window_width_px: Option<u16>,
         window_height_px: Option<u16>,
         /// Pre-serialized terminal profile bytes (binary-encoded), or `None`.
+        #[serde(with = "bmux_codec::serde_bytes_vec::option")]
         terminal_profile: Option<Vec<u8>>,
     },
     Resize {
@@ -1308,6 +1245,7 @@ pub enum DisplayTrackEvent {
         rows: u16,
     },
     FrameBytes {
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
         data: Vec<u8>,
     },
     CursorSnapshot {
@@ -1436,52 +1374,6 @@ mod tests {
         let bytes = encode(&request).expect("request should encode");
         let decoded: Request = decode(&bytes).expect("request should decode");
         assert_eq!(decoded, request);
-    }
-
-    #[test]
-    fn decode_request_fast_accepts_hot_variants() {
-        let requests = [
-            Request::Ping,
-            Request::ServerStop,
-            Request::InvokeService {
-                capability: "bmux.test".into(),
-                kind: InvokeServiceKind::Query,
-                interface_id: "test-query/v1".into(),
-                operation: "get".into(),
-                payload: vec![1, 2, 3, 4],
-            },
-            Request::InvokeService {
-                capability: "bmux.test".into(),
-                kind: InvokeServiceKind::Command,
-                interface_id: "test-command/v1".into(),
-                operation: "set".into(),
-                payload: vec![255; 512],
-            },
-        ];
-
-        for request in requests {
-            let bytes = encode(&request).expect("request should encode");
-            assert_eq!(decode_request_fast(&bytes), Some(request));
-        }
-    }
-
-    #[test]
-    fn decode_request_fast_rejects_unsupported_or_invalid_payloads() {
-        let unsupported = Request::ServerStatus;
-        let mut trailing = encode(&Request::Ping).expect("request should encode");
-        trailing.push(0);
-
-        let mut invalid_utf8 = Vec::new();
-        bmux_codec::varint::encode_u32(&mut invalid_utf8, 8);
-        bmux_codec::varint::encode_usize(&mut invalid_utf8, 1);
-        invalid_utf8.push(0xFF);
-
-        assert_eq!(
-            decode_request_fast(&encode(&unsupported).expect("request should encode")),
-            None
-        );
-        assert_eq!(decode_request_fast(&trailing), None);
-        assert_eq!(decode_request_fast(&invalid_utf8), None);
     }
 
     #[test]

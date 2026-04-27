@@ -34,6 +34,141 @@ pub use de::from_bytes;
 pub use error::Error;
 pub use ser::to_vec;
 
+/// Serde adapter for `Vec<u8>` fields that are semantically raw bytes.
+///
+/// The bmux codec's sequence-of-`u8` and byte-buffer encodings are identical
+/// (`varint length + raw bytes`). Using this adapter lets those fields decode
+/// through `deserialize_byte_buf`, avoiding per-byte `SeqAccess` dispatch while
+/// keeping the wire format unchanged.
+pub mod serde_bytes_vec {
+    use serde::{Deserializer, Serializer, de::Visitor, ser::Serialize};
+    use std::fmt;
+
+    /// Serialize a byte vector as codec bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns any serializer error from the underlying format.
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(bytes)
+    }
+
+    /// Deserialize a byte vector through the format's byte-buffer path.
+    ///
+    /// # Errors
+    ///
+    /// Returns any deserializer error from the underlying format.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_byte_buf(ByteVecVisitor)
+    }
+
+    struct ByteVecVisitor;
+
+    impl<'de> Visitor<'de> for ByteVecVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a byte buffer")
+        }
+
+        fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_vec())
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value)
+        }
+    }
+
+    struct ByteSlice<'a>(&'a [u8]);
+
+    impl Serialize for ByteSlice<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_bytes(self.0)
+        }
+    }
+
+    /// Serde adapter for `Option<Vec<u8>>` fields that are semantically raw bytes.
+    pub mod option {
+        use super::{ByteSlice, ByteVecVisitor};
+        use serde::{Deserializer, Serializer, de::Visitor};
+        use std::fmt;
+
+        /// Serialize an optional byte vector as codec bytes when present.
+        ///
+        /// # Errors
+        ///
+        /// Returns any serializer error from the underlying format.
+        pub fn serialize<S>(bytes: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            match bytes {
+                Some(bytes) => serializer.serialize_some(&ByteSlice(bytes)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        /// Deserialize optional codec bytes into a byte vector when present.
+        ///
+        /// # Errors
+        ///
+        /// Returns any deserializer error from the underlying format.
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_option(OptionByteVecVisitor)
+        }
+
+        struct OptionByteVecVisitor;
+
+        impl<'de> Visitor<'de> for OptionByteVecVisitor {
+            type Value = Option<Vec<u8>>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an optional byte buffer")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer.deserialize_byte_buf(ByteVecVisitor).map(Some)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +577,58 @@ mod tests {
         let v: Vec<u8> = (0..=255).collect();
         let bytes = to_vec(&v).unwrap();
         assert_eq!(from_bytes::<Vec<u8>>(&bytes).unwrap(), v);
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct WithRawBytesAdapter {
+        name: String,
+        #[serde(with = "crate::serde_bytes_vec")]
+        payload: Vec<u8>,
+        #[serde(with = "crate::serde_bytes_vec::option")]
+        maybe_payload: Option<Vec<u8>>,
+    }
+
+    #[test]
+    fn raw_bytes_adapter_preserves_wire_format() {
+        #[derive(Serialize)]
+        struct PlainBytes<'a> {
+            name: &'a str,
+            payload: Vec<u8>,
+            maybe_payload: Option<Vec<u8>>,
+        }
+
+        let payload: Vec<u8> = (0..=255).cycle().take(1024).collect();
+        let adapted = WithRawBytesAdapter {
+            name: "bytes".into(),
+            payload: payload.clone(),
+            maybe_payload: Some(payload.clone()),
+        };
+        let plain = PlainBytes {
+            name: "bytes",
+            payload,
+            maybe_payload: adapted.maybe_payload.clone(),
+        };
+
+        let adapted_bytes = to_vec(&adapted).unwrap();
+        let plain_bytes = to_vec(&plain).unwrap();
+        assert_eq!(adapted_bytes, plain_bytes);
+        assert_eq!(
+            from_bytes::<WithRawBytesAdapter>(&adapted_bytes).unwrap(),
+            adapted
+        );
+    }
+
+    #[test]
+    fn raw_bytes_adapter_rejects_truncated_payload() {
+        let value = WithRawBytesAdapter {
+            name: "bytes".into(),
+            payload: vec![1, 2, 3, 4],
+            maybe_payload: None,
+        };
+        let mut bytes = to_vec(&value).unwrap();
+        bytes.pop();
+
+        assert!(from_bytes::<WithRawBytesAdapter>(&bytes).is_err());
     }
 
     // ── Struct with serde_json::Value field (stored as bytes) ────────────────
