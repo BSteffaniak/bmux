@@ -4832,8 +4832,8 @@ async fn handle_connection(
     // ── Request loop ─────────────────────────────────────────────────────
 
     loop {
-        let envelope = match reader.recv_envelope().await {
-            Ok(envelope) => envelope,
+        let (envelope, request_read_timing) = match reader.recv_envelope_with_timing().await {
+            Ok(result) => result,
             Err(IpcTransportError::Io(error))
                 if error.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -4842,6 +4842,7 @@ async fn handle_connection(
             Err(error) => return Err(error).context("failed receiving request envelope"),
         };
 
+        let request_decode_started = Instant::now();
         let request = match parse_request(&envelope) {
             Ok(request) => request,
             Err(error) => {
@@ -4855,6 +4856,7 @@ async fn handle_connection(
                 continue;
             }
         };
+        let request_decode_us = request_decode_started.elapsed().as_micros();
 
         // Track whether this request enables event push delivery.
         let is_enable_push = matches!(request, Request::EnableEventPush);
@@ -4976,13 +4978,13 @@ async fn handle_connection(
             }
         };
         let response_send_started = Instant::now();
-        match send_response_via_channel(
+        let response_send_timing = match send_response_via_channel(
             &frame_tx,
             envelope.request_id,
             &response,
             negotiated_frame_codec.as_deref(),
         ) {
-            Ok(()) => {}
+            Ok(timing) => timing,
             Err(err) if is_frame_too_large_error(&err) => {
                 warn!(
                     client_id = %client_id.0,
@@ -4996,9 +4998,10 @@ async fn handle_connection(
                     "response too large".to_string(),
                     negotiated_frame_codec.as_deref(),
                 )?;
+                IpcResponseSendTiming::default()
             }
             Err(err) => return Err(err),
-        }
+        };
         let response_send_us = response_send_started.elapsed().as_micros();
         emit_phase_timing(
             PhaseChannel::Ipc,
@@ -5007,11 +5010,17 @@ async fn handle_connection(
                 service_metadata,
                 envelope.request_id,
                 &response,
+                request_read_timing.socket_read_us,
+                request_read_timing.frame_decode_us,
+                request_decode_us,
                 request_record_encode_us,
                 request_record_us,
                 handle_us,
                 response_record_encode_us,
                 response_record_us,
+                response_send_timing.response_encode,
+                response_send_timing.frame_encode,
+                response_send_timing.writer_queue,
                 response_send_us,
                 started_at.elapsed().as_micros(),
             ),
@@ -6001,11 +6010,17 @@ fn server_ipc_request_phase_payload(
     service_metadata: serde_json::Map<String, serde_json::Value>,
     request_id: u64,
     response: &Response,
+    socket_read_us: u128,
+    frame_decode_us: u128,
+    request_decode_us: u128,
     request_record_encode_us: u128,
     request_record_us: u128,
     handle_us: u128,
     response_record_encode_us: u128,
     response_record_us: u128,
+    response_encode_us: u128,
+    response_frame_encode_us: u128,
+    writer_queue_us: u128,
     response_send_us: u128,
     total_us: u128,
 ) -> serde_json::Value {
@@ -6013,11 +6028,17 @@ fn server_ipc_request_phase_payload(
         .field("request", request_kind)
         .field("request_id", request_id)
         .field("response", response_kind_name(response))
+        .field("socket_read_us", socket_read_us)
+        .field("frame_decode_us", frame_decode_us)
+        .field("request_decode_us", request_decode_us)
         .field("request_record_encode_us", request_record_encode_us)
         .field("request_record_us", request_record_us)
         .field("handle_us", handle_us)
         .field("response_record_encode_us", response_record_encode_us)
         .field("response_record_us", response_record_us)
+        .field("response_encode_us", response_encode_us)
+        .field("response_frame_encode_us", response_frame_encode_us)
+        .field("writer_queue_us", writer_queue_us)
         .field("response_send_us", response_send_us)
         .field("total_us", total_us)
         .extend(service_metadata)
@@ -6560,7 +6581,14 @@ fn send_error_via_channel(
     frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
 ) -> Result<()> {
     let response = Response::Err(ErrorResponse { code, message });
-    send_response_via_channel(frame_tx, request_id, &response, frame_codec)
+    send_response_via_channel(frame_tx, request_id, &response, frame_codec).map(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct IpcResponseSendTiming {
+    response_encode: u128,
+    frame_encode: u128,
+    writer_queue: u128,
 }
 
 fn send_response_via_channel(
@@ -6568,19 +6596,28 @@ fn send_response_via_channel(
     request_id: u64,
     response: &Response,
     frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
-) -> Result<()> {
+) -> Result<IpcResponseSendTiming> {
+    let response_encode_started = Instant::now();
     let payload = encode(response).context("failed encoding response payload")?;
+    let response_encode_us = response_encode_started.elapsed().as_micros();
     let envelope = Envelope::new(request_id, EnvelopeKind::Response, payload);
+    let frame_encode_started = Instant::now();
     let frame = if frame_codec.is_some() {
         bmux_ipc::frame::encode_frame_compressed(&envelope, frame_codec)
             .context("failed encoding compressed response frame")?
     } else {
         bmux_ipc::frame::encode_frame(&envelope).context("failed encoding response frame")?
     };
+    let frame_encode_us = frame_encode_started.elapsed().as_micros();
+    let queue_started = Instant::now();
     frame_tx
         .send(frame)
         .map_err(|_| anyhow::anyhow!("writer channel closed"))?;
-    Ok(())
+    Ok(IpcResponseSendTiming {
+        response_encode: response_encode_us,
+        frame_encode: frame_encode_us,
+        writer_queue: queue_started.elapsed().as_micros(),
+    })
 }
 
 /// Resolve a frame compression codec from negotiated capability strings.

@@ -30,6 +30,7 @@ pub(crate) struct BenchmarkDefaults {
     pub(crate) attach_command_limit_ms: Option<f64>,
     pub(crate) retarget_limit_ms: Option<f64>,
     pub(crate) core_service_limit_ms: Option<f64>,
+    pub(crate) generic_ipc_limit_ms: Option<f64>,
     pub(crate) static_service_limit_ms: Option<f64>,
 }
 
@@ -121,6 +122,11 @@ pub(crate) fn resolve_benchmark_options(
         &mut limits,
         "core_service",
         manifest.defaults.core_service_limit_ms,
+    );
+    insert_default_limit(
+        &mut limits,
+        "generic_ipc",
+        manifest.defaults.generic_ipc_limit_ms,
     );
     insert_default_limit(
         &mut limits,

@@ -41,6 +41,7 @@ fn run() -> Result<(), String> {
         "validate-phase-schema" => run_validate_phase_schema(args),
         "list-benchmarks" => run_list_benchmarks(args),
         "run-benchmark" => run_benchmark(args),
+        "sample-generic-ipc" => run_sample_generic_ipc(args),
         "sample-static-service" => run_sample_static_service(args),
         "sample-core-services" => run_sample_core_services(args),
         "prepare-scale-fixture" => run_prepare_scale_fixture(args),
@@ -65,6 +66,7 @@ fn usage() -> &'static str {
   validate-phase-schema --input PATH
   list-benchmarks [--dir PATH]
   run-benchmark --manifest PATH [--profile NAME] [--artifact-json PATH] [--phase-report-dir PATH] [benchmark overrides]
+  sample-generic-ipc --iterations N --warmup N --out-json PATH
   sample-static-service --iterations N --warmup N --out-json PATH [--max-p99-us N]
   sample-core-services --iterations N --warmup N --out-json PATH [--max-p99-us N]
   prepare-scale-fixture --config-dir PATH --plugin-root PATH --count N [--profile small|medium|large]
@@ -138,6 +140,7 @@ fn run_benchmark(args: Vec<String>) -> Result<(), String> {
     let options = resolve_benchmark_options(cli, &manifest, manifest_path)?;
     match manifest.benchmark.kind.as_str() {
         "core-services" => run_core_services_benchmark(&manifest, &options),
+        "generic-ipc" => run_generic_ipc_benchmark(&manifest, &options),
         "attach-tab-switch" => run_attach_tab_switch_benchmark(&manifest, &options),
         "plugin-hot-path" => run_plugin_hot_path_benchmark(&manifest, &options),
         other => Err(format!("unsupported benchmark kind '{other}'")),
@@ -260,6 +263,50 @@ fn run_core_services_benchmark(
     ])?;
     validate_benchmark_phases(&artifact_json, options)?;
     write_standard_benchmark_artifact(manifest, options, &artifact_json, &artifact_json)?;
+    println!("artifact_json={artifact_json}");
+    println!("phase_report_dir={}", options.phase_report_dir);
+    Ok(())
+}
+
+fn run_generic_ipc_benchmark(
+    manifest: &BenchmarkManifest,
+    options: &BenchmarkResolvedOptions,
+) -> Result<(), String> {
+    let artifact_json = options.artifact_json.clone().unwrap_or_else(|| {
+        env::temp_dir()
+            .join("bmux-generic-ipc.json")
+            .display()
+            .to_string()
+    });
+    let sample_json = env::temp_dir()
+        .join(format!("bmux-generic-ipc-sample-{}.json", process::id()))
+        .display()
+        .to_string();
+    let exe =
+        env::current_exe().map_err(|error| format!("failed resolving current exe: {error}"))?;
+    let output = Command::new(exe)
+        .args([
+            "sample-generic-ipc",
+            "--iterations",
+            &options.iterations.to_string(),
+            "--warmup",
+            &options.warmup.to_string(),
+            "--out-json",
+            &sample_json,
+        ])
+        .env("BMUX_IPC_PHASE_TIMING", "1")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("failed running generic IPC sample: {error}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("generic IPC sample failed:\n{stderr}"));
+    }
+    merge_sample_events(&sample_json, parse_phase_events(&stderr))?;
+    validate_benchmark_phases(&sample_json, options)?;
+    write_standard_benchmark_artifact(manifest, options, &sample_json, &artifact_json)?;
+    let _ = fs::remove_file(&sample_json);
     println!("artifact_json={artifact_json}");
     println!("phase_report_dir={}", options.phase_report_dir);
     Ok(())
@@ -1338,6 +1385,276 @@ fn core_service_phase_events(scenario: &Value) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn run_sample_generic_ipc(args: Vec<String>) -> Result<(), String> {
+    let mut iterations = None;
+    let mut warmup = 0_usize;
+    let mut out_json = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--iterations" => {
+                iterations = Some(parse_usize_arg(&args, index, "--iterations")?);
+                index += 2;
+            }
+            "--warmup" => {
+                warmup = parse_usize_arg(&args, index, "--warmup")?;
+                index += 2;
+            }
+            "--out-json" => {
+                out_json = Some(require_arg(&args, index, "--out-json")?.to_string());
+                index += 2;
+            }
+            other => return Err(format!("unknown argument for sample-generic-ipc: {other}")),
+        }
+    }
+
+    let iterations = iterations.ok_or_else(|| "--iterations is required".to_string())?;
+    let out_json = out_json.ok_or_else(|| "--out-json is required".to_string())?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| format!("failed creating tokio runtime: {error}"))?;
+    runtime.block_on(sample_generic_ipc_async(iterations, warmup, &out_json))
+}
+
+async fn sample_generic_ipc_async(
+    iterations: usize,
+    warmup: usize,
+    out_json: &str,
+) -> Result<(), String> {
+    let endpoint = generic_ipc_endpoint();
+    let server = std::sync::Arc::new(bmux_server::BmuxServer::new(endpoint.clone()));
+    server
+        .register_service_handler(
+            "bmux.perf.ipc",
+            bmux_ipc::InvokeServiceKind::Query,
+            "generic-ipc/v1",
+            "echo",
+            |_route, _context, payload| async move { Ok(payload) },
+        )
+        .map_err(|error| format!("failed registering generic IPC handler: {error}"))?;
+    let server_task = {
+        let server = std::sync::Arc::clone(&server);
+        tokio::spawn(async move { server.run().await })
+    };
+    let mut client = connect_generic_ipc_client(&endpoint).await?;
+
+    for _ in 0..warmup {
+        generic_ipc_ping(&mut client).await?;
+        generic_ipc_echo(&mut client, &[]).await?;
+        generic_ipc_echo(&mut client, &[7_u8; 64]).await?;
+        generic_ipc_echo(&mut client, &[9_u8; 4096]).await?;
+    }
+
+    let ping = sample_generic_ipc_ping_operation(iterations, &mut client).await?;
+    let invoke_empty = sample_generic_ipc_echo_operation(iterations, &mut client, &[]).await?;
+    let small_payload = vec![7_u8; 64];
+    let invoke_small =
+        sample_generic_ipc_echo_operation(iterations, &mut client, &small_payload).await?;
+    let medium_payload = vec![9_u8; 4096];
+    let invoke_medium =
+        sample_generic_ipc_echo_operation(iterations, &mut client, &medium_payload).await?;
+
+    server.request_shutdown();
+    let _ = client.stop_server().await;
+    match tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await {
+        Ok(Ok(Ok(()))) | Ok(Err(_)) => {}
+        Ok(Ok(Err(error))) => return Err(format!("generic IPC server failed: {error:#}")),
+        Err(_) => return Err("generic IPC server did not shut down".to_string()),
+    }
+    cleanup_generic_ipc_endpoint(&endpoint);
+
+    let scenarios = vec![
+        generic_ipc_scenario_json("ping", ping),
+        generic_ipc_scenario_json("invoke.empty", invoke_empty),
+        generic_ipc_scenario_json("invoke.small", invoke_small),
+        generic_ipc_scenario_json("invoke.medium", invoke_medium),
+    ];
+    let events = scenarios
+        .iter()
+        .flat_map(generic_ipc_phase_events)
+        .collect::<Vec<_>>();
+    for scenario in &scenarios {
+        let stats = scenario
+            .get("latency_us")
+            .ok_or_else(|| "generic IPC scenario missing latency_us".to_string())?;
+        println!(
+            "{} p50={:.3}us p95={:.3}us p99={:.3}us avg={:.3}us max={:.3}us",
+            scenario
+                .get("scenario")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            stats.get("p50").and_then(Value::as_f64).unwrap_or(0.0),
+            stats.get("p95").and_then(Value::as_f64).unwrap_or(0.0),
+            stats.get("p99").and_then(Value::as_f64).unwrap_or(0.0),
+            stats.get("avg").and_then(Value::as_f64).unwrap_or(0.0),
+            stats.get("max").and_then(Value::as_f64).unwrap_or(0.0),
+        );
+    }
+    let all_samples_ms = scenarios
+        .iter()
+        .flat_map(|scenario| {
+            scenario
+                .get("samples_us")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_f64)
+                .map(|value| value / 1000.0)
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "scenario": "generic-ipc",
+        "iterations": iterations,
+        "warmup": warmup,
+        "samples_ms": all_samples_ms,
+        "scenarios": scenarios,
+        "events": events,
+        "passed": true,
+    });
+    let encoded = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("failed encoding generic IPC sample json: {error}"))?;
+    fs::write(out_json, encoded)
+        .map_err(|error| format!("failed writing generic IPC sample json: {error}"))
+}
+
+async fn connect_generic_ipc_client(
+    endpoint: &bmux_ipc::IpcEndpoint,
+) -> Result<bmux_client::BmuxClient, String> {
+    let mut last_error = None;
+    for _ in 0..100 {
+        match bmux_client::BmuxClient::connect(
+            endpoint,
+            std::time::Duration::from_secs(5),
+            "bmux-perf-generic-ipc",
+        )
+        .await
+        {
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                last_error = Some(error.to_string());
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+    Err(format!(
+        "failed connecting generic IPC client: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
+async fn generic_ipc_ping(client: &mut bmux_client::BmuxClient) -> Result<(), String> {
+    client
+        .ping()
+        .await
+        .map_err(|error| format!("generic IPC ping failed: {error}"))
+}
+
+async fn generic_ipc_echo(
+    client: &mut bmux_client::BmuxClient,
+    payload: &[u8],
+) -> Result<(), String> {
+    let response = client
+        .invoke_service_raw(
+            "bmux.perf.ipc",
+            bmux_ipc::InvokeServiceKind::Query,
+            "generic-ipc/v1",
+            "echo",
+            payload.to_vec(),
+        )
+        .await
+        .map_err(|error| format!("generic IPC echo failed: {error}"))?;
+    if response == payload {
+        Ok(())
+    } else {
+        Err("generic IPC echo returned unexpected payload".to_string())
+    }
+}
+
+async fn sample_generic_ipc_ping_operation(
+    iterations: usize,
+    client: &mut bmux_client::BmuxClient,
+) -> Result<Vec<f64>, String> {
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let started = Instant::now();
+        generic_ipc_ping(client).await?;
+        samples.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+    Ok(samples)
+}
+
+async fn sample_generic_ipc_echo_operation(
+    iterations: usize,
+    client: &mut bmux_client::BmuxClient,
+    payload: &[u8],
+) -> Result<Vec<f64>, String> {
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let started = Instant::now();
+        generic_ipc_echo(client, payload).await?;
+        samples.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+    Ok(samples)
+}
+
+fn generic_ipc_scenario_json(name: &str, samples_us: Vec<f64>) -> Value {
+    let stats = compute_latency_stats(&samples_us);
+    json!({
+        "scenario": name,
+        "samples_us": samples_us,
+        "latency_us": stats_json(stats),
+    })
+}
+
+fn generic_ipc_phase_events(scenario: &Value) -> Vec<Value> {
+    let Some(name) = scenario.get("scenario").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    scenario
+        .get("samples_us")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_f64)
+        .map(|total_us| {
+            json!({
+                "phase": "generic_ipc",
+                "scenario": name,
+                "total_us": total_us,
+            })
+        })
+        .collect()
+}
+
+fn generic_ipc_endpoint() -> bmux_ipc::IpcEndpoint {
+    #[cfg(unix)]
+    {
+        let path = env::temp_dir().join(format!(
+            "bmux-generic-ipc-{}-{}.sock",
+            process::id(),
+            unix_now_ms()
+        ));
+        bmux_ipc::IpcEndpoint::unix_socket(path)
+    }
+    #[cfg(windows)]
+    {
+        bmux_ipc::IpcEndpoint::windows_named_pipe(format!(
+            r"\\.\pipe\bmux-generic-ipc-{}-{}",
+            process::id(),
+            unix_now_ms()
+        ))
+    }
+}
+
+fn cleanup_generic_ipc_endpoint(endpoint: &bmux_ipc::IpcEndpoint) {
+    #[cfg(unix)]
+    if let Some(path) = endpoint.as_unix_socket() {
+        let _ = fs::remove_file(path);
+    }
+    #[cfg(windows)]
+    let _ = endpoint;
 }
 
 struct CoreServiceBenchContext {
@@ -2968,6 +3285,18 @@ fn read_json_file(path: &str) -> Result<Value, String> {
     let bytes = fs::read(path).map_err(|error| format!("failed reading {path}: {error}"))?;
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("failed parsing json from {path}: {error}"))
+}
+
+fn merge_sample_events(path: &str, mut additional_events: Vec<Value>) -> Result<(), String> {
+    let mut payload = read_json_file(path)?;
+    let events = payload
+        .get_mut("events")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| format!("sample json {path} missing events array"))?;
+    events.append(&mut additional_events);
+    let encoded = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("failed encoding merged sample json: {error}"))?;
+    fs::write(path, encoded).map_err(|error| format!("failed writing merged sample json: {error}"))
 }
 
 fn percentile_nearest_rank(values: &[f64], percentile: f64) -> f64 {

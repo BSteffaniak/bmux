@@ -1584,10 +1584,14 @@ dependencies = [
 name = "bmux_perf_tools"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_client",
+ "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_server",
  "serde",
  "serde_json",
+ "tokio",
  "toml 0.8.23",
 ]
 

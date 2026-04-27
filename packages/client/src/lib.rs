@@ -8,7 +8,7 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{
     ErasedIpcStream, ErasedIpcStreamReader, ErasedIpcStreamWriter, IpcStreamReader,
-    IpcStreamWriter, IpcTransportError, LocalIpcStream,
+    IpcStreamWriter, IpcTransportError, IpcWriteTiming, LocalIpcStream,
 };
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, AttachPaneImageDelta, AttachPaneInputMode,
@@ -269,13 +269,13 @@ enum ClientStream {
 }
 
 impl ClientStream {
-    async fn send_envelope(
+    async fn send_envelope_with_timing(
         &mut self,
         envelope: &Envelope,
-    ) -> std::result::Result<(), IpcTransportError> {
+    ) -> std::result::Result<IpcWriteTiming, IpcTransportError> {
         match self {
-            Self::Local(stream) => stream.send_envelope(envelope).await,
-            Self::Bridge(stream) => stream.send_envelope(envelope).await,
+            Self::Local(stream) => stream.send_envelope_with_timing(envelope).await,
+            Self::Bridge(stream) => stream.send_envelope_with_timing(envelope).await,
         }
     }
 
@@ -579,19 +579,22 @@ impl BmuxClient {
         let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
 
         let send_started = std::time::Instant::now();
-        tokio::time::timeout(self.timeout, self.stream.send_envelope(&envelope))
-            .await
-            .map_err(|_| {
-                warn!(
-                    request_id,
-                    request = request_kind,
-                    timeout_ms,
-                    phase = "send",
-                    duration_ms = started_at.elapsed().as_millis(),
-                    "ipc.request.timeout"
-                );
-                ClientError::Timeout(self.timeout)
-            })??;
+        let write_timing = tokio::time::timeout(
+            self.timeout,
+            self.stream.send_envelope_with_timing(&envelope),
+        )
+        .await
+        .map_err(|_| {
+            warn!(
+                request_id,
+                request = request_kind,
+                timeout_ms,
+                phase = "send",
+                duration_ms = started_at.elapsed().as_millis(),
+                "ipc.request.timeout"
+            );
+            ClientError::Timeout(self.timeout)
+        })??;
         let send_us = send_started.elapsed().as_micros();
 
         trace!(
@@ -636,6 +639,8 @@ impl BmuxClient {
             IpcClientTiming {
                 encode: encode_us,
                 send: send_us,
+                frame_encode: write_timing.frame_encode_us,
+                socket_write: write_timing.socket_write_us,
                 recv: recv_us,
                 decode: decode_us,
                 total: started_at.elapsed().as_micros(),
@@ -1660,6 +1665,8 @@ impl StreamingBmuxClient {
             IpcClientTiming {
                 encode: encode_us,
                 send: send_us,
+                frame_encode: 0,
+                socket_write: 0,
                 recv: recv_us,
                 decode: 0,
                 total: started_at.elapsed().as_micros(),
@@ -2427,6 +2434,8 @@ fn validate_response_envelope(
 struct IpcClientTiming {
     encode: u128,
     send: u128,
+    frame_encode: u128,
+    socket_write: u128,
     recv: u128,
     decode: u128,
     total: u128,
@@ -2472,9 +2481,14 @@ fn ipc_client_request_phase_payload(
         .field("request_id", request_id)
         .field("response", response)
         .field("encode_us", timing.encode)
+        .field("request_encode_us", timing.encode)
         .field("send_us", timing.send)
+        .field("frame_encode_us", timing.frame_encode)
+        .field("socket_write_us", timing.socket_write)
         .field("recv_us", timing.recv)
+        .field("response_read_us", timing.recv)
         .field("decode_us", timing.decode)
+        .field("response_decode_us", timing.decode)
         .field("total_us", timing.total);
     if let Request::InvokeService {
         capability,

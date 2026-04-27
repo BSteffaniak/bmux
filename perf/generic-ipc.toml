@@ -1,0 +1,95 @@
+[benchmark]
+name = "generic-ipc"
+kind = "generic-ipc"
+
+[defaults]
+iterations = 200
+warmup = 20
+generic_ipc_limit_ms = 5
+
+[profiles.normal]
+tags = ["ipc"]
+ipc_timing = true
+
+[profiles.diagnostic]
+tags = ["ipc"]
+ipc_timing = true
+loosen_slo = true
+
+[profiles.ci]
+tags = ["ipc"]
+ipc_timing = true
+
+[profiles.stress]
+tags = ["ipc"]
+ipc_timing = true
+loosen_slo = true
+
+[limit]
+generic_ipc = 5
+
+[[reports]]
+phase = "generic_ipc"
+field = "total_us"
+limit = "generic_ipc"
+filter = { key = "scenario", value = "ping" }
+
+[[reports]]
+phase = "generic_ipc"
+field = "total_us"
+limit = "generic_ipc"
+filter = { key = "scenario", value = "invoke.empty" }
+
+[[reports]]
+phase = "generic_ipc"
+field = "total_us"
+limit = "generic_ipc"
+filter = { key = "scenario", value = "invoke.small" }
+
+[[reports]]
+phase = "generic_ipc"
+field = "total_us"
+limit = "generic_ipc"
+filter = { key = "scenario", value = "invoke.medium" }
+
+[[reports]]
+phase = "ipc.client_request"
+field = "frame_encode_us"
+limit = "generic_ipc"
+tags = ["ipc"]
+filter = { key = "request", value = "invoke_service" }
+
+[[reports]]
+phase = "ipc.client_request"
+field = "socket_write_us"
+limit = "generic_ipc"
+tags = ["ipc"]
+filter = { key = "request", value = "invoke_service" }
+
+[[reports]]
+phase = "ipc.server_request"
+field = "request_decode_us"
+limit = "generic_ipc"
+tags = ["ipc"]
+filter = { key = "request", value = "invoke_service" }
+
+[[reports]]
+phase = "ipc.server_request"
+field = "response_encode_us"
+limit = "generic_ipc"
+tags = ["ipc"]
+filter = { key = "request", value = "invoke_service" }
+
+[[reports]]
+phase = "ipc.server_request"
+field = "response_frame_encode_us"
+limit = "generic_ipc"
+tags = ["ipc"]
+filter = { key = "request", value = "invoke_service" }
+
+[[reports]]
+phase = "ipc.server_request"
+field = "writer_queue_us"
+limit = "generic_ipc"
+tags = ["ipc"]
+filter = { key = "request", value = "invoke_service" }

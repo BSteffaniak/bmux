@@ -9,6 +9,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
@@ -187,6 +188,20 @@ pub struct ErasedIpcStreamReader {
     compressed_frames: bool,
 }
 
+/// Per-frame client/server send attribution in microseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IpcWriteTiming {
+    pub frame_encode_us: u128,
+    pub socket_write_us: u128,
+}
+
+/// Per-frame client/server receive attribution in microseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IpcReadTiming {
+    pub socket_read_us: u128,
+    pub frame_decode_us: u128,
+}
+
 impl std::fmt::Debug for ErasedIpcStreamReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ErasedIpcStreamReader(..)")
@@ -203,12 +218,31 @@ impl IpcStreamWriter {
     ///
     /// Returns an error if frame encoding or socket writes fail.
     pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
+        self.send_envelope_with_timing(envelope).await.map(|_| ())
+    }
+
+    /// Send a framed envelope and return frame/socket timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame encoding or socket writes fail.
+    pub async fn send_envelope_with_timing(
+        &mut self,
+        envelope: &Envelope,
+    ) -> Result<IpcWriteTiming, IpcTransportError> {
+        let encode_started = Instant::now();
         let frame = if self.frame_codec.is_some() {
             encode_frame_compressed(envelope, self.frame_codec.as_deref())?
         } else {
             encode_frame(envelope)?
         };
-        write_frame(&mut self.inner, &frame).await
+        let frame_encode_us = encode_started.elapsed().as_micros();
+        let write_started = Instant::now();
+        write_frame(&mut self.inner, &frame).await?;
+        Ok(IpcWriteTiming {
+            frame_encode_us,
+            socket_write_us: write_started.elapsed().as_micros(),
+        })
     }
 
     /// Write a pre-encoded frame (length-prefixed bytes) directly to the socket.
@@ -239,12 +273,31 @@ impl ErasedIpcStreamWriter {
     ///
     /// Returns an error if frame encoding or socket writes fail.
     pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
+        self.send_envelope_with_timing(envelope).await.map(|_| ())
+    }
+
+    /// Send a framed envelope and return frame/socket timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame encoding or socket writes fail.
+    pub async fn send_envelope_with_timing(
+        &mut self,
+        envelope: &Envelope,
+    ) -> Result<IpcWriteTiming, IpcTransportError> {
+        let encode_started = Instant::now();
         let frame = if self.frame_codec.is_some() {
             encode_frame_compressed(envelope, self.frame_codec.as_deref())?
         } else {
             encode_frame(envelope)?
         };
-        write_frame(&mut self.inner, &frame).await
+        let frame_encode_us = encode_started.elapsed().as_micros();
+        let write_started = Instant::now();
+        write_frame(&mut self.inner, &frame).await?;
+        Ok(IpcWriteTiming {
+            frame_encode_us,
+            socket_write_us: write_started.elapsed().as_micros(),
+        })
     }
 
     /// Enable frame-level compression for all subsequent `send_envelope` calls.
@@ -266,10 +319,23 @@ impl IpcStreamReader {
     ///
     /// Returns an error if frame reads fail or the frame is invalid.
     pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
+        self.recv_envelope_with_timing()
+            .await
+            .map(|(envelope, _)| envelope)
+    }
+
+    /// Receive a framed envelope and return socket/decode timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame reads fail or the frame is invalid.
+    pub async fn recv_envelope_with_timing(
+        &mut self,
+    ) -> Result<(Envelope, IpcReadTiming), IpcTransportError> {
         if self.compressed_frames {
-            read_frame_compressed(&mut self.inner).await
+            read_frame_compressed_with_timing(&mut self.inner).await
         } else {
-            read_frame(&mut self.inner).await
+            read_frame_with_timing(&mut self.inner).await
         }
     }
 
@@ -289,10 +355,23 @@ impl ErasedIpcStreamReader {
     ///
     /// Returns an error if frame reads fail or the frame is invalid.
     pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
+        self.recv_envelope_with_timing()
+            .await
+            .map(|(envelope, _)| envelope)
+    }
+
+    /// Receive a framed envelope and return socket/decode timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame reads fail or the frame is invalid.
+    pub async fn recv_envelope_with_timing(
+        &mut self,
+    ) -> Result<(Envelope, IpcReadTiming), IpcTransportError> {
         if self.compressed_frames {
-            read_frame_compressed(&mut self.inner).await
+            read_frame_compressed_with_timing(&mut self.inner).await
         } else {
-            read_frame(&mut self.inner).await
+            read_frame_with_timing(&mut self.inner).await
         }
     }
 
@@ -363,16 +442,34 @@ impl LocalIpcStream {
     ///
     /// Returns an error if frame encoding or socket writes fail.
     pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
-        let frame = encode_frame(envelope)?;
+        self.send_envelope_with_timing(envelope).await.map(|_| ())
+    }
 
+    /// Send a framed envelope and return frame/socket timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame encoding or socket writes fail.
+    pub async fn send_envelope_with_timing(
+        &mut self,
+        envelope: &Envelope,
+    ) -> Result<IpcWriteTiming, IpcTransportError> {
+        let encode_started = Instant::now();
+        let frame = encode_frame(envelope)?;
+        let frame_encode_us = encode_started.elapsed().as_micros();
+        let write_started = Instant::now();
         match &mut self.inner {
             #[cfg(unix)]
-            StreamInner::Unix(stream) => write_frame(stream, &frame).await,
+            StreamInner::Unix(stream) => write_frame(stream, &frame).await?,
             #[cfg(windows)]
-            StreamInner::WindowsServer(stream) => write_frame(stream, &frame).await,
+            StreamInner::WindowsServer(stream) => write_frame(stream, &frame).await?,
             #[cfg(windows)]
-            StreamInner::WindowsClient(stream) => write_frame(stream, &frame).await,
+            StreamInner::WindowsClient(stream) => write_frame(stream, &frame).await?,
         }
+        Ok(IpcWriteTiming {
+            frame_encode_us,
+            socket_write_us: write_started.elapsed().as_micros(),
+        })
     }
 
     /// Receive a single framed envelope.
@@ -381,13 +478,26 @@ impl LocalIpcStream {
     ///
     /// Returns an error if frame reads fail or the frame is invalid.
     pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
+        self.recv_envelope_with_timing()
+            .await
+            .map(|(envelope, _)| envelope)
+    }
+
+    /// Receive a framed envelope and return socket/decode timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame reads fail or the frame is invalid.
+    pub async fn recv_envelope_with_timing(
+        &mut self,
+    ) -> Result<(Envelope, IpcReadTiming), IpcTransportError> {
         match &mut self.inner {
             #[cfg(unix)]
-            StreamInner::Unix(stream) => read_frame(stream).await,
+            StreamInner::Unix(stream) => read_frame_with_timing(stream).await,
             #[cfg(windows)]
-            StreamInner::WindowsServer(stream) => read_frame(stream).await,
+            StreamInner::WindowsServer(stream) => read_frame_with_timing(stream).await,
             #[cfg(windows)]
-            StreamInner::WindowsClient(stream) => read_frame(stream).await,
+            StreamInner::WindowsClient(stream) => read_frame_with_timing(stream).await,
         }
     }
 }
@@ -411,12 +521,31 @@ impl ErasedIpcStream {
     ///
     /// Returns an error if frame encoding or socket writes fail.
     pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
+        self.send_envelope_with_timing(envelope).await.map(|_| ())
+    }
+
+    /// Send a framed envelope and return frame/socket timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame encoding or socket writes fail.
+    pub async fn send_envelope_with_timing(
+        &mut self,
+        envelope: &Envelope,
+    ) -> Result<IpcWriteTiming, IpcTransportError> {
+        let encode_started = Instant::now();
         let frame = if self.frame_codec.is_some() {
             encode_frame_compressed(envelope, self.frame_codec.as_deref())?
         } else {
             encode_frame(envelope)?
         };
-        write_frame(&mut self.inner, &frame).await
+        let frame_encode_us = encode_started.elapsed().as_micros();
+        let write_started = Instant::now();
+        write_frame(&mut self.inner, &frame).await?;
+        Ok(IpcWriteTiming {
+            frame_encode_us,
+            socket_write_us: write_started.elapsed().as_micros(),
+        })
     }
 
     /// Receive a single framed envelope from the erased transport.
@@ -428,10 +557,23 @@ impl ErasedIpcStream {
     ///
     /// Returns an error if frame reads fail or the frame is invalid.
     pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
+        self.recv_envelope_with_timing()
+            .await
+            .map(|(envelope, _)| envelope)
+    }
+
+    /// Receive a framed envelope and return socket/decode timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame reads fail or the frame is invalid.
+    pub async fn recv_envelope_with_timing(
+        &mut self,
+    ) -> Result<(Envelope, IpcReadTiming), IpcTransportError> {
         if self.compressed_frames {
-            read_frame_compressed(&mut self.inner).await
+            read_frame_compressed_with_timing(&mut self.inner).await
         } else {
-            read_frame(&mut self.inner).await
+            read_frame_with_timing(&mut self.inner).await
         }
     }
 
@@ -539,36 +681,58 @@ where
     Ok(())
 }
 
-async fn read_frame<T>(stream: &mut T) -> Result<Envelope, IpcTransportError>
+async fn read_frame_with_timing<T>(
+    stream: &mut T,
+) -> Result<(Envelope, IpcReadTiming), IpcTransportError>
 where
     T: AsyncRead + Unpin,
 {
     let mut len_bytes = [0_u8; 4];
+    let read_started = Instant::now();
     stream.read_exact(&mut len_bytes).await?;
     let payload_len = u32::from_le_bytes(len_bytes) as usize;
     let mut frame = Vec::with_capacity(4 + payload_len);
     frame.extend_from_slice(&len_bytes);
     frame.resize(4 + payload_len, 0);
     stream.read_exact(&mut frame[4..]).await?;
+    let socket_read_us = read_started.elapsed().as_micros();
+    let decode_started = Instant::now();
     let envelope = decode_frame_exact(&frame)?;
-    Ok(envelope)
+    Ok((
+        envelope,
+        IpcReadTiming {
+            socket_read_us,
+            frame_decode_us: decode_started.elapsed().as_micros(),
+        },
+    ))
 }
 
 /// Read one frame using the compressed frame format (1-byte compression id
 /// prefix after the length).
-async fn read_frame_compressed<T>(stream: &mut T) -> Result<Envelope, IpcTransportError>
+async fn read_frame_compressed_with_timing<T>(
+    stream: &mut T,
+) -> Result<(Envelope, IpcReadTiming), IpcTransportError>
 where
     T: AsyncRead + Unpin,
 {
     let mut len_bytes = [0_u8; 4];
+    let read_started = Instant::now();
     stream.read_exact(&mut len_bytes).await?;
     let total_len = u32::from_le_bytes(len_bytes) as usize;
     let mut frame = Vec::with_capacity(4 + total_len);
     frame.extend_from_slice(&len_bytes);
     frame.resize(4 + total_len, 0);
     stream.read_exact(&mut frame[4..]).await?;
+    let socket_read_us = read_started.elapsed().as_micros();
+    let decode_started = Instant::now();
     let envelope = decode_frame_compressed(&frame)?;
-    Ok(envelope)
+    Ok((
+        envelope,
+        IpcReadTiming {
+            socket_read_us,
+            frame_decode_us: decode_started.elapsed().as_micros(),
+        },
+    ))
 }
 
 #[cfg(unix)]
