@@ -116,13 +116,14 @@ use plugin_kernel::{
     service_descriptors_from_declarations,
 };
 use plugin_runtime::{
-    activate_loaded_plugins, bundled_plugin_root as bundled_plugin_roots, command_accepts_repeat,
-    deactivate_loaded_plugins, discover_bundled_plugin_ids, dispatch_loaded_plugin_event,
-    effective_enabled_plugins, load_enabled_plugins, load_plugin, plugin_command_policy_hints,
-    plugin_event_bridge_loop, plugin_host_metadata, plugin_system_event,
-    registered_plugin_entry_exists, resolve_plugin_search_paths, run_external_plugin_command,
-    run_plugin_command, run_plugin_command_with_state, run_plugin_keybinding_command,
-    scan_available_plugins, validate_enabled_plugins,
+    activate_loaded_plugins, build_runtime_command_state,
+    bundled_plugin_root as bundled_plugin_roots, command_accepts_repeat, deactivate_loaded_plugins,
+    discover_bundled_plugin_ids, dispatch_loaded_plugin_event, effective_enabled_plugins,
+    load_enabled_plugins, load_plugin, plugin_command_policy_hints, plugin_event_bridge_loop,
+    plugin_host_metadata, plugin_system_event, registered_plugin_entry_exists,
+    resolve_plugin_search_paths, run_external_plugin_command, run_plugin_command,
+    run_plugin_command_with_state, run_plugin_keybinding_command,
+    run_plugin_keybinding_command_with_state, scan_available_plugins, validate_enabled_plugins,
 };
 pub use prompt::{
     PromptEvent, PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse,

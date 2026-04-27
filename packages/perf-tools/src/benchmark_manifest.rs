@@ -43,6 +43,8 @@ pub(crate) struct BenchmarkProfile {
     #[serde(default)]
     pub(crate) tags: Vec<String>,
     #[serde(default)]
+    pub(crate) plugin_timing: bool,
+    #[serde(default)]
     pub(crate) service_timing: bool,
     #[serde(default)]
     pub(crate) ipc_timing: bool,
@@ -108,6 +110,7 @@ pub(crate) struct BenchmarkResolvedOptions {
     pub(crate) tags: Vec<String>,
     pub(crate) limits: BTreeMap<String, f64>,
     pub(crate) vars: BTreeMap<String, String>,
+    pub(crate) plugin_timing: bool,
     pub(crate) service_timing: bool,
     pub(crate) ipc_timing: bool,
     pub(crate) storage_timing: bool,
@@ -199,6 +202,7 @@ pub(crate) fn resolve_benchmark_options(
         tags,
         limits,
         vars: cli.vars,
+        plugin_timing: profile.plugin_timing,
         service_timing: profile.service_timing,
         ipc_timing: profile.ipc_timing,
         storage_timing: profile.storage_timing,
@@ -235,6 +239,7 @@ core_service_limit_ms = 1
 
 [profiles.diagnostic]
 tags = ["service"]
+plugin_timing = true
 service_timing = true
 ipc_timing = true
 storage_timing = true
@@ -252,6 +257,7 @@ loosen_slo = true
         )
         .unwrap();
         assert!(options.service_timing);
+        assert!(options.plugin_timing);
         assert!(options.ipc_timing);
         assert!(options.storage_timing);
         assert_eq!(options.tags, vec!["service"]);

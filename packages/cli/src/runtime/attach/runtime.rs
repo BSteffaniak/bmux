@@ -17,7 +17,10 @@ use bmux_ipc::{
     PaneFocusDirection, PaneSplitDirection, SessionSelector, SessionSummary,
 };
 use bmux_keybind::{action_to_config_name, parse_action};
-use bmux_plugin_sdk::{HostScope, PluginCommandOutcome, ServiceKind, ServiceRequest};
+use bmux_plugin_sdk::{
+    HostScope, PluginCommandOutcome, ServiceKind, ServiceRequest,
+    perf_telemetry::{PhaseChannel, emit as emit_phase_timing},
+};
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -69,7 +72,6 @@ use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
-const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
 /// progress output burst to complete (e.g. when the server indicates
@@ -80,10 +82,7 @@ const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_co
 const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
-    if std::env::var_os("BMUX_ATTACH_PHASE_TIMING").is_none() {
-        return;
-    }
-    eprintln!("{ATTACH_PHASE_MARKER}{payload}");
+    emit_phase_timing(PhaseChannel::Attach, payload);
 }
 
 #[allow(clippy::too_many_arguments)]

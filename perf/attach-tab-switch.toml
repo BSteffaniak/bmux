@@ -18,7 +18,8 @@ retarget_limit_ms = 8
 tags = ["navigation", "production"]
 
 [profiles.diagnostic]
-tags = ["navigation", "production", "ipc"]
+tags = ["navigation", "production", "plugin", "ipc"]
+plugin_timing = true
 service_timing = false
 ipc_timing = true
 storage_timing = false
@@ -166,6 +167,39 @@ field = "total_us"
 limit = "attach_command"
 tags = ["service"]
 filter = { key = "operation", value = "${service_operation}" }
+
+[[reports]]
+phase = "runtime_command_state"
+field = "total_us"
+tags = ["plugin"]
+allow_empty = true
+
+[[reports]]
+phase = "plugin.command"
+field = "total_us"
+tags = ["plugin"]
+filters = [
+  { key = "plugin_id", value = "bmux.windows" },
+  { key = "command_name", value = "${command_name}" },
+]
+
+[[reports]]
+phase = "plugin.command"
+field = "load_us"
+tags = ["plugin"]
+filters = [
+  { key = "plugin_id", value = "bmux.windows" },
+  { key = "command_name", value = "${command_name}" },
+]
+
+[[reports]]
+phase = "plugin.command"
+field = "run_us"
+tags = ["plugin"]
+filters = [
+  { key = "plugin_id", value = "bmux.windows" },
+  { key = "command_name", value = "${command_name}" },
+]
 
 [[reports]]
 phase = "service.server_invoke"

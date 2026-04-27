@@ -12,6 +12,7 @@ use bmux_plugin::HostRuntimeApi;
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, CoreCliCommandResponse, NativeCommandContext, PluginCommandError,
     RustPlugin,
+    perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_perf_phase},
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -45,16 +46,13 @@ impl RustPlugin for PluginCliPlugin {
 }
 
 fn emit_phase_timing(command: &str, total_us: u128, result: &Result<i32, PluginCommandError>) {
-    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
-        return;
-    }
-    let payload = serde_json::json!({
-        "plugin_id": "bmux.plugin_cli",
-        "command_name": command,
-        "total_us": total_us,
-        "status": result.as_ref().copied().unwrap_or(1),
-    });
-    eprintln!("[bmux-plugin-phase-json]{payload}");
+    let payload = PhasePayload::new("plugin.command")
+        .field("plugin_id", "bmux.plugin_cli")
+        .field("command_name", command)
+        .field("total_us", total_us)
+        .field("status", result.as_ref().copied().unwrap_or(1))
+        .finish();
+    emit_perf_phase(PhaseChannel::Plugin, &payload);
 }
 
 include!(concat!(env!("OUT_DIR"), "/core_proxy_commands.rs"));

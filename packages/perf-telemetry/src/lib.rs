@@ -12,6 +12,14 @@ pub enum PhaseChannel {
     Storage,
 }
 
+pub const ALL_PHASE_CHANNELS: [PhaseChannel; 5] = [
+    PhaseChannel::Plugin,
+    PhaseChannel::Attach,
+    PhaseChannel::Service,
+    PhaseChannel::Ipc,
+    PhaseChannel::Storage,
+];
+
 impl PhaseChannel {
     #[must_use]
     pub const fn marker(self) -> &'static str {
@@ -39,6 +47,14 @@ impl PhaseChannel {
     pub fn enabled(self) -> bool {
         std::env::var_os(self.env_var()).is_some()
     }
+}
+
+#[must_use]
+pub fn phase_marker_payload(line: &str) -> Option<&str> {
+    ALL_PHASE_CHANNELS.iter().find_map(|channel| {
+        line.split_once(channel.marker())
+            .map(|(_, payload)| payload.trim())
+    })
 }
 
 pub fn emit(channel: PhaseChannel, payload: &Value) {
@@ -133,4 +149,22 @@ impl PhaseTimer {
 #[must_use]
 pub fn elapsed_us_since(started_at: Instant) -> u128 {
     started_at.elapsed().as_micros()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase_marker_payload_extracts_known_channel_payload() {
+        assert_eq!(
+            phase_marker_payload("INFO [bmux-plugin-phase-json]{\"phase\":\"plugin.command\"}"),
+            Some("{\"phase\":\"plugin.command\"}")
+        );
+    }
+
+    #[test]
+    fn phase_marker_payload_ignores_unmarked_lines() {
+        assert_eq!(phase_marker_payload("plain stderr"), None);
+    }
 }

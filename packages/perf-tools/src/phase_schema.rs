@@ -22,7 +22,9 @@ pub(crate) fn validate_phase_schema(events: &[Value]) -> Result<(), Vec<String>>
 }
 
 fn required_fields(phase: &str) -> &'static [&'static str] {
-    if phase.starts_with("service.") || phase == "plugin.native_service_invoke" {
+    if phase == "plugin.command" {
+        &["plugin_id", "command_name", "total_us"]
+    } else if phase.starts_with("service.") || phase == "plugin.native_service_invoke" {
         &[
             "capability",
             "kind",
@@ -55,6 +57,17 @@ mod tests {
             "kind": "Query",
             "interface_id": "example/v1",
             "operation": "get",
+            "total_us": 1,
+        })];
+        assert!(validate_phase_schema(&events).is_ok());
+    }
+
+    #[test]
+    fn validates_plugin_command_required_fields() {
+        let events = vec![json!({
+            "phase": "plugin.command",
+            "plugin_id": "bmux.example",
+            "command_name": "do-work",
             "total_us": 1,
         })];
         assert!(validate_phase_schema(&events).is_ok());

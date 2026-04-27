@@ -31,7 +31,7 @@ pub struct RegisteredPlugin {
     pub bundled_static: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PluginRegistry {
     plugins: BTreeMap<String, RegisteredPlugin>,
 }

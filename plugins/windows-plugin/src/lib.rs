@@ -10,6 +10,7 @@ use bmux_plugin_sdk::{
     HostScope, StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext,
     TypedServiceRegistry, VolatileStateClearRequest, VolatileStateGetRequest,
     VolatileStateSetRequest,
+    perf_telemetry::{PhaseChannel, emit as emit_phase_timing},
 };
 use bmux_windows_plugin_api::windows_commands::{
     self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, PaneResizeDirection,
@@ -30,13 +31,8 @@ const ACTIVE_WINDOW_CONTEXT_KEY: &str = "windows.active_context_id";
 const PREVIOUS_WINDOW_CONTEXT_KEY: &str = "windows.previous_context_id";
 const WINDOW_ORDER_KEY: &str = "windows.order";
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
-const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
-
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
-    if std::env::var_os("BMUX_ATTACH_PHASE_TIMING").is_none() {
-        return;
-    }
-    eprintln!("{ATTACH_PHASE_MARKER}{payload}");
+    emit_phase_timing(PhaseChannel::Attach, payload);
 }
 
 /// Shared "last selected pane per client" map. Mutated by the

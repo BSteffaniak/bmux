@@ -9,7 +9,10 @@ use anyhow::{Context, Result, bail};
 use bmux_client::BmuxClient;
 use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector};
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
-use bmux_plugin_sdk::{PluginCliCommandRequest, PluginCliCommandResponse};
+use bmux_plugin_sdk::{
+    PluginCliCommandRequest, PluginCliCommandResponse,
+    perf_telemetry::{ALL_PHASE_CHANNELS, PhaseChannel, emit as emit_phase_timing},
+};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
@@ -36,29 +39,18 @@ use super::types::{
 
 /// Default timeout for waiting for the sandbox server to start.
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const SANDBOX_PHASE_MARKERS: [&str; 4] = [
-    "[bmux-attach-phase-json]",
-    "[bmux-service-phase-json]",
-    "[bmux-ipc-phase-json]",
-    "[bmux-storage-phase-json]",
-];
-
 /// Max bytes to read from attach output per drain cycle.
 const ATTACH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 
 const VISUAL_RENDER_INTERVAL: Duration = Duration::from_millis(50);
 const VISUAL_REFRESH_INTERVAL: Duration = Duration::from_millis(60);
 const VISUAL_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(30);
-const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
 const PLAYBOOK_ATTACH_COMMAND_EXECUTION_ENV: &str = "BMUX_PLAYBOOK_ATTACH_COMMAND_EXECUTION";
 const PLAYBOOK_PRODUCTION_COMMAND_ENV: &str = "BMUX_PLAYBOOK_PRODUCTION_COMMAND_NAME";
 const SELECTED_CONTEXT_METADATA_KEY: &str = "bmux.contexts.selected_context_id";
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
-    if std::env::var_os("BMUX_ATTACH_PHASE_TIMING").is_none() {
-        return;
-    }
-    eprintln!("{ATTACH_PHASE_MARKER}{payload}");
+    emit_phase_timing(PhaseChannel::Attach, payload);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1541,9 +1533,9 @@ fn forward_sandbox_phase_timing(sandbox: &SandboxServer) {
         return;
     };
     for line in contents.lines() {
-        if SANDBOX_PHASE_MARKERS
+        if ALL_PHASE_CHANNELS
             .iter()
-            .any(|marker| line.contains(marker))
+            .any(|channel| line.contains(channel.marker()))
         {
             eprintln!("{line}");
         }

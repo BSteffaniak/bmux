@@ -55,6 +55,7 @@ mod typed_dispatch_client;
 mod version;
 mod wire_event_sink;
 
+pub use bmux_perf_telemetry as perf_telemetry;
 pub use capability::{HostScope, PluginFeature};
 pub use command::{
     CommandExecutionKind, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,

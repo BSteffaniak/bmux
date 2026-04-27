@@ -1589,6 +1589,7 @@ dependencies = [
  "bmux_client",
  "bmux_codec",
  "bmux_ipc",
+ "bmux_perf_telemetry",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_server",

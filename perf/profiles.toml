@@ -5,7 +5,7 @@ enforce_slo = true
 
 [[profiles]]
 name = "diagnostic"
-description = "Attribution mode with service, IPC, and storage timing enabled; timings may be perturbed."
+description = "Attribution mode with plugin, service, IPC, and storage timing enabled; timings may be perturbed."
 enforce_slo = false
 
 [[profiles]]

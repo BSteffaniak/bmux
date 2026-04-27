@@ -30,10 +30,10 @@ pub(super) type KernelClientFactory =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<BmuxClient>> + Send>> + Send + Sync>;
 
 use super::{
-    ConnectionContext, dispatch::dispatch_built_in_command, effective_enabled_plugins, load_plugin,
-    plugin_host_metadata, resolve_plugin_search_paths, run_keymap_doctor, run_logs_level,
-    run_logs_path, run_plugin_keybinding_command, run_recording_path,
-    run_terminal_install_terminfo,
+    ConnectionContext, build_runtime_command_state, dispatch::dispatch_built_in_command,
+    effective_enabled_plugins, load_plugin, plugin_host_metadata, resolve_plugin_search_paths,
+    run_keymap_doctor, run_logs_level, run_logs_path, run_plugin_keybinding_command,
+    run_plugin_keybinding_command_with_state, run_recording_path, run_terminal_install_terminfo,
 };
 
 thread_local! {
@@ -406,6 +406,21 @@ fn run_plugin_bridge_command_execution(
     )
 }
 
+fn run_plugin_bridge_command_execution_with_state(
+    state: &super::plugin_runtime::RuntimeCommandState,
+    request: &PluginCliCommandRequest,
+    caller_client_id: Option<uuid::Uuid>,
+) -> Result<super::plugin_runtime::PluginCommandExecution> {
+    run_plugin_keybinding_command_with_state(
+        state,
+        request.plugin_id.as_str(),
+        request.command_name.as_str(),
+        &request.arguments,
+        None,
+        caller_client_id,
+    )
+}
+
 fn run_core_built_in_command_fast_path(
     request: &bmux_plugin_sdk::CoreCliCommandRequest,
 ) -> Result<Option<i32>> {
@@ -650,6 +665,8 @@ pub(super) fn register_plugin_service_handlers(
         .keys()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
+    let command_state =
+        build_runtime_command_state(config.clone(), paths.clone(), Arc::new(registry.clone()))?;
     let mut loaded_provider_cache: BTreeMap<String, Arc<bmux_plugin::LoadedPlugin>> =
         BTreeMap::new();
 
@@ -658,24 +675,30 @@ pub(super) fn register_plugin_service_handlers(
         InvokeServiceKind::Command,
         CORE_CLI_COMMAND_INTERFACE_V1,
         CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
-        move |_route, invoke_context, payload| async move {
-            let request: PluginCliCommandRequest = decode_service_message(&payload)?;
-            let execution =
-                run_plugin_bridge_command_execution(&request, Some(invoke_context.client_id().0))?;
-            let response = if execution.status == 0 {
-                PluginCliCommandResponse::new(execution.status)
-            } else {
-                PluginCliCommandResponse::failed(
-                    execution.status,
-                    execution.outcome.error_message.clone().unwrap_or_else(|| {
-                        format!("plugin exited with status {}", execution.status)
-                    }),
-                )
-            };
-            Ok(bmux_server::ServiceInvokeOutput {
-                payload: encode_service_message(&response)?,
-                metadata: execution.outcome.metadata,
-            })
+        move |_route, invoke_context, payload| {
+            let command_state = command_state.clone();
+            async move {
+                let request: PluginCliCommandRequest = decode_service_message(&payload)?;
+                let execution = run_plugin_bridge_command_execution_with_state(
+                    &command_state,
+                    &request,
+                    Some(invoke_context.client_id().0),
+                )?;
+                let response = if execution.status == 0 {
+                    PluginCliCommandResponse::new(execution.status)
+                } else {
+                    PluginCliCommandResponse::failed(
+                        execution.status,
+                        execution.outcome.error_message.clone().unwrap_or_else(|| {
+                            format!("plugin exited with status {}", execution.status)
+                        }),
+                    )
+                };
+                Ok(bmux_server::ServiceInvokeOutput {
+                    payload: encode_service_message(&response)?,
+                    metadata: execution.outcome.metadata,
+                })
+            }
         },
     )?;
 

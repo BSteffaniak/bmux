@@ -22,9 +22,10 @@ Common fields should keep stable names:
 
 - Service dimensions: `capability`, `kind`, `interface_id`, `operation`.
 - IPC dimensions: `request`, `request_id`, `response`.
-- Plugin dimensions: `plugin_id`, `backend`.
+- Plugin dimensions: `plugin_id`, `command_name`, `operation`, `backend`, `measurement_stage` when applicable.
 - Storage dimensions: `plugin_id`, `key`, `value_len`, `cache_hit` when applicable.
 - Timings: use `*_us` fields and keep `total_us` for the full phase.
+- Stage labels: use `measurement_stage = "setup"`, `"cold"`, or `"warm"` when a benchmark separates setup, first-touch, and warmed paths. Warm reports should carry primary SLOs; cold reports should normally be diagnostic.
 
 ## Configs
 
@@ -45,6 +46,7 @@ core_service_limit_ms = 1
 [profiles.normal]
 
 [profiles.diagnostic]
+plugin_timing = true
 loosen_slo = true
 ```
 
@@ -59,6 +61,20 @@ phase = "core_service"
 field = "total_us"
 limit = "core_service"
 filter = { key = "scenario", value = "storage.cached_get" }
+```
+
+Use `filters = [...]` for multi-dimensional reports:
+
+```toml
+[[reports]]
+phase = "plugin.command"
+field = "total_us"
+tags = ["plugin"]
+filters = [
+  { key = "plugin_id", value = "bmux.example" },
+  { key = "command_name", value = "do-work" },
+  { key = "measurement_stage", value = "warm" },
+]
 ```
 
 Use `tags` for expensive diagnostic reports so normal runs can skip them unless the script enables the tag.
@@ -92,6 +108,20 @@ Profile metadata lives in `perf/profiles.toml`.
 3. Prefer implementing the runner in `bmux-perf-tools run-benchmark`; keep shell scripts as wrappers only.
 4. Make the runner produce one standard artifact containing `benchmark`, `kind`, `profile`, `scenario`, `events`, `limits`, `latency_ms`, and `raw`.
 5. Run a normal-mode benchmark for SLO validation and a diagnostic-mode benchmark only for attribution.
+
+## Plugin Benchmark Contract
+
+Plugin-owned benchmark coverage should be added without special host code whenever possible:
+
+1. Emit runtime phases through `bmux_plugin_sdk::perf_telemetry` or `bmux_perf_telemetry` directly.
+2. Use `PhaseChannel::Plugin` for plugin command/service internals. The stable command phase is `plugin.command` with `plugin_id`, `command_name`, and `total_us`.
+3. If a plugin has useful internal attribution, emit namespaced phases such as `plugin.<short-name>.<operation>` and include `plugin_id`, `operation`, and `total_us`.
+4. Keep emitters gated by `PhaseChannel::enabled()` or `emit(...)`; never compute expensive diagnostic payloads when the channel is disabled.
+5. Add reports to a `perf/*.toml` manifest using `tags = ["plugin"]` for diagnostic-only attribution.
+6. Keep SLO limits in the manifest. Runtime/plugin code should not contain benchmark thresholds.
+7. Prefer generic setup/previsit/measured stages over benchmark-only command shortcuts. If a cold path matters, report it separately from warmed SLOs.
+
+The benchmark runner forwards all standard phase channels when their profile enables them. Plugin owners should not need bespoke stderr parsing or shell wrappers for phase collection.
 
 ## Registry
 

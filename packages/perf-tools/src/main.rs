@@ -5,6 +5,7 @@ use benchmark_manifest::{
     AttachCommandExecution, BenchmarkManifest, BenchmarkResolvedOptions, BenchmarkRunOptions,
     read_manifest, resolve_benchmark_options,
 };
+use bmux_perf_telemetry::{PhaseChannel, phase_marker_payload};
 use phase_schema::validate_phase_schema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -75,12 +76,6 @@ fn usage() -> &'static str {
   compare-report --baseline PATH --candidate PATH [--candidate PATH ...] [--warn-regression-ms N] [--json-output PATH]
   discover-run-candidate --bmux-bin PATH"
 }
-
-const PHASE_MARKER: &str = "[bmux-plugin-phase-json]";
-const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
-const SERVICE_PHASE_MARKER: &str = "[bmux-service-phase-json]";
-const IPC_PHASE_MARKER: &str = "[bmux-ipc-phase-json]";
-const STORAGE_PHASE_MARKER: &str = "[bmux-storage-phase-json]";
 
 #[derive(Debug, Deserialize)]
 struct PhaseReportConfig {
@@ -374,7 +369,7 @@ fn run_generic_ipc_benchmark(
             "--out-json",
             &sample_json,
         ])
-        .env("BMUX_IPC_PHASE_TIMING", "1")
+        .env(PhaseChannel::Ipc.env_var(), "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .output()
@@ -665,7 +660,7 @@ fn attach_scenario_key(
 
 fn attach_envs(options: &BenchmarkResolvedOptions) -> Vec<(String, String)> {
     let mut envs = vec![
-        ("BMUX_ATTACH_PHASE_TIMING".to_string(), "1".to_string()),
+        (PhaseChannel::Attach.env_var().to_string(), "1".to_string()),
         (
             "BMUX_PLAYBOOK_ATTACH_COMMAND_EXECUTION".to_string(),
             options.attach_command_execution.as_str().to_string(),
@@ -675,25 +670,29 @@ fn attach_envs(options: &BenchmarkResolvedOptions) -> Vec<(String, String)> {
             options.scenario.clone(),
         ),
     ];
+    if options.plugin_timing {
+        envs.push((PhaseChannel::Plugin.env_var().to_string(), "1".to_string()));
+        envs.push((
+            "BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING".to_string(),
+            "1".to_string(),
+        ));
+    }
     if options.service_timing {
-        envs.push(("BMUX_SERVICE_PHASE_TIMING".to_string(), "1".to_string()));
+        envs.push((PhaseChannel::Service.env_var().to_string(), "1".to_string()));
         envs.push((
             "BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING".to_string(),
             "1".to_string(),
         ));
     }
     if options.ipc_timing {
-        envs.push(("BMUX_IPC_PHASE_TIMING".to_string(), "1".to_string()));
+        envs.push((PhaseChannel::Ipc.env_var().to_string(), "1".to_string()));
         envs.push((
             "BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING".to_string(),
             "1".to_string(),
         ));
     }
     if options.storage_timing {
-        envs.push((
-            "BMUX_PLUGIN_STORAGE_PHASE_TIMING".to_string(),
-            "1".to_string(),
-        ));
+        envs.push((PhaseChannel::Storage.env_var().to_string(), "1".to_string()));
         envs.push((
             "BMUX_PLAYBOOK_FORWARD_SANDBOX_PHASE_TIMING".to_string(),
             "1".to_string(),
@@ -861,6 +860,10 @@ fn write_standard_benchmark_artifact(
         "limits": options.limits,
         "tags": options.tags,
         "loosen_slo": options.loosen_slo,
+        "plugin_timing": options.plugin_timing,
+        "service_timing": options.service_timing,
+        "ipc_timing": options.ipc_timing,
+        "storage_timing": options.storage_timing,
         "attach_command_execution": options.attach_command_execution.as_str(),
         "latency_ms": latency,
         "events": events,
@@ -2557,14 +2560,7 @@ fn run_sample(args: Vec<String>) -> Result<(), String> {
 fn parse_phase_events(stderr: &str) -> Vec<Value> {
     stderr
         .lines()
-        .filter_map(|line| {
-            line.split_once(PHASE_MARKER)
-                .or_else(|| line.split_once(ATTACH_PHASE_MARKER))
-                .or_else(|| line.split_once(SERVICE_PHASE_MARKER))
-                .or_else(|| line.split_once(IPC_PHASE_MARKER))
-                .or_else(|| line.split_once(STORAGE_PHASE_MARKER))
-                .map(|(_, payload)| payload.trim())
-        })
+        .filter_map(phase_marker_payload)
         .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
         .collect()
 }

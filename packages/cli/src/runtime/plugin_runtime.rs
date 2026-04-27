@@ -7,6 +7,7 @@ use bmux_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
     HostScope, NativeCommandContext, NativeLifecycleContext, PluginCommandOutcome, PluginEvent,
     PluginEventKind, RegisteredService,
+    perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing},
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -397,17 +398,13 @@ fn mark_runtime_command_state_remote(state: &RuntimeCommandState) {
 }
 
 fn emit_runtime_state_phase_timing(config_us: u128, scan_us: u128, build_us: u128) {
-    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
-        return;
-    }
-    let payload = serde_json::json!({
-        "phase": "runtime_command_state",
-        "config_us": config_us,
-        "scan_us": scan_us,
-        "build_us": build_us,
-        "total_us": config_us + scan_us + build_us,
-    });
-    eprintln!("[bmux-plugin-phase-json]{payload}");
+    let payload = PhasePayload::new("runtime_command_state")
+        .field("config_us", config_us)
+        .field("scan_us", scan_us)
+        .field("build_us", build_us)
+        .field("total_us", config_us + scan_us + build_us)
+        .finish();
+    emit_phase_timing(PhaseChannel::Plugin, &payload);
 }
 
 pub(super) fn resolve_plugin_search_paths(
@@ -1548,6 +1545,25 @@ pub(super) fn run_plugin_keybinding_command(
     )
 }
 
+pub(super) fn run_plugin_keybinding_command_with_state(
+    state: &RuntimeCommandState,
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+    kernel_client_factory: Option<&KernelClientFactory>,
+    caller_client_id: Option<uuid::Uuid>,
+) -> Result<PluginCommandExecution> {
+    run_plugin_command_internal_with_state(
+        Some(state),
+        plugin_id,
+        command_name,
+        args,
+        kernel_client_factory,
+        caller_client_id,
+        bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct PluginCommandPolicyHints {
     pub(super) execution: bmux_plugin_sdk::CommandExecutionKind,
@@ -1738,21 +1754,18 @@ fn emit_plugin_phase_timing(
     run_us: u128,
     total_us: u128,
 ) {
-    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
-        return;
-    }
-    let payload = serde_json::json!({
-        "plugin_id": plugin_id,
-        "command_name": command_name,
-        "invocation_source": format!("{invocation_source:?}"),
-        "runtime_state_us": runtime_state_us,
-        "lookup_us": lookup_us,
-        "load_us": load_us,
-        "context_us": context_us,
-        "run_us": run_us,
-        "total_us": total_us,
-    });
-    eprintln!("[bmux-plugin-phase-json]{payload}");
+    let payload = PhasePayload::new("plugin.command")
+        .field("plugin_id", plugin_id)
+        .field("command_name", command_name)
+        .field("invocation_source", format!("{invocation_source:?}"))
+        .field("runtime_state_us", runtime_state_us)
+        .field("lookup_us", lookup_us)
+        .field("load_us", load_us)
+        .field("context_us", context_us)
+        .field("run_us", run_us)
+        .field("total_us", total_us)
+        .finish();
+    emit_phase_timing(PhaseChannel::Plugin, &payload);
 }
 
 fn load_cached_plugin(
@@ -1890,19 +1903,16 @@ fn emit_external_plugin_phase_timing(
     dispatch_us: u128,
     total_us: u128,
 ) {
-    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
-        return;
-    }
-    let payload = serde_json::json!({
-        "command_path": args,
-        "config_us": config_us,
-        "scan_us": scan_us,
-        "registry_us": registry_us,
-        "resolve_us": resolve_us,
-        "dispatch_us": dispatch_us,
-        "total_us": total_us,
-    });
-    eprintln!("[bmux-plugin-phase-json]{payload}");
+    let payload = PhasePayload::new("plugin.external_command")
+        .field("command_path", args)
+        .field("config_us", config_us)
+        .field("scan_us", scan_us)
+        .field("registry_us", registry_us)
+        .field("resolve_us", resolve_us)
+        .field("dispatch_us", dispatch_us)
+        .field("total_us", total_us)
+        .finish();
+    emit_phase_timing(PhaseChannel::Plugin, &payload);
 }
 #[cfg(test)]
 mod tests {

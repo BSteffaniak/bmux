@@ -15,16 +15,17 @@ name = "bmux-perf-tools"
 path = "src/main.rs"
 
 [dependencies]
-bmux_client     = { workspace = true }
-bmux_codec      = { workspace = true }
-bmux_ipc        = { workspace = true }
-bmux_plugin     = { workspace = true }
-bmux_plugin_sdk = { workspace = true }
-bmux_server     = { workspace = true }
-serde           = { workspace = true }
-serde_json      = { workspace = true }
-tokio           = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-toml            = { workspace = true, features = ["parse"] }
+bmux_client         = { workspace = true }
+bmux_codec          = { workspace = true }
+bmux_ipc            = { workspace = true }
+bmux_perf_telemetry = { workspace = true }
+bmux_plugin         = { workspace = true }
+bmux_plugin_sdk     = { workspace = true }
+bmux_server         = { workspace = true }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+tokio               = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+toml                = { workspace = true, features = ["parse"] }
 
 [features]
 fail-on-warnings = []

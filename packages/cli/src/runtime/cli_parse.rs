@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, LogLevel};
 use bmux_config::{BmuxConfig, ConfigLoadOverrides, ConfigPaths, RECORDINGS_DIR_OVERRIDE_ENV};
 use bmux_plugin::PluginRegistry;
+use bmux_plugin_sdk::perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use clap::{CommandFactory, FromArgMatches};
 use std::sync::Arc;
 use std::time::Instant;
@@ -122,20 +123,16 @@ fn emit_parse_phase_timing(
     parse_us: u128,
     total_us: u128,
 ) {
-    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
-        return;
-    }
-    let payload = serde_json::json!({
-        "phase": "parse_runtime_cli",
-        "argv_us": argv_us,
-        "slot_us": slot_us,
-        "config_us": config_us,
-        "scan_us": scan_us,
-        "state_us": state_us,
-        "parse_us": parse_us,
-        "total_us": total_us,
-    });
-    eprintln!("[bmux-plugin-phase-json]{payload}");
+    let payload = PhasePayload::new("parse_runtime_cli")
+        .field("argv_us", argv_us)
+        .field("slot_us", slot_us)
+        .field("config_us", config_us)
+        .field("scan_us", scan_us)
+        .field("state_us", state_us)
+        .field("parse_us", parse_us)
+        .field("total_us", total_us)
+        .finish();
+    emit_phase_timing(PhaseChannel::Plugin, &payload);
 }
 
 fn apply_runtime_override_from_raw_args(
@@ -394,18 +391,14 @@ fn emit_parse_with_registry_phase_timing(
     clap_parse_us: u128,
     total_us: u128,
 ) {
-    if std::env::var_os("BMUX_PLUGIN_PHASE_TIMING").is_none() {
-        return;
-    }
-    let payload = serde_json::json!({
-        "phase": "parse_runtime_cli_with_registry",
-        "command_registry_us": registry_us,
-        "resolve_us": resolve_us,
-        "clap_augment_us": clap_augment_us,
-        "clap_parse_us": clap_parse_us,
-        "total_us": total_us,
-    });
-    eprintln!("[bmux-plugin-phase-json]{payload}");
+    let payload = PhasePayload::new("parse_runtime_cli_with_registry")
+        .field("command_registry_us", registry_us)
+        .field("resolve_us", resolve_us)
+        .field("clap_augment_us", clap_augment_us)
+        .field("clap_parse_us", clap_parse_us)
+        .field("total_us", total_us)
+        .finish();
+    emit_phase_timing(PhaseChannel::Plugin, &payload);
 }
 
 pub(super) fn resolve_log_level(
