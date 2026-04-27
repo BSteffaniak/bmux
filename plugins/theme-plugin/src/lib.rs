@@ -19,7 +19,7 @@ use bmux_plugin_sdk::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
 
@@ -298,12 +298,6 @@ fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
         warn!("no active theme resolved for startup extension apply");
         return;
     };
-    info!(
-        source = ?active.source,
-        requested_name = active.requested_name.as_deref().unwrap_or(""),
-        stack = ?active.stack,
-        "applying active theme extensions",
-    );
     let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
     let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
     apply_theme_extensions(
@@ -334,7 +328,7 @@ fn configured_theme(context: &(impl ThemeHostContext + ?Sized)) -> Option<Active
 }
 
 fn log_active_theme(context: &impl ThemeHostContext, active: &ActiveThemeResolution) {
-    info!(
+    debug!(
         data_dir = %context.connection_info().data_dir,
         source = ?active.source,
         requested_name = active.requested_name.as_deref().unwrap_or(""),
@@ -795,26 +789,15 @@ fn apply_theme_extensions(
             continue;
         };
         let capability = format!("{plugin_id}.write");
-        match execute_theme_extension_apply(context, &capability, payload) {
-            Ok(()) => {
-                info!(
-                    plugin_id = %plugin_id,
-                    capability = %capability,
-                    interface = "theme-extension",
-                    operation = "apply",
-                    "theme extension apply succeeded",
-                );
-            }
-            Err(error) => {
-                warn!(
-                    %error,
-                    plugin_id = %plugin_id,
-                    capability = %capability,
-                    interface = "theme-extension",
-                    operation = "apply",
-                    "theme extension apply failed",
-                );
-            }
+        if let Err(error) = execute_theme_extension_apply(context, &capability, payload) {
+            warn!(
+                %error,
+                plugin_id = %plugin_id,
+                capability = %capability,
+                interface = "theme-extension",
+                operation = "apply",
+                "theme extension apply failed",
+            );
         }
     }
 }

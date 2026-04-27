@@ -743,10 +743,6 @@ fn apply_theme_extension_toml(
             state.animation_hz = None;
             install_script_backend(&mut state, None);
             bump_revision(&mut state);
-            tracing::info!(
-                scene_revision = state.scene_revision,
-                "decoration theme extension cleared",
-            );
         }
         return Ok(());
     }
@@ -774,12 +770,6 @@ fn apply_theme_extension_toml(
         state.animation_hz = animation_hz;
         install_script_backend(&mut state, script);
         bump_revision(&mut state);
-        tracing::info!(
-            scene_revision = state.scene_revision,
-            animation_hz = state.animation_hz,
-            script_loaded = state.script_backend.is_some(),
-            "decoration theme extension applied",
-        );
     }
     if let Some(hz) = animation_hz
         && hz > 0
