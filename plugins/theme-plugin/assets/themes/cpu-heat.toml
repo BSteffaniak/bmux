@@ -1,0 +1,62 @@
+# CPU Heat theme - uses bmux.performance metrics to color pane borders.
+
+background           = "#050505"
+cursor               = "#ffd75f"
+foreground           = "#f4f1e8"
+name                 = "cpu-heat"
+selection_background = "#3a2512"
+
+[border]
+active   = "#ffaf00"
+inactive = "#3a3a3a"
+
+[status]
+active_window  = "#ffaf00"
+background     = "#111111"
+foreground     = "#f4f1e8"
+mode_indicator = "#ff5f5f"
+
+[plugins."bmux.decoration"]
+script = "cpu_heat"
+
+[plugins."bmux.decoration".unfocused]
+bg            = ""
+fg            = "#444444"
+glyphs_custom = []
+gradient_from = ""
+gradient_to   = ""
+style         = "single-line"
+
+[plugins."bmux.decoration".focused]
+bg            = ""
+fg            = "#ffaf00"
+glyphs_custom = []
+gradient_from = "#5fd75f"
+gradient_to   = "#ff5f5f"
+style         = "thick"
+
+[plugins."bmux.decoration".zoomed]
+bg            = ""
+fg            = "#ff5f5f"
+glyphs_custom = []
+gradient_from = "#ffaf00"
+gradient_to   = "#ff5f5f"
+style         = "double"
+
+[plugins."bmux.decoration".badges]
+exited  = "x"
+running = ">"
+
+[plugins."bmux.decoration".animation]
+hz   = 8
+kind = "cpu_heat"
+
+[plugins."bmux.decoration".script_access]
+event_channels = ["bmux.performance/metric-events"]
+state_channels = ["bmux.performance/metrics-state"]
+
+[[plugins."bmux.decoration".script_access.services]]
+capability   = "bmux.performance.read"
+interface_id = "performance-commands"
+kind         = "query"
+operation    = "get-snapshot"

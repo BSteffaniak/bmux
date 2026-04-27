@@ -31,6 +31,17 @@ interface pane-runtime-state {
         panes: list<pane-summary>,
     }
 
+    record pane-process-identity {
+        session_id: uuid,
+        pane_id: uuid,
+        pid: u32?,
+        process_group_id: i32?,
+    }
+
+    record pane-process-list {
+        panes: list<pane-process-identity>,
+    }
+
     variant pane-state-error {
         session-not-found,
         pane-not-found,
@@ -39,6 +50,9 @@ interface pane-runtime-state {
     query list-panes(session_id: uuid?) -> result<session-pane-list, pane-state-error>;
     query get-pane(session_id: uuid, pane_id: uuid)
         -> result<pane-summary, pane-state-error>;
+    query list-pane-processes() -> result<pane-process-list, pane-state-error>;
+    query get-pane-process(session_id: uuid, pane_id: uuid)
+        -> result<pane-process-identity, pane-state-error>;
 }
 
 interface pane-runtime-commands {

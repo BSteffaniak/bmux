@@ -6867,6 +6867,42 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             .ok_or_else(Self::lock_poisoned_anyhow)?
     }
 
+    fn list_pane_processes(&self) -> Vec<bmux_pane_runtime_state::PaneProcessIdentity> {
+        self.with_lock_read(|m| {
+            let mut identities = Vec::new();
+            for (session_id, runtime) in &m.runtimes {
+                for (pane_id, pane) in &runtime.panes {
+                    identities.push(bmux_pane_runtime_state::PaneProcessIdentity {
+                        session_id: *session_id,
+                        pane_id: *pane_id,
+                        pid: pane.process_id.lock().ok().and_then(|pid| *pid),
+                        process_group_id: pane.process_group_id.lock().ok().and_then(|pgid| *pgid),
+                    });
+                }
+            }
+            identities
+        })
+        .unwrap_or_default()
+    }
+
+    fn pane_process_identity(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> Option<bmux_pane_runtime_state::PaneProcessIdentity> {
+        self.with_lock_read(|m| {
+            let runtime = m.runtimes.get(&session_id)?;
+            let pane = runtime.panes.get(&pane_id)?;
+            Some(bmux_pane_runtime_state::PaneProcessIdentity {
+                session_id,
+                pane_id,
+                pid: pane.process_id.lock().ok().and_then(|pid| *pid),
+                process_group_id: pane.process_group_id.lock().ok().and_then(|pgid| *pgid),
+            })
+        })
+        .flatten()
+    }
+
     fn write_input(
         &self,
         session_id: SessionId,

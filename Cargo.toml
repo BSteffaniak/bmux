@@ -265,6 +265,7 @@ sha2 = { version = "0.10.9", default-features = false, features = ["std"] }
 similar = { version = "2.7.0" }
 ssh2 = { version = "0.9.5" }
 syn = { version = "2.0.117", default-features = false }
+sysinfo = { version = "0.37.2" }
 tempfile = { version = "3.27.0", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
 time = { version = "0.3.47", default-features = false }

@@ -11,3 +11,13 @@ version               = "0.0.1-alpha.0"
 capability   = "bmux.performance.read"
 interface_id = "performance-commands"
 kind         = "command"
+
+[[services]]
+capability   = "bmux.performance.read"
+interface_id = "performance-commands"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.performance.write"
+interface_id = "performance-commands"
+kind         = "command"

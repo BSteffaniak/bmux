@@ -22,6 +22,8 @@ pub enum PerformanceTypedClientError {
     Encode(String),
     #[error("failed to decode performance response: {0}")]
     Decode(String),
+    #[error("unexpected performance response variant")]
+    UnexpectedResponse,
 }
 
 type Result<T> = core::result::Result<T, PerformanceTypedClientError>;
@@ -54,13 +56,16 @@ async fn dispatch<C: TypedDispatchClient>(
 pub async fn performance_status<C: TypedDispatchClient>(
     client: &mut C,
 ) -> Result<PerformanceRuntimeSettings> {
-    let PerformanceResponse::Settings { settings } = dispatch(
+    let response = dispatch(
         client,
         PERFORMANCE_READ.as_str(),
         PerformanceRequest::GetSettings,
     )
     .await?;
-    Ok(settings)
+    match response {
+        PerformanceResponse::Settings { settings } => Ok(settings),
+        _ => Err(PerformanceTypedClientError::UnexpectedResponse),
+    }
 }
 
 /// Update runtime performance telemetry settings.
@@ -72,11 +77,14 @@ pub async fn performance_set<C: TypedDispatchClient>(
     client: &mut C,
     settings: PerformanceRuntimeSettings,
 ) -> Result<PerformanceRuntimeSettings> {
-    let PerformanceResponse::Settings { settings } = dispatch(
+    let response = dispatch(
         client,
         PERFORMANCE_WRITE.as_str(),
         PerformanceRequest::SetSettings { settings },
     )
     .await?;
-    Ok(settings)
+    match response {
+        PerformanceResponse::Settings { settings } => Ok(settings),
+        _ => Err(PerformanceTypedClientError::UnexpectedResponse),
+    }
 }

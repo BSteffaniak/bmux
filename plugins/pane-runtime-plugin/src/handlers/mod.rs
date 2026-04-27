@@ -36,6 +36,12 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "pane-runtime-state", "get-pane" => |req: pane_state::GetPaneArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_state::get_pane(&req, ctx))
         },
+        "pane-runtime-state", "list-pane-processes" => |_req: (), _ctx| {
+            Ok::<_, ServiceResponse>(pane_state::list_pane_processes())
+        },
+        "pane-runtime-state", "get-pane-process" => |req: pane_state::GetPaneProcessArgs, _ctx| {
+            Ok::<_, ServiceResponse>(pane_state::get_pane_process(&req))
+        },
 
         // pane-runtime-commands mutations.
         "pane-runtime-commands", "split-pane" => |req: pane_commands::SplitPaneArgs, ctx| {

@@ -706,6 +706,7 @@ const fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
             "rainbow-snake",
             include_str!("../assets/themes/rainbow-snake.toml"),
         ),
+        ("cpu-heat", include_str!("../assets/themes/cpu-heat.toml")),
         (
             "mode-aware",
             include_str!("../assets/themes/mode-aware.toml"),

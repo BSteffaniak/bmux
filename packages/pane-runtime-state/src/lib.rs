@@ -36,7 +36,7 @@ pub use layout::{
 };
 pub use manager_handle::{
     AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, NoopSessionRuntimeManager,
-    RemovedRuntimeInfo, SessionRuntimeManagerApi, SessionRuntimeManagerHandle,
+    PaneProcessIdentity, RemovedRuntimeInfo, SessionRuntimeManagerApi, SessionRuntimeManagerHandle,
     SessionRuntimeSnapshot,
 };
 pub use meta::{PaneCommandSource, PaneLaunchSpec, PaneResurrectionSnapshot, PaneRuntimeMeta};

@@ -932,6 +932,10 @@ pub fn bundled_decoration_scripts() -> &'static [(&'static str, &'static str)] {
                 "rainbow_snake",
                 include_str!("../assets/decorations/rainbow_snake.lua"),
             ),
+            (
+                "cpu_heat",
+                include_str!("../assets/decorations/cpu_heat.lua"),
+            ),
         ]
     }
     #[cfg(not(feature = "bundled-decoration-scripts"))]
@@ -1236,6 +1240,44 @@ mod tests {
                 .expect("compile");
             let outcome = backend.invoke(&render_message()).expect("render invoke");
             assert!(outcome.surfaces.is_empty());
+        }
+
+        #[test]
+        fn bundled_cpu_heat_script_uses_metrics_state() {
+            let backend = make_backend(ScriptHostAccess::default());
+            backend
+                .compile(
+                    Path::new("cpu_heat.lua"),
+                    include_str!("../assets/decorations/cpu_heat.lua"),
+                )
+                .expect("compile");
+            backend
+                .invoke(&ScriptMessage::Event(ScriptEventMessage {
+                    source: "bmux.performance/metrics-state".to_string(),
+                    kind: "bmux.performance/metrics-state".to_string(),
+                    delivery: ScriptEventDelivery::State,
+                    snapshot: true,
+                    payload: json!({
+                        "system": { "cpu_percent": 12.0 },
+                        "panes": {
+                            "test-pane": {
+                                "available": true,
+                                "cpu_percent": 86.0
+                            }
+                        }
+                    }),
+                }))
+                .expect("metrics event invoke");
+            let outcome = backend.invoke(&render_message()).expect("render invoke");
+            let commands = &outcome.surfaces["test-pane"];
+            assert!(commands.iter().any(|command| matches!(
+                command,
+                bmux_scene_protocol::scene_protocol::PaintCommand::BoxBorder { .. }
+            )));
+            assert!(commands.iter().any(|command| matches!(
+                command,
+                bmux_scene_protocol::scene_protocol::PaintCommand::Text { .. }
+            )));
         }
     }
 }

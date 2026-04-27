@@ -17,6 +17,7 @@ bmux_plugin_sdk        = { workspace = true }
 serde                  = { workspace = true, features = ["derive", "std"] }
 serde_json             = { workspace = true, features = ["std"] }
 thiserror              = { workspace = true }
+uuid                   = { workspace = true, features = ["serde"] }
 
 [features]
 default          = []

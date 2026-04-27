@@ -2,7 +2,7 @@
 
 use bmux_client_state::FollowStateHandle;
 use bmux_pane_runtime_plugin_api::pane_runtime_state::{
-    PaneStateError, PaneSummary, SessionPaneList,
+    PaneProcessIdentity, PaneProcessList, PaneStateError, PaneSummary, SessionPaneList,
 };
 use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::NativeServiceContext;
@@ -20,6 +20,12 @@ pub struct ListPanesArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetPaneArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetPaneProcessArgs {
     pub session_id: Uuid,
     pub pane_id: Uuid,
 }
@@ -84,4 +90,36 @@ pub fn get_pane(
         .into_iter()
         .find(|p| p.id == req.pane_id)
         .ok_or(PaneStateError::PaneNotFound)
+}
+
+pub fn list_pane_processes() -> Result<PaneProcessList, PaneStateError> {
+    let handle = super::session_runtime_handle().ok_or(PaneStateError::SessionNotFound)?;
+    Ok(PaneProcessList {
+        panes: handle
+            .0
+            .list_pane_processes()
+            .into_iter()
+            .map(|identity| to_api_process_identity(&identity))
+            .collect(),
+    })
+}
+
+pub fn get_pane_process(req: &GetPaneProcessArgs) -> Result<PaneProcessIdentity, PaneStateError> {
+    let handle = super::session_runtime_handle().ok_or(PaneStateError::SessionNotFound)?;
+    handle
+        .0
+        .pane_process_identity(SessionId(req.session_id), req.pane_id)
+        .map(|identity| to_api_process_identity(&identity))
+        .ok_or(PaneStateError::PaneNotFound)
+}
+
+const fn to_api_process_identity(
+    value: &bmux_pane_runtime_state::PaneProcessIdentity,
+) -> PaneProcessIdentity {
+    PaneProcessIdentity {
+        session_id: value.session_id.0,
+        pane_id: value.pane_id,
+        pid: value.pid,
+        process_group_id: value.process_group_id,
+    }
 }

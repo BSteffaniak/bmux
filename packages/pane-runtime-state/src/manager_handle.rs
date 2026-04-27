@@ -71,6 +71,17 @@ pub struct AttachPaneSnapshotState {
     pub pane_input_modes: Vec<AttachPaneInputMode>,
 }
 
+/// Process identity for a running pane runtime. `pid` is the spawned
+/// shell/process id; `process_group_id` is the platform process-group
+/// root when available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneProcessIdentity {
+    pub session_id: SessionId,
+    pub pane_id: Uuid,
+    pub pid: Option<u32>,
+    pub process_group_id: Option<i32>,
+}
+
 /// Per-session pane-runtime projection used when building a
 /// persistence snapshot.
 #[derive(Debug, Clone)]
@@ -160,6 +171,13 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
     // ── Pane I/O ───────────────────────────────────────────────────
 
     fn list_panes(&self, session_id: SessionId) -> anyhow::Result<Vec<PaneSummary>>;
+
+    fn list_pane_processes(&self) -> Vec<PaneProcessIdentity>;
+    fn pane_process_identity(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> Option<PaneProcessIdentity>;
 
     fn write_input(
         &self,
@@ -446,6 +464,16 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
     }
     fn list_panes(&self, _session_id: SessionId) -> anyhow::Result<Vec<PaneSummary>> {
         Ok(Vec::new())
+    }
+    fn list_pane_processes(&self) -> Vec<PaneProcessIdentity> {
+        Vec::new()
+    }
+    fn pane_process_identity(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+    ) -> Option<PaneProcessIdentity> {
+        None
     }
     fn write_input(
         &self,
