@@ -1,3 +1,5 @@
+use std::{cell::RefCell, collections::BTreeMap};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -80,4 +82,41 @@ pub struct PluginCommandOutcome {
     /// TTYs for in-process plugins).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Generic metadata produced by a plugin command.
+    ///
+    /// Hosts may interpret well-known keys for their own runtime surfaces while
+    /// the SDK remains domain-agnostic.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+}
+
+thread_local! {
+    static COMMAND_OUTCOME_CAPTURE: RefCell<Option<PluginCommandOutcome>> = const { RefCell::new(None) };
+}
+
+#[doc(hidden)]
+pub fn begin_command_outcome_capture() {
+    COMMAND_OUTCOME_CAPTURE.with(|slot| {
+        *slot.borrow_mut() = Some(PluginCommandOutcome::default());
+    });
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn finish_command_outcome_capture() -> PluginCommandOutcome {
+    COMMAND_OUTCOME_CAPTURE
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// Record metadata for the currently-running plugin command.
+///
+/// If no command capture is active, this is a no-op. That keeps plugin code safe
+/// to call from CLI, service, and test harnesses that do not collect outcomes.
+pub fn record_command_outcome_metadata(key: impl Into<String>, value: Value) {
+    COMMAND_OUTCOME_CAPTURE.with(|slot| {
+        if let Some(outcome) = slot.borrow_mut().as_mut() {
+            outcome.metadata.insert(key.into(), value);
+        }
+    });
 }

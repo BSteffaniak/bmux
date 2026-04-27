@@ -70,6 +70,7 @@ use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
+const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
 /// progress output burst to complete (e.g. when the server indicates
 /// `output_still_pending` or the inner application is mid-synchronized-
@@ -2113,14 +2114,34 @@ pub struct AttachRunOutcome {
 /// [`plugin_fallback_retarget_context_id`] and the caller).
 ///
 /// The function is kept as a no-op-friendly shim so call sites don't
-/// need conditional compilation; it always returns `Ok(false)`.
-#[allow(clippy::unused_async)] // Keep async to preserve signature for call sites.
+/// need conditional compilation; it returns whether the outcome changed attach state.
 pub async fn apply_plugin_command_outcome(
-    _client: &mut StreamingBmuxClient,
-    _view_state: &mut AttachViewState,
-    _outcome: PluginCommandOutcome,
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    outcome: PluginCommandOutcome,
 ) -> std::result::Result<bool, ClientError> {
-    Ok(false)
+    let Some(context_id) = selected_context_id_from_command_outcome(&outcome) else {
+        return Ok(false);
+    };
+    if view_state.attached_context_id == Some(context_id) {
+        return Ok(true);
+    }
+    retarget_attach_to_context(client, view_state, context_id).await?;
+    Ok(true)
+}
+
+fn selected_context_id_from_command_outcome(outcome: &PluginCommandOutcome) -> Option<Uuid> {
+    let value = outcome
+        .metadata
+        .get(COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY)?;
+    let context_id = value.as_str().and_then(|value| Uuid::parse_str(value).ok());
+    if context_id.is_none() {
+        warn!(
+            value = ?value,
+            "attach.plugin_command.invalid_selected_context_outcome"
+        );
+    }
+    context_id
 }
 
 /// React to a `contexts-events` payload forwarded from the server
@@ -2654,19 +2675,28 @@ pub async fn handle_attach_plugin_command_action(
             let outcome_us = outcome_started.elapsed().as_micros();
 
             let after_started = Instant::now();
-            let after_context_id = typed_current_context_attach(client)
-                .await
-                .map_or(None, |context| context.map(|entry| entry.id));
-            let after_context_ids = typed_list_contexts_attach(client)
-                .await
-                .ok()
-                .map(|contexts| {
-                    contexts
-                        .into_iter()
-                        .map(|context| context.id)
-                        .collect::<std::collections::BTreeSet<_>>()
-                });
-            let after_us = after_started.elapsed().as_micros();
+            let (after_context_id, after_context_ids, after_us) = if outcome_applied {
+                (None, None, 0)
+            } else {
+                let after_context_id = typed_current_context_attach(client)
+                    .await
+                    .map_or(None, |context| context.map(|entry| entry.id));
+                let after_context_ids =
+                    typed_list_contexts_attach(client)
+                        .await
+                        .ok()
+                        .map(|contexts| {
+                            contexts
+                                .into_iter()
+                                .map(|context| context.id)
+                                .collect::<std::collections::BTreeSet<_>>()
+                        });
+                (
+                    after_context_id,
+                    after_context_ids,
+                    after_started.elapsed().as_micros(),
+                )
+            };
             debug!(
                 plugin_id = %plugin_id,
                 command_name = %command_name,
@@ -7435,6 +7465,32 @@ mod tests {
             });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
         view_state
+    }
+
+    #[test]
+    fn command_outcome_selected_context_metadata_parses_uuid() {
+        let context_id = Uuid::from_u128(42);
+        let mut outcome = PluginCommandOutcome::default();
+        outcome.metadata.insert(
+            COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY.to_string(),
+            serde_json::json!(context_id.to_string()),
+        );
+
+        assert_eq!(
+            selected_context_id_from_command_outcome(&outcome),
+            Some(context_id)
+        );
+    }
+
+    #[test]
+    fn command_outcome_selected_context_metadata_ignores_invalid_value() {
+        let mut outcome = PluginCommandOutcome::default();
+        outcome.metadata.insert(
+            COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY.to_string(),
+            serde_json::json!("not-a-uuid"),
+        );
+
+        assert_eq!(selected_context_id_from_command_outcome(&outcome), None);
     }
 
     #[test]

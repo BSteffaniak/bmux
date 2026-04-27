@@ -29,6 +29,7 @@ use uuid::Uuid;
 const ACTIVE_WINDOW_CONTEXT_KEY: &str = "windows.active_context_id";
 const PREVIOUS_WINDOW_CONTEXT_KEY: &str = "windows.previous_context_id";
 const WINDOW_ORDER_KEY: &str = "windows.order";
+const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
 const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
@@ -511,6 +512,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
         "new-window" => {
             let name = option_value(&context.arguments, "name");
             let ack = create_window(context, &plugin.runtime_state, name)?;
+            record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(context_id) = ack.id {
                 println!("created window context: {context_id}");
             }
@@ -601,6 +603,10 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             let context_id = ack
                 .id
                 .ok_or_else(|| "switch-window did not return selected context id".to_string())?;
+            bmux_plugin_sdk::record_command_outcome_metadata(
+                COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY,
+                serde_json::json!(context_id),
+            );
             if emit_to_stdout {
                 println!("active window context: {context_id}");
             }
@@ -614,6 +620,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
             )?;
+            record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("next-window selected context {id}");
             }
@@ -627,6 +634,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
             )?;
+            record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("prev-window selected context {id}");
             }
@@ -640,6 +648,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
             )?;
+            record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("last-window selected context {id}");
             }
@@ -661,6 +670,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
             )?;
+            record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(id) = ack.id {
                 println!("goto-window {index} selected context {id}");
             }
@@ -760,6 +770,15 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             Err("restart-pane is not yet wired to a host primitive".to_string())
         }
         _ => Err(format!("unsupported command '{}'", context.command)),
+    }
+}
+
+fn record_selected_context_outcome(ack: &WindowAck) {
+    if let Some(context_id) = ack.id.as_deref() {
+        bmux_plugin_sdk::record_command_outcome_metadata(
+            COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY,
+            serde_json::json!(context_id),
+        );
     }
 }
 
@@ -3862,6 +3881,26 @@ mod tests {
         let ack: WindowAck = decode_service_message(&response.payload).expect("ack should decode");
         assert!(ack.ok);
         assert!(ack.id.is_some_and(|id| !id.is_empty()));
+    }
+
+    #[test]
+    fn selected_context_ack_records_command_outcome_metadata() {
+        let context_id = Uuid::from_u128(42);
+        bmux_plugin_sdk::begin_command_outcome_capture();
+        record_selected_context_outcome(&WindowAck {
+            ok: true,
+            id: Some(context_id.to_string()),
+        });
+
+        let outcome = bmux_plugin_sdk::finish_command_outcome_capture();
+        let expected = context_id.to_string();
+        assert_eq!(
+            outcome
+                .metadata
+                .get(COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some(expected.as_str())
+        );
     }
 
     #[test]

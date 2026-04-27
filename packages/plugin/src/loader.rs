@@ -28,7 +28,6 @@ use bmux_plugin_sdk::{
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
@@ -608,22 +607,6 @@ fn summarize_stderr_suffix(stderr: &[u8]) -> String {
     } else {
         format!("; stderr: {text}")
     }
-}
-
-thread_local! {
-    static COMMAND_OUTCOME_CAPTURE: RefCell<Option<bmux_plugin_sdk::PluginCommandOutcome>> = const { RefCell::new(None) };
-}
-
-fn begin_command_outcome_capture() {
-    COMMAND_OUTCOME_CAPTURE.with(|slot| {
-        *slot.borrow_mut() = Some(bmux_plugin_sdk::PluginCommandOutcome::default());
-    });
-}
-
-fn finish_command_outcome_capture() -> bmux_plugin_sdk::PluginCommandOutcome {
-    COMMAND_OUTCOME_CAPTURE
-        .with(|slot| slot.borrow_mut().take())
-        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1712,10 +1695,10 @@ impl LoadedPlugin {
 
             match &self.backend {
                 PluginBackend::Static(vtable) => {
-                    begin_command_outcome_capture();
+                    bmux_plugin_sdk::begin_command_outcome_capture();
                     let _ = bmux_plugin_sdk::take_last_command_error();
                     let status = (vtable.run_command_with_context)(payload.as_ptr(), payload.len());
-                    let mut outcome = finish_command_outcome_capture();
+                    let mut outcome = bmux_plugin_sdk::finish_command_outcome_capture();
                     if let Some(error) = bmux_plugin_sdk::take_last_command_error() {
                         outcome.error_message = Some(error.message);
                     }
@@ -1727,10 +1710,10 @@ impl LoadedPlugin {
                             DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL.as_bytes(),
                         )
                     } {
-                        begin_command_outcome_capture();
+                        bmux_plugin_sdk::begin_command_outcome_capture();
                         let _ = bmux_plugin_sdk::take_last_command_error();
                         let status = unsafe { command_symbol(payload.as_ptr(), payload.len()) };
-                        let mut outcome = finish_command_outcome_capture();
+                        let mut outcome = bmux_plugin_sdk::finish_command_outcome_capture();
                         if let Some(error) = bmux_plugin_sdk::take_last_command_error() {
                             outcome.error_message = Some(error.message);
                         }

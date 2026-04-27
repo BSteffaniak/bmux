@@ -81,7 +81,8 @@ pub use host_services::{
     LogWriteLevel, LogWriteRequest, PluginCommandOutcome, RecordingWriteEventRequest,
     RecordingWriteEventResponse, StorageGetRequest, StorageGetResponse, StorageSetRequest,
     VolatileStateClearRequest, VolatileStateGetRequest, VolatileStateGetResponse,
-    VolatileStateSetRequest,
+    VolatileStateSetRequest, begin_command_outcome_capture, finish_command_outcome_capture,
+    record_command_outcome_metadata,
 };
 pub use ident::{CapabilityId, InterfaceId, OperationId, PluginEventKind};
 pub use native_exports::{
