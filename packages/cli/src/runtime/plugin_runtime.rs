@@ -75,9 +75,9 @@ pub(super) fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPat
 
 /// Declare statically-linked bundled plugins from a single table.
 ///
-/// This generates both `register_static_bundled_plugins` (registers each
-/// plugin's manifest into the [`PluginRegistry`]) and `static_bundled_vtable`
-/// (returns the [`StaticPluginVtable`] for a given plugin id).
+/// This generates `register_static_bundled_plugins`, which registers each
+/// plugin's manifest into the [`PluginRegistry`] and its static vtable into the
+/// process-wide static vtable registry.
 ///
 /// Each entry is only compiled when its Cargo feature flag is active, so the
 /// binary only includes the plugin code the user opted into (all bundled by
@@ -111,16 +111,6 @@ macro_rules! declare_bundled_plugins {
             )*
         }
 
-        #[allow(unused_variables, clippy::missing_const_for_fn)]
-        fn static_bundled_vtable(plugin_id: &str) -> Option<bmux_plugin_sdk::StaticPluginVtable> {
-            $(
-                #[cfg(feature = $feature)]
-                if plugin_id == $plugin_id {
-                    return Some(bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest));
-                }
-            )*
-            None
-        }
     };
 }
 
@@ -215,11 +205,12 @@ pub(super) fn load_plugin(
     available_capabilities: &std::collections::BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
 ) -> bmux_plugin_sdk::Result<bmux_plugin::LoadedPlugin> {
     if plugin.bundled_static {
-        let vtable = static_bundled_vtable(plugin.declaration.id.as_str()).ok_or_else(|| {
-            bmux_plugin_sdk::PluginError::MissingStaticVtable {
-                plugin_id: plugin.declaration.id.as_str().to_string(),
-            }
-        })?;
+        let vtable =
+            bmux_plugin::static_vtable(plugin.declaration.id.as_str()).ok_or_else(|| {
+                bmux_plugin_sdk::PluginError::MissingStaticVtable {
+                    plugin_id: plugin.declaration.id.as_str().to_string(),
+                }
+            })?;
         bmux_plugin::load_trusted_static_plugin(plugin, vtable, host, available_capabilities)
     } else {
         load_native_registered_plugin(plugin, host, available_capabilities)
@@ -2101,6 +2092,35 @@ mod tests {
         let config = BmuxConfig::default();
         let enabled = effective_enabled_plugins(&config, &registry);
         assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+    }
+
+    #[test]
+    fn static_bundled_load_uses_registered_vtable() {
+        let config = BmuxConfig::default();
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/config"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
+        );
+        let registry = scan_available_plugins(&config, &paths).expect("plugin scan should succeed");
+        let plugin = registry
+            .get("bmux.theme")
+            .expect("theme plugin should be registered");
+        assert!(plugin.bundled_static);
+        assert!(
+            bmux_plugin::static_vtable("bmux.theme").is_some(),
+            "scan should register the process-wide static vtable used by load_plugin"
+        );
+
+        let enabled = effective_enabled_plugins(&config, &registry);
+        let providers = registry
+            .capability_providers_for(&enabled, &core_provided_capabilities())
+            .expect("providers should resolve");
+        let loaded = load_plugin(plugin, &plugin_host_metadata(), &providers)
+            .expect("registered static vtable should load bundled plugin");
+
+        assert_eq!(loaded.declaration.id.as_str(), "bmux.theme");
     }
 
     #[test]
