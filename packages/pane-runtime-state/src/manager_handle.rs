@@ -140,6 +140,7 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         session_id: SessionId,
         target: Option<PaneSelector>,
         direction: PaneResizeDirection,
+        cells: u16,
     ) -> anyhow::Result<()>;
 
     fn close_pane(
@@ -422,6 +423,7 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _session_id: SessionId,
         _target: Option<PaneSelector>,
         _direction: PaneResizeDirection,
+        _cells: u16,
     ) -> anyhow::Result<()> {
         anyhow::bail!("pane-runtime plugin not active")
     }

@@ -3489,6 +3489,7 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         target: Option<PaneSelector>,
         direction: PaneResizeDirection,
+        cells: u16,
     ) -> Result<()> {
         let session = self
             .runtimes
@@ -3502,7 +3503,7 @@ impl SessionRuntimeManager {
         let root = scene_root_from_viewport(session.attach_viewport);
         let _ = session
             .layout_root
-            .resize_focused(pane_id, direction, root, 1);
+            .resize_focused(pane_id, direction, root, cells.max(1));
         self.apply_stored_attach_viewport(session_id);
         Ok(())
     }
@@ -6792,8 +6793,9 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         session_id: SessionId,
         target: Option<PaneSelector>,
         direction: PaneResizeDirection,
+        cells: u16,
     ) -> anyhow::Result<()> {
-        self.with_lock(|m| m.resize_pane(session_id, target, direction))
+        self.with_lock(|m| m.resize_pane(session_id, target, direction, cells))
             .ok_or_else(Self::lock_poisoned_anyhow)?
     }
 

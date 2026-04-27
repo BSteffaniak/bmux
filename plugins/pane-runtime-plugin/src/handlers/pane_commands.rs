@@ -56,6 +56,12 @@ pub struct ResizePaneArgs {
     #[serde(default)]
     pub target: Option<Uuid>,
     pub direction: String,
+    #[serde(default = "default_resize_cells")]
+    pub cells: u16,
+}
+
+const fn default_resize_cells() -> u16 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,7 +371,12 @@ pub fn resize_pane(
     let direction = parse_resize_direction(&req.direction)?;
     handle
         .0
-        .resize_pane(session_id, target_selector(req.target), direction)
+        .resize_pane(
+            session_id,
+            target_selector(req.target),
+            direction,
+            req.cells.max(1),
+        )
         .map_err(|e| failed_command(e.to_string()))?;
     emit_attach_view_changed_scene(session_id);
     Ok(SessionAck {

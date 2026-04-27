@@ -88,6 +88,7 @@ pub mod args {
         #[serde(default)]
         pub target: Option<Selector>,
         pub direction: PaneResizeDirection,
+        pub cells: u16,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

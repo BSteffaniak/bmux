@@ -1439,6 +1439,8 @@ pub struct MouseBehaviorConfig {
     pub scroll_lines_per_tick: u16,
     /// Exit scrollback mode automatically when wheel scrolling reaches bottom.
     pub exit_scrollback_on_bottom: bool,
+    /// Resize panes by dragging shared pane borders.
+    pub resize_borders: bool,
     /// Optional mouse gesture overrides mapped to action names.
     ///
     /// Supported keys in the current core runtime are `click_left`,
@@ -1460,6 +1462,7 @@ impl Default for MouseBehaviorConfig {
             wheel_propagation: MouseWheelPropagation::default(),
             scroll_lines_per_tick: 3,
             exit_scrollback_on_bottom: true,
+            resize_borders: true,
             gesture_actions: BTreeMap::new(),
         }
     }
@@ -3638,6 +3641,20 @@ timeout_profile = "missing"
             MouseClickPropagation::FocusAndForward
         );
         assert_eq!(mouse.wheel_propagation, MouseWheelPropagation::ForwardOnly);
+        assert!(mouse.resize_borders);
+    }
+
+    #[test]
+    fn load_parses_mouse_resize_borders_toggle() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(&path, "[behavior.mouse]\nresize_borders = false\n")
+            .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert!(!config.behavior.mouse.resize_borders);
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
 
     #[test]

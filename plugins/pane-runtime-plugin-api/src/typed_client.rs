@@ -169,6 +169,7 @@ struct ResizePaneArgs {
     #[serde(default)]
     target: Option<Uuid>,
     direction: String,
+    cells: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +309,7 @@ pub async fn resize_pane<C: TypedDispatchClient>(
     session_id: Uuid,
     target: Option<Uuid>,
     direction: &str,
+    cells: u16,
 ) -> Result<
     core::result::Result<
         pane_runtime_commands::SessionAck,
@@ -324,6 +326,7 @@ pub async fn resize_pane<C: TypedDispatchClient>(
             session_id,
             target,
             direction: direction.to_string(),
+            cells,
         },
     )
     .await

@@ -6,6 +6,7 @@ pub use bmux_attach_pipeline::{
 use bmux_client::AttachLayoutState;
 use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState, ContextSummary, SessionSummary};
+use bmux_windows_plugin_api::windows_commands::PaneResizeDirection;
 use bmux_windows_plugin_api::windows_list::WindowListSnapshot;
 use crossterm::event::MouseEvent;
 use std::collections::{BTreeMap, BTreeSet};
@@ -148,6 +149,24 @@ pub struct AttachMouseState {
     pub hover_started_at: Option<Instant>,
     pub hovered_pane_id: Option<Uuid>,
     pub last_focused_pane_id: Option<Uuid>,
+    pub resize_drag: Option<AttachMouseResizeDrag>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachMouseResizeDrag {
+    pub axis: AttachMouseResizeAxis,
+    pub positive_target_pane_id: Uuid,
+    pub positive_direction: PaneResizeDirection,
+    pub negative_target_pane_id: Uuid,
+    pub negative_direction: PaneResizeDirection,
+    pub last_column: u16,
+    pub last_row: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachMouseResizeAxis {
+    Horizontal,
+    Vertical,
 }
 
 impl AttachViewState {

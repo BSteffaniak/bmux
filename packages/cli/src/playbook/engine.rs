@@ -2919,6 +2919,7 @@ async fn apply_attach_runtime_actions(
                         )),
                         target: None,
                         direction,
+                        cells: 1,
                     },
                 )
                 .await

@@ -222,6 +222,7 @@ pub struct PaneResizeRequest {
     pub session: Option<SessionSelector>,
     pub target: Option<PaneSelector>,
     pub direction: PaneResizeDirection,
+    pub cells: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -938,6 +939,7 @@ pub trait KernelOps: ServiceCaller {
             session_id: Uuid,
             target: Option<Uuid>,
             direction: &'static str,
+            cells: u16,
         }
         let session_id = self.resolve_session_uuid(request.session.as_ref())?;
         let target = request.target.as_ref().and_then(|sel| match sel {
@@ -957,6 +959,7 @@ pub trait KernelOps: ServiceCaller {
                 session_id,
                 target,
                 direction,
+                cells: request.cells,
             },
         )?;
         match result {

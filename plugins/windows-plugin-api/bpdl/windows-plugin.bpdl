@@ -179,6 +179,7 @@ interface windows-commands {
         session: selector?,
         target: selector?,
         direction: pane-resize-direction,
+        cells: u16,
     ) -> result<pane-ack, pane-mutation-error>;
 
     command zoom-pane(

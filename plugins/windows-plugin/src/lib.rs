@@ -209,6 +209,7 @@ impl RustPlugin for WindowsPlugin {
                     session: req.session.as_ref().and_then(selector_to_session),
                     target: req.target.as_ref().map(selector_to_pane),
                     direction: typed_resize_to_domain(req.direction),
+                    cells: req.cells.max(1),
                 };
                 ctx.pane_resize(&request)
                     .map(|_| PaneAck { ok: true, pane_id: None })
@@ -678,6 +679,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 session: None,
                 target: None,
                 direction,
+                cells: 1,
             };
             context.pane_resize(&request).map_err(|e| e.to_string())?;
             Ok(())
@@ -1727,6 +1729,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         session: Option<Selector>,
         target: Option<Selector>,
         direction: PaneResizeDirection,
+        cells: u16,
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
@@ -1734,6 +1737,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
                 session: session.as_ref().and_then(selector_to_session),
                 target: target.as_ref().map(selector_to_pane),
                 direction: typed_resize_to_domain(direction),
+                cells: cells.max(1),
             };
             caller
                 .pane_resize(&request)
@@ -2060,6 +2064,12 @@ struct ResizePaneArgs {
     #[serde(default)]
     target: Option<Selector>,
     direction: PaneResizeDirection,
+    #[serde(default = "default_resize_cells")]
+    cells: u16,
+}
+
+const fn default_resize_cells() -> u16 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
