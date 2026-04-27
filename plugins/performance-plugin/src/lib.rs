@@ -14,10 +14,10 @@
 #![allow(clippy::module_name_repetitions)]
 
 use bmux_performance_plugin_api::{
-    EVENT_KIND, METRIC_EVENT_KIND, METRICS_STATE_KIND, MetricEvent, MetricTarget, MetricWatch,
-    MetricsSnapshot, PERFORMANCE_COMMANDS_INTERFACE, PERFORMANCE_READ, PERFORMANCE_WRITE,
-    PaneMetricsSnapshot, PerformanceEvent, PerformanceRequest, PerformanceResponse,
-    ProcessMetricsSnapshot, SystemMetricsSnapshot,
+    CpuPercentMode, EVENT_KIND, METRIC_EVENT_KIND, METRICS_STATE_KIND, MetricEvent, MetricTarget,
+    MetricWatch, MetricsSnapshot, PERFORMANCE_COMMANDS_INTERFACE, PERFORMANCE_READ,
+    PERFORMANCE_WRITE, PaneMetricsSnapshot, PerformanceEvent, PerformanceRequest,
+    PerformanceResponse, ProcessMetricsSnapshot, SystemMetricsSnapshot,
 };
 use bmux_performance_state::{PerformanceCaptureSettings, PerformanceSettingsHandle};
 use bmux_plugin::{global_event_bus, global_plugin_state_registry};
@@ -296,7 +296,9 @@ fn sample_metrics(system: &mut System, watches: Vec<MetricWatch>) -> MetricsSnap
         }
     }
 
-    let process_tree = ProcessTree::from_system(system);
+    let cpu_count = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let cpu_percent_mode = effective_cpu_percent_mode(&watches);
+    let process_tree = ProcessTree::from_system(system, cpu_count, cpu_percent_mode);
     let processes = process_roots
         .into_iter()
         .map(|pid| (pid, process_tree.snapshot_for_root(pid)))
@@ -323,6 +325,8 @@ fn sample_metrics(system: &mut System, watches: Vec<MetricWatch>) -> MetricsSnap
                         pid: identity.pid,
                         process_group_id: identity.process_group_id,
                         cpu_percent: process.cpu_percent,
+                        cpu_raw_percent: process.cpu_raw_percent,
+                        cpu_normalized_percent: process.cpu_normalized_percent,
                         memory_bytes: process.memory_bytes,
                         process_count: process.process_count,
                         available: true,
@@ -337,11 +341,36 @@ fn sample_metrics(system: &mut System, watches: Vec<MetricWatch>) -> MetricsSnap
         watches,
         system: SystemMetricsSnapshot {
             cpu_percent: system.global_cpu_usage(),
+            cpu_raw_percent: system.global_cpu_usage(),
+            cpu_normalized_percent: system.global_cpu_usage().clamp(0.0, 100.0),
             memory_used_bytes: system.used_memory(),
             memory_total_bytes: system.total_memory(),
         },
         processes,
         panes,
+    }
+}
+
+fn effective_cpu_percent_mode(watches: &[MetricWatch]) -> CpuPercentMode {
+    if watches
+        .iter()
+        .any(|watch| watch.cpu_percent_mode == CpuPercentMode::RawCoreSum)
+    {
+        CpuPercentMode::RawCoreSum
+    } else {
+        CpuPercentMode::Normalized
+    }
+}
+
+fn normalize_cpu_percent(raw_percent: f32, cpu_count: usize) -> f32 {
+    let bounded_cpu_count = u16::try_from(cpu_count.max(1)).unwrap_or(u16::MAX);
+    (raw_percent / f32::from(bounded_cpu_count)).clamp(0.0, 100.0)
+}
+
+fn display_cpu_percent(raw_percent: f32, normalized_percent: f32, mode: CpuPercentMode) -> f32 {
+    match mode {
+        CpuPercentMode::Normalized => normalized_percent,
+        CpuPercentMode::RawCoreSum => raw_percent,
     }
 }
 
@@ -368,19 +397,29 @@ fn epoch_millis_now() -> u64 {
 struct ProcessTree {
     processes: BTreeMap<u32, ProcessMetricsSnapshot>,
     children_by_parent: BTreeMap<u32, Vec<u32>>,
+    cpu_count: usize,
+    cpu_percent_mode: CpuPercentMode,
 }
 
 impl ProcessTree {
-    fn from_system(system: &System) -> Self {
+    fn from_system(system: &System, cpu_count: usize, cpu_percent_mode: CpuPercentMode) -> Self {
         let mut processes = BTreeMap::new();
         let mut children_by_parent: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for (pid, process) in system.processes() {
             let pid = pid.as_u32();
+            let raw_cpu_percent = process.cpu_usage();
+            let normalized_cpu_percent = normalize_cpu_percent(raw_cpu_percent, cpu_count);
             processes.insert(
                 pid,
                 ProcessMetricsSnapshot {
                     pid,
-                    cpu_percent: process.cpu_usage(),
+                    cpu_percent: display_cpu_percent(
+                        raw_cpu_percent,
+                        normalized_cpu_percent,
+                        cpu_percent_mode,
+                    ),
+                    cpu_raw_percent: raw_cpu_percent,
+                    cpu_normalized_percent: normalized_cpu_percent,
                     memory_bytes: process.memory(),
                     process_count: 1,
                 },
@@ -395,6 +434,8 @@ impl ProcessTree {
         Self {
             processes,
             children_by_parent,
+            cpu_count,
+            cpu_percent_mode,
         }
     }
 
@@ -410,7 +451,7 @@ impl ProcessTree {
                 continue;
             }
             if let Some(process) = self.processes.get(&pid) {
-                aggregate.cpu_percent += process.cpu_percent;
+                aggregate.cpu_raw_percent += process.cpu_raw_percent;
                 aggregate.memory_bytes =
                     aggregate.memory_bytes.saturating_add(process.memory_bytes);
                 aggregate.process_count = aggregate.process_count.saturating_add(1);
@@ -419,6 +460,13 @@ impl ProcessTree {
                 stack.extend(children.iter().copied());
             }
         }
+        aggregate.cpu_normalized_percent =
+            normalize_cpu_percent(aggregate.cpu_raw_percent, self.cpu_count);
+        aggregate.cpu_percent = display_cpu_percent(
+            aggregate.cpu_raw_percent,
+            aggregate.cpu_normalized_percent,
+            self.cpu_percent_mode,
+        );
         aggregate
     }
 }
@@ -452,6 +500,8 @@ mod tests {
                     ProcessMetricsSnapshot {
                         pid: 10,
                         cpu_percent: 5.0,
+                        cpu_raw_percent: 5.0,
+                        cpu_normalized_percent: 2.5,
                         memory_bytes: 100,
                         process_count: 1,
                     },
@@ -461,6 +511,8 @@ mod tests {
                     ProcessMetricsSnapshot {
                         pid: 11,
                         cpu_percent: 7.0,
+                        cpu_raw_percent: 7.0,
+                        cpu_normalized_percent: 3.5,
                         memory_bytes: 200,
                         process_count: 1,
                     },
@@ -470,17 +522,23 @@ mod tests {
                     ProcessMetricsSnapshot {
                         pid: 12,
                         cpu_percent: 9.0,
+                        cpu_raw_percent: 9.0,
+                        cpu_normalized_percent: 4.5,
                         memory_bytes: 300,
                         process_count: 1,
                     },
                 ),
             ]),
             children_by_parent: BTreeMap::from([(10, vec![11]), (11, vec![12])]),
+            cpu_count: 2,
+            cpu_percent_mode: CpuPercentMode::Normalized,
         };
 
         let snapshot = tree.snapshot_for_root(10);
         assert_eq!(snapshot.pid, 10);
-        assert!((snapshot.cpu_percent - 21.0).abs() < f32::EPSILON);
+        assert!((snapshot.cpu_raw_percent - 21.0).abs() < f32::EPSILON);
+        assert!((snapshot.cpu_normalized_percent - 10.5).abs() < f32::EPSILON);
+        assert!((snapshot.cpu_percent - 10.5).abs() < f32::EPSILON);
         assert_eq!(snapshot.memory_bytes, 600);
         assert_eq!(snapshot.process_count, 3);
     }
@@ -492,6 +550,7 @@ mod tests {
             target: MetricTarget::System,
             metrics: Vec::new(),
             interval_ms: 1,
+            cpu_percent_mode: CpuPercentMode::Normalized,
         });
 
         let PerformanceResponse::Watches { watches } = response else {

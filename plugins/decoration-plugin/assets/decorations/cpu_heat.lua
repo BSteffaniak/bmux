@@ -25,10 +25,10 @@ end
 local function pane_cpu(pane)
     local pane_metrics = latest.panes and latest.panes[pane.id]
     if pane_metrics ~= nil and pane_metrics.available then
-        return pane_metrics.cpu_percent or 0
+        return pane_metrics.cpu_normalized_percent or pane_metrics.cpu_percent or 0
     end
     if latest.system ~= nil then
-        return latest.system.cpu_percent or 0
+        return latest.system.cpu_normalized_percent or latest.system.cpu_percent or 0
     end
     return 0
 end
@@ -46,7 +46,7 @@ end
 local function render(message)
     local surfaces = {}
     for _, pane in ipairs(message.panes or {}) do
-        local cpu = pane_cpu(pane)
+        local cpu = clamp(pane_cpu(pane), 0, 100)
         local r, g, b = heat_color(cpu)
         local glyphs = "single-line"
         local z = 11
@@ -72,7 +72,7 @@ local function render(message)
         }
 
         if pane.focused or cpu >= 70 then
-            local label = string.format(" CPU %02d%% ", math.floor(cpu + 0.5))
+            local label = string.format(" CPU %d%% ", math.floor(cpu + 0.5))
             table.insert(cmds, {
                 kind = "text",
                 col = pane.rect.x + 2,

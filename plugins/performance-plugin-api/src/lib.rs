@@ -249,6 +249,17 @@ pub enum MetricName {
     ProcessCount,
 }
 
+/// How `cpu_percent` should be presented in consumer-facing snapshots.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuPercentMode {
+    /// Normalize multicore process usage into a 0..100 whole-machine load.
+    #[default]
+    Normalized,
+    /// Preserve process-tree core-sum semantics where one full core is 100%.
+    RawCoreSum,
+}
+
 /// One subscribed metric watch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetricWatch {
@@ -256,6 +267,8 @@ pub struct MetricWatch {
     pub target: MetricTarget,
     pub metrics: Vec<MetricName>,
     pub interval_ms: u64,
+    #[serde(default)]
+    pub cpu_percent_mode: CpuPercentMode,
 }
 
 impl MetricWatch {
@@ -276,6 +289,7 @@ impl Default for MetricWatch {
             target: MetricTarget::System,
             metrics: vec![MetricName::CpuPercent, MetricName::MemoryBytes],
             interval_ms: 1_000,
+            cpu_percent_mode: CpuPercentMode::Normalized,
         }
     }
 }
@@ -284,6 +298,8 @@ impl Default for MetricWatch {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SystemMetricsSnapshot {
     pub cpu_percent: f32,
+    pub cpu_raw_percent: f32,
+    pub cpu_normalized_percent: f32,
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
 }
@@ -292,7 +308,12 @@ pub struct SystemMetricsSnapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProcessMetricsSnapshot {
     pub pid: u32,
+    /// Consumer-facing CPU percentage, shaped by `MetricWatch.cpu_percent_mode`.
     pub cpu_percent: f32,
+    /// Raw process-tree CPU where one saturated core is 100%.
+    pub cpu_raw_percent: f32,
+    /// Whole-machine-normalized CPU percentage, clamped to 0..100.
+    pub cpu_normalized_percent: f32,
     pub memory_bytes: u64,
     pub process_count: u32,
 }
@@ -304,7 +325,12 @@ pub struct PaneMetricsSnapshot {
     pub session_id: Option<Uuid>,
     pub pid: Option<u32>,
     pub process_group_id: Option<i32>,
+    /// Consumer-facing CPU percentage, shaped by `MetricWatch.cpu_percent_mode`.
     pub cpu_percent: f32,
+    /// Raw process-tree CPU where one saturated core is 100%.
+    pub cpu_raw_percent: f32,
+    /// Whole-machine-normalized CPU percentage, clamped to 0..100.
+    pub cpu_normalized_percent: f32,
     pub memory_bytes: u64,
     pub process_count: u32,
     pub available: bool,
@@ -352,6 +378,7 @@ mod tests {
             target: MetricTarget::System,
             metrics: Vec::new(),
             interval_ms: 1,
+            cpu_percent_mode: CpuPercentMode::Normalized,
         }
         .normalized();
 
@@ -370,6 +397,8 @@ mod tests {
             watches: vec![MetricWatch::default()],
             system: SystemMetricsSnapshot {
                 cpu_percent: 12.5,
+                cpu_raw_percent: 12.5,
+                cpu_normalized_percent: 12.5,
                 memory_used_bytes: 100,
                 memory_total_bytes: 200,
             },
@@ -378,6 +407,8 @@ mod tests {
                 ProcessMetricsSnapshot {
                     pid: 7,
                     cpu_percent: 33.0,
+                    cpu_raw_percent: 66.0,
+                    cpu_normalized_percent: 33.0,
                     memory_bytes: 44,
                     process_count: 2,
                 },
@@ -390,6 +421,8 @@ mod tests {
                     pid: Some(7),
                     process_group_id: Some(7),
                     cpu_percent: 33.0,
+                    cpu_raw_percent: 66.0,
+                    cpu_normalized_percent: 33.0,
                     memory_bytes: 44,
                     process_count: 2,
                     available: true,

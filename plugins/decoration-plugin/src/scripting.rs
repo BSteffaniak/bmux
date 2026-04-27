@@ -1258,11 +1258,12 @@ mod tests {
                     delivery: ScriptEventDelivery::State,
                     snapshot: true,
                     payload: json!({
-                        "system": { "cpu_percent": 12.0 },
+                        "system": { "cpu_percent": 12.0, "cpu_normalized_percent": 12.0 },
                         "panes": {
                             "test-pane": {
                                 "available": true,
-                                "cpu_percent": 86.0
+                                "cpu_percent": 450.0,
+                                "cpu_normalized_percent": 86.0
                             }
                         }
                     }),
@@ -1277,6 +1278,41 @@ mod tests {
             assert!(commands.iter().any(|command| matches!(
                 command,
                 bmux_scene_protocol::scene_protocol::PaintCommand::Text { .. }
+            )));
+        }
+
+        #[test]
+        fn bundled_cpu_heat_script_formats_zero_without_padding() {
+            let backend = make_backend(ScriptHostAccess::default());
+            backend
+                .compile(
+                    Path::new("cpu_heat.lua"),
+                    include_str!("../assets/decorations/cpu_heat.lua"),
+                )
+                .expect("compile");
+            backend
+                .invoke(&ScriptMessage::Event(ScriptEventMessage {
+                    source: "bmux.performance/metrics-state".to_string(),
+                    kind: "bmux.performance/metrics-state".to_string(),
+                    delivery: ScriptEventDelivery::State,
+                    snapshot: true,
+                    payload: json!({
+                        "system": { "cpu_percent": 0.0, "cpu_normalized_percent": 0.0 },
+                        "panes": {
+                            "test-pane": {
+                                "available": true,
+                                "cpu_percent": 0.0,
+                                "cpu_normalized_percent": 0.0
+                            }
+                        }
+                    }),
+                }))
+                .expect("metrics event invoke");
+            let outcome = backend.invoke(&render_message()).expect("render invoke");
+            let commands = &outcome.surfaces["test-pane"];
+            assert!(commands.iter().any(|command| matches!(
+                command,
+                bmux_scene_protocol::scene_protocol::PaintCommand::Text { text, .. } if text == " CPU 0% "
             )));
         }
     }
