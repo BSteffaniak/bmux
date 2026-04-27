@@ -22,8 +22,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-#[cfg(not(test))]
-use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uuid::Uuid;
@@ -47,24 +45,18 @@ fn emit_attach_phase_timing(payload: &serde_json::Value) {
 /// same [`Arc<Mutex<_>>`]). Both paths observe the same state.
 type LastSelectedByClient = Arc<Mutex<BTreeMap<Uuid, Uuid>>>;
 
-#[cfg(not(test))]
 #[derive(Debug, Default)]
 struct WindowRuntimeState {
     active_context_id: Option<Uuid>,
     previous_context_id: Option<Uuid>,
 }
 
-#[cfg(not(test))]
-static WINDOW_RUNTIME_STATE: OnceLock<Mutex<WindowRuntimeState>> = OnceLock::new();
-
-#[cfg(not(test))]
-fn window_runtime_state() -> &'static Mutex<WindowRuntimeState> {
-    WINDOW_RUNTIME_STATE.get_or_init(Mutex::default)
-}
+type WindowRuntimeStateHandle = Arc<Mutex<WindowRuntimeState>>;
 
 #[derive(Default)]
 pub struct WindowsPlugin {
     last_selected_by_client: LastSelectedByClient,
+    runtime_state: WindowRuntimeStateHandle,
 }
 
 impl RustPlugin for WindowsPlugin {
@@ -107,28 +99,34 @@ impl RustPlugin for WindowsPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "windows-state", "list-windows" => |req: ListWindowsArgs, ctx| {
-                let windows = list_windows(ctx, req.session.as_deref())
+                let windows = list_windows(ctx, &self.runtime_state, req.session.as_deref())
                     .map_err(|e| ServiceResponse::error("list_failed", e))?;
                 Ok(windows)
             },
             "windows-commands", "new-window" => |req: NewWindowArgs, ctx| {
-                create_window(ctx, req.name)
+                create_window(ctx, &self.runtime_state, req.name)
                     .map_err(|e| ServiceResponse::error("new_failed", e))
             },
             "windows-commands", "kill-window" => |req: KillWindowArgs, ctx| {
                 let selector = parse_selector(&req.target)
                     .map_err(|e| ServiceResponse::error("invalid_request", e))?;
-                kill_window(ctx, selector, req.force_local)
+                kill_window(ctx, &self.runtime_state, selector, req.force_local)
                     .map_err(|e| ServiceResponse::error("kill_failed", e))
             },
             "windows-commands", "kill-all-windows" => |req: KillAllWindowsArgs, ctx| {
-                kill_all_windows(ctx, req.force_local)
+                kill_all_windows(ctx, &self.runtime_state, req.force_local)
                     .map_err(|e| ServiceResponse::error("kill_failed", e))
             },
             "windows-commands", "switch-window" => |req: SwitchWindowArgs, ctx| {
                 let selector = parse_selector(&req.target)
                     .map_err(|e| ServiceResponse::error("invalid_request", e))?;
-                switch_window(ctx, selector, &self.last_selected_by_client, ctx.caller_client_id)
+                switch_window(
+                    ctx,
+                    &self.runtime_state,
+                    selector,
+                    &self.last_selected_by_client,
+                    ctx.caller_client_id,
+                )
                     .map_err(|e| ServiceResponse::error("switch_failed", e))
             },
             "windows-commands", "focus-pane" => |req: FocusPaneArgs, ctx| {
@@ -263,6 +261,7 @@ impl RustPlugin for WindowsPlugin {
         let shared = WindowsSharedState {
             caller: Arc::new(TypedServiceCaller::from_registration_context(&context)),
             last_selected_by_client: self.last_selected_by_client.clone(),
+            runtime_state: self.runtime_state.clone(),
         };
 
         let (Ok(read_cap), Ok(write_cap)) = (
@@ -321,7 +320,7 @@ impl RustPlugin for WindowsPlugin {
         // `<data_dir>/plugin-storage/bmux.windows/windows.order.bin`
         // by the kernel storage service, so the user sees their tab
         // order exactly as they left it before the server shutdown.
-        publish_window_list_snapshot(shared.caller.as_ref());
+        publish_window_list_snapshot(shared.caller.as_ref(), &shared.runtime_state);
     }
 }
 
@@ -382,16 +381,16 @@ fn handle_context_event(
     match event {
         ContextEvent::Created { context_id, .. } => {
             let _ = append_context_to_window_order(caller, *context_id);
-            publish_window_list_snapshot(caller);
+            publish_window_list_snapshot(caller, &shared.runtime_state);
         }
         ContextEvent::Closed { context_id } => {
-            let _ = remove_context_from_window_order(caller, *context_id);
-            publish_window_list_snapshot(caller);
+            let _ = remove_context_from_window_order(caller, &shared.runtime_state, *context_id);
+            publish_window_list_snapshot(caller, &shared.runtime_state);
         }
         ContextEvent::Selected { context_id }
         | ContextEvent::SessionActiveContextChanged { context_id, .. } => {
-            let _ = mark_context_active(caller, *context_id);
-            publish_window_list_snapshot(caller);
+            let _ = mark_context_active(caller, &shared.runtime_state, *context_id);
+            publish_window_list_snapshot(caller, &shared.runtime_state);
         }
     }
 }
@@ -436,6 +435,7 @@ fn append_contexts_to_window_order(
 /// if it was pointing at the removed context.
 fn remove_context_from_window_order(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     context_id: Uuid,
 ) -> Result<(), String> {
     let mut order_ids = get_stored_window_order_ids(caller)?;
@@ -448,15 +448,18 @@ fn remove_context_from_window_order(
         set_stored_window_order_ids(caller, &order_ids)?;
     }
     // Clear active marker if it points at the removed context.
-    if let Ok(Some(active)) = get_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)
+    if let Ok(Some(active)) =
+        get_runtime_context_id(caller, runtime_state, ACTIVE_WINDOW_CONTEXT_KEY)
         && active == context_id
     {
-        let _ = clear_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY);
+        let _ = clear_runtime_context_id(caller, runtime_state, ACTIVE_WINDOW_CONTEXT_KEY);
+        let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, None);
     }
-    if let Ok(Some(previous)) = get_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY)
+    if let Ok(Some(previous)) =
+        get_runtime_context_id(caller, runtime_state, PREVIOUS_WINDOW_CONTEXT_KEY)
         && previous == context_id
     {
-        let _ = clear_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY);
+        let _ = clear_runtime_context_id(caller, runtime_state, PREVIOUS_WINDOW_CONTEXT_KEY);
     }
     Ok(())
 }
@@ -464,16 +467,30 @@ fn remove_context_from_window_order(
 /// Update `ACTIVE_WINDOW_CONTEXT_KEY` to `context_id`, moving the
 /// previous active context (if any and different) into
 /// `PREVIOUS_WINDOW_CONTEXT_KEY` so `last-window` still works.
-fn mark_context_active(caller: &impl HostRuntimeApi, context_id: Uuid) -> Result<(), String> {
-    let previous = get_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)
+fn mark_context_active(
+    caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
+    context_id: Uuid,
+) -> Result<(), String> {
+    let previous = get_runtime_context_id(caller, runtime_state, ACTIVE_WINDOW_CONTEXT_KEY)
         .ok()
         .flatten();
     if let Some(previous) = previous
         && previous != context_id
     {
-        let _ = set_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
+        let _ = set_runtime_context_id(
+            caller,
+            runtime_state,
+            PREVIOUS_WINDOW_CONTEXT_KEY,
+            Some(previous),
+        );
     }
-    set_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id))?;
+    set_runtime_context_id(
+        caller,
+        runtime_state,
+        ACTIVE_WINDOW_CONTEXT_KEY,
+        Some(context_id),
+    )?;
     set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id))
 }
 
@@ -493,7 +510,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
     match context.command.as_str() {
         "new-window" => {
             let name = option_value(&context.arguments, "name");
-            let ack = create_window(context, name)?;
+            let ack = create_window(context, &plugin.runtime_state, name)?;
             if emit_to_stdout && let Some(context_id) = ack.id {
                 println!("created window context: {context_id}");
             }
@@ -502,7 +519,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
         "list-windows" => {
             let session_filter = option_value(&context.arguments, "session");
             let as_json = has_flag(&context.arguments, "json");
-            let windows = list_windows(context, session_filter.as_deref())?;
+            let windows = list_windows(context, &plugin.runtime_state, session_filter.as_deref())?;
             if !emit_to_stdout {
                 // Rendering list output is only meaningful from the
                 // CLI; attach keybindings don't have a useful surface
@@ -576,6 +593,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             let selector = parse_selector(&target)?;
             let ack = switch_window(
                 context,
+                &plugin.runtime_state,
                 selector,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
@@ -591,6 +609,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
         "next-window" => {
             let ack = cycle_window(
                 context,
+                &plugin.runtime_state,
                 WindowCycleDirection::Next,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
@@ -603,6 +622,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
         "prev-window" => {
             let ack = cycle_window(
                 context,
+                &plugin.runtime_state,
                 WindowCycleDirection::Previous,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
@@ -615,6 +635,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
         "last-window" => {
             let ack = cycle_window(
                 context,
+                &plugin.runtime_state,
                 WindowCycleDirection::Last,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
@@ -635,6 +656,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             }
             let ack = goto_window_by_index(
                 context,
+                &plugin.runtime_state,
                 index,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
@@ -647,6 +669,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
         "close-current-window" => {
             let ack = close_current_window(
                 context,
+                &plugin.runtime_state,
                 &plugin.last_selected_by_client,
                 context.caller_client_id,
             )?;
@@ -656,7 +679,7 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             Ok(())
         }
         "reset-order" => {
-            let count = reset_window_order(context)?;
+            let count = reset_window_order(context, &plugin.runtime_state)?;
             if emit_to_stdout {
                 println!("reset window order; rebuilt {count} windows");
             }
@@ -749,6 +772,7 @@ enum WindowCycleDirection {
 
 fn list_windows(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     session_filter: Option<&str>,
 ) -> Result<Vec<WindowEntry>, String> {
     let contexts = caller
@@ -768,7 +792,8 @@ fn list_windows(
     } else {
         contexts
     };
-    let current_context = resolve_effective_current_context_with_contexts(caller, &selected)?;
+    let current_context =
+        resolve_effective_current_context_with_contexts(caller, runtime_state, &selected)?;
 
     Ok(selected
         .into_iter()
@@ -804,8 +829,11 @@ static WINDOW_LIST_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// when the state channel has not been registered (plugin not yet
 /// activated). The channel is seeded empty in `activate`, so once the
 /// plugin is active this publish always succeeds.
-fn publish_window_list_snapshot(caller: &impl HostRuntimeApi) {
-    let Ok(entries) = list_windows(caller, None) else {
+fn publish_window_list_snapshot(
+    caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
+) {
+    let Ok(entries) = list_windows(caller, runtime_state, None) else {
         return;
     };
     publish_window_list_entries(entries);
@@ -869,7 +897,10 @@ fn publish_window_list_entries(entries: Vec<WindowEntry>) {
 /// creation order should recreate their contexts after reset.
 ///
 /// Returns the count of contexts written to the new order.
-fn reset_window_order(caller: &impl HostRuntimeApi) -> Result<usize, String> {
+fn reset_window_order(
+    caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
+) -> Result<usize, String> {
     let contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
@@ -877,19 +908,24 @@ fn reset_window_order(caller: &impl HostRuntimeApi) -> Result<usize, String> {
     let mut ids: Vec<Uuid> = contexts.iter().map(|context| context.id).collect();
     ids.sort_by_key(uuid::Uuid::as_u128);
     set_stored_window_order_ids(caller, &ids)?;
-    publish_window_list_snapshot(caller);
+    publish_window_list_snapshot(caller, runtime_state);
     Ok(ids.len())
 }
 
-fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<WindowAck, String> {
+fn create_window(
+    caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
+    name: Option<String>,
+) -> Result<WindowAck, String> {
     let mut contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
     let resolved_name = name.or_else(|| Some(next_default_tab_name_for_contexts(&contexts)));
-    let previous_context = resolve_effective_current_context_with_contexts(caller, &contexts)
-        .ok()
-        .flatten();
+    let previous_context =
+        resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)
+            .ok()
+            .flatten();
     let response = caller
         .context_create(&ContextCreateRequest {
             name: resolved_name,
@@ -907,9 +943,19 @@ fn create_window(caller: &impl HostRuntimeApi, name: Option<String>) -> Result<W
     if let Some(previous) = previous_context
         && previous != context_id
     {
-        let _ = set_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
+        let _ = set_runtime_context_id(
+            caller,
+            runtime_state,
+            PREVIOUS_WINDOW_CONTEXT_KEY,
+            Some(previous),
+        );
     }
-    let _ = set_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
+    let _ = set_runtime_context_id(
+        caller,
+        runtime_state,
+        ACTIVE_WINDOW_CONTEXT_KEY,
+        Some(context_id),
+    );
     let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
     publish_window_list_snapshot_from_contexts(caller, &contexts, Some(context_id));
     Ok(WindowAck {
@@ -934,6 +980,7 @@ fn next_default_tab_name_for_contexts(contexts: &[domain_ipc::ContextSummary]) -
 
 fn kill_window(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     selector: ContextSelector,
     force_local: bool,
 ) -> Result<WindowAck, String> {
@@ -943,14 +990,18 @@ fn kill_window(
             force: force_local,
         })
         .map_err(|error| error.to_string())?;
-    publish_window_list_snapshot(caller);
+    publish_window_list_snapshot(caller, runtime_state);
     Ok(WindowAck {
         ok: true,
         id: Some(response.id.to_string()),
     })
 }
 
-fn kill_all_windows(caller: &impl HostRuntimeApi, force_local: bool) -> Result<WindowAck, String> {
+fn kill_all_windows(
+    caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
+    force_local: bool,
+) -> Result<WindowAck, String> {
     let contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
@@ -963,13 +1014,14 @@ fn kill_all_windows(caller: &impl HostRuntimeApi, force_local: bool) -> Result<W
             })
             .map_err(|error| error.to_string())?;
     }
-    publish_window_list_snapshot(caller);
+    publish_window_list_snapshot(caller, runtime_state);
     Ok(WindowAck { ok: true, id: None })
 }
 
 #[allow(clippy::needless_pass_by_value)] // Plugin command dispatch passes owned selector from deserialized request
 fn switch_window(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     selector: ContextSelector,
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
@@ -984,26 +1036,30 @@ fn switch_window(
     let contexts = order_contexts_for_navigation(caller, contexts)?;
     switch_window_with_contexts(
         caller,
+        runtime_state,
         &selector,
         last_selected_by_client,
         caller_client_id,
         &contexts,
-        context_list_us,
-        total_started,
+        SwitchWindowTiming {
+            context_list_us,
+            total_started,
+        },
     )
 }
 
 fn switch_window_with_contexts(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     selector: &ContextSelector,
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
     contexts: &[domain_ipc::ContextSummary],
-    context_list_us: u128,
-    total_started: Instant,
+    timing: SwitchWindowTiming,
 ) -> Result<WindowAck, String> {
     let resolve_started = Instant::now();
-    let previous_context = resolve_effective_current_context_with_contexts(caller, contexts)?;
+    let previous_context =
+        resolve_effective_current_context_with_contexts(caller, runtime_state, contexts)?;
     let context_id = resolve_context_id_from_contexts(contexts, selector)?;
     let resolve_us = resolve_started.elapsed().as_micros();
     let select_started = Instant::now();
@@ -1028,9 +1084,19 @@ fn switch_window_with_contexts(
         && previous != context_id
         && !remembered_for_client
     {
-        let _ = set_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
+        let _ = set_runtime_context_id(
+            caller,
+            runtime_state,
+            PREVIOUS_WINDOW_CONTEXT_KEY,
+            Some(previous),
+        );
     }
-    let _ = set_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
+    let _ = set_runtime_context_id(
+        caller,
+        runtime_state,
+        ACTIVE_WINDOW_CONTEXT_KEY,
+        Some(context_id),
+    );
     let remember_us = remember_started.elapsed().as_micros();
     let publish_started = Instant::now();
     publish_window_list_ordered_contexts(contexts.to_vec(), Some(context_id));
@@ -1040,12 +1106,12 @@ fn switch_window_with_contexts(
         "previous_context_id": previous_context,
         "selected_context_id": context_id,
         "context_count": contexts.len(),
-        "context_list_us": context_list_us,
+        "context_list_us": timing.context_list_us,
         "resolve_us": resolve_us,
         "context_select_us": context_select_us,
         "remember_us": remember_us,
         "publish_us": publish_us,
-        "total_us": total_started.elapsed().as_micros(),
+        "total_us": timing.total_started.elapsed().as_micros(),
     }));
     Ok(WindowAck {
         ok: true,
@@ -1053,9 +1119,16 @@ fn switch_window_with_contexts(
     })
 }
 
+#[derive(Clone, Copy)]
+struct SwitchWindowTiming {
+    context_list_us: u128,
+    total_started: Instant,
+}
+
 #[allow(clippy::needless_pass_by_value)] // Plugin command dispatch passes owned direction from deserialized request
 fn cycle_window(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     direction: WindowCycleDirection,
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
@@ -1074,8 +1147,9 @@ fn cycle_window(
         return Err("no alternate window available".to_string());
     }
     let resolve_started = Instant::now();
-    let current_context = resolve_effective_current_context_with_contexts(caller, &contexts)?
-        .unwrap_or(contexts[0].id);
+    let current_context =
+        resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
+            .unwrap_or(contexts[0].id);
     let current_index = contexts
         .iter()
         .position(|context| context.id == current_context)
@@ -1094,7 +1168,7 @@ fn cycle_window(
             });
             let remembered = remembered_by_client
                 .or_else(|| {
-                    get_runtime_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY)
+                    get_runtime_context_id(caller, runtime_state, PREVIOUS_WINDOW_CONTEXT_KEY)
                         .ok()
                         .flatten()
                 })
@@ -1122,17 +1196,21 @@ fn cycle_window(
     }));
     switch_window_with_contexts(
         caller,
+        runtime_state,
         &ContextSelector::ById(target_id),
         last_selected_by_client,
         caller_client_id,
         &contexts,
-        context_list_us,
-        total_started,
+        SwitchWindowTiming {
+            context_list_us,
+            total_started,
+        },
     )
 }
 
 fn goto_window_by_index(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     index: usize,
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
@@ -1162,17 +1240,21 @@ fn goto_window_by_index(
     let target_id = contexts[zero_based].id;
     switch_window_with_contexts(
         caller,
+        runtime_state,
         &ContextSelector::ById(target_id),
         last_selected_by_client,
         caller_client_id,
         &contexts,
-        context_list_us,
-        total_started,
+        SwitchWindowTiming {
+            context_list_us,
+            total_started,
+        },
     )
 }
 
 fn close_current_window(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
 ) -> Result<WindowAck, String> {
@@ -1181,8 +1263,9 @@ fn close_current_window(
         .map_err(|error| error.to_string())?
         .contexts;
     let contexts = order_contexts_for_navigation(caller, contexts)?;
-    let current_id = resolve_effective_current_context_with_contexts(caller, &contexts)?
-        .ok_or_else(|| "no current window to close".to_string())?;
+    let current_id =
+        resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
+            .ok_or_else(|| "no current window to close".to_string())?;
 
     // If there is another window to switch to, do so before closing.
     if contexts.len() > 1 {
@@ -1199,6 +1282,7 @@ fn close_current_window(
         let fallback_id = contexts[fallback_index].id;
         let _ = switch_window(
             caller,
+            runtime_state,
             ContextSelector::ById(fallback_id),
             last_selected_by_client,
             caller_client_id,
@@ -1212,7 +1296,7 @@ fn close_current_window(
         })
         .map_err(|error| error.to_string())?;
 
-    publish_window_list_snapshot(caller);
+    publish_window_list_snapshot(caller, runtime_state);
     Ok(WindowAck {
         ok: true,
         id: Some(current_id.to_string()),
@@ -1235,9 +1319,10 @@ fn resolve_context_id_from_contexts(
 
 fn resolve_effective_current_context_with_contexts(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     contexts: &[domain_ipc::ContextSummary],
 ) -> Result<Option<Uuid>, String> {
-    let stored_active = in_memory_runtime_context_id(ACTIVE_WINDOW_CONTEXT_KEY)
+    let stored_active = in_memory_runtime_context_id(runtime_state, ACTIVE_WINDOW_CONTEXT_KEY)
         .filter(|id| contexts.iter().any(|context| context.id == *id));
     if stored_active.is_some() {
         return Ok(stored_active);
@@ -1251,7 +1336,7 @@ fn resolve_effective_current_context_with_contexts(
     if current.is_some() {
         return Ok(current);
     }
-    let stored_active = get_runtime_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)?
+    let stored_active = get_runtime_context_id(caller, runtime_state, ACTIVE_WINDOW_CONTEXT_KEY)?
         .filter(|id| contexts.iter().any(|context| context.id == *id));
     Ok(stored_active)
 }
@@ -1273,8 +1358,12 @@ fn get_stored_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<Opti
     Ok(Some(id))
 }
 
-fn get_runtime_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<Option<Uuid>, String> {
-    if let Some(context_id) = in_memory_runtime_context_id(key) {
+fn get_runtime_context_id(
+    caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
+    key: &str,
+) -> Result<Option<Uuid>, String> {
+    if let Some(context_id) = in_memory_runtime_context_id(runtime_state, key) {
         return Ok(Some(context_id));
     }
     if let Some(id) = get_volatile_context_id(caller, key)? {
@@ -1283,14 +1372,11 @@ fn get_runtime_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<Opt
     get_stored_context_id(caller, key)
 }
 
-#[cfg(test)]
-const fn in_memory_runtime_context_id(_key: &str) -> Option<Uuid> {
-    None
-}
-
-#[cfg(not(test))]
-fn in_memory_runtime_context_id(key: &str) -> Option<Uuid> {
-    let state = window_runtime_state().lock().ok()?;
+fn in_memory_runtime_context_id(
+    runtime_state: &WindowRuntimeStateHandle,
+    key: &str,
+) -> Option<Uuid> {
+    let state = runtime_state.lock().ok()?;
     match key {
         ACTIVE_WINDOW_CONTEXT_KEY => state.active_context_id,
         PREVIOUS_WINDOW_CONTEXT_KEY => state.previous_context_id,
@@ -1329,14 +1415,15 @@ fn get_volatile_context_id(
 
 fn set_runtime_context_id(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     key: &str,
     context_id: Option<Uuid>,
 ) -> Result<(), String> {
-    if set_in_memory_runtime_context_id(key, context_id) {
+    if set_in_memory_runtime_context_id(runtime_state, key, context_id) {
         return Ok(());
     }
     context_id.map_or_else(
-        || clear_runtime_context_id(caller, key),
+        || clear_runtime_context_id(caller, runtime_state, key),
         |context_id| {
             caller
                 .call_service::<_, ()>(
@@ -1354,14 +1441,12 @@ fn set_runtime_context_id(
     )
 }
 
-#[cfg(test)]
-const fn set_in_memory_runtime_context_id(_key: &str, _context_id: Option<Uuid>) -> bool {
-    false
-}
-
-#[cfg(not(test))]
-fn set_in_memory_runtime_context_id(key: &str, context_id: Option<Uuid>) -> bool {
-    let Ok(mut state) = window_runtime_state().lock() else {
+fn set_in_memory_runtime_context_id(
+    runtime_state: &WindowRuntimeStateHandle,
+    key: &str,
+    context_id: Option<Uuid>,
+) -> bool {
+    let Ok(mut state) = runtime_state.lock() else {
         return false;
     };
     match key {
@@ -1372,8 +1457,12 @@ fn set_in_memory_runtime_context_id(key: &str, context_id: Option<Uuid>) -> bool
     true
 }
 
-fn clear_runtime_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<(), String> {
-    if set_in_memory_runtime_context_id(key, None) {
+fn clear_runtime_context_id(
+    caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
+    key: &str,
+) -> Result<(), String> {
+    if set_in_memory_runtime_context_id(runtime_state, key, None) {
         return Ok(());
     }
     caller
@@ -1533,6 +1622,7 @@ fn set_stored_window_order_ids(
 struct WindowsSharedState {
     caller: Arc<TypedServiceCaller>,
     last_selected_by_client: LastSelectedByClient,
+    runtime_state: WindowRuntimeStateHandle,
 }
 
 /// Typed implementation of [`WindowsCommandsService`]. Wraps a
@@ -1890,7 +1980,8 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<WindowAck, WindowError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            create_window(&*caller, name).map_err(|reason| WindowError::Failed { reason })
+            create_window(&*caller, &self.shared.runtime_state, name)
+                .map_err(|reason| WindowError::Failed { reason })
         })
     }
 
@@ -1903,7 +1994,7 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         Box::pin(async move {
             let selector =
                 parse_selector(&target).map_err(|reason| WindowError::Failed { reason })?;
-            kill_window(&*caller, selector, force_local)
+            kill_window(&*caller, &self.shared.runtime_state, selector, force_local)
                 .map_err(|reason| WindowError::Failed { reason })
         })
     }
@@ -1914,7 +2005,8 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<WindowAck, WindowError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            kill_all_windows(&*caller, force_local).map_err(|reason| WindowError::Failed { reason })
+            kill_all_windows(&*caller, &self.shared.runtime_state, force_local)
+                .map_err(|reason| WindowError::Failed { reason })
         })
     }
 
@@ -1927,8 +2019,14 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         Box::pin(async move {
             let selector =
                 parse_selector(&target).map_err(|reason| WindowError::Failed { reason })?;
-            switch_window(&*caller, selector, &last_selected, None)
-                .map_err(|reason| WindowError::Failed { reason })
+            switch_window(
+                &*caller,
+                &self.shared.runtime_state,
+                selector,
+                &last_selected,
+                None,
+            )
+            .map_err(|reason| WindowError::Failed { reason })
         })
     }
 }
@@ -1991,7 +2089,10 @@ impl WindowsStateService for WindowsStateHandle {
         session: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Vec<WindowEntry>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
-        Box::pin(async move { list_windows(&*caller, session.as_deref()).unwrap_or_default() })
+        Box::pin(async move {
+            list_windows(&*caller, &self.shared.runtime_state, session.as_deref())
+                .unwrap_or_default()
+        })
     }
 }
 
@@ -3087,12 +3188,17 @@ mod tests {
         set_stored_window_order_ids(host, &ids).expect("seed window order should succeed");
     }
 
+    fn runtime_state() -> WindowRuntimeStateHandle {
+        WindowRuntimeStateHandle::default()
+    }
+
     #[test]
     fn list_windows_projects_sessions_and_marks_first_active() {
         let sessions = sample_sessions();
         let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
         seed_window_order(&host, &sessions);
-        let windows = list_windows(&host, None).expect("list should succeed");
+        let windows = list_windows(&host, &runtime_state, None).expect("list should succeed");
 
         assert_eq!(windows.len(), 2);
         assert!(windows[0].active);
@@ -3106,13 +3212,15 @@ mod tests {
         let sessions = sample_sessions();
         let beta_id = sessions[1].id;
         let host = MockHost::with_sessions(sessions);
+        let runtime_state = runtime_state();
 
-        let by_name = list_windows(&host, Some("beta")).expect("list by name should succeed");
+        let by_name =
+            list_windows(&host, &runtime_state, Some("beta")).expect("list by name should succeed");
         assert_eq!(by_name.len(), 1);
         assert_eq!(by_name[0].name, "beta");
 
-        let by_id =
-            list_windows(&host, Some(&beta_id.to_string())).expect("list by id should succeed");
+        let by_id = list_windows(&host, &runtime_state, Some(&beta_id.to_string()))
+            .expect("list by id should succeed");
         assert_eq!(by_id.len(), 1);
         assert_eq!(by_id[0].id, beta_id.to_string());
     }
@@ -3132,9 +3240,10 @@ mod tests {
             },
         ];
         let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
         seed_window_order(&host, &sessions);
 
-        let windows = list_windows(&host, None).expect("list should succeed");
+        let windows = list_windows(&host, &runtime_state, None).expect("list should succeed");
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].name, "tab-1");
         assert_eq!(windows[1].name, "tab-2");
@@ -3166,7 +3275,9 @@ mod tests {
         let sessions = sample_sessions();
         let first_id = sessions[0].id;
         let host = MockHost::with_sessions(sessions);
-        let ack = create_window(&host, Some("dev".to_string())).expect("create should succeed");
+        let runtime_state = runtime_state();
+        let ack = create_window(&host, &runtime_state, Some("dev".to_string()))
+            .expect("create should succeed");
         assert!(ack.ok);
         let created_id = ack.id.expect("create should return context id");
         let created_id = Uuid::parse_str(&created_id).expect("created id should be uuid");
@@ -3185,8 +3296,9 @@ mod tests {
         let sessions = sample_sessions();
         let first_id = sessions[0].id;
         let host = MockHost::with_sessions(sessions);
+        let runtime_state = runtime_state();
 
-        let ack = create_window(&host, None).expect("create should succeed");
+        let ack = create_window(&host, &runtime_state, None).expect("create should succeed");
         let created_id =
             Uuid::parse_str(ack.id.as_deref().expect("create should return context id"))
                 .expect("created id should be uuid");
@@ -3194,7 +3306,7 @@ mod tests {
         let stored_order = get_stored_window_order_ids(&host).expect("order lookup should succeed");
         assert_eq!(stored_order, vec![first_id, created_id]);
 
-        let windows = list_windows(&host, None).expect("list should succeed");
+        let windows = list_windows(&host, &runtime_state, None).expect("list should succeed");
         let ids = windows
             .iter()
             .map(|window| window.id.as_str())
@@ -3220,8 +3332,9 @@ mod tests {
             },
         ];
         let host = MockHost::with_sessions(sessions);
+        let runtime_state = runtime_state();
 
-        let ack = create_window(&host, None).expect("create should succeed");
+        let ack = create_window(&host, &runtime_state, None).expect("create should succeed");
         assert!(ack.ok);
         assert!(ack.id.is_some());
         let creates: Vec<_> = host
@@ -3235,7 +3348,8 @@ mod tests {
     #[test]
     fn kill_all_windows_calls_kill_for_each_session() {
         let host = MockHost::with_sessions(sample_sessions());
-        let ack = kill_all_windows(&host, true).expect("kill all should succeed");
+        let runtime_state = runtime_state();
+        let ack = kill_all_windows(&host, &runtime_state, true).expect("kill all should succeed");
         assert!(ack.ok);
         let (kill_count, all_force) = {
             let kills = host.kills.lock().expect("kill log lock should succeed");
@@ -3254,8 +3368,9 @@ mod tests {
             .expect("sample sessions should exist")
             .id;
 
-        let ack =
-            kill_window(&host, SessionSelector::ById(target), true).expect("kill should succeed");
+        let runtime_state = runtime_state();
+        let ack = kill_window(&host, &runtime_state, SessionSelector::ById(target), true)
+            .expect("kill should succeed");
         assert!(ack.ok);
         let target_text = target.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
@@ -3279,8 +3394,10 @@ mod tests {
     fn switch_window_requires_target_context_to_exist() {
         let host = MockHost::with_sessions(sample_sessions());
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
         let error = switch_window(
             &host,
+            &runtime_state,
             SessionSelector::ById(Uuid::new_v4()),
             &last_selected_by_client,
             None,
@@ -3295,9 +3412,11 @@ mod tests {
         let target_id = sessions[1].id;
         let host = MockHost::with_sessions(sessions);
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
         let ack = switch_window(
             &host,
+            &runtime_state,
             SessionSelector::ById(target_id),
             &last_selected_by_client,
             None,
@@ -3324,9 +3443,11 @@ mod tests {
             .expect("sample sessions should include second item")
             .id;
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
         let ack = switch_window(
             &host,
+            &runtime_state,
             SessionSelector::ById(target_id),
             &last_selected_by_client,
             None,
@@ -3344,9 +3465,11 @@ mod tests {
         let host = MockHost::with_sessions(sessions.clone());
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
         let ack = cycle_window(
             &host,
+            &runtime_state,
             WindowCycleDirection::Next,
             &last_selected_by_client,
             None,
@@ -3380,9 +3503,11 @@ mod tests {
         let host = MockHost::with_sessions(sessions.clone());
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
         let ack = cycle_window(
             &host,
+            &runtime_state,
             WindowCycleDirection::Previous,
             &last_selected_by_client,
             None,
@@ -3402,9 +3527,11 @@ mod tests {
         let host = MockHost::with_sessions(sessions.clone());
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
         let next = cycle_window(
             &host,
+            &runtime_state,
             WindowCycleDirection::Next,
             &last_selected_by_client,
             None,
@@ -3415,6 +3542,7 @@ mod tests {
 
         let next_again = cycle_window(
             &host,
+            &runtime_state,
             WindowCycleDirection::Next,
             &last_selected_by_client,
             None,
@@ -3425,6 +3553,7 @@ mod tests {
 
         let previous = cycle_window(
             &host,
+            &runtime_state,
             WindowCycleDirection::Previous,
             &last_selected_by_client,
             None,
@@ -3452,16 +3581,18 @@ mod tests {
         let host = MockHost::with_sessions(sessions.clone());
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
         let _ = cycle_window(
             &host,
+            &runtime_state,
             WindowCycleDirection::Next,
             &last_selected_by_client,
             None,
         )
         .expect("next window should succeed");
 
-        let windows = list_windows(&host, None).expect("list should succeed");
+        let windows = list_windows(&host, &runtime_state, None).expect("list should succeed");
         assert_eq!(windows.len(), 3);
         let window_ids = windows
             .iter()
@@ -3512,8 +3643,9 @@ mod tests {
             .mru_context_ids
             .lock()
             .expect("mru context lock should succeed") = vec![third_id, second_id, first_id];
+        let runtime_state = runtime_state();
 
-        let windows = list_windows(&host, None).expect("list should succeed");
+        let windows = list_windows(&host, &runtime_state, None).expect("list should succeed");
         let ids = windows
             .iter()
             .map(|window| window.id.as_str())
@@ -3538,7 +3670,8 @@ mod tests {
             .lock()
             .expect("mru context lock should succeed") = vec![second_id, third_id, first_id];
 
-        let windows = list_windows(&host, None).expect("second list should succeed");
+        let windows =
+            list_windows(&host, &runtime_state, None).expect("second list should succeed");
         let ids = windows
             .iter()
             .map(|window| window.id.as_str())
@@ -3562,8 +3695,10 @@ mod tests {
         }];
         let host = MockHost::with_sessions(sessions);
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
         let error = cycle_window(
             &host,
+            &runtime_state,
             WindowCycleDirection::Last,
             &last_selected_by_client,
             None,
@@ -3578,9 +3713,11 @@ mod tests {
         let target_id = sessions[0].id;
         let host = MockHost::with_sessions(sessions);
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
         let _ = cycle_window(
             &host,
+            &runtime_state,
             WindowCycleDirection::Next,
             &last_selected_by_client,
             None,
@@ -3589,6 +3726,7 @@ mod tests {
 
         let ack = cycle_window(
             &host,
+            &runtime_state,
             WindowCycleDirection::Last,
             &last_selected_by_client,
             None,
@@ -3603,7 +3741,8 @@ mod tests {
     #[test]
     fn create_window_propagates_host_error() {
         let host = MockHost::with_failures(true, false, false);
-        let error = create_window(&host, Some("dev".to_string()))
+        let runtime_state = runtime_state();
+        let error = create_window(&host, &runtime_state, Some("dev".to_string()))
             .expect_err("create should surface host failure");
         assert!(error.contains("mock create failure"), "error was: {error}");
     }
@@ -3611,15 +3750,23 @@ mod tests {
     #[test]
     fn kill_window_propagates_host_error() {
         let host = MockHost::with_failures(false, true, false);
-        let error = kill_window(&host, SessionSelector::ByName("alpha".to_string()), false)
-            .expect_err("kill should surface host failure");
+        let runtime_state = runtime_state();
+        let error = kill_window(
+            &host,
+            &runtime_state,
+            SessionSelector::ByName("alpha".to_string()),
+            false,
+        )
+        .expect_err("kill should surface host failure");
         assert!(error.contains("mock kill failure"));
     }
 
     #[test]
     fn kill_all_windows_propagates_host_error() {
         let host = MockHost::with_failures(false, true, false);
-        let error = kill_all_windows(&host, true).expect_err("kill all should fail on host error");
+        let runtime_state = runtime_state();
+        let error = kill_all_windows(&host, &runtime_state, true)
+            .expect_err("kill all should fail on host error");
         assert!(error.contains("mock kill failure"));
     }
 
@@ -3632,8 +3779,10 @@ mod tests {
             .expect("sample sessions should exist")
             .id;
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
         let error = switch_window(
             &host,
+            &runtime_state,
             SessionSelector::ById(target),
             &last_selected_by_client,
             None,
@@ -3778,8 +3927,9 @@ mod tests {
         let host = MockHost::with_sessions(sessions.clone());
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
-        let ack = goto_window_by_index(&host, 1, &last_selected_by_client, None)
+        let ack = goto_window_by_index(&host, &runtime_state, 1, &last_selected_by_client, None)
             .expect("goto index 1 should succeed");
         assert!(ack.ok);
         let first_text = first_id.to_string();
@@ -3793,8 +3943,9 @@ mod tests {
         let host = MockHost::with_sessions(sessions.clone());
         seed_window_order(&host, &sessions);
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
-        let ack = goto_window_by_index(&host, 2, &last_selected_by_client, None)
+        let ack = goto_window_by_index(&host, &runtime_state, 2, &last_selected_by_client, None)
             .expect("goto index 2 should succeed");
         assert!(ack.ok);
         let second_text = second_id.to_string();
@@ -3805,8 +3956,9 @@ mod tests {
     fn goto_window_by_index_rejects_zero() {
         let host = MockHost::with_sessions(sample_sessions());
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
-        let error = goto_window_by_index(&host, 0, &last_selected_by_client, None)
+        let error = goto_window_by_index(&host, &runtime_state, 0, &last_selected_by_client, None)
             .expect_err("index 0 should fail");
         assert!(error.contains("1 or greater"));
     }
@@ -3815,8 +3967,9 @@ mod tests {
     fn goto_window_by_index_rejects_out_of_range() {
         let host = MockHost::with_sessions(sample_sessions());
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
-        let error = goto_window_by_index(&host, 99, &last_selected_by_client, None)
+        let error = goto_window_by_index(&host, &runtime_state, 99, &last_selected_by_client, None)
             .expect_err("index 99 should fail");
         assert!(error.contains("out of range"));
     }
@@ -3827,8 +3980,9 @@ mod tests {
         let first_id = sessions[0].id;
         let host = MockHost::with_sessions(sessions);
         let last_selected_by_client = LastSelectedByClient::default();
+        let runtime_state = runtime_state();
 
-        let ack = close_current_window(&host, &last_selected_by_client, None)
+        let ack = close_current_window(&host, &runtime_state, &last_selected_by_client, None)
             .expect("close current should succeed");
         assert!(ack.ok);
         let first_text = first_id.to_string();
@@ -3962,9 +4116,10 @@ mod tests {
         let a = Uuid::from_u128(1);
         let b = Uuid::from_u128(2);
         let c = Uuid::from_u128(3);
+        let runtime_state = runtime_state();
 
         set_stored_window_order_ids(&host, &[a, b, c]).expect("seed order");
-        remove_context_from_window_order(&host, b).expect("remove B");
+        remove_context_from_window_order(&host, &runtime_state, b).expect("remove B");
 
         let order = get_stored_window_order_ids(&host).expect("order readable");
         assert_eq!(order, vec![a, c]);
@@ -3977,10 +4132,11 @@ mod tests {
     fn remove_context_from_window_order_clears_stale_active_marker() {
         let host = MockHost::with_sessions(Vec::new());
         let a = Uuid::from_u128(42);
+        let runtime_state = runtime_state();
 
         set_stored_window_order_ids(&host, &[a]).expect("seed order");
         set_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY, Some(a)).expect("set active");
-        remove_context_from_window_order(&host, a).expect("remove A");
+        remove_context_from_window_order(&host, &runtime_state, a).expect("remove A");
 
         let active =
             get_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY).expect("active readable");
@@ -3995,16 +4151,18 @@ mod tests {
         let host = MockHost::with_sessions(Vec::new());
         let a = Uuid::from_u128(11);
         let b = Uuid::from_u128(22);
+        let runtime_state = runtime_state();
 
         set_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY, Some(a)).expect("seed active = A");
-        mark_context_active(&host, b).expect("mark B active");
+        mark_context_active(&host, &runtime_state, b).expect("mark B active");
 
         assert_eq!(
             get_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY).expect("active readable"),
             Some(b)
         );
         assert_eq!(
-            get_stored_context_id(&host, PREVIOUS_WINDOW_CONTEXT_KEY).expect("previous readable"),
+            get_runtime_context_id(&host, &runtime_state, PREVIOUS_WINDOW_CONTEXT_KEY)
+                .expect("previous readable"),
             Some(a)
         );
     }
@@ -4015,16 +4173,43 @@ mod tests {
     fn mark_context_active_is_idempotent_when_already_active() {
         let host = MockHost::with_sessions(Vec::new());
         let a = Uuid::from_u128(7);
+        let runtime_state = runtime_state();
 
         set_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY, Some(a)).expect("seed active");
-        mark_context_active(&host, a).expect("re-mark active");
+        mark_context_active(&host, &runtime_state, a).expect("re-mark active");
 
         assert_eq!(
             get_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY).expect("active readable"),
             Some(a)
         );
         assert_eq!(
-            get_stored_context_id(&host, PREVIOUS_WINDOW_CONTEXT_KEY).expect("previous readable"),
+            get_runtime_context_id(&host, &runtime_state, PREVIOUS_WINDOW_CONTEXT_KEY)
+                .expect("previous readable"),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_state_is_plugin_instance_scoped() {
+        let host = MockHost::with_sessions(Vec::new());
+        let first_runtime_state = runtime_state();
+        let second_runtime_state = runtime_state();
+        let active = Uuid::from_u128(99);
+
+        set_runtime_context_id(
+            &host,
+            &first_runtime_state,
+            ACTIVE_WINDOW_CONTEXT_KEY,
+            Some(active),
+        )
+        .expect("first runtime state should be writable");
+
+        assert_eq!(
+            in_memory_runtime_context_id(&first_runtime_state, ACTIVE_WINDOW_CONTEXT_KEY),
+            Some(active)
+        );
+        assert_eq!(
+            in_memory_runtime_context_id(&second_runtime_state, ACTIVE_WINDOW_CONTEXT_KEY),
             None
         );
     }
