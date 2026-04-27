@@ -8,18 +8,23 @@ warmup = 5
 windows = 4
 switches = 4
 scenario = "next-window"
+attach_command_execution = "production"
 attach_command_limit_ms = 8
 retarget_limit_ms = 8
 
 [profiles.normal]
-tags = ["navigation"]
+tags = ["navigation", "production"]
 
 [profiles.diagnostic]
-tags = ["navigation", "service", "ipc", "storage"]
-service_timing = true
+tags = ["navigation", "production", "ipc"]
+service_timing = false
 ipc_timing = true
-storage_timing = true
+storage_timing = false
 loosen_slo = true
+
+[profiles.direct-service]
+tags = ["navigation", "direct-service"]
+attach_command_execution = "direct-window-service"
 
 [profiles.ci]
 tags = ["navigation"]
@@ -54,6 +59,14 @@ filter = { key = "command_name", value = "${command_name}" }
 skip_first_per_sample = 1
 
 [[reports]]
+phase = "attach.plugin_command_pipeline"
+field = "total_us"
+limit = "attach_command"
+tags = ["production"]
+filter = { key = "command_name", value = "${command_name}" }
+skip_first_per_sample = 1
+
+[[reports]]
 phase = "attach.plugin_command"
 field = "retarget_us"
 limit = "retarget"
@@ -64,7 +77,7 @@ skip_first_per_sample = 1
 phase = "attach.window_cycle"
 field = "invoke_us"
 limit = "attach_command"
-tags = ["navigation"]
+tags = ["direct-service"]
 filter = { key = "command_name", value = "${command_name}" }
 skip_first_per_sample = 1
 
@@ -185,14 +198,14 @@ phase = "ipc.client_request"
 field = "total_us"
 limit = "attach_command"
 tags = ["ipc"]
-filter = { key = "request", value = "invoke_service" }
+filter = { key = "request", value = "invoke_service_pipeline" }
 
 [[reports]]
 phase = "ipc.client_request"
 field = "recv_us"
 limit = "attach_command"
 tags = ["ipc"]
-filter = { key = "request", value = "invoke_service" }
+filter = { key = "request", value = "invoke_service_pipeline" }
 
 [[reports]]
 phase = "ipc.client_request"

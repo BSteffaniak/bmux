@@ -50,6 +50,9 @@ const VISUAL_RENDER_INTERVAL: Duration = Duration::from_millis(50);
 const VISUAL_REFRESH_INTERVAL: Duration = Duration::from_millis(60);
 const VISUAL_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const ATTACH_PHASE_MARKER: &str = "[bmux-attach-phase-json]";
+const PLAYBOOK_ATTACH_COMMAND_EXECUTION_ENV: &str = "BMUX_PLAYBOOK_ATTACH_COMMAND_EXECUTION";
+const PLAYBOOK_PRODUCTION_COMMAND_ENV: &str = "BMUX_PLAYBOOK_PRODUCTION_COMMAND_NAME";
+const SELECTED_CONTEXT_METADATA_KEY: &str = "bmux.contexts.selected_context_id";
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     if std::env::var_os("BMUX_ATTACH_PHASE_TIMING").is_none() {
@@ -63,6 +66,35 @@ enum PlaybookInteractiveMode {
     Disabled,
     Prompt,
     Visual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybookAttachCommandExecution {
+    Production,
+    DirectWindowService,
+}
+
+impl PlaybookAttachCommandExecution {
+    fn from_env() -> Self {
+        match std::env::var(PLAYBOOK_ATTACH_COMMAND_EXECUTION_ENV).as_deref() {
+            Ok("production") => Self::Production,
+            Ok("direct-window-service") | Err(_) => Self::DirectWindowService,
+            Ok(other) => {
+                warn!(
+                    value = other,
+                    "unknown playbook attach command execution mode; using direct-window-service"
+                );
+                Self::DirectWindowService
+            }
+        }
+    }
+
+    fn should_use_production_for(command_name: &str) -> bool {
+        if Self::from_env() != Self::Production {
+            return false;
+        }
+        std::env::var(PLAYBOOK_PRODUCTION_COMMAND_ENV).map_or(true, |target| target == command_name)
+    }
 }
 
 const fn resolve_interactive_mode(
@@ -883,16 +915,72 @@ async fn retarget_attach_to_context_playbook(
     Ok(())
 }
 
+struct PlaybookPluginCommandExecution {
+    response: PluginCliCommandResponse,
+    selected_context_id: Option<Uuid>,
+}
+
+async fn run_plugin_command_pipeline_playbook(
+    client: &mut BmuxClient,
+    plugin_id: &str,
+    command_name: &str,
+    args: Vec<String>,
+) -> anyhow::Result<PlaybookPluginCommandExecution> {
+    let started_at = Instant::now();
+    let request =
+        PluginCliCommandRequest::new(plugin_id.to_string(), command_name.to_string(), args);
+    let payload = bmux_plugin_sdk::encode_service_message(&request)
+        .context("failed encoding plugin command pipeline request")?;
+    let pipeline = bmux_ipc::ServicePipelineRequest {
+        inputs: std::collections::BTreeMap::new(),
+        steps: vec![bmux_ipc::ServicePipelineStep {
+            capability: bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY.to_string(),
+            kind: InvokeServiceKind::Command,
+            interface_id: bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1.to_string(),
+            operation: bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1.to_string(),
+            payload: bmux_ipc::ServicePipelinePayload::Encoded { payload },
+        }],
+    };
+    let results = client
+        .invoke_service_pipeline_raw(pipeline)
+        .await
+        .map_err(|e| anyhow::anyhow!("plugin command pipeline failed: {e}"))?;
+    let result = results
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("plugin command pipeline returned no results"))?;
+    let response = bmux_plugin_sdk::decode_service_message(&result.payload)
+        .context("failed decoding plugin command pipeline response")?;
+    let selected_context_id = result
+        .metadata
+        .get(SELECTED_CONTEXT_METADATA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    emit_attach_phase_timing(&serde_json::json!({
+        "phase": "attach.plugin_command_pipeline",
+        "plugin_id": plugin_id,
+        "command_name": command_name,
+        "selected_context_id": selected_context_id,
+        "total_us": started_at.elapsed().as_micros(),
+    }));
+    Ok(PlaybookPluginCommandExecution {
+        response,
+        selected_context_id,
+    })
+}
+
 async fn run_plugin_command_playbook(
     client: &mut BmuxClient,
     plugin_id: &str,
     command_name: &str,
     args: Vec<String>,
-) -> anyhow::Result<PluginCliCommandResponse> {
+) -> anyhow::Result<PlaybookPluginCommandExecution> {
     if let Some(response) =
         run_known_attach_plugin_command_playbook(client, plugin_id, command_name, &args).await?
     {
-        return Ok(response);
+        return Ok(PlaybookPluginCommandExecution {
+            response,
+            selected_context_id: None,
+        });
     }
     let request =
         PluginCliCommandRequest::new(plugin_id.to_string(), command_name.to_string(), args);
@@ -908,8 +996,12 @@ async fn run_plugin_command_playbook(
         )
         .await
         .map_err(|e| anyhow::anyhow!("plugin command bridge failed: {e}"))?;
-    bmux_plugin_sdk::decode_service_message(&response_payload)
-        .context("failed decoding plugin command response")
+    let response = bmux_plugin_sdk::decode_service_message(&response_payload)
+        .context("failed decoding plugin command response")?;
+    Ok(PlaybookPluginCommandExecution {
+        response,
+        selected_context_id: None,
+    })
 }
 
 /// Invoke the typed `sessions-commands:new-session` operation. Returns
@@ -2998,26 +3090,49 @@ async fn apply_attach_runtime_actions(
                 let run_started = Instant::now();
                 let mut selected_context_id = None;
                 let mut window_cycle_timing = None;
-                let response = if plugin_id == "bmux.windows" && command_name == "next-window" {
+                let use_production_pipeline =
+                    PlaybookAttachCommandExecution::should_use_production_for(&command_name);
+                let response = if !use_production_pipeline
+                    && plugin_id == "bmux.windows"
+                    && command_name == "next-window"
+                {
                     let (context_id, timing) =
                         cycle_known_window_playbook(client, runtime, false).await?;
                     selected_context_id = Some(context_id);
                     window_cycle_timing = Some(timing);
                     PluginCliCommandResponse::new(0)
-                } else if plugin_id == "bmux.windows" && command_name == "prev-window" {
+                } else if !use_production_pipeline
+                    && plugin_id == "bmux.windows"
+                    && command_name == "prev-window"
+                {
                     let (context_id, timing) =
                         cycle_known_window_playbook(client, runtime, true).await?;
                     selected_context_id = Some(context_id);
                     window_cycle_timing = Some(timing);
                     PluginCliCommandResponse::new(0)
-                } else if plugin_id == "bmux.windows" && command_name == "goto-window" {
+                } else if !use_production_pipeline
+                    && plugin_id == "bmux.windows"
+                    && command_name == "goto-window"
+                {
                     let (context_id, timing) =
                         goto_known_window_playbook(client, runtime, &args).await?;
                     selected_context_id = Some(context_id);
                     window_cycle_timing = Some(timing);
                     PluginCliCommandResponse::new(0)
+                } else if use_production_pipeline {
+                    let execution = run_plugin_command_pipeline_playbook(
+                        client,
+                        &plugin_id,
+                        &command_name,
+                        args,
+                    )
+                    .await?;
+                    selected_context_id = execution.selected_context_id;
+                    execution.response
                 } else {
-                    run_plugin_command_playbook(client, &plugin_id, &command_name, args).await?
+                    run_plugin_command_playbook(client, &plugin_id, &command_name, args)
+                        .await?
+                        .response
                 };
                 let run_us = run_started.elapsed().as_micros();
                 if let Some(timing) = window_cycle_timing {

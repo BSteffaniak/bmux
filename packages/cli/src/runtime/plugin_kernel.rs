@@ -389,19 +389,20 @@ fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -
 }
 
 fn run_plugin_bridge_command(request: &PluginCliCommandRequest) -> Result<i32> {
-    let execution = run_plugin_bridge_command_execution(request)?;
+    let execution = run_plugin_bridge_command_execution(request, None)?;
     Ok(execution.status)
 }
 
 fn run_plugin_bridge_command_execution(
     request: &PluginCliCommandRequest,
+    caller_client_id: Option<uuid::Uuid>,
 ) -> Result<super::plugin_runtime::PluginCommandExecution> {
     run_plugin_keybinding_command(
         request.plugin_id.as_str(),
         request.command_name.as_str(),
         &request.arguments,
         None,
-        None,
+        caller_client_id,
     )
 }
 
@@ -657,9 +658,10 @@ pub(super) fn register_plugin_service_handlers(
         InvokeServiceKind::Command,
         CORE_CLI_COMMAND_INTERFACE_V1,
         CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
-        move |_route, _invoke_context, payload| async move {
+        move |_route, invoke_context, payload| async move {
             let request: PluginCliCommandRequest = decode_service_message(&payload)?;
-            let execution = run_plugin_bridge_command_execution(&request)?;
+            let execution =
+                run_plugin_bridge_command_execution(&request, Some(invoke_context.client_id().0))?;
             let response = if execution.status == 0 {
                 PluginCliCommandResponse::new(execution.status)
             } else {

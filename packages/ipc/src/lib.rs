@@ -522,7 +522,7 @@ pub enum Request {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServicePipelineRequest {
-    #[serde(default)]
+    #[serde(default, with = "json_value_map")]
     pub inputs: BTreeMap<String, serde_json::Value>,
     pub steps: Vec<ServicePipelineStep>,
 }
@@ -544,6 +544,7 @@ pub enum ServicePipelinePayload {
         payload: Vec<u8>,
     },
     JsonTemplate {
+        #[serde(with = "json_value")]
         value: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         field_order: Option<Vec<String>>,
@@ -1082,8 +1083,69 @@ pub enum ResponsePayload {
 pub struct ServicePipelineStepResult {
     #[serde(with = "bmux_codec::serde_bytes_vec")]
     pub payload: Vec<u8>,
-    #[serde(default)]
+    #[serde(default, with = "json_value_map")]
     pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+mod json_value {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &serde_json::Value, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
+        encoded.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        serde_json::from_str(&encoded).map_err(serde::de::Error::custom)
+    }
+}
+
+mod json_value_map {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(
+        value: &BTreeMap<String, serde_json::Value>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded = value
+            .iter()
+            .map(|(key, value)| {
+                serde_json::to_string(value)
+                    .map(|value| (key.clone(), value))
+                    .map_err(serde::ser::Error::custom)
+            })
+            .collect::<Result<BTreeMap<_, _>, S::Error>>()?;
+        encoded.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<String, serde_json::Value>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = BTreeMap::<String, String>::deserialize(deserializer)?;
+        encoded
+            .into_iter()
+            .map(|(key, value)| {
+                serde_json::from_str(&value)
+                    .map(|value| (key, value))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
 }
 
 /// Canonical error codes returned over IPC.

@@ -2,8 +2,8 @@ mod benchmark_manifest;
 mod phase_schema;
 
 use benchmark_manifest::{
-    BenchmarkManifest, BenchmarkResolvedOptions, BenchmarkRunOptions, read_manifest,
-    resolve_benchmark_options,
+    AttachCommandExecution, BenchmarkManifest, BenchmarkResolvedOptions, BenchmarkRunOptions,
+    read_manifest, resolve_benchmark_options,
 };
 use phase_schema::validate_phase_schema;
 use serde::{Deserialize, Serialize};
@@ -208,6 +208,12 @@ fn parse_benchmark_run_options(args: Vec<String>) -> Result<BenchmarkRunOptions,
                 )?);
                 index += 2;
             }
+            "--attach-command-execution" => {
+                options.attach_command_execution = Some(parse_attach_command_execution(
+                    require_arg(&args, index, "--attach-command-execution")?,
+                )?);
+                index += 2;
+            }
             "--tag" => {
                 options
                     .tags
@@ -236,6 +242,16 @@ fn parse_benchmark_run_options(args: Vec<String>) -> Result<BenchmarkRunOptions,
         }
     }
     Ok(options)
+}
+
+fn parse_attach_command_execution(value: &str) -> Result<AttachCommandExecution, String> {
+    match value {
+        "production" => Ok(AttachCommandExecution::Production),
+        "direct-window-service" => Ok(AttachCommandExecution::DirectWindowService),
+        other => Err(format!(
+            "unsupported attach command execution '{other}'; expected production or direct-window-service"
+        )),
+    }
 }
 
 fn require_arg<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str, String> {
@@ -418,8 +434,16 @@ fn run_attach_tab_switch_benchmark(
     let mut vars = options.vars.clone();
     vars.entry("command_name".to_string())
         .or_insert(scenario.command_name.to_string());
+    let measured_service_operation = match options.attach_command_execution {
+        AttachCommandExecution::Production => {
+            bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1
+        }
+        AttachCommandExecution::DirectWindowService => scenario.service_operation,
+    };
     vars.entry("service_operation".to_string())
-        .or_insert(scenario.service_operation.to_string());
+        .or_insert(measured_service_operation.to_string());
+    vars.entry("attach_command_execution".to_string())
+        .or_insert(options.attach_command_execution.as_str().to_string());
     validate_benchmark_phases_with_vars(&sample_json.display().to_string(), options, vars)?;
     let artifact_json = options.artifact_json.clone().unwrap_or_else(|| {
         env::temp_dir()
@@ -519,7 +543,17 @@ fn write_attach_playbook(
 }
 
 fn attach_envs(options: &BenchmarkResolvedOptions) -> Vec<(String, String)> {
-    let mut envs = vec![("BMUX_ATTACH_PHASE_TIMING".to_string(), "1".to_string())];
+    let mut envs = vec![
+        ("BMUX_ATTACH_PHASE_TIMING".to_string(), "1".to_string()),
+        (
+            "BMUX_PLAYBOOK_ATTACH_COMMAND_EXECUTION".to_string(),
+            options.attach_command_execution.as_str().to_string(),
+        ),
+        (
+            "BMUX_PLAYBOOK_PRODUCTION_COMMAND_NAME".to_string(),
+            options.scenario.clone(),
+        ),
+    ];
     if options.service_timing {
         envs.push(("BMUX_SERVICE_PHASE_TIMING".to_string(), "1".to_string()));
         envs.push((
@@ -702,6 +736,7 @@ fn write_standard_benchmark_artifact(
         "limits": options.limits,
         "tags": options.tags,
         "loosen_slo": options.loosen_slo,
+        "attach_command_execution": options.attach_command_execution.as_str(),
         "latency_ms": latency,
         "events": events,
         "raw": payload,

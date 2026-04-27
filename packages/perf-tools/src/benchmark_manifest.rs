@@ -33,6 +33,7 @@ pub(crate) struct BenchmarkDefaults {
     pub(crate) codec_payload_limit_ms: Option<f64>,
     pub(crate) generic_ipc_limit_ms: Option<f64>,
     pub(crate) static_service_limit_ms: Option<f64>,
+    pub(crate) attach_command_execution: Option<AttachCommandExecution>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -47,6 +48,23 @@ pub(crate) struct BenchmarkProfile {
     pub(crate) storage_timing: bool,
     #[serde(default)]
     pub(crate) loosen_slo: bool,
+    pub(crate) attach_command_execution: Option<AttachCommandExecution>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AttachCommandExecution {
+    Production,
+    DirectWindowService,
+}
+
+impl AttachCommandExecution {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::DirectWindowService => "direct-window-service",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +83,7 @@ pub(crate) struct BenchmarkRunOptions {
     pub(crate) tags: Vec<String>,
     pub(crate) limits: BTreeMap<String, f64>,
     pub(crate) vars: BTreeMap<String, String>,
+    pub(crate) attach_command_execution: Option<AttachCommandExecution>,
 }
 
 #[derive(Debug)]
@@ -87,6 +106,7 @@ pub(crate) struct BenchmarkResolvedOptions {
     pub(crate) ipc_timing: bool,
     pub(crate) storage_timing: bool,
     pub(crate) loosen_slo: bool,
+    pub(crate) attach_command_execution: AttachCommandExecution,
 }
 
 pub(crate) fn read_manifest(path: &str) -> Result<BenchmarkManifest, String> {
@@ -169,6 +189,11 @@ pub(crate) fn resolve_benchmark_options(
         ipc_timing: profile.ipc_timing,
         storage_timing: profile.storage_timing,
         loosen_slo: profile.loosen_slo,
+        attach_command_execution: cli
+            .attach_command_execution
+            .or(profile.attach_command_execution)
+            .or(manifest.defaults.attach_command_execution)
+            .unwrap_or(AttachCommandExecution::Production),
     })
 }
 
@@ -247,5 +272,52 @@ core_service_limit_ms = 1
         )
         .unwrap();
         assert_eq!(options.limits.get("core_service"), Some(&0.5));
+    }
+
+    #[test]
+    fn attach_command_execution_defaults_to_production_and_profile_overrides() {
+        let manifest: BenchmarkManifest = toml::from_str(
+            r#"
+[benchmark]
+name = "example"
+kind = "attach-tab-switch"
+
+[defaults]
+attach_command_execution = "production"
+
+[profiles.normal]
+
+[profiles.direct-service]
+attach_command_execution = "direct-window-service"
+"#,
+        )
+        .unwrap();
+        let normal = resolve_benchmark_options(
+            BenchmarkRunOptions {
+                profile: "normal".to_string(),
+                ..BenchmarkRunOptions::default()
+            },
+            &manifest,
+            "perf/example.toml".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            normal.attach_command_execution,
+            AttachCommandExecution::Production
+        );
+
+        let direct = resolve_benchmark_options(
+            BenchmarkRunOptions {
+                profile: "direct-service".to_string(),
+                ..BenchmarkRunOptions::default()
+            },
+            &manifest,
+            "perf/example.toml".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            direct.attach_command_execution,
+            AttachCommandExecution::DirectWindowService
+        );
     }
 }
