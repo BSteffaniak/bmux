@@ -81,7 +81,6 @@ pub struct BmuxServer {
 }
 
 struct ServerState {
-    session_runtimes: Arc<Mutex<SessionRuntimeManager>>,
     attach_tokens: Arc<Mutex<AttachTokenManager>>,
     performance_settings: PerformanceSettingsStore,
     operation_lock: AsyncMutex<()>,
@@ -4497,7 +4496,6 @@ impl BmuxServer {
         Self {
             endpoint,
             state: Arc::new(ServerState {
-                session_runtimes,
                 attach_tokens,
                 performance_settings,
                 operation_lock: AsyncMutex::new(()),
@@ -7570,6 +7568,103 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             })
         })
         .flatten()
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Snapshot persistence must validate and refresh all panes from one consistent runtime-manager view."
+    )]
+    fn snapshot_session_runtime_for_persistence(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<Option<bmux_pane_runtime_state::SessionRuntimeSnapshot>> {
+        self.with_lock(|m| {
+            let Some(runtime) = m.runtimes.get_mut(&session_id) else {
+                return Ok(None);
+            };
+
+            validate_runtime_layout_matches_panes(&runtime.layout_root, &runtime.panes)
+                .with_context(|| {
+                    format!(
+                        "cannot snapshot inconsistent layout for session {}",
+                        session_id.0
+                    )
+                })?;
+
+            let mut pane_ids = Vec::new();
+            runtime.layout_root.pane_order(&mut pane_ids);
+            let mut panes = Vec::with_capacity(pane_ids.len());
+            for pane_id in pane_ids {
+                let Some(pane) = runtime.panes.get_mut(&pane_id) else {
+                    anyhow::bail!(
+                        "layout references missing pane {pane_id} in session {}",
+                        session_id.0
+                    );
+                };
+
+                let process_id = pane.process_id.lock().ok().and_then(|v| *v);
+                let process_group_id = pane.process_group_id.lock().ok().and_then(|v| *v);
+                let mut resurrection_runtime = pane
+                    .resurrection_state
+                    .lock()
+                    .ok()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+
+                if !pane.exited.load(Ordering::SeqCst)
+                    && resurrection_runtime.active_command_source
+                        != Some(PaneCommandSource::Verbatim)
+                {
+                    match inspect_process_group_command_and_cwd(
+                        process_group_id,
+                        process_id,
+                        &pane.meta.shell,
+                    ) {
+                        Some(inspection) => {
+                            if let Some(command) = inspection.command {
+                                resurrection_runtime.active_command = Some(command);
+                                resurrection_runtime.active_command_source =
+                                    Some(PaneCommandSource::Inspection);
+                            } else if resurrection_runtime.active_command_source
+                                == Some(PaneCommandSource::Inspection)
+                            {
+                                resurrection_runtime.active_command = None;
+                                resurrection_runtime.active_command_source = None;
+                            }
+                            if let Some(cwd) = inspection.cwd {
+                                resurrection_runtime.last_known_cwd = Some(cwd);
+                            }
+                        }
+                        None if resurrection_runtime.active_command_source
+                            == Some(PaneCommandSource::Inspection) =>
+                        {
+                            resurrection_runtime.active_command = None;
+                            resurrection_runtime.active_command_source = None;
+                        }
+                        None => {}
+                    }
+                }
+
+                if let Ok(mut state_guard) = pane.resurrection_state.lock() {
+                    *state_guard = resurrection_runtime.clone();
+                }
+
+                let mut meta = pane.meta.clone();
+                meta.resurrection = resurrection_runtime.to_snapshot();
+                panes.push(meta);
+            }
+
+            Ok(Some(bmux_pane_runtime_state::SessionRuntimeSnapshot {
+                session_id,
+                panes,
+                focused_pane_id: runtime.focused_pane_id,
+                layout_root: runtime.layout_root.clone(),
+                floating_surfaces: runtime.floating_surfaces.clone(),
+                attached_clients: runtime.attached_clients.clone(),
+                attach_viewport: runtime.attach_viewport,
+            }))
+        })
+        .unwrap_or_else(|| Err(anyhow::anyhow!("session runtime manager lock poisoned")))
     }
 
     fn list_session_ids(&self) -> Vec<SessionId> {

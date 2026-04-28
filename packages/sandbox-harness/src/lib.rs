@@ -16,7 +16,7 @@ use tracing::warn;
 /// Default timeout while waiting for the sandbox server to become ready.
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-const CLEANUP_MIN_AGE: Duration = Duration::from_secs(300);
+const CLEANUP_MIN_AGE: Duration = Duration::from_mins(5);
 const SANDBOX_PREFIX: &str = "bsh-";
 
 /// Configuration options for sandbox startup.

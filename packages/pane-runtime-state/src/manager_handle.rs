@@ -338,6 +338,18 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
 
     fn snapshot_session_runtime(&self, session_id: SessionId) -> Option<SessionRuntimeSnapshot>;
 
+    /// Snapshot a session runtime for persistence. Implementations may
+    /// refresh runtime-derived fields (for example, inspected active
+    /// commands / working directories) before returning the projection.
+    /// The default keeps simple implementors equivalent to the normal
+    /// in-memory snapshot path.
+    fn snapshot_session_runtime_for_persistence(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<Option<SessionRuntimeSnapshot>> {
+        Ok(self.snapshot_session_runtime(session_id))
+    }
+
     fn list_session_ids(&self) -> Vec<SessionId>;
 
     /// Drive the async shutdown for a `RemovedRuntimeInfo` produced

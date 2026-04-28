@@ -8,10 +8,8 @@
 //! server-side participant so the pane runtime ends up in that
 //! envelope alongside the plugin-owned slices.
 
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
-use anyhow::Context;
 use bmux_ipc::PaneLaunchCommand;
 use bmux_plugin_sdk::{
     PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
@@ -25,8 +23,8 @@ use uuid::Uuid;
 
 use crate::{
     FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec, PaneLayoutNode,
-    PaneResurrectionSnapshot, PaneRuntimeMeta, PaneSplitDirection, ServerState,
-    inspect_process_group_command_and_cwd, session_handle, validate_runtime_layout_matches_panes,
+    PaneResurrectionSnapshot, PaneRuntimeMeta, PaneSplitDirection, ServerState, session_handle,
+    session_runtime_handle,
 };
 
 /// Stable id for the server pane-runtime snapshot surface.
@@ -205,109 +203,51 @@ impl ServerPaneRuntimeStateful {
     }
 }
 
-/// Walk `state.session_runtimes` and produce a real pane-runtime
-/// payload for persistence.
-#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-fn build_pane_runtime_payload(state: &Arc<ServerState>) -> anyhow::Result<PaneRuntimeSnapshotV1> {
+/// Walk the registered session-runtime handle and produce a real
+/// pane-runtime payload for persistence.
+fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
     let sessions = session_handle().0.list_sessions();
-
-    let runtime_manager = state
-        .session_runtimes
-        .lock()
-        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+    let runtime_manager = session_runtime_handle();
 
     let mut out = Vec::with_capacity(sessions.len());
     for session_info in sessions {
-        let Some(runtime) = runtime_manager.runtimes.get(&session_info.id) else {
+        let Some(runtime) = runtime_manager
+            .0
+            .snapshot_session_runtime_for_persistence(session_info.id)?
+        else {
             continue;
         };
 
-        validate_runtime_layout_matches_panes(&runtime.layout_root, &runtime.panes).with_context(
-            || {
-                format!(
-                    "cannot snapshot inconsistent layout for session {}",
-                    session_info.id.0
-                )
-            },
-        )?;
+        let panes = runtime
+            .panes
+            .into_iter()
+            .map(|pane| {
+                let process_group_id = runtime_manager
+                    .0
+                    .pane_process_identity(session_info.id, pane.id)
+                    .and_then(|identity| identity.process_group_id);
 
-        let mut pane_ids = Vec::new();
-        runtime.layout_root.pane_order(&mut pane_ids);
-        let mut panes = Vec::with_capacity(pane_ids.len());
-        for pane_id in pane_ids {
-            let Some(pane) = runtime.panes.get(&pane_id) else {
-                anyhow::bail!(
-                    "layout references missing pane {pane_id} in session {}",
-                    session_info.id.0
-                );
-            };
-            let process_id = pane.process_id.lock().ok().and_then(|v| *v);
-            let process_group_id = pane.process_group_id.lock().ok().and_then(|v| *v);
-            let mut resurrection_runtime = pane
-                .resurrection_state
-                .lock()
-                .ok()
-                .map(|s| s.clone())
-                .unwrap_or_default();
-
-            if !pane.exited.load(Ordering::SeqCst)
-                && resurrection_runtime.active_command_source != Some(PaneCommandSource::Verbatim)
-            {
-                match inspect_process_group_command_and_cwd(
+                PaneRuntimeSnapshotV1Pane {
+                    id: pane.id,
+                    name: pane.name,
+                    shell: pane.shell,
+                    launch_command: pane.launch.as_ref().map(|command| PaneLaunchCommand {
+                        program: command.program.clone(),
+                        args: command.args.clone(),
+                        cwd: command.cwd.clone(),
+                        env: command.env.clone(),
+                    }),
                     process_group_id,
-                    process_id,
-                    &pane.meta.shell,
-                ) {
-                    Some(inspection) => {
-                        if let Some(command) = inspection.command {
-                            resurrection_runtime.active_command = Some(command);
-                            resurrection_runtime.active_command_source =
-                                Some(PaneCommandSource::Inspection);
-                        } else if resurrection_runtime.active_command_source
-                            == Some(PaneCommandSource::Inspection)
-                        {
-                            resurrection_runtime.active_command = None;
-                            resurrection_runtime.active_command_source = None;
-                        }
-                        if let Some(cwd) = inspection.cwd {
-                            resurrection_runtime.last_known_cwd = Some(cwd);
-                        }
-                    }
-                    None if resurrection_runtime.active_command_source
-                        == Some(PaneCommandSource::Inspection) =>
-                    {
-                        resurrection_runtime.active_command = None;
-                        resurrection_runtime.active_command_source = None;
-                    }
-                    None => {}
+                    active_command: pane.resurrection.active_command,
+                    active_command_source: pane.resurrection.active_command_source,
+                    last_known_cwd: pane.resurrection.last_known_cwd,
                 }
-            }
-
-            if let Ok(mut state_guard) = pane.resurrection_state.lock() {
-                *state_guard = resurrection_runtime.clone();
-            }
-            let resurrection_snapshot = resurrection_runtime.to_snapshot();
-
-            panes.push(PaneRuntimeSnapshotV1Pane {
-                id: pane.meta.id,
-                name: pane.meta.name.clone(),
-                shell: pane.meta.shell.clone(),
-                launch_command: pane.meta.launch.as_ref().map(|command| PaneLaunchCommand {
-                    program: command.program.clone(),
-                    args: command.args.clone(),
-                    cwd: command.cwd.clone(),
-                    env: command.env.clone(),
-                }),
-                process_group_id,
-                active_command: resurrection_snapshot.active_command,
-                active_command_source: resurrection_snapshot.active_command_source,
-                last_known_cwd: resurrection_snapshot.last_known_cwd,
-            });
-        }
+            })
+            .collect();
 
         let floating_surfaces = runtime
             .floating_surfaces
-            .iter()
+            .into_iter()
             .map(|surface| PaneRuntimeSnapshotV1FloatingSurface {
                 id: surface.id,
                 pane_id: surface.pane_id,
@@ -340,15 +280,9 @@ fn build_pane_runtime_payload(state: &Arc<ServerState>) -> anyhow::Result<PaneRu
 /// sessions-plugin participant's responsibility, restored earlier in
 /// the envelope iteration), reconstruct the pane runtime via
 /// `SessionRuntimeManager::restore_runtime`.
-fn apply_pane_runtime_payload(
-    state: &Arc<ServerState>,
-    payload: &PaneRuntimeSnapshotV1,
-) -> anyhow::Result<()> {
+fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
     let session_manager = session_handle();
-    let mut runtime_manager = state
-        .session_runtimes
-        .lock()
-        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+    let runtime_manager = session_runtime_handle();
 
     for entry in &payload.sessions {
         if entry.panes.is_empty() {
@@ -418,7 +352,7 @@ fn apply_pane_runtime_payload(
             })
             .collect::<Vec<_>>();
 
-        if let Err(error) = runtime_manager.restore_runtime(
+        if let Err(error) = runtime_manager.0.restore_runtime(
             session_id,
             &runtime_panes,
             entry.layout_root.as_ref().map(layout_from_snapshot),
@@ -434,7 +368,6 @@ fn apply_pane_runtime_payload(
             let _ = session_manager.0.remove_session(session_id);
         }
     }
-    Ok(())
 }
 
 impl StatefulPlugin for ServerPaneRuntimeStateful {
@@ -443,17 +376,16 @@ impl StatefulPlugin for ServerPaneRuntimeStateful {
     }
 
     fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
-        let Some(state) = self.state.upgrade() else {
+        if self.state.upgrade().is_none() {
             // Server has gone away — emit an empty payload so the
             // orchestrator can still produce a valid envelope.
             return empty_snapshot();
-        };
-        let payload = build_pane_runtime_payload(&state).map_err(|err| {
-            StatefulPluginError::SnapshotFailed {
+        }
+        let payload =
+            build_pane_runtime_payload().map_err(|err| StatefulPluginError::SnapshotFailed {
                 plugin: SERVER_PANE_RUNTIME_ID.as_str().to_string(),
                 details: format!("{err:#}"),
-            }
-        })?;
+            })?;
         let bytes =
             serde_json::to_vec(&payload).map_err(|err| StatefulPluginError::SnapshotFailed {
                 plugin: SERVER_PANE_RUNTIME_ID.as_str().to_string(),
@@ -481,16 +413,12 @@ impl StatefulPlugin for ServerPaneRuntimeStateful {
                     details: err.to_string(),
                 }
             })?;
-        let Some(state) = self.state.upgrade() else {
+        if self.state.upgrade().is_none() {
             // Server gone — nothing to restore into. Not an error.
             return Ok(());
-        };
-        apply_pane_runtime_payload(&state, &decoded).map_err(|err| {
-            StatefulPluginError::RestoreFailed {
-                plugin: SERVER_PANE_RUNTIME_ID.as_str().to_string(),
-                details: format!("{err:#}"),
-            }
-        })
+        }
+        apply_pane_runtime_payload(&decoded);
+        Ok(())
     }
 }
 

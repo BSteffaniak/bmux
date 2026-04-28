@@ -3047,11 +3047,10 @@ fn synthetic_plugin_manifest(profile: &str, plugin_id: &str, idx: usize) -> Stri
     out.push_str("version = \"0.0.0\"\n");
 
     match profile {
-        "small" => {
-            if idx.is_multiple_of(2) {
-                out.push_str("provided_capabilities = [\"bench.synthetic.read\"]\n");
-            }
+        "small" if idx.is_multiple_of(2) => {
+            out.push_str("provided_capabilities = [\"bench.synthetic.read\"]\n");
         }
+        "small" => {}
         "medium" => {
             out.push_str("required_capabilities = [\"bmux.commands\"]\n");
             out.push_str("provided_capabilities = [\"bench.synthetic.read\"]\n");
