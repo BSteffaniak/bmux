@@ -3123,7 +3123,6 @@ active_profile = "vim"
                 .and_then(|mode| mode.bindings.get(":")),
             Some(&"enter_mode command".to_string())
         );
-        assert_eq!(config.keybindings.timeout_profile.as_deref(), Some("fast"));
         let insert_bindings = &config
             .keybindings
             .modes

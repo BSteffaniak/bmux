@@ -1768,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_mode_prefix_times_out_to_pane_input() {
+    fn passthrough_mode_prefix_forwards_when_next_key_does_not_complete_chord() {
         let modes = BTreeMap::from([
             ("normal".to_string(), modal_mode("NORMAL", false, &[])),
             (
@@ -1785,7 +1785,7 @@ mod tests {
         ]);
 
         let keymap = Keymap::from_modal_parts_with_scroll(
-            Some(50),
+            None,
             "insert",
             &modes,
             &BTreeMap::new(),
@@ -1798,10 +1798,9 @@ mod tests {
             processor.process_chunk(&[0x01]),
             Vec::<RuntimeAction>::new()
         );
-        thread::sleep(Duration::from_millis(70));
         assert_eq!(
-            processor.process_chunk(&[]),
-            vec![RuntimeAction::ForwardToPane(vec![0x01])]
+            processor.process_chunk(b"x"),
+            vec![RuntimeAction::ForwardToPane(vec![0x01, b'x'])]
         );
         assert_eq!(processor.active_mode_id(), Some("insert"));
     }

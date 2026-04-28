@@ -1,6 +1,5 @@
 [keybindings]
-initial_mode    = "normal"
-timeout_profile = "fast"
+initial_mode = "normal"
 
 [keybindings.modes.normal.bindings]
 ":" = "enter_mode command"
