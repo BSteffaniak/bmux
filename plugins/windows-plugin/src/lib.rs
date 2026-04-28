@@ -31,6 +31,7 @@ const ACTIVE_WINDOW_CONTEXT_KEY: &str = "windows.active_context_id";
 const PREVIOUS_WINDOW_CONTEXT_KEY: &str = "windows.previous_context_id";
 const WINDOW_ORDER_KEY: &str = "windows.order";
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
+
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
 }
@@ -50,6 +51,9 @@ type LastSelectedByClient = Arc<Mutex<BTreeMap<Uuid, Uuid>>>;
 struct WindowRuntimeState {
     active_context_id: Option<Uuid>,
     previous_context_id: Option<Uuid>,
+    window_order_ids: Option<Vec<Uuid>>,
+    window_order_dirty: bool,
+    known_contexts: BTreeMap<Uuid, Option<String>>,
 }
 
 type WindowRuntimeStateHandle = Arc<Mutex<WindowRuntimeState>>;
@@ -393,11 +397,13 @@ fn handle_context_event(
 
     let caller = shared.caller.as_ref();
     match event {
-        ContextEvent::Created { context_id, .. } => {
-            let _ = append_context_to_window_order(caller, *context_id);
+        ContextEvent::Created { context_id, name } => {
+            cache_known_context(&shared.runtime_state, *context_id, name.clone());
+            let _ = append_context_to_window_order(caller, &shared.runtime_state, *context_id);
             publish_window_list_snapshot(caller, &shared.runtime_state);
         }
         ContextEvent::Closed { context_id } => {
+            remove_known_context(&shared.runtime_state, *context_id);
             let _ = remove_context_from_window_order(caller, &shared.runtime_state, *context_id);
             publish_window_list_snapshot(caller, &shared.runtime_state);
         }
@@ -415,17 +421,66 @@ fn handle_context_event(
 /// creation order of the `ContextEvent::Created` stream.
 fn append_context_to_window_order(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     context_id: Uuid,
 ) -> Result<(), String> {
-    let mut order_ids = get_stored_window_order_ids(caller)?;
-    if order_ids.contains(&context_id) {
-        return Ok(());
-    }
-    order_ids.push(context_id);
-    set_stored_window_order_ids(caller, &order_ids)
+    append_contexts_to_window_order(caller, runtime_state, [context_id])
 }
 
 fn append_contexts_to_window_order(
+    caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
+    context_ids: impl IntoIterator<Item = Uuid>,
+) -> Result<(), String> {
+    let Ok(mut state) = runtime_state.lock() else {
+        return append_contexts_to_stored_window_order(caller, context_ids);
+    };
+    let mut order_ids = if let Some(order_ids) = state.window_order_ids.clone() {
+        order_ids
+    } else {
+        let order_ids = get_stored_window_order_ids(caller)?;
+        state.window_order_ids = Some(order_ids.clone());
+        order_ids
+    };
+    let mut known_ids = order_ids.iter().copied().collect::<HashSet<_>>();
+    let mut appended_ids = Vec::new();
+    for context_id in context_ids {
+        if known_ids.insert(context_id) {
+            order_ids.push(context_id);
+            appended_ids.push(context_id);
+        }
+    }
+    if !appended_ids.is_empty() || state.window_order_dirty {
+        state.window_order_ids = Some(order_ids.clone());
+        set_stored_window_order_ids(caller, &order_ids)?;
+        state.window_order_dirty = false;
+    }
+    Ok(())
+}
+
+fn cache_contexts_to_window_order(
+    runtime_state: &WindowRuntimeStateHandle,
+    context_ids: impl IntoIterator<Item = Uuid>,
+) {
+    let Ok(mut state) = runtime_state.lock() else {
+        return;
+    };
+    let mut order_ids = state.window_order_ids.clone().unwrap_or_default();
+    let mut known_ids = order_ids.iter().copied().collect::<HashSet<_>>();
+    let mut changed = false;
+    for context_id in context_ids {
+        if known_ids.insert(context_id) {
+            order_ids.push(context_id);
+            changed = true;
+        }
+    }
+    if changed {
+        state.window_order_ids = Some(order_ids);
+        state.window_order_dirty = true;
+    }
+}
+
+fn append_contexts_to_stored_window_order(
     caller: &impl HostRuntimeApi,
     context_ids: impl IntoIterator<Item = Uuid>,
 ) -> Result<(), String> {
@@ -461,6 +516,10 @@ fn remove_context_from_window_order(
     } else {
         set_stored_window_order_ids(caller, &order_ids)?;
     }
+    if let Ok(mut state) = runtime_state.lock() {
+        state.window_order_ids = Some(order_ids);
+        state.window_order_dirty = false;
+    }
     // Clear active marker if it points at the removed context.
     if let Ok(Some(active)) =
         get_runtime_context_id(caller, runtime_state, ACTIVE_WINDOW_CONTEXT_KEY)
@@ -481,6 +540,21 @@ fn remove_context_from_window_order(
 /// Update `ACTIVE_WINDOW_CONTEXT_KEY` to `context_id`, moving the
 /// previous active context (if any and different) into
 /// `PREVIOUS_WINDOW_CONTEXT_KEY` so `last-window` still works.
+fn mark_context_active_cached(
+    runtime_state: &WindowRuntimeStateHandle,
+    previous_context: Option<Uuid>,
+    context_id: Uuid,
+) {
+    if let Ok(mut state) = runtime_state.lock() {
+        if let Some(previous) = previous_context
+            && previous != context_id
+        {
+            state.previous_context_id = Some(previous);
+        }
+        state.active_context_id = Some(context_id);
+    }
+}
+
 fn mark_context_active(
     caller: &impl HostRuntimeApi,
     runtime_state: &WindowRuntimeStateHandle,
@@ -489,9 +563,10 @@ fn mark_context_active(
     let previous = get_runtime_context_id(caller, runtime_state, ACTIVE_WINDOW_CONTEXT_KEY)
         .ok()
         .flatten();
-    if let Some(previous) = previous
-        && previous != context_id
-    {
+    if previous == Some(context_id) {
+        return Ok(());
+    }
+    if let Some(previous) = previous {
         let _ = set_runtime_context_id(
             caller,
             runtime_state,
@@ -811,7 +886,7 @@ fn list_windows(
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
-    let contexts = order_contexts_for_navigation(caller, contexts)?;
+    let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     let selected = if let Some(filter) = session_filter {
         let selector = parse_selector(filter)?;
         contexts
@@ -873,10 +948,12 @@ fn publish_window_list_snapshot(
 
 fn publish_window_list_snapshot_from_contexts(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     contexts: &[domain_ipc::ContextSummary],
     active_context_id: Option<Uuid>,
 ) {
-    let Ok(contexts) = order_contexts_for_navigation(caller, contexts.to_vec()) else {
+    let Ok(contexts) = order_contexts_for_navigation(caller, runtime_state, contexts.to_vec())
+    else {
         return;
     };
     publish_window_list_ordered_contexts(contexts, active_context_id);
@@ -940,6 +1017,10 @@ fn reset_window_order(
     let mut ids: Vec<Uuid> = contexts.iter().map(|context| context.id).collect();
     ids.sort_by_key(uuid::Uuid::as_u128);
     set_stored_window_order_ids(caller, &ids)?;
+    if let Ok(mut state) = runtime_state.lock() {
+        state.window_order_ids = Some(ids.clone());
+        state.window_order_dirty = false;
+    }
     publish_window_list_snapshot(caller, runtime_state);
     Ok(ids.len())
 }
@@ -949,10 +1030,16 @@ fn create_window(
     runtime_state: &WindowRuntimeStateHandle,
     name: Option<String>,
 ) -> Result<WindowAck, String> {
-    let mut contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
+    let mut contexts = cached_known_contexts(runtime_state).map_or_else(
+        || {
+            caller
+                .context_list()
+                .map(|response| response.contexts)
+                .map_err(|error| error.to_string())
+        },
+        Ok,
+    )?;
+    seed_known_contexts(runtime_state, &contexts);
     let resolved_name = name.or_else(|| Some(next_default_tab_name_for_contexts(&contexts)));
     let previous_context =
         resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)
@@ -965,31 +1052,16 @@ fn create_window(
         })
         .map_err(|error| error.to_string())?;
     let context_id = response.context.id;
+    cache_known_context(runtime_state, context_id, response.context.name.clone());
     contexts.push(response.context);
     let mut order_appends = Vec::with_capacity(2);
     if let Some(previous) = previous_context {
         order_appends.push(previous);
     }
     order_appends.push(context_id);
-    append_contexts_to_window_order(caller, order_appends)?;
-    if let Some(previous) = previous_context
-        && previous != context_id
-    {
-        let _ = set_runtime_context_id(
-            caller,
-            runtime_state,
-            PREVIOUS_WINDOW_CONTEXT_KEY,
-            Some(previous),
-        );
-    }
-    let _ = set_runtime_context_id(
-        caller,
-        runtime_state,
-        ACTIVE_WINDOW_CONTEXT_KEY,
-        Some(context_id),
-    );
-    let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
-    publish_window_list_snapshot_from_contexts(caller, &contexts, Some(context_id));
+    cache_contexts_to_window_order(runtime_state, order_appends);
+    mark_context_active_cached(runtime_state, previous_context, context_id);
+    publish_window_list_snapshot_from_contexts(caller, runtime_state, &contexts, Some(context_id));
     Ok(WindowAck {
         ok: true,
         id: Some(context_id.to_string()),
@@ -1065,7 +1137,7 @@ fn switch_window(
         .map_err(|error| error.to_string())?
         .contexts;
     let context_list_us = list_started.elapsed().as_micros();
-    let contexts = order_contexts_for_navigation(caller, contexts)?;
+    let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     switch_window_with_contexts(
         caller,
         runtime_state,
@@ -1173,7 +1245,7 @@ fn cycle_window(
         .contexts;
     let context_list_us = list_started.elapsed().as_micros();
     let order_started = Instant::now();
-    let contexts = order_contexts_for_navigation(caller, contexts)?;
+    let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     let order_us = order_started.elapsed().as_micros();
     if contexts.len() < 2 {
         return Err("no alternate window available".to_string());
@@ -1257,7 +1329,7 @@ fn goto_window_by_index(
         .map_err(|error| error.to_string())?
         .contexts;
     let context_list_us = list_started.elapsed().as_micros();
-    let contexts = order_contexts_for_navigation(caller, contexts)?;
+    let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     if contexts.is_empty() {
         return Err("no windows available".to_string());
     }
@@ -1294,7 +1366,7 @@ fn close_current_window(
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
-    let contexts = order_contexts_for_navigation(caller, contexts)?;
+    let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     let current_id =
         resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
             .ok_or_else(|| "no current window to close".to_string())?;
@@ -1526,9 +1598,10 @@ fn set_stored_context_id(
 
 fn order_contexts_for_navigation(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     contexts: Vec<domain_ipc::ContextSummary>,
 ) -> Result<Vec<domain_ipc::ContextSummary>, String> {
-    let order_ids = resolve_window_order_ids(caller, &contexts)?;
+    let order_ids = resolve_window_order_ids(caller, runtime_state, &contexts)?;
     let mut by_id = contexts
         .into_iter()
         .map(|context| (context.id, context))
@@ -1541,13 +1614,22 @@ fn order_contexts_for_navigation(
 
 fn resolve_window_order_ids(
     caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
     contexts: &[domain_ipc::ContextSummary],
 ) -> Result<Vec<Uuid>, String> {
+    if let Some(order_ids) = cached_window_order_ids(runtime_state) {
+        return Ok(project_window_order_ids(order_ids, contexts));
+    }
+
     let mut order_ids = get_stored_window_order_ids(caller)?;
     if order_ids.is_empty() && !contexts.is_empty() {
         order_ids = contexts.iter().map(|context| context.id).collect();
         order_ids.sort_by_key(uuid::Uuid::as_u128);
         set_stored_window_order_ids(caller, &order_ids)?;
+        if let Ok(mut state) = runtime_state.lock() {
+            state.window_order_ids = Some(order_ids.clone());
+            state.window_order_dirty = false;
+        }
         return Ok(order_ids);
     }
 
@@ -1578,6 +1660,79 @@ fn resolve_window_order_ids(
         set_stored_window_order_ids(caller, &order_ids)?;
     }
 
+    let order_ids = project_window_order_ids(order_ids, contexts);
+    if let Ok(mut state) = runtime_state.lock() {
+        state.window_order_ids = Some(order_ids.clone());
+        state.window_order_dirty = false;
+    }
+    Ok(order_ids)
+}
+
+fn cached_window_order_ids(runtime_state: &WindowRuntimeStateHandle) -> Option<Vec<Uuid>> {
+    runtime_state
+        .lock()
+        .ok()
+        .and_then(|state| state.window_order_ids.clone())
+}
+
+fn cached_known_contexts(
+    runtime_state: &WindowRuntimeStateHandle,
+) -> Option<Vec<domain_ipc::ContextSummary>> {
+    let state = runtime_state.lock().ok()?;
+    if state.known_contexts.is_empty() {
+        return None;
+    }
+    Some(
+        state
+            .known_contexts
+            .iter()
+            .map(|(id, name)| domain_ipc::ContextSummary {
+                id: *id,
+                name: name.clone(),
+                attributes: BTreeMap::new(),
+            })
+            .collect(),
+    )
+}
+
+fn seed_known_contexts(
+    runtime_state: &WindowRuntimeStateHandle,
+    contexts: &[domain_ipc::ContextSummary],
+) {
+    if let Ok(mut state) = runtime_state.lock() {
+        for context in contexts {
+            state
+                .known_contexts
+                .insert(context.id, context.name.clone());
+        }
+    }
+}
+
+fn cache_known_context(
+    runtime_state: &WindowRuntimeStateHandle,
+    context_id: Uuid,
+    name: Option<String>,
+) {
+    if let Ok(mut state) = runtime_state.lock() {
+        state.known_contexts.insert(context_id, name);
+    }
+}
+
+fn remove_known_context(runtime_state: &WindowRuntimeStateHandle, context_id: Uuid) {
+    if let Ok(mut state) = runtime_state.lock() {
+        state.known_contexts.remove(&context_id);
+    }
+}
+
+fn project_window_order_ids(
+    mut order_ids: Vec<Uuid>,
+    contexts: &[domain_ipc::ContextSummary],
+) -> Vec<Uuid> {
+    let context_ids = contexts
+        .iter()
+        .map(|context| context.id)
+        .collect::<HashSet<_>>();
+    order_ids.retain(|id| context_ids.contains(id));
     let mut known_ids = order_ids.iter().copied().collect::<HashSet<_>>();
     // Append missing contexts only in the returned projection, never
     // in persisted storage. `contexts` is MRU-first, so persisting
@@ -1596,8 +1751,7 @@ fn resolve_window_order_ids(
             order_ids.push(id);
         }
     }
-
-    Ok(order_ids)
+    order_ids
 }
 
 fn get_stored_window_order_ids(caller: &impl HostRuntimeApi) -> Result<Vec<Uuid>, String> {
@@ -1613,8 +1767,21 @@ fn get_stored_window_order_ids(caller: &impl HostRuntimeApi) -> Result<Vec<Uuid>
         return Ok(Vec::new());
     }
 
-    let raw = serde_json::from_slice::<Vec<String>>(&value)
-        .map_err(|error| format!("failed parsing stored window order: {error}"))?;
+    if let Ok(raw) = serde_json::from_slice::<Vec<String>>(&value) {
+        return parse_stored_window_order_entries(raw);
+    }
+    let text = String::from_utf8(value)
+        .map_err(|error| format!("failed parsing stored window order as utf8: {error}"))?;
+    parse_stored_window_order_entries(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
+}
+
+fn parse_stored_window_order_entries(raw: Vec<String>) -> Result<Vec<Uuid>, String> {
     raw.into_iter()
         .map(|entry| {
             Uuid::parse_str(entry.trim()).map_err(|error| {
@@ -1628,15 +1795,26 @@ fn set_stored_window_order_ids(
     caller: &impl HostRuntimeApi,
     order_ids: &[Uuid],
 ) -> Result<(), String> {
-    let payload = order_ids.iter().map(Uuid::to_string).collect::<Vec<_>>();
-    let value = serde_json::to_vec(&payload)
-        .map_err(|error| format!("failed encoding stored window order: {error}"))?;
+    let value = encode_stored_window_order_lines(order_ids);
     caller
         .storage_set(&StorageSetRequest {
             key: WINDOW_ORDER_KEY.to_string(),
             value,
         })
         .map_err(|error| error.to_string())
+}
+
+fn encode_stored_window_order_lines(order_ids: &[Uuid]) -> Vec<u8> {
+    if order_ids.is_empty() {
+        return Vec::new();
+    }
+    let mut text = order_ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push('\n');
+    text.into_bytes()
 }
 
 // ── Typed service handles ────────────────────────────────────────────
@@ -3313,8 +3491,9 @@ mod tests {
         assert!(ack.ok);
         let created_id = ack.id.expect("create should return context id");
         let created_id = Uuid::parse_str(&created_id).expect("created id should be uuid");
-        let stored_order = get_stored_window_order_ids(&host).expect("order lookup should succeed");
-        assert_eq!(stored_order, vec![first_id, created_id]);
+        let cached_order =
+            cached_window_order_ids(&runtime_state).expect("order cache should be warm");
+        assert_eq!(cached_order, vec![first_id, created_id]);
         let creates: Vec<_> = host
             .creates
             .lock()
@@ -3335,8 +3514,9 @@ mod tests {
             Uuid::parse_str(ack.id.as_deref().expect("create should return context id"))
                 .expect("created id should be uuid");
 
-        let stored_order = get_stored_window_order_ids(&host).expect("order lookup should succeed");
-        assert_eq!(stored_order, vec![first_id, created_id]);
+        let cached_order =
+            cached_window_order_ids(&runtime_state).expect("order cache should be warm");
+        assert_eq!(cached_order, vec![first_id, created_id]);
 
         let windows = list_windows(&host, &runtime_state, None).expect("list should succeed");
         let ids = windows
@@ -4138,9 +4318,10 @@ mod tests {
         let b = Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
         let c = Uuid::from_u128(0x3333_3333_3333_3333_3333_3333_3333_3333);
 
-        append_context_to_window_order(&host, a).expect("append A");
-        append_context_to_window_order(&host, b).expect("append B");
-        append_context_to_window_order(&host, c).expect("append C");
+        let runtime_state = runtime_state();
+        append_context_to_window_order(&host, &runtime_state, a).expect("append A");
+        append_context_to_window_order(&host, &runtime_state, b).expect("append B");
+        append_context_to_window_order(&host, &runtime_state, c).expect("append C");
 
         let order = get_stored_window_order_ids(&host).expect("order readable");
         assert_eq!(order, vec![a, b, c]);
@@ -4153,8 +4334,9 @@ mod tests {
         let host = MockHost::with_sessions(Vec::new());
         let a = Uuid::from_u128(0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
 
-        append_context_to_window_order(&host, a).expect("first append");
-        append_context_to_window_order(&host, a).expect("second append");
+        let runtime_state = runtime_state();
+        append_context_to_window_order(&host, &runtime_state, a).expect("first append");
+        append_context_to_window_order(&host, &runtime_state, a).expect("second append");
 
         let order = get_stored_window_order_ids(&host).expect("order readable");
         assert_eq!(order, vec![a]);
