@@ -1175,6 +1175,7 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_session_models",
+ "bmux_session_state",
  "bmux_snapshot_runtime",
  "serde",
  "serde_json",

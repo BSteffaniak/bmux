@@ -6,8 +6,7 @@
 use bmux_contexts_plugin_api::{
     capabilities::{CONTEXTS_READ, CONTEXTS_WRITE},
     contexts_commands::{
-        self, CloseContextError, ContextAck, ContextSelector as CommandContextSelector,
-        CreateContextError, SelectContextError,
+        self, CloseContextError, ContextAck, CreateContextError, SelectContextError,
     },
     contexts_state::{self, ContextSelector as StateContextSelector, ContextSummary},
 };
@@ -18,6 +17,8 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use super::typed_service::{InvokeError, invoke_with};
+
+type CommandContextSelector = StateContextSelector;
 
 pub const CONTEXTS_READ_CAPABILITY: CapabilityId = CONTEXTS_READ;
 pub const CONTEXTS_WRITE_CAPABILITY: CapabilityId = CONTEXTS_WRITE;

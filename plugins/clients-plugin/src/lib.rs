@@ -33,6 +33,7 @@ use bmux_plugin_sdk::{
     TypedServiceRegistry, WireEventSinkHandle,
 };
 use bmux_session_models::{ClientId, SessionId};
+use bmux_session_state::SessionManagerHandle;
 use bmux_snapshot_runtime::StatefulPluginRegistry;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -415,18 +416,9 @@ impl RustPlugin for ClientsPlugin {
                     current_client_local(ctx.caller_client_id)
                 )
             },
-            "clients-commands", "set-current-session" => |_req: SetCurrentSessionArgs, _ctx| {
-                // Session selection is currently driven by `Request::Attach`
-                // (which selects as a side-effect) rather than an explicit
-                // set-current-session RPC. Wiring this into a dedicated
-                // typed operation is tracked as a follow-up; today this
-                // handler returns `Denied` so callers can't rely on it.
+            "clients-commands", "set-current-session" => |req: SetCurrentSessionArgs, ctx| {
                 Ok::<Result<ClientAck, SetCurrentSessionError>, ServiceResponse>(
-                    Err(SetCurrentSessionError::Denied {
-                        reason: "set-current-session is driven by Request::Attach today; \
-                                 explicit typed operation is a follow-up"
-                            .to_string(),
-                    })
+                    set_current_session_local(ctx, ctx.caller_client_id, req.session_id)
                 )
             },
             "clients-commands", "set-following" => |req: SetFollowingArgs, ctx| {
@@ -472,6 +464,144 @@ impl RustPlugin for ClientsPlugin {
 }
 
 // ── IPC helpers ──────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_lines)]
+fn set_current_session_local(
+    caller: &impl ServiceCaller,
+    caller_client_id: Option<Uuid>,
+    session_id: Uuid,
+) -> Result<ClientAck, SetCurrentSessionError> {
+    let Some(self_id) = caller_client_id else {
+        return Err(SetCurrentSessionError::Denied {
+            reason: "no current client identity".to_string(),
+        });
+    };
+    let self_client_id = ClientId(self_id);
+    let next_session = SessionId(session_id);
+
+    let Some(sessions) = global_plugin_state_registry().get::<SessionManagerHandle>() else {
+        return Err(SetCurrentSessionError::Denied {
+            reason: "sessions plugin state not registered".to_string(),
+        });
+    };
+    let sessions = sessions
+        .read()
+        .map_err(|_| SetCurrentSessionError::Denied {
+            reason: "sessions plugin state lock poisoned".to_string(),
+        })?;
+    if !sessions.0.contains(next_session) {
+        return Err(SetCurrentSessionError::NotFound);
+    }
+    drop(sessions);
+
+    let Some(state_handle) = global_plugin_state_registry().get::<FollowState>() else {
+        return Err(SetCurrentSessionError::Denied {
+            reason: "clients plugin state not registered".to_string(),
+        });
+    };
+
+    let (previous_session, follower_previous_sessions, follower_updates) = {
+        let mut follow_state =
+            state_handle
+                .write()
+                .map_err(|_| SetCurrentSessionError::Denied {
+                    reason: "follow state lock poisoned".to_string(),
+                })?;
+
+        if !follow_state.connected_clients.contains(&self_client_id) {
+            return Err(SetCurrentSessionError::NotFound);
+        }
+
+        let previous_session = follow_state
+            .selected_sessions
+            .get(&self_client_id)
+            .copied()
+            .flatten();
+        let follower_previous_sessions = follow_state
+            .follows
+            .iter()
+            .filter(|(_, entry)| entry.leader_client_id == self_client_id && entry.global)
+            .map(|(follower_id, _)| {
+                (
+                    *follower_id,
+                    follow_state
+                        .selected_sessions
+                        .get(follower_id)
+                        .copied()
+                        .flatten(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // Explicit session selection is not context selection. Clearing
+        // the context avoids pairing a stale context with the new session.
+        follow_state.set_selected_target(self_client_id, None, Some(next_session));
+        let follower_updates =
+            follow_state.sync_followers_from_leader(self_client_id, None, Some(next_session));
+        drop(follow_state);
+
+        (
+            previous_session,
+            follower_previous_sessions,
+            follower_updates,
+        )
+    };
+
+    if previous_session != Some(next_session) {
+        reconcile_client_membership_via_typed_dispatch(
+            caller,
+            self_id,
+            previous_session.map(|s| s.0),
+            Some(session_id),
+        )
+        .map_err(|reason| SetCurrentSessionError::Denied { reason })?;
+    }
+
+    let _ = global_event_bus().emit(
+        &clients_events::EVENT_KIND,
+        ClientEvent::SessionSelected {
+            client_id: self_id,
+            session_id,
+        },
+    );
+
+    for update in follower_updates {
+        if let Some(update_session) = update.session_id {
+            let previous = follower_previous_sessions
+                .iter()
+                .find_map(|(client_id, previous)| {
+                    (*client_id == update.follower_client_id).then_some(*previous)
+                })
+                .flatten();
+            if previous != Some(update_session) {
+                let _ = reconcile_client_membership_via_typed_dispatch(
+                    caller,
+                    update.follower_client_id.0,
+                    previous.map(|s| s.0),
+                    Some(update_session.0),
+                );
+            }
+
+            let _ = global_event_bus().emit(
+                &clients_events::EVENT_KIND,
+                ClientEvent::FollowTargetChanged {
+                    follower_client_id: update.follower_client_id.0,
+                    leader_client_id: update.leader_client_id.0,
+                    context_id: update.context_id,
+                    session_id: update_session.0,
+                },
+            );
+            publish_wire_event(bmux_ipc::Event::FollowTargetChanged {
+                follower_client_id: update.follower_client_id.0,
+                leader_client_id: update.leader_client_id.0,
+                context_id: update.context_id,
+                session_id: update_session.0,
+            });
+        }
+    }
+
+    Ok(ClientAck { client_id: self_id })
+}
 
 fn list_clients_local() -> Result<Vec<ClientSummary>, String> {
     let Some(state) = global_plugin_state_registry().get::<FollowState>() else {
@@ -805,16 +935,15 @@ impl ClientsCommandsHandle {
 impl ClientsCommandsService for ClientsCommandsHandle {
     fn set_current_session<'a>(
         &'a self,
-        _session_id: Uuid,
+        session_id: Uuid,
     ) -> Pin<
         Box<
             dyn Future<Output = std::result::Result<ClientAck, SetCurrentSessionError>> + Send + 'a,
         >,
     > {
         Box::pin(async move {
-            Err(SetCurrentSessionError::Denied {
-                reason: "set-current-session is not wired into the core runtime yet".to_string(),
-            })
+            let caller_client_id = current_client_id_for_typed_handle(self.caller.as_ref());
+            set_current_session_local(self.caller.as_ref(), caller_client_id, session_id)
         })
     }
 
@@ -828,19 +957,7 @@ impl ClientsCommandsService for ClientsCommandsHandle {
             // Handle callers don't have `caller_client_id` threaded
             // through (TypedServiceCaller doesn't carry it), so fall
             // back to a typed `current-client` lookup to obtain it.
-            let caller_client_id = match self.caller.call_service::<(), std::result::Result<
-                ClientSummary,
-                ClientQueryError,
-            >>(
-                bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(),
-                ServiceKind::Query,
-                clients_state::INTERFACE_ID.as_str(),
-                "current-client",
-                &(),
-            ) {
-                Ok(Ok(summary)) => Some(summary.id),
-                _ => None,
-            };
+            let caller_client_id = current_client_id_for_typed_handle(self.caller.as_ref());
             set_following_via_ipc(
                 self.caller.as_ref(),
                 caller_client_id,
@@ -854,6 +971,19 @@ impl ClientsCommandsService for ClientsCommandsHandle {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+fn current_client_id_for_typed_handle(caller: &TypedServiceCaller) -> Option<Uuid> {
+    match caller.call_service::<(), std::result::Result<ClientSummary, ClientQueryError>>(
+        bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(),
+        ServiceKind::Query,
+        clients_state::INTERFACE_ID.as_str(),
+        clients_state::OP_CURRENT_CLIENT.as_str(),
+        &(),
+    ) {
+        Ok(Ok(summary)) => Some(summary.id),
+        _ => None,
+    }
+}
 
 const fn ipc_summary_to_typed(summary: &bmux_ipc::ClientSummary) -> ClientSummary {
     ClientSummary {

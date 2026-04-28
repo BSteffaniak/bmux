@@ -16,7 +16,7 @@
 //! caller-provided [`ImportMap`], which maps each alias to the Rust
 //! crate path where the imported bindings live.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use crate::ast::{
@@ -31,6 +31,8 @@ use crate::ast::{
 /// Keys are the import aliases declared in the schema's `import`
 /// directives; values are the [`ImportInfo`] describing the target crate.
 pub type ImportMap = BTreeMap<String, ImportInfo>;
+
+type OwnTypeMap = BTreeMap<String, BTreeSet<String>>;
 
 /// Resolution target for a single import alias.
 #[derive(Debug, Clone)]
@@ -57,13 +59,42 @@ pub fn emit(schema: &Schema) -> String {
 #[must_use]
 pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
     let mut out = String::new();
+    let own_types = own_type_map(schema);
     out.push_str("// AUTO-GENERATED FROM BPDL. DO NOT EDIT BY HAND.\n\n");
     out.push_str("use serde::{Deserialize, Serialize};\n\n");
     emit_capabilities(&schema.capabilities, &mut out);
     for iface in &schema.interfaces {
-        emit_interface(&schema.plugin.plugin_id, iface, imports, &mut out);
+        emit_interface(
+            &schema.plugin.plugin_id,
+            iface,
+            imports,
+            &own_types,
+            &mut out,
+        );
     }
     out
+}
+
+fn own_type_map(schema: &Schema) -> OwnTypeMap {
+    schema
+        .interfaces
+        .iter()
+        .map(|iface| {
+            let types = iface
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    InterfaceItem::Record(r) => Some(r.name.clone()),
+                    InterfaceItem::Variant(v) => Some(v.name.clone()),
+                    InterfaceItem::Enum(e) => Some(e.name.clone()),
+                    InterfaceItem::Query(_)
+                    | InterfaceItem::Command(_)
+                    | InterfaceItem::Events(_) => None,
+                })
+                .collect::<BTreeSet<_>>();
+            (iface.name.clone(), types)
+        })
+        .collect()
 }
 
 fn emit_capabilities(capabilities: &[CapabilityDecl], out: &mut String) {
@@ -83,15 +114,21 @@ fn emit_capabilities(capabilities: &[CapabilityDecl], out: &mut String) {
     out.push_str("}\n\n");
 }
 
-fn emit_interface(plugin_id: &str, iface: &Interface, imports: &ImportMap, out: &mut String) {
+fn emit_interface(
+    plugin_id: &str,
+    iface: &Interface,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    out: &mut String,
+) {
     let module_name = snake_case(&iface.name);
     let _ = writeln!(out, "pub mod {module_name} {{");
     out.push_str("    use super::*;\n\n");
 
     for item in &iface.items {
         match item {
-            InterfaceItem::Record(r) => emit_record(r, imports, out),
-            InterfaceItem::Variant(v) => emit_variant(v, imports, out),
+            InterfaceItem::Record(r) => emit_record(r, imports, own_types, out),
+            InterfaceItem::Variant(v) => emit_variant(v, imports, own_types, out),
             InterfaceItem::Enum(e) => emit_enum(e, out),
             InterfaceItem::Query(_) | InterfaceItem::Command(_) | InterfaceItem::Events(_) => {}
         }
@@ -100,23 +137,23 @@ fn emit_interface(plugin_id: &str, iface: &Interface, imports: &ImportMap, out: 
     // Service trait contains queries + commands. Events are exposed
     // separately as a typed `EVENT_KIND` constant + payload type
     // alias below.
-    emit_service_trait(iface, imports, out);
+    emit_service_trait(iface, imports, own_types, out);
 
     // If this interface declares `events <type>`, emit a canonical
     // `PluginEventKind` constant plus a `EventPayload` type alias so
     // both producers and subscribers import from the same place.
-    emit_event_bindings(plugin_id, iface, imports, out);
+    emit_event_bindings(plugin_id, iface, imports, own_types, out);
 
     out.push_str("}\n\n");
 }
 
-fn emit_record(r: &RecordDef, imports: &ImportMap, out: &mut String) {
+fn emit_record(r: &RecordDef, imports: &ImportMap, own_types: &OwnTypeMap, out: &mut String) {
     let name = pascal_case(&r.name);
     out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n");
     let _ = writeln!(out, "    pub struct {name} {{");
     for f in &r.fields {
         let field_name = snake_case(&f.name);
-        let ty = rust_type(&f.ty, imports);
+        let ty = rust_type(&f.ty, imports, own_types);
         // Emit `#[serde(default)]` on fields whose Rust type carries a
         // sensible Default impl. This lets additively-added fields
         // round-trip old payloads: a missing TOML/JSON key parses as
@@ -150,7 +187,7 @@ fn type_has_default(ty: &crate::ast::TypeRef) -> bool {
     }
 }
 
-fn emit_variant(v: &VariantDef, imports: &ImportMap, out: &mut String) {
+fn emit_variant(v: &VariantDef, imports: &ImportMap, own_types: &OwnTypeMap, out: &mut String) {
     let name = pascal_case(&v.name);
     out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n");
     // External (default) tagging. Internally-tagged variants
@@ -162,7 +199,7 @@ fn emit_variant(v: &VariantDef, imports: &ImportMap, out: &mut String) {
     out.push_str("    #[serde(rename_all = \"snake_case\")]\n");
     let _ = writeln!(out, "    pub enum {name} {{");
     for c in &v.cases {
-        emit_variant_case(c, imports, out);
+        emit_variant_case(c, imports, own_types, out);
     }
     out.push_str("    }\n\n");
 
@@ -175,7 +212,12 @@ fn emit_variant(v: &VariantDef, imports: &ImportMap, out: &mut String) {
     }
 }
 
-fn emit_variant_case(case: &VariantCase, imports: &ImportMap, out: &mut String) {
+fn emit_variant_case(
+    case: &VariantCase,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    out: &mut String,
+) {
     let case_name = pascal_case(&case.name);
     if case.payload.is_empty() {
         let _ = writeln!(out, "        {case_name},");
@@ -183,7 +225,7 @@ fn emit_variant_case(case: &VariantCase, imports: &ImportMap, out: &mut String) 
         let _ = writeln!(out, "        {case_name} {{");
         for f in &case.payload {
             let field_name = snake_case(&f.name);
-            let ty = rust_type(&f.ty, imports);
+            let ty = rust_type(&f.ty, imports, own_types);
             if let Some(adapter) = serde_bytes_adapter(&f.ty) {
                 let _ = writeln!(out, "            #[serde(with = \"{adapter}\")]");
             }
@@ -212,7 +254,12 @@ fn emit_enum(e: &EnumDef, out: &mut String) {
     }
 }
 
-fn emit_service_trait(iface: &Interface, imports: &ImportMap, out: &mut String) {
+fn emit_service_trait(
+    iface: &Interface,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    out: &mut String,
+) {
     let trait_name = format!("{}Service", pascal_case(&iface.name));
     // Canonical interface identifier used to look up a typed service via
     // the plugin host registry. Matches the BPDL `interface <name>` name.
@@ -230,12 +277,12 @@ fn emit_service_trait(iface: &Interface, imports: &ImportMap, out: &mut String) 
     let _ = writeln!(out, "    pub trait {trait_name}: Send + Sync {{");
     for item in &iface.items {
         if let InterfaceItem::Query(op) | InterfaceItem::Command(op) = item {
-            emit_operation_signature(op, imports, out);
+            emit_operation_signature(op, imports, own_types, out);
         }
     }
     out.push_str("    }\n\n");
 
-    emit_service_client(iface, imports, out, &trait_name);
+    emit_service_client(iface, imports, own_types, out, &trait_name);
 }
 
 fn emit_operation_constants(iface: &Interface, out: &mut String) {
@@ -262,7 +309,13 @@ fn emit_operation_constants(iface: &Interface, out: &mut String) {
 ///   it without re-stating the BPDL type name.
 ///
 /// Interfaces without an `events` declaration emit nothing here.
-fn emit_event_bindings(plugin_id: &str, iface: &Interface, imports: &ImportMap, out: &mut String) {
+fn emit_event_bindings(
+    plugin_id: &str,
+    iface: &Interface,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    out: &mut String,
+) {
     let Some(decl) = iface.items.iter().find_map(|item| match item {
         InterfaceItem::Events(decl) => Some(decl),
         _ => None,
@@ -270,7 +323,7 @@ fn emit_event_bindings(plugin_id: &str, iface: &Interface, imports: &ImportMap, 
         return;
     };
     let kind_literal = format!("{plugin_id}/{}", iface.name);
-    let ty = rust_type(&decl.ty, imports);
+    let ty = rust_type(&decl.ty, imports, own_types);
     match decl.delivery {
         DeliveryMode::Broadcast => {
             let _ = writeln!(
@@ -295,7 +348,13 @@ fn emit_event_bindings(plugin_id: &str, iface: &Interface, imports: &ImportMap, 
     }
 }
 
-fn emit_service_client(iface: &Interface, imports: &ImportMap, out: &mut String, trait_name: &str) {
+fn emit_service_client(
+    iface: &Interface,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    out: &mut String,
+    trait_name: &str,
+) {
     let client_name = format!("{}Client", pascal_case(&iface.name));
     out.push_str("    /// Typed client for this interface.\n");
     out.push_str("    ///\n");
@@ -332,22 +391,33 @@ fn emit_service_client(iface: &Interface, imports: &ImportMap, out: &mut String,
     // Forward every query/command through the trait.
     for item in &iface.items {
         if let InterfaceItem::Query(op) | InterfaceItem::Command(op) = item {
-            emit_client_forwarder(op, imports, out);
+            emit_client_forwarder(op, imports, own_types, out);
         }
     }
 
     out.push_str("    }\n\n");
 }
 
-fn emit_client_forwarder(op: &Operation, imports: &ImportMap, out: &mut String) {
+fn emit_client_forwarder(
+    op: &Operation,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    out: &mut String,
+) {
     let name = snake_case(&op.name);
     let params = op
         .params
         .iter()
-        .map(|f: &Field| format!("{}: {}", snake_case(&f.name), rust_type(&f.ty, imports)))
+        .map(|f: &Field| {
+            format!(
+                "{}: {}",
+                snake_case(&f.name),
+                rust_type(&f.ty, imports, own_types)
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    let returns = rust_type(&op.returns, imports);
+    let returns = rust_type(&op.returns, imports, own_types);
     let sep = if op.params.is_empty() { "" } else { ", " };
     let arg_names = op
         .params
@@ -364,15 +434,26 @@ fn emit_client_forwarder(op: &Operation, imports: &ImportMap, out: &mut String) 
     out.push_str("        }\n");
 }
 
-fn emit_operation_signature(op: &Operation, imports: &ImportMap, out: &mut String) {
+fn emit_operation_signature(
+    op: &Operation,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    out: &mut String,
+) {
     let name = snake_case(&op.name);
     let params = op
         .params
         .iter()
-        .map(|f: &Field| format!("{}: {}", snake_case(&f.name), rust_type(&f.ty, imports)))
+        .map(|f: &Field| {
+            format!(
+                "{}: {}",
+                snake_case(&f.name),
+                rust_type(&f.ty, imports, own_types)
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    let returns = rust_type(&op.returns, imports);
+    let returns = rust_type(&op.returns, imports, own_types);
     let sep = if op.params.is_empty() { "" } else { ", " };
     let _ = writeln!(
         out,
@@ -380,7 +461,7 @@ fn emit_operation_signature(op: &Operation, imports: &ImportMap, out: &mut Strin
     );
 }
 
-fn rust_type(ty: &TypeRef, imports: &ImportMap) -> String {
+fn rust_type(ty: &TypeRef, imports: &ImportMap, own_types: &OwnTypeMap) -> String {
     match ty {
         TypeRef::Primitive(p) => match p {
             Primitive::Bool => "bool".to_string(),
@@ -399,21 +480,21 @@ fn rust_type(ty: &TypeRef, imports: &ImportMap) -> String {
             Primitive::Uuid => "::uuid::Uuid".to_string(),
         },
         TypeRef::Named(name) => pascal_case(name),
-        TypeRef::Qualified { alias, name } => resolve_qualified(alias, name, imports),
-        TypeRef::Option(inner) => format!("Option<{}>", rust_type(inner, imports)),
-        TypeRef::List(inner) => format!("Vec<{}>", rust_type(inner, imports)),
+        TypeRef::Qualified { alias, name } => resolve_qualified(alias, name, imports, own_types),
+        TypeRef::Option(inner) => format!("Option<{}>", rust_type(inner, imports, own_types)),
+        TypeRef::List(inner) => format!("Vec<{}>", rust_type(inner, imports, own_types)),
         TypeRef::Map(key, value) => {
             format!(
                 "::std::collections::BTreeMap<{}, {}>",
-                rust_type(key, imports),
-                rust_type(value, imports)
+                rust_type(key, imports, own_types),
+                rust_type(value, imports, own_types)
             )
         }
         TypeRef::Result(ok, err) => {
             format!(
                 "::std::result::Result<{}, {}>",
-                rust_type(ok, imports),
-                rust_type(err, imports)
+                rust_type(ok, imports, own_types),
+                rust_type(err, imports, own_types)
             )
         }
         TypeRef::Unit => "()".to_string(),
@@ -434,12 +515,25 @@ fn serde_bytes_adapter(ty: &TypeRef) -> Option<&'static str> {
 }
 
 /// Resolve `alias.type-name` to a concrete Rust path by consulting the
-/// imports table. If the alias is unknown at codegen time we emit a
+/// imports table first, then same-schema interface names. If the alias
+/// is unknown at codegen time we emit a
 /// `::bmux_plugin_schema_unresolved::<alias>::<type>` path that will
 /// trigger an obvious compile error; normal validated schemas never hit
-/// this branch because the validator requires declared aliases.
-fn resolve_qualified(alias: &str, name: &str, imports: &ImportMap) -> String {
+/// this branch because the validator requires declared aliases or
+/// same-schema interfaces.
+fn resolve_qualified(
+    alias: &str,
+    name: &str,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+) -> String {
     let Some(info) = imports.get(alias) else {
+        if own_types
+            .get(alias)
+            .is_some_and(|types| types.contains(name))
+        {
+            return format!("super::{}::{}", snake_case(alias), pascal_case(name));
+        }
         return format!(
             "::bmux_plugin_schema_unresolved::{}::{}",
             snake_case(alias),
@@ -844,6 +938,19 @@ mod tests {
         assert!(
             rust.contains("::bmux_windows_plugin_api::windows_state::PaneState"),
             "qualified type should resolve to imported crate path; got: {rust}"
+        );
+    }
+
+    #[test]
+    fn emits_qualified_type_via_same_schema_interface() {
+        let src = "plugin p version 1;\n\
+                   interface shared-types { record shared-row { id: uuid } }\n\
+                   interface state { query row() -> shared-types.shared-row; }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            rust.contains("fn row<'a>(&'a self) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = super::shared_types::SharedRow> + Send + 'a>>;"),
+            "same-schema qualified type should resolve to sibling module path; got: {rust}"
         );
     }
 }

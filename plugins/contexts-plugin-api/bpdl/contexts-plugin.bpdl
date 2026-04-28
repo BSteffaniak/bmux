@@ -24,10 +24,6 @@ interface contexts-state {
 
     // Selector identifying a context. Exactly one of `id` or `name`
     // should be populated; `id` wins when both are set.
-    //
-    // Defined here and re-declared in `contexts-commands` because BPDL
-    // doesn't currently support cross-interface type references within
-    // the same plugin.
     record context-selector {
         id: uuid?,
         name: string?,
@@ -45,13 +41,6 @@ interface contexts-state {
 }
 
 interface contexts-commands {
-    // Selector identifying a context. Mirrors
-    // `contexts-state.context-selector` — see note there.
-    record context-selector {
-        id: uuid?,
-        name: string?,
-    }
-
     // Errors a `create-context` command can produce.
     //
     // Names are display hints, not identity: context creation does
@@ -94,9 +83,9 @@ interface contexts-commands {
 
     command create-context(name: string?, attributes: map<string, string>)
         -> result<context-ack, create-context-error>;
-    command select-context(selector: context-selector)
+    command select-context(selector: contexts-state.context-selector)
         -> result<context-ack, select-context-error>;
-    command close-context(selector: context-selector, force: bool)
+    command close-context(selector: contexts-state.context-selector, force: bool)
         -> result<context-ack, close-context-error>;
 }
 

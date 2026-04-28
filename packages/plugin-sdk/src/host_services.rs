@@ -2,7 +2,6 @@ use std::{cell::RefCell, collections::BTreeMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageGetRequest {
@@ -60,8 +59,8 @@ pub struct LogWriteRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingWriteEventRequest {
-    pub session_id: Option<Uuid>,
-    pub pane_id: Option<Uuid>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
     pub name: String,
     pub payload: Value,
 }

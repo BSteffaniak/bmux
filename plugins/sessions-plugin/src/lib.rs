@@ -35,7 +35,7 @@ use bmux_session_state::{
 };
 use bmux_sessions_plugin_api::sessions_commands::{
     self, KillSessionError, NewSessionError, ReconcileError, SelectSessionError, SessionAck,
-    SessionSelector as CommandSessionSelector, SessionsCommandsService,
+    SessionsCommandsService,
 };
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use bmux_sessions_plugin_api::sessions_state::{
@@ -737,7 +737,7 @@ impl SessionsCommandsService for SessionsCommandsHandle {
 
     fn kill_session<'a>(
         &'a self,
-        selector: CommandSessionSelector,
+        selector: StateSessionSelector,
         force_local: bool,
     ) -> Pin<Box<dyn Future<Output = std::result::Result<SessionAck, KillSessionError>> + Send + 'a>>
     {
@@ -752,7 +752,7 @@ impl SessionsCommandsService for SessionsCommandsHandle {
 
     fn select_session<'a>(
         &'a self,
-        selector: CommandSessionSelector,
+        selector: StateSessionSelector,
     ) -> Pin<
         Box<dyn Future<Output = std::result::Result<SessionAck, SelectSessionError>> + Send + 'a>,
     > {

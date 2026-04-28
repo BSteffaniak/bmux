@@ -188,8 +188,8 @@ pub trait HostRuntimeApi: ServiceCaller {
         use bmux_recording_plugin_api::{RecordingRequest, RecordingResponse};
 
         let recording_request = RecordingRequest::WriteCustomEvent {
-            session_id: request.session_id,
-            pane_id: request.pane_id,
+            session_id: recording_attribute_uuid(request, "bmux.session_id"),
+            pane_id: recording_attribute_uuid(request, "bmux.pane_id"),
             // `HostRuntimeApi` doesn't know which plugin is calling,
             // so we pass an empty source. The caller-side code that
             // needs source identity should dispatch directly via
@@ -217,3 +217,10 @@ pub trait HostRuntimeApi: ServiceCaller {
 }
 
 impl<T> HostRuntimeApi for T where T: ServiceCaller + ?Sized {}
+
+fn recording_attribute_uuid(request: &RecordingWriteEventRequest, key: &str) -> Option<uuid::Uuid> {
+    request
+        .attributes
+        .get(key)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+}

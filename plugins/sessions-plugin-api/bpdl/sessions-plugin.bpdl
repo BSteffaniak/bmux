@@ -25,11 +25,6 @@ interface sessions-state {
 
     // Selector identifying a session. Exactly one of `id` or `name`
     // should be populated; `id` wins when both are set.
-    //
-    // Defined here and re-declared in `sessions-commands` because BPDL
-    // doesn't currently support cross-interface type references within
-    // the same plugin. Both copies use identical field layout so a
-    // value serializes the same either way.
     record session-selector {
         id: uuid?,
         name: string?,
@@ -46,13 +41,6 @@ interface sessions-state {
 }
 
 interface sessions-commands {
-    // Selector identifying a session. Mirrors
-    // `sessions-state.session-selector` — see note there.
-    record session-selector {
-        id: uuid?,
-        name: string?,
-    }
-
     // Errors a `new-session` command can produce.
     //
     // Session names are display hints, not identity: session
@@ -89,9 +77,9 @@ interface sessions-commands {
     }
 
     command new-session(name: string?) -> result<session-ack, new-session-error>;
-    command kill-session(selector: session-selector, force-local: bool)
+    command kill-session(selector: sessions-state.session-selector, force-local: bool)
         -> result<session-ack, kill-session-error>;
-    command select-session(selector: session-selector)
+    command select-session(selector: sessions-state.session-selector)
         -> result<session-ack, select-session-error>;
 
     // Update which client is considered attached to which session. When

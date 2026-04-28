@@ -6,8 +6,8 @@
 //! - Variant/enum case names are unique within their parent.
 //! - Operation names (queries + commands) are unique within an interface.
 //! - All `Named` type references resolve to a declared type in the same
-//!   interface. Qualified (`alias.type`) references resolve against the
-//!   caller-provided imports table when present.
+//!   interface. Qualified (`alias.type`) references resolve against
+//!   declared imports or same-schema interface names.
 //! - `map<K, V>` keys are one of the allowed primitives.
 //! - `@default` is used at most once per enum or variant.
 //! - An interface declares at most one `events <type>`.
@@ -27,10 +27,10 @@ use crate::{
 
 /// Validate a parsed BPDL schema in isolation.
 ///
-/// Qualified type references (`alias.type`) are tolerated — their alias
-/// is checked against the schema's own `imports` list but the imported
-/// type is not resolved. Use [`validate_with_imports`] for full
-/// cross-schema validation at codegen time.
+/// Qualified type references (`alias.type`) are checked against the
+/// schema's own `imports` list or interface names, but imported types are
+/// not resolved. Use [`validate_with_imports`] for full cross-schema
+/// validation at codegen time.
 ///
 /// # Errors
 ///
@@ -43,8 +43,9 @@ pub fn validate(schema: &Schema) -> Result<(), Error> {
 ///
 /// `imports` maps this schema's import alias to the pre-parsed imported
 /// [`Schema`]. Qualified type references are fully resolved against that
-/// table; the alias must be declared via `import` in the schema under
-/// validation and the imported schema's `plugin <id>` must match the
+/// table when they use an import alias, or against this schema's
+/// interface names otherwise. Imported aliases must be declared via
+/// `import`, and the imported schema's `plugin <id>` must match the
 /// declared `plugin_id` in the `import` statement.
 ///
 /// # Errors
@@ -82,6 +83,7 @@ pub fn validate_with_imports(
     }
     let declared_aliases: BTreeSet<&str> =
         schema.imports.iter().map(|i| i.alias.as_str()).collect();
+    let schema_type_names = schema_type_names(schema);
 
     let mut capability_names: BTreeSet<&str> = BTreeSet::new();
     let mut capability_ids: BTreeSet<&str> = BTreeSet::new();
@@ -107,9 +109,31 @@ pub fn validate_with_imports(
     }
 
     for iface in &schema.interfaces {
-        validate_interface(iface, &declared_aliases, imports)?;
+        validate_interface(iface, &declared_aliases, imports, &schema_type_names)?;
     }
     Ok(())
+}
+
+fn schema_type_names(schema: &Schema) -> BTreeMap<String, BTreeSet<String>> {
+    schema
+        .interfaces
+        .iter()
+        .map(|iface| {
+            let names = iface
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    InterfaceItem::Record(r) => Some(r.name.clone()),
+                    InterfaceItem::Variant(v) => Some(v.name.clone()),
+                    InterfaceItem::Enum(e) => Some(e.name.clone()),
+                    InterfaceItem::Query(_)
+                    | InterfaceItem::Command(_)
+                    | InterfaceItem::Events(_) => None,
+                })
+                .collect();
+            (iface.name.clone(), names)
+        })
+        .collect()
 }
 
 fn is_rust_const_identifier(value: &str) -> bool {
@@ -127,9 +151,16 @@ fn validate_interface(
     iface: &Interface,
     declared_aliases: &BTreeSet<&str>,
     imports: &BTreeMap<String, Schema>,
+    schema_type_names: &BTreeMap<String, BTreeSet<String>>,
 ) -> Result<(), Error> {
     let type_names = collect_and_validate_names(iface)?;
-    resolve_type_references(iface, &type_names, declared_aliases, imports)?;
+    resolve_type_references(
+        iface,
+        &type_names,
+        declared_aliases,
+        imports,
+        schema_type_names,
+    )?;
     // Acyclic check on records and variants (compile-follows — `Option<T>`,
     // `list<T>`, and `map<_, T>` value break cycles).
     check_acyclic(iface)?;
@@ -239,25 +270,47 @@ fn resolve_type_references(
     type_names: &BTreeSet<String>,
     declared_aliases: &BTreeSet<&str>,
     imports: &BTreeMap<String, Schema>,
+    schema_type_names: &BTreeMap<String, BTreeSet<String>>,
 ) -> Result<(), Error> {
     for item in &iface.items {
         match item {
             InterfaceItem::Record(r) => {
                 for f in &r.fields {
-                    check_type(&f.ty, type_names, &iface.name, declared_aliases, imports)?;
+                    check_type(
+                        &f.ty,
+                        type_names,
+                        &iface.name,
+                        declared_aliases,
+                        imports,
+                        schema_type_names,
+                    )?;
                 }
             }
             InterfaceItem::Variant(v) => {
                 for c in &v.cases {
                     for f in &c.payload {
-                        check_type(&f.ty, type_names, &iface.name, declared_aliases, imports)?;
+                        check_type(
+                            &f.ty,
+                            type_names,
+                            &iface.name,
+                            declared_aliases,
+                            imports,
+                            schema_type_names,
+                        )?;
                     }
                 }
             }
             InterfaceItem::Enum(_) => {}
             InterfaceItem::Query(op) | InterfaceItem::Command(op) => {
                 for p in &op.params {
-                    check_type(&p.ty, type_names, &iface.name, declared_aliases, imports)?;
+                    check_type(
+                        &p.ty,
+                        type_names,
+                        &iface.name,
+                        declared_aliases,
+                        imports,
+                        schema_type_names,
+                    )?;
                 }
                 check_type(
                     &op.returns,
@@ -265,10 +318,18 @@ fn resolve_type_references(
                     &iface.name,
                     declared_aliases,
                     imports,
+                    schema_type_names,
                 )?;
             }
             InterfaceItem::Events(decl) => {
-                check_type(&decl.ty, type_names, &iface.name, declared_aliases, imports)?;
+                check_type(
+                    &decl.ty,
+                    type_names,
+                    &iface.name,
+                    declared_aliases,
+                    imports,
+                    schema_type_names,
+                )?;
             }
         }
     }
@@ -281,6 +342,7 @@ fn check_type(
     iface_name: &str,
     declared_aliases: &BTreeSet<&str>,
     imports: &BTreeMap<String, Schema>,
+    schema_type_names: &BTreeMap<String, BTreeSet<String>>,
 ) -> Result<(), Error> {
     match ty {
         TypeRef::Primitive(_) | TypeRef::Unit => Ok(()),
@@ -296,38 +358,83 @@ fn check_type(
             }
         }
         TypeRef::Qualified { alias, name } => {
-            if !declared_aliases.contains(alias.as_str()) {
+            if declared_aliases.contains(alias.as_str()) {
+                // If the caller supplied the resolved schema, confirm the
+                // type exists in one of its interfaces.
+                if let Some(imported) = imports.get(alias)
+                    && !imported_has_type(imported, name)
+                {
+                    return Err(Error::Validate {
+                        message: format!(
+                            "imported plugin `{}` (alias `{alias}`) has no type `{name}`",
+                            imported.plugin.plugin_id
+                        ),
+                    });
+                }
+                return Ok(());
+            }
+
+            if let Some(types) = schema_type_names.get(alias) {
+                if types.contains(name) {
+                    return Ok(());
+                }
                 return Err(Error::Validate {
                     message: format!(
-                        "unknown import alias `{alias}` referenced in interface `{iface_name}`"
+                        "interface `{alias}` referenced in interface `{iface_name}` has no type `{name}`"
                     ),
                 });
             }
-            // If the caller supplied the resolved schema, confirm the
-            // type exists in one of its interfaces.
-            if let Some(imported) = imports.get(alias)
-                && !imported_has_type(imported, name)
-            {
-                return Err(Error::Validate {
-                    message: format!(
-                        "imported plugin `{}` (alias `{alias}`) has no type `{name}`",
-                        imported.plugin.plugin_id
-                    ),
-                });
-            }
-            Ok(())
+
+            Err(Error::Validate {
+                message: format!(
+                    "unknown import alias or interface `{alias}` referenced in interface `{iface_name}`"
+                ),
+            })
         }
-        TypeRef::Option(inner) | TypeRef::List(inner) => {
-            check_type(inner, known, iface_name, declared_aliases, imports)
-        }
+        TypeRef::Option(inner) | TypeRef::List(inner) => check_type(
+            inner,
+            known,
+            iface_name,
+            declared_aliases,
+            imports,
+            schema_type_names,
+        ),
         TypeRef::Map(key, value) => {
             check_map_key(key, iface_name)?;
-            check_type(key, known, iface_name, declared_aliases, imports)?;
-            check_type(value, known, iface_name, declared_aliases, imports)
+            check_type(
+                key,
+                known,
+                iface_name,
+                declared_aliases,
+                imports,
+                schema_type_names,
+            )?;
+            check_type(
+                value,
+                known,
+                iface_name,
+                declared_aliases,
+                imports,
+                schema_type_names,
+            )
         }
         TypeRef::Result(a, b) => {
-            check_type(a, known, iface_name, declared_aliases, imports)?;
-            check_type(b, known, iface_name, declared_aliases, imports)
+            check_type(
+                a,
+                known,
+                iface_name,
+                declared_aliases,
+                imports,
+                schema_type_names,
+            )?;
+            check_type(
+                b,
+                known,
+                iface_name,
+                declared_aliases,
+                imports,
+                schema_type_names,
+            )
         }
     }
 }
@@ -661,6 +768,23 @@ mod tests {
                      query q() -> windows.pane-state;\n\
                    }";
         let _ = compile(src).expect("qualified ref with declared import is allowed");
+    }
+
+    #[test]
+    fn accepts_qualified_ref_to_same_schema_interface() {
+        let src = "plugin p version 1;\n\
+                   interface shared { record row { id: uuid } }\n\
+                   interface state { query q() -> shared.row; }";
+        let _ = compile(src).expect("qualified ref to same-schema interface is allowed");
+    }
+
+    #[test]
+    fn rejects_unknown_type_in_same_schema_interface_ref() {
+        let src = "plugin p version 1;\n\
+                   interface shared { record row { id: uuid } }\n\
+                   interface state { query q() -> shared.missing; }";
+        let err = compile(src).unwrap_err();
+        assert!(matches!(err, Error::Validate { .. }));
     }
 
     #[test]

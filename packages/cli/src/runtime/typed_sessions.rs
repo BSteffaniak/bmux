@@ -15,16 +15,15 @@ use bmux_ipc::InvokeServiceKind;
 use bmux_plugin_sdk::{CapabilityId, InterfaceId};
 use bmux_sessions_plugin_api::{
     capabilities::{SESSIONS_READ, SESSIONS_WRITE},
-    sessions_commands::{
-        self, KillSessionError, NewSessionError, SelectSessionError, SessionAck,
-        SessionSelector as CommandSessionSelector,
-    },
+    sessions_commands::{self, KillSessionError, NewSessionError, SelectSessionError, SessionAck},
     sessions_state::{self, SessionSelector as StateSessionSelector, SessionSummary},
 };
 use serde::Serialize;
 use uuid::Uuid;
 
 use super::typed_service::{InvokeError, invoke_with};
+
+type CommandSessionSelector = StateSessionSelector;
 
 /// Capability guarding the sessions plugin's mutating command surface.
 pub const SESSIONS_WRITE_CAPABILITY: CapabilityId = SESSIONS_WRITE;

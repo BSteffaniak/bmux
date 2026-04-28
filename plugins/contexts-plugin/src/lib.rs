@@ -20,8 +20,8 @@ use bmux_context_state::{
     RuntimeContext,
 };
 use bmux_contexts_plugin_api::contexts_commands::{
-    self, CloseContextError, ContextAck, ContextSelector as CommandContextSelector,
-    ContextsCommandsService, CreateContextError, SelectContextError,
+    self, CloseContextError, ContextAck, ContextsCommandsService, CreateContextError,
+    SelectContextError,
 };
 use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
 use bmux_contexts_plugin_api::contexts_state::{
@@ -930,9 +930,8 @@ fn kill_session_via_sessions_plugin(
     caller: &impl ServiceCaller,
     session_id: SessionId,
 ) -> Result<(), String> {
-    use bmux_sessions_plugin_api::sessions_commands::{
-        self, KillSessionError, SessionAck, SessionSelector,
-    };
+    use bmux_sessions_plugin_api::sessions_commands::{self, KillSessionError, SessionAck};
+    use bmux_sessions_plugin_api::sessions_state::SessionSelector;
 
     #[derive(Serialize)]
     struct KillSessionArgs {
@@ -969,9 +968,8 @@ fn select_session_via_sessions_plugin(
     caller: &impl ServiceCaller,
     session_id: SessionId,
 ) -> Result<(), String> {
-    use bmux_sessions_plugin_api::sessions_commands::{
-        self, SelectSessionError, SessionAck, SessionSelector,
-    };
+    use bmux_sessions_plugin_api::sessions_commands::{self, SelectSessionError, SessionAck};
+    use bmux_sessions_plugin_api::sessions_state::SessionSelector;
 
     #[derive(Serialize)]
     struct SelectSessionArgs {
@@ -1077,7 +1075,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
 
     fn select_context<'a>(
         &'a self,
-        selector: CommandContextSelector,
+        selector: StateContextSelector,
     ) -> Pin<
         Box<dyn Future<Output = std::result::Result<ContextAck, SelectContextError>> + Send + 'a>,
     > {
@@ -1092,7 +1090,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
 
     fn close_context<'a>(
         &'a self,
-        selector: CommandContextSelector,
+        selector: StateContextSelector,
         force: bool,
     ) -> Pin<Box<dyn Future<Output = std::result::Result<ContextAck, CloseContextError>> + Send + 'a>>
     {
