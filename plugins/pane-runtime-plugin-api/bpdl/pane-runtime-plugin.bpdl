@@ -116,7 +116,8 @@ interface pane-runtime-commands {
     command resize-pane(
         session_id: uuid,
         target: uuid?,
-        delta_percent: i8,    // signed: negative shrinks, positive grows
+        direction: string,    // "left" | "right" | "up" | "down"
+        cells: u16,
     ) -> result<session-ack, pane-command-error>;
 
     command close-pane(
