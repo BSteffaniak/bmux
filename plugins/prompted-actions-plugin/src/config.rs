@@ -188,6 +188,11 @@ pub fn format_prompt_value(_field: &PromptField, value: &bmux_plugin_sdk::Prompt
         PromptValue::Text(s) | PromptValue::Single(s) => s.clone(),
         PromptValue::Confirm(b) => b.to_string(),
         PromptValue::Multi(items) => items.join(","),
+        PromptValue::Form(values) => values
+            .iter()
+            .map(|(key, value)| format!("{key}={value:?}"))
+            .collect::<Vec<_>>()
+            .join(","),
     }
 }
 

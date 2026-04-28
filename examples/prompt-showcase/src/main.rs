@@ -222,6 +222,7 @@ fn format_prompt_line(label: &str, response: &PromptResponse) -> String {
         PromptResponse::Submitted(PromptValue::Multi(values)) => {
             format!("multi={}", values.join(", "))
         }
+        PromptResponse::Submitted(PromptValue::Form(values)) => format!("form={}", values.len()),
         PromptResponse::Cancelled => "cancelled".to_string(),
         PromptResponse::RejectedBusy => "rejected_busy".to_string(),
     };

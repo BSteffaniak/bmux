@@ -16,8 +16,9 @@ use std::sync::{Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 
 pub use bmux_plugin_sdk::prompt::{
-    PromptEvent, PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
-    PromptValidation, PromptValue, PromptWidth,
+    PromptEvent, PromptField, PromptFormField, PromptFormFieldKind, PromptFormSection,
+    PromptFormValue, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValidation,
+    PromptValue, PromptWidth,
 };
 
 // ── Host request envelope ────────────────────────────────────────────────────

@@ -14,10 +14,11 @@
 #![allow(clippy::module_name_repetitions)]
 
 use bmux_performance_plugin_api::{
-    CpuPercentMode, EVENT_KIND, METRIC_EVENT_KIND, METRICS_STATE_KIND, MetricEvent, MetricTarget,
-    MetricWatch, MetricsSnapshot, PERFORMANCE_COMMANDS_INTERFACE, PERFORMANCE_READ,
-    PERFORMANCE_WRITE, PaneMetricsSnapshot, PerformanceEvent, PerformanceRequest,
-    PerformanceResponse, ProcessMetricsSnapshot, SystemMetricsSnapshot,
+    CpuPercentMode, EVENT_KIND, METRIC_EVENT_KIND, METRICS_STATE_KIND, MetricAccuracy,
+    MetricCapability, MetricEvent, MetricTarget, MetricTargetKind, MetricWatch, MetricsSnapshot,
+    PERFORMANCE_COMMANDS_INTERFACE, PERFORMANCE_READ, PERFORMANCE_WRITE, PaneMetricsSnapshot,
+    PerformanceEvent, PerformanceRequest, PerformanceResponse, ProcessMetricsSnapshot,
+    SystemMetricsSnapshot, ThemeHeaderMetric, ThemeHeaderSettings,
 };
 use bmux_performance_state::{PerformanceCaptureSettings, PerformanceSettingsHandle};
 use bmux_plugin::{global_event_bus, global_plugin_state_registry};
@@ -35,6 +36,7 @@ const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 struct MetricsState {
     watches: BTreeMap<String, MetricWatch>,
     snapshot: MetricsSnapshot,
+    theme_header_settings: ThemeHeaderSettings,
     worker_started: bool,
 }
 
@@ -48,6 +50,7 @@ impl Default for MetricsState {
                 watches: vec![watch],
                 ..MetricsSnapshot::default()
             },
+            theme_header_settings: ThemeHeaderSettings::default(),
             worker_started: false,
         }
     }
@@ -116,6 +119,21 @@ impl RustPlugin for PerformancePlugin {
             "performance-commands", "get-snapshot" => |_req: (), _ctx| {
                 Ok::<PerformanceResponse, ServiceResponse>(handle_request(PerformanceRequest::GetSnapshot))
             },
+            "performance-commands", "get-metric-capabilities" => |_req: (), _ctx| {
+                Ok::<PerformanceResponse, ServiceResponse>(handle_request(PerformanceRequest::GetMetricCapabilities))
+            },
+            "performance-commands", "get-theme-header-settings" => |_req: (), _ctx| {
+                Ok::<PerformanceResponse, ServiceResponse>(handle_request(PerformanceRequest::GetThemeHeaderSettings))
+            },
+            "performance-commands", "set-theme-header-settings" => |settings: ThemeHeaderSettings, _ctx| {
+                Ok::<PerformanceResponse, ServiceResponse>(handle_request(PerformanceRequest::SetThemeHeaderSettings { settings }))
+            },
+            "performance-commands", "build-theme-header-settings-form" => |_req: (), _ctx| {
+                Ok::<PerformanceResponse, ServiceResponse>(handle_request(PerformanceRequest::BuildThemeHeaderSettingsForm))
+            },
+            "performance-commands", "apply-theme-header-settings-form" => |values: BTreeMap<String, bmux_plugin_sdk::PromptFormValue>, _ctx| {
+                Ok::<PerformanceResponse, ServiceResponse>(handle_request(PerformanceRequest::ApplyThemeHeaderSettingsForm { values }))
+            },
         })
     }
 
@@ -142,6 +160,17 @@ fn handle_request(req: PerformanceRequest) -> PerformanceResponse {
         PerformanceRequest::StartWatch { watch } => handle_start_watch(watch),
         PerformanceRequest::StopWatch { watch_id } => handle_stop_watch(&watch_id),
         PerformanceRequest::GetSnapshot => handle_get_snapshot(),
+        PerformanceRequest::GetMetricCapabilities => handle_get_metric_capabilities(),
+        PerformanceRequest::GetThemeHeaderSettings => handle_get_theme_header_settings(),
+        PerformanceRequest::SetThemeHeaderSettings { settings } => {
+            handle_set_theme_header_settings(settings)
+        }
+        PerformanceRequest::BuildThemeHeaderSettingsForm => {
+            handle_build_theme_header_settings_form()
+        }
+        PerformanceRequest::ApplyThemeHeaderSettingsForm { values } => {
+            handle_apply_theme_header_settings_form(&values)
+        }
     }
 }
 
@@ -180,6 +209,297 @@ fn handle_get_snapshot() -> PerformanceResponse {
         |state| state.snapshot.clone(),
     );
     PerformanceResponse::Snapshot { snapshot }
+}
+
+fn handle_get_metric_capabilities() -> PerformanceResponse {
+    PerformanceResponse::MetricCapabilities {
+        capabilities: metric_capabilities(),
+    }
+}
+
+fn handle_get_theme_header_settings() -> PerformanceResponse {
+    let settings = metrics_state().lock().map_or_else(
+        |_| ThemeHeaderSettings::default(),
+        |state| state.theme_header_settings.clone(),
+    );
+    PerformanceResponse::ThemeHeaderSettings { settings }
+}
+
+fn handle_set_theme_header_settings(settings: ThemeHeaderSettings) -> PerformanceResponse {
+    let normalized = normalize_theme_header_settings(settings);
+    if let Ok(mut state) = metrics_state().lock() {
+        state.theme_header_settings = normalized.clone();
+        let watch = watch_from_theme_header_settings(&normalized);
+        state.watches.insert(watch.id.clone(), watch);
+        state.snapshot.watches = state.watches.values().cloned().collect();
+    }
+    ensure_metrics_worker();
+    PerformanceResponse::ThemeHeaderSettings {
+        settings: normalized,
+    }
+}
+
+fn handle_build_theme_header_settings_form() -> PerformanceResponse {
+    let settings = metrics_state().lock().map_or_else(
+        |_| ThemeHeaderSettings::default(),
+        |state| state.theme_header_settings.clone(),
+    );
+    PerformanceResponse::PromptForm {
+        request: theme_header_settings_form(&settings),
+    }
+}
+
+fn handle_apply_theme_header_settings_form(
+    values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
+) -> PerformanceResponse {
+    handle_set_theme_header_settings(settings_from_form_values(values))
+}
+
+fn metric_capabilities() -> Vec<MetricCapability> {
+    use ThemeHeaderMetric::{Cpu, DiskRead, DiskWrite, Memory, NetworkRx, NetworkTx, ProcessCount};
+    [
+        (Cpu, true, None),
+        (Memory, true, None),
+        (ProcessCount, true, None),
+        (
+            DiskRead,
+            false,
+            Some("pane disk throughput is not available with reliable per-pane attribution yet"),
+        ),
+        (
+            DiskWrite,
+            false,
+            Some("pane disk throughput is not available with reliable per-pane attribution yet"),
+        ),
+        (
+            NetworkRx,
+            false,
+            Some("pane network throughput is not available with reliable per-pane attribution yet"),
+        ),
+        (
+            NetworkTx,
+            false,
+            Some("pane network throughput is not available with reliable per-pane attribution yet"),
+        ),
+    ]
+    .into_iter()
+    .map(|(metric, supported, reason)| MetricCapability {
+        metric,
+        target: MetricTargetKind::Pane,
+        supported,
+        disabled_reason: reason.map(str::to_string),
+        accuracy: supported.then_some(MetricAccuracy::Estimated),
+    })
+    .collect()
+}
+
+fn normalize_theme_header_settings(mut settings: ThemeHeaderSettings) -> ThemeHeaderSettings {
+    settings.sample_interval_ms = settings.sample_interval_ms.max(500);
+    let supported = metric_capabilities()
+        .into_iter()
+        .filter(|capability| capability.supported)
+        .map(|capability| capability.metric)
+        .collect::<BTreeSet<_>>();
+    settings.metrics.retain(|metric| supported.contains(metric));
+    if settings.metrics.is_empty() {
+        settings.metrics = ThemeHeaderSettings::default().metrics;
+    }
+    settings
+}
+
+fn watch_from_theme_header_settings(settings: &ThemeHeaderSettings) -> MetricWatch {
+    MetricWatch {
+        id: "theme-header".to_string(),
+        target: MetricTarget::System,
+        metrics: settings
+            .metrics
+            .iter()
+            .map(|metric| match metric {
+                ThemeHeaderMetric::Cpu => bmux_performance_plugin_api::MetricName::CpuPercent,
+                ThemeHeaderMetric::Memory => bmux_performance_plugin_api::MetricName::MemoryBytes,
+                ThemeHeaderMetric::ProcessCount => {
+                    bmux_performance_plugin_api::MetricName::ProcessCount
+                }
+                ThemeHeaderMetric::DiskRead => {
+                    bmux_performance_plugin_api::MetricName::DiskReadBytesPerSec
+                }
+                ThemeHeaderMetric::DiskWrite => {
+                    bmux_performance_plugin_api::MetricName::DiskWriteBytesPerSec
+                }
+                ThemeHeaderMetric::NetworkRx => {
+                    bmux_performance_plugin_api::MetricName::NetworkRxBytesPerSec
+                }
+                ThemeHeaderMetric::NetworkTx => {
+                    bmux_performance_plugin_api::MetricName::NetworkTxBytesPerSec
+                }
+            })
+            .collect(),
+        interval_ms: settings.sample_interval_ms,
+        cpu_percent_mode: settings.cpu_percent_mode,
+    }
+    .normalized()
+}
+
+fn theme_header_settings_form(settings: &ThemeHeaderSettings) -> bmux_plugin_sdk::PromptRequest {
+    let capabilities = metric_capabilities();
+    let supported = capabilities
+        .iter()
+        .filter(|capability| capability.supported)
+        .collect::<Vec<_>>();
+    let metric_options = supported
+        .iter()
+        .map(|capability| {
+            bmux_plugin_sdk::PromptOption::new(
+                metric_form_value(capability.metric),
+                metric_label(capability.metric),
+            )
+        })
+        .collect::<Vec<_>>();
+    let default_indices = metric_options
+        .iter()
+        .enumerate()
+        .filter_map(|(index, option)| {
+            settings
+                .metrics
+                .iter()
+                .any(|metric| metric_form_value(*metric) == option.value)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    let mut fields = vec![
+        bmux_plugin_sdk::PromptFormField::new(
+            "enabled",
+            "Enabled",
+            bmux_plugin_sdk::PromptFormFieldKind::Bool {
+                default: settings.enabled,
+            },
+        ),
+        bmux_plugin_sdk::PromptFormField::new(
+            "metrics",
+            "Metrics",
+            bmux_plugin_sdk::PromptFormFieldKind::MultiToggle {
+                options: metric_options,
+                default_indices,
+                min_selected: 1,
+            },
+        ),
+        bmux_plugin_sdk::PromptFormField::new(
+            "cpu_percent_mode",
+            "CPU mode",
+            bmux_plugin_sdk::PromptFormFieldKind::SingleSelect {
+                options: vec![
+                    bmux_plugin_sdk::PromptOption::new("normalized", "Normalized 0-100"),
+                    bmux_plugin_sdk::PromptOption::new("raw_core_sum", "Raw core sum"),
+                ],
+                default_index: usize::from(settings.cpu_percent_mode == CpuPercentMode::RawCoreSum),
+            },
+        ),
+        bmux_plugin_sdk::PromptFormField::new(
+            "sample_interval_ms",
+            "Sample interval ms",
+            bmux_plugin_sdk::PromptFormFieldKind::Integer {
+                initial_value: i64::try_from(settings.sample_interval_ms).unwrap_or(1_000),
+                min: Some(500),
+                max: Some(60_000),
+            },
+        ),
+    ];
+    for capability in capabilities
+        .iter()
+        .filter(|capability| !capability.supported)
+    {
+        fields.push(
+            bmux_plugin_sdk::PromptFormField::new(
+                format!("unsupported_{}", metric_form_value(capability.metric)),
+                metric_label(capability.metric),
+                bmux_plugin_sdk::PromptFormFieldKind::Bool { default: false },
+            )
+            .disabled(
+                capability
+                    .disabled_reason
+                    .clone()
+                    .unwrap_or_else(|| "not supported on this platform".to_string()),
+            ),
+        );
+    }
+
+    bmux_plugin_sdk::PromptRequest::form(
+        "Performance Header Settings",
+        vec![bmux_plugin_sdk::PromptFormSection::new(
+            "performance-header",
+            "Performance Header",
+            fields,
+        )],
+    )
+    .owner_plugin_id("bmux.performance")
+    .modal_id("theme-header-settings")
+    .width_range(56, 100)
+}
+
+fn settings_from_form_values(
+    values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
+) -> ThemeHeaderSettings {
+    let mut settings = ThemeHeaderSettings::default();
+    if let Some(bmux_plugin_sdk::PromptFormValue::Bool(value)) = values.get("enabled") {
+        settings.enabled = *value;
+    }
+    if let Some(bmux_plugin_sdk::PromptFormValue::Multi(metrics)) = values.get("metrics") {
+        settings.metrics = metrics
+            .iter()
+            .filter_map(|value| metric_from_form_value(value))
+            .collect();
+    }
+    if let Some(bmux_plugin_sdk::PromptFormValue::Single(value)) = values.get("cpu_percent_mode") {
+        settings.cpu_percent_mode = if value == "raw_core_sum" {
+            CpuPercentMode::RawCoreSum
+        } else {
+            CpuPercentMode::Normalized
+        };
+    }
+    if let Some(bmux_plugin_sdk::PromptFormValue::Integer(value)) = values.get("sample_interval_ms")
+        && let Ok(value) = u64::try_from(*value)
+    {
+        settings.sample_interval_ms = value;
+    }
+    normalize_theme_header_settings(settings)
+}
+
+fn metric_form_value(metric: ThemeHeaderMetric) -> &'static str {
+    match metric {
+        ThemeHeaderMetric::Cpu => "cpu",
+        ThemeHeaderMetric::Memory => "memory",
+        ThemeHeaderMetric::ProcessCount => "process_count",
+        ThemeHeaderMetric::DiskRead => "disk_read",
+        ThemeHeaderMetric::DiskWrite => "disk_write",
+        ThemeHeaderMetric::NetworkRx => "network_rx",
+        ThemeHeaderMetric::NetworkTx => "network_tx",
+    }
+}
+
+fn metric_label(metric: ThemeHeaderMetric) -> &'static str {
+    match metric {
+        ThemeHeaderMetric::Cpu => "CPU",
+        ThemeHeaderMetric::Memory => "Memory",
+        ThemeHeaderMetric::ProcessCount => "Process count",
+        ThemeHeaderMetric::DiskRead => "Disk read",
+        ThemeHeaderMetric::DiskWrite => "Disk write",
+        ThemeHeaderMetric::NetworkRx => "Network receive",
+        ThemeHeaderMetric::NetworkTx => "Network transmit",
+    }
+}
+
+fn metric_from_form_value(value: &str) -> Option<ThemeHeaderMetric> {
+    match value {
+        "cpu" => Some(ThemeHeaderMetric::Cpu),
+        "memory" => Some(ThemeHeaderMetric::Memory),
+        "process_count" => Some(ThemeHeaderMetric::ProcessCount),
+        "disk_read" => Some(ThemeHeaderMetric::DiskRead),
+        "disk_write" => Some(ThemeHeaderMetric::DiskWrite),
+        "network_rx" => Some(ThemeHeaderMetric::NetworkRx),
+        "network_tx" => Some(ThemeHeaderMetric::NetworkTx),
+        _ => None,
+    }
 }
 
 fn handle_get_settings() -> PerformanceResponse {

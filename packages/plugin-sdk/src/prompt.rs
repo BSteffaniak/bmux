@@ -7,6 +7,7 @@
 //! construct prompts without depending on the full CLI crate.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Prompt policy & layout ───────────────────────────────────────────────────
@@ -173,6 +174,120 @@ pub enum PromptField {
         default_indices: Vec<usize>,
         min_selected: usize,
     },
+    /// Multi-field settings form. This is intentionally generic so plugins can
+    /// use it for advanced configuration without the prompt host knowing the
+    /// plugin domain.
+    Form {
+        sections: Vec<PromptFormSection>,
+        live_preview: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptFormSection {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub fields: Vec<PromptFormField>,
+}
+
+impl PromptFormSection {
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        fields: Vec<PromptFormField>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            description: None,
+            fields,
+        }
+    }
+
+    #[must_use]
+    pub fn description(mut self, value: impl Into<String>) -> Self {
+        self.description = Some(value.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptFormField {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub disabled: bool,
+    pub disabled_reason: Option<String>,
+    pub required: bool,
+    pub kind: PromptFormFieldKind,
+}
+
+impl PromptFormField {
+    #[must_use]
+    pub fn new(id: impl Into<String>, label: impl Into<String>, kind: PromptFormFieldKind) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            description: None,
+            disabled: false,
+            disabled_reason: None,
+            required: false,
+            kind,
+        }
+    }
+
+    #[must_use]
+    pub fn description(mut self, value: impl Into<String>) -> Self {
+        self.description = Some(value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn disabled(mut self, reason: impl Into<String>) -> Self {
+        self.disabled = true;
+        self.disabled_reason = Some(reason.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn required(mut self, required: bool) -> Self {
+        self.required = required;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptFormFieldKind {
+    Bool {
+        default: bool,
+    },
+    Text {
+        initial_value: String,
+        placeholder: Option<String>,
+        validation: Option<PromptValidation>,
+    },
+    Integer {
+        initial_value: i64,
+        min: Option<i64>,
+        max: Option<i64>,
+    },
+    Number {
+        initial_value: String,
+        min: Option<String>,
+        max: Option<String>,
+    },
+    SingleSelect {
+        options: Vec<PromptOption>,
+        default_index: usize,
+    },
+    MultiToggle {
+        options: Vec<PromptOption>,
+        default_indices: Vec<usize>,
+        min_selected: usize,
+    },
 }
 
 // ── Prompt request ───────────────────────────────────────────────────────────
@@ -191,6 +306,8 @@ fn next_prompt_id() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptRequest {
     pub id: u64,
+    pub owner_plugin_id: Option<String>,
+    pub modal_id: Option<String>,
     pub title: String,
     pub message: Option<String>,
     pub submit_label: String,
@@ -208,6 +325,8 @@ impl PromptRequest {
     pub fn confirm(title: impl Into<String>) -> Self {
         Self {
             id: next_prompt_id(),
+            owner_plugin_id: None,
+            modal_id: None,
             title: title.into(),
             message: None,
             submit_label: "Submit".to_string(),
@@ -227,6 +346,8 @@ impl PromptRequest {
     pub fn text_input(title: impl Into<String>) -> Self {
         Self {
             id: next_prompt_id(),
+            owner_plugin_id: None,
+            modal_id: None,
             title: title.into(),
             message: None,
             submit_label: "Submit".to_string(),
@@ -247,6 +368,8 @@ impl PromptRequest {
     pub fn single_select(title: impl Into<String>, options: Vec<PromptOption>) -> Self {
         Self {
             id: next_prompt_id(),
+            owner_plugin_id: None,
+            modal_id: None,
             title: title.into(),
             message: None,
             submit_label: "Select".to_string(),
@@ -266,6 +389,8 @@ impl PromptRequest {
     pub fn multi_toggle(title: impl Into<String>, options: Vec<PromptOption>) -> Self {
         Self {
             id: next_prompt_id(),
+            owner_plugin_id: None,
+            modal_id: None,
             title: title.into(),
             message: None,
             submit_label: "Apply".to_string(),
@@ -277,6 +402,26 @@ impl PromptRequest {
                 options,
                 default_indices: Vec::new(),
                 min_selected: 0,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn form(title: impl Into<String>, sections: Vec<PromptFormSection>) -> Self {
+        Self {
+            id: next_prompt_id(),
+            owner_plugin_id: None,
+            modal_id: None,
+            title: title.into(),
+            message: None,
+            submit_label: "Apply".to_string(),
+            cancel_label: "Cancel".to_string(),
+            esc_cancels: true,
+            policy: PromptPolicy::Enqueue,
+            width: PromptWidth::default(),
+            field: PromptField::Form {
+                sections,
+                live_preview: false,
             },
         }
     }
@@ -321,6 +466,18 @@ impl PromptRequest {
             PromptWidth { min: max, max: min }
         };
         self.width = normalized;
+        self
+    }
+
+    #[must_use]
+    pub fn owner_plugin_id(mut self, value: impl Into<String>) -> Self {
+        self.owner_plugin_id = Some(value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn modal_id(mut self, value: impl Into<String>) -> Self {
+        self.modal_id = Some(value.into());
         self
     }
 
@@ -431,6 +588,14 @@ impl PromptRequest {
         }
         self
     }
+
+    #[must_use]
+    pub const fn form_live_preview(mut self, enabled: bool) -> Self {
+        if let PromptField::Form { live_preview, .. } = &mut self.field {
+            *live_preview = enabled;
+        }
+        self
+    }
 }
 
 // ── Response types ───────────────────────────────────────────────────────────
@@ -440,6 +605,18 @@ impl PromptRequest {
 pub enum PromptValue {
     Confirm(bool),
     Text(String),
+    Single(String),
+    Multi(Vec<String>),
+    Form(BTreeMap<String, PromptFormValue>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum PromptFormValue {
+    Bool(bool),
+    Text(String),
+    Integer(i64),
+    Number(String),
     Single(String),
     Multi(Vec<String>),
 }
@@ -458,7 +635,15 @@ pub enum PromptResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PromptEvent {
-    SelectionChanged { index: usize, value: String },
+    SelectionChanged {
+        index: usize,
+        value: String,
+    },
+    FormChanged {
+        field_id: String,
+        value: PromptFormValue,
+        values: BTreeMap<String, PromptFormValue>,
+    },
 }
 
 impl PromptResponse {

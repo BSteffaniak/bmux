@@ -9,6 +9,7 @@ use bmux_appearance::{
     RuntimeContentEffectPatch, RuntimeContentEffectScope, RuntimeStatusAppearancePatch,
 };
 use bmux_ipc::Request as IpcRequest;
+use bmux_performance_plugin_api::{PERFORMANCE_READ, PERFORMANCE_WRITE, PerformanceResponse};
 use bmux_plugin::prompt;
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
@@ -306,6 +307,13 @@ fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
         &all_plugin_ids,
         &context.connection.config_dir_candidates,
     );
+    if active
+        .stack
+        .iter()
+        .any(|name| name == "performance" || name == "cpu-heat")
+    {
+        apply_persisted_performance_theme_settings(context);
+    }
 }
 
 fn active_runtime_appearance(
@@ -448,6 +456,9 @@ async fn run_theme_picker(context: NativeCommandContext) {
         ) {
             persist_theme_name(&context, &name);
         }
+        if name == "performance" || name == "cpu-heat" {
+            configure_performance_theme_header(&context, settings.persistence).await;
+        }
         debug!(theme = %name, "theme selected");
         return;
     }
@@ -458,6 +469,88 @@ async fn run_theme_picker(context: NativeCommandContext) {
         &original_theme,
         &all_plugin_ids,
         &context.connection.config_dir_candidates,
+    );
+}
+
+async fn configure_performance_theme_header(
+    context: &NativeCommandContext,
+    persistence: ThemePersistence,
+) {
+    let Ok(response) = context.call_service::<(), PerformanceResponse>(
+        PERFORMANCE_READ.as_str(),
+        ServiceKind::Query,
+        "performance-commands",
+        "build-theme-header-settings-form",
+        &(),
+    ) else {
+        return;
+    };
+    let PerformanceResponse::PromptForm { request } = response else {
+        return;
+    };
+    let request = request
+        .owner_plugin_id("bmux.theme")
+        .modal_id("performance-advanced-settings")
+        .policy(bmux_plugin_sdk::PromptPolicy::RejectIfBusy);
+    let Ok(response) = prompt::request(request).await else {
+        return;
+    };
+    let PromptResponse::Submitted(PromptValue::Form(values)) = response else {
+        return;
+    };
+    let Ok(PerformanceResponse::ThemeHeaderSettings { settings }) = context
+        .call_service::<_, PerformanceResponse>(
+            PERFORMANCE_WRITE.as_str(),
+            ServiceKind::Command,
+            "performance-commands",
+            "apply-theme-header-settings-form",
+            &values,
+        )
+    else {
+        return;
+    };
+    if matches!(persistence, ThemePersistence::PersistBetweenConnects) {
+        persist_performance_theme_settings(context, &settings);
+    }
+}
+
+fn persist_performance_theme_settings(
+    context: &impl ServiceCaller,
+    settings: &bmux_performance_plugin_api::ThemeHeaderSettings,
+) {
+    let Ok(value) = serde_json::to_vec(settings) else {
+        return;
+    };
+    let request = StorageSetRequest {
+        key: "theme_settings:performance".to_string(),
+        value,
+    };
+    if let Err(error) = context.storage_set(&request) {
+        warn!(%error, "failed persisting performance theme settings");
+    }
+}
+
+fn apply_persisted_performance_theme_settings(context: &impl ServiceCaller) {
+    let request = StorageGetRequest {
+        key: "theme_settings:performance".to_string(),
+    };
+    let Ok(response) = context.storage_get(&request) else {
+        return;
+    };
+    let Some(value) = response.value else {
+        return;
+    };
+    let Ok(settings) =
+        serde_json::from_slice::<bmux_performance_plugin_api::ThemeHeaderSettings>(&value)
+    else {
+        return;
+    };
+    let _ = context.call_service::<_, PerformanceResponse>(
+        PERFORMANCE_WRITE.as_str(),
+        ServiceKind::Command,
+        "performance-commands",
+        "set-theme-header-settings",
+        &settings,
     );
 }
 
@@ -705,6 +798,10 @@ const fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
         (
             "rainbow-snake",
             include_str!("../assets/themes/rainbow-snake.toml"),
+        ),
+        (
+            "performance",
+            include_str!("../assets/themes/performance.toml"),
         ),
         ("cpu-heat", include_str!("../assets/themes/cpu-heat.toml")),
         (

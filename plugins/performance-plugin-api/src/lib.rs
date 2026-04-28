@@ -14,7 +14,7 @@ pub mod typed_client;
 
 use bmux_ipc::PerformanceRuntimeSettings;
 use bmux_performance_state::PerformanceCaptureSettings;
-use bmux_plugin_sdk::{CapabilityId, InterfaceId, PluginEventKind};
+use bmux_plugin_sdk::{CapabilityId, InterfaceId, PluginEventKind, PromptRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -208,6 +208,18 @@ pub enum PerformanceRequest {
     StopWatch { watch_id: String },
     /// Return the latest sampled metrics snapshot, if one exists.
     GetSnapshot,
+    /// Return metric availability for theme/header configuration UIs.
+    GetMetricCapabilities,
+    /// Return current performance theme-header settings.
+    GetThemeHeaderSettings,
+    /// Replace current performance theme-header settings.
+    SetThemeHeaderSettings { settings: ThemeHeaderSettings },
+    /// Return a generic prompt form for editing theme-header settings.
+    BuildThemeHeaderSettingsForm,
+    /// Apply a generic prompt form response to theme-header settings.
+    ApplyThemeHeaderSettingsForm {
+        values: BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
+    },
 }
 
 /// Typed response variants for the performance plugin's typed service
@@ -224,6 +236,15 @@ pub enum PerformanceResponse {
     },
     Snapshot {
         snapshot: MetricsSnapshot,
+    },
+    MetricCapabilities {
+        capabilities: Vec<MetricCapability>,
+    },
+    ThemeHeaderSettings {
+        settings: ThemeHeaderSettings,
+    },
+    PromptForm {
+        request: PromptRequest,
     },
     Ack,
 }
@@ -247,6 +268,46 @@ pub enum MetricName {
     CpuPercent,
     MemoryBytes,
     ProcessCount,
+    DiskReadBytesPerSec,
+    DiskWriteBytesPerSec,
+    NetworkRxBytesPerSec,
+    NetworkTxBytesPerSec,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeHeaderMetric {
+    Cpu,
+    Memory,
+    ProcessCount,
+    DiskRead,
+    DiskWrite,
+    NetworkRx,
+    NetworkTx,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricTargetKind {
+    System,
+    Process,
+    Pane,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricAccuracy {
+    Exact,
+    Estimated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricCapability {
+    pub metric: ThemeHeaderMetric,
+    pub target: MetricTargetKind,
+    pub supported: bool,
+    pub disabled_reason: Option<String>,
+    pub accuracy: Option<MetricAccuracy>,
 }
 
 /// How `cpu_percent` should be presented in consumer-facing snapshots.
@@ -258,6 +319,51 @@ pub enum CpuPercentMode {
     Normalized,
     /// Preserve process-tree core-sum semantics where one full core is 100%.
     RawCoreSum,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeHeaderScope {
+    #[default]
+    Pane,
+    System,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeHeaderStyle {
+    #[default]
+    Compact,
+    Detailed,
+    HeatOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThemeHeaderSettings {
+    pub enabled: bool,
+    pub sample_interval_ms: u64,
+    pub scope: ThemeHeaderScope,
+    pub style: ThemeHeaderStyle,
+    pub cpu_percent_mode: CpuPercentMode,
+    pub metrics: Vec<ThemeHeaderMetric>,
+}
+
+impl Default for ThemeHeaderSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_interval_ms: 1_000,
+            scope: ThemeHeaderScope::Pane,
+            style: ThemeHeaderStyle::Compact,
+            cpu_percent_mode: CpuPercentMode::Normalized,
+            metrics: vec![
+                ThemeHeaderMetric::Cpu,
+                ThemeHeaderMetric::Memory,
+                ThemeHeaderMetric::ProcessCount,
+            ],
+        }
+    }
 }
 
 /// One subscribed metric watch.

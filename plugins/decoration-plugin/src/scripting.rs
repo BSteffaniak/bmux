@@ -933,6 +933,10 @@ pub fn bundled_decoration_scripts() -> &'static [(&'static str, &'static str)] {
                 include_str!("../assets/decorations/rainbow_snake.lua"),
             ),
             (
+                "performance_header",
+                include_str!("../assets/decorations/performance_header.lua"),
+            ),
+            (
                 "cpu_heat",
                 include_str!("../assets/decorations/cpu_heat.lua"),
             ),

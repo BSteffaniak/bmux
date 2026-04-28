@@ -1,7 +1,8 @@
 use super::render::{AttachLayer, AttachLayerSurface, opaque_row_text, queue_layer_fill};
 use super::state::{AttachCursorState, PaneRect};
 use crate::runtime::prompt::{
-    PromptField, PromptHostRequest, PromptPolicy, PromptRequest, PromptResponse, PromptValue,
+    PromptField, PromptFormField, PromptFormFieldKind, PromptFormValue, PromptHostRequest,
+    PromptPolicy, PromptRequest, PromptResponse, PromptValue,
 };
 use anyhow::{Context, Result};
 use bmux_ipc::{AttachLayer as SurfaceLayer, AttachRect, AttachSurface, AttachSurfaceKind};
@@ -12,7 +13,7 @@ use crossterm::event::{
 use crossterm::queue;
 use crossterm::style::Print;
 use crossterm::terminal;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -66,6 +67,12 @@ enum PromptWidgetState {
         cursor: usize,
         selected: BTreeSet<usize>,
         scroll: usize,
+    },
+    Form {
+        cursor: usize,
+        scroll: usize,
+        values: BTreeMap<String, PromptFormValue>,
+        errors: BTreeMap<String, String>,
     },
 }
 
@@ -122,6 +129,12 @@ impl ActivePrompt {
                     scroll: 0,
                 }
             }
+            PromptField::Form { sections, .. } => PromptWidgetState::Form {
+                cursor: 0,
+                scroll: 0,
+                values: initial_form_values(sections),
+                errors: BTreeMap::new(),
+            },
         };
         Self {
             envelope,
@@ -166,6 +179,9 @@ impl AttachPromptState {
             }
             PromptField::MultiToggle { .. } => {
                 "Prompt | Up/Down move | Space toggle | Enter submit | Esc cancel"
+            }
+            PromptField::Form { .. } => {
+                "Prompt | Up/Down move | Space edit/toggle | Enter apply | Esc cancel"
             }
         };
         Some(hint)
@@ -400,6 +416,94 @@ impl AttachPromptState {
                                 values.sort();
                                 completion =
                                     Some(PromptResponse::Submitted(PromptValue::Multi(values)));
+                            }
+                            _ => {}
+                        }
+                        *scroll = (*scroll).min(*cursor);
+                    }
+                }
+                (
+                    PromptField::Form {
+                        sections,
+                        live_preview,
+                    },
+                    PromptWidgetState::Form {
+                        cursor,
+                        scroll,
+                        values,
+                        errors,
+                    },
+                ) => {
+                    let fields = flatten_form_fields(sections);
+                    let len = fields.len();
+                    if len == 0 {
+                        if matches!(key.code, KeyCode::Enter) {
+                            completion =
+                                Some(PromptResponse::Submitted(PromptValue::Form(values.clone())));
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                *cursor = cursor.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                *cursor = cursor.saturating_add(1).min(len.saturating_sub(1));
+                            }
+                            KeyCode::Home => {
+                                *cursor = 0;
+                            }
+                            KeyCode::End => {
+                                *cursor = len.saturating_sub(1);
+                            }
+                            KeyCode::Char(' ') => {
+                                if let Some(field) = fields.get(*cursor)
+                                    && !field.disabled
+                                {
+                                    cycle_form_value(field, values);
+                                    errors.remove(&field.id);
+                                    if *live_preview {
+                                        emit_form_changed(&active.envelope, field, values);
+                                    }
+                                }
+                            }
+                            KeyCode::Enter => {
+                                errors.clear();
+                                for field in &fields {
+                                    if let Err(message) = validate_form_field(field, values) {
+                                        errors.insert(field.id.clone(), message);
+                                    }
+                                }
+                                if errors.is_empty() {
+                                    completion = Some(PromptResponse::Submitted(
+                                        PromptValue::Form(values.clone()),
+                                    ));
+                                }
+                            }
+                            KeyCode::Char(ch)
+                                if !key
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
+                                if let Some(field) = fields.get(*cursor)
+                                    && !field.disabled
+                                    && append_form_text_char(field, values, ch)
+                                {
+                                    errors.remove(&field.id);
+                                    if *live_preview {
+                                        emit_form_changed(&active.envelope, field, values);
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(field) = fields.get(*cursor)
+                                    && !field.disabled
+                                    && pop_form_text_char(field, values)
+                                {
+                                    errors.remove(&field.id);
+                                    if *live_preview {
+                                        emit_form_changed(&active.envelope, field, values);
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -656,6 +760,242 @@ fn emit_selection_changed(envelope: &AttachPromptEnvelope, selected: usize) {
     }
 }
 
+fn emit_form_changed(
+    envelope: &AttachPromptEnvelope,
+    field: &PromptFormField,
+    values: &BTreeMap<String, PromptFormValue>,
+) {
+    let AttachPromptOrigin::External {
+        event_tx: Some(event_tx),
+        ..
+    } = &envelope.origin
+    else {
+        return;
+    };
+    if let Some(value) = values.get(&field.id) {
+        let _ = event_tx.send(crate::runtime::prompt::PromptEvent::FormChanged {
+            field_id: field.id.clone(),
+            value: value.clone(),
+            values: values.clone(),
+        });
+    }
+}
+
+fn flatten_form_fields(
+    sections: &[crate::runtime::prompt::PromptFormSection],
+) -> Vec<&PromptFormField> {
+    sections
+        .iter()
+        .flat_map(|section| section.fields.iter())
+        .collect()
+}
+
+fn initial_form_values(
+    sections: &[crate::runtime::prompt::PromptFormSection],
+) -> BTreeMap<String, PromptFormValue> {
+    flatten_form_fields(sections)
+        .into_iter()
+        .map(|field| (field.id.clone(), default_form_value(field)))
+        .collect()
+}
+
+fn default_form_value(field: &PromptFormField) -> PromptFormValue {
+    match &field.kind {
+        PromptFormFieldKind::Bool { default } => PromptFormValue::Bool(*default),
+        PromptFormFieldKind::Text { initial_value, .. } => {
+            PromptFormValue::Text(initial_value.clone())
+        }
+        PromptFormFieldKind::Integer { initial_value, .. } => {
+            PromptFormValue::Integer(*initial_value)
+        }
+        PromptFormFieldKind::Number { initial_value, .. } => {
+            PromptFormValue::Number(initial_value.clone())
+        }
+        PromptFormFieldKind::SingleSelect {
+            options,
+            default_index,
+        } => PromptFormValue::Single(
+            options
+                .get((*default_index).min(options.len().saturating_sub(1)))
+                .map_or_else(String::new, |option| option.value.clone()),
+        ),
+        PromptFormFieldKind::MultiToggle {
+            options,
+            default_indices,
+            ..
+        } => {
+            let mut values = default_indices
+                .iter()
+                .filter_map(|index| options.get(*index).map(|option| option.value.clone()))
+                .collect::<Vec<_>>();
+            values.sort();
+            PromptFormValue::Multi(values)
+        }
+    }
+}
+
+fn cycle_form_value(field: &PromptFormField, values: &mut BTreeMap<String, PromptFormValue>) {
+    match (&field.kind, values.get_mut(&field.id)) {
+        (PromptFormFieldKind::Bool { .. }, Some(PromptFormValue::Bool(value))) => {
+            *value = !*value;
+        }
+        (
+            PromptFormFieldKind::SingleSelect { options, .. },
+            Some(PromptFormValue::Single(value)),
+        ) => {
+            if options.is_empty() {
+                return;
+            }
+            let current = options
+                .iter()
+                .position(|option| option.value == *value)
+                .unwrap_or(0);
+            let next = current.saturating_add(1) % options.len();
+            value.clone_from(&options[next].value);
+        }
+        (
+            PromptFormFieldKind::MultiToggle { options, .. },
+            Some(PromptFormValue::Multi(selected)),
+        ) => {
+            if let Some(option) = options.first() {
+                if selected.iter().any(|value| value == &option.value) {
+                    selected.retain(|value| value != &option.value);
+                } else {
+                    selected.push(option.value.clone());
+                    selected.sort();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn append_form_text_char(
+    field: &PromptFormField,
+    values: &mut BTreeMap<String, PromptFormValue>,
+    ch: char,
+) -> bool {
+    match (&field.kind, values.get_mut(&field.id)) {
+        (PromptFormFieldKind::Text { .. }, Some(PromptFormValue::Text(value)))
+        | (PromptFormFieldKind::Number { .. }, Some(PromptFormValue::Number(value))) => {
+            value.push(ch);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn pop_form_text_char(
+    field: &PromptFormField,
+    values: &mut BTreeMap<String, PromptFormValue>,
+) -> bool {
+    match (&field.kind, values.get_mut(&field.id)) {
+        (PromptFormFieldKind::Text { .. }, Some(PromptFormValue::Text(value)))
+        | (PromptFormFieldKind::Number { .. }, Some(PromptFormValue::Number(value))) => {
+            value.pop();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn validate_form_field(
+    field: &PromptFormField,
+    values: &BTreeMap<String, PromptFormValue>,
+) -> Result<(), String> {
+    if field.disabled {
+        return Ok(());
+    }
+    let Some(value) = values.get(&field.id) else {
+        return Err("missing value".to_string());
+    };
+    match (&field.kind, value) {
+        (PromptFormFieldKind::Text { validation, .. }, PromptFormValue::Text(value)) => {
+            if field.required && value.trim().is_empty() {
+                return Err("value is required".to_string());
+            }
+            if let Some(rule) = validation {
+                run_prompt_validation(rule, value)?;
+            }
+        }
+        (PromptFormFieldKind::Integer { min, max, .. }, PromptFormValue::Integer(value)) => {
+            if min.is_some_and(|min| *value < min) || max.is_some_and(|max| *value > max) {
+                return Err("value is out of range".to_string());
+            }
+        }
+        (PromptFormFieldKind::Number { min, max, .. }, PromptFormValue::Number(value)) => {
+            let parsed = value
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| "value must be a number".to_string())?;
+            if min
+                .as_deref()
+                .and_then(|min| min.parse::<f64>().ok())
+                .is_some_and(|min| parsed < min)
+                || max
+                    .as_deref()
+                    .and_then(|max| max.parse::<f64>().ok())
+                    .is_some_and(|max| parsed > max)
+            {
+                return Err("value is out of range".to_string());
+            }
+        }
+        (PromptFormFieldKind::MultiToggle { min_selected, .. }, PromptFormValue::Multi(values)) => {
+            if values.len() < *min_selected {
+                return Err(format!("select at least {min_selected}"));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+struct FormRenderRow {
+    text: String,
+    selectable: bool,
+}
+
+fn form_render_rows(
+    sections: &[crate::runtime::prompt::PromptFormSection],
+    values: &BTreeMap<String, PromptFormValue>,
+    errors: &BTreeMap<String, String>,
+) -> Vec<FormRenderRow> {
+    let mut rows = Vec::new();
+    for section in sections {
+        for field in &section.fields {
+            let value = values
+                .get(&field.id)
+                .map_or_else(String::new, form_value_display);
+            let suffix = if field.disabled {
+                field.disabled_reason.as_ref().map_or_else(
+                    || " disabled".to_string(),
+                    |reason| format!(" disabled: {reason}"),
+                )
+            } else if let Some(error) = errors.get(&field.id) {
+                format!(" ! {error}")
+            } else {
+                String::new()
+            };
+            rows.push(FormRenderRow {
+                text: format!("{}: {value}{suffix}", field.label),
+                selectable: !field.disabled,
+            });
+        }
+    }
+    rows
+}
+
+fn form_value_display(value: &PromptFormValue) -> String {
+    match value {
+        PromptFormValue::Bool(value) => if *value { "on" } else { "off" }.to_string(),
+        PromptFormValue::Text(value)
+        | PromptFormValue::Number(value)
+        | PromptFormValue::Single(value) => value.clone(),
+        PromptFormValue::Integer(value) => value.to_string(),
+        PromptFormValue::Multi(values) => values.join(", "),
+    }
+}
+
 #[allow(clippy::cast_possible_truncation)] // Overlay geometry is clamped to terminal bounds before u16 conversion.
 fn prompt_overlay_layout(request: Option<&PromptRequest>) -> Option<PromptOverlayLayout> {
     let request = request?;
@@ -752,6 +1092,14 @@ fn prompt_estimated_width(request: &PromptRequest) -> usize {
                 width = width.max(option.label.chars().count().saturating_add(6));
             }
         }
+        PromptField::Form { sections, .. } => {
+            for section in sections {
+                width = width.max(section.title.chars().count().saturating_add(2));
+                for field in &section.fields {
+                    width = width.max(field.label.chars().count().saturating_add(18));
+                }
+            }
+        }
     }
     width
 }
@@ -768,6 +1116,11 @@ fn prompt_estimated_lines(request: &PromptRequest) -> usize {
         PromptField::SingleSelect { options, .. } | PromptField::MultiToggle { options, .. } => {
             options.len().max(1)
         }
+        PromptField::Form { sections, .. } => sections
+            .iter()
+            .map(|section| 1usize.saturating_add(section.fields.len()))
+            .sum::<usize>()
+            .max(1),
     });
     lines.max(1)
 }
@@ -907,6 +1260,37 @@ fn render_prompt_body(
                 }
             }
         }
+        (
+            PromptField::Form { sections, .. },
+            PromptWidgetState::Form {
+                cursor: index,
+                scroll,
+                values,
+                errors,
+            },
+        ) => {
+            let rows = form_render_rows(sections, values, errors);
+            if rows.is_empty() {
+                field_lines.push(opaque_row_text("(no fields)", text_width));
+            } else {
+                let visible_rows = body_rows.saturating_sub(lines.len()).max(1);
+                *index = (*index).min(rows.len().saturating_sub(1));
+                *scroll = adjust_scroll(*scroll, *index, rows.len(), visible_rows);
+                let end = (*scroll).saturating_add(visible_rows).min(rows.len());
+                for (row_index, row) in rows.iter().enumerate().take(end).skip(*scroll) {
+                    let marker = if row.selectable && row_index == *index {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    let line = format!("{marker} {}", row.text);
+                    field_lines.push(opaque_row_text(
+                        &truncate_chars(&line, text_width),
+                        text_width,
+                    ));
+                }
+            }
+        }
         _ => {
             field_lines.push(opaque_row_text("invalid prompt state", text_width));
         }
@@ -946,6 +1330,10 @@ fn prompt_footer_text(request: &PromptRequest) -> String {
         ),
         PromptField::MultiToggle { .. } => format!(
             "Up/Down move | Space toggle | Enter {} | Esc {}",
+            request.submit_label, request.cancel_label
+        ),
+        PromptField::Form { .. } => format!(
+            "Up/Down move | Space edit | Enter {} | Esc {}",
             request.submit_label, request.cancel_label
         ),
     }

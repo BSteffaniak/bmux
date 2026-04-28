@@ -5,7 +5,8 @@
 //! attach loop both use the same channel via `bmux_plugin`.
 
 pub use bmux_plugin::prompt::{
-    PromptEvent, PromptField, PromptHostRequest, PromptOption, PromptPolicy, PromptRequest,
-    PromptResponse, PromptSubmitError, PromptValidation, PromptValue, PromptWidth, register_host,
-    request, request_with_events, submit, submit_with_events,
+    PromptEvent, PromptField, PromptFormField, PromptFormFieldKind, PromptFormSection,
+    PromptFormValue, PromptHostRequest, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
+    PromptSubmitError, PromptValidation, PromptValue, PromptWidth, register_host, request,
+    request_with_events, submit, submit_with_events,
 };
