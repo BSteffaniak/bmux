@@ -18,9 +18,9 @@ retarget_limit_ms = 8
 tags = ["navigation", "production"]
 
 [profiles.diagnostic]
-tags = ["navigation", "production", "plugin", "ipc"]
+tags = ["navigation", "production", "plugin", "service", "ipc"]
 plugin_timing = true
-service_timing = false
+service_timing = true
 ipc_timing = true
 storage_timing = false
 loosen_slo = true
@@ -166,6 +166,7 @@ phase = "service.client_invoke"
 field = "total_us"
 limit = "attach_command"
 tags = ["service"]
+allow_empty = true
 filter = { key = "operation", value = "${service_operation}" }
 
 [[reports]]
@@ -324,10 +325,44 @@ tags = ["service"]
 filter = { key = "operation", value = "${service_operation}" }
 
 [[reports]]
+phase = "service_pipeline.client_request"
+field = "total_us"
+limit = "attach_command"
+tags = ["service"]
+
+[[reports]]
+phase = "service_pipeline.execute"
+field = "total_us"
+limit = "attach_command"
+tags = ["service"]
+
+[[reports]]
+phase = "service_pipeline.step"
+field = "total_us"
+limit = "attach_command"
+tags = ["service"]
+filter = { key = "operation", value = "run_plugin" }
+
+[[reports]]
+phase = "service_pipeline.step"
+field = "payload_resolve_us"
+limit = "attach_command"
+tags = ["service"]
+filter = { key = "operation", value = "run_plugin" }
+
+[[reports]]
+phase = "service_pipeline.step"
+field = "invoke_us"
+limit = "attach_command"
+tags = ["service"]
+filter = { key = "operation", value = "run_plugin" }
+
+[[reports]]
 phase = "plugin.native_service_invoke"
 field = "total_us"
 limit = "attach_command"
 tags = ["service"]
+allow_empty = true
 filter = { key = "operation", value = "${service_operation}" }
 
 [[reports]]
@@ -335,6 +370,7 @@ phase = "plugin.native_service_invoke"
 field = "encode_us"
 limit = "attach_command"
 tags = ["service"]
+allow_empty = true
 filter = { key = "operation", value = "${service_operation}" }
 
 [[reports]]
@@ -342,6 +378,7 @@ phase = "plugin.native_service_invoke"
 field = "call_us"
 limit = "attach_command"
 tags = ["service"]
+allow_empty = true
 filter = { key = "operation", value = "${service_operation}" }
 
 [[reports]]
@@ -349,6 +386,7 @@ phase = "plugin.native_service_invoke"
 field = "decode_us"
 limit = "attach_command"
 tags = ["service"]
+allow_empty = true
 filter = { key = "operation", value = "${service_operation}" }
 
 [[reports]]

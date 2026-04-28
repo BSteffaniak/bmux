@@ -43,6 +43,17 @@ fn required_fields(phase: &str) -> &'static [&'static str] {
             "operation",
             "total_us",
         ]
+    } else if phase == "service_pipeline.step" {
+        &[
+            "capability",
+            "kind",
+            "interface_id",
+            "operation",
+            "step_index",
+            "total_us",
+        ]
+    } else if phase.starts_with("service_pipeline.") {
+        &["step_count", "total_us"]
     } else if phase.starts_with("plugin.") {
         &["total_us"]
     } else if phase.starts_with("ipc.") {
@@ -70,6 +81,20 @@ mod tests {
             "kind": "Query",
             "interface_id": "example/v1",
             "operation": "get",
+            "total_us": 1,
+        })];
+        assert!(validate_phase_schema(&events).is_ok());
+    }
+
+    #[test]
+    fn validates_service_pipeline_step_required_fields() {
+        let events = vec![json!({
+            "phase": "service_pipeline.step",
+            "capability": "bmux.example",
+            "kind": "Command",
+            "interface_id": "example/v1",
+            "operation": "run",
+            "step_index": 0,
             "total_us": 1,
         })];
         assert!(validate_phase_schema(&events).is_ok());

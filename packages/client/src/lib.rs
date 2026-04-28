@@ -538,11 +538,23 @@ impl BmuxClient {
         &mut self,
         pipeline: ServicePipelineRequest,
     ) -> Result<Vec<ServicePipelineStepResult>> {
+        let step_count = pipeline.steps.len();
+        let total_timer = PhaseTimer::start();
         match self
             .request(Request::InvokeServicePipeline { pipeline })
             .await?
         {
-            ResponsePayload::ServicePipelineInvoked { results } => Ok(results),
+            ResponsePayload::ServicePipelineInvoked { results } => {
+                emit_phase_timing(
+                    PhaseChannel::Service,
+                    &service_client_pipeline_phase_payload(
+                        step_count,
+                        results.len(),
+                        total_timer.elapsed_us(),
+                    ),
+                );
+                Ok(results)
+            }
             _ => Err(ClientError::UnexpectedResponse(
                 "expected service pipeline invoked",
             )),
@@ -2309,11 +2321,23 @@ impl StreamingBmuxClient {
         &mut self,
         pipeline: ServicePipelineRequest,
     ) -> Result<Vec<ServicePipelineStepResult>> {
+        let step_count = pipeline.steps.len();
+        let total_timer = PhaseTimer::start();
         match self
             .request(Request::InvokeServicePipeline { pipeline })
             .await?
         {
-            ResponsePayload::ServicePipelineInvoked { results } => Ok(results),
+            ResponsePayload::ServicePipelineInvoked { results } => {
+                emit_phase_timing(
+                    PhaseChannel::Service,
+                    &service_client_pipeline_phase_payload(
+                        step_count,
+                        results.len(),
+                        total_timer.elapsed_us(),
+                    ),
+                );
+                Ok(results)
+            }
             _ => Err(ClientError::UnexpectedResponse(
                 "expected service pipeline invoked",
             )),
@@ -2511,6 +2535,18 @@ fn service_client_invoke_phase_payload(
         .finish()
 }
 
+fn service_client_pipeline_phase_payload(
+    step_count: usize,
+    result_count: usize,
+    total_us: u128,
+) -> serde_json::Value {
+    PhasePayload::new("service_pipeline.client_request")
+        .field("step_count", step_count)
+        .field("result_count", result_count)
+        .field("total_us", total_us)
+        .finish()
+}
+
 fn ipc_client_request_phase_payload(
     request: &Request,
     request_id: u64,
@@ -2542,6 +2578,8 @@ fn ipc_client_request_phase_payload(
         payload = payload
             .service_fields(capability, format!("{kind:?}"), interface_id, operation)
             .field("service_payload_len", service_payload.len());
+    } else if let Request::InvokeServicePipeline { pipeline } = request {
+        payload = payload.field("pipeline_step_count", pipeline.steps.len());
     }
     payload.finish()
 }

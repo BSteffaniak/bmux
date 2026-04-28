@@ -28,7 +28,7 @@ use bmux_pane_runtime_state::{
     PaneLayoutNode, PaneResizeDirection, PaneResurrectionSnapshot, PaneRuntimeMeta,
     SessionRuntimeError,
 };
-use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
+use bmux_perf_telemetry::{PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing};
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::{SessionManagerHandle, SessionManagerSnapshot};
@@ -207,6 +207,7 @@ async fn invoke_service_output(
     route: ServiceRoute,
     payload: Vec<u8>,
 ) -> Result<ServiceInvokeOutput> {
+    let total_timer = PhaseTimer::start();
     let capability = route.capability.clone();
     let kind = route.kind;
     let interface_id = route.interface_id.clone();
@@ -217,6 +218,7 @@ async fn invoke_service_output(
         client_id,
         client_principal_id,
     };
+    let registry_timer = PhaseTimer::start();
     let dispatch = {
         let registry = state
             .service_registry
@@ -224,6 +226,8 @@ async fn invoke_service_output(
             .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
         registry.dispatch(&route, invoke_context, payload.clone())
     };
+    let registry_us = registry_timer.elapsed_us();
+    let resolver_timer = PhaseTimer::start();
     let invocation = if let Some(invocation) = dispatch {
         Some(invocation)
     } else {
@@ -234,13 +238,30 @@ async fn invoke_service_output(
             .clone();
         resolver.map(|resolver| resolver(route, payload))
     };
+    let resolver_us = resolver_timer.elapsed_us();
 
     let Some(invocation) = invocation else {
         return Err(anyhow::anyhow!(
             "no provider for service capability='{capability}' kind='{kind:?}' interface='{interface_id}' operation='{operation}'"
         ));
     };
-    invocation.await
+    let invocation_timer = PhaseTimer::start();
+    let output = invocation.await?;
+    let invocation_us = invocation_timer.elapsed_us();
+    emit_phase_timing(
+        PhaseChannel::Service,
+        &PhasePayload::new("service.server_invoke")
+            .service_fields(&capability, format!("{kind:?}"), &interface_id, &operation)
+            .field("client_id", client_id)
+            .field("registry_us", registry_us)
+            .field("resolver_us", resolver_us)
+            .field("invocation_us", invocation_us)
+            .field("response_payload_len", output.payload.len())
+            .field("metadata_keys", output.metadata.len())
+            .field("total_us", total_timer.elapsed_us())
+            .finish(),
+    );
+    Ok(output)
 }
 
 async fn execute_service_pipeline(
@@ -250,16 +271,27 @@ async fn execute_service_pipeline(
     client_principal_id: Uuid,
     pipeline: ServicePipelineRequest,
 ) -> Result<Vec<ServicePipelineStepResult>> {
+    let total_timer = PhaseTimer::start();
+    let step_count = pipeline.steps.len();
     let mut results = Vec::with_capacity(pipeline.steps.len());
     let mut metadata_by_step = Vec::with_capacity(pipeline.steps.len());
-    for step in pipeline.steps {
+    for (step_index, step) in pipeline.steps.into_iter().enumerate() {
+        let step_timer = PhaseTimer::start();
+        let resolve_timer = PhaseTimer::start();
         let payload = resolve_pipeline_payload(&step.payload, &pipeline.inputs, &metadata_by_step)?;
+        let payload_resolve_us = resolve_timer.elapsed_us();
+        let payload_len = payload.len();
+        let capability = step.capability;
+        let kind = step.kind;
+        let interface_id = step.interface_id;
+        let operation = step.operation;
         let route = ServiceRoute {
-            capability: step.capability,
-            kind: step.kind,
-            interface_id: step.interface_id,
-            operation: step.operation,
+            capability: capability.clone(),
+            kind,
+            interface_id: interface_id.clone(),
+            operation: operation.clone(),
         };
+        let invoke_timer = PhaseTimer::start();
         let output = invoke_service_output(
             state,
             shutdown_tx,
@@ -269,12 +301,35 @@ async fn execute_service_pipeline(
             payload,
         )
         .await?;
+        let invoke_us = invoke_timer.elapsed_us();
+        emit_phase_timing(
+            PhaseChannel::Service,
+            &PhasePayload::new("service_pipeline.step")
+                .service_fields(&capability, format!("{kind:?}"), &interface_id, &operation)
+                .field("client_id", client_id)
+                .field("step_index", step_index)
+                .field("payload_resolve_us", payload_resolve_us)
+                .field("invoke_us", invoke_us)
+                .field("request_payload_len", payload_len)
+                .field("response_payload_len", output.payload.len())
+                .field("metadata_keys", output.metadata.len())
+                .field("total_us", step_timer.elapsed_us())
+                .finish(),
+        );
         metadata_by_step.push(output.metadata.clone());
         results.push(ServicePipelineStepResult {
             payload: output.payload,
             metadata: output.metadata,
         });
     }
+    emit_phase_timing(
+        PhaseChannel::Service,
+        &PhasePayload::new("service_pipeline.execute")
+            .field("client_id", client_id)
+            .field("step_count", step_count)
+            .field("total_us", total_timer.elapsed_us())
+            .finish(),
+    );
     Ok(results)
 }
 
