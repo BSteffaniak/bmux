@@ -237,11 +237,10 @@ the legacy wire `Event::{FollowStarted, FollowStopped, FollowTargetChanged}` for
 same pattern as the control-catalog bridge.
 
 `SessionRuntimeManager` (the heavier pane-runtime struct that owns
-PTY handles, layout tree, and floating surfaces) remains in
-`packages/server` — it is too entangled with server-specific runtime
-primitives (`portable-pty`, tokio channels) to relocate without
-pulling those dependencies into a plugin crate. Migrating it is
-tracked as future work.
+PTY handles, layout tree, and floating surfaces) is owned by
+`pane-runtime-plugin`. The server accesses it only through the neutral
+`SessionRuntimeManagerHandle` trait object registered in the plugin
+state registry.
 
 ## Persistence
 
@@ -278,12 +277,12 @@ Each participant implements
 `StatefulPluginHandle` into a shared
 `bmux_snapshot_runtime::StatefulPluginRegistry` during `activate`:
 
-| Participant id                  | Owner                               | Payload type             |
-| ------------------------------- | ----------------------------------- | ------------------------ |
-| `bmux.clients/follow-state`     | `clients-plugin`                    | `FollowStateSnapshot`    |
-| `bmux.contexts/context-state`   | `contexts-plugin`                   | `ContextStateSnapshot`   |
-| `bmux.sessions/session-manager` | `sessions-plugin`                   | `SessionManagerSnapshot` |
-| `bmux.server/pane-runtime`      | server (`pane_runtime_snapshot.rs`) | `PaneRuntimeSnapshotV1`  |
+| Participant id                   | Owner                 | Payload type             |
+| -------------------------------- | --------------------- | ------------------------ |
+| `bmux.clients/follow-state`      | `clients-plugin`      | `FollowStateSnapshot`    |
+| `bmux.contexts/context-state`    | `contexts-plugin`     | `ContextStateSnapshot`   |
+| `bmux.sessions/session-manager`  | `sessions-plugin`     | `SessionManagerSnapshot` |
+| `bmux.pane_runtime/pane-runtime` | `pane-runtime-plugin` | `PaneRuntimeSnapshotV1`  |
 
 Each participant serializes its own section independently (serde-JSON
 inside the opaque `bytes` field). Sections are decoded + routed back
@@ -322,9 +321,9 @@ delegate to the orchestrator through
 schema, never reads or writes the envelope file directly.
 
 On `BmuxServer::run_impl`, after every plugin has activated and the
-server's own `ServerPaneRuntimeStateful` participant has registered,
-server awaits `restore_if_present_boxed()` to populate the four
-participant slices from the on-disk envelope in a single pass.
+pane-runtime plugin has registered its `PaneRuntimeStateful`
+participant, server awaits `restore_if_present_boxed()` to populate
+the participant slices from the on-disk envelope in a single pass.
 
 ### Offline path (`offline_kill_sessions`)
 
@@ -337,7 +336,7 @@ decodes each relevant section through the matching neutral primitive
 crate (`SessionManagerSnapshot` from `bmux_session_state`,
 `ContextStateSnapshot` from `bmux_context_state`,
 `FollowStateSnapshot` from `bmux_client_state`, pane-runtime via
-`serde_json::Value` since its schema is server-internal), mutates
+`serde_json::Value` since its schema is plugin-owned), mutates
 the in-memory structures, rebuilds the envelope checksum, and writes
 atomically.
 
@@ -362,7 +361,7 @@ The persistence boundary is closed:
 Enforced at test time by four architecture guardrails
 (`server_does_not_define_snapshot_schema`, `snapshot_plugin_exists`,
 `state_plugins_implement_stateful_plugin`,
-`server_implements_pane_runtime_stateful`).
+`pane_runtime_plugin_implements_stateful`).
 
 ## Interaction patterns
 

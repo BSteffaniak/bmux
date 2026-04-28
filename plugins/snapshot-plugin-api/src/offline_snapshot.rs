@@ -43,9 +43,9 @@ const SESSIONS_SECTION_ID: &str = "bmux.sessions/session-manager";
 const CONTEXTS_SECTION_ID: &str = "bmux.contexts/context-state";
 /// Section id for the clients plugin's snapshot payload.
 const CLIENTS_SECTION_ID: &str = "bmux.clients/follow-state";
-/// Section id for the server's pane-runtime snapshot payload. Matches
-/// `packages/server/src/pane_runtime_snapshot.rs`'s `SERVER_PANE_RUNTIME_ID`.
-const PANE_RUNTIME_SECTION_ID: &str = "bmux.server/pane-runtime";
+/// Section id for the pane-runtime plugin's snapshot payload. Matches
+/// `plugins/pane-runtime-plugin/src/snapshot.rs`.
+const PANE_RUNTIME_SECTION_ID: &str = "bmux.pane_runtime/pane-runtime";
 
 /// Default snapshot file name. Must match the value registered by
 /// CLI bootstrap into `SnapshotPluginConfig.snapshot_path.file_name`.
@@ -166,7 +166,7 @@ pub fn offline_kill_sessions(
     // `sessions[].session_id` and `sessions[].panes[].process_group_id`
     // to drive `terminate_process_group`. Keeping the decode shallow
     // means this plugin-api crate does not have to duplicate the full
-    // pane-runtime schema that lives in `packages/server`.
+    // pane-runtime schema that lives in `plugins/pane-runtime-plugin`.
     if let Some(pane_runtime_value) =
         get_section_json::<serde_json::Value>(&envelope, PANE_RUNTIME_SECTION_ID)?
     {
