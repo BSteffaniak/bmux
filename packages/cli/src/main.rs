@@ -6,11 +6,13 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match bmux_cli::run_cli().await {
+    let exit_code = match bmux_cli::run_cli().await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("bmux error: {error:#}");
             ExitCode::from(1)
         }
-    }
+    };
+    bmux_plugin_sdk::perf_telemetry::flush();
+    exit_code
 }

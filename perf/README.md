@@ -17,6 +17,10 @@ Standard channels:
 - `PhaseChannel::Service` uses `BMUX_SERVICE_PHASE_TIMING` and `[bmux-service-phase-json]`.
 - `PhaseChannel::Ipc` uses `BMUX_IPC_PHASE_TIMING` and `[bmux-ipc-phase-json]`.
 - `PhaseChannel::Storage` uses `BMUX_PLUGIN_STORAGE_PHASE_TIMING` and `[bmux-storage-phase-json]`.
+- `BMUX_PHASE_TIMING_MODE=buffered` keeps the same call-site API but batches phase events in memory and flushes them at runtime/benchmark boundaries. Use this for production-faithful diagnostics.
+- `BMUX_PHASE_TIMING_MODE=stderr` or an unset mode writes each event immediately. This is useful for live debugging but can perturb hot-path latency.
+- `BMUX_PHASE_TIMING_FILTER` accepts comma-separated exact phases or prefix globs ending in `*`, for example `service_pipeline.*,service.server_invoke`.
+- `BMUX_PHASE_TIMING_BUFFER_LIMIT` controls the automatic buffered flush size. The default is intentionally large so benchmarks normally rely on explicit boundary flushes instead of flushing inside hot paths.
 
 Common fields should keep stable names:
 
@@ -118,7 +122,7 @@ Plugin-owned benchmark coverage should be added without special host code whenev
 3. Host-owned cold-start phases use generic names such as `plugin.registry_scan`, `plugin.load`, `plugin.typed_services.collect`, `plugin.lifecycle.activate`, `plugin.command.invoke`, and `plugin.process.invoke`.
 4. Host-owned service-pipeline phases use `service_pipeline.client_request`, `service_pipeline.execute`, and `service_pipeline.step`; step events include `capability`, `kind`, `interface_id`, `operation`, `step_index`, and `total_us`.
 5. If a plugin has useful internal attribution, emit namespaced phases such as `bmux.<short-name>.<operation>` and include `plugin_id`, `operation`, and `total_us`.
-6. Keep emitters gated by `PhaseChannel::enabled()` or `emit(...)`; never compute expensive diagnostic payloads when the channel is disabled.
+6. Keep emitters gated by `PhaseChannel::enabled()` or `emit(...)`; never compute expensive diagnostic payloads when the channel is disabled. Call sites should not manually buffer or flush.
 7. Add reports to a `perf/*.toml` manifest using `tags = ["plugin"]` for diagnostic-only attribution.
 8. Keep SLO limits in the manifest. Runtime/plugin code should not contain benchmark thresholds.
 9. Prefer generic setup/previsit/measured stages over benchmark-only command shortcuts. If a cold path matters, report it separately from warmed SLOs.

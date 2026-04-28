@@ -661,6 +661,7 @@ fn attach_scenario_key(
 fn attach_envs(options: &BenchmarkResolvedOptions) -> Vec<(String, String)> {
     let mut envs = vec![
         (PhaseChannel::Attach.env_var().to_string(), "1".to_string()),
+        ("BMUX_PHASE_TIMING_MODE".to_string(), "buffered".to_string()),
         (
             "BMUX_PLAYBOOK_ATTACH_COMMAND_EXECUTION".to_string(),
             options.attach_command_execution.as_str().to_string(),

@@ -1501,7 +1501,11 @@ async fn run_playbook_inner(
         .as_ref()
         .map(|sb| sb.root_dir().to_string_lossy().to_string());
 
+    bmux_plugin_sdk::perf_telemetry::flush();
     if let Some(ref sb) = sandbox {
+        if let Ok(mut client) = sb.connect("bmux-playbook-phase-flush").await {
+            let _ = client.stop_server().await;
+        }
         forward_sandbox_phase_timing(sb);
     }
 

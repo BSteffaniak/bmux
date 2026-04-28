@@ -28,7 +28,9 @@ use bmux_pane_runtime_state::{
     PaneLayoutNode, PaneResizeDirection, PaneResurrectionSnapshot, PaneRuntimeMeta,
     SessionRuntimeError,
 };
-use bmux_perf_telemetry::{PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing};
+use bmux_perf_telemetry::{
+    PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing, flush as flush_phase_timing,
+};
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::{SessionManagerHandle, SessionManagerSnapshot};
@@ -5011,6 +5013,7 @@ impl BmuxServer {
         }
 
         info!("bmux server listener closed on {:?}", self.endpoint);
+        flush_phase_timing();
 
         Ok(())
     }
@@ -6017,6 +6020,7 @@ async fn handle_request(
         }
         Request::ServerStop => {
             let _ = shutdown_tx.send(true);
+            flush_phase_timing();
             Response::Ok(ResponsePayload::ServerStopping)
         }
         Request::InvokeService {
