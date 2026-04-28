@@ -446,13 +446,9 @@ Recommended naming:
 
 ### Plugin API direction
 
-Expose generic host service interfaces for context operations:
-
-- `context-query/v1`
-- `context-command/v1`
-
-Use typed `bmux_plugin_sdk` host runtime APIs for all plugin access to
-core mechanics.
+Expose context operations through the contexts plugin's BPDL services
+(`contexts-state`, `contexts-commands`, and `contexts-events`). Core
+does not advertise context host-service convenience interfaces.
 
 ### Command outcome contract
 

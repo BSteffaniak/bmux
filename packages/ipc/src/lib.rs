@@ -1696,10 +1696,10 @@ mod tests {
             Request::ServerRestoreApply,
             Request::ServerStop,
             Request::InvokeService {
-                capability: "bmux.sessions.read".into(),
+                capability: "bmux.storage".into(),
                 kind: InvokeServiceKind::Query,
-                interface_id: "session-query/v1".into(),
-                operation: "list".into(),
+                interface_id: "storage-query/v1".into(),
+                operation: "get".into(),
                 payload: vec![1, 2, 3],
             },
             Request::SubscribeEvents,

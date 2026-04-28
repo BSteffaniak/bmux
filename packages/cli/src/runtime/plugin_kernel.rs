@@ -557,48 +557,6 @@ pub(super) fn core_service_descriptors() -> Vec<RegisteredService> {
             interface_id: CORE_CLI_COMMAND_INTERFACE_V1.to_string(),
             provider: bmux_plugin_sdk::ProviderId::Host,
         },
-        RegisteredService {
-            capability: HostScope::new("bmux.clients.read").expect("capability should parse"),
-            kind: ServiceKind::Query,
-            interface_id: "client-query/v1".to_string(),
-            provider: bmux_plugin_sdk::ProviderId::Host,
-        },
-        RegisteredService {
-            capability: HostScope::new("bmux.contexts.read").expect("capability should parse"),
-            kind: ServiceKind::Query,
-            interface_id: "context-query/v1".to_string(),
-            provider: bmux_plugin_sdk::ProviderId::Host,
-        },
-        RegisteredService {
-            capability: HostScope::new("bmux.contexts.write").expect("capability should parse"),
-            kind: ServiceKind::Command,
-            interface_id: "context-command/v1".to_string(),
-            provider: bmux_plugin_sdk::ProviderId::Host,
-        },
-        RegisteredService {
-            capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
-            kind: ServiceKind::Query,
-            interface_id: "session-query/v1".to_string(),
-            provider: bmux_plugin_sdk::ProviderId::Host,
-        },
-        RegisteredService {
-            capability: HostScope::new("bmux.sessions.write").expect("capability should parse"),
-            kind: ServiceKind::Command,
-            interface_id: "session-command/v1".to_string(),
-            provider: bmux_plugin_sdk::ProviderId::Host,
-        },
-        RegisteredService {
-            capability: HostScope::new("bmux.panes.read").expect("capability should parse"),
-            kind: ServiceKind::Query,
-            interface_id: "pane-query/v1".to_string(),
-            provider: bmux_plugin_sdk::ProviderId::Host,
-        },
-        RegisteredService {
-            capability: HostScope::new("bmux.panes.write").expect("capability should parse"),
-            kind: ServiceKind::Command,
-            interface_id: "pane-command/v1".to_string(),
-            provider: bmux_plugin_sdk::ProviderId::Host,
-        },
     ]
 }
 

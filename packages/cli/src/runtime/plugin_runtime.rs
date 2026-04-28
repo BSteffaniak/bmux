@@ -2641,7 +2641,7 @@ mod tests {
             context.provided_capabilities,
             vec!["example.provider.write".to_string()]
         );
-        assert_eq!(context.services.len(), 15);
+        assert_eq!(context.services.len(), 8);
         assert!(
             context
                 .services
@@ -2683,48 +2683,6 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "cli-command/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "client-query/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "context-query/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "context-command/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "session-query/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "session-command/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "pane-query/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "pane-command/v1")
         );
         assert!(
             context
@@ -2834,7 +2792,7 @@ mod tests {
                 "example.provider.write".to_string()
             ]
         );
-        assert_eq!(context.services.len(), 16);
+        assert_eq!(context.services.len(), 9);
         assert!(
             context
                 .services
@@ -2864,48 +2822,6 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "cli-command/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "client-query/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "context-query/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "context-command/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "session-query/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "session-command/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "pane-query/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "pane-command/v1")
         );
     }
 

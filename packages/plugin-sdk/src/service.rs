@@ -421,9 +421,9 @@ mod tests {
     #[test]
     fn registered_service_with_host_provider_roundtrip() {
         let service = RegisteredService {
-            capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
+            capability: HostScope::new("bmux.storage").expect("capability should parse"),
             kind: ServiceKind::Command,
-            interface_id: "session-command/v1".to_string(),
+            interface_id: "storage-command/v1".to_string(),
             provider: ProviderId::Host,
         };
         let bytes = encode_service_message(&service).expect("registered service should encode");

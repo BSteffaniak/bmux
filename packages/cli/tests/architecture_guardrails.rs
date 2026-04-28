@@ -1538,6 +1538,31 @@ fn pane_runtime_plugin_implements_stateful() {
     }
 }
 
+/// Core may advertise only domain-agnostic host services. Domain
+/// services are provided by their owning plugins through BPDL surfaces,
+/// not by `bmux.core` convenience interfaces.
+#[test]
+fn core_service_descriptors_have_no_legacy_domain_host_interfaces() {
+    let plugin_kernel = include_str!("../src/runtime/plugin_kernel.rs");
+    let plugin_kernel_prod = production_section(plugin_kernel);
+    let denied = [
+        "client-query/v1",
+        "context-query/v1",
+        "context-command/v1",
+        "session-query/v1",
+        "session-command/v1",
+        "pane-query/v1",
+        "pane-command/v1",
+    ];
+
+    for marker in denied {
+        assert!(
+            !plugin_kernel_prod.contains(marker),
+            "packages/cli/src/runtime/plugin_kernel.rs must not advertise legacy domain host interface `{marker}`; use plugin-owned BPDL services instead",
+        );
+    }
+}
+
 /// `Request::NewSession` / `Request::KillSession` /
 /// `Request::ListSessions` / `Request::ListPanes` are absent from
 /// `bmux_ipc`. Session lifecycle and listing flow through
