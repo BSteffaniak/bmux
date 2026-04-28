@@ -3269,6 +3269,86 @@ mod tests {
         let surface = scene.surfaces.get(&pane).expect("surface present");
         assert_eq!(surface.rect, rect(2, 3, 20, 5));
         assert_eq!(surface.content_rect, rect(3, 4, 18, 3));
+        assert!(surface.paint_commands.iter().any(|cmd| {
+            matches!(
+                cmd,
+                PaintCommand::BoxBorder {
+                    glyphs: BorderGlyphs::SingleLine,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn event_bus_focus_change_updates_scene_paint_commands() {
+        use bmux_attach_layout_protocol::attach_layout_protocol::{
+            AttachLayoutSnapshot, AttachSurfaceSummary,
+        };
+        use bmux_windows_plugin_api::windows_events::PaneEvent as WindowsPaneEvent;
+
+        let bus = bmux_plugin::global_event_bus();
+        bus.register_channel::<WindowsPaneEvent>(
+            bmux_windows_plugin_api::windows_events::EVENT_KIND,
+        );
+
+        let plugin = DecorationPlugin::new();
+        spawn_windows_pane_event_subscriber(plugin.state.clone_arc());
+        let pane = Uuid::from_u128(701);
+        {
+            let mut state = plugin.state.inner.lock().expect("state");
+            apply_attach_layout_snapshot(
+                &mut state,
+                &AttachLayoutSnapshot {
+                    surfaces: vec![AttachSurfaceSummary {
+                        surface_id: pane,
+                        pane_id: Some(pane),
+                        rect: rect(2, 3, 20, 5),
+                        content_rect: rect(3, 4, 18, 3),
+                        visible: true,
+                    }],
+                    revision: 1,
+                },
+            );
+        }
+
+        bus.emit(
+            &bmux_windows_plugin_api::windows_events::EVENT_KIND,
+            WindowsPaneEvent::Focused { pane_id: pane },
+        )
+        .expect("emit focus event");
+
+        let focused_scene = wait_for_scene(&plugin, |scene| {
+            scene.surfaces.get(&pane).is_some_and(|surface| {
+                surface
+                    .paint_commands
+                    .iter()
+                    .any(|cmd| matches!(cmd, PaintCommand::BoxBorder { style, .. } if style.bold))
+            })
+        });
+        let surface = focused_scene.surfaces.get(&pane).expect("surface present");
+        assert_eq!(surface.content_rect, rect(3, 4, 18, 3));
+    }
+
+    fn wait_for_scene<F>(
+        plugin: &DecorationPlugin,
+        predicate: F,
+    ) -> bmux_scene_protocol::scene_protocol::DecorationScene
+    where
+        F: Fn(&bmux_scene_protocol::scene_protocol::DecorationScene) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let scene = plugin.build_scene();
+            if predicate(&scene) {
+                return scene;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for retained decoration scene update"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     // PR 3: scene-state publication. The decoration plugin publishes a

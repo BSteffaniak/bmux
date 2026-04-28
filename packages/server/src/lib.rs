@@ -10,12 +10,12 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_context_state::ContextStateHandle;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector, Envelope,
-    EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PerformanceRecordingLevel,
-    ProtocolContract, RecordingEventKind, RecordingPayload, RecordingRollingStartOptions, Request,
-    Response, ResponsePayload, ServerSnapshotStatus, ServicePipelinePayload,
-    ServicePipelineRequest, ServicePipelineStepResult, decode, default_supported_capabilities,
-    encode, negotiate_protocol,
+    AttachGrant, AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector,
+    ControlCatalogScope, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint,
+    PerformanceRecordingLevel, ProtocolContract, RecordingEventKind, RecordingPayload,
+    RecordingRollingStartOptions, Request, Response, ResponsePayload, ServerSnapshotStatus,
+    ServicePipelinePayload, ServicePipelineRequest, ServicePipelineStepResult, decode,
+    default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_perf_telemetry::{
     PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing, flush as flush_phase_timing,
@@ -2065,7 +2065,7 @@ fn lag_recovery_attach_view_events_for_client(
         return Vec::new();
     }
 
-    let events: Vec<Event> = revisions
+    let mut events: Vec<Event> = revisions
         .into_iter()
         .map(|(session_id, revision)| Event::AttachViewChanged {
             context_id: current_context_id_for_session(state, session_id),
@@ -2080,14 +2080,25 @@ fn lag_recovery_attach_view_events_for_client(
         })
         .collect();
 
-    // NOTE: previously, lag-recovery also pushed a full-resync
-    // `Event::ControlCatalogChanged` here. The catalog revision counter
-    // now lives in the control-catalog plugin, so the server no longer
-    // has access to the authoritative revision. Clients reconnecting
-    // after lag should poll the catalog via the typed
-    // `control-catalog-state::snapshot` query to reconcile.
+    // Force attach clients to poll the plugin-owned catalog after a
+    // dropped event window. The revision is intentionally neutral here:
+    // clients treat `full_resync` as authoritative and fetch the typed
+    // snapshot from the control-catalog plugin.
+    events.push(control_catalog_full_resync_event());
 
     events
+}
+
+fn control_catalog_full_resync_event() -> Event {
+    Event::ControlCatalogChanged {
+        revision: 0,
+        scopes: vec![
+            ControlCatalogScope::Sessions,
+            ControlCatalogScope::Contexts,
+            ControlCatalogScope::Bindings,
+        ],
+        full_resync: true,
+    }
 }
 
 fn unsubscribe_events(state: &Arc<ServerState>, client_id: ClientId) -> Result<()> {
@@ -3081,6 +3092,24 @@ mod tests {
                 context_id: "ctx-1".to_string(),
                 can_write: true,
                 cols: 120,
+            }
+        );
+    }
+
+    #[test]
+    fn lag_recovery_control_catalog_event_forces_full_resync() {
+        let event = control_catalog_full_resync_event();
+
+        assert_eq!(
+            event,
+            Event::ControlCatalogChanged {
+                revision: 0,
+                scopes: vec![
+                    ControlCatalogScope::Sessions,
+                    ControlCatalogScope::Contexts,
+                    ControlCatalogScope::Bindings,
+                ],
+                full_resync: true,
             }
         );
     }
