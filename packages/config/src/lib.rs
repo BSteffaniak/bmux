@@ -2719,9 +2719,7 @@ impl BmuxConfig {
                 .timeout_profile
                 .clone_from(&keybind_defaults.timeout_profile);
             self.keybindings.timeout_profiles = keybind_defaults.timeout_profiles;
-            repaired_fields.push(format!(
-                "keybindings timeout settings -> indefinite ({error})"
-            ));
+            repaired_fields.push(format!("keybindings timeout settings -> default ({error})"));
         }
 
         if self.behavior.protocol_trace_capacity == 0 {
@@ -3125,6 +3123,19 @@ active_profile = "vim"
                 .and_then(|mode| mode.bindings.get(":")),
             Some(&"enter_mode command".to_string())
         );
+        assert_eq!(config.keybindings.timeout_profile.as_deref(), Some("fast"));
+        let insert_bindings = &config
+            .keybindings
+            .modes
+            .get("insert")
+            .expect("insert mode should exist")
+            .bindings;
+        assert_eq!(
+            insert_bindings.get("ctrl+a escape"),
+            Some(&"enter_mode normal".to_string())
+        );
+        assert!(!insert_bindings.contains_key("ctrl+c"));
+        assert!(!insert_bindings.contains_key("escape"));
         assert!(config.keybindings.modes.contains_key("visual"));
         assert!(config.keybindings.modes.contains_key("command"));
     }

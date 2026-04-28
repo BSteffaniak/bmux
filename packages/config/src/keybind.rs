@@ -484,7 +484,7 @@ fn default_normal_bindings() -> BTreeMap<String, String> {
 
 fn default_insert_bindings() -> BTreeMap<String, String> {
     let mut bindings = BTreeMap::new();
-    bindings.insert("escape".to_string(), "enter_mode normal".to_string());
+    bindings.insert("ctrl+a escape".to_string(), "enter_mode normal".to_string());
     bindings
 }
 

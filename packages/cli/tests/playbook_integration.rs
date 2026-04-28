@@ -277,6 +277,7 @@ fn playbook_echo_assert() {
 }
 
 #[test]
+#[serial]
 fn playbook_multi_pane() {
     let (json, pass) = run_playbook_fixture("multi_pane.dsl");
     assert!(pass, "multi-pane playbook should pass: {json:#}");

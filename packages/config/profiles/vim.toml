@@ -1,5 +1,6 @@
 [keybindings]
-initial_mode = "normal"
+initial_mode    = "normal"
+timeout_profile = "fast"
 
 [keybindings.modes.normal.bindings]
 ":" = "enter_mode command"
@@ -8,8 +9,7 @@ i   = "enter_mode insert"
 v   = "enter_mode visual"
 
 [keybindings.modes.insert.bindings]
-"ctrl+c" = "enter_mode normal"
-escape   = "enter_mode normal"
+"ctrl+a escape" = "enter_mode normal"
 
 [keybindings.modes.visual]
 label       = "VISUAL"

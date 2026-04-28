@@ -681,7 +681,7 @@ impl InputProcessor {
                     continue;
                 }
 
-                if any_scroll_prefix {
+                if any_scroll_prefix && !force_timeout {
                     break;
                 }
             }
@@ -709,7 +709,7 @@ impl InputProcessor {
                 continue;
             }
 
-            if any_prefix {
+            if any_prefix && !force_timeout {
                 break;
             }
 
@@ -1719,7 +1719,10 @@ mod tests {
                 modal_mode(
                     "INSERT",
                     true,
-                    &[("escape", RuntimeAction::EnterMode("normal".to_string()))],
+                    &[(
+                        "ctrl+a escape",
+                        RuntimeAction::EnterMode("normal".to_string()),
+                    )],
                 ),
             ),
         ]);
@@ -1746,9 +1749,60 @@ mod tests {
         );
         assert_eq!(
             processor.process_chunk(&[0x1b]),
+            vec![RuntimeAction::ForwardToPane(vec![0x1b])]
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            vec![RuntimeAction::ForwardToPane(vec![0x03])]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01]),
+            Vec::<RuntimeAction>::new()
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x1b]),
             vec![RuntimeAction::EnterMode("normal".to_string())]
         );
         assert_eq!(processor.active_mode_id(), Some("normal"));
         assert_eq!(processor.process_chunk(b"x"), Vec::<RuntimeAction>::new());
+    }
+
+    #[test]
+    fn passthrough_mode_prefix_times_out_to_pane_input() {
+        let modes = BTreeMap::from([
+            ("normal".to_string(), modal_mode("NORMAL", false, &[])),
+            (
+                "insert".to_string(),
+                modal_mode(
+                    "INSERT",
+                    true,
+                    &[(
+                        "ctrl+a escape",
+                        RuntimeAction::EnterMode("normal".to_string()),
+                    )],
+                ),
+            ),
+        ]);
+
+        let keymap = Keymap::from_modal_parts_with_scroll(
+            Some(50),
+            "insert",
+            &modes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("modal keymap should parse");
+        let mut processor = new_processor(keymap);
+
+        assert_eq!(
+            processor.process_chunk(&[0x01]),
+            Vec::<RuntimeAction>::new()
+        );
+        thread::sleep(Duration::from_millis(70));
+        assert_eq!(
+            processor.process_chunk(&[]),
+            vec![RuntimeAction::ForwardToPane(vec![0x01])]
+        );
+        assert_eq!(processor.active_mode_id(), Some("insert"));
     }
 }
