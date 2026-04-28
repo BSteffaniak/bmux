@@ -3,8 +3,9 @@
 use crate::{
     Error, Span,
     ast::{
-        DeliveryMode, EnumCase, EnumDef, EventsDecl, Field, Import, Interface, InterfaceItem,
-        Operation, PluginHeader, Primitive, RecordDef, Schema, TypeRef, VariantCase, VariantDef,
+        CapabilityDecl, DeliveryMode, EnumCase, EnumDef, EventsDecl, Field, Import, Interface,
+        InterfaceItem, Operation, PluginHeader, Primitive, RecordDef, Schema, TypeRef, VariantCase,
+        VariantDef,
     },
     lexer::{Token, TokenKind},
 };
@@ -33,6 +34,10 @@ impl Parser<'_> {
         while self.check(&TokenKind::Import) {
             imports.push(self.parse_import()?);
         }
+        let mut capabilities = Vec::new();
+        while self.check_identifier("capability") {
+            capabilities.push(self.parse_capability()?);
+        }
         let mut interfaces = Vec::new();
         while self.peek().is_some() {
             interfaces.push(self.parse_interface()?);
@@ -40,6 +45,7 @@ impl Parser<'_> {
         Ok(Schema {
             plugin,
             imports,
+            capabilities,
             interfaces,
         })
     }
@@ -72,6 +78,15 @@ impl Parser<'_> {
             plugin_id,
             span,
         })
+    }
+
+    fn parse_capability(&mut self) -> Result<CapabilityDecl, Error> {
+        let span = self.expect_contextual_keyword("capability", "expected `capability` keyword")?;
+        let name = self.expect_identifier("expected capability constant name")?;
+        self.expect(&TokenKind::Equals, "expected `=` after capability name")?;
+        let id = self.parse_dotted_ident("expected capability id")?;
+        self.expect(&TokenKind::Semicolon, "expected `;` ending capability")?;
+        Ok(CapabilityDecl { name, id, span })
     }
 
     fn parse_interface(&mut self) -> Result<Interface, Error> {
@@ -411,6 +426,10 @@ impl Parser<'_> {
         self.peek().is_some_and(|t| &t.kind == kind)
     }
 
+    fn check_identifier(&self, value: &str) -> bool {
+        matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Identifier(ident)) if ident == value)
+    }
+
     fn expect(&mut self, kind: &TokenKind, message: &str) -> Result<Span, Error> {
         let tok = self.peek().ok_or_else(|| Error::Parse {
             span: Span::new(0, 0),
@@ -420,6 +439,24 @@ impl Parser<'_> {
             let span = tok.span;
             self.advance();
             Ok(span)
+        } else {
+            Err(Error::Parse {
+                span: tok.span,
+                message: format!("{message} (got {:?})", tok.kind),
+            })
+        }
+    }
+
+    fn expect_contextual_keyword(&mut self, value: &str, message: &str) -> Result<Span, Error> {
+        let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
+            span: Span::new(0, 0),
+            message: format!("{message} (unexpected end of input)"),
+        })?;
+        if let TokenKind::Identifier(name) = &tok.kind
+            && name == value
+        {
+            self.advance();
+            Ok(tok.span)
         } else {
             Err(Error::Parse {
                 span: tok.span,
@@ -585,6 +622,18 @@ mod tests {
         assert_eq!(schema.imports.len(), 1);
         assert_eq!(schema.imports[0].alias, "windows");
         assert_eq!(schema.imports[0].plugin_id, "bmux.windows");
+    }
+
+    #[test]
+    fn parses_capability_directive() {
+        let schema = must_parse(
+            "plugin p version 1;\n\
+              capability FOO_READ = bmux.foo.read;\n\
+              interface i { query q() -> unit; }",
+        );
+        assert_eq!(schema.capabilities.len(), 1);
+        assert_eq!(schema.capabilities[0].name, "FOO_READ");
+        assert_eq!(schema.capabilities[0].id, "bmux.foo.read");
     }
 
     #[test]

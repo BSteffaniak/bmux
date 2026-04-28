@@ -11,6 +11,9 @@
 
 plugin bmux.windows version 1;
 
+capability WINDOWS_READ = bmux.windows.read;
+capability WINDOWS_WRITE = bmux.windows.write;
+
 interface windows-state {
     // A pane's current lifecycle status.
     variant pane-status {

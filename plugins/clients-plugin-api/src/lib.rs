@@ -17,18 +17,3 @@ bmux_plugin_schema_macros::schema! {
 }
 
 pub mod typed_client;
-
-/// Capability identifiers gating access to this plugin's surfaces.
-///
-/// Written by hand (not BPDL-generated) until the schema language grows
-/// a `[[capabilities]]` declaration.
-pub mod capabilities {
-    use bmux_plugin_sdk::CapabilityId;
-
-    /// Capability gating read access to clients-plugin query surfaces.
-    pub const CLIENTS_READ: CapabilityId = CapabilityId::from_static("bmux.clients.read");
-
-    /// Capability gating write access to clients-plugin command
-    /// surfaces.
-    pub const CLIENTS_WRITE: CapabilityId = CapabilityId::from_static("bmux.clients.write");
-}

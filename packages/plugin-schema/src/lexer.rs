@@ -1,8 +1,8 @@
 //! Tokenizer for BPDL.
 //!
 //! The grammar uses a small set of tokens: keywords (`plugin`, `version`,
-//! `interface`, `import`, `record`, `variant`, `enum`, `query`, `command`,
-//! `events`, `list`, `map`, `result`, `unit`), identifiers, integer
+//! `interface`, `import`, `record`, `variant`, `enum`,
+//! `query`, `command`, `events`, `list`, `map`, `result`, `unit`), identifiers, integer
 //! literals, and punctuation (`{ } ( ) , ; : ? < > . = @ ->`).
 
 use crate::{Error, Span};
@@ -363,6 +363,26 @@ mod tests {
                 TokenKind::Identifier("bmux".to_string()),
                 TokenKind::Dot,
                 TokenKind::Identifier("windows".to_string()),
+                TokenKind::Semicolon,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_capability_directive() {
+        let toks = tokenize("capability FOO_READ = bmux.foo.read;").expect("lex");
+        let kinds: Vec<_> = toks.into_iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier("capability".to_string()),
+                TokenKind::Identifier("FOO_READ".to_string()),
+                TokenKind::Equals,
+                TokenKind::Identifier("bmux".to_string()),
+                TokenKind::Dot,
+                TokenKind::Identifier("foo".to_string()),
+                TokenKind::Dot,
+                TokenKind::Identifier("read".to_string()),
                 TokenKind::Semicolon,
             ]
         );

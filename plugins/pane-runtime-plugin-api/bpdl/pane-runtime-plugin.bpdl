@@ -18,6 +18,11 @@
 
 plugin bmux.pane_runtime version 1;
 
+capability PANE_RUNTIME_READ = bmux.pane_runtime.read;
+capability PANE_RUNTIME_WRITE = bmux.pane_runtime.write;
+capability ATTACH_RUNTIME_WRITE = bmux.attach_runtime.write;
+capability ATTACH_RUNTIME_READ = bmux.attach_runtime.read;
+
 interface pane-runtime-state {
     record pane-summary {
         id: uuid,

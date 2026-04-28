@@ -97,7 +97,7 @@ pub async fn list_panes<C: TypedDispatchClient>(
         PANE_RUNTIME_READ.as_str(),
         InvokeServiceKind::Query,
         pane_runtime_state::INTERFACE_ID.as_str(),
-        "list-panes",
+        pane_runtime_state::OP_LIST_PANES.as_str(),
         &ListPanesArgs { session_id },
     )
     .await
@@ -119,7 +119,7 @@ pub async fn get_pane<C: TypedDispatchClient>(
         PANE_RUNTIME_READ.as_str(),
         InvokeServiceKind::Query,
         pane_runtime_state::INTERFACE_ID.as_str(),
-        "get-pane",
+        pane_runtime_state::OP_GET_PANE.as_str(),
         &GetPaneArgs {
             session_id,
             pane_id,
@@ -222,7 +222,7 @@ pub async fn split_pane<C: TypedDispatchClient>(
         PANE_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         pane_runtime_commands::INTERFACE_ID.as_str(),
-        "split-pane",
+        pane_runtime_commands::OP_SPLIT_PANE.as_str(),
         &SplitPaneArgs {
             session_id,
             target,
@@ -256,7 +256,7 @@ pub async fn launch_pane<C: TypedDispatchClient>(
         PANE_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         pane_runtime_commands::INTERFACE_ID.as_str(),
-        "launch-pane",
+        pane_runtime_commands::OP_LAUNCH_PANE.as_str(),
         &LaunchPaneArgs {
             session_id,
             target,
@@ -289,7 +289,7 @@ pub async fn focus_pane<C: TypedDispatchClient>(
         PANE_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         pane_runtime_commands::INTERFACE_ID.as_str(),
-        "focus-pane",
+        pane_runtime_commands::OP_FOCUS_PANE.as_str(),
         &FocusPaneArgs {
             session_id,
             target,
@@ -321,7 +321,7 @@ pub async fn resize_pane<C: TypedDispatchClient>(
         PANE_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         pane_runtime_commands::INTERFACE_ID.as_str(),
-        "resize-pane",
+        pane_runtime_commands::OP_RESIZE_PANE.as_str(),
         &ResizePaneArgs {
             session_id,
             target,
@@ -349,7 +349,7 @@ pub async fn close_pane<C: TypedDispatchClient>(
         PANE_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         pane_runtime_commands::INTERFACE_ID.as_str(),
-        "close-pane",
+        pane_runtime_commands::OP_CLOSE_PANE.as_str(),
         &TargetedPaneArgs { session_id, target },
     )
     .await
@@ -372,7 +372,7 @@ pub async fn restart_pane<C: TypedDispatchClient>(
         PANE_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         pane_runtime_commands::INTERFACE_ID.as_str(),
-        "restart-pane",
+        pane_runtime_commands::OP_RESTART_PANE.as_str(),
         &TargetedPaneArgs { session_id, target },
     )
     .await
@@ -394,7 +394,7 @@ pub async fn zoom_pane<C: TypedDispatchClient>(
         PANE_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         pane_runtime_commands::INTERFACE_ID.as_str(),
-        "zoom-pane",
+        pane_runtime_commands::OP_ZOOM_PANE.as_str(),
         &ZoomPaneArgs { session_id },
     )
     .await
@@ -418,7 +418,7 @@ pub async fn pane_direct_input<C: TypedDispatchClient>(
         PANE_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         pane_runtime_commands::INTERFACE_ID.as_str(),
-        "pane-direct-input",
+        pane_runtime_commands::OP_PANE_DIRECT_INPUT.as_str(),
         &PaneDirectInputArgs {
             session_id,
             pane_id,
@@ -452,7 +452,7 @@ pub async fn new_session_with_runtime<C: TypedDispatchClient>(
         PANE_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         pane_runtime_commands::INTERFACE_ID.as_str(),
-        "new-session-with-runtime",
+        pane_runtime_commands::OP_NEW_SESSION_WITH_RUNTIME.as_str(),
         &NewSessionArgs { name },
     )
     .await
@@ -478,7 +478,7 @@ pub async fn kill_session_runtime<C: TypedDispatchClient>(
         PANE_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         pane_runtime_commands::INTERFACE_ID.as_str(),
-        "kill-session-runtime",
+        pane_runtime_commands::OP_KILL_SESSION_RUNTIME.as_str(),
         &KillSessionArgs {
             session_id,
             force_local,
@@ -570,7 +570,7 @@ pub async fn attach_session<C: TypedDispatchClient>(
         ATTACH_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         attach_runtime_commands::INTERFACE_ID.as_str(),
-        "attach-session",
+        attach_runtime_commands::OP_ATTACH_SESSION.as_str(),
         &AttachSessionArgs {
             selector,
             can_write,
@@ -599,7 +599,7 @@ pub async fn attach_context<C: TypedDispatchClient>(
         ATTACH_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         attach_runtime_commands::INTERFACE_ID.as_str(),
-        "attach-context",
+        attach_runtime_commands::OP_ATTACH_CONTEXT.as_str(),
         &AttachContextArgs {
             selector,
             can_write,
@@ -628,7 +628,7 @@ pub async fn attach_open<C: TypedDispatchClient>(
         ATTACH_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         attach_runtime_commands::INTERFACE_ID.as_str(),
-        "attach-open",
+        attach_runtime_commands::OP_ATTACH_OPEN.as_str(),
         &AttachOpenArgs {
             session_id,
             attach_token,
@@ -657,7 +657,7 @@ pub async fn attach_input<C: TypedDispatchClient>(
         ATTACH_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         attach_runtime_commands::INTERFACE_ID.as_str(),
-        "attach-input",
+        attach_runtime_commands::OP_ATTACH_INPUT.as_str(),
         &AttachInputArgs { session_id, data },
     )
     .await
@@ -683,7 +683,7 @@ pub async fn attach_output<C: TypedDispatchClient>(
         ATTACH_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         attach_runtime_commands::INTERFACE_ID.as_str(),
-        "attach-output",
+        attach_runtime_commands::OP_ATTACH_OUTPUT.as_str(),
         &AttachOutputArgs {
             session_id,
             max_bytes,
@@ -706,7 +706,7 @@ pub async fn set_client_attach_policy<C: TypedDispatchClient>(
         ATTACH_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         attach_runtime_commands::INTERFACE_ID.as_str(),
-        "set-client-attach-policy",
+        attach_runtime_commands::OP_SET_CLIENT_ATTACH_POLICY.as_str(),
         &SetClientAttachPolicyArgs { allow_detach },
     )
     .await
@@ -725,7 +725,7 @@ pub async fn detach<C: TypedDispatchClient>(
         ATTACH_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         attach_runtime_commands::INTERFACE_ID.as_str(),
-        "detach",
+        attach_runtime_commands::OP_DETACH.as_str(),
         &DetachArgs,
     )
     .await
@@ -757,7 +757,7 @@ pub async fn attach_set_viewport<C: TypedDispatchClient>(
         ATTACH_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         attach_runtime_commands::INTERFACE_ID.as_str(),
-        "attach-set-viewport",
+        attach_runtime_commands::OP_ATTACH_SET_VIEWPORT.as_str(),
         &AttachSetViewportArgs {
             session_id,
             cols,
@@ -798,7 +798,7 @@ pub async fn attach_retarget_context<C: TypedDispatchClient>(
         ATTACH_RUNTIME_WRITE.as_str(),
         InvokeServiceKind::Command,
         attach_runtime_commands::INTERFACE_ID.as_str(),
-        "attach-retarget-context",
+        attach_runtime_commands::OP_ATTACH_RETARGET_CONTEXT.as_str(),
         &AttachRetargetContextArgs {
             context_id,
             can_write,
@@ -859,7 +859,7 @@ pub async fn attach_layout_state<C: TypedDispatchClient>(
         ATTACH_RUNTIME_READ.as_str(),
         InvokeServiceKind::Query,
         attach_runtime_state::INTERFACE_ID.as_str(),
-        "attach-layout-state",
+        attach_runtime_state::OP_ATTACH_LAYOUT_STATE.as_str(),
         &AttachLayoutArgs { session_id },
     )
     .await
@@ -886,7 +886,7 @@ pub async fn attach_snapshot_state<C: TypedDispatchClient>(
         ATTACH_RUNTIME_READ.as_str(),
         InvokeServiceKind::Query,
         attach_runtime_state::INTERFACE_ID.as_str(),
-        "attach-snapshot-state",
+        attach_runtime_state::OP_ATTACH_SNAPSHOT_STATE.as_str(),
         &AttachSnapshotArgs {
             session_id,
             max_bytes_per_pane,
@@ -916,7 +916,7 @@ pub async fn attach_pane_snapshot_state<C: TypedDispatchClient>(
         ATTACH_RUNTIME_READ.as_str(),
         InvokeServiceKind::Query,
         attach_runtime_state::INTERFACE_ID.as_str(),
-        "attach-pane-snapshot-state",
+        attach_runtime_state::OP_ATTACH_PANE_SNAPSHOT_STATE.as_str(),
         &AttachPaneSnapshotArgs {
             session_id,
             pane_ids,
@@ -947,7 +947,7 @@ pub async fn attach_pane_output_batch<C: TypedDispatchClient>(
         ATTACH_RUNTIME_READ.as_str(),
         InvokeServiceKind::Query,
         attach_runtime_state::INTERFACE_ID.as_str(),
-        "attach-pane-output-batch",
+        attach_runtime_state::OP_ATTACH_PANE_OUTPUT_BATCH.as_str(),
         &AttachPaneOutputBatchArgs {
             session_id,
             pane_ids,
@@ -985,7 +985,7 @@ pub async fn attach_pane_images<C: TypedDispatchClient>(
         ATTACH_RUNTIME_READ.as_str(),
         InvokeServiceKind::Query,
         attach_runtime_state::INTERFACE_ID.as_str(),
-        "attach-pane-images",
+        attach_runtime_state::OP_ATTACH_PANE_IMAGES.as_str(),
         &AttachPaneImagesArgs {
             session_id,
             pane_ids,

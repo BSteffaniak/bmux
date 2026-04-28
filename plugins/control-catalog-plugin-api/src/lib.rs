@@ -18,15 +18,3 @@ bmux_plugin_schema_macros::schema! {
 }
 
 pub mod typed_client;
-
-/// Capability identifiers gating access to this plugin's surfaces.
-///
-/// Written by hand (not BPDL-generated) until the schema language grows
-/// a `[[capabilities]]` declaration.
-pub mod capabilities {
-    use bmux_plugin_sdk::CapabilityId;
-
-    /// Capability gating read access to the control-catalog plugin
-    /// query surface.
-    pub const CATALOG_READ: CapabilityId = CapabilityId::from_static("bmux.control_catalog.read");
-}

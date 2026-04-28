@@ -65,7 +65,7 @@ pub async fn control_catalog_snapshot<C: TypedDispatchClient>(
             CATALOG_READ.as_str(),
             InvokeServiceKind::Query,
             control_catalog_state::INTERFACE_ID.as_str(),
-            "snapshot",
+            control_catalog_state::OP_SNAPSHOT.as_str(),
             payload,
         )
         .await?;

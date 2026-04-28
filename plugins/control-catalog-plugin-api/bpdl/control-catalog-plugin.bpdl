@@ -9,6 +9,8 @@
 
 plugin bmux.control_catalog version 1;
 
+capability CATALOG_READ = bmux.control_catalog.read;
+
 interface control-catalog-state {
     // Snapshot of a single session row in the catalog.
     record session-row {

@@ -11,6 +11,9 @@
 
 plugin bmux.contexts version 1;
 
+capability CONTEXTS_READ = bmux.contexts.read;
+capability CONTEXTS_WRITE = bmux.contexts.write;
+
 interface contexts-state {
     // Snapshot of a single context's public state.
     record context-summary {

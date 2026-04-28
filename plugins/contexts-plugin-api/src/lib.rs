@@ -16,18 +16,3 @@
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/contexts-plugin.bpdl",
 }
-
-/// Capability identifiers gating access to this plugin's surfaces.
-///
-/// Written by hand (not BPDL-generated) until the schema language grows
-/// a `[[capabilities]]` declaration.
-pub mod capabilities {
-    use bmux_plugin_sdk::CapabilityId;
-
-    /// Capability gating read access to contexts-plugin query surfaces.
-    pub const CONTEXTS_READ: CapabilityId = CapabilityId::from_static("bmux.contexts.read");
-
-    /// Capability gating write access to contexts-plugin command
-    /// surfaces (creating, selecting, and closing contexts).
-    pub const CONTEXTS_WRITE: CapabilityId = CapabilityId::from_static("bmux.contexts.write");
-}

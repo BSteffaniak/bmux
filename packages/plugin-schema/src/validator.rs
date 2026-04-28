@@ -16,6 +16,7 @@
 //!   allowed because the generated Rust compiles).
 //! - Import aliases are unique; declared plugin ids must match the
 //!   imported schema's `plugin <id>` (when an imports table is supplied).
+//! - Capability constant names and ids are unique.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -82,10 +83,44 @@ pub fn validate_with_imports(
     let declared_aliases: BTreeSet<&str> =
         schema.imports.iter().map(|i| i.alias.as_str()).collect();
 
+    let mut capability_names: BTreeSet<&str> = BTreeSet::new();
+    let mut capability_ids: BTreeSet<&str> = BTreeSet::new();
+    for capability in &schema.capabilities {
+        if !is_rust_const_identifier(&capability.name) {
+            return Err(Error::Validate {
+                message: format!(
+                    "capability constant `{}` is not a valid Rust constant identifier",
+                    capability.name
+                ),
+            });
+        }
+        if !capability_names.insert(capability.name.as_str()) {
+            return Err(Error::Validate {
+                message: format!("duplicate capability constant `{}`", capability.name),
+            });
+        }
+        if !capability_ids.insert(capability.id.as_str()) {
+            return Err(Error::Validate {
+                message: format!("duplicate capability id `{}`", capability.id),
+            });
+        }
+    }
+
     for iface in &schema.interfaces {
         validate_interface(iface, &declared_aliases, imports)?;
     }
     Ok(())
+}
+
+fn is_rust_const_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn validate_interface(
@@ -489,6 +524,35 @@ mod tests {
                    interface i {\n\
                      query q() -> missing;\n\
                    }";
+        let err = compile(src).unwrap_err();
+        assert!(matches!(err, Error::Validate { .. }));
+    }
+
+    #[test]
+    fn rejects_duplicate_capability_constants() {
+        let src = "plugin p version 1;\n\
+                   capability FOO = bmux.foo.read;\n\
+                   capability FOO = bmux.foo.write;\n\
+                   interface i { query q() -> unit; }";
+        let err = compile(src).unwrap_err();
+        assert!(matches!(err, Error::Validate { .. }));
+    }
+
+    #[test]
+    fn rejects_duplicate_capability_ids() {
+        let src = "plugin p version 1;\n\
+                   capability FOO_READ = bmux.foo.read;\n\
+                   capability BAR_READ = bmux.foo.read;\n\
+                   interface i { query q() -> unit; }";
+        let err = compile(src).unwrap_err();
+        assert!(matches!(err, Error::Validate { .. }));
+    }
+
+    #[test]
+    fn rejects_invalid_capability_constant_name() {
+        let src = "plugin p version 1;\n\
+                   capability foo-read = bmux.foo.read;\n\
+                   interface i { query q() -> unit; }";
         let err = compile(src).unwrap_err();
         assert!(matches!(err, Error::Validate { .. }));
     }

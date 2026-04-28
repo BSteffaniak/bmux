@@ -35,25 +35,3 @@ pub struct PaneRuntimePluginConfig {
 /// Typed-client helpers for invoking this plugin's services from any
 /// `TypedDispatchClient` (production `bmux_client`, tests, mocks).
 pub mod typed_client;
-
-/// Capability identifiers gating access to this plugin's surfaces.
-pub mod capabilities {
-    use bmux_plugin_sdk::CapabilityId;
-
-    /// Capability gating read access to pane-runtime query surfaces.
-    pub const PANE_RUNTIME_READ: CapabilityId = CapabilityId::from_static("bmux.pane_runtime.read");
-
-    /// Capability gating write access to pane-runtime command surfaces.
-    pub const PANE_RUNTIME_WRITE: CapabilityId =
-        CapabilityId::from_static("bmux.pane_runtime.write");
-
-    /// Capability gating attach-lifecycle commands. Separate from
-    /// pane-runtime.write because attach is a per-client concern and
-    /// may be gated differently by the permissions plugin.
-    pub const ATTACH_RUNTIME_WRITE: CapabilityId =
-        CapabilityId::from_static("bmux.attach_runtime.write");
-
-    /// Capability gating attach-state queries.
-    pub const ATTACH_RUNTIME_READ: CapabilityId =
-        CapabilityId::from_static("bmux.attach_runtime.read");
-}

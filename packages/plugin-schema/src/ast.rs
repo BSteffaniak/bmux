@@ -15,6 +15,9 @@ pub struct Schema {
     /// `import <alias> = <plugin.id>;` directives. Resolved against a
     /// caller-provided imports table at validation and codegen time.
     pub imports: Vec<Import>,
+    /// `capability <NAME> = <capability.id>;` declarations emitted as
+    /// typed [`bmux_plugin_sdk::CapabilityId`] constants.
+    pub capabilities: Vec<CapabilityDecl>,
     pub interfaces: Vec<Interface>,
 }
 
@@ -33,6 +36,16 @@ pub struct Import {
     pub alias: String,
     /// The imported plugin's `plugin <id>` value.
     pub plugin_id: String,
+    pub span: Span,
+}
+
+/// A named capability constant declared at schema top level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityDecl {
+    /// Rust constant name emitted under `pub mod capabilities`.
+    pub name: String,
+    /// Canonical capability id, for example `bmux.foo.read`.
+    pub id: String,
     pub span: Span,
 }
 

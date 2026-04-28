@@ -12,6 +12,9 @@
 
 plugin bmux.clients version 1;
 
+capability CLIENTS_READ = bmux.clients.read;
+capability CLIENTS_WRITE = bmux.clients.write;
+
 interface clients-state {
     // Snapshot of a single client's public view state.
     record client-summary {

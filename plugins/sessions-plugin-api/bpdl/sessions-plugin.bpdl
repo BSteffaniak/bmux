@@ -9,6 +9,9 @@
 
 plugin bmux.sessions version 1;
 
+capability SESSIONS_READ = bmux.sessions.read;
+capability SESSIONS_WRITE = bmux.sessions.write;
+
 interface sessions-state {
     // Snapshot of a single session's public state. `client_count` is
     // the number of clients currently attached to this session; the

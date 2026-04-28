@@ -9,7 +9,8 @@
 //! - `impl Default` for any `enum`/`variant` with a `@default` case.
 //! - A `<Iface>Service` async trait bundling every `query` and
 //!   `command`.
-//! - A `pub const INTERFACE_ID: &str` with the canonical name.
+//! - `CapabilityId`, `InterfaceId`, `OperationId`, and event-kind
+//!   constants for schema-declared surfaces.
 //!
 //! Qualified type references (`<alias>.<type>`) are resolved against a
 //! caller-provided [`ImportMap`], which maps each alias to the Rust
@@ -19,8 +20,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::ast::{
-    DeliveryMode, EnumDef, Field, Interface, InterfaceItem, Operation, Primitive, RecordDef,
-    Schema, TypeRef, VariantCase, VariantDef,
+    CapabilityDecl, DeliveryMode, EnumDef, Field, Interface, InterfaceItem, Operation, Primitive,
+    RecordDef, Schema, TypeRef, VariantCase, VariantDef,
 };
 
 /// Resolution table used by codegen to turn qualified BPDL type
@@ -58,10 +59,28 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
     let mut out = String::new();
     out.push_str("// AUTO-GENERATED FROM BPDL. DO NOT EDIT BY HAND.\n\n");
     out.push_str("use serde::{Deserialize, Serialize};\n\n");
+    emit_capabilities(&schema.capabilities, &mut out);
     for iface in &schema.interfaces {
         emit_interface(&schema.plugin.plugin_id, iface, imports, &mut out);
     }
     out
+}
+
+fn emit_capabilities(capabilities: &[CapabilityDecl], out: &mut String) {
+    if capabilities.is_empty() {
+        return;
+    }
+
+    out.push_str("/// Capability identifiers declared by this plugin schema.\n");
+    out.push_str("pub mod capabilities {\n");
+    for capability in capabilities {
+        let _ = writeln!(
+            out,
+            "    /// Capability id `{}`.\n    pub const {}: ::bmux_plugin_sdk::CapabilityId = ::bmux_plugin_sdk::CapabilityId::from_static(\"{}\");\n",
+            capability.id, capability.name, capability.id,
+        );
+    }
+    out.push_str("}\n\n");
 }
 
 fn emit_interface(plugin_id: &str, iface: &Interface, imports: &ImportMap, out: &mut String) {
@@ -202,6 +221,7 @@ fn emit_service_trait(iface: &Interface, imports: &ImportMap, out: &mut String) 
         "    /// Canonical identifier for this interface. Matches the `interface`\n    /// name in the BPDL source exactly; used to look up a provider via\n    /// the plugin host registry.\n    pub const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = ::bmux_plugin_sdk::InterfaceId::from_static(\"{}\");\n",
         iface.name
     );
+    emit_operation_constants(iface, out);
     out.push_str("    /// Service trait for this interface.\n");
     out.push_str("    ///\n");
     out.push_str("    /// Consumers call through a `&dyn` reference; providers `impl`\n");
@@ -216,6 +236,19 @@ fn emit_service_trait(iface: &Interface, imports: &ImportMap, out: &mut String) 
     out.push_str("    }\n\n");
 
     emit_service_client(iface, imports, out, &trait_name);
+}
+
+fn emit_operation_constants(iface: &Interface, out: &mut String) {
+    for item in &iface.items {
+        if let InterfaceItem::Query(op) | InterfaceItem::Command(op) = item {
+            let const_name = operation_const_name(&op.name);
+            let _ = writeln!(
+                out,
+                "    /// Canonical operation identifier for `{}`.\n    pub const {}: ::bmux_plugin_sdk::OperationId = ::bmux_plugin_sdk::OperationId::from_static(\"{}\");\n",
+                op.name, const_name, op.name,
+            );
+        }
+    }
 }
 
 /// Emit event-stream bindings for an interface that declares
@@ -447,6 +480,10 @@ fn snake_case(s: &str) -> String {
     s.replace(['-', '.'], "_")
 }
 
+fn operation_const_name(s: &str) -> String {
+    format!("OP_{}", snake_case(s).to_ascii_uppercase())
+}
+
 fn pascal_case(s: &str) -> String {
     // Convert `kebab-case` or `snake_case` to `PascalCase` for Rust
     // type/trait names.
@@ -602,6 +639,47 @@ mod tests {
                 "pub const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = ::bmux_plugin_sdk::InterfaceId::from_static(\"windows-state\");"
             ),
             "codegen must emit the canonical interface id as a typed const; got: {rust}"
+        );
+    }
+
+    #[test]
+    fn emits_capability_constants() {
+        let src = "plugin bmux.foo version 1;\n\
+                   capability FOO_READ = bmux.foo.read;\n\
+                   capability FOO_WRITE = bmux.foo.write;\n\
+                   interface foo-state { query ping() -> bool; }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            rust.contains("pub mod capabilities"),
+            "codegen must emit capabilities module; got: {rust}"
+        );
+        assert!(
+            rust.contains("pub const FOO_READ: ::bmux_plugin_sdk::CapabilityId = ::bmux_plugin_sdk::CapabilityId::from_static(\"bmux.foo.read\");"),
+            "codegen must emit typed capability constants; got: {rust}"
+        );
+        assert!(
+            rust.contains("pub const FOO_WRITE: ::bmux_plugin_sdk::CapabilityId = ::bmux_plugin_sdk::CapabilityId::from_static(\"bmux.foo.write\");"),
+            "codegen must emit every declared capability; got: {rust}"
+        );
+    }
+
+    #[test]
+    fn emits_operation_id_constants() {
+        let src = "plugin p version 1;\n\
+                   interface windows-state {\n\
+                     query list-panes(session: uuid) -> unit;\n\
+                     command focus-pane(id: uuid) -> unit;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
+        assert!(
+            rust.contains("pub const OP_LIST_PANES: ::bmux_plugin_sdk::OperationId = ::bmux_plugin_sdk::OperationId::from_static(\"list-panes\");"),
+            "codegen must emit query operation id constants; got: {rust}"
+        );
+        assert!(
+            rust.contains("pub const OP_FOCUS_PANE: ::bmux_plugin_sdk::OperationId = ::bmux_plugin_sdk::OperationId::from_static(\"focus-pane\");"),
+            "codegen must emit command operation id constants; got: {rust}"
         );
     }
 

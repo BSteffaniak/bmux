@@ -55,7 +55,7 @@ pub async fn whoami<C: TypedDispatchClient>(client: &mut C) -> Result<Uuid> {
             CLIENTS_READ.as_str(),
             InvokeServiceKind::Query,
             clients_state::INTERFACE_ID.as_str(),
-            "current-client",
+            clients_state::OP_CURRENT_CLIENT.as_str(),
             payload,
         )
         .await?;
@@ -117,7 +117,7 @@ async fn set_following<C: TypedDispatchClient>(
             CLIENTS_WRITE.as_str(),
             InvokeServiceKind::Command,
             clients_commands::INTERFACE_ID.as_str(),
-            "set-following",
+            clients_commands::OP_SET_FOLLOWING.as_str(),
             payload,
         )
         .await?;
