@@ -63,11 +63,16 @@ impl StartupReadyGateRegistry {
         Self::default()
     }
 
-    /// Register a gate. Duplicate `(plugin_id, signal)` pairs with
-    /// different timeouts all wait; callers coordinate timeouts if
-    /// that matters.
+    /// Register a gate. Re-registering the same `(plugin_id, signal)`
+    /// replaces the timeout instead of accumulating duplicate waits.
     pub fn register(&self, gate: StartupReadyGate) {
         if let Ok(mut guard) = self.entries.write() {
+            if let Some(existing) = guard.iter_mut().find(|existing| {
+                existing.plugin_id == gate.plugin_id && existing.signal == gate.signal
+            }) {
+                *existing = gate;
+                return;
+            }
             guard.push(gate);
         }
     }
@@ -137,5 +142,24 @@ mod tests {
         let snap = registry.snapshot();
         assert_eq!(snap[0].plugin_id, "plug.a");
         assert_eq!(snap[1].signal, "warm");
+    }
+
+    #[test]
+    fn registry_replaces_duplicate_gate() {
+        let registry = StartupReadyGateRegistry::new();
+        registry.register(StartupReadyGate {
+            plugin_id: "plug.a".to_string(),
+            signal: "ready".to_string(),
+            timeout: Duration::from_millis(500),
+        });
+        registry.register(StartupReadyGate {
+            plugin_id: "plug.a".to_string(),
+            signal: "ready".to_string(),
+            timeout: Duration::from_millis(25),
+        });
+
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].timeout, Duration::from_millis(25));
     }
 }

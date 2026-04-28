@@ -850,6 +850,7 @@ fn parse_script_service_kind(kind: &str) -> Result<ServiceKind, String> {
 }
 
 const MAX_SCRIPT_EVENT_QUEUE: usize = 256;
+const DEFAULT_STARTUP_READY_GATE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn install_script_event_subscriptions(
     state: &Arc<Mutex<State>>,
@@ -1612,6 +1613,13 @@ fn resolve_decoration_script(
 
 impl RustPlugin for DecorationPlugin {
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        if let Some(timeout) = startup_ready_gate_timeout(context.settings.as_ref()) {
+            bmux_plugin::register_startup_ready_gate(
+                &context.plugin_id,
+                SCENE_PUBLISHED_SIGNAL,
+                timeout,
+            );
+        }
         self.lifecycle_context = Some(context);
         // Register the retained scene channel before any mutator (including
         // the initial revision bump below) tries to publish. Failure is
@@ -2279,6 +2287,25 @@ fn translate_windows_event(
             exited: false,
         },
     }
+}
+
+fn startup_ready_gate_timeout(settings: Option<&toml::Value>) -> Option<Duration> {
+    let Some(table) = settings.and_then(toml::Value::as_table) else {
+        return Some(DEFAULT_STARTUP_READY_GATE_TIMEOUT);
+    };
+    if table
+        .get("startup_ready_gate")
+        .and_then(toml::Value::as_bool)
+        == Some(false)
+    {
+        return None;
+    }
+    let timeout = table
+        .get("startup_ready_timeout_ms")
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u64::try_from(value).ok())
+        .map_or(DEFAULT_STARTUP_READY_GATE_TIMEOUT, Duration::from_millis);
+    Some(timeout)
 }
 
 /// Re-export the public API types so downstream consumers can import
@@ -3014,6 +3041,35 @@ mod tests {
             .expect("downcast");
         let style = block_on(service.default_border_style());
         assert_eq!(style, BorderStyle::default());
+    }
+
+    #[test]
+    fn startup_ready_gate_settings_default_enabled() {
+        assert_eq!(
+            startup_ready_gate_timeout(None),
+            Some(DEFAULT_STARTUP_READY_GATE_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn startup_ready_gate_settings_can_disable_gate() {
+        let settings = toml::Value::Table(toml::map::Map::from_iter([(
+            "startup_ready_gate".to_string(),
+            toml::Value::Boolean(false),
+        )]));
+        assert_eq!(startup_ready_gate_timeout(Some(&settings)), None);
+    }
+
+    #[test]
+    fn startup_ready_gate_settings_can_override_timeout() {
+        let settings = toml::Value::Table(toml::map::Map::from_iter([(
+            "startup_ready_timeout_ms".to_string(),
+            toml::Value::Integer(75),
+        )]));
+        assert_eq!(
+            startup_ready_gate_timeout(Some(&settings)),
+            Some(Duration::from_millis(75))
+        );
     }
 
     #[test]

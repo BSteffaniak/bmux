@@ -14,6 +14,20 @@ The plugin ships four built-in border styles (`none`, `ascii`, `single`,
 `cpu-heat`). ASCII is the default, matching the characters the core renderer
 falls back to when no theme is active.
 
+## Startup ready gate
+
+By default, attach startup waits briefly for `bmux.decoration` to publish its
+initial `scene-published` ready signal before drawing the first frame. Tune or
+disable that gate with plugin settings:
+
+```toml
+[plugins.settings."bmux.decoration"]
+startup_ready_gate = true
+startup_ready_timeout_ms = 2000
+```
+
+Set `startup_ready_gate = false` to skip the wait entirely.
+
 ## Lua scripting (`decorate(message)`)
 
 Themes can attach a Lua script that emits paint commands each animation
