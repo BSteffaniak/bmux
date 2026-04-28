@@ -7370,6 +7370,43 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         .unwrap_or(Err(SessionRuntimeError::Closed))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "implements the trait's atomic attach-retarget operation with viewport dimensions"
+    )]
+    fn retarget_attach_stream(
+        &self,
+        previous_session_id: Option<SessionId>,
+        next_session_id: SessionId,
+        client_id: ClientId,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+        cell_pixel_width: u16,
+        cell_pixel_height: u16,
+    ) -> Result<(u16, u16, u16, u16), SessionRuntimeError> {
+        self.with_lock(|m| {
+            if let Some(previous_session_id) = previous_session_id
+                && previous_session_id != next_session_id
+            {
+                m.end_attach(previous_session_id, client_id);
+            }
+            m.begin_attach(next_session_id, client_id)?;
+            m.set_attach_viewport(
+                next_session_id,
+                client_id,
+                cols,
+                rows,
+                status_top_inset,
+                status_bottom_inset,
+                cell_pixel_width,
+                cell_pixel_height,
+            )
+        })
+        .unwrap_or(Err(SessionRuntimeError::Closed))
+    }
+
     fn apply_stored_attach_viewport(&self, session_id: SessionId) {
         let _ = self.with_lock(|m| m.apply_stored_attach_viewport(session_id));
     }

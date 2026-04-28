@@ -53,6 +53,8 @@ struct WindowRuntimeState {
     previous_context_id: Option<Uuid>,
     window_order_ids: Option<Vec<Uuid>>,
     window_order_dirty: bool,
+    window_order_flush_generation: u64,
+    window_order_flush_scheduled: bool,
     known_contexts: BTreeMap<Uuid, Option<String>>,
 }
 
@@ -386,9 +388,9 @@ fn spawn_contexts_events_subscriber(shared: WindowsSharedState) {
 }
 
 /// Dispatch a single `ContextEvent` against the windows-plugin's
-/// persisted window order + active marker. Every handler ends with a
-/// `publish_window_list_snapshot` so subscribers of the `windows-list`
-/// state channel see the update without polling.
+/// persisted window order + active marker. Create/select event bursts
+/// are coalesced so the hot `new-window` path does not publish the
+/// same window list three times.
 fn handle_context_event(
     shared: &WindowsSharedState,
     event: &bmux_contexts_plugin_api::contexts_events::ContextEvent,
@@ -399,16 +401,24 @@ fn handle_context_event(
     match event {
         ContextEvent::Created { context_id, name } => {
             cache_known_context(&shared.runtime_state, *context_id, name.clone());
-            let _ = append_context_to_window_order(caller, &shared.runtime_state, *context_id);
-            publish_window_list_snapshot(caller, &shared.runtime_state);
+            cache_contexts_to_window_order(&shared.runtime_state, [*context_id]);
+            schedule_window_order_flush(shared.clone());
         }
         ContextEvent::Closed { context_id } => {
             remove_known_context(&shared.runtime_state, *context_id);
             let _ = remove_context_from_window_order(caller, &shared.runtime_state, *context_id);
             publish_window_list_snapshot(caller, &shared.runtime_state);
         }
-        ContextEvent::Selected { context_id }
-        | ContextEvent::SessionActiveContextChanged { context_id, .. } => {
+        ContextEvent::Selected { context_id } => {
+            let _ = mark_context_active(caller, &shared.runtime_state, *context_id);
+            publish_window_list_snapshot(caller, &shared.runtime_state);
+        }
+        ContextEvent::SessionActiveContextChanged { context_id, .. } => {
+            if in_memory_runtime_context_id(&shared.runtime_state, ACTIVE_WINDOW_CONTEXT_KEY)
+                == Some(*context_id)
+            {
+                return;
+            }
             let _ = mark_context_active(caller, &shared.runtime_state, *context_id);
             publish_window_list_snapshot(caller, &shared.runtime_state);
         }
@@ -419,6 +429,7 @@ fn handle_context_event(
 /// is not already present. Preserves the existing order of every
 /// already-known entry — new contexts land at the end, matching the
 /// creation order of the `ContextEvent::Created` stream.
+#[cfg(test)]
 fn append_context_to_window_order(
     caller: &impl HostRuntimeApi,
     runtime_state: &WindowRuntimeStateHandle,
@@ -427,6 +438,73 @@ fn append_context_to_window_order(
     append_contexts_to_window_order(caller, runtime_state, [context_id])
 }
 
+fn schedule_window_order_flush(shared: WindowsSharedState) {
+    let mut generation = {
+        let Ok(mut state) = shared.runtime_state.lock() else {
+            return;
+        };
+        state.window_order_flush_generation = state.window_order_flush_generation.saturating_add(1);
+        if state.window_order_flush_scheduled {
+            return;
+        }
+        state.window_order_flush_scheduled = true;
+        state.window_order_flush_generation
+    };
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let Some(current_generation) =
+                current_window_order_flush_generation(&shared.runtime_state)
+            else {
+                return;
+            };
+            if current_generation != generation {
+                generation = current_generation;
+                continue;
+            }
+            let _ = flush_dirty_window_order(shared.caller.as_ref(), &shared.runtime_state);
+            let Ok(mut state) = shared.runtime_state.lock() else {
+                return;
+            };
+            if state.window_order_flush_generation == generation {
+                state.window_order_flush_scheduled = false;
+                return;
+            }
+            generation = state.window_order_flush_generation;
+        }
+    });
+}
+
+fn current_window_order_flush_generation(runtime_state: &WindowRuntimeStateHandle) -> Option<u64> {
+    runtime_state
+        .lock()
+        .ok()
+        .map(|state| state.window_order_flush_generation)
+}
+
+fn flush_dirty_window_order(
+    caller: &impl HostRuntimeApi,
+    runtime_state: &WindowRuntimeStateHandle,
+) -> Result<(), String> {
+    let order_ids = {
+        let Ok(state) = runtime_state.lock() else {
+            return Ok(());
+        };
+        if !state.window_order_dirty {
+            return Ok(());
+        }
+        state.window_order_ids.clone().unwrap_or_default()
+    };
+    set_stored_window_order_ids(caller, &order_ids)?;
+    if let Ok(mut state) = runtime_state.lock()
+        && state.window_order_ids.as_ref() == Some(&order_ids)
+    {
+        state.window_order_dirty = false;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn append_contexts_to_window_order(
     caller: &impl HostRuntimeApi,
     runtime_state: &WindowRuntimeStateHandle,
@@ -480,6 +558,7 @@ fn cache_contexts_to_window_order(
     }
 }
 
+#[cfg(test)]
 fn append_contexts_to_stored_window_order(
     caller: &impl HostRuntimeApi,
     context_ids: impl IntoIterator<Item = Uuid>,
@@ -946,19 +1025,6 @@ fn publish_window_list_snapshot(
     publish_window_list_entries(entries);
 }
 
-fn publish_window_list_snapshot_from_contexts(
-    caller: &impl HostRuntimeApi,
-    runtime_state: &WindowRuntimeStateHandle,
-    contexts: &[domain_ipc::ContextSummary],
-    active_context_id: Option<Uuid>,
-) {
-    let Ok(contexts) = order_contexts_for_navigation(caller, runtime_state, contexts.to_vec())
-    else {
-        return;
-    };
-    publish_window_list_ordered_contexts(contexts, active_context_id);
-}
-
 fn publish_window_list_ordered_contexts(
     contexts: Vec<domain_ipc::ContextSummary>,
     active_context_id: Option<Uuid>,
@@ -1061,7 +1127,6 @@ fn create_window(
     order_appends.push(context_id);
     cache_contexts_to_window_order(runtime_state, order_appends);
     mark_context_active_cached(runtime_state, previous_context, context_id);
-    publish_window_list_snapshot_from_contexts(caller, runtime_state, &contexts, Some(context_id));
     Ok(WindowAck {
         ok: true,
         id: Some(context_id.to_string()),

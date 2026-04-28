@@ -257,6 +257,40 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         cell_pixel_height: u16,
     ) -> Result<(u16, u16, u16, u16), SessionRuntimeError>;
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "retargeting atomically combines attach-open and viewport dimensions; grouping would churn the public trait more than it clarifies"
+    )]
+    fn retarget_attach_stream(
+        &self,
+        previous_session_id: Option<SessionId>,
+        next_session_id: SessionId,
+        client_id: ClientId,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+        cell_pixel_width: u16,
+        cell_pixel_height: u16,
+    ) -> Result<(u16, u16, u16, u16), SessionRuntimeError> {
+        if let Some(previous_session_id) = previous_session_id
+            && previous_session_id != next_session_id
+        {
+            self.end_attach(previous_session_id, client_id);
+        }
+        self.begin_attach(next_session_id, client_id)?;
+        self.set_attach_viewport(
+            next_session_id,
+            client_id,
+            cols,
+            rows,
+            status_top_inset,
+            status_bottom_inset,
+            cell_pixel_width,
+            cell_pixel_height,
+        )
+    }
+
     fn apply_stored_attach_viewport(&self, session_id: SessionId);
 
     fn attach_layout_state(

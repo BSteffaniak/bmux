@@ -110,54 +110,88 @@ fn publish_event(event: Event) {
     }
 }
 
-fn begin_attach_stream_for_retarget(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "handler forwards the wire retarget request's viewport dimensions to the runtime atomically"
+)]
+fn retarget_attach_stream(
     runtime: &bmux_pane_runtime_state::SessionRuntimeManagerHandle,
     follow: &bmux_client_state::FollowStateHandle,
     client_id: ClientId,
     next_session_id: SessionId,
-) -> Result<(), AttachCommandError> {
+    cols: u16,
+    rows: u16,
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+    cell_pixel_width: u16,
+    cell_pixel_height: u16,
+) -> Result<(u16, u16, u16, u16), AttachCommandError> {
     let previous_stream = follow.0.attached_stream_session(client_id);
-    if let Some(prev) = previous_stream
-        && prev != next_session_id
-    {
-        runtime.0.end_attach(prev, client_id);
-        publish_event(Event::ClientDetached { id: prev.0 });
-    }
-
-    let begin_result = match runtime.0.begin_attach(next_session_id, client_id) {
-        Ok(()) => Ok(()),
+    let previous_to_detach = previous_stream.filter(|prev| *prev != next_session_id);
+    let retarget_result = match runtime.0.retarget_attach_stream(
+        previous_to_detach,
+        next_session_id,
+        client_id,
+        cols,
+        rows,
+        status_top_inset,
+        status_bottom_inset,
+        cell_pixel_width,
+        cell_pixel_height,
+    ) {
+        Ok(viewport) => Ok(viewport),
         Err(SessionRuntimeError::NotFound) => {
             let _ = runtime.0.start_runtime(next_session_id);
-            runtime.0.begin_attach(next_session_id, client_id)
+            runtime.0.retarget_attach_stream(
+                previous_to_detach,
+                next_session_id,
+                client_id,
+                cols,
+                rows,
+                status_top_inset,
+                status_bottom_inset,
+                cell_pixel_width,
+                cell_pixel_height,
+            )
         }
         Err(SessionRuntimeError::Closed) => {
             if let Some(removed) = runtime.0.remove_runtime(next_session_id) {
                 runtime.0.shutdown_removed_runtime(removed);
             }
             let _ = runtime.0.start_runtime(next_session_id);
-            runtime.0.begin_attach(next_session_id, client_id)
+            runtime.0.retarget_attach_stream(
+                previous_to_detach,
+                next_session_id,
+                client_id,
+                cols,
+                rows,
+                status_top_inset,
+                status_bottom_inset,
+                cell_pixel_width,
+                cell_pixel_height,
+            )
         }
         Err(err) => Err(err),
     };
 
-    match begin_result {
-        Ok(()) => {
+    match retarget_result {
+        Ok(viewport) => {
+            if let Some(prev) = previous_to_detach {
+                publish_event(Event::ClientDetached { id: prev.0 });
+            }
             follow
                 .0
                 .set_attached_stream_session(client_id, Some(next_session_id));
             publish_event(Event::ClientAttached {
                 id: next_session_id.0,
             });
-            super::publish_focus_state_snapshot();
+            Ok(viewport)
         }
         Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
-            return Err(AttachCommandError::SessionNotFound);
+            Err(AttachCommandError::SessionNotFound)
         }
-        Err(SessionRuntimeError::NotAttached) => {
-            return Err(failed("failed opening attach stream"));
-        }
+        Err(SessionRuntimeError::NotAttached) => Err(failed("failed opening attach stream")),
     }
-    Ok(())
 }
 
 fn session_manager() -> Result<bmux_session_state::SessionManagerHandle, AttachCommandError> {
@@ -494,59 +528,58 @@ pub fn attach_retarget_context(
     let runtime = super::session_runtime_handle()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
 
-    let context = contexts
-        .0
-        .select_for_client(client_id, &ContextSelector::ById(req.context_id))
-        .map_err(|m| failed(m.to_string()))?;
-    let Some(next_session_id) = contexts.0.current_session_for_client(client_id) else {
-        return Err(failed("context has no attached runtime"));
-    };
+    let selected_target = follow.0.selected_target(client_id);
+    let (context_id, next_session_id, selection_already_applied) =
+        if let Some((Some(selected_context_id), Some(selected_session_id))) = selected_target
+            && selected_context_id == req.context_id
+        {
+            (selected_context_id, selected_session_id, true)
+        } else {
+            let context = contexts
+                .0
+                .select_for_client(client_id, &ContextSelector::ById(req.context_id))
+                .map_err(|m| failed(m.to_string()))?;
+            let Some(selected_session_id) = contexts.0.current_session_for_client(client_id) else {
+                return Err(failed("context has no attached runtime"));
+            };
+            (context.id, selected_session_id, false)
+        };
 
-    let previous_session = follow.0.selected_session(client_id);
-    if let Some(prev) = previous_session
-        && prev != next_session_id
-    {
-        manager.0.remove_client(prev, &client_id);
+    if !selection_already_applied {
+        let previous_session = selected_target.and_then(|(_, session_id)| session_id);
+        if let Some(prev) = previous_session
+            && prev != next_session_id
+        {
+            manager.0.remove_client(prev, &client_id);
+        }
+
+        if !manager.0.contains(next_session_id) {
+            let _ = contexts.0.remove_contexts_for_session(next_session_id);
+            return Err(AttachCommandError::SessionNotFound);
+        }
+
+        manager.0.add_client(next_session_id, client_id);
+        follow
+            .0
+            .set_selected_target(client_id, Some(context_id), Some(next_session_id));
     }
 
-    if !manager.0.contains(next_session_id) {
-        let _ = contexts.0.remove_contexts_for_session(next_session_id);
-        return Err(AttachCommandError::SessionNotFound);
-    }
-
-    manager.0.add_client(next_session_id, client_id);
-    follow
-        .0
-        .set_selected_target(client_id, Some(context.id), Some(next_session_id));
-
-    if !runtime.0.session_exists(next_session_id)
-        && let Err(err) = runtime.0.start_runtime(next_session_id)
-    {
-        return Err(failed(format!(
-            "failed restarting missing session runtime {}: {err:#}",
-            next_session_id.0
-        )));
-    }
-
-    begin_attach_stream_for_retarget(&runtime, &follow, client_id, next_session_id)?;
-
-    let (cols, rows, top, bottom) = runtime
-        .0
-        .set_attach_viewport(
-            next_session_id,
-            client_id,
-            req.cols,
-            req.rows,
-            req.status_top_inset,
-            req.status_bottom_inset,
-            req.cell_pixel_width,
-            req.cell_pixel_height,
-        )
-        .map_err(|e| failed(format!("failed setting attach viewport: {e:?}")))?;
+    let (cols, rows, top, bottom) = retarget_attach_stream(
+        &runtime,
+        &follow,
+        client_id,
+        next_session_id,
+        req.cols,
+        req.rows,
+        req.status_top_inset,
+        req.status_bottom_inset,
+        req.cell_pixel_width,
+        req.cell_pixel_height,
+    )?;
 
     Ok(AttachRetargetReady {
         session_id: next_session_id.0,
-        context_id: Some(context.id),
+        context_id: Some(context_id),
         can_write: req.can_write,
         cols,
         rows,
