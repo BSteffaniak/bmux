@@ -1063,6 +1063,7 @@ dependencies = [
  "bmux_keybind",
  "bmux_keyboard",
  "bmux_pane_runtime_plugin",
+ "bmux_pane_runtime_plugin_api",
  "bmux_performance_plugin",
  "bmux_performance_plugin_api",
  "bmux_permissions_plugin",
@@ -1533,19 +1534,29 @@ dependencies = [
 name = "bmux_pane_runtime_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "anyhow",
  "bmux_attach_token_state",
  "bmux_client_state",
+ "bmux_config",
  "bmux_context_state",
+ "bmux_image",
  "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
  "bmux_pane_runtime_state",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_recording_runtime",
  "bmux_session_models",
  "bmux_session_state",
+ "bmux_snapshot_runtime",
+ "bmux_terminal_protocol",
+ "portable-pty",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
+ "vt100",
 ]
 
 [[package]]
@@ -1844,7 +1855,6 @@ dependencies = [
  "bmux_codec",
  "bmux_config",
  "bmux_context_state",
- "bmux_image",
  "bmux_ipc",
  "bmux_pane_runtime_state",
  "bmux_perf_telemetry",
@@ -1857,14 +1867,11 @@ dependencies = [
  "bmux_session_models",
  "bmux_session_state",
  "bmux_snapshot_runtime",
- "bmux_terminal_protocol",
- "portable-pty",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "uuid",
- "vt100",
 ]
 
 [[package]]

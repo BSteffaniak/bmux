@@ -24,6 +24,14 @@ bmux_plugin_schema_macros::schema! {
     source: "bpdl/pane-runtime-plugin.bpdl",
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaneRuntimePluginConfig {
+    pub shell: String,
+    pub pane_term: String,
+    #[serde(default)]
+    pub shell_integration_root: Option<std::path::PathBuf>,
+}
+
 /// Typed-client helpers for invoking this plugin's services from any
 /// `TypedDispatchClient` (production `bmux_client`, tests, mocks).
 pub mod typed_client;

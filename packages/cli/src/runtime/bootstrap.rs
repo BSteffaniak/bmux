@@ -400,7 +400,8 @@ pub(super) async fn run_server_start(
         effective_rolling_enabled,
         &effective_rolling_settings,
     );
-    register_snapshot_plugin_config(&paths);
+    register_snapshot_plugin_config(&config, &paths);
+    register_pane_runtime_plugin_config(&config, &paths, pane_shell_integration_override);
     activate_loaded_plugins(&loaded_plugins, &config, &paths)?;
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;
     let server = BmuxServer::from_config_paths_with_start_options(
@@ -540,14 +541,88 @@ fn register_recording_plugin_config(
 /// its orchestrator. The file name is versioned (`bmux-snapshot-v1.json`)
 /// so the new combined-envelope format never silently overwrites an
 /// older monolithic snapshot.
-fn register_snapshot_plugin_config(paths: &ConfigPaths) {
+fn register_snapshot_plugin_config(config: &BmuxConfig, paths: &ConfigPaths) {
     use bmux_snapshot_plugin_api::SnapshotPluginConfig;
+    if !config.behavior.restore_last_layout {
+        return;
+    }
     let plugin_config = SnapshotPluginConfig {
         snapshot_path: paths.data_dir.join("runtime").join("bmux-snapshot-v1.json"),
         debounce_ms: 1_000,
     };
     let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
     bmux_plugin::global_plugin_state_registry().register::<SnapshotPluginConfig>(&handle);
+}
+
+fn register_pane_runtime_plugin_config(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    pane_shell_integration_override: Option<bool>,
+) {
+    use bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig;
+    let plugin_config = PaneRuntimePluginConfig {
+        shell: resolve_pane_runtime_shell(config),
+        pane_term: resolve_pane_runtime_term(config),
+        shell_integration_root: pane_shell_integration_override
+            .unwrap_or(config.behavior.pane_shell_integration)
+            .then(|| paths.state_dir().join("runtime").join("shell-integration")),
+    };
+    let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
+    bmux_plugin::global_plugin_state_registry().register::<PaneRuntimePluginConfig>(&handle);
+}
+
+fn resolve_pane_runtime_shell(config: &BmuxConfig) -> String {
+    if let Some(shell) = config.general.default_shell.as_ref()
+        && !shell.trim().is_empty()
+    {
+        return shell.clone();
+    }
+    if let Ok(shell) = std::env::var("SHELL")
+        && !shell.trim().is_empty()
+    {
+        return shell;
+    }
+    if cfg!(windows) {
+        "cmd.exe".to_string()
+    } else {
+        "/bin/sh".to_string()
+    }
+}
+
+fn resolve_pane_runtime_term(config: &BmuxConfig) -> String {
+    const FALLBACKS: &[&str] = &["xterm-256color", "screen-256color"];
+    let configured = config.behavior.pane_term.trim();
+    let candidate = if configured.is_empty() {
+        "xterm-256color"
+    } else {
+        configured
+    };
+    if check_terminfo_available(candidate) {
+        return candidate.to_string();
+    }
+    for fallback in FALLBACKS {
+        if *fallback != candidate && check_terminfo_available(fallback) {
+            warn!(
+                "pane TERM '{}' terminfo not installed; falling back to '{}'",
+                candidate, fallback
+            );
+            return (*fallback).to_string();
+        }
+    }
+    warn!(
+        "pane TERM '{}' terminfo not installed and no fallback found; using as-is",
+        candidate
+    );
+    candidate.to_string()
+}
+
+fn check_terminfo_available(term: &str) -> bool {
+    std::process::Command::new("infocmp")
+        .arg(term)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn rolling_start_override_args(

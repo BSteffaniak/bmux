@@ -1,15 +1,7 @@
 //! bmux pane-runtime plugin.
 //!
-//! Declares capabilities + typed service interfaces for pane-runtime
-//! operations. The authoritative `SessionRuntimeManager` + its
-//! `SessionRuntimeManagerApi` handle are registered by `bmux_server`
-//! during `BmuxServer::new`; this plugin intentionally does not
-//! construct a second manager. Plugin role:
-//!
-//! - Hold the `bmux.pane_runtime` capability/feature declarations so
-//!   other plugins may declare typed dependencies on it.
-//! - Provide typed service handlers that translate BPDL requests into
-//!   calls against the registered `SessionRuntimeManagerHandle`.
+//! Owns the concrete pane runtime and exposes it through typed services
+//! plus the shared `SessionRuntimeManagerHandle` trait object.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
@@ -21,6 +13,8 @@ use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use std::collections::BTreeMap;
 
 mod handlers;
+mod runtime;
+mod snapshot;
 
 #[derive(Default)]
 pub struct PaneRuntimePlugin;
@@ -47,6 +41,21 @@ impl RustPlugin for PaneRuntimePlugin {
         // though the map is usually empty at activate time — sessions
         // are created later).
         handlers::publish_focus_state_snapshot();
+
+        let config = bmux_plugin::global_plugin_state_registry()
+            .get::<bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig>()
+            .and_then(|handle| handle.read().ok().map(|guard| (*guard).clone()))
+            .unwrap_or_else(|| bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig {
+                shell: std::env::var("SHELL")
+                    .ok()
+                    .filter(|shell| !shell.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.to_string()
+                    }),
+                pane_term: "xterm-256color".to_string(),
+                shell_integration_root: None,
+            });
+        runtime::activate_pane_runtime(config);
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 

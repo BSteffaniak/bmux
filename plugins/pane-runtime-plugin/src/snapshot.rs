@@ -1,14 +1,10 @@
-//! Server-owned pane-runtime `StatefulPlugin` participant.
+//! Pane-runtime plugin `StatefulPlugin` participant.
 //!
 //! Panes, layouts, floating surfaces and per-pane resurrection fields
-//! are server runtime — they live inside the process managing PTYs,
-//! not inside any plugin domain. The snapshot-orchestration plugin
-//! iterates every registered `StatefulPlugin` participant when
-//! building/restoring a combined envelope; this module registers the
-//! server-side participant so the pane runtime ends up in that
-//! envelope alongside the plugin-owned slices.
-
-use std::sync::{Arc, Weak};
+//! belong to this plugin. The snapshot-orchestration plugin iterates
+//! every registered `StatefulPlugin` participant when building/restoring
+//! a combined envelope; this module registers the pane-runtime participant
+//! so that state is persisted alongside the other plugin-owned slices.
 
 use bmux_ipc::PaneLaunchCommand;
 use bmux_plugin_sdk::{
@@ -21,25 +17,26 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{
+use crate::runtime::{session_handle, session_runtime_handle};
+use bmux_ipc::PaneSplitDirection;
+use bmux_pane_runtime_state::{
     FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec, PaneLayoutNode,
-    PaneResurrectionSnapshot, PaneRuntimeMeta, PaneSplitDirection, ServerState, session_handle,
-    session_runtime_handle,
+    PaneResurrectionSnapshot, PaneRuntimeMeta,
 };
 
-/// Stable id for the server pane-runtime snapshot surface.
-const SERVER_PANE_RUNTIME_ID: PluginEventKind =
-    PluginEventKind::from_static("bmux.server/pane-runtime");
+/// Stable id for the pane-runtime plugin snapshot surface.
+const PANE_RUNTIME_PLUGIN_SNAPSHOT_ID: PluginEventKind =
+    PluginEventKind::from_static("bmux.pane_runtime/pane-runtime");
 
 /// Current schema version for pane-runtime snapshots. Bump on any
 /// breaking change to [`PaneRuntimeSnapshotV1`] or its descendants.
-const SERVER_PANE_RUNTIME_VERSION: u32 = 1;
+const PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION: u32 = 1;
 
 /// Combined pane-runtime snapshot — one entry per session.
 ///
 /// The session identity itself is owned by the sessions plugin; this
-/// schema tracks only the runtime overlay the server manages (PTY
-/// panes, layout tree, floating surfaces, focused pane).
+/// schema tracks only the plugin-owned runtime overlay (PTY panes,
+/// layout tree, floating surfaces, focused pane).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PaneRuntimeSnapshotV1 {
     /// Per-session pane-runtime record.
@@ -164,31 +161,17 @@ fn layout_from_snapshot(node: &PaneRuntimeSnapshotV1Layout) -> PaneLayoutNode {
     }
 }
 
-/// Stateful-plugin participant that marshals the server's pane runtime
-/// into a [`PaneRuntimeSnapshotV1`].
-///
-/// Holds a `Weak<ServerState>` so the handle, which lives in the
-/// plugin state registry for the process lifetime, does not keep the
-/// server alive past a normal shutdown. If the weak reference has
-/// expired, snapshot/restore degrade to a no-op.
-pub struct ServerPaneRuntimeStateful {
-    state: Weak<ServerState>,
-}
+/// Stateful-plugin participant that marshals the pane-runtime plugin's
+/// runtime into a [`PaneRuntimeSnapshotV1`].
+pub struct PaneRuntimeStateful;
 
-impl ServerPaneRuntimeStateful {
-    fn new(state: &Arc<ServerState>) -> Self {
-        Self {
-            state: Arc::downgrade(state),
-        }
-    }
-
+impl PaneRuntimeStateful {
     /// Register a `StatefulPluginHandle` wrapping this participant in
     /// the process-wide stateful-plugin registry (creating the
     /// registry slot if absent). Intended to be called once from
-    /// `BmuxServer::run_impl` after the `SessionRuntimeManager` has
-    /// been constructed.
-    pub fn register(state: &Arc<ServerState>) {
-        let participant = Self::new(state);
+    /// pane-runtime plugin activation after the manager has been constructed.
+    pub fn register() {
+        let participant = Self;
         let handle = StatefulPluginHandle::new(participant);
         let registry = bmux_plugin::global_plugin_state_registry();
         let stateful_registry = bmux_snapshot_runtime::get_or_init_stateful_registry(
@@ -370,70 +353,47 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
     }
 }
 
-impl StatefulPlugin for ServerPaneRuntimeStateful {
+impl StatefulPlugin for PaneRuntimeStateful {
     fn id(&self) -> PluginEventKind {
-        SERVER_PANE_RUNTIME_ID
+        PANE_RUNTIME_PLUGIN_SNAPSHOT_ID
     }
 
     fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
-        if self.state.upgrade().is_none() {
-            // Server has gone away — emit an empty payload so the
-            // orchestrator can still produce a valid envelope.
-            return empty_snapshot();
-        }
         let payload =
             build_pane_runtime_payload().map_err(|err| StatefulPluginError::SnapshotFailed {
-                plugin: SERVER_PANE_RUNTIME_ID.as_str().to_string(),
+                plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
                 details: format!("{err:#}"),
             })?;
         let bytes =
             serde_json::to_vec(&payload).map_err(|err| StatefulPluginError::SnapshotFailed {
-                plugin: SERVER_PANE_RUNTIME_ID.as_str().to_string(),
+                plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
                 details: err.to_string(),
             })?;
         Ok(StatefulPluginSnapshot::new(
-            SERVER_PANE_RUNTIME_ID,
-            SERVER_PANE_RUNTIME_VERSION,
+            PANE_RUNTIME_PLUGIN_SNAPSHOT_ID,
+            PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION,
             bytes,
         ))
     }
 
     fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
-        if snapshot.version != SERVER_PANE_RUNTIME_VERSION {
+        if snapshot.version != PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION {
             return Err(StatefulPluginError::UnsupportedVersion {
-                plugin: SERVER_PANE_RUNTIME_ID.as_str().to_string(),
+                plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
                 version: snapshot.version,
-                expected: vec![SERVER_PANE_RUNTIME_VERSION],
+                expected: vec![PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION],
             });
         }
         let decoded: PaneRuntimeSnapshotV1 =
             serde_json::from_slice(&snapshot.bytes).map_err(|err| {
                 StatefulPluginError::RestoreFailed {
-                    plugin: SERVER_PANE_RUNTIME_ID.as_str().to_string(),
+                    plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
                     details: err.to_string(),
                 }
             })?;
-        if self.state.upgrade().is_none() {
-            // Server gone — nothing to restore into. Not an error.
-            return Ok(());
-        }
         apply_pane_runtime_payload(&decoded);
         Ok(())
     }
-}
-
-fn empty_snapshot() -> StatefulPluginResult<StatefulPluginSnapshot> {
-    let bytes = serde_json::to_vec(&PaneRuntimeSnapshotV1::default()).map_err(|err| {
-        StatefulPluginError::SnapshotFailed {
-            plugin: SERVER_PANE_RUNTIME_ID.as_str().to_string(),
-            details: err.to_string(),
-        }
-    })?;
-    Ok(StatefulPluginSnapshot::new(
-        SERVER_PANE_RUNTIME_ID,
-        SERVER_PANE_RUNTIME_VERSION,
-        bytes,
-    ))
 }
 
 #[cfg(test)]
@@ -443,8 +403,8 @@ mod tests {
         PaneRuntimeSnapshotV1Layout, PaneRuntimeSnapshotV1Pane,
         PaneRuntimeSnapshotV1SplitDirection,
     };
-    use crate::PaneCommandSource;
     use bmux_ipc::PaneLaunchCommand;
+    use bmux_pane_runtime_state::PaneCommandSource;
     use std::collections::BTreeMap;
     use uuid::Uuid;
 

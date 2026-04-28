@@ -16,7 +16,6 @@ bmux_attach_token_state     = { workspace = true }
 bmux_client_state           = { workspace = true }
 bmux_config                 = { workspace = true }
 bmux_context_state          = { workspace = true }
-bmux_image                  = { workspace = true, optional = true }
 bmux_ipc                    = { workspace = true }
 bmux_pane_runtime_state     = { workspace = true }
 bmux_perf_telemetry         = { workspace = true }
@@ -29,12 +28,10 @@ bmux_recording_runtime      = { workspace = true }
 bmux_session_models         = { workspace = true, features = ["serde"] }
 bmux_session_state          = { workspace = true }
 bmux_snapshot_runtime       = { workspace = true }
-bmux_terminal_protocol      = { workspace = true }
 
 # External dependencies
 anyhow = { workspace = true, features = ["std"] }
 bmux_codec = { workspace = true }
-portable-pty = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = [
@@ -47,7 +44,6 @@ tokio = { workspace = true, features = [
 ] }
 tracing = { workspace = true, features = ["std"] }
 uuid = { workspace = true, features = ["std", "v4"] }
-vt100 = { workspace = true }
 
 
 [features]
@@ -58,19 +54,9 @@ default = []
 fail-on-warnings = [
     "bmux_codec/fail-on-warnings",
     "bmux_config/fail-on-warnings",
-    "bmux_image?/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
     "bmux_session_models/fail-on-warnings",
-    "bmux_terminal_protocol/fail-on-warnings",
-]
-
-# Terminal image protocol support (feature-gated, optional)
-image-registry = [
-    "dep:bmux_image",
-    "bmux_image/sixel",
-    "bmux_image/kitty",
-    "bmux_image/iterm2",
 ]
 
 # IPC compression support

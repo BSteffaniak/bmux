@@ -32,6 +32,7 @@ bmux_fonts                      = { workspace = true, default-features = false }
 bmux_ipc                        = { workspace = true }
 bmux_keybind                    = { workspace = true }
 bmux_keyboard                   = { workspace = true }
+bmux_pane_runtime_plugin_api    = { workspace = true }
 bmux_performance_plugin_api     = { workspace = true }
 bmux_plugin                     = { workspace = true }
 bmux_plugin_sdk                 = { workspace = true }
@@ -257,19 +258,19 @@ image-iterm2 = [
     "dep:bmux_image",
     "dep:image",
     "bmux_image/iterm2",
-    "bmux_server/image-registry",
+    "bmux_pane_runtime_plugin/image-registry",
 ]
 image-kitty = [
     "dep:bmux_image",
     "dep:image",
     "bmux_image/kitty",
-    "bmux_server/image-registry",
+    "bmux_pane_runtime_plugin/image-registry",
 ]
 image-protocols = ["image-sixel", "image-kitty", "image-iterm2"]
 image-sixel = [
     "dep:bmux_image",
     "bmux_image/sixel",
-    "bmux_server/image-registry",
+    "bmux_pane_runtime_plugin/image-registry",
 ]
 
 [dev-dependencies]

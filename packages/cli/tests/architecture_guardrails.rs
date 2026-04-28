@@ -1468,60 +1468,74 @@ fn state_plugins_implement_stateful_plugin() {
     }
 }
 
-/// Verify that the server implements `StatefulPlugin` for its
-/// pane-runtime surface (panes + layout + floating + resurrection).
-/// Unlike the three foundational state plugins, pane-runtime is
-/// genuine server runtime — PTY handles live inside the server
-/// process — so the server itself registers a participant into the
-/// shared `StatefulPluginRegistry`.
+/// Verify that the pane-runtime plugin owns the `StatefulPlugin`
+/// participant for concrete pane runtime state.
 #[test]
-fn server_implements_pane_runtime_stateful() {
+fn pane_runtime_plugin_implements_stateful() {
     let pane_runtime_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../server/src/pane_runtime_snapshot.rs");
+        .join("../../plugins/pane-runtime-plugin/src/snapshot.rs");
     assert!(
         pane_runtime_path.exists(),
-        "packages/server/src/pane_runtime_snapshot.rs must exist",
+        "plugins/pane-runtime-plugin/src/snapshot.rs must exist",
     );
 
-    let module_src = include_str!("../../server/src/pane_runtime_snapshot.rs");
+    let module_src = include_str!("../../../plugins/pane-runtime-plugin/src/snapshot.rs");
     assert!(
-        module_src.contains("pub struct ServerPaneRuntimeStateful"),
-        "packages/server/src/pane_runtime_snapshot.rs must export \
-         `ServerPaneRuntimeStateful` — the server's participant in \
+        module_src.contains("pub struct PaneRuntimeStateful"),
+        "plugins/pane-runtime-plugin/src/snapshot.rs must export \
+         `PaneRuntimeStateful` — the plugin's participant in \
          the shared `StatefulPluginRegistry`",
     );
     assert!(
-        module_src.contains("impl StatefulPlugin for ServerPaneRuntimeStateful"),
-        "packages/server/src/pane_runtime_snapshot.rs must implement \
-         `StatefulPlugin` for `ServerPaneRuntimeStateful`",
+        module_src.contains("impl StatefulPlugin for PaneRuntimeStateful"),
+        "plugins/pane-runtime-plugin/src/snapshot.rs must implement \
+         `StatefulPlugin` for `PaneRuntimeStateful`",
     );
     assert!(
-        module_src.contains("bmux.server/pane-runtime"),
-        "packages/server/src/pane_runtime_snapshot.rs must ground its \
-         participant at id `bmux.server/pane-runtime` so the snapshot \
+        module_src.contains("bmux.pane_runtime/pane-runtime"),
+        "plugins/pane-runtime-plugin/src/snapshot.rs must ground its \
+         participant at id `bmux.pane_runtime/pane-runtime` so the snapshot \
          orchestrator can route restore payloads back to it",
     );
     assert!(
         module_src.contains("pub struct PaneRuntimeSnapshotV1"),
-        "packages/server/src/pane_runtime_snapshot.rs must define the \
+        "plugins/pane-runtime-plugin/src/snapshot.rs must define the \
          `PaneRuntimeSnapshotV1` schema for the pane-runtime section",
     );
 
     let server_source = include_str!("../../server/src/lib.rs");
     let server_prod = production_section(server_source);
+    let plugin_source = include_str!("../../../plugins/pane-runtime-plugin/src/lib.rs");
     assert!(
-        server_source.contains("mod pane_runtime_snapshot"),
-        "packages/server/src/lib.rs must declare the \
-         `pane_runtime_snapshot` module",
+        !server_source.contains("mod pane_runtime_snapshot"),
+        "packages/server/src/lib.rs must not declare a pane-runtime snapshot module",
     );
     assert!(
-        server_prod.contains("ServerPaneRuntimeStateful::register"),
-        "packages/server/src/lib.rs must call \
-         `ServerPaneRuntimeStateful::register(&self.state)` during \
-         `run_impl` so the server's pane-runtime participant is \
-         pushed into the shared registry before \
-         `restore_if_present` runs",
+        !server_prod.contains("PaneRuntimeStateful::register"),
+        "packages/server/src/lib.rs must not register the pane-runtime snapshot participant",
     );
+    for forbidden in [
+        "struct SessionRuntimeManager",
+        "struct PaneRuntimeHandle",
+        "struct OutputFanoutBuffer",
+        "process_pane_exit_events",
+    ] {
+        assert!(
+            !server_prod.contains(forbidden),
+            "packages/server/src/lib.rs must not define concrete pane runtime item `{forbidden}`",
+        );
+    }
+    assert!(
+        plugin_source.contains("runtime::activate_pane_runtime"),
+        "pane-runtime plugin activation must construct/register the concrete runtime",
+    );
+    let server_cargo = include_str!("../../server/Cargo.toml");
+    for forbidden_dep in ["portable-pty", "vt100", "bmux_terminal_protocol"] {
+        assert!(
+            !server_cargo.contains(forbidden_dep),
+            "packages/server/Cargo.toml must not depend on pane-runtime-only dependency `{forbidden_dep}`",
+        );
+    }
 }
 
 /// `Request::NewSession` / `Request::KillSession` /
