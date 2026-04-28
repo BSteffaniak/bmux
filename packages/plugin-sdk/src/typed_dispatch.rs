@@ -24,7 +24,7 @@
 //! [`InProcessTypedDispatch`] helpers serialize and deserialize JSON
 //! payloads so non-Rust SDKs can interoperate.
 
-use crate::{HostScope, PluginError, Result, ServiceKind};
+use crate::{HostScope, InterfaceId, PluginError, Result, ServiceKind};
 use serde::{Serialize, de::DeserializeOwned};
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
@@ -92,7 +92,7 @@ impl<S: ?Sized + 'static> TypedProviderCell<S> {
 /// wrappers use [`Self::provider_as_trait`] to recover `Arc<S>`.
 pub struct TypedServiceHandle {
     capability: HostScope,
-    interface_id: String,
+    interface_id: InterfaceId,
     kind: ServiceKind,
     provider: Arc<dyn Any + Send + Sync>,
     provider_type: TypeId,
@@ -119,7 +119,7 @@ impl TypedServiceHandle {
     #[must_use]
     pub fn new(
         capability: HostScope,
-        interface_id: impl Into<String>,
+        interface_id: impl Into<InterfaceId>,
         kind: ServiceKind,
         provider: Arc<dyn Any + Send + Sync>,
     ) -> Self {
@@ -143,7 +143,7 @@ impl TypedServiceHandle {
     #[must_use]
     pub fn new_typed<S: ?Sized + Send + Sync + 'static>(
         capability: HostScope,
-        interface_id: impl Into<String>,
+        interface_id: impl Into<InterfaceId>,
         kind: ServiceKind,
         provider: Arc<S>,
     ) -> Self {
@@ -165,7 +165,7 @@ impl TypedServiceHandle {
     }
 
     #[must_use]
-    pub fn interface_id(&self) -> &str {
+    pub const fn interface_id(&self) -> &InterfaceId {
         &self.interface_id
     }
 
@@ -223,7 +223,7 @@ impl TypedServiceHandle {
 }
 
 /// Key used to uniquely identify a typed service entry.
-pub type TypedServiceKey = (HostScope, ServiceKind, String);
+pub type TypedServiceKey = (HostScope, ServiceKind, InterfaceId);
 
 /// Collection of typed service handles a plugin provides.
 ///
@@ -259,7 +259,7 @@ impl TypedServiceRegistry {
         &mut self,
         capability: HostScope,
         kind: ServiceKind,
-        interface_id: impl Into<String>,
+        interface_id: impl Into<InterfaceId>,
         provider: Arc<S>,
     ) {
         self.insert(TypedServiceHandle::new_typed(
@@ -295,8 +295,11 @@ impl TypedServiceRegistry {
         kind: ServiceKind,
         interface_id: &str,
     ) -> Option<&TypedServiceHandle> {
-        self.entries
-            .get(&(capability.clone(), kind, interface_id.to_string()))
+        self.entries.get(&(
+            capability.clone(),
+            kind,
+            InterfaceId::from_owned(interface_id.to_string()),
+        ))
     }
 
     /// Consume the registry and return the underlying map.

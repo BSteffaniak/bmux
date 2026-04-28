@@ -1237,7 +1237,7 @@ pub(super) fn resolve_windows_commands_service() -> Option<
     let handle = registry.get(&(
         write_cap,
         bmux_plugin_sdk::ServiceKind::Command,
-        bmux_windows_plugin_api::windows_commands::INTERFACE_ID.to_string(),
+        bmux_windows_plugin_api::windows_commands::INTERFACE_ID,
     ))?;
     handle
         .provider_as_trait::<
@@ -1259,7 +1259,7 @@ pub(super) fn resolve_windows_state_service() -> Option<
     let handle = registry.get(&(
         read_cap,
         bmux_plugin_sdk::ServiceKind::Query,
-        bmux_windows_plugin_api::windows_state::INTERFACE_ID.to_string(),
+        bmux_windows_plugin_api::windows_state::INTERFACE_ID,
     ))?;
     handle
         .provider_as_trait::<
@@ -2051,12 +2051,15 @@ fn emit_external_plugin_phase_timing(
 }
 #[cfg(test)]
 mod tests {
+    static TEMP_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn temp_dir() -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time should be monotonic for test")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bmux-cli-plugin-test-{nanos}"));
+        let id = TEMP_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("bmux-cli-plugin-test-{nanos}-{id}"));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         dir
     }

@@ -1,7 +1,7 @@
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_plugin_sdk::{
-    HostConnectionInfo, HostMetadata, HostScope, PluginHost, RegisteredService, ServiceKind,
-    TypedServiceHandle, TypedServiceKey, TypedServiceRegistry,
+    HostConnectionInfo, HostMetadata, HostScope, InterfaceId, PluginHost, RegisteredService,
+    ServiceKind, TypedServiceHandle, TypedServiceKey, TypedServiceRegistry,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -100,8 +100,11 @@ impl PluginHost for CliPluginHost {
         kind: ServiceKind,
         interface_id: &str,
     ) -> Option<&TypedServiceHandle> {
-        self.typed_services
-            .get(&(capability.clone(), kind, interface_id.to_string()))
+        self.typed_services.get(&(
+            capability.clone(),
+            kind,
+            InterfaceId::from_owned(interface_id.to_string()),
+        ))
     }
 }
 
