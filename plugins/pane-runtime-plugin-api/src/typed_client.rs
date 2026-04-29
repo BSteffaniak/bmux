@@ -491,8 +491,23 @@ pub async fn kill_session_runtime<C: TypedDispatchClient>(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AttachSessionArgs {
-    selector: bmux_ipc::SessionSelector,
+    selector: attach_runtime_commands::SessionSelector,
     can_write: bool,
+}
+
+fn session_selector_from_ipc(
+    selector: bmux_ipc::SessionSelector,
+) -> attach_runtime_commands::SessionSelector {
+    match selector {
+        bmux_ipc::SessionSelector::ById(id) => attach_runtime_commands::SessionSelector {
+            id: Some(id),
+            name: None,
+        },
+        bmux_ipc::SessionSelector::ByName(name) => attach_runtime_commands::SessionSelector {
+            id: None,
+            name: Some(name),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -572,7 +587,7 @@ pub async fn attach_session<C: TypedDispatchClient>(
         attach_runtime_commands::INTERFACE_ID.as_str(),
         attach_runtime_commands::OP_ATTACH_SESSION.as_str(),
         &AttachSessionArgs {
-            selector,
+            selector: session_selector_from_ipc(selector),
             can_write,
         },
     )

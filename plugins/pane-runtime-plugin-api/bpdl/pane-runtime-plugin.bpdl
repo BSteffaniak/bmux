@@ -221,6 +221,13 @@ interface attach-runtime-commands {
         bytes: u32,
     }
 
+    // Selector identifying a session. Exactly one of `id` or `name`
+    // should be populated; `id` wins when both are set.
+    record session-selector {
+        id: uuid?,
+        name: string?,
+    }
+
     variant attach-command-error {
         session-not-found,
         invalid-grant,
@@ -230,7 +237,7 @@ interface attach-runtime-commands {
     }
 
     command attach-session(
-        session_id: uuid,
+        selector: session-selector,
         can_write: bool,
     ) -> result<attach-grant, attach-command-error>;
 

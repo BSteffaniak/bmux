@@ -13,6 +13,7 @@
 use bmux_clients_plugin_api::clients_state as api_clients_state;
 use bmux_contexts_plugin_api::{contexts_commands, contexts_state as api_contexts_state};
 use bmux_pane_runtime_plugin_api::{
+    attach_runtime_commands as api_attach_runtime_commands,
     pane_runtime_commands as api_pane_runtime_commands,
     pane_runtime_state as api_pane_runtime_state,
 };
@@ -359,6 +360,21 @@ fn session_selector_to_api(selector: &SessionSelector) -> api_sessions_state::Se
     }
 }
 
+fn session_selector_to_attach_api(
+    selector: &SessionSelector,
+) -> api_attach_runtime_commands::SessionSelector {
+    match selector {
+        SessionSelector::ById(id) => api_attach_runtime_commands::SessionSelector {
+            id: Some(*id),
+            name: None,
+        },
+        SessionSelector::ByName(name) => api_attach_runtime_commands::SessionSelector {
+            id: None,
+            name: Some(name.clone()),
+        },
+    }
+}
+
 fn context_selector_to_api(selector: &ContextSelector) -> api_contexts_state::ContextSelector {
     match selector {
         ContextSelector::ById(id) => api_contexts_state::ContextSelector {
@@ -456,25 +472,19 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn session_select(&self, request: &SessionSelectRequest) -> Result<SessionSelectResponse> {
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct Args {
-            selector: bmux_ipc::SessionSelector,
-            can_write: bool,
-        }
-        let result = self.call_service::<Args, std::result::Result<
-            bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachGrant,
-            bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachCommandError,
-        >>(
-            bmux_pane_runtime_plugin_api::capabilities::ATTACH_RUNTIME_WRITE.as_str(),
-            bmux_plugin_sdk::ServiceKind::Command,
-            bmux_pane_runtime_plugin_api::attach_runtime_commands::INTERFACE_ID.as_str(),
-            "attach-session",
-            &Args {
-                selector: session_selector_to_ipc(&request.selector),
-                can_write: true,
-            },
-        )?;
+    fn session_select(&self, request: &SessionSelectRequest) -> Result<SessionSelectResponse>
+    where
+        Self: Sync,
+    {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result = bmux_plugin::block_on_typed_dispatch(
+            api_attach_runtime_commands::client::attach_session(
+                &mut client,
+                session_selector_to_attach_api(&request.selector),
+                true,
+            ),
+        )
+        .map_err(|err| typed_service_error("attach-session", err))?;
         match result {
             Ok(grant) => Ok(SessionSelectResponse {
                 session_id: grant.session_id,

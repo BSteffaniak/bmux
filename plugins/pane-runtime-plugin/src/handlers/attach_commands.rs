@@ -9,10 +9,10 @@
 //! and wire-event emission.
 
 use bmux_attach_token_state::AttachTokenValidationError;
-use bmux_ipc::{AttachGrant, ContextSelector, Event, SessionSelector};
+use bmux_ipc::{AttachGrant, ContextSelector, Event};
 use bmux_pane_runtime_plugin_api::attach_runtime_commands::{
     AttachCommandError, AttachGrant as AttachGrantRecord, AttachOutput as AttachOutputRecord,
-    AttachReady, AttachRetargetReady, AttachViewportSet,
+    AttachReady, AttachRetargetReady, AttachViewportSet, SessionSelector,
 };
 use bmux_pane_runtime_state::SessionRuntimeError;
 use bmux_plugin::global_plugin_state_registry;
@@ -227,21 +227,17 @@ fn resolve_session_by_selector(
     manager: &dyn bmux_session_state::SessionManagerReader,
     selector: &SessionSelector,
 ) -> Option<SessionId> {
-    match selector {
-        SessionSelector::ById(id) => {
-            let sid = SessionId(*id);
-            if manager.contains(sid) {
-                Some(sid)
-            } else {
-                None
-            }
-        }
-        SessionSelector::ByName(name) => manager
+    if let Some(id) = selector.id {
+        let sid = SessionId(id);
+        return manager.contains(sid).then_some(sid);
+    }
+    selector.name.as_ref().and_then(|name| {
+        manager
             .list_sessions()
             .into_iter()
             .find(|info| info.name.as_deref() == Some(name.as_str()))
-            .map(|info| info.id),
-    }
+            .map(|info| info.id)
+    })
 }
 
 fn to_api_grant(grant: &AttachGrant) -> AttachGrantRecord {
