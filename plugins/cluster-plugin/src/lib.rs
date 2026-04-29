@@ -54,7 +54,7 @@ trait ClusterRuntimeOps {
     fn storage_set(&self, request: &StorageSetRequest) -> Result<(), String>;
 }
 
-impl<T: HostRuntimeApi + KernelOps + ?Sized> ClusterRuntimeOps for T {
+impl<T: HostRuntimeApi + KernelOps + Sync + ?Sized> ClusterRuntimeOps for T {
     fn core_cli_command_run_path(
         &self,
         request: &CoreCliCommandRequest,

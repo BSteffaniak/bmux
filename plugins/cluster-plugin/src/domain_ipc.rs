@@ -10,9 +10,15 @@
 #![allow(dead_code)]
 #![allow(clippy::result_large_err)]
 
+use bmux_clients_plugin_api::clients_state as api_clients_state;
 use bmux_contexts_plugin_api::{contexts_commands, contexts_state as api_contexts_state};
+use bmux_pane_runtime_plugin_api::{
+    pane_runtime_commands as api_pane_runtime_commands,
+    pane_runtime_state as api_pane_runtime_state,
+};
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::{PluginError, Result};
+use bmux_sessions_plugin_api::sessions_state as api_sessions_state;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -332,6 +338,27 @@ fn api_context_summary_to_local(summary: api_contexts_state::ContextSummary) -> 
     }
 }
 
+fn api_session_summary_to_local(summary: api_sessions_state::SessionSummary) -> SessionSummary {
+    SessionSummary {
+        id: summary.id,
+        name: summary.name,
+        client_count: summary.client_count as usize,
+    }
+}
+
+fn session_selector_to_api(selector: &SessionSelector) -> api_sessions_state::SessionSelector {
+    match selector {
+        SessionSelector::ById(id) => api_sessions_state::SessionSelector {
+            id: Some(*id),
+            name: None,
+        },
+        SessionSelector::ByName(name) => api_sessions_state::SessionSelector {
+            id: None,
+            name: Some(name.clone()),
+        },
+    }
+}
+
 fn context_selector_to_api(selector: &ContextSelector) -> api_contexts_state::ContextSelector {
     match selector {
         ContextSelector::ById(id) => api_contexts_state::ContextSelector {
@@ -351,6 +378,19 @@ fn typed_context_error(operation: &'static str, err: impl std::fmt::Display) -> 
     }
 }
 
+fn typed_service_error(operation: &'static str, err: impl std::fmt::Display) -> PluginError {
+    PluginError::ServiceProtocol {
+        details: format!("{operation} failed: {err}"),
+    }
+}
+
+fn pane_target_uuid(selector: Option<&PaneSelector>) -> Option<Uuid> {
+    selector.and_then(|sel| match sel {
+        PaneSelector::ById(id) => Some(*id),
+        PaneSelector::ByIndex(_) | PaneSelector::Active => None,
+    })
+}
+
 // ── Extension trait ─────────────────────────────────────────────────
 
 /// Extension trait bundling core-IPC helpers for session/pane/context/
@@ -366,30 +406,19 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn session_list(&self) -> Result<SessionListResponse> {
-        #[derive(Deserialize)]
-        struct Entry {
-            id: Uuid,
-            #[serde(default)]
-            name: Option<String>,
-            #[serde(default)]
-            client_count: u32,
-        }
-        let entries: Vec<Entry> = self.call_service(
-            bmux_sessions_plugin_api::capabilities::SESSIONS_READ.as_str(),
-            bmux_plugin_sdk::ServiceKind::Query,
-            bmux_sessions_plugin_api::sessions_state::INTERFACE_ID.as_str(),
-            "list-sessions",
-            &(),
-        )?;
+    fn session_list(&self) -> Result<SessionListResponse>
+    where
+        Self: Sync,
+    {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let entries = bmux_plugin::block_on_typed_dispatch(
+            api_sessions_state::client::list_sessions(&mut client),
+        )
+        .map_err(|err| typed_service_error("session_list", err))?;
         Ok(SessionListResponse {
             sessions: entries
                 .into_iter()
-                .map(|e| SessionSummary {
-                    id: e.id,
-                    name: e.name,
-                    client_count: e.client_count as usize,
-                })
+                .map(api_session_summary_to_local)
                 .collect(),
         })
     }
@@ -399,23 +428,18 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn session_create(&self, request: &SessionCreateRequest) -> Result<SessionCreateResponse> {
-        #[derive(Serialize)]
-        struct Args {
-            name: Option<String>,
-        }
-        let result: std::result::Result<
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionAck,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionRuntimeCommandError,
-        > = self.call_service(
-            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
-            bmux_plugin_sdk::ServiceKind::Command,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
-            "new-session-with-runtime",
-            &Args {
-                name: request.name.clone(),
-            },
-        )?;
+    fn session_create(&self, request: &SessionCreateRequest) -> Result<SessionCreateResponse>
+    where
+        Self: Sync,
+    {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result = bmux_plugin::block_on_typed_dispatch(
+            api_pane_runtime_commands::client::new_session_with_runtime(
+                &mut client,
+                request.name.clone(),
+            ),
+        )
+        .map_err(|err| typed_service_error("new-session-with-runtime", err))?;
         match result {
             Ok(ack) => Ok(SessionCreateResponse {
                 id: ack.session_id,
@@ -468,26 +492,24 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn current_client(&self) -> Result<CurrentClientResponse> {
-        use bmux_clients_plugin_api::clients_state::{self, ClientQueryError, ClientSummary};
-        self.call_service::<(), std::result::Result<ClientSummary, ClientQueryError>>(
-            bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(),
-            bmux_plugin_sdk::ServiceKind::Query,
-            clients_state::INTERFACE_ID.as_str(),
-            "current-client",
-            &(),
-        )?
-        .map_or_else(
-            |_| Err(unexpected("current_client")),
-            |summary| {
-                Ok(CurrentClientResponse {
-                    id: summary.id,
-                    selected_session_id: summary.selected_session_id,
-                    following_client_id: summary.following_client_id,
-                    following_global: summary.following_global,
-                })
-            },
-        )
+    fn current_client(&self) -> Result<CurrentClientResponse>
+    where
+        Self: Sync,
+    {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        bmux_plugin::block_on_typed_dispatch(api_clients_state::client::current_client(&mut client))
+            .map_err(|err| typed_service_error("current_client", err))?
+            .map_or_else(
+                |_| Err(unexpected("current_client")),
+                |summary| {
+                    Ok(CurrentClientResponse {
+                        id: summary.id,
+                        selected_session_id: summary.selected_session_id,
+                        following_client_id: summary.following_client_id,
+                        following_global: summary.following_global,
+                    })
+                },
+            )
     }
 
     /// List all contexts.
@@ -615,28 +637,10 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn pane_list(&self, request: &PaneListRequest) -> Result<PaneListResponse> {
-        // Dispatch through pane-runtime plugin's typed
-        // `pane-runtime-state::list-panes` service. When the caller
-        // provides a by-id selector we forward it; otherwise we pass
-        // `None` and let the handler resolve the caller's
-        // selected session via FollowState.
-        #[derive(Serialize)]
-        struct Args {
-            session_id: Option<Uuid>,
-        }
-        #[derive(Deserialize)]
-        struct Panes {
-            panes: Vec<PaneEntry>,
-        }
-        #[derive(Deserialize)]
-        struct PaneEntry {
-            id: Uuid,
-            #[serde(default)]
-            name: Option<String>,
-            #[serde(default)]
-            focused: bool,
-        }
+    fn pane_list(&self, request: &PaneListRequest) -> Result<PaneListResponse>
+    where
+        Self: Sync,
+    {
         let session_id = match request.session.as_ref() {
             Some(SessionSelector::ById(id)) => Some(*id),
             Some(SessionSelector::ByName(_)) => {
@@ -648,13 +652,11 @@ pub trait KernelOps: ServiceCaller {
             }
             None => None,
         };
-        let result: std::result::Result<Panes, serde_json::Value> = self.call_service(
-            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_READ.as_str(),
-            bmux_plugin_sdk::ServiceKind::Query,
-            bmux_pane_runtime_plugin_api::pane_runtime_state::INTERFACE_ID.as_str(),
-            "list-panes",
-            &Args { session_id },
-        )?;
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result = bmux_plugin::block_on_typed_dispatch(
+            api_pane_runtime_state::client::list_panes(&mut client, session_id),
+        )
+        .map_err(|err| typed_service_error("list-panes", err))?;
         match result {
             Ok(panes) => Ok(PaneListResponse {
                 panes: panes
@@ -670,7 +672,7 @@ pub trait KernelOps: ServiceCaller {
                     .collect(),
             }),
             Err(err) => Err(PluginError::ServiceProtocol {
-                details: format!("list-panes typed dispatch returned error: {err}"),
+                details: format!("list-panes failed: {err:?}"),
             }),
         }
     }
@@ -682,23 +684,18 @@ pub trait KernelOps: ServiceCaller {
     ///
     /// Returns an error when the typed service call fails or a
     /// name-based selector doesn't match a known session.
-    fn resolve_session_uuid(&self, selector: Option<&SessionSelector>) -> Result<Uuid> {
+    fn resolve_session_uuid(&self, selector: Option<&SessionSelector>) -> Result<Uuid>
+    where
+        Self: Sync,
+    {
         match selector {
             Some(SessionSelector::ById(id)) => Ok(*id),
             Some(SessionSelector::ByName(name)) => {
-                #[derive(Deserialize)]
-                struct Entry {
-                    id: Uuid,
-                    #[serde(default)]
-                    name: Option<String>,
-                }
-                let entries: Vec<Entry> = self.call_service(
-                    bmux_sessions_plugin_api::capabilities::SESSIONS_READ.as_str(),
-                    bmux_plugin_sdk::ServiceKind::Query,
-                    bmux_sessions_plugin_api::sessions_state::INTERFACE_ID.as_str(),
-                    "list-sessions",
-                    &(),
-                )?;
+                let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+                let entries = bmux_plugin::block_on_typed_dispatch(
+                    api_sessions_state::client::list_sessions(&mut client),
+                )
+                .map_err(|err| typed_service_error("resolve_session_uuid", err))?;
                 entries
                     .into_iter()
                     .find(|e| e.name.as_deref() == Some(name.as_str()))
@@ -718,38 +715,26 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn pane_split(&self, request: &PaneSplitRequest) -> Result<PaneSplitResponse> {
-        #[derive(Serialize)]
-        struct Args {
-            session_id: Uuid,
-            target: Option<Uuid>,
-            direction: String,
-            ratio_percent: u8,
-        }
+    fn pane_split(&self, request: &PaneSplitRequest) -> Result<PaneSplitResponse>
+    where
+        Self: Sync,
+    {
         let session_id = self.resolve_session_uuid(request.session.as_ref())?;
-        let target = request.target.as_ref().and_then(|sel| match sel {
-            PaneSelector::ById(id) => Some(*id),
-            _ => None,
-        });
+        let target = pane_target_uuid(request.target.as_ref());
         let direction = match request.direction {
             PaneSplitDirection::Horizontal => "horizontal",
             PaneSplitDirection::Vertical => "vertical",
         };
-        let result: std::result::Result<
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
-        > = self.call_service(
-            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
-            bmux_plugin_sdk::ServiceKind::Command,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
-            "split-pane",
-            &Args {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result =
+            bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::split_pane(
+                &mut client,
                 session_id,
                 target,
-                direction: direction.to_string(),
-                ratio_percent: 50,
-            },
-        )?;
+                direction.to_string(),
+                50,
+            ))
+            .map_err(|err| typed_service_error("split-pane", err))?;
         match result {
             Ok(ack) => Ok(PaneSplitResponse {
                 id: ack.pane_id,
@@ -766,50 +751,30 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn pane_launch(&self, request: &PaneLaunchRequest) -> Result<PaneLaunchResponse> {
-        #[derive(Serialize)]
-        #[allow(
-            clippy::struct_field_names,
-            reason = "Args field names mirror the BPDL contract fields"
-        )]
-        struct Args {
-            session_id: Uuid,
-            target: Option<Uuid>,
-            direction: String,
-            ratio_percent: u8,
-            name: Option<String>,
-            program: String,
-            args: Vec<String>,
-            cwd: Option<String>,
-        }
+    fn pane_launch(&self, request: &PaneLaunchRequest) -> Result<PaneLaunchResponse>
+    where
+        Self: Sync,
+    {
         let session_id = self.resolve_session_uuid(request.session.as_ref())?;
-        let target = request.target.as_ref().and_then(|sel| match sel {
-            PaneSelector::ById(id) => Some(*id),
-            _ => None,
-        });
+        let target = pane_target_uuid(request.target.as_ref());
         let direction = match request.direction {
             PaneSplitDirection::Horizontal => "horizontal",
             PaneSplitDirection::Vertical => "vertical",
         };
-        let result: std::result::Result<
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
-        > = self.call_service(
-            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
-            bmux_plugin_sdk::ServiceKind::Command,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
-            "launch-pane",
-            &Args {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result =
+            bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::launch_pane(
+                &mut client,
                 session_id,
                 target,
-                direction: direction.to_string(),
-                ratio_percent: 50,
-                name: request.name.clone(),
-                program: request.command.program.clone(),
-                args: request.command.args.clone(),
-                cwd: request.command.cwd.clone(),
-            },
-        )?;
+                direction.to_string(),
+                50,
+                request.name.clone(),
+                request.command.program.clone(),
+                request.command.args.clone(),
+                request.command.cwd.clone(),
+            ))
+            .map_err(|err| typed_service_error("launch-pane", err))?;
         match result {
             Ok(ack) => Ok(PaneLaunchResponse {
                 id: ack.pane_id,
@@ -826,36 +791,25 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn pane_focus(&self, request: &PaneFocusRequest) -> Result<PaneFocusResponse> {
-        #[derive(Serialize)]
-        struct Args {
-            session_id: Uuid,
-            target: Option<Uuid>,
-            direction: String,
-        }
+    fn pane_focus(&self, request: &PaneFocusRequest) -> Result<PaneFocusResponse>
+    where
+        Self: Sync,
+    {
         let session_id = self.resolve_session_uuid(request.session.as_ref())?;
-        let target = request.target.as_ref().and_then(|sel| match sel {
-            PaneSelector::ById(id) => Some(*id),
-            _ => None,
-        });
+        let target = pane_target_uuid(request.target.as_ref());
         let direction = request.direction.map_or_else(String::new, |d| match d {
             PaneFocusDirection::Next => "next".to_string(),
             PaneFocusDirection::Prev => "prev".to_string(),
         });
-        let result: std::result::Result<
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
-        > = self.call_service(
-            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
-            bmux_plugin_sdk::ServiceKind::Command,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
-            "focus-pane",
-            &Args {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result =
+            bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::focus_pane(
+                &mut client,
                 session_id,
                 target,
                 direction,
-            },
-        )?;
+            ))
+            .map_err(|err| typed_service_error("focus-pane", err))?;
         match result {
             Ok(ack) => Ok(PaneFocusResponse {
                 id: ack.pane_id,
@@ -872,35 +826,23 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn pane_resize(&self, request: &PaneResizeRequest) -> Result<PaneResizeResponse> {
-        #[derive(Serialize)]
-        struct Args {
-            session_id: Uuid,
-            target: Option<Uuid>,
-            direction: &'static str,
-            cells: u16,
-        }
+    fn pane_resize(&self, request: &PaneResizeRequest) -> Result<PaneResizeResponse>
+    where
+        Self: Sync,
+    {
         let session_id = self.resolve_session_uuid(request.session.as_ref())?;
-        let target = request.target.as_ref().and_then(|sel| match sel {
-            PaneSelector::ById(id) => Some(*id),
-            _ => None,
-        });
+        let target = pane_target_uuid(request.target.as_ref());
         let direction = pane_resize_direction_name(request.direction);
-        let result: std::result::Result<
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionAck,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
-        > = self.call_service(
-            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
-            bmux_plugin_sdk::ServiceKind::Command,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
-            "resize-pane",
-            &Args {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result =
+            bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::resize_pane(
+                &mut client,
                 session_id,
                 target,
-                direction,
-                cells: request.cells,
-            },
-        )?;
+                direction.to_string(),
+                request.cells,
+            ))
+            .map_err(|err| typed_service_error("resize-pane", err))?;
         match result {
             Ok(ack) => Ok(PaneResizeResponse {
                 session_id: ack.session_id,
@@ -916,27 +858,17 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn pane_close(&self, request: &PaneCloseRequest) -> Result<PaneCloseResponse> {
-        #[derive(Serialize)]
-        struct Args {
-            session_id: Uuid,
-            target: Option<Uuid>,
-        }
+    fn pane_close(&self, request: &PaneCloseRequest) -> Result<PaneCloseResponse>
+    where
+        Self: Sync,
+    {
         let session_id = self.resolve_session_uuid(request.session.as_ref())?;
-        let target = request.target.as_ref().and_then(|sel| match sel {
-            PaneSelector::ById(id) => Some(*id),
-            _ => None,
-        });
-        let result: std::result::Result<
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
-        > = self.call_service(
-            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
-            bmux_plugin_sdk::ServiceKind::Command,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
-            "close-pane",
-            &Args { session_id, target },
-        )?;
+        let target = pane_target_uuid(request.target.as_ref());
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result = bmux_plugin::block_on_typed_dispatch(
+            api_pane_runtime_commands::client::close_pane(&mut client, session_id, target),
+        )
+        .map_err(|err| typed_service_error("close-pane", err))?;
         match result {
             Ok(ack) => Ok(PaneCloseResponse {
                 id: ack.pane_id,
@@ -955,22 +887,16 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn pane_zoom(&self, request: &PaneZoomRequest) -> Result<PaneZoomResponse> {
-        #[derive(Serialize)]
-        struct Args {
-            session_id: Uuid,
-        }
+    fn pane_zoom(&self, request: &PaneZoomRequest) -> Result<PaneZoomResponse>
+    where
+        Self: Sync,
+    {
         let session_id = self.resolve_session_uuid(request.session.as_ref())?;
-        let result: std::result::Result<
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneCommandError,
-        > = self.call_service(
-            bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
-            bmux_plugin_sdk::ServiceKind::Command,
-            bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
-            "zoom-pane",
-            &Args { session_id },
-        )?;
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result = bmux_plugin::block_on_typed_dispatch(
+            api_pane_runtime_commands::client::zoom_pane(&mut client, session_id),
+        )
+        .map_err(|err| typed_service_error("zoom-pane", err))?;
         match result {
             Ok(ack) => Ok(PaneZoomResponse {
                 session_id: ack.session_id,
