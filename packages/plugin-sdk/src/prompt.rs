@@ -65,7 +65,7 @@ impl PromptOption {
 /// on submission and display an inline error if the value is invalid.  The
 /// prompt stays open until the user corrects the input or cancels.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PromptValidation {
     /// The value must not be empty or whitespace-only.
     NonEmpty,
@@ -144,7 +144,7 @@ impl PromptValidation {
 
 /// The concrete field type for a prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PromptField {
     /// Yes / No confirmation.
     Confirm {
@@ -259,7 +259,7 @@ impl PromptFormField {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PromptFormFieldKind {
     Bool {
         default: bool,
@@ -611,7 +611,7 @@ pub enum PromptValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PromptFormValue {
     Bool(bool),
     Text(String),
@@ -731,5 +731,68 @@ mod tests {
 
         let cancelled = PromptResponse::Cancelled;
         assert_eq!(cancelled.submitted_value(), None);
+    }
+
+    #[test]
+    fn prompt_form_request_round_trips_through_service_codec() {
+        let request = PromptRequest::form(
+            "Performance settings",
+            vec![PromptFormSection::new(
+                "general",
+                "General",
+                vec![
+                    PromptFormField::new(
+                        "enabled",
+                        "Enabled",
+                        PromptFormFieldKind::Bool { default: true },
+                    ),
+                    PromptFormField::new(
+                        "sample_interval_ms",
+                        "Sample interval",
+                        PromptFormFieldKind::Integer {
+                            initial_value: 1_000,
+                            min: Some(250),
+                            max: Some(60_000),
+                        },
+                    ),
+                    PromptFormField::new(
+                        "label",
+                        "Label",
+                        PromptFormFieldKind::Text {
+                            initial_value: "CPU".to_string(),
+                            placeholder: Some("Metric label".to_string()),
+                            validation: Some(PromptValidation::NonEmpty),
+                        },
+                    ),
+                ],
+            )],
+        );
+
+        let payload = crate::encode_service_message(&request).expect("encode prompt request");
+        let decoded: PromptRequest =
+            crate::decode_service_message(&payload).expect("decode prompt request");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn prompt_form_values_round_trip_through_service_codec() {
+        let values = BTreeMap::from([
+            ("enabled".to_string(), PromptFormValue::Bool(true)),
+            (
+                "sample_interval_ms".to_string(),
+                PromptFormValue::Integer(1_000),
+            ),
+            (
+                "metrics".to_string(),
+                PromptFormValue::Multi(vec!["cpu".to_string(), "memory".to_string()]),
+            ),
+        ]);
+
+        let payload = crate::encode_service_message(&values).expect("encode form values");
+        let decoded: BTreeMap<String, PromptFormValue> =
+            crate::decode_service_message(&payload).expect("decode form values");
+
+        assert_eq!(decoded, values);
     }
 }

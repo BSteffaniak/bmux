@@ -191,7 +191,7 @@ fn epoch_millis_now() -> u64 {
 /// variants that used to live on `bmux_ipc::Request` before the
 /// performance plugin migration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PerformanceRequest {
     /// Return the current normalized settings.
     GetSettings,
@@ -226,7 +226,7 @@ pub enum PerformanceRequest {
 /// dispatch surface. Both operations return a single variant carrying
 /// the current (or newly-updated) settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PerformanceResponse {
     Settings {
         settings: PerformanceRuntimeSettings,
@@ -251,7 +251,7 @@ pub enum PerformanceResponse {
 
 /// Metric target selected by a watch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum MetricTarget {
     /// Whole-machine CPU/memory metrics.
     System,
@@ -456,7 +456,7 @@ pub struct MetricsSnapshot {
 /// implementation emits `SnapshotUpdated` after each sample; consumers
 /// that only need latest values should prefer `METRICS_STATE_KIND`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum MetricEvent {
     SnapshotUpdated { sampled_at_epoch_ms: u64 },
 }
@@ -466,7 +466,7 @@ pub enum MetricEvent {
 /// this to the legacy wire `Event::PerformanceSettingsUpdated` for
 /// cross-process subscribers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PerformanceEvent {
     SettingsUpdated {
         settings: PerformanceRuntimeSettings,
@@ -539,5 +539,51 @@ mod tests {
         let encoded = serde_json::to_string(&snapshot).expect("encode snapshot");
         let decoded: MetricsSnapshot = serde_json::from_str(&encoded).expect("decode snapshot");
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn performance_request_round_trips_through_service_codec() {
+        let request = PerformanceRequest::StartWatch {
+            watch: MetricWatch {
+                id: "hot".to_string(),
+                target: MetricTarget::Pane {
+                    pane_id: Uuid::nil(),
+                },
+                metrics: vec![MetricName::CpuPercent, MetricName::MemoryBytes],
+                interval_ms: 1_000,
+                cpu_percent_mode: CpuPercentMode::Normalized,
+            },
+        };
+
+        let payload =
+            bmux_plugin_sdk::encode_service_message(&request).expect("encode performance request");
+        let decoded: PerformanceRequest =
+            bmux_plugin_sdk::decode_service_message(&payload).expect("decode performance request");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn prompt_form_response_round_trips_through_service_codec() {
+        let request = PromptRequest::form(
+            "Performance settings",
+            vec![bmux_plugin_sdk::PromptFormSection::new(
+                "general",
+                "General",
+                vec![bmux_plugin_sdk::PromptFormField::new(
+                    "enabled",
+                    "Enabled",
+                    bmux_plugin_sdk::PromptFormFieldKind::Bool { default: true },
+                )],
+            )],
+        );
+        let response = PerformanceResponse::PromptForm { request };
+
+        let payload = bmux_plugin_sdk::encode_service_message(&response)
+            .expect("encode prompt form response");
+        let decoded: PerformanceResponse =
+            bmux_plugin_sdk::decode_service_message(&payload).expect("decode prompt form response");
+
+        assert_eq!(decoded, response);
     }
 }

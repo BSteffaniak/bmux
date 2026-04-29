@@ -476,37 +476,50 @@ async fn configure_performance_theme_header(
     context: &NativeCommandContext,
     persistence: ThemePersistence,
 ) {
-    let Ok(response) = context.call_service::<(), PerformanceResponse>(
+    let response = match context.call_service::<(), PerformanceResponse>(
         PERFORMANCE_READ.as_str(),
         ServiceKind::Query,
         "performance-commands",
         "build-theme-header-settings-form",
         &(),
-    ) else {
-        return;
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(%error, "failed building performance theme settings form");
+            return;
+        }
     };
     let PerformanceResponse::PromptForm { request } = response else {
+        warn!("performance settings form service returned unexpected response");
         return;
     };
     let request = request
         .owner_plugin_id("bmux.theme")
         .modal_id("performance-advanced-settings")
-        .policy(bmux_plugin_sdk::PromptPolicy::RejectIfBusy);
-    let Ok(response) = prompt::request(request).await else {
-        return;
+        .policy(bmux_plugin_sdk::PromptPolicy::Enqueue);
+    let response = match prompt::request(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(%error, "failed opening performance theme settings form");
+            return;
+        }
     };
     let PromptResponse::Submitted(PromptValue::Form(values)) = response else {
         return;
     };
-    let Ok(PerformanceResponse::ThemeHeaderSettings { settings }) = context
-        .call_service::<_, PerformanceResponse>(
-            PERFORMANCE_WRITE.as_str(),
-            ServiceKind::Command,
-            "performance-commands",
-            "apply-theme-header-settings-form",
-            &values,
-        )
-    else {
+    let response = context.call_service::<_, PerformanceResponse>(
+        PERFORMANCE_WRITE.as_str(),
+        ServiceKind::Command,
+        "performance-commands",
+        "apply-theme-header-settings-form",
+        &values,
+    );
+    let Ok(PerformanceResponse::ThemeHeaderSettings { settings }) = response else {
+        if let Err(error) = response {
+            warn!(%error, "failed applying performance theme settings form");
+        } else {
+            warn!("performance settings apply service returned unexpected response");
+        }
         return;
     };
     if matches!(persistence, ThemePersistence::PersistBetweenConnects) {
