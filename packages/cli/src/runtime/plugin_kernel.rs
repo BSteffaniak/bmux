@@ -53,8 +53,25 @@ pub(super) struct HostKernelClientFactoryGuard;
 
 pub(super) static EFFECTIVE_LOG_LEVEL: OnceLock<Level> = OnceLock::new();
 
-pub(super) static LOG_WRITER_GUARD: OnceLock<moosicbox_log_runtime::init::LoggingHandle> =
-    OnceLock::new();
+pub(super) enum RuntimeLoggingHandle {
+    Moosicbox {
+        _handle: moosicbox_log_runtime::init::LoggingHandle,
+    },
+    Diagnostic {
+        handle: bmux_diagnostic_log::DiagnosticLogHandle,
+        _guard: tracing_appender::non_blocking::WorkerGuard,
+    },
+}
+
+impl RuntimeLoggingHandle {
+    pub(super) fn set_client_id(&self, client_id: impl Into<String>) {
+        if let Self::Diagnostic { handle, .. } = self {
+            handle.set_client_id(client_id);
+        }
+    }
+}
+
+pub(super) static LOG_WRITER_GUARD: OnceLock<RuntimeLoggingHandle> = OnceLock::new();
 
 impl Drop for ServiceKernelContextGuard {
     fn drop(&mut self) {

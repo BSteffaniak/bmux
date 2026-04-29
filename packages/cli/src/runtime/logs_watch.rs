@@ -27,8 +27,8 @@ pub fn run_logs_watch(
 ) -> Result<u8> {
     moosicbox_log_watch::run_watch(moosicbox_log_watch::WatchRunConfig {
         title: BMUX_WATCH_TITLE.to_string(),
-        log_dir: ConfigPaths::default().logs_dir(),
-        log_file_prefix: BMUX_LOG_FILE_PREFIX.to_string(),
+        log_dir: active_log_watch_dir(),
+        log_file_prefix: active_log_watch_prefix().to_string(),
         lines,
         since: since.map(ToString::to_string),
         profile: profile.map(ToString::to_string),
@@ -142,10 +142,43 @@ pub fn run_logs_profiles_rename(from: &str, to: &str) -> Result<u8> {
 }
 
 pub fn active_log_file_path() -> PathBuf {
+    let segmented = ConfigPaths::default()
+        .logs_dir()
+        .join("server")
+        .join("latest")
+        .join("latest.log");
+    if segmented.exists() {
+        return segmented;
+    }
     moosicbox_log_watch::active_log_file_path(
         &ConfigPaths::default().logs_dir(),
         BMUX_LOG_FILE_PREFIX,
     )
+}
+
+fn active_log_watch_dir() -> PathBuf {
+    let segmented_dir = ConfigPaths::default()
+        .logs_dir()
+        .join("server")
+        .join("latest");
+    if segmented_dir.exists() {
+        segmented_dir
+    } else {
+        ConfigPaths::default().logs_dir()
+    }
+}
+
+fn active_log_watch_prefix() -> &'static str {
+    if ConfigPaths::default()
+        .logs_dir()
+        .join("server")
+        .join("latest")
+        .exists()
+    {
+        "server"
+    } else {
+        BMUX_LOG_FILE_PREFIX
+    }
 }
 
 fn logs_watch_state_file_path() -> PathBuf {

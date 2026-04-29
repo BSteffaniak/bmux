@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Segmented diagnostic log writer for bmux runtimes"
+edition     = { workspace = true }
+keywords    = ["bmux", "diagnostics", "logging"]
+license     = { workspace = true }
+name        = "bmux_diagnostic_log"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+fail-on-warnings = []

@@ -71,8 +71,8 @@ pub use attach::runtime::AttachRunOutcome;
 use attach::runtime::run_session_attach_with_client;
 pub use attach::state::AttachExitReason;
 use bootstrap::{
-    DefaultAttachOptions, init_logging, map_attach_client_error, map_cli_client_error,
-    run_default_server_attach, run_server_start, run_session_attach,
+    DefaultAttachOptions, LogProcessScope, init_logging, map_attach_client_error,
+    map_cli_client_error, run_default_server_attach, run_server_start, run_session_attach,
 };
 use built_in_commands::{BuiltInHandlerId, built_in_command_by_handler};
 use cli_parse::{
@@ -265,6 +265,35 @@ enum TerminalProfile {
 /// Returns `true` for commands that enter raw terminal mode (TUI attach
 /// sessions).  When `command` is `None` the default attach path is taken,
 /// which always enters raw mode.
+const fn logging_scope_for_command(command: Option<&bmux_cli_schema::Command>) -> LogProcessScope {
+    use bmux_cli_schema::{Command, KioskCommand, ServerCommand, SessionCommand};
+    let Some(cmd) = command else {
+        return LogProcessScope::Client;
+    };
+    match cmd {
+        Command::Attach { .. }
+        | Command::Connect { .. }
+        | Command::Join { .. }
+        | Command::Host { .. }
+        | Command::Kiosk {
+            command: KioskCommand::Attach { .. },
+        }
+        | Command::Session {
+            command: SessionCommand::Attach { .. },
+        } => LogProcessScope::Client,
+        Command::Server {
+            command: ServerCommand::Start { .. } | ServerCommand::Gateway { .. },
+        } => LogProcessScope::Server,
+        _ => LogProcessScope::Command,
+    }
+}
+
+pub fn set_logging_client_id(client_id: impl Into<String>) {
+    if let Some(handle) = LOG_WRITER_GUARD.get() {
+        handle.set_client_id(client_id);
+    }
+}
+
 const fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> bool {
     use bmux_cli_schema::{
         Command, LogsCommand, PlaybookCommand, RecordingCommand, SessionCommand,
@@ -335,7 +364,12 @@ pub async fn run() -> Result<u8> {
         } => {
             let _config_override_guard = push_process_config_overrides(config_overrides);
             let file_only = command_enters_raw_mode(cli.command.as_ref()) || cli.core_builtins_only;
-            init_logging(verbose, Some(log_level), file_only);
+            init_logging(
+                verbose,
+                Some(log_level),
+                file_only,
+                logging_scope_for_command(cli.command.as_ref()),
+            );
             validate_record_bootstrap_flags(&cli)?;
             maybe_print_slot_startup_banner(cli.command.as_ref());
             let connection_context = ConnectionContext::new(cli.target.as_deref());
@@ -367,7 +401,7 @@ pub async fn run() -> Result<u8> {
             config_overrides,
         } => {
             let _config_override_guard = push_process_config_overrides(config_overrides);
-            init_logging(false, Some(log_level), false);
+            init_logging(false, Some(log_level), false, LogProcessScope::Command);
             if let Some(status) =
                 maybe_run_cluster_plugin_command_via_gateway(&plugin_id, &command_name, &arguments)
                     .await?

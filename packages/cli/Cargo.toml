@@ -27,6 +27,7 @@ bmux_codec                      = { workspace = true }
 bmux_config                     = { workspace = true }
 bmux_contexts_plugin_api        = { workspace = true }
 bmux_control_catalog_plugin_api = { workspace = true }
+bmux_diagnostic_log             = { workspace = true }
 bmux_env                        = { workspace = true }
 bmux_fonts                      = { workspace = true, default-features = false }
 bmux_ipc                        = { workspace = true }
@@ -147,6 +148,14 @@ tokio-rustls = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
+tracing-appender = { workspace = true }
+tracing-log = { workspace = true, features = ["log-tracer", "std"] }
+tracing-subscriber = { workspace = true, features = [
+    "ansi",
+    "env-filter",
+    "fmt",
+    "std",
+] }
 ttf-parser = { workspace = true }
 unicode-width = { workspace = true }
 uuid = { workspace = true, features = ["std"] }
@@ -174,6 +183,7 @@ fail-on-warnings = [
     "bmux_clipboard_plugin?/fail-on-warnings",
     "bmux_cluster_plugin?/fail-on-warnings",
     "bmux_config/fail-on-warnings",
+    "bmux_diagnostic_log/fail-on-warnings",
     "bmux_contexts_plugin?/fail-on-warnings",
     "bmux_control_catalog_plugin?/fail-on-warnings",
     "bmux_image?/fail-on-warnings",

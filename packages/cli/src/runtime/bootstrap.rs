@@ -4,6 +4,7 @@ use bmux_client::{BmuxClient, ClientError};
 use bmux_clients_plugin_api::clients_state;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_contexts_plugin_api::contexts_commands::{self, ContextAck as ContextAckRecord};
+use bmux_diagnostic_log::{DiagnosticLogConfig, DiagnosticLogMode, DiagnosticLogWriter};
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
 use bmux_recording_plugin_api::{recording_commands, recording_state};
 use bmux_server::BmuxServer;
@@ -14,6 +15,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use tracing::{Level, warn};
 use uuid::Uuid;
 
+use super::plugin_kernel::RuntimeLoggingHandle;
 use super::{
     ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_WRITER_GUARD,
     SERVER_START_TIMEOUT, activate_loaded_plugins, append_runtime_arg, cleanup_stale_pid_file,
@@ -734,7 +736,19 @@ pub(super) fn map_cli_client_error(error: ClientError) -> anyhow::Error {
     map_client_connect_error(error)
 }
 
-pub(super) fn init_logging(verbose: bool, cli_level: Option<LogLevel>, file_only: bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LogProcessScope {
+    Server,
+    Client,
+    Command,
+}
+
+pub(super) fn init_logging(
+    verbose: bool,
+    cli_level: Option<LogLevel>,
+    file_only: bool,
+    scope: LogProcessScope,
+) {
     let level = resolve_log_level(
         verbose,
         cli_level,
@@ -743,37 +757,131 @@ pub(super) fn init_logging(verbose: bool, cli_level: Option<LogLevel>, file_only
     let tracing_level = tracing_level(level);
     let _ = EFFECTIVE_LOG_LEVEL.set(tracing_level);
 
-    {
-        let paths = resolve_logging_paths();
-        let runtime_level = match level {
-            LogLevel::Error => "error",
-            LogLevel::Warn => "warn",
-            LogLevel::Info => "info",
-            LogLevel::Debug => "debug",
-            LogLevel::Trace => "trace",
-        };
-        let mut log_config = moosicbox_log_runtime::init::InitConfig::new(&paths);
-        log_config.default_env_filter = Some(format!("bmux={runtime_level}"));
-        log_config.sinks.file = Some(moosicbox_log_runtime::init::FileSinkConfig {
-            mode: moosicbox_log_runtime::init::FileMode::Exact("bmux.log"),
-        });
-        // Commands that enter raw terminal mode (attach, connect, join, etc.)
-        // must not write tracing output to stderr — it would corrupt the TUI.
-        // All log output is still captured in the log file at
-        // ~/Library/Logs/bmux/bmux.log (macOS) or ~/.local/state/bmux/logs/
-        // (Linux).  Non-raw-mode commands keep stderr for interactive debugging.
-        if file_only {
-            log_config.sinks.stderr = false;
-        }
-        match moosicbox_log_runtime::init::init(log_config) {
+    let paths = resolve_logging_paths();
+    let runtime_level = match level {
+        LogLevel::Error => "error",
+        LogLevel::Warn => "warn",
+        LogLevel::Info => "info",
+        LogLevel::Debug => "debug",
+        LogLevel::Trace => "trace",
+    };
+    let config = BmuxConfig::load().unwrap_or_default();
+    let mode = log_mode_for_scope(&config, scope);
+    if mode == DiagnosticLogMode::Segmented {
+        match init_segmented_logging(&paths, &config, scope, runtime_level, file_only) {
             Ok(handle) => {
                 let _ = LOG_WRITER_GUARD.set(handle);
             }
             Err(error) => {
-                eprintln!("bmux warning: failed to initialize file logging: {error}");
+                eprintln!("bmux warning: failed to initialize segmented logging: {error}");
             }
         }
+        return;
     }
+
+    let mut log_config = moosicbox_log_runtime::init::InitConfig::new(&paths);
+    log_config.default_env_filter = Some(format!("bmux={runtime_level}"));
+    log_config.sinks.file = match mode {
+        DiagnosticLogMode::Segmented => unreachable!("segmented mode handled above"),
+        DiagnosticLogMode::Unified => Some(moosicbox_log_runtime::init::FileSinkConfig {
+            mode: moosicbox_log_runtime::init::FileMode::Exact(unified_log_file_name(scope)),
+        }),
+        DiagnosticLogMode::Off => None,
+    };
+    // Commands that enter raw terminal mode (attach, connect, join, etc.) must not
+    // write tracing output to stderr — it would corrupt the TUI. Non-raw-mode
+    // commands keep stderr for interactive debugging.
+    if file_only {
+        log_config.sinks.stderr = false;
+    }
+    match moosicbox_log_runtime::init::init(log_config) {
+        Ok(handle) => {
+            let _ = LOG_WRITER_GUARD.set(RuntimeLoggingHandle::Moosicbox { _handle: handle });
+        }
+        Err(error) => {
+            eprintln!("bmux warning: failed to initialize file logging: {error}");
+        }
+    }
+}
+
+const fn log_mode_for_scope(config: &BmuxConfig, scope: LogProcessScope) -> DiagnosticLogMode {
+    match scope {
+        LogProcessScope::Server => config_log_mode(config.logs.server.mode),
+        LogProcessScope::Client => config_log_mode(config.logs.client.mode),
+        LogProcessScope::Command => DiagnosticLogMode::Unified,
+    }
+}
+
+const fn config_log_mode(mode: bmux_config::DiagnosticLogModeConfig) -> DiagnosticLogMode {
+    match mode {
+        bmux_config::DiagnosticLogModeConfig::Segmented => DiagnosticLogMode::Segmented,
+        bmux_config::DiagnosticLogModeConfig::Unified => DiagnosticLogMode::Unified,
+        bmux_config::DiagnosticLogModeConfig::Off => DiagnosticLogMode::Off,
+    }
+}
+
+const fn unified_log_file_name(scope: LogProcessScope) -> &'static str {
+    match scope {
+        LogProcessScope::Server | LogProcessScope::Command => "bmux.log",
+        LogProcessScope::Client => "bmux-client.log",
+    }
+}
+
+fn init_segmented_logging(
+    paths: &moosicbox_log_runtime::LogRuntimePaths,
+    config: &BmuxConfig,
+    scope: LogProcessScope,
+    runtime_level: &str,
+    file_only: bool,
+) -> anyhow::Result<RuntimeLoggingHandle> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let (root_dir, file_prefix, segment_mb, retention_days, max_total_mb) = match scope {
+        LogProcessScope::Server | LogProcessScope::Command => (
+            paths.log_dir.join("server"),
+            "server",
+            config.logs.server.segment_mb,
+            config.logs.server.retention_days,
+            config.logs.server.max_total_mb,
+        ),
+        LogProcessScope::Client => (
+            paths.log_dir.join("clients"),
+            "client",
+            config.logs.client.segment_mb,
+            config.logs.client.retention_days,
+            config.logs.client.max_total_mb,
+        ),
+    };
+    let run_id = format!("{}-{}", std::process::id(), Uuid::new_v4());
+    let (writer, handle) = DiagnosticLogWriter::start(DiagnosticLogConfig {
+        root_dir,
+        kind: file_prefix.to_owned(),
+        file_prefix: file_prefix.to_owned(),
+        run_id,
+        mode: DiagnosticLogMode::Segmented,
+        segment_mb,
+        retention_days,
+        max_total_mb,
+        client_id: None,
+    })?;
+    let (non_blocking_writer, guard) = tracing_appender::non_blocking(writer);
+    let env_filter = tracing_subscriber::EnvFilter::try_new(format!("bmux={runtime_level}"))?;
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(non_blocking_writer);
+    let stderr_layer =
+        (!file_only).then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
+    let subscriber = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(file_layer)
+        .with(stderr_layer);
+    let _ = tracing_log::LogTracer::init();
+    subscriber.try_init()?;
+    Ok(RuntimeLoggingHandle::Diagnostic {
+        handle,
+        _guard: guard,
+    })
 }
 
 fn resolve_logging_paths() -> moosicbox_log_runtime::LogRuntimePaths {

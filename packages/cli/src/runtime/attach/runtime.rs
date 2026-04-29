@@ -748,12 +748,26 @@ async fn maybe_emit_attach_perf_window(
     session_id: Uuid,
     window: &mut AttachPerfWindow,
 ) -> Result<()> {
-    if !perf_emitter.enabled() {
+    let elapsed = window.started_at.elapsed();
+    if elapsed < Duration::from_millis(perf_emitter.window_ms()) {
         return Ok(());
     }
 
-    let elapsed = window.started_at.elapsed();
-    if elapsed < Duration::from_millis(perf_emitter.window_ms()) {
+    tracing::info!(
+        session_id = %session_id,
+        window_elapsed_ms = duration_millis_u64(elapsed),
+        drain_rounds = window.drain_rounds,
+        drain_ipc_calls = window.drain_ipc_calls,
+        drain_bytes = window.drain_bytes,
+        drain_ipc_ms_max = window.drain_ipc_ms_max,
+        render_frames = window.render_frames,
+        render_ms_max = window.render_ms_max,
+        drain_budget_hits = window.drain_budget_hits,
+        "attach.metrics.window"
+    );
+
+    if !perf_emitter.enabled() {
+        window.reset();
         return Ok(());
     }
 
@@ -988,6 +1002,8 @@ pub async fn run_session_attach_with_client(
         .await?
         .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?
         .id;
+    crate::runtime::set_logging_client_id(self_client_id.to_string());
+    tracing::info!(client_id = %self_client_id, "attach.client_log.initialized");
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
         // Inline follow target resolution using BmuxClient (before streaming upgrade).
@@ -1785,9 +1801,18 @@ pub async fn run_session_attach_with_client(
                 &attach_keymap,
                 &attach_help_lines,
                 help_scroll,
+                attach_config.logs.client.slow_terminal_write_ms,
                 &mut display_capture,
             )?;
             let render_ms = duration_millis_u64(render_started_at.elapsed());
+            if render_ms >= attach_config.logs.client.slow_frame_ms {
+                tracing::warn!(
+                    frame_index = rendered_frame_count.saturating_add(1),
+                    render_ms,
+                    threshold_ms = attach_config.logs.client.slow_frame_ms,
+                    "attach.render.slow_frame"
+                );
+            }
             perf_window.record_render_frame(render_ms);
             rendered_frame_count = rendered_frame_count.saturating_add(1);
             maybe_emit_attach_frame_perf(
@@ -2015,9 +2040,18 @@ pub async fn run_session_attach_with_client(
             &attach_keymap,
             &attach_help_lines,
             help_scroll,
+            attach_config.logs.client.slow_terminal_write_ms,
             &mut display_capture,
         )?;
         let render_ms = duration_millis_u64(render_started_at.elapsed());
+        if render_ms >= attach_config.logs.client.slow_frame_ms {
+            tracing::warn!(
+                frame_index = rendered_frame_count.saturating_add(1),
+                render_ms,
+                threshold_ms = attach_config.logs.client.slow_frame_ms,
+                "attach.render.slow_frame"
+            );
+        }
         perf_window.record_render_frame(render_ms);
         rendered_frame_count = rendered_frame_count.saturating_add(1);
         maybe_emit_attach_frame_perf(
@@ -4292,6 +4326,7 @@ pub fn render_attach_frame(
     keymap: &crate::input::Keymap,
     help_lines: &[String],
     help_scroll: usize,
+    slow_terminal_write_ms: u64,
     display_capture: &mut DisplayCaptureFanout,
 ) -> Result<()> {
     if view_state.dirty.status_needs_redraw {
@@ -4485,11 +4520,21 @@ pub fn render_attach_frame(
 
     queue!(frame_bytes, EndSynchronizedUpdate).context("failed queuing end synchronized update")?;
 
+    let terminal_write_started_at = Instant::now();
     let mut stdout = io::stdout();
     stdout
         .write_all(&frame_bytes)
         .context("failed writing attach frame")?;
     stdout.flush().context("failed flushing attach frame")?;
+    let terminal_write_ms = duration_millis_u64(terminal_write_started_at.elapsed());
+    if terminal_write_ms >= slow_terminal_write_ms {
+        tracing::warn!(
+            terminal_write_ms,
+            threshold_ms = slow_terminal_write_ms,
+            frame_bytes = frame_bytes.len(),
+            "attach.terminal.slow_write"
+        );
+    }
     view_state.dirty.full_pane_redraw = false;
     view_state.dirty.overlay_needs_redraw = false;
     view_state.dirty.pane_dirty_ids.clear();

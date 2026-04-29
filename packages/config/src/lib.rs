@@ -689,6 +689,9 @@ pub struct BmuxConfig {
     /// Performance diagnostics capture controls and telemetry safety limits
     #[config_doc(nested)]
     pub performance: PerformanceConfig,
+    /// Runtime diagnostic log rotation, retention, and sink selection
+    #[config_doc(nested)]
+    pub logs: LogsConfig,
     /// Kiosk profiles and SSH/bootstrap settings for locked-down access flows
     #[config_doc(nested)]
     pub kiosk: KioskConfig,
@@ -1003,6 +1006,127 @@ pub enum PerformanceRecordingLevel {
     Basic,
     Detailed,
     Trace,
+}
+
+/// Diagnostic log sink mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticLogModeConfig {
+    /// Rotate logs into per-run segment directories.
+    #[default]
+    Segmented,
+    /// Append all log output into a single file.
+    Unified,
+    /// Disable this diagnostic log sink.
+    Off,
+}
+
+/// Client diagnostic event verbosity.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientDiagnosticLevel {
+    /// Startup, rate, latency, backlog, and slow-path summaries only.
+    #[default]
+    Basic,
+    /// More frequent timing summaries and renderer loop checkpoints.
+    Detailed,
+    /// High-volume diagnostic events; never includes raw pane I/O by default.
+    Trace,
+}
+
+/// Runtime diagnostic log rotation and retention settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "logs")]
+#[serde(default)]
+pub struct LogsConfig {
+    /// Default completed-log retention for sinks that do not override it.
+    pub retention_days: u64,
+    /// Default maximum total disk usage in MiB for sinks that do not override it.
+    pub max_total_mb: usize,
+    /// Background prune cadence in seconds for long-running processes.
+    pub prune_interval_secs: u64,
+    /// Server process diagnostic log settings.
+    #[config_doc(nested)]
+    pub server: ServerLogConfig,
+    /// Attach/client process diagnostic log settings.
+    #[config_doc(nested)]
+    pub client: ClientLogConfig,
+}
+
+impl Default for LogsConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: 14,
+            max_total_mb: 1024,
+            prune_interval_secs: 3600,
+            server: ServerLogConfig::default(),
+            client: ClientLogConfig::default(),
+        }
+    }
+}
+
+/// Server process diagnostic log settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "logs.server")]
+#[serde(default)]
+pub struct ServerLogConfig {
+    /// Sink mode: `segmented`, `unified`, or `off`.
+    pub mode: DiagnosticLogModeConfig,
+    /// Segment rotation size in MiB.
+    pub segment_mb: usize,
+    /// Completed-run retention in days.
+    pub retention_days: u64,
+    /// Maximum total disk usage in MiB.
+    pub max_total_mb: usize,
+}
+
+impl Default for ServerLogConfig {
+    fn default() -> Self {
+        Self {
+            mode: DiagnosticLogModeConfig::Segmented,
+            segment_mb: 16,
+            retention_days: 14,
+            max_total_mb: 512,
+        }
+    }
+}
+
+/// Attach/client process diagnostic log settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "logs.client")]
+#[serde(default)]
+pub struct ClientLogConfig {
+    /// Sink mode: `segmented`, `unified`, or `off`.
+    pub mode: DiagnosticLogModeConfig,
+    /// Diagnostic event verbosity.
+    pub diagnostic_level: ClientDiagnosticLevel,
+    /// Segment rotation size in MiB.
+    pub segment_mb: usize,
+    /// Completed-run retention in days.
+    pub retention_days: u64,
+    /// Maximum total disk usage in MiB.
+    pub max_total_mb: usize,
+    /// Slow frame warning threshold in milliseconds.
+    pub slow_frame_ms: u64,
+    /// Slow terminal write warning threshold in milliseconds.
+    pub slow_terminal_write_ms: u64,
+    /// Metrics summary window in milliseconds.
+    pub metrics_window_ms: u64,
+}
+
+impl Default for ClientLogConfig {
+    fn default() -> Self {
+        Self {
+            mode: DiagnosticLogModeConfig::Segmented,
+            diagnostic_level: ClientDiagnosticLevel::Basic,
+            segment_mb: 8,
+            retention_days: 7,
+            max_total_mb: 256,
+            slow_frame_ms: 50,
+            slow_terminal_write_ms: 25,
+            metrics_window_ms: 1000,
+        }
+    }
 }
 
 /// Performance diagnostics capture settings.

@@ -1056,6 +1056,7 @@ dependencies = [
  "bmux_control_catalog_plugin_api",
  "bmux_decoration_plugin",
  "bmux_decoration_plugin_renderer",
+ "bmux_diagnostic_log",
  "bmux_env",
  "bmux_fonts",
  "bmux_image",
@@ -1117,6 +1118,9 @@ dependencies = [
  "toml 0.8.23",
  "toml_edit 0.22.27",
  "tracing",
+ "tracing-appender",
+ "tracing-log",
+ "tracing-subscriber",
  "ttf-parser",
  "unicode-width",
  "uuid",
@@ -1379,6 +1383,16 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "bmux_diagnostic_log"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

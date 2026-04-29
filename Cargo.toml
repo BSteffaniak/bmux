@@ -22,6 +22,7 @@ members = [
     "packages/config-doc",
     "packages/config-doc-derive",
     "packages/context-state",
+    "packages/diagnostic-log",
     "packages/event/models",
     "packages/ipc",
     "packages/keybind",
@@ -137,6 +138,7 @@ bmux_config                 = { version = "0.0.1-alpha.0", default-features = fa
 bmux_config_doc             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config-doc" }
 bmux_config_doc_derive      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config-doc-derive" }
 bmux_context_state          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/context-state" }
+bmux_diagnostic_log         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/diagnostic-log" }
 bmux_env                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux-env" }
 bmux_event_models           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
 bmux_fonts                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/fonts" }
@@ -277,6 +279,9 @@ toml_edit = { version = "0.22.26", default-features = false, features = [
     "display",
 ] }
 tracing = { version = "0.1.44", default-features = false }
+tracing-appender = { version = "0.2.3", default-features = false }
+tracing-log = { version = "0.2.0", default-features = false }
+tracing-subscriber = { version = "0.3.20", default-features = false }
 trybuild = { version = "1.0.101" }
 ttf-parser = { version = "0.25.1", default-features = true }
 unicode-width = { version = "0.2.2", default-features = false }
