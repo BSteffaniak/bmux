@@ -635,7 +635,7 @@ fn mark_context_active_cached(
 }
 
 fn mark_context_active(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     context_id: Uuid,
 ) -> Result<(), String> {
@@ -957,7 +957,7 @@ enum WindowCycleDirection {
 }
 
 fn list_windows(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     session_filter: Option<&str>,
 ) -> Result<Vec<WindowEntry>, String> {
@@ -1016,7 +1016,7 @@ static WINDOW_LIST_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// activated). The channel is seeded empty in `activate`, so once the
 /// plugin is active this publish always succeeds.
 fn publish_window_list_snapshot(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
 ) {
     let Ok(entries) = list_windows(caller, runtime_state, None) else {
@@ -1073,7 +1073,7 @@ fn publish_window_list_entries(entries: Vec<WindowEntry>) {
 ///
 /// Returns the count of contexts written to the new order.
 fn reset_window_order(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
 ) -> Result<usize, String> {
     let contexts = caller
@@ -1092,7 +1092,7 @@ fn reset_window_order(
 }
 
 fn create_window(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     name: Option<String>,
 ) -> Result<WindowAck, String> {
@@ -1148,7 +1148,7 @@ fn next_default_tab_name_for_contexts(contexts: &[domain_ipc::ContextSummary]) -
 }
 
 fn kill_window(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     selector: ContextSelector,
     force_local: bool,
@@ -1167,7 +1167,7 @@ fn kill_window(
 }
 
 fn kill_all_windows(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     force_local: bool,
 ) -> Result<WindowAck, String> {
@@ -1189,7 +1189,7 @@ fn kill_all_windows(
 
 #[allow(clippy::needless_pass_by_value)] // Plugin command dispatch passes owned selector from deserialized request
 fn switch_window(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     selector: ContextSelector,
     last_selected_by_client: &LastSelectedByClient,
@@ -1218,7 +1218,7 @@ fn switch_window(
 }
 
 fn switch_window_with_contexts(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     selector: &ContextSelector,
     last_selected_by_client: &LastSelectedByClient,
@@ -1296,7 +1296,7 @@ struct SwitchWindowTiming {
 
 #[allow(clippy::needless_pass_by_value)] // Plugin command dispatch passes owned direction from deserialized request
 fn cycle_window(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     direction: WindowCycleDirection,
     last_selected_by_client: &LastSelectedByClient,
@@ -1378,7 +1378,7 @@ fn cycle_window(
 }
 
 fn goto_window_by_index(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     index: usize,
     last_selected_by_client: &LastSelectedByClient,
@@ -1422,7 +1422,7 @@ fn goto_window_by_index(
 }
 
 fn close_current_window(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
@@ -1487,7 +1487,7 @@ fn resolve_context_id_from_contexts(
 }
 
 fn resolve_effective_current_context_with_contexts(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     contexts: &[domain_ipc::ContextSummary],
 ) -> Result<Option<Uuid>, String> {
@@ -1662,7 +1662,7 @@ fn set_stored_context_id(
 }
 
 fn order_contexts_for_navigation(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
     contexts: Vec<domain_ipc::ContextSummary>,
 ) -> Result<Vec<domain_ipc::ContextSummary>, String> {
@@ -2374,7 +2374,7 @@ impl WindowsStateService for WindowsStateHandle {
 #[cfg(test)]
 #[allow(clippy::needless_pass_by_value)] // Test helper; owned selector from deserialized request
 fn resolve_session_id(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     selector: ContextSelector,
 ) -> Result<Uuid, String> {
     let contexts = caller

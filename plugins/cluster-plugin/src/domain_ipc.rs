@@ -10,6 +10,9 @@
 #![allow(dead_code)]
 #![allow(clippy::result_large_err)]
 
+use bmux_contexts_plugin_api::{
+    contexts_state as api_contexts_state, typed_client as contexts_typed_client,
+};
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::{PluginError, Result};
 use serde::{Deserialize, Serialize};
@@ -323,6 +326,33 @@ fn unexpected(operation: &'static str) -> PluginError {
     }
 }
 
+fn api_context_summary_to_local(summary: api_contexts_state::ContextSummary) -> ContextSummary {
+    ContextSummary {
+        id: summary.id,
+        name: summary.name,
+        attributes: summary.attributes,
+    }
+}
+
+fn context_selector_to_api(selector: &ContextSelector) -> api_contexts_state::ContextSelector {
+    match selector {
+        ContextSelector::ById(id) => api_contexts_state::ContextSelector {
+            id: Some(*id),
+            name: None,
+        },
+        ContextSelector::ByName(name) => api_contexts_state::ContextSelector {
+            id: None,
+            name: Some(name.clone()),
+        },
+    }
+}
+
+fn typed_context_error(operation: &'static str, err: impl std::fmt::Display) -> PluginError {
+    PluginError::ServiceProtocol {
+        details: format!("{operation} failed: {err}"),
+    }
+}
+
 // ── Extension trait ─────────────────────────────────────────────────
 
 /// Extension trait bundling core-IPC helpers for session/pane/context/
@@ -467,16 +497,17 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn context_list(&self) -> Result<ContextListResponse> {
-        // Route through the contexts-plugin typed surface — the
-        // `Request::ListContexts` IPC variant was removed.
-        let contexts: Vec<ContextSummary> = self.call_service(
-            "bmux.contexts.read",
-            bmux_plugin_sdk::ServiceKind::Query,
-            "contexts-state",
-            "list-contexts",
-            &(),
-        )?;
+    fn context_list(&self) -> Result<ContextListResponse>
+    where
+        Self: Sync,
+    {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let contexts =
+            bmux_plugin::block_on_typed_dispatch(contexts_typed_client::list_contexts(&mut client))
+                .map_err(|err| typed_context_error("context_list", err))?
+                .into_iter()
+                .map(api_context_summary_to_local)
+                .collect();
         Ok(ContextListResponse { contexts })
     }
 
@@ -485,14 +516,16 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn context_current(&self) -> Result<ContextCurrentResponse> {
-        let context: Option<ContextSummary> = self.call_service(
-            "bmux.contexts.read",
-            bmux_plugin_sdk::ServiceKind::Query,
-            "contexts-state",
-            "current-context",
-            &(),
-        )?;
+    fn context_current(&self) -> Result<ContextCurrentResponse>
+    where
+        Self: Sync,
+    {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let context = bmux_plugin::block_on_typed_dispatch(contexts_typed_client::current_context(
+            &mut client,
+        ))
+        .map_err(|err| typed_context_error("context_current", err))?
+        .map(api_context_summary_to_local);
         Ok(ContextCurrentResponse { context })
     }
 
@@ -501,42 +534,17 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn context_create(&self, request: &ContextCreateRequest) -> Result<ContextCreateResponse> {
-        #[derive(serde::Serialize)]
-        struct Args<'a> {
-            name: &'a Option<String>,
-            attributes: &'a std::collections::BTreeMap<String, String>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Ack {
-            id: ::uuid::Uuid,
-            #[allow(dead_code)]
-            session_id: Option<::uuid::Uuid>,
-        }
-        #[derive(serde::Deserialize, Debug)]
-        #[serde(rename_all = "snake_case")]
-        enum CreateErr {
-            InvalidName { reason: String },
-            Failed { reason: String },
-        }
-        impl std::fmt::Display for CreateErr {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                match self {
-                    Self::InvalidName { reason } => write!(f, "invalid name: {reason}"),
-                    Self::Failed { reason } => write!(f, "{reason}"),
-                }
-            }
-        }
-        let result: std::result::Result<Ack, CreateErr> = self.call_service(
-            "bmux.contexts.write",
-            bmux_plugin_sdk::ServiceKind::Command,
-            "contexts-commands",
-            "create-context",
-            &Args {
-                name: &request.name,
-                attributes: &request.attributes,
-            },
-        )?;
+    fn context_create(&self, request: &ContextCreateRequest) -> Result<ContextCreateResponse>
+    where
+        Self: Sync,
+    {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result = bmux_plugin::block_on_typed_dispatch(contexts_typed_client::create_context(
+            &mut client,
+            request.name.clone(),
+            request.attributes.clone(),
+        ))
+        .map_err(|err| typed_context_error("context_create", err))?;
         match result {
             Ok(ack) => Ok(ContextCreateResponse {
                 context: ContextSummary {
@@ -546,7 +554,7 @@ pub trait KernelOps: ServiceCaller {
                 },
             }),
             Err(err) => Err(PluginError::ServiceProtocol {
-                details: format!("context_create failed: {err}"),
+                details: format!("context_create failed: {err:?}"),
             }),
         }
     }
@@ -556,54 +564,18 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn context_select(&self, request: &ContextSelectRequest) -> Result<ContextSelectResponse> {
-        #[derive(serde::Serialize)]
-        struct Selector {
-            id: Option<::uuid::Uuid>,
-            name: Option<String>,
-        }
-        #[derive(serde::Serialize)]
-        struct Args {
-            selector: Selector,
-        }
-        #[derive(serde::Deserialize)]
-        struct Ack {
-            id: ::uuid::Uuid,
-            #[allow(dead_code)]
-            session_id: Option<::uuid::Uuid>,
-        }
-        // Mirror of the BPDL-generated `SelectContextError` shape so
-        // we can decode without pulling in the contexts-plugin-api
-        // crate (which would be an odd dep direction).
-        #[derive(serde::Deserialize, Debug)]
-        #[serde(rename_all = "snake_case")]
-        enum SelectErr {
-            NotFound,
-            Denied { reason: String },
-        }
-        impl std::fmt::Display for SelectErr {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                match self {
-                    Self::NotFound => write!(f, "not_found"),
-                    Self::Denied { reason } => write!(f, "{reason}"),
-                }
-            }
-        }
-        let (id, name) = match &request.selector {
-            ContextSelector::ById(id) => (Some(*id), None),
-            ContextSelector::ByName(n) => (None, Some(n.clone())),
-        };
-        let result: std::result::Result<Ack, SelectErr> = self.call_service(
-            "bmux.contexts.write",
-            bmux_plugin_sdk::ServiceKind::Command,
-            "contexts-commands",
-            "select-context",
-            &Args {
-                selector: Selector { id, name },
-            },
-        )?;
+    fn context_select(&self, request: &ContextSelectRequest) -> Result<ContextSelectResponse>
+    where
+        Self: Sync,
+    {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result = bmux_plugin::block_on_typed_dispatch(contexts_typed_client::select_context(
+            &mut client,
+            context_selector_to_api(&request.selector),
+        ))
+        .map_err(|err| typed_context_error("context_select", err))?;
         let ack = result.map_err(|err| PluginError::ServiceProtocol {
-            details: format!("context_select failed: {err}"),
+            details: format!("context_select failed: {err:?}"),
         })?;
         Ok(ContextSelectResponse {
             context: ContextSummary {
@@ -619,54 +591,19 @@ pub trait KernelOps: ServiceCaller {
     /// # Errors
     ///
     /// Returns an error when the service call fails.
-    fn context_close(&self, request: &ContextCloseRequest) -> Result<ContextCloseResponse> {
-        #[derive(serde::Serialize)]
-        struct Selector {
-            id: Option<::uuid::Uuid>,
-            name: Option<String>,
-        }
-        #[derive(serde::Serialize)]
-        struct Args {
-            selector: Selector,
-            force: bool,
-        }
-        #[derive(serde::Deserialize)]
-        struct Ack {
-            id: ::uuid::Uuid,
-            #[allow(dead_code)]
-            session_id: Option<::uuid::Uuid>,
-        }
-        #[derive(serde::Deserialize, Debug)]
-        #[serde(rename_all = "snake_case")]
-        enum CloseErr {
-            NotFound,
-            Denied { reason: String },
-            Failed { reason: String },
-        }
-        impl std::fmt::Display for CloseErr {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                match self {
-                    Self::NotFound => write!(f, "not_found"),
-                    Self::Denied { reason } | Self::Failed { reason } => write!(f, "{reason}"),
-                }
-            }
-        }
-        let (id, name) = match &request.selector {
-            ContextSelector::ById(i) => (Some(*i), None),
-            ContextSelector::ByName(n) => (None, Some(n.clone())),
-        };
-        let result: std::result::Result<Ack, CloseErr> = self.call_service(
-            "bmux.contexts.write",
-            bmux_plugin_sdk::ServiceKind::Command,
-            "contexts-commands",
-            "close-context",
-            &Args {
-                selector: Selector { id, name },
-                force: request.force,
-            },
-        )?;
+    fn context_close(&self, request: &ContextCloseRequest) -> Result<ContextCloseResponse>
+    where
+        Self: Sync,
+    {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
+        let result = bmux_plugin::block_on_typed_dispatch(contexts_typed_client::close_context(
+            &mut client,
+            context_selector_to_api(&request.selector),
+            request.force,
+        ))
+        .map_err(|err| typed_context_error("context_close", err))?;
         let ack = result.map_err(|err| PluginError::ServiceProtocol {
-            details: format!("context_close failed: {err}"),
+            details: format!("context_close failed: {err:?}"),
         })?;
         Ok(ContextCloseResponse { id: ack.id })
     }
