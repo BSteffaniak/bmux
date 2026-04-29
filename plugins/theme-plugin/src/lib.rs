@@ -518,7 +518,7 @@ async fn configure_performance_theme_header(
             &request,
         );
     let settings = match response {
-        Ok(settings) => settings.into(),
+        Ok(settings) => settings,
         Err(error) => {
             warn!(%error, "failed applying performance theme settings form");
             return;
@@ -560,9 +560,7 @@ fn apply_persisted_performance_theme_settings(context: &impl ServiceCaller) {
     else {
         return;
     };
-    let request = performance_commands::client::SetThemeHeaderSettingsRequest {
-        settings: settings.into(),
-    };
+    let request = performance_commands::client::SetThemeHeaderSettingsRequest { settings };
     let _ = context
         .call_service::<_, bmux_performance_plugin_api::performance_types::ThemeHeaderSettings>(
             capabilities::PERFORMANCE_WRITE.as_str(),

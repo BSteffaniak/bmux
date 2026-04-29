@@ -33,6 +33,7 @@ use crate::ast::{
 pub type ImportMap = BTreeMap<String, ImportInfo>;
 
 type OwnTypeMap = BTreeMap<String, BTreeSet<String>>;
+type NonEqTypeSet = BTreeSet<String>;
 
 /// Resolution target for a single import alias.
 #[derive(Debug, Clone)]
@@ -60,6 +61,7 @@ pub fn emit(schema: &Schema) -> String {
 pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
     let mut out = String::new();
     let own_types = own_type_map(schema);
+    let non_eq_types = non_eq_type_set(schema);
     out.push_str("// AUTO-GENERATED FROM BPDL. DO NOT EDIT BY HAND.\n\n");
     out.push_str("use serde::{Deserialize, Serialize};\n\n");
     emit_capabilities(&schema.capabilities, &mut out);
@@ -69,10 +71,60 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
             iface,
             imports,
             &own_types,
+            &non_eq_types,
             &mut out,
         );
     }
     out
+}
+
+fn non_eq_type_set(schema: &Schema) -> NonEqTypeSet {
+    let mut non_eq = BTreeSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for iface in &schema.interfaces {
+            for item in &iface.items {
+                let (name, has_non_eq) = match item {
+                    InterfaceItem::Record(record) => (
+                        &record.name,
+                        record
+                            .fields
+                            .iter()
+                            .any(|field| type_contains_non_eq(&field.ty, &non_eq)),
+                    ),
+                    InterfaceItem::Variant(variant) => (
+                        &variant.name,
+                        variant.cases.iter().any(|case| {
+                            case.payload
+                                .iter()
+                                .any(|field| type_contains_non_eq(&field.ty, &non_eq))
+                        }),
+                    ),
+                    InterfaceItem::Enum(_)
+                    | InterfaceItem::Query(_)
+                    | InterfaceItem::Command(_)
+                    | InterfaceItem::Events(_) => continue,
+                };
+                if has_non_eq && non_eq.insert(name.clone()) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    non_eq
+}
+
+fn type_contains_non_eq(ty: &TypeRef, non_eq_types: &NonEqTypeSet) -> bool {
+    match ty {
+        TypeRef::Primitive(Primitive::F32 | Primitive::F64) => true,
+        TypeRef::Primitive(_) | TypeRef::Qualified { .. } | TypeRef::Unit => false,
+        TypeRef::Named(name) => non_eq_types.contains(name),
+        TypeRef::Option(inner) | TypeRef::List(inner) => type_contains_non_eq(inner, non_eq_types),
+        TypeRef::Map(key, value) | TypeRef::Result(key, value) => {
+            type_contains_non_eq(key, non_eq_types) || type_contains_non_eq(value, non_eq_types)
+        }
+    }
 }
 
 fn own_type_map(schema: &Schema) -> OwnTypeMap {
@@ -119,6 +171,7 @@ fn emit_interface(
     iface: &Interface,
     imports: &ImportMap,
     own_types: &OwnTypeMap,
+    non_eq_types: &NonEqTypeSet,
     out: &mut String,
 ) {
     let module_name = snake_case(&iface.name);
@@ -127,8 +180,8 @@ fn emit_interface(
 
     for item in &iface.items {
         match item {
-            InterfaceItem::Record(r) => emit_record(r, imports, own_types, out),
-            InterfaceItem::Variant(v) => emit_variant(v, imports, own_types, out),
+            InterfaceItem::Record(r) => emit_record(r, imports, own_types, non_eq_types, out),
+            InterfaceItem::Variant(v) => emit_variant(v, imports, own_types, non_eq_types, out),
             InterfaceItem::Enum(e) => emit_enum(e, out),
             InterfaceItem::Query(_) | InterfaceItem::Command(_) | InterfaceItem::Events(_) => {}
         }
@@ -148,9 +201,19 @@ fn emit_interface(
     out.push_str("}\n\n");
 }
 
-fn emit_record(r: &RecordDef, imports: &ImportMap, own_types: &OwnTypeMap, out: &mut String) {
+fn emit_record(
+    r: &RecordDef,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    non_eq_types: &NonEqTypeSet,
+    out: &mut String,
+) {
     let name = pascal_case(&r.name);
-    out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n");
+    if non_eq_types.contains(&r.name) {
+        out.push_str("    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n");
+    } else {
+        out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n");
+    }
     let _ = writeln!(out, "    pub struct {name} {{");
     for f in &r.fields {
         let field_name = snake_case(&f.name);
@@ -188,9 +251,19 @@ fn type_has_default(ty: &crate::ast::TypeRef) -> bool {
     }
 }
 
-fn emit_variant(v: &VariantDef, imports: &ImportMap, own_types: &OwnTypeMap, out: &mut String) {
+fn emit_variant(
+    v: &VariantDef,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    non_eq_types: &NonEqTypeSet,
+    out: &mut String,
+) {
     let name = pascal_case(&v.name);
-    out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n");
+    if non_eq_types.contains(&v.name) {
+        out.push_str("    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n");
+    } else {
+        out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n");
+    }
     // External (default) tagging. Internally-tagged variants
     // (`#[serde(tag = ...)]`) require `deserialize_any`, which the
     // non-self-describing `bmux_codec` cannot implement. External
@@ -238,7 +311,7 @@ fn emit_variant_case(
 
 fn emit_enum(e: &EnumDef, out: &mut String) {
     let name = pascal_case(&e.name);
-    out.push_str("    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n");
+    out.push_str("    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]\n");
     out.push_str("    #[serde(rename_all = \"snake_case\")]\n");
     let _ = writeln!(out, "    pub enum {name} {{");
     for c in &e.cases {

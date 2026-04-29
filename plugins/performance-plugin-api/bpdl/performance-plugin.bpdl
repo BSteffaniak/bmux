@@ -100,18 +100,18 @@ interface performance-types {
     }
 
     record system-metrics-snapshot {
-        cpu_percent: string,
-        cpu_raw_percent: string,
-        cpu_normalized_percent: string,
+        cpu_percent: f32,
+        cpu_raw_percent: f32,
+        cpu_normalized_percent: f32,
         memory_used_bytes: u64,
         memory_total_bytes: u64,
     }
 
     record process-metrics-snapshot {
         pid: u32,
-        cpu_percent: string,
-        cpu_raw_percent: string,
-        cpu_normalized_percent: string,
+        cpu_percent: f32,
+        cpu_raw_percent: f32,
+        cpu_normalized_percent: f32,
         memory_bytes: u64,
         process_count: u32,
     }
@@ -121,9 +121,9 @@ interface performance-types {
         session_id: uuid?,
         pid: u32?,
         process_group_id: i32?,
-        cpu_percent: string,
-        cpu_raw_percent: string,
-        cpu_normalized_percent: string,
+        cpu_percent: f32,
+        cpu_raw_percent: f32,
+        cpu_normalized_percent: f32,
         memory_bytes: u64,
         process_count: u32,
         available: bool,

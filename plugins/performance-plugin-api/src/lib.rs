@@ -12,18 +12,23 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use bmux_ipc::PerformanceRuntimeSettings;
 use bmux_performance_state::PerformanceCaptureSettings;
 use bmux_plugin_sdk::{PluginEventKind, PromptRequest};
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/performance-plugin.bpdl",
 }
 
 pub use capabilities::{PERFORMANCE_READ, PERFORMANCE_WRITE};
+pub use metric_events::MetricEvent;
+pub use performance_events::PerformanceEvent;
+pub use performance_types::{
+    CpuPercentMode, MetricAccuracy, MetricCapability, MetricName, MetricTarget, MetricTargetKind,
+    MetricWatch, MetricsSnapshot, PaneMetricsSnapshot, PerformanceRuntimeSettings,
+    ProcessMetricsSnapshot, SystemMetricsSnapshot, ThemeHeaderMetric, ThemeHeaderScope,
+    ThemeHeaderSettings, ThemeHeaderStyle,
+};
 
 impl From<performance_types::PerformanceRecordingLevel> for bmux_ipc::PerformanceRecordingLevel {
     fn from(value: performance_types::PerformanceRecordingLevel) -> Self {
@@ -71,380 +76,106 @@ impl From<bmux_ipc::PerformanceRuntimeSettings> for performance_types::Performan
     }
 }
 
-impl From<performance_types::MetricTarget> for MetricTarget {
-    fn from(value: performance_types::MetricTarget) -> Self {
-        match value {
-            performance_types::MetricTarget::System => Self::System,
-            performance_types::MetricTarget::Process { pid } => Self::Process { pid },
-            performance_types::MetricTarget::Pane { pane_id } => Self::Pane { pane_id },
-        }
-    }
-}
-
-impl From<MetricTarget> for performance_types::MetricTarget {
-    fn from(value: MetricTarget) -> Self {
-        match value {
-            MetricTarget::System => Self::System,
-            MetricTarget::Process { pid } => Self::Process { pid },
-            MetricTarget::Pane { pane_id } => Self::Pane { pane_id },
-        }
-    }
-}
-
-impl From<performance_types::MetricName> for MetricName {
-    fn from(value: performance_types::MetricName) -> Self {
-        match value {
-            performance_types::MetricName::CpuPercent => Self::CpuPercent,
-            performance_types::MetricName::MemoryBytes => Self::MemoryBytes,
-            performance_types::MetricName::ProcessCount => Self::ProcessCount,
-            performance_types::MetricName::DiskReadBytesPerSec => Self::DiskReadBytesPerSec,
-            performance_types::MetricName::DiskWriteBytesPerSec => Self::DiskWriteBytesPerSec,
-            performance_types::MetricName::NetworkRxBytesPerSec => Self::NetworkRxBytesPerSec,
-            performance_types::MetricName::NetworkTxBytesPerSec => Self::NetworkTxBytesPerSec,
-        }
-    }
-}
-
-impl From<MetricName> for performance_types::MetricName {
-    fn from(value: MetricName) -> Self {
-        match value {
-            MetricName::CpuPercent => Self::CpuPercent,
-            MetricName::MemoryBytes => Self::MemoryBytes,
-            MetricName::ProcessCount => Self::ProcessCount,
-            MetricName::DiskReadBytesPerSec => Self::DiskReadBytesPerSec,
-            MetricName::DiskWriteBytesPerSec => Self::DiskWriteBytesPerSec,
-            MetricName::NetworkRxBytesPerSec => Self::NetworkRxBytesPerSec,
-            MetricName::NetworkTxBytesPerSec => Self::NetworkTxBytesPerSec,
-        }
-    }
-}
-
-impl From<performance_types::ThemeHeaderMetric> for ThemeHeaderMetric {
-    fn from(value: performance_types::ThemeHeaderMetric) -> Self {
-        match value {
-            performance_types::ThemeHeaderMetric::Cpu => Self::Cpu,
-            performance_types::ThemeHeaderMetric::Memory => Self::Memory,
-            performance_types::ThemeHeaderMetric::ProcessCount => Self::ProcessCount,
-            performance_types::ThemeHeaderMetric::DiskRead => Self::DiskRead,
-            performance_types::ThemeHeaderMetric::DiskWrite => Self::DiskWrite,
-            performance_types::ThemeHeaderMetric::NetworkRx => Self::NetworkRx,
-            performance_types::ThemeHeaderMetric::NetworkTx => Self::NetworkTx,
-        }
-    }
-}
-
-impl From<ThemeHeaderMetric> for performance_types::ThemeHeaderMetric {
-    fn from(value: ThemeHeaderMetric) -> Self {
-        match value {
-            ThemeHeaderMetric::Cpu => Self::Cpu,
-            ThemeHeaderMetric::Memory => Self::Memory,
-            ThemeHeaderMetric::ProcessCount => Self::ProcessCount,
-            ThemeHeaderMetric::DiskRead => Self::DiskRead,
-            ThemeHeaderMetric::DiskWrite => Self::DiskWrite,
-            ThemeHeaderMetric::NetworkRx => Self::NetworkRx,
-            ThemeHeaderMetric::NetworkTx => Self::NetworkTx,
-        }
-    }
-}
-
-impl From<performance_types::MetricTargetKind> for MetricTargetKind {
-    fn from(value: performance_types::MetricTargetKind) -> Self {
-        match value {
-            performance_types::MetricTargetKind::System => Self::System,
-            performance_types::MetricTargetKind::Process => Self::Process,
-            performance_types::MetricTargetKind::Pane => Self::Pane,
-        }
-    }
-}
-
-impl From<MetricTargetKind> for performance_types::MetricTargetKind {
-    fn from(value: MetricTargetKind) -> Self {
-        match value {
-            MetricTargetKind::System => Self::System,
-            MetricTargetKind::Process => Self::Process,
-            MetricTargetKind::Pane => Self::Pane,
-        }
-    }
-}
-
-impl From<performance_types::MetricAccuracy> for MetricAccuracy {
-    fn from(value: performance_types::MetricAccuracy) -> Self {
-        match value {
-            performance_types::MetricAccuracy::Exact => Self::Exact,
-            performance_types::MetricAccuracy::Estimated => Self::Estimated,
-        }
-    }
-}
-
-impl From<MetricAccuracy> for performance_types::MetricAccuracy {
-    fn from(value: MetricAccuracy) -> Self {
-        match value {
-            MetricAccuracy::Exact => Self::Exact,
-            MetricAccuracy::Estimated => Self::Estimated,
-        }
-    }
-}
-
-impl From<performance_types::CpuPercentMode> for CpuPercentMode {
-    fn from(value: performance_types::CpuPercentMode) -> Self {
-        match value {
-            performance_types::CpuPercentMode::Normalized => Self::Normalized,
-            performance_types::CpuPercentMode::RawCoreSum => Self::RawCoreSum,
-        }
-    }
-}
-
-impl From<CpuPercentMode> for performance_types::CpuPercentMode {
-    fn from(value: CpuPercentMode) -> Self {
-        match value {
-            CpuPercentMode::Normalized => Self::Normalized,
-            CpuPercentMode::RawCoreSum => Self::RawCoreSum,
-        }
-    }
-}
-
-impl From<performance_types::ThemeHeaderScope> for ThemeHeaderScope {
-    fn from(value: performance_types::ThemeHeaderScope) -> Self {
-        match value {
-            performance_types::ThemeHeaderScope::Pane => Self::Pane,
-            performance_types::ThemeHeaderScope::System => Self::System,
-            performance_types::ThemeHeaderScope::Both => Self::Both,
-        }
-    }
-}
-
-impl From<ThemeHeaderScope> for performance_types::ThemeHeaderScope {
-    fn from(value: ThemeHeaderScope) -> Self {
-        match value {
-            ThemeHeaderScope::Pane => Self::Pane,
-            ThemeHeaderScope::System => Self::System,
-            ThemeHeaderScope::Both => Self::Both,
-        }
-    }
-}
-
-impl From<performance_types::ThemeHeaderStyle> for ThemeHeaderStyle {
-    fn from(value: performance_types::ThemeHeaderStyle) -> Self {
-        match value {
-            performance_types::ThemeHeaderStyle::Compact => Self::Compact,
-            performance_types::ThemeHeaderStyle::Detailed => Self::Detailed,
-            performance_types::ThemeHeaderStyle::HeatOnly => Self::HeatOnly,
-        }
-    }
-}
-
-impl From<ThemeHeaderStyle> for performance_types::ThemeHeaderStyle {
-    fn from(value: ThemeHeaderStyle) -> Self {
-        match value {
-            ThemeHeaderStyle::Compact => Self::Compact,
-            ThemeHeaderStyle::Detailed => Self::Detailed,
-            ThemeHeaderStyle::HeatOnly => Self::HeatOnly,
-        }
-    }
-}
-
-impl From<performance_types::MetricCapability> for MetricCapability {
-    fn from(value: performance_types::MetricCapability) -> Self {
+impl Default for performance_types::ThemeHeaderSettings {
+    fn default() -> Self {
         Self {
-            metric: value.metric.into(),
-            target: value.target.into(),
-            supported: value.supported,
-            disabled_reason: value.disabled_reason,
-            accuracy: value.accuracy.map(Into::into),
+            enabled: true,
+            sample_interval_ms: 1_000,
+            scope: performance_types::ThemeHeaderScope::Pane,
+            style: performance_types::ThemeHeaderStyle::Compact,
+            cpu_percent_mode: performance_types::CpuPercentMode::Normalized,
+            metrics: vec![
+                performance_types::ThemeHeaderMetric::Cpu,
+                performance_types::ThemeHeaderMetric::Memory,
+                performance_types::ThemeHeaderMetric::ProcessCount,
+            ],
         }
     }
 }
 
-impl From<MetricCapability> for performance_types::MetricCapability {
-    fn from(value: MetricCapability) -> Self {
+impl performance_types::MetricWatch {
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        self.interval_ms = self.interval_ms.max(MIN_METRICS_INTERVAL_MS);
+        if self.metrics.is_empty() {
+            self.metrics = vec![
+                performance_types::MetricName::CpuPercent,
+                performance_types::MetricName::MemoryBytes,
+            ];
+        }
+        self
+    }
+}
+
+impl Default for performance_types::MetricWatch {
+    fn default() -> Self {
         Self {
-            metric: value.metric.into(),
-            target: value.target.into(),
-            supported: value.supported,
-            disabled_reason: value.disabled_reason,
-            accuracy: value.accuracy.map(Into::into),
+            id: DEFAULT_METRICS_WATCH_ID.to_string(),
+            target: performance_types::MetricTarget::System,
+            metrics: vec![
+                performance_types::MetricName::CpuPercent,
+                performance_types::MetricName::MemoryBytes,
+            ],
+            interval_ms: 1_000,
+            cpu_percent_mode: performance_types::CpuPercentMode::Normalized,
         }
     }
 }
 
-impl From<performance_types::ThemeHeaderSettings> for ThemeHeaderSettings {
-    fn from(value: performance_types::ThemeHeaderSettings) -> Self {
+// This would be derivable on the generated struct, but the BPDL macro owns
+// the item definition; keep the impl here with the other generated-type
+// extensions.
+#[allow(clippy::derivable_impls)]
+impl Default for performance_types::MetricsSnapshot {
+    fn default() -> Self {
         Self {
-            enabled: value.enabled,
-            sample_interval_ms: value.sample_interval_ms,
-            scope: value.scope.into(),
-            style: value.style.into(),
-            cpu_percent_mode: value.cpu_percent_mode.into(),
-            metrics: value.metrics.into_iter().map(Into::into).collect(),
+            sampled_at_epoch_ms: 0,
+            watches: Vec::new(),
+            system: performance_types::SystemMetricsSnapshot::default(),
+            processes: std::collections::BTreeMap::new(),
+            panes: std::collections::BTreeMap::new(),
         }
     }
 }
 
-impl From<ThemeHeaderSettings> for performance_types::ThemeHeaderSettings {
-    fn from(value: ThemeHeaderSettings) -> Self {
+impl Default for performance_types::SystemMetricsSnapshot {
+    fn default() -> Self {
         Self {
-            enabled: value.enabled,
-            sample_interval_ms: value.sample_interval_ms,
-            scope: value.scope.into(),
-            style: value.style.into(),
-            cpu_percent_mode: value.cpu_percent_mode.into(),
-            metrics: value.metrics.into_iter().map(Into::into).collect(),
+            cpu_percent: 0.0,
+            cpu_raw_percent: 0.0,
+            cpu_normalized_percent: 0.0,
+            memory_used_bytes: 0,
+            memory_total_bytes: 0,
         }
     }
 }
 
-impl From<performance_types::MetricWatch> for MetricWatch {
-    fn from(value: performance_types::MetricWatch) -> Self {
+impl Default for performance_types::ProcessMetricsSnapshot {
+    fn default() -> Self {
         Self {
-            id: value.id,
-            target: value.target.into(),
-            metrics: value.metrics.into_iter().map(Into::into).collect(),
-            interval_ms: value.interval_ms,
-            cpu_percent_mode: value.cpu_percent_mode.into(),
+            pid: 0,
+            cpu_percent: 0.0,
+            cpu_raw_percent: 0.0,
+            cpu_normalized_percent: 0.0,
+            memory_bytes: 0,
+            process_count: 0,
         }
     }
 }
 
-impl From<MetricWatch> for performance_types::MetricWatch {
-    fn from(value: MetricWatch) -> Self {
+impl Default for performance_types::PaneMetricsSnapshot {
+    fn default() -> Self {
         Self {
-            id: value.id,
-            target: value.target.into(),
-            metrics: value.metrics.into_iter().map(Into::into).collect(),
-            interval_ms: value.interval_ms,
-            cpu_percent_mode: value.cpu_percent_mode.into(),
-        }
-    }
-}
-
-fn f32_to_wire(value: f32) -> String {
-    value.to_string()
-}
-
-fn f32_from_wire(value: &str) -> f32 {
-    value.parse().unwrap_or_default()
-}
-
-impl From<SystemMetricsSnapshot> for performance_types::SystemMetricsSnapshot {
-    fn from(value: SystemMetricsSnapshot) -> Self {
-        Self {
-            cpu_percent: f32_to_wire(value.cpu_percent),
-            cpu_raw_percent: f32_to_wire(value.cpu_raw_percent),
-            cpu_normalized_percent: f32_to_wire(value.cpu_normalized_percent),
-            memory_used_bytes: value.memory_used_bytes,
-            memory_total_bytes: value.memory_total_bytes,
-        }
-    }
-}
-
-impl From<performance_types::SystemMetricsSnapshot> for SystemMetricsSnapshot {
-    fn from(value: performance_types::SystemMetricsSnapshot) -> Self {
-        Self {
-            cpu_percent: f32_from_wire(&value.cpu_percent),
-            cpu_raw_percent: f32_from_wire(&value.cpu_raw_percent),
-            cpu_normalized_percent: f32_from_wire(&value.cpu_normalized_percent),
-            memory_used_bytes: value.memory_used_bytes,
-            memory_total_bytes: value.memory_total_bytes,
-        }
-    }
-}
-
-impl From<ProcessMetricsSnapshot> for performance_types::ProcessMetricsSnapshot {
-    fn from(value: ProcessMetricsSnapshot) -> Self {
-        Self {
-            pid: value.pid,
-            cpu_percent: f32_to_wire(value.cpu_percent),
-            cpu_raw_percent: f32_to_wire(value.cpu_raw_percent),
-            cpu_normalized_percent: f32_to_wire(value.cpu_normalized_percent),
-            memory_bytes: value.memory_bytes,
-            process_count: value.process_count,
-        }
-    }
-}
-
-impl From<performance_types::ProcessMetricsSnapshot> for ProcessMetricsSnapshot {
-    fn from(value: performance_types::ProcessMetricsSnapshot) -> Self {
-        Self {
-            pid: value.pid,
-            cpu_percent: f32_from_wire(&value.cpu_percent),
-            cpu_raw_percent: f32_from_wire(&value.cpu_raw_percent),
-            cpu_normalized_percent: f32_from_wire(&value.cpu_normalized_percent),
-            memory_bytes: value.memory_bytes,
-            process_count: value.process_count,
-        }
-    }
-}
-
-impl From<PaneMetricsSnapshot> for performance_types::PaneMetricsSnapshot {
-    fn from(value: PaneMetricsSnapshot) -> Self {
-        Self {
-            pane_id: value.pane_id,
-            session_id: value.session_id,
-            pid: value.pid,
-            process_group_id: value.process_group_id,
-            cpu_percent: f32_to_wire(value.cpu_percent),
-            cpu_raw_percent: f32_to_wire(value.cpu_raw_percent),
-            cpu_normalized_percent: f32_to_wire(value.cpu_normalized_percent),
-            memory_bytes: value.memory_bytes,
-            process_count: value.process_count,
-            available: value.available,
-        }
-    }
-}
-
-impl From<performance_types::PaneMetricsSnapshot> for PaneMetricsSnapshot {
-    fn from(value: performance_types::PaneMetricsSnapshot) -> Self {
-        Self {
-            pane_id: value.pane_id,
-            session_id: value.session_id,
-            pid: value.pid,
-            process_group_id: value.process_group_id,
-            cpu_percent: f32_from_wire(&value.cpu_percent),
-            cpu_raw_percent: f32_from_wire(&value.cpu_raw_percent),
-            cpu_normalized_percent: f32_from_wire(&value.cpu_normalized_percent),
-            memory_bytes: value.memory_bytes,
-            process_count: value.process_count,
-            available: value.available,
-        }
-    }
-}
-
-impl From<MetricsSnapshot> for performance_types::MetricsSnapshot {
-    fn from(value: MetricsSnapshot) -> Self {
-        Self {
-            sampled_at_epoch_ms: value.sampled_at_epoch_ms,
-            watches: value.watches.into_iter().map(Into::into).collect(),
-            system: value.system.into(),
-            processes: value
-                .processes
-                .into_iter()
-                .map(|(pid, snapshot)| (pid, snapshot.into()))
-                .collect(),
-            panes: value
-                .panes
-                .into_iter()
-                .map(|(pane_id, snapshot)| (pane_id, snapshot.into()))
-                .collect(),
-        }
-    }
-}
-
-impl From<performance_types::MetricsSnapshot> for MetricsSnapshot {
-    fn from(value: performance_types::MetricsSnapshot) -> Self {
-        Self {
-            sampled_at_epoch_ms: value.sampled_at_epoch_ms,
-            watches: value.watches.into_iter().map(Into::into).collect(),
-            system: value.system.into(),
-            processes: value
-                .processes
-                .into_iter()
-                .map(|(pid, snapshot)| (pid, snapshot.into()))
-                .collect(),
-            panes: value
-                .panes
-                .into_iter()
-                .map(|(pane_id, snapshot)| (pane_id, snapshot.into()))
-                .collect(),
+            pane_id: uuid::Uuid::nil(),
+            session_id: None,
+            pid: None,
+            process_group_id: None,
+            cpu_percent: 0.0,
+            cpu_raw_percent: 0.0,
+            cpu_normalized_percent: 0.0,
+            memory_bytes: 0,
+            process_count: 0,
+            available: false,
         }
     }
 }
@@ -639,237 +370,11 @@ fn epoch_millis_now() -> u64 {
     now.as_millis() as u64
 }
 
-/// Metric target selected by a watch.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MetricTarget {
-    /// Whole-machine CPU/memory metrics.
-    System,
-    /// A process tree rooted at a specific process id.
-    Process { pid: u32 },
-    /// A bmux pane's process tree, resolved through pane-runtime state.
-    Pane { pane_id: Uuid },
-}
-
-/// Metric names a watch may request.
-#[derive(
-    Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum MetricName {
-    CpuPercent,
-    MemoryBytes,
-    ProcessCount,
-    DiskReadBytesPerSec,
-    DiskWriteBytesPerSec,
-    NetworkRxBytesPerSec,
-    NetworkTxBytesPerSec,
-}
-
-#[derive(
-    Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ThemeHeaderMetric {
-    Cpu,
-    Memory,
-    ProcessCount,
-    DiskRead,
-    DiskWrite,
-    NetworkRx,
-    NetworkTx,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MetricTargetKind {
-    System,
-    Process,
-    Pane,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MetricAccuracy {
-    Exact,
-    Estimated,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct MetricCapability {
-    pub metric: ThemeHeaderMetric,
-    pub target: MetricTargetKind,
-    pub supported: bool,
-    pub disabled_reason: Option<String>,
-    pub accuracy: Option<MetricAccuracy>,
-}
-
-/// How `cpu_percent` should be presented in consumer-facing snapshots.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CpuPercentMode {
-    /// Normalize multicore process usage into a 0..100 whole-machine load.
-    #[default]
-    Normalized,
-    /// Preserve process-tree core-sum semantics where one full core is 100%.
-    RawCoreSum,
-}
-
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ThemeHeaderScope {
-    #[default]
-    Pane,
-    System,
-    Both,
-}
-
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ThemeHeaderStyle {
-    #[default]
-    Compact,
-    Detailed,
-    HeatOnly,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct ThemeHeaderSettings {
-    pub enabled: bool,
-    pub sample_interval_ms: u64,
-    pub scope: ThemeHeaderScope,
-    pub style: ThemeHeaderStyle,
-    pub cpu_percent_mode: CpuPercentMode,
-    pub metrics: Vec<ThemeHeaderMetric>,
-}
-
-impl Default for ThemeHeaderSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            sample_interval_ms: 1_000,
-            scope: ThemeHeaderScope::Pane,
-            style: ThemeHeaderStyle::Compact,
-            cpu_percent_mode: CpuPercentMode::Normalized,
-            metrics: vec![
-                ThemeHeaderMetric::Cpu,
-                ThemeHeaderMetric::Memory,
-                ThemeHeaderMetric::ProcessCount,
-            ],
-        }
-    }
-}
-
-/// One subscribed metric watch.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct MetricWatch {
-    pub id: String,
-    pub target: MetricTarget,
-    pub metrics: Vec<MetricName>,
-    pub interval_ms: u64,
-    #[serde(default)]
-    pub cpu_percent_mode: CpuPercentMode,
-}
-
-impl MetricWatch {
-    #[must_use]
-    pub fn normalized(mut self) -> Self {
-        self.interval_ms = self.interval_ms.max(MIN_METRICS_INTERVAL_MS);
-        if self.metrics.is_empty() {
-            self.metrics = vec![MetricName::CpuPercent, MetricName::MemoryBytes];
-        }
-        self
-    }
-}
-
-impl Default for MetricWatch {
-    fn default() -> Self {
-        Self {
-            id: DEFAULT_METRICS_WATCH_ID.to_string(),
-            target: MetricTarget::System,
-            metrics: vec![MetricName::CpuPercent, MetricName::MemoryBytes],
-            interval_ms: 1_000,
-            cpu_percent_mode: CpuPercentMode::Normalized,
-        }
-    }
-}
-
-/// Current metrics sampled for the entire machine.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct SystemMetricsSnapshot {
-    pub cpu_percent: f32,
-    pub cpu_raw_percent: f32,
-    pub cpu_normalized_percent: f32,
-    pub memory_used_bytes: u64,
-    pub memory_total_bytes: u64,
-}
-
-/// Current metrics sampled for one process tree.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct ProcessMetricsSnapshot {
-    pub pid: u32,
-    /// Consumer-facing CPU percentage, shaped by `MetricWatch.cpu_percent_mode`.
-    pub cpu_percent: f32,
-    /// Raw process-tree CPU where one saturated core is 100%.
-    pub cpu_raw_percent: f32,
-    /// Whole-machine-normalized CPU percentage, clamped to 0..100.
-    pub cpu_normalized_percent: f32,
-    pub memory_bytes: u64,
-    pub process_count: u32,
-}
-
-/// Current metrics sampled for one pane's process tree.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct PaneMetricsSnapshot {
-    pub pane_id: Uuid,
-    pub session_id: Option<Uuid>,
-    pub pid: Option<u32>,
-    pub process_group_id: Option<i32>,
-    /// Consumer-facing CPU percentage, shaped by `MetricWatch.cpu_percent_mode`.
-    pub cpu_percent: f32,
-    /// Raw process-tree CPU where one saturated core is 100%.
-    pub cpu_raw_percent: f32,
-    /// Whole-machine-normalized CPU percentage, clamped to 0..100.
-    pub cpu_normalized_percent: f32,
-    pub memory_bytes: u64,
-    pub process_count: u32,
-    pub available: bool,
-}
-
-/// Latest metrics state published by `bmux.performance`.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct MetricsSnapshot {
-    pub sampled_at_epoch_ms: u64,
-    pub watches: Vec<MetricWatch>,
-    pub system: SystemMetricsSnapshot,
-    pub processes: BTreeMap<u32, ProcessMetricsSnapshot>,
-    pub panes: BTreeMap<Uuid, PaneMetricsSnapshot>,
-}
-
-/// Broadcast event for threshold/crossing-style consumers. The first
-/// implementation emits `SnapshotUpdated` after each sample; consumers
-/// that only need latest values should prefer `METRICS_STATE_KIND`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum MetricEvent {
-    SnapshotUpdated { sampled_at_epoch_ms: u64 },
-}
-
-/// Typed event emitted on the plugin event bus when performance
-/// settings change. Server's `spawn_performance_events_bridge` maps
-/// this to the legacy wire `Event::PerformanceSettingsUpdated` for
-/// cross-process subscribers.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PerformanceEvent {
-    SettingsUpdated {
-        settings: PerformanceRuntimeSettings,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
 
     #[test]
     fn metric_watch_normalizes_interval_and_metrics() {

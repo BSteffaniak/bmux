@@ -141,13 +141,13 @@ impl RustPlugin for PerformancePlugin {
                 let PerformanceResponse::Watches { watches } = handle_list_watches() else {
                     unreachable!("list watches handler returns watches")
                 };
-                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(watches.into_iter().map(Into::into).collect())
+                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(watches)
             },
             "performance-commands", "start-watch" => |req: StartWatchRequest, _ctx| {
-                let PerformanceResponse::Watches { watches } = handle_start_watch(req.watch.into()) else {
+                let PerformanceResponse::Watches { watches } = handle_start_watch(req.watch) else {
                     unreachable!("start watch handler returns watches")
                 };
-                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(watches.into_iter().map(Into::into).collect())
+                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(watches)
             },
             "performance-commands", "stop-watch" => |req: StopWatchRequest, _ctx| {
                 let _ = handle_stop_watch(&req.watch_id);
@@ -157,25 +157,25 @@ impl RustPlugin for PerformancePlugin {
                 let PerformanceResponse::Snapshot { snapshot } = handle_get_snapshot() else {
                     unreachable!("snapshot handler returns snapshot")
                 };
-                Ok::<performance_types::MetricsSnapshot, ServiceResponse>(snapshot.into())
+                Ok::<performance_types::MetricsSnapshot, ServiceResponse>(snapshot)
             },
             "performance-state", "get-metric-capabilities" => |_req: (), _ctx| {
                 let PerformanceResponse::MetricCapabilities { capabilities } = handle_get_metric_capabilities() else {
                     unreachable!("capabilities handler returns capabilities")
                 };
-                Ok::<Vec<performance_types::MetricCapability>, ServiceResponse>(capabilities.into_iter().map(Into::into).collect())
+                Ok::<Vec<performance_types::MetricCapability>, ServiceResponse>(capabilities)
             },
             "performance-state", "get-theme-header-settings" => |_req: (), _ctx| {
                 let PerformanceResponse::ThemeHeaderSettings { settings } = handle_get_theme_header_settings() else {
                     unreachable!("theme settings handler returns settings")
                 };
-                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(settings.into())
+                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(settings)
             },
             "performance-commands", "set-theme-header-settings" => |req: SetThemeHeaderSettingsRequest, _ctx| {
-                let PerformanceResponse::ThemeHeaderSettings { settings } = handle_set_theme_header_settings(req.settings.into()) else {
+                let PerformanceResponse::ThemeHeaderSettings { settings } = handle_set_theme_header_settings(req.settings) else {
                     unreachable!("theme settings handler returns settings")
                 };
-                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(settings.into())
+                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(settings)
             },
             "performance-state", "build-theme-header-settings-form" => |_req: (), _ctx| {
                 let PerformanceResponse::PromptForm { request } = handle_build_theme_header_settings_form() else {
@@ -188,7 +188,7 @@ impl RustPlugin for PerformancePlugin {
                 let PerformanceResponse::ThemeHeaderSettings { settings } = handle_apply_theme_header_settings_form(&values) else {
                     unreachable!("theme settings form handler returns settings")
                 };
-                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(settings.into())
+                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(settings)
             },
         })
     }
@@ -594,7 +594,7 @@ fn handle_set_settings(requested: &bmux_ipc::PerformanceRuntimeSettings) -> Perf
     let _ = global_event_bus().emit(
         &EVENT_KIND,
         PerformanceEvent::SettingsUpdated {
-            settings: normalized.clone(),
+            settings: normalized.clone().into(),
         },
     );
     publish_wire_event(bmux_ipc::Event::PerformanceSettingsUpdated {
