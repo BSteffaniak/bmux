@@ -72,3 +72,23 @@ pub struct NoopRecordingSink;
 impl RecordingSink for NoopRecordingSink {
     fn record(&self, _kind: RecordingEventKind, _payload: RecordingPayload, _meta: RecordMeta) {}
 }
+
+/// Default rolling-recording configuration (window seconds + enabled
+/// event kinds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollingRecordingSettings {
+    pub window_secs: u64,
+    pub event_kinds: Vec<RecordingEventKind>,
+}
+
+impl RollingRecordingSettings {
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        self.window_secs > 0 && !self.event_kinds.is_empty()
+    }
+
+    #[must_use]
+    pub fn capture_input(&self) -> bool {
+        self.event_kinds.contains(&RecordingEventKind::PaneInputRaw)
+    }
+}

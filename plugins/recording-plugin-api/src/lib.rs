@@ -24,13 +24,13 @@
 
 pub mod offline_prune;
 
+pub use bmux_recording_runtime::RollingRecordingSettings;
 pub use offline_prune::prune_old_recordings;
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/recording-plugin.bpdl",
 }
 
-use bmux_ipc::RecordingEventKind;
 impl From<recording_types::RecordingProfile> for bmux_ipc::RecordingProfile {
     fn from(value: recording_types::RecordingProfile) -> Self {
         match value {
@@ -276,26 +276,6 @@ impl From<recording_types::RecordingRollingClearReport> for bmux_ipc::RecordingR
             usage_before: value.usage_before.into(),
             usage_after: value.usage_after.into(),
         }
-    }
-}
-
-/// Default rolling-recording configuration (window seconds + enabled
-/// event kinds).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RollingRecordingSettings {
-    pub window_secs: u64,
-    pub event_kinds: Vec<RecordingEventKind>,
-}
-
-impl RollingRecordingSettings {
-    #[must_use]
-    pub const fn is_available(&self) -> bool {
-        self.window_secs > 0 && !self.event_kinds.is_empty()
-    }
-
-    #[must_use]
-    pub fn capture_input(&self) -> bool {
-        self.event_kinds.contains(&RecordingEventKind::PaneInputRaw)
     }
 }
 

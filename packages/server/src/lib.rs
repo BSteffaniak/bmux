@@ -32,12 +32,11 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use bmux_performance_plugin_api::PerformanceEventRateLimiter;
 use bmux_performance_state::{
-    PerformanceSettingsHandle, PerformanceSettingsReader, PerformanceSettingsStore,
+    PerformanceEventRateLimiter, PerformanceSettingsHandle, PerformanceSettingsReader,
+    PerformanceSettingsStore,
 };
-use bmux_recording_plugin_api::RollingRecordingSettings;
-use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
+use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle, RollingRecordingSettings};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);

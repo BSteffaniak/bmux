@@ -28,8 +28,10 @@ use bmux_ipc::{
 use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
-use bmux_recording_plugin_api::{RecordingPluginConfig, RollingRecordingSettings, recording_types};
-use bmux_recording_runtime::{RecordMeta, RecordingSink, RecordingSinkHandle};
+use bmux_recording_plugin_api::{RecordingPluginConfig, recording_types};
+use bmux_recording_runtime::{
+    RecordMeta, RecordingSink, RecordingSinkHandle, RollingRecordingSettings,
+};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 

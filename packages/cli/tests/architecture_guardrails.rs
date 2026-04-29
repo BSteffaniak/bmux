@@ -248,11 +248,9 @@ fn event_core_crate_has_no_domain_event_types() {
 
 /// Verify that the performance-plugin crates exist and that core does
 /// not define the `PerformanceCaptureSettings` or
-/// `PerformanceEventRateLimiter` types. Both were relocated from
-/// `packages/server/src/lib.rs` to
-/// `plugins/performance-plugin-api/src/lib.rs`; server imports them
-/// via `use bmux_performance_plugin_api::...` without depending on
-/// the plugin impl crate.
+/// `PerformanceEventRateLimiter` types. Both live in the neutral
+/// `packages/performance-state` crate so server does not import the
+/// performance plugin API crate for runtime support types.
 #[test]
 fn performance_plugin_exists() {
     let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -268,7 +266,6 @@ fn performance_plugin_exists() {
         "plugins/performance-plugin/Cargo.toml must exist",
     );
 
-    let plugin_api_source = include_str!("../../../plugins/performance-plugin-api/src/lib.rs");
     let state_source = include_str!("../../../packages/performance-state/src/lib.rs");
     assert!(
         state_source.contains("pub struct PerformanceCaptureSettings"),
@@ -276,8 +273,8 @@ fn performance_plugin_exists() {
          canonical `PerformanceCaptureSettings` struct",
     );
     assert!(
-        plugin_api_source.contains("pub struct PerformanceEventRateLimiter"),
-        "plugins/performance-plugin-api/src/lib.rs must export the \
+        state_source.contains("pub struct PerformanceEventRateLimiter"),
+        "packages/performance-state/src/lib.rs must export the \
          canonical `PerformanceEventRateLimiter` struct",
     );
     assert!(
@@ -292,18 +289,19 @@ fn performance_plugin_exists() {
         !server_source.contains("struct PerformanceCaptureSettings {"),
         "packages/server/src/lib.rs must not define \
          `PerformanceCaptureSettings`; the type lives in \
-         bmux_performance_plugin_api",
+          bmux_performance_state",
     );
     assert!(
         !server_source.contains("struct PerformanceEventRateLimiter {"),
         "packages/server/src/lib.rs must not define \
          `PerformanceEventRateLimiter`; the type lives in \
-         bmux_performance_plugin_api",
+          bmux_performance_state",
     );
     assert!(
-        server_source.contains("use bmux_performance_plugin_api::"),
-        "packages/server/src/lib.rs must import performance types via \
-         `use bmux_performance_plugin_api::...`",
+        !server_source.contains("bmux_performance_plugin_api"),
+        "packages/server/src/lib.rs must not import \
+          `bmux_performance_plugin_api`; runtime support types live in \
+          neutral packages",
     );
     assert!(
         server_source.contains("register::<PerformanceSettingsHandle>"),
@@ -317,6 +315,32 @@ fn performance_plugin_exists() {
          `spawn_performance_events_bridge`; the performance plugin \
          now publishes `Event::PerformanceSettingsUpdated` directly \
          through the registered `WireEventSinkHandle`",
+    );
+}
+
+/// Server is core runtime architecture and must not import plugin API
+/// crates for domain support types. Plugin API crates are allowed in
+/// CLI/plugin consumers, but not in `packages/server`.
+#[test]
+fn server_does_not_import_plugin_api_crates() {
+    let server_source = production_section(include_str!("../../server/src/lib.rs"));
+    assert!(
+        !server_source.contains("bmux_performance_plugin_api"),
+        "packages/server/src/lib.rs must not import bmux_performance_plugin_api",
+    );
+    assert!(
+        !server_source.contains("bmux_recording_plugin_api"),
+        "packages/server/src/lib.rs must not import bmux_recording_plugin_api",
+    );
+
+    let server_cargo = include_str!("../../server/Cargo.toml");
+    assert!(
+        !server_cargo.contains("bmux_performance_plugin_api"),
+        "packages/server/Cargo.toml must not depend on bmux_performance_plugin_api",
+    );
+    assert!(
+        !server_cargo.contains("bmux_recording_plugin_api"),
+        "packages/server/Cargo.toml must not depend on bmux_recording_plugin_api",
     );
 }
 
