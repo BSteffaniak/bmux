@@ -77,18 +77,3 @@ impl RustPlugin for PaneRuntimePlugin {
     ) {
     }
 }
-
-// Keep the capability/interface constants alive for consumers of the
-// exported plugin binary (plugin.toml references them by string; Rust
-// doesn't see that wiring).
-const _KEEPS_CONSTS_ALIVE: (
-    bmux_plugin_sdk::CapabilityId,
-    bmux_plugin_sdk::CapabilityId,
-    bmux_plugin_sdk::CapabilityId,
-    bmux_plugin_sdk::CapabilityId,
-) = (
-    bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_READ,
-    bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE,
-    bmux_pane_runtime_plugin_api::capabilities::ATTACH_RUNTIME_READ,
-    bmux_pane_runtime_plugin_api::capabilities::ATTACH_RUNTIME_WRITE,
-);
