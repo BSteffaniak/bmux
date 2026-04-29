@@ -25,9 +25,7 @@ use std::sync::{Arc, RwLock};
 use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
-use bmux_snapshot_plugin_api::{
-    SnapshotPluginConfig, snapshot_commands, snapshot_state, snapshot_types,
-};
+use bmux_snapshot_plugin_api::{SnapshotPluginConfig, snapshot_types};
 use bmux_snapshot_runtime::{
     SnapshotDirtyFlagHandle, SnapshotOrchestratorError, SnapshotOrchestratorHandle,
     StatefulPluginRegistry,
@@ -266,18 +264,3 @@ fn spawn_debounce_loop(
 }
 
 bmux_plugin_sdk::export_plugin!(SnapshotPlugin, include_str!("../plugin.toml"));
-
-// Keep the capability/interface constants alive for consumers of the
-// exported plugin binary (plugin.toml references them by string; Rust
-// doesn't see that wiring).
-const _KEEPS_CONSTS_ALIVE: (
-    bmux_plugin_sdk::CapabilityId,
-    bmux_plugin_sdk::CapabilityId,
-    bmux_plugin_sdk::InterfaceId,
-    bmux_plugin_sdk::InterfaceId,
-) = (
-    bmux_snapshot_plugin_api::capabilities::SNAPSHOT_READ,
-    bmux_snapshot_plugin_api::capabilities::SNAPSHOT_WRITE,
-    snapshot_state::INTERFACE_ID,
-    snapshot_commands::INTERFACE_ID,
-);

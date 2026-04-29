@@ -586,20 +586,6 @@ pub enum ControlCatalogScope {
     Bindings,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextSessionBindingSummary {
-    pub context_id: Uuid,
-    pub session_id: Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ControlCatalogSnapshot {
-    pub revision: u64,
-    pub sessions: Vec<SessionSummary>,
-    pub contexts: Vec<ContextSummary>,
-    pub context_session_bindings: Vec<ContextSessionBindingSummary>,
-}
-
 /// Summary returned when listing panes in the active session runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSummary {
@@ -1279,7 +1265,7 @@ pub enum Event {
         settings: PerformanceRuntimeSettings,
     },
     /// Control-plane catalog state changed (sessions/contexts/bindings).
-    /// Clients should refresh via `ControlCatalogSnapshot` and reconcile local caches.
+    /// Clients should refresh through the control-catalog plugin and reconcile local caches.
     ControlCatalogChanged {
         revision: u64,
         scopes: Vec<ControlCatalogScope>,

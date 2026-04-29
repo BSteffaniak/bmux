@@ -12,9 +12,8 @@ use bmux_client::{
 };
 use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
 use bmux_ipc::{
-    AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ContextSelector,
-    ContextSessionBindingSummary, ContextSummary, ControlCatalogSnapshot, InvokeServiceKind,
-    PaneFocusDirection, PaneSplitDirection, SessionSelector, SessionSummary,
+    AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ContextSelector, InvokeServiceKind,
+    PaneFocusDirection, PaneSplitDirection, SessionSelector,
 };
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_plugin_sdk::{
@@ -122,10 +121,12 @@ fn emit_attach_plugin_command_timing(
     }));
 }
 
-use super::super::control_catalog_mapping;
 use bmux_clients_plugin_api::{clients_state, clients_state::ClientSummary};
 use bmux_contexts_plugin_api::{
     contexts_state, contexts_state::ContextSummary as PluginContextSummary,
+};
+use bmux_control_catalog_plugin_api::control_catalog_state::{
+    self, ContextRow, ContextSessionBinding, SessionRow,
 };
 use bmux_performance_plugin_api::performance_state;
 use bmux_plugin_sdk::{TypedServiceClientError, TypedServiceEndpoint};
@@ -252,8 +253,8 @@ async fn typed_list_contexts_attach(
 /// broadcast has zero subscribers at that moment and the message is
 /// lost. We pull on attach startup to seed our local state channel;
 /// subsequent mutations arrive as `PluginBusEvent`s and drive updates
-/// through the normal subscription path. This matches the
-/// `ControlCatalogSnapshot` pull-on-connect pattern.
+/// through the normal subscription path. This matches the control-catalog
+/// plugin snapshot pull-on-connect pattern.
 async fn typed_list_windows_attach(
     client: &mut StreamingBmuxClient,
 ) -> std::result::Result<Vec<windows_state::WindowEntry>, ClientError> {
@@ -3719,9 +3720,11 @@ pub fn build_attach_status_line_for_draw(
 
     let cached_contexts = view_state.cached_contexts.clone();
     let cached_sessions = view_state.cached_sessions.clone();
+    let cached_context_session_bindings = view_state.cached_context_session_bindings.clone();
 
     let tabs = build_attach_tabs_from_catalog(
         &cached_contexts,
+        &cached_context_session_bindings,
         view_state,
         status_config,
         context_id,
@@ -3729,8 +3732,12 @@ pub fn build_attach_status_line_for_draw(
     );
     let (session_label, session_count) =
         resolve_attach_session_label_and_count_from_catalog(&cached_sessions, session_id);
-    let current_context_label =
-        resolve_attach_context_label_from_catalog(&cached_contexts, context_id, session_id);
+    let current_context_label = resolve_attach_context_label_from_catalog(
+        &cached_contexts,
+        &cached_context_session_bindings,
+        context_id,
+        session_id,
+    );
     let tab_position_label = tabs
         .iter()
         .position(|tab| tab.active)
@@ -4490,7 +4497,8 @@ pub fn render_attach_frame(
 }
 
 pub fn build_attach_tabs_from_catalog(
-    contexts: &[ContextSummary],
+    contexts: &[ContextRow],
+    bindings: &[ContextSessionBinding],
     view_state: &AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
     context_id: Option<Uuid>,
@@ -4520,13 +4528,14 @@ pub fn build_attach_tabs_from_catalog(
         return build_attach_tabs_from_plugin_snapshot(
             snapshot,
             contexts,
+            bindings,
             status_config,
             context_id,
             session_id,
         );
     }
 
-    build_attach_tabs_from_raw_contexts(contexts, status_config, context_id, session_id)
+    build_attach_tabs_from_raw_contexts(contexts, bindings, status_config, context_id, session_id)
 }
 
 /// Project the windows-plugin's authoritative ordered window list onto
@@ -4534,7 +4543,8 @@ pub fn build_attach_tabs_from_catalog(
 /// been populated from the `windows-list` state channel.
 fn build_attach_tabs_from_plugin_snapshot(
     snapshot: &bmux_windows_plugin_api::windows_list::WindowListSnapshot,
-    contexts: &[ContextSummary],
+    contexts: &[ContextRow],
+    bindings: &[ContextSessionBinding],
     status_config: &bmux_config::StatusBarConfig,
     context_id: Option<Uuid>,
     session_id: Uuid,
@@ -4554,10 +4564,7 @@ fn build_attach_tabs_from_plugin_snapshot(
                     .iter()
                     .find(|context| context.id == entry.id)
                     .is_some_and(|context| {
-                        context
-                            .attributes
-                            .get("bmux.session_id")
-                            .is_some_and(|value| value == &session_id.to_string())
+                        context_session_id(bindings, context.id) == Some(session_id)
                     })
             })
             .collect();
@@ -4573,12 +4580,7 @@ fn build_attach_tabs_from_plugin_snapshot(
     let current_id = context_id.or_else(|| {
         contexts
             .iter()
-            .find(|context| {
-                context
-                    .attributes
-                    .get("bmux.session_id")
-                    .is_some_and(|value| value == &session_id.to_string())
-            })
+            .find(|context| context_session_id(bindings, context.id) == Some(session_id))
             .map(|context| context.id)
     });
 
@@ -4597,7 +4599,8 @@ fn build_attach_tabs_from_plugin_snapshot(
 /// Renders `cached_contexts` in the order the server delivered them.
 /// Core does not stabilize or reorder — that's the plugin's job.
 fn build_attach_tabs_from_raw_contexts(
-    contexts: &[ContextSummary],
+    contexts: &[ContextRow],
+    bindings: &[ContextSessionBinding],
     status_config: &bmux_config::StatusBarConfig,
     context_id: Option<Uuid>,
     session_id: Uuid,
@@ -4617,12 +4620,7 @@ fn build_attach_tabs_from_raw_contexts(
         bmux_config::StatusTabScope::SessionContexts => {
             let filtered = contexts
                 .iter()
-                .filter(|context| {
-                    context
-                        .attributes
-                        .get("bmux.session_id")
-                        .is_some_and(|value| value == &session_id.to_string())
-                })
+                .filter(|context| context_session_id(bindings, context.id) == Some(session_id))
                 .cloned()
                 .collect::<Vec<_>>();
             if filtered.is_empty() {
@@ -4636,12 +4634,7 @@ fn build_attach_tabs_from_raw_contexts(
     let current_context_id = context_id.or_else(|| {
         tab_contexts
             .iter()
-            .find(|context| {
-                context
-                    .attributes
-                    .get("bmux.session_id")
-                    .is_some_and(|value| value == &session_id.to_string())
-            })
+            .find(|context| context_session_id(bindings, context.id) == Some(session_id))
             .map(|context| context.id)
     });
 
@@ -4657,7 +4650,8 @@ fn build_attach_tabs_from_raw_contexts(
 }
 
 pub fn resolve_attach_context_label_from_catalog(
-    contexts: &[ContextSummary],
+    contexts: &[ContextRow],
+    bindings: &[ContextSessionBinding],
     context_id: Option<Uuid>,
     session_id: Uuid,
 ) -> String {
@@ -4670,19 +4664,18 @@ pub fn resolve_attach_context_label_from_catalog(
         return context_summary_label(context, Some(index.saturating_add(1)));
     }
 
-    if let Some((index, context)) = contexts.iter().enumerate().find(|(_, context)| {
-        context
-            .attributes
-            .get("bmux.session_id")
-            .is_some_and(|value| value == &session_id.to_string())
-    }) {
+    if let Some((index, context)) = contexts
+        .iter()
+        .enumerate()
+        .find(|(_, context)| context_session_id(bindings, context.id) == Some(session_id))
+    {
         return context_summary_label(context, Some(index.saturating_add(1)));
     }
 
     "terminal".to_string()
 }
 
-pub fn context_summary_label(context: &ContextSummary, fallback_index: Option<usize>) -> String {
+pub fn context_summary_label(context: &ContextRow, fallback_index: Option<usize>) -> String {
     context
         .name
         .as_deref()
@@ -4694,7 +4687,7 @@ pub fn context_summary_label(context: &ContextSummary, fallback_index: Option<us
 }
 
 pub fn resolve_attach_session_label_and_count_from_catalog(
-    sessions: &[SessionSummary],
+    sessions: &[SessionRow],
     session_id: Uuid,
 ) -> (String, usize) {
     let count = sessions.len();
@@ -4708,7 +4701,7 @@ pub fn resolve_attach_session_label_and_count_from_catalog(
     (label, count)
 }
 
-pub fn session_summary_label(session: &bmux_ipc::SessionSummary) -> String {
+pub fn session_summary_label(session: &SessionRow) -> String {
     session
         .name
         .clone()
@@ -4722,6 +4715,7 @@ pub fn attach_context_status_from_catalog(view_state: &AttachViewState) -> Strin
     );
     let context_label = resolve_attach_context_label_from_catalog(
         &view_state.cached_contexts,
+        &view_state.cached_context_session_bindings,
         view_state.attached_context_id,
         view_state.attached_id,
     );
@@ -4765,40 +4759,20 @@ pub const fn attached_session_selector(view_state: &AttachViewState) -> SessionS
     SessionSelector::ById(view_state.attached_id)
 }
 
-fn parse_context_session_id(context: &ContextSummary) -> Option<Uuid> {
-    context
-        .attributes
-        .get("bmux.session_id")
-        .and_then(|value| Uuid::parse_str(value).ok())
-}
-
-fn apply_context_session_bindings_to_contexts(
-    contexts: &mut [ContextSummary],
-    bindings: &[ContextSessionBindingSummary],
-) {
-    let binding_by_context = bindings
+fn context_session_id(bindings: &[ContextSessionBinding], context_id: Uuid) -> Option<Uuid> {
+    bindings
         .iter()
-        .map(|binding| (binding.context_id, binding.session_id))
-        .collect::<BTreeMap<_, _>>();
-    for context in contexts {
-        if let Some(session_id) = binding_by_context.get(&context.id) {
-            context
-                .attributes
-                .insert("bmux.session_id".to_string(), session_id.to_string());
-        }
-    }
+        .find(|binding| binding.context_id == context_id)
+        .map(|binding| binding.session_id)
 }
 
 fn apply_control_catalog_snapshot(
     view_state: &mut AttachViewState,
-    mut snapshot: ControlCatalogSnapshot,
+    snapshot: control_catalog_state::Snapshot,
 ) {
-    apply_context_session_bindings_to_contexts(
-        &mut snapshot.contexts,
-        &snapshot.context_session_bindings,
-    );
     view_state.cached_contexts = snapshot.contexts;
     view_state.cached_sessions = snapshot.sessions;
+    view_state.cached_context_session_bindings = snapshot.context_session_bindings;
     view_state.control_catalog_revision = snapshot.revision;
 }
 
@@ -4810,11 +4784,8 @@ pub async fn reconcile_attached_session_from_catalog(
         return Ok(false);
     };
 
-    let Some(mapped_session_id) = view_state
-        .cached_contexts
-        .iter()
-        .find(|context| context.id == context_id)
-        .and_then(parse_context_session_id)
+    let Some(mapped_session_id) =
+        context_session_id(&view_state.cached_context_session_bindings, context_id)
     else {
         return Ok(false);
     };
@@ -4860,11 +4831,10 @@ pub async fn refresh_attach_status_catalog(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> anyhow::Result<()> {
-    let snapshot = control_catalog_mapping::control_catalog_snapshot(
-        client,
-        Some(view_state.control_catalog_revision),
-    )
-    .await?;
+    let snapshot =
+        control_catalog_state::client::snapshot(client, Some(view_state.control_catalog_revision))
+            .await
+            .context("control-catalog snapshot dispatch failed")?;
     apply_control_catalog_snapshot(view_state, snapshot);
     Ok(())
 }
@@ -7718,26 +7688,29 @@ mod tests {
             },
         ));
         let contexts = vec![
-            ContextSummary {
+            ContextRow {
                 id: stale_active,
                 name: Some("old".to_string()),
-                attributes: BTreeMap::from([(
-                    "bmux.session_id".to_string(),
-                    session_id.to_string(),
-                )]),
             },
-            ContextSummary {
+            ContextRow {
                 id: attached_context,
                 name: Some("new".to_string()),
-                attributes: BTreeMap::from([(
-                    "bmux.session_id".to_string(),
-                    session_id.to_string(),
-                )]),
+            },
+        ];
+        let bindings = vec![
+            ContextSessionBinding {
+                context_id: stale_active,
+                session_id,
+            },
+            ContextSessionBinding {
+                context_id: attached_context,
+                session_id,
             },
         ];
 
         let tabs = build_attach_tabs_from_catalog(
             &contexts,
+            &bindings,
             &view_state,
             &BmuxConfig::default().status_bar,
             Some(attached_context),

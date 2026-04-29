@@ -32,8 +32,6 @@ mod bootstrap;
 mod built_in_commands;
 mod cli_parse;
 mod config_cli;
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) mod control_catalog_mapping;
 mod dispatch;
 mod doctor_cli;
 mod hosted_output;

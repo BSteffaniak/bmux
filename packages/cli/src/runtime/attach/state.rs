@@ -5,7 +5,10 @@ pub use bmux_attach_pipeline::{
 };
 use bmux_client::AttachLayoutState;
 use bmux_config::{MouseBehaviorConfig, StatusPosition};
-use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState, ContextSummary, SessionSummary};
+use bmux_control_catalog_plugin_api::control_catalog_state::{
+    ContextRow, ContextSessionBinding, SessionRow,
+};
+use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState};
 use bmux_windows_plugin_api::windows_commands::PaneResizeDirection;
 use bmux_windows_plugin_api::windows_list::WindowListSnapshot;
 use crossterm::event::MouseEvent;
@@ -90,8 +93,9 @@ pub struct AttachViewState {
     /// order). Updated by the attach loop whenever the plugin
     /// publishes a new value via `publish_window_list_snapshot`.
     pub cached_window_list: Option<Arc<WindowListSnapshot>>,
-    pub cached_contexts: Vec<ContextSummary>,
-    pub cached_sessions: Vec<SessionSummary>,
+    pub cached_contexts: Vec<ContextRow>,
+    pub cached_sessions: Vec<SessionRow>,
+    pub cached_context_session_bindings: Vec<ContextSessionBinding>,
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
     pub pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
     pub pane_input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
@@ -191,6 +195,7 @@ impl AttachViewState {
             cached_window_list: None,
             cached_contexts: Vec::new(),
             cached_sessions: Vec::new(),
+            cached_context_session_bindings: Vec::new(),
             pane_buffers: BTreeMap::new(),
             pane_mouse_protocol_hints: BTreeMap::new(),
             pane_input_mode_hints: BTreeMap::new(),

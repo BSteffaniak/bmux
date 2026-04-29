@@ -901,6 +901,17 @@ fn client_ipc_variants_are_absent() {
 #[test]
 fn control_catalog_snapshot_ipc_variant_is_absent() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
+    let denied_models = [
+        "pub struct ContextSessionBindingSummary",
+        "pub struct ControlCatalogSnapshot",
+    ];
+    for marker in denied_models {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; \
+             catalog snapshots go through `control-catalog-state::snapshot` typed dispatch",
+        );
+    }
     assert!(
         !ipc_source.contains("    ControlCatalogSnapshot {\n        /// Optional"),
         "packages/ipc/src/lib.rs must not reintroduce `Request::ControlCatalogSnapshot`; \
