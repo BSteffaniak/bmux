@@ -16,7 +16,8 @@ serde_json = { workspace = true }
 thiserror  = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile         = { workspace = true }
+tracing-appender = { workspace = true }
 
 [features]
 fail-on-warnings = []

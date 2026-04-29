@@ -98,7 +98,7 @@ use playbook_cli::{
     run_playbook_interactive, run_playbook_run, run_playbook_validate,
 };
 use plugin_kernel::{
-    EFFECTIVE_LOG_LEVEL, KernelClientFactory, LOG_WRITER_GUARD, available_capability_providers,
+    EFFECTIVE_LOG_LEVEL, KernelClientFactory, LOG_CONTROL, available_capability_providers,
     available_service_descriptors, core_provided_capabilities, enter_host_kernel_client_factory,
     enter_host_kernel_connection, host_kernel_bridge, register_plugin_service_handlers,
     service_descriptors_from_declarations,
@@ -289,8 +289,8 @@ const fn logging_scope_for_command(command: Option<&bmux_cli_schema::Command>) -
 }
 
 pub fn set_logging_client_id(client_id: impl Into<String>) {
-    if let Some(handle) = LOG_WRITER_GUARD.get() {
-        handle.set_client_id(client_id);
+    if let Some(control) = LOG_CONTROL.get() {
+        control.set_subject_id(client_id);
     }
 }
 
@@ -364,11 +364,14 @@ pub async fn run() -> Result<u8> {
         } => {
             let _config_override_guard = push_process_config_overrides(config_overrides);
             let file_only = command_enters_raw_mode(cli.command.as_ref()) || cli.core_builtins_only;
-            init_logging(
-                verbose,
-                Some(log_level),
+            let logging_scope = logging_scope_for_command(cli.command.as_ref());
+            let _logging_guard = init_logging(verbose, Some(log_level), file_only, logging_scope);
+            tracing::info!(
+                scope = ?logging_scope,
                 file_only,
-                logging_scope_for_command(cli.command.as_ref()),
+                has_command = cli.command.is_some(),
+                core_builtins_only = cli.core_builtins_only,
+                "runtime.cli.builtin_start"
             );
             validate_record_bootstrap_flags(&cli)?;
             maybe_print_slot_startup_banner(cli.command.as_ref());
@@ -401,7 +404,9 @@ pub async fn run() -> Result<u8> {
             config_overrides,
         } => {
             let _config_override_guard = push_process_config_overrides(config_overrides);
-            init_logging(false, Some(log_level), false, LogProcessScope::Command);
+            let _logging_guard =
+                init_logging(false, Some(log_level), false, LogProcessScope::Command);
+            tracing::info!(plugin_id, command_name, "runtime.cli.plugin_start");
             if let Some(status) =
                 maybe_run_cluster_plugin_command_via_gateway(&plugin_id, &command_name, &arguments)
                     .await?

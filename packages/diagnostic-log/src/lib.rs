@@ -48,8 +48,8 @@ pub struct DiagnosticLogConfig {
     pub retention_days: u64,
     /// Maximum total bytes under this scope. `0` disables size pruning.
     pub max_total_mb: usize,
-    /// Optional client/process identifier to write into the manifest.
-    pub client_id: Option<String>,
+    /// Optional process/domain subject identifier to write into the manifest.
+    pub subject_id: Option<String>,
 }
 
 /// On-disk manifest for segmented diagnostic logs.
@@ -59,7 +59,7 @@ pub struct DiagnosticLogManifest {
     pub kind: String,
     pub run_id: String,
     pub pid: u32,
-    pub client_id: Option<String>,
+    pub subject_id: Option<String>,
     pub started_epoch_ms: u64,
     pub ended_epoch_ms: Option<u64>,
     pub segments: Vec<String>,
@@ -70,6 +70,12 @@ pub struct DiagnosticLogManifest {
 /// Shared writer suitable for tracing sinks.
 #[derive(Clone, Debug)]
 pub struct DiagnosticLogWriter {
+    inner: Arc<Mutex<DiagnosticLogState>>,
+}
+
+/// Lightweight control handle for updating metadata without owning finalization.
+#[derive(Clone, Debug)]
+pub struct DiagnosticLogControl {
     inner: Arc<Mutex<DiagnosticLogState>>,
 }
 
@@ -100,6 +106,8 @@ pub enum DiagnosticLogError {
     CreateDir { path: String, source: io::Error },
     #[error("failed opening log file {path}")]
     OpenFile { path: String, source: io::Error },
+    #[error("failed writing log file")]
+    WriteLog(#[source] io::Error),
     #[error("failed writing manifest {path}")]
     WriteManifest { path: String, source: io::Error },
     #[error("failed serializing manifest")]
@@ -130,11 +138,11 @@ impl DiagnosticLogWriter {
     }
 }
 
-impl DiagnosticLogHandle {
-    /// Update the manifest client identifier.
-    pub fn set_client_id(&self, client_id: impl Into<String>) {
+impl DiagnosticLogControl {
+    /// Update the manifest subject identifier.
+    pub fn set_subject_id(&self, subject_id: impl Into<String>) {
         if let Ok(mut guard) = self.inner.lock() {
-            guard.set_client_id(Some(client_id.into()));
+            guard.set_subject_id(Some(subject_id.into()));
         }
     }
 
@@ -142,6 +150,27 @@ impl DiagnosticLogHandle {
     #[must_use]
     pub fn active_path(&self) -> Option<PathBuf> {
         self.inner.lock().ok().and_then(|guard| guard.active_path())
+    }
+}
+
+impl DiagnosticLogHandle {
+    /// Return a non-owning control handle for metadata updates.
+    #[must_use]
+    pub fn control(&self) -> DiagnosticLogControl {
+        DiagnosticLogControl {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Update the manifest subject identifier.
+    pub fn set_subject_id(&self, subject_id: impl Into<String>) {
+        self.control().set_subject_id(subject_id);
+    }
+
+    /// Return the active log path for this handle.
+    #[must_use]
+    pub fn active_path(&self) -> Option<PathBuf> {
+        self.control().active_path()
     }
 }
 
@@ -224,7 +253,7 @@ impl DiagnosticLogState {
                 kind: config.kind,
                 run_id: config.run_id,
                 pid: std::process::id(),
-                client_id: config.client_id,
+                subject_id: config.subject_id,
                 started_epoch_ms: now_epoch_ms(),
                 ended_epoch_ms: None,
                 segments: Vec::new(),
@@ -234,10 +263,24 @@ impl DiagnosticLogState {
             writer: None,
         };
         state.open_next_segment()?;
+        state.write_start_marker()?;
         state.write_manifest()?;
         replace_latest_link(&config.root_dir.join(LATEST_LINK_NAME), &run_dir);
         state.prune(config.retention_days, config.max_total_mb);
         Ok(state)
+    }
+
+    fn write_start_marker(&mut self) -> Result<(), DiagnosticLogError> {
+        let Some(manifest) = self.manifest.as_ref() else {
+            return Ok(());
+        };
+        let marker = format!(
+            "diagnostic_log.started kind={} run_id={} pid={} started_epoch_ms={}\n",
+            manifest.kind, manifest.run_id, manifest.pid, manifest.started_epoch_ms
+        );
+        self.write(marker.as_bytes())
+            .map_err(DiagnosticLogError::WriteLog)?;
+        self.flush().map_err(DiagnosticLogError::WriteLog)
     }
 
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -307,9 +350,9 @@ impl DiagnosticLogState {
         Ok(())
     }
 
-    fn set_client_id(&mut self, client_id: Option<String>) {
+    fn set_subject_id(&mut self, subject_id: Option<String>) {
         if let Some(manifest) = self.manifest.as_mut() {
-            manifest.client_id = client_id;
+            manifest.subject_id = subject_id;
             let _ = self.write_manifest();
         }
     }
@@ -495,7 +538,7 @@ mod tests {
             segment_mb: 1,
             retention_days: 0,
             max_total_mb: 0,
-            client_id: None,
+            subject_id: None,
         }
     }
 
@@ -517,6 +560,52 @@ mod tests {
         .expect("parse manifest");
         assert_eq!(manifest.segments, vec!["test_000000.log"]);
         assert!(manifest.ended_epoch_ms.is_some());
+        let log = std::fs::read_to_string(run_dir.join("test_000000.log")).expect("read log");
+        assert!(log.contains("diagnostic_log.started kind=test run_id=run-1"));
+        assert!(log.contains("hello\n"));
+    }
+
+    #[test]
+    fn control_handle_updates_manifest_subject() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_writer, handle) = DiagnosticLogWriter::start(test_config(temp.path().to_path_buf()))
+            .expect("start writer");
+        let control = handle.control();
+        control.set_subject_id("subject-1");
+        drop(handle);
+
+        let manifest: DiagnosticLogManifest = serde_json::from_slice(
+            &std::fs::read(temp.path().join("runs/run-1").join(MANIFEST_FILE_NAME))
+                .expect("read manifest"),
+        )
+        .expect("parse manifest");
+        assert_eq!(manifest.subject_id.as_deref(), Some("subject-1"));
+        assert!(manifest.ended_epoch_ms.is_some());
+    }
+
+    #[test]
+    fn non_blocking_guard_flushes_before_manifest_finalization() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (writer, handle) = DiagnosticLogWriter::start(test_config(temp.path().to_path_buf()))
+            .expect("start writer");
+        let (mut non_blocking_writer, guard) = tracing_appender::non_blocking(writer);
+        non_blocking_writer
+            .write_all(b"queued\n")
+            .expect("queue log");
+        drop(non_blocking_writer);
+        drop(guard);
+        drop(handle);
+
+        let log = std::fs::read_to_string(temp.path().join("runs/run-1/test_000000.log"))
+            .expect("read log");
+        assert!(log.contains("queued\n"));
+        let manifest: DiagnosticLogManifest = serde_json::from_slice(
+            &std::fs::read(temp.path().join("runs/run-1").join(MANIFEST_FILE_NAME))
+                .expect("read manifest"),
+        )
+        .expect("parse manifest");
+        assert!(manifest.ended_epoch_ms.is_some());
+        assert!(manifest.total_segment_bytes > 0);
     }
 
     #[test]

@@ -58,20 +58,14 @@ pub(super) enum RuntimeLoggingHandle {
         _handle: moosicbox_log_runtime::init::LoggingHandle,
     },
     Diagnostic {
-        handle: bmux_diagnostic_log::DiagnosticLogHandle,
+        // Drop the non-blocking guard before finalizing the manifest handle.
         _guard: tracing_appender::non_blocking::WorkerGuard,
+        handle: bmux_diagnostic_log::DiagnosticLogHandle,
     },
 }
 
-impl RuntimeLoggingHandle {
-    pub(super) fn set_client_id(&self, client_id: impl Into<String>) {
-        if let Self::Diagnostic { handle, .. } = self {
-            handle.set_client_id(client_id);
-        }
-    }
-}
-
-pub(super) static LOG_WRITER_GUARD: OnceLock<RuntimeLoggingHandle> = OnceLock::new();
+pub(super) static LOG_CONTROL: OnceLock<bmux_diagnostic_log::DiagnosticLogControl> =
+    OnceLock::new();
 
 impl Drop for ServiceKernelContextGuard {
     fn drop(&mut self) {

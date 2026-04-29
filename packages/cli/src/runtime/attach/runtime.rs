@@ -932,6 +932,14 @@ pub async fn run_session_attach_with_client(
         anyhow::bail!("attach accepts either a session target or --follow, not both");
     }
 
+    tracing::info!(
+        target = target.unwrap_or(""),
+        follow = follow.unwrap_or(""),
+        global,
+        has_kernel_client_factory = kernel_client_factory.is_some(),
+        "attach.runtime.start"
+    );
+
     // Install client-side render extensions for any bundled plugins
     // that ship one. Each crate's `install` is idempotent; process-
     // wide state is initialised on first call. Extensions populate
@@ -998,6 +1006,7 @@ pub async fn run_session_attach_with_client(
         .map_err(|err| anyhow::anyhow!("clients-commands set-following failed: {err:?}"))?;
     }
 
+    tracing::info!("attach.runtime.whoami_start");
     let self_client_id = clients_state::client::current_client(&mut client)
         .await?
         .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?

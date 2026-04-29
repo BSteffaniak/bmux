@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::plugin_kernel::RuntimeLoggingHandle;
 use super::{
-    ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_WRITER_GUARD,
+    ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_CONTROL,
     SERVER_START_TIMEOUT, activate_loaded_plugins, append_runtime_arg, cleanup_stale_pid_file,
     connect_with_context, deactivate_loaded_plugins, dispatch_loaded_plugin_event,
     load_enabled_plugins, map_client_connect_error, plugin_event_bridge_loop, plugin_system_event,
@@ -38,14 +38,21 @@ pub(super) struct DefaultAttachOptions {
     pub(super) stop_server_on_exit: bool,
 }
 
+#[allow(clippy::too_many_lines)] // Default attach bootstrap is a linear lifecycle; splitting would obscure cleanup ordering.
 pub(super) async fn run_default_server_attach(
     options: DefaultAttachOptions,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
+    tracing::info!(
+        record = options.record,
+        stop_server_on_exit = options.stop_server_on_exit,
+        "attach.bootstrap.default_start"
+    );
     if options.record {
         ensure_server_not_running_for_record_bootstrap(connection_context).await?;
     }
     ensure_server_running_for_default_attach(connection_context).await?;
+    tracing::info!("attach.bootstrap.server_ready");
 
     let mut active_recording_id = None;
     if options.record {
@@ -83,13 +90,16 @@ pub(super) async fn run_default_server_attach(
         }
     }
 
+    tracing::info!("attach.bootstrap.connect_start");
     let mut client = connect_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-default-attach",
         connection_context,
     )
     .await?;
+    tracing::info!("attach.bootstrap.connect_done");
     let target = resolve_default_attach_target(&mut client).await?;
+    tracing::info!(session_id = %target, "attach.bootstrap.target_resolved");
     let target = target.to_string();
     let attach_result =
         run_session_attach_with_client(client, Some(target.as_str()), None, false, None)
@@ -158,9 +168,11 @@ pub(super) async fn ensure_server_running_for_default_attach(
     connection_context: ConnectionContext<'_>,
 ) -> Result<()> {
     if server_is_running(connection_context).await? {
+        tracing::info!("attach.bootstrap.server_already_running");
         return Ok(());
     }
 
+    tracing::info!("attach.bootstrap.server_start_required");
     let _ = run_server_start(
         true,
         false,
@@ -172,6 +184,7 @@ pub(super) async fn ensure_server_running_for_default_attach(
     if !server_is_running(connection_context).await? {
         anyhow::bail!("bmux server failed to start for default attach")
     }
+    tracing::info!("attach.bootstrap.server_started");
     Ok(())
 }
 
@@ -708,12 +721,19 @@ pub(super) async fn run_session_attach(
     global: bool,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
+    tracing::info!(
+        target = target.unwrap_or(""),
+        follow = follow.unwrap_or(""),
+        global,
+        "attach.bootstrap.explicit_start"
+    );
     let client = connect_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-attach",
         connection_context,
     )
     .await?;
+    tracing::info!("attach.bootstrap.explicit_connected");
     run_session_attach_with_client(client, target, follow, global, None)
         .await
         .map(|outcome| outcome.status_code)
@@ -748,7 +768,7 @@ pub(super) fn init_logging(
     cli_level: Option<LogLevel>,
     file_only: bool,
     scope: LogProcessScope,
-) {
+) -> Option<RuntimeLoggingHandle> {
     let level = resolve_log_level(
         verbose,
         cli_level,
@@ -770,13 +790,27 @@ pub(super) fn init_logging(
     if mode == DiagnosticLogMode::Segmented {
         match init_segmented_logging(&paths, &config, scope, runtime_level, file_only) {
             Ok(handle) => {
-                let _ = LOG_WRITER_GUARD.set(handle);
+                if let RuntimeLoggingHandle::Diagnostic {
+                    handle: control_handle,
+                    ..
+                } = &handle
+                {
+                    let _ = LOG_CONTROL.set(control_handle.control());
+                }
+                tracing::info!(
+                    scope = ?scope,
+                    mode = ?mode,
+                    file_only,
+                    pid = std::process::id(),
+                    "logging.initialized"
+                );
+                return Some(handle);
             }
             Err(error) => {
                 eprintln!("bmux warning: failed to initialize segmented logging: {error}");
             }
         }
-        return;
+        return None;
     }
 
     let mut log_config = moosicbox_log_runtime::init::InitConfig::new(&paths);
@@ -796,12 +830,20 @@ pub(super) fn init_logging(
     }
     match moosicbox_log_runtime::init::init(log_config) {
         Ok(handle) => {
-            let _ = LOG_WRITER_GUARD.set(RuntimeLoggingHandle::Moosicbox { _handle: handle });
+            tracing::info!(
+                scope = ?scope,
+                mode = ?mode,
+                file_only,
+                pid = std::process::id(),
+                "logging.initialized"
+            );
+            return Some(RuntimeLoggingHandle::Moosicbox { _handle: handle });
         }
         Err(error) => {
             eprintln!("bmux warning: failed to initialize file logging: {error}");
         }
     }
+    None
 }
 
 const fn log_mode_for_scope(config: &BmuxConfig, scope: LogProcessScope) -> DiagnosticLogMode {
@@ -835,7 +877,6 @@ fn init_segmented_logging(
     file_only: bool,
 ) -> anyhow::Result<RuntimeLoggingHandle> {
     use tracing_subscriber::layer::SubscriberExt as _;
-    use tracing_subscriber::util::SubscriberInitExt as _;
 
     let (root_dir, file_prefix, segment_mb, retention_days, max_total_mb) = match scope {
         LogProcessScope::Server | LogProcessScope::Command => (
@@ -863,7 +904,7 @@ fn init_segmented_logging(
         segment_mb,
         retention_days,
         max_total_mb,
-        client_id: None,
+        subject_id: None,
     })?;
     let (non_blocking_writer, guard) = tracing_appender::non_blocking(writer);
     let env_filter = tracing_subscriber::EnvFilter::try_new(format!("bmux={runtime_level}"))?;
@@ -876,11 +917,11 @@ fn init_segmented_logging(
         .with(env_filter)
         .with(file_layer)
         .with(stderr_layer);
+    tracing::subscriber::set_global_default(subscriber)?;
     let _ = tracing_log::LogTracer::init();
-    subscriber.try_init()?;
     Ok(RuntimeLoggingHandle::Diagnostic {
-        handle,
         _guard: guard,
+        handle,
     })
 }
 
