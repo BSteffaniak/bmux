@@ -507,9 +507,15 @@ focus_on_click = true
 click_propagation = "focus_and_forward"
 focus_on_hover = false
 scroll_scrollback = true
-wheel_propagation = "forward_only"
+# auto = terminal-like: forward to mouse-aware panes, otherwise use bmux scrollback.
+# Explicit alternatives: forward_only, scrollback_only, forward_and_scrollback.
+wheel_propagation = "auto"
 scroll_lines_per_tick = 3
 exit_scrollback_on_bottom = true
+# Alternate-screen panes that did not request mouse tracking are ignored by default.
+alternate_screen_wheel = "ignore"
+# Mouse selection release behavior: select, copy, or copy_and_exit.
+selection_release = "select"
 
 [behavior.mouse.gesture_actions]
 click_left = "plugin:bmux.windows:new-window"
@@ -524,6 +530,11 @@ Supported gesture keys in current core runtime:
 - `hover_focus`
 - `scroll_up`
 - `scroll_down`
+
+When terminal mouse capture is enabled, bmux owns mouse selection for regular
+shell output. Host-terminal native selection usually remains available through
+the terminal's bypass modifier (commonly Shift-drag), matching tmux/zellij-style
+mouse behavior.
 
 ## Permissions and policy
 

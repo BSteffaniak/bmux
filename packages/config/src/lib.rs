@@ -1439,6 +1439,10 @@ pub struct MouseBehaviorConfig {
     pub scroll_lines_per_tick: u16,
     /// Exit scrollback mode automatically when wheel scrolling reaches bottom.
     pub exit_scrollback_on_bottom: bool,
+    /// How wheel events behave in alternate-screen panes that have not requested mouse tracking.
+    pub alternate_screen_wheel: AlternateScreenWheelBehavior,
+    /// What to do when a bmux-managed mouse selection drag is released.
+    pub selection_release: MouseSelectionReleaseBehavior,
     /// Resize panes by dragging shared pane borders.
     pub resize_borders: bool,
     /// Optional mouse gesture overrides mapped to action names.
@@ -1462,6 +1466,8 @@ impl Default for MouseBehaviorConfig {
             wheel_propagation: MouseWheelPropagation::default(),
             scroll_lines_per_tick: 3,
             exit_scrollback_on_bottom: true,
+            alternate_screen_wheel: AlternateScreenWheelBehavior::default(),
+            selection_release: MouseSelectionReleaseBehavior::default(),
             resize_borders: true,
             gesture_actions: BTreeMap::new(),
         }
@@ -1605,9 +1611,28 @@ pub enum MouseClickPropagation {
 #[serde(rename_all = "snake_case")]
 pub enum MouseWheelPropagation {
     #[default]
+    Auto,
     ForwardOnly,
     ScrollbackOnly,
     ForwardAndScrollback,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum AlternateScreenWheelBehavior {
+    #[default]
+    Ignore,
+    ForwardOnly,
+    ScrollbackOnly,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseSelectionReleaseBehavior {
+    #[default]
+    Select,
+    Copy,
+    CopyAndExit,
 }
 
 impl MouseBehaviorConfig {
@@ -1628,7 +1653,9 @@ impl MouseBehaviorConfig {
     pub const fn effective_wheel_propagation(&self) -> MouseWheelPropagation {
         match (self.wheel_propagation, self.scroll_scrollback) {
             (
-                MouseWheelPropagation::ScrollbackOnly | MouseWheelPropagation::ForwardAndScrollback,
+                MouseWheelPropagation::Auto
+                | MouseWheelPropagation::ScrollbackOnly
+                | MouseWheelPropagation::ForwardAndScrollback,
                 false,
             ) => MouseWheelPropagation::ForwardOnly,
             (other, _) => other,
@@ -2860,9 +2887,9 @@ impl BmuxConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        BMUX_CONFIG_ENV, BmuxConfig, ConfigLoadOverrides, MouseClickPropagation,
-        MouseWheelPropagation, ResolvedTimeout, SandboxCleanupSource, StaleBuildAction,
-        push_process_config_overrides,
+        AlternateScreenWheelBehavior, BMUX_CONFIG_ENV, BmuxConfig, ConfigLoadOverrides,
+        MouseClickPropagation, MouseSelectionReleaseBehavior, MouseWheelPropagation,
+        ResolvedTimeout, SandboxCleanupSource, StaleBuildAction, push_process_config_overrides,
     };
     use crate::ConfigPaths;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3644,13 +3671,21 @@ timeout_profile = "missing"
     }
 
     #[test]
-    fn mouse_defaults_prioritize_tui_forwarding() {
+    fn mouse_defaults_use_terminal_like_scrollback_behavior() {
         let mouse = BmuxConfig::default().behavior.mouse;
         assert_eq!(
             mouse.click_propagation,
             MouseClickPropagation::FocusAndForward
         );
-        assert_eq!(mouse.wheel_propagation, MouseWheelPropagation::ForwardOnly);
+        assert_eq!(mouse.wheel_propagation, MouseWheelPropagation::Auto);
+        assert_eq!(
+            mouse.alternate_screen_wheel,
+            AlternateScreenWheelBehavior::Ignore
+        );
+        assert_eq!(
+            mouse.selection_release,
+            MouseSelectionReleaseBehavior::Select
+        );
         assert!(mouse.resize_borders);
     }
 
@@ -3673,7 +3708,7 @@ timeout_profile = "missing"
         let dir = path.parent().expect("temp dir").to_path_buf();
         std::fs::write(
             &path,
-            "[behavior.mouse]\nclick_propagation = \"forward_only\"\nwheel_propagation = \"forward_and_scrollback\"\n",
+            "[behavior.mouse]\nclick_propagation = \"forward_only\"\nwheel_propagation = \"forward_and_scrollback\"\nalternate_screen_wheel = \"scrollback_only\"\nselection_release = \"copy_and_exit\"\n",
         )
         .expect("failed writing config fixture");
 
@@ -3685,6 +3720,14 @@ timeout_profile = "missing"
         assert_eq!(
             config.behavior.mouse.wheel_propagation,
             MouseWheelPropagation::ForwardAndScrollback
+        );
+        assert_eq!(
+            config.behavior.mouse.alternate_screen_wheel,
+            AlternateScreenWheelBehavior::ScrollbackOnly
+        );
+        assert_eq!(
+            config.behavior.mouse.selection_release,
+            MouseSelectionReleaseBehavior::CopyAndExit
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");

@@ -154,6 +154,14 @@ pub struct AttachMouseState {
     pub hovered_pane_id: Option<Uuid>,
     pub last_focused_pane_id: Option<Uuid>,
     pub resize_drag: Option<AttachMouseResizeDrag>,
+    pub selection_drag: Option<AttachMouseSelectionDrag>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachMouseSelectionDrag {
+    pub pane_id: Uuid,
+    pub anchor: AttachScrollbackPosition,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

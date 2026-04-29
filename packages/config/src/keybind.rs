@@ -265,6 +265,7 @@ fn default_scroll_bindings() -> BTreeMap<String, String> {
         ("g", RuntimeAction::ScrollTop),
         ("shift+g", RuntimeAction::ScrollBottom),
         ("v", RuntimeAction::BeginSelection),
+        ("y", RuntimeAction::CopyScrollback),
     ])
 }
 

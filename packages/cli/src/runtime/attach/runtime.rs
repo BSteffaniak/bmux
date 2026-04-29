@@ -65,8 +65,8 @@ use super::render::{
 };
 use super::state::{
     AttachEventAction, AttachExitReason, AttachMouseResizeAxisDrag, AttachMouseResizeDrag,
-    AttachScrollbackCursor, AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRect,
-    PaneRenderBuffer,
+    AttachMouseSelectionDrag, AttachScrollbackCursor, AttachScrollbackPosition, AttachUiMode,
+    AttachViewState, PaneRect, PaneRenderBuffer,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
@@ -6252,6 +6252,14 @@ pub async fn handle_attach_mouse_event(
         .map(|layout| layout.focused_pane_id);
     let in_focused_pane = target_pane.is_some() && target_pane == focused_pane;
 
+    if matches!(
+        mouse_event.kind,
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+    ) && handle_attach_mouse_selection_drag(view_state, mouse_event)
+    {
+        return Ok(());
+    }
+
     if matches!(mouse_event.kind, MouseEventKind::ScrollUp)
         && handle_attach_mouse_gesture_action(
             client,
@@ -6280,6 +6288,17 @@ pub async fn handle_attach_mouse_event(
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
     ) {
         match view_state.mouse.config.effective_wheel_propagation() {
+            bmux_config::MouseWheelPropagation::Auto => {
+                let _ = handle_attach_mouse_wheel_auto(
+                    client,
+                    view_state,
+                    mouse_event,
+                    target_pane,
+                    in_focused_pane,
+                )
+                .await?;
+                return Ok(());
+            }
             bmux_config::MouseWheelPropagation::ForwardOnly => {
                 let _ = maybe_forward_attach_mouse_event(
                     client,
@@ -6325,6 +6344,10 @@ pub async fn handle_attach_mouse_event(
             )
             .await?
             {
+                if maybe_begin_attach_mouse_selection_drag(view_state, target, mouse_event) {
+                    return Ok(());
+                }
+
                 match view_state.mouse.config.effective_click_propagation() {
                     bmux_config::MouseClickPropagation::FocusOnly => {
                         if let Some(pane_id) = target {
@@ -6943,6 +6966,245 @@ pub fn resolve_mouse_gesture_action(
     }
 }
 
+pub async fn handle_attach_mouse_wheel_auto(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+    target_pane: Option<Uuid>,
+    in_focused_pane: bool,
+) -> std::result::Result<bool, ClientError> {
+    if pane_mouse_protocol_reports_event(view_state, target_pane, mouse_event.kind)
+        && maybe_forward_attach_mouse_event(
+            client,
+            view_state,
+            mouse_event,
+            target_pane,
+            in_focused_pane,
+            false,
+        )
+        .await?
+    {
+        return Ok(true);
+    }
+
+    if !in_focused_pane {
+        return Ok(false);
+    }
+
+    let Some(target_pane) = target_pane else {
+        return Ok(false);
+    };
+
+    if attach_pane_uses_alternate_screen(view_state, target_pane) {
+        return match view_state.mouse.config.alternate_screen_wheel {
+            bmux_config::AlternateScreenWheelBehavior::Ignore => Ok(false),
+            bmux_config::AlternateScreenWheelBehavior::ForwardOnly => {
+                maybe_forward_attach_mouse_event(
+                    client,
+                    view_state,
+                    mouse_event,
+                    Some(target_pane),
+                    in_focused_pane,
+                    false,
+                )
+                .await
+            }
+            bmux_config::AlternateScreenWheelBehavior::ScrollbackOnly => {
+                Ok(handle_attach_mouse_scrollback(view_state, mouse_event.kind))
+            }
+        };
+    }
+
+    Ok(handle_attach_mouse_scrollback(view_state, mouse_event.kind))
+}
+
+pub fn pane_mouse_protocol_reports_event(
+    view_state: &AttachViewState,
+    target_pane: Option<Uuid>,
+    kind: MouseEventKind,
+) -> bool {
+    let Some(target_pane) = target_pane else {
+        return false;
+    };
+    let Some(protocol) = attach_pane_mouse_protocol(view_state, target_pane) else {
+        return false;
+    };
+    attach_mouse::mode_reports_event(protocol.mode, mouse_event_kind_to_shared(kind))
+}
+
+pub fn attach_pane_uses_alternate_screen(view_state: &AttachViewState, pane_id: Uuid) -> bool {
+    view_state
+        .pane_buffers
+        .get(&pane_id)
+        .is_some_and(|buffer| buffer.parser.screen().alternate_screen())
+}
+
+pub fn maybe_begin_attach_mouse_selection_drag(
+    view_state: &mut AttachViewState,
+    target_pane: Option<Uuid>,
+    mouse_event: MouseEvent,
+) -> bool {
+    if view_state.mouse.config.effective_wheel_propagation()
+        == bmux_config::MouseWheelPropagation::ForwardOnly
+        || view_state.mouse.config.effective_click_propagation()
+            == bmux_config::MouseClickPropagation::ForwardOnly
+    {
+        return false;
+    }
+
+    let Some(target_pane) = target_pane else {
+        return false;
+    };
+    if focused_attach_pane_id(view_state) != Some(target_pane) {
+        return false;
+    }
+    if pane_mouse_protocol_reports_event(view_state, Some(target_pane), mouse_event.kind)
+        || attach_pane_uses_alternate_screen(view_state, target_pane)
+    {
+        return false;
+    }
+
+    let Some(anchor) = attach_mouse_scrollback_position_for_event(
+        view_state,
+        target_pane,
+        mouse_event.column,
+        mouse_event.row,
+        false,
+    ) else {
+        return false;
+    };
+
+    view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
+        pane_id: target_pane,
+        anchor,
+        active: false,
+    });
+    true
+}
+
+pub fn handle_attach_mouse_selection_drag(
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+) -> bool {
+    match mouse_event.kind {
+        MouseEventKind::Drag(MouseButton::Left) => {
+            update_attach_mouse_selection_drag(view_state, mouse_event.column, mouse_event.row)
+        }
+        MouseEventKind::Up(MouseButton::Left) => finish_attach_mouse_selection_drag(view_state),
+        _ => false,
+    }
+}
+
+fn update_attach_mouse_selection_drag(
+    view_state: &mut AttachViewState,
+    column: u16,
+    row: u16,
+) -> bool {
+    let Some(drag) = view_state.mouse.selection_drag else {
+        return false;
+    };
+
+    if !view_state.scrollback_active && !enter_attach_scrollback(view_state) {
+        view_state.mouse.selection_drag = None;
+        return true;
+    }
+
+    let Some(head) =
+        attach_mouse_scrollback_position_for_event(view_state, drag.pane_id, column, row, true)
+    else {
+        return true;
+    };
+
+    view_state.selection_anchor = Some(drag.anchor);
+    let _ = set_attach_scrollback_cursor_to_position(view_state, head);
+    if !drag.active {
+        view_state.set_transient_status(
+            ATTACH_SELECTION_STARTED_STATUS,
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+    }
+    view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
+        active: true,
+        ..drag
+    });
+    view_state.dirty.full_pane_redraw = true;
+    view_state.dirty.status_needs_redraw = true;
+    true
+}
+
+fn finish_attach_mouse_selection_drag(view_state: &mut AttachViewState) -> bool {
+    let Some(drag) = view_state.mouse.selection_drag.take() else {
+        return false;
+    };
+    if drag.active {
+        match view_state.mouse.config.selection_release {
+            bmux_config::MouseSelectionReleaseBehavior::Select => {}
+            bmux_config::MouseSelectionReleaseBehavior::Copy => {
+                copy_attach_selection(view_state, false);
+            }
+            bmux_config::MouseSelectionReleaseBehavior::CopyAndExit => {
+                copy_attach_selection(view_state, true);
+            }
+        }
+        view_state.dirty.full_pane_redraw = true;
+        view_state.dirty.status_needs_redraw = true;
+    }
+    true
+}
+
+fn attach_mouse_scrollback_position_for_event(
+    view_state: &AttachViewState,
+    pane_id: Uuid,
+    column: u16,
+    row: u16,
+    clamp: bool,
+) -> Option<AttachScrollbackPosition> {
+    let content = attach_scene_pane_content_rect(view_state, pane_id)?;
+    if content.w == 0 || content.h == 0 {
+        return None;
+    }
+
+    let max_column = content.x.saturating_add(content.w.saturating_sub(1));
+    let max_row = content.y.saturating_add(content.h.saturating_sub(1));
+    if !clamp && (column < content.x || column > max_column || row < content.y || row > max_row) {
+        return None;
+    }
+
+    let local_col = column
+        .saturating_sub(content.x)
+        .min(content.w.saturating_sub(1));
+    let local_row = row
+        .saturating_sub(content.y)
+        .min(content.h.saturating_sub(1));
+    Some(AttachScrollbackPosition {
+        row: view_state
+            .scrollback_offset
+            .saturating_add(usize::from(local_row)),
+        col: usize::from(local_col),
+    })
+}
+
+fn set_attach_scrollback_cursor_to_position(
+    view_state: &mut AttachViewState,
+    position: AttachScrollbackPosition,
+) -> bool {
+    let Some((inner_w, inner_h)) = focused_attach_pane_inner_size(view_state) else {
+        return false;
+    };
+    if inner_w == 0 || inner_h == 0 {
+        return false;
+    }
+    view_state.scrollback_cursor = Some(AttachScrollbackCursor {
+        row: position
+            .row
+            .saturating_sub(view_state.scrollback_offset)
+            .min(inner_h.saturating_sub(1)),
+        col: position.col.min(inner_w.saturating_sub(1)),
+    });
+    true
+}
+
 pub fn handle_attach_mouse_scrollback(
     view_state: &mut AttachViewState,
     kind: MouseEventKind,
@@ -7455,12 +7717,14 @@ mod tests {
     use crate::input::InputProcessor;
     use crate::runtime::attach::render::append_pane_output;
     use crate::runtime::attach::state::{
-        AttachEventAction, AttachScrollbackCursor, AttachScrollbackPosition, AttachUiMode,
-        AttachViewState, PaneRenderBuffer,
+        AttachEventAction, AttachMouseSelectionDrag, AttachScrollbackCursor,
+        AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRenderBuffer,
     };
 
     use bmux_client::{AttachLayoutState, AttachOpenInfo};
-    use bmux_config::{BmuxConfig, MouseClickPropagation, MouseWheelPropagation};
+    use bmux_config::{
+        BmuxConfig, MouseClickPropagation, MouseSelectionReleaseBehavior, MouseWheelPropagation,
+    };
     use bmux_ipc::{
         AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         AttachViewComponent, PaneLayoutNode, PaneState, PaneSummary,
@@ -8222,6 +8486,156 @@ mod tests {
             view_state.mouse.config.effective_wheel_propagation(),
             MouseWheelPropagation::ForwardAndScrollback
         );
+    }
+
+    #[test]
+    fn wheel_policy_defaults_to_auto() {
+        let view_state = attach_view_state_with_scrollback_fixture();
+
+        assert_eq!(
+            view_state.mouse.config.effective_wheel_propagation(),
+            MouseWheelPropagation::Auto
+        );
+    }
+
+    #[test]
+    fn mouse_selection_drag_selects_visible_scrollback_text() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert!(maybe_begin_attach_mouse_selection_drag(
+            &mut view_state,
+            Some(pane_id),
+            down,
+        ));
+        assert!(!view_state.scrollback_active);
+
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(handle_attach_mouse_selection_drag(&mut view_state, drag));
+        assert!(view_state.scrollback_active);
+        assert_eq!(
+            view_state.selection_anchor,
+            Some(AttachScrollbackPosition { row: 1, col: 1 })
+        );
+        assert_eq!(
+            view_state.scrollback_cursor,
+            Some(AttachScrollbackCursor { row: 2, col: 4 })
+        );
+
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(handle_attach_mouse_selection_drag(&mut view_state, up));
+        assert!(view_state.scrollback_active);
+        assert_eq!(view_state.mouse.selection_drag, None);
+        assert!(view_state.selection_active());
+    }
+
+    #[test]
+    fn mouse_selection_drag_ignores_single_click_without_drag() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(maybe_begin_attach_mouse_selection_drag(
+            &mut view_state,
+            Some(pane_id),
+            down,
+        ));
+
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(handle_attach_mouse_selection_drag(&mut view_state, up));
+        assert!(!view_state.scrollback_active);
+        assert_eq!(view_state.selection_anchor, None);
+    }
+
+    #[test]
+    fn mouse_selection_drag_respects_copy_release_config_without_clearing_on_failure() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        view_state.mouse.config.selection_release = MouseSelectionReleaseBehavior::Copy;
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
+        view_state.mouse.selection_drag = Some(AttachMouseSelectionDrag {
+            pane_id,
+            anchor: AttachScrollbackPosition { row: 1, col: 1 },
+            active: true,
+        });
+        assert!(enter_attach_scrollback(&mut view_state));
+        view_state.selection_anchor = Some(AttachScrollbackPosition { row: 1, col: 1 });
+        view_state.scrollback_cursor = Some(AttachScrollbackCursor { row: 2, col: 4 });
+
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(handle_attach_mouse_selection_drag(&mut view_state, up));
+        assert!(view_state.selection_active());
+    }
+
+    #[test]
+    fn mouse_selection_drag_does_not_start_in_alternate_screen() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
+        let buffer = view_state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane render buffer");
+        append_pane_output(buffer, b"\x1b[?1049h");
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert!(!maybe_begin_attach_mouse_selection_drag(
+            &mut view_state,
+            Some(pane_id),
+            down,
+        ));
+    }
+
+    #[test]
+    fn mouse_selection_drag_does_not_start_when_clicks_always_forward() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        view_state.mouse.config.click_propagation = MouseClickPropagation::ForwardOnly;
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert!(!maybe_begin_attach_mouse_selection_drag(
+            &mut view_state,
+            Some(pane_id),
+            down,
+        ));
     }
 
     #[test]
