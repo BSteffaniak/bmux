@@ -9,7 +9,7 @@ use bmux_clients_plugin_api::{
     clients_state::{self, ClientSummary},
 };
 use bmux_ipc::InvokeServiceKind;
-use bmux_plugin_sdk::{CapabilityId, InterfaceId};
+use bmux_plugin_sdk::{CapabilityId, InterfaceId, TypedDispatchClient};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -79,3 +79,35 @@ pub const OP_SET_FOLLOWING: &str = "set-following";
 
 pub const QUERY_KIND: InvokeServiceKind = InvokeServiceKind::Query;
 pub const COMMAND_KIND: InvokeServiceKind = InvokeServiceKind::Command;
+
+pub async fn whoami<C: TypedDispatchClient>(client: &mut C) -> anyhow::Result<Uuid> {
+    let current = clients_state::client::current_client(client)
+        .await
+        .map_err(|err| anyhow::anyhow!("clients-state current-client dispatch failed: {err}"))?
+        .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?;
+    Ok(current.id)
+}
+
+pub async fn follow_client<C: TypedDispatchClient>(
+    client: &mut C,
+    target_client_id: Uuid,
+    global: bool,
+) -> anyhow::Result<()> {
+    set_following(client, Some(target_client_id), global).await
+}
+
+pub async fn unfollow<C: TypedDispatchClient>(client: &mut C) -> anyhow::Result<()> {
+    set_following(client, None, false).await
+}
+
+async fn set_following<C: TypedDispatchClient>(
+    client: &mut C,
+    target_client_id: Option<Uuid>,
+    global: bool,
+) -> anyhow::Result<()> {
+    clients_commands::client::set_following(client, target_client_id, global)
+        .await
+        .map_err(|err| anyhow::anyhow!("clients-commands set-following dispatch failed: {err}"))?
+        .map_err(|err| anyhow::anyhow!("clients-commands set-following failed: {err:?}"))?;
+    Ok(())
+}

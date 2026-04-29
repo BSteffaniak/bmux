@@ -986,11 +986,10 @@ pub async fn run_session_attach_with_client(
             .subscribe_events()
             .await
             .map_err(map_attach_client_error)?;
-        bmux_clients_plugin_api::typed_client::follow_client(&mut client, leader_client_id, global)
-            .await?;
+        typed_clients::follow_client(&mut client, leader_client_id, global).await?;
     }
 
-    let self_client_id = bmux_clients_plugin_api::typed_client::whoami(&mut client).await?;
+    let self_client_id = typed_clients::whoami(&mut client).await?;
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
         // Inline follow target resolution using BmuxClient (before streaming upgrade).
@@ -2080,7 +2079,7 @@ pub async fn run_session_attach_with_client(
         let _ = client.detach().await;
     }
     if follow_target_id.is_some() {
-        let _ = bmux_clients_plugin_api::typed_client::unfollow(&mut client).await;
+        let _ = typed_clients::unfollow(&mut client).await;
     }
     if let Some(message) = attach_exit_message(exit_reason) {
         println!("{message}");
@@ -2486,7 +2485,7 @@ async fn enforce_hot_path_plugin_policy(
         return Ok(execution);
     };
 
-    let client_id = bmux_clients_plugin_api::typed_client::whoami(client).await?;
+    let client_id = typed_clients::whoami(client).await?;
     let principal_info = client.whoami_principal().await?;
     let request = HotPathExecutionPolicyCheckRequest {
         session_id: attached_session_id,

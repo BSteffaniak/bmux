@@ -1206,15 +1206,12 @@ fn plugin_api_crates_have_no_concrete_state() {
     );
 }
 
-/// Verify that the typed-client helper modules exist in each
-/// plugin-api crate that exposes a typed-service surface.
+/// Verify that remaining handwritten typed-client helper modules expose
+/// transport-agnostic helpers while generated-client migrations are in
+/// progress.
 #[test]
 fn plugin_api_crates_expose_typed_client_helpers() {
     let crates = [
-        (
-            "plugins/clients-plugin-api",
-            include_str!("../../../plugins/clients-plugin-api/src/typed_client.rs"),
-        ),
         (
             "plugins/recording-plugin-api",
             include_str!("../../../plugins/recording-plugin-api/src/typed_client.rs"),

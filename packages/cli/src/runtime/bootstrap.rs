@@ -198,7 +198,7 @@ pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Re
         return Ok(session_id);
     }
 
-    let _client_id = bmux_clients_plugin_api::typed_client::whoami(client).await?;
+    let _client_id = super::typed_clients::whoami(client).await?;
     let writable_sessions = sessions.clone();
 
     if writable_sessions.is_empty() {

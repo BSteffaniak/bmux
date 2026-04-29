@@ -15,5 +15,3 @@
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/clients-plugin.bpdl",
 }
-
-pub mod typed_client;

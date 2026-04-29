@@ -1131,7 +1131,7 @@ async fn run_playbook_inner(
                 // Create display track writer for GIF export.
                 if let Some(ref sb) = sandbox {
                     let rec_dir = sb.paths().recordings_dir().join(rid.to_string());
-                    let client_id = bmux_clients_plugin_api::typed_client::whoami(&mut client)
+                    let client_id = crate::runtime::typed_clients::whoami(&mut client)
                         .await
                         .unwrap_or_else(|_| Uuid::new_v4());
                     match super::display_track::PlaybookDisplayTrackWriter::new(

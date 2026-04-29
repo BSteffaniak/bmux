@@ -186,7 +186,7 @@ pub(super) async fn run_client_list(
         connection_context,
     )
     .await?;
-    let self_id = bmux_clients_plugin_api::typed_client::whoami(&mut api).await?;
+    let self_id = typed_clients::whoami(&mut api).await?;
     let mut clients = typed_list_clients(&mut api).await?;
     clients.sort_by_key(|client| (client.id != self_id, client.id));
 
