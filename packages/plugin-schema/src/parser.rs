@@ -90,6 +90,11 @@ impl Parser<'_> {
     }
 
     fn parse_interface(&mut self) -> Result<Interface, Error> {
+        let capability = if self.check(&TokenKind::At) {
+            Some(self.consume_interface_capability_annotation()?)
+        } else {
+            None
+        };
         let span = self.expect(&TokenKind::Interface, "expected `interface` keyword")?;
         let name = self.expect_identifier("expected interface name")?;
         self.expect(&TokenKind::LBrace, "expected `{` opening interface body")?;
@@ -98,7 +103,12 @@ impl Parser<'_> {
             items.push(self.parse_interface_item()?);
         }
         self.expect(&TokenKind::RBrace, "expected `}` closing interface body")?;
-        Ok(Interface { name, items, span })
+        Ok(Interface {
+            name,
+            capability,
+            items,
+            span,
+        })
     }
 
     fn parse_interface_item(&mut self) -> Result<InterfaceItem, Error> {
@@ -288,6 +298,41 @@ impl Parser<'_> {
                 ),
             }),
         }
+    }
+
+    /// Consume an interface-level `@capability(NAME)` annotation.
+    fn consume_interface_capability_annotation(&mut self) -> Result<String, Error> {
+        let at_span = self.expect(&TokenKind::At, "expected `@`")?;
+        let (name, span) = match self.advance().cloned() {
+            Some(Token {
+                kind: TokenKind::Identifier(name),
+                span,
+            }) => (name, span),
+            Some(other) => {
+                return Err(Error::Parse {
+                    span: other.span,
+                    message: format!("expected identifier after `@`; got {:?}", other.kind),
+                });
+            }
+            None => {
+                return Err(Error::Parse {
+                    span: at_span,
+                    message: "expected annotation identifier after `@`".to_string(),
+                });
+            }
+        };
+        if name != "capability" {
+            return Err(Error::Parse {
+                span,
+                message: format!(
+                    "unknown interface annotation `@{name}`; only `@capability(NAME)` is recognised"
+                ),
+            });
+        }
+        self.expect(&TokenKind::LParen, "expected `(` after `@capability`")?;
+        let capability = self.expect_identifier("expected capability constant name")?;
+        self.expect(&TokenKind::RParen, "expected `)` after capability name")?;
+        Ok(capability)
     }
 
     fn parse_fields(&mut self) -> Result<Vec<Field>, Error> {

@@ -138,6 +138,7 @@ fn emit_interface(
     // separately as a typed `EVENT_KIND` constant + payload type
     // alias below.
     emit_service_trait(iface, imports, own_types, out);
+    emit_transport_client(iface, imports, own_types, out);
 
     // If this interface declares `events <type>`, emit a canonical
     // `PluginEventKind` constant plus a `EventPayload` type alias so
@@ -396,6 +397,154 @@ fn emit_service_client(
     }
 
     out.push_str("    }\n\n");
+}
+
+fn emit_transport_client(
+    iface: &Interface,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    out: &mut String,
+) {
+    let Some(capability) = iface.capability.as_deref() else {
+        return;
+    };
+    let operations = iface
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            InterfaceItem::Query(op) => Some((op, "Query")),
+            InterfaceItem::Command(op) => Some((op, "Command")),
+            InterfaceItem::Record(_)
+            | InterfaceItem::Variant(_)
+            | InterfaceItem::Enum(_)
+            | InterfaceItem::Events(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if operations.is_empty() {
+        return;
+    }
+
+    out.push_str("    /// Generated transport clients for this interface.\n");
+    out.push_str("    pub mod client {\n");
+    out.push_str("        use super::*;\n\n");
+    for (op, kind) in operations {
+        emit_transport_endpoint(iface, op, kind, capability, imports, own_types, out);
+        emit_transport_client_function(op, imports, own_types, out);
+    }
+    out.push_str("    }\n\n");
+}
+
+fn emit_transport_endpoint(
+    _iface: &Interface,
+    op: &Operation,
+    kind: &str,
+    capability: &str,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    out: &mut String,
+) {
+    let endpoint_name = format!("{}Endpoint", pascal_case(&op.name));
+    let request_ty = transport_request_type(op);
+    let returns = rust_type(&op.returns, imports, own_types);
+    if !op.params.is_empty() {
+        let request_name = request_ty.clone();
+        out.push_str("        #[derive(Debug, Clone, Serialize)]\n");
+        let _ = writeln!(out, "        pub struct {request_name} {{");
+        for param in &op.params {
+            let field_name = snake_case(&param.name);
+            let ty = rust_type(&param.ty, imports, own_types);
+            if let Some(adapter) = serde_bytes_adapter(&param.ty) {
+                let _ = writeln!(out, "            #[serde(with = \"{adapter}\")]");
+            }
+            let _ = writeln!(out, "            pub {field_name}: {ty},");
+        }
+        out.push_str("        }\n\n");
+    }
+
+    let _ = writeln!(out, "        /// Typed endpoint marker for `{}`.", op.name);
+    let _ = writeln!(out, "        pub struct {endpoint_name};");
+    let _ = writeln!(
+        out,
+        "        impl ::bmux_plugin_sdk::TypedServiceEndpoint for {endpoint_name} {{"
+    );
+    let _ = writeln!(out, "            type Request = {request_ty};");
+    let _ = writeln!(out, "            type Response = {returns};");
+    let _ = writeln!(
+        out,
+        "            const CAPABILITY: ::bmux_plugin_sdk::CapabilityId = super::super::capabilities::{capability};"
+    );
+    let _ = writeln!(
+        out,
+        "            const KIND: ::bmux_ipc::InvokeServiceKind = ::bmux_ipc::InvokeServiceKind::{kind};"
+    );
+    let _ = writeln!(
+        out,
+        "            const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = super::INTERFACE_ID;"
+    );
+    let _ = writeln!(
+        out,
+        "            const OPERATION: ::bmux_plugin_sdk::OperationId = super::{};",
+        operation_const_name(&op.name)
+    );
+    out.push_str("        }\n\n");
+}
+
+fn emit_transport_client_function(
+    op: &Operation,
+    imports: &ImportMap,
+    own_types: &OwnTypeMap,
+    out: &mut String,
+) {
+    let name = snake_case(&op.name);
+    let endpoint_name = format!("{}Endpoint", pascal_case(&op.name));
+    let params = op
+        .params
+        .iter()
+        .map(|f| {
+            format!(
+                "{}: {}",
+                snake_case(&f.name),
+                rust_type(&f.ty, imports, own_types)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sep = if params.is_empty() { "" } else { ", " };
+    let returns = rust_type(&op.returns, imports, own_types);
+    let request_expr = if op.params.is_empty() {
+        "()".to_string()
+    } else {
+        let fields = op
+            .params
+            .iter()
+            .map(|f| snake_case(&f.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{}Request {{ {fields} }}", pascal_case(&op.name))
+    };
+    let _ = writeln!(
+        out,
+        "        /// Invoke `{}` through a typed dispatch client.",
+        op.name
+    );
+    let _ = writeln!(
+        out,
+        "        pub async fn {name}<C: ::bmux_plugin_sdk::TypedDispatchClient>(client: &mut C{sep}{params}) -> ::bmux_plugin_sdk::TypedServiceClientResult<{returns}> {{"
+    );
+    let _ = writeln!(out, "            let request = {request_expr};");
+    let _ = writeln!(
+        out,
+        "            ::bmux_plugin_sdk::invoke_typed_service::<C, {endpoint_name}>(client, &request).await"
+    );
+    out.push_str("        }\n\n");
+}
+
+fn transport_request_type(op: &Operation) -> String {
+    if op.params.is_empty() {
+        "()".to_string()
+    } else {
+        format!("{}Request", pascal_case(&op.name))
+    }
 }
 
 fn emit_client_forwarder(
@@ -670,14 +819,21 @@ mod tests {
     #[test]
     fn emits_service_trait_with_queries_and_commands() {
         let src = "plugin p version 1;\n\
+                   capability WINDOWS_READ = bmux.windows.read;\n\
+                   capability WINDOWS_WRITE = bmux.windows.write;\n\
+                   @capability(WINDOWS_READ)\n\
                    interface windows-state {\n\
-                     record pane-state { id: uuid }\n\
-                     query pane-state(id: uuid) -> pane-state?;\n\
-                     command focus-pane(id: uuid) -> result<unit, string>;\n\
+                      record pane-state { id: uuid }\n\
+                      query pane-state(id: uuid) -> pane-state?;\n\
+                   }\n\
+                   @capability(WINDOWS_WRITE)\n\
+                   interface windows-commands {\n\
+                      command focus-pane(id: uuid) -> result<unit, string>;\n\
                    }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
         assert!(rust.contains("pub trait WindowsStateService"));
+        assert!(rust.contains("pub trait WindowsCommandsService"));
         assert!(rust.contains("fn pane_state"));
         assert!(rust.contains("fn focus_pane"));
         assert!(rust.contains("Option<PaneState>"));
@@ -687,10 +843,11 @@ mod tests {
     #[test]
     fn emits_service_client_with_forwarders() {
         let src = "plugin p version 1;\n\
+                   capability WINDOWS_READ = bmux.windows.read;\n\
+                   @capability(WINDOWS_READ)\n\
                    interface windows-state {\n\
-                     record pane-state { id: uuid }\n\
-                     query pane-state(id: uuid) -> pane-state?;\n\
-                     command focus-pane(id: uuid) -> result<unit, string>;\n\
+                      record pane-state { id: uuid }\n\
+                      query pane-state(id: uuid) -> pane-state?;\n\
                    }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
@@ -714,17 +871,50 @@ mod tests {
             rust.contains("self.inner.pane_state("),
             "client should forward pane_state through inner; got: {rust}"
         );
+    }
+
+    #[test]
+    fn emits_transport_client_with_endpoint_metadata() {
+        let src = "plugin p version 1;\n\
+                   capability WINDOWS_READ = bmux.windows.read;\n\
+                   @capability(WINDOWS_READ)\n\
+                   interface windows-state {\n\
+                     record pane-state { id: uuid }\n\
+                     query pane-state(id: uuid) -> pane-state?;\n\
+                   }";
+        let schema = compile(src).expect("valid");
+        let rust = emit(&schema);
         assert!(
-            rust.contains("self.inner.focus_pane("),
-            "client should forward focus_pane through inner; got: {rust}"
+            rust.contains("pub mod client"),
+            "transport client module should be emitted; got: {rust}"
+        );
+        assert!(
+            rust.contains("pub struct PaneStateEndpoint"),
+            "endpoint marker should be emitted; got: {rust}"
+        );
+        assert!(
+            rust.contains("const CAPABILITY: ::bmux_plugin_sdk::CapabilityId = super::super::capabilities::WINDOWS_READ;"),
+            "endpoint should carry explicit capability; got: {rust}"
+        );
+        assert!(
+            rust.contains(
+                "const KIND: ::bmux_ipc::InvokeServiceKind = ::bmux_ipc::InvokeServiceKind::Query;"
+            ),
+            "endpoint should carry query kind; got: {rust}"
+        );
+        assert!(
+            rust.contains("pub async fn pane_state<C: ::bmux_plugin_sdk::TypedDispatchClient>"),
+            "transport client function should be emitted; got: {rust}"
         );
     }
 
     #[test]
     fn emits_interface_id_const() {
         let src = "plugin p version 1;\n\
+                   capability WINDOWS_READ = bmux.windows.read;\n\
+                   @capability(WINDOWS_READ)\n\
                    interface windows-state {\n\
-                     query ping() -> bool;\n\
+                      query ping() -> bool;\n\
                    }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
@@ -741,6 +931,7 @@ mod tests {
         let src = "plugin bmux.foo version 1;\n\
                    capability FOO_READ = bmux.foo.read;\n\
                    capability FOO_WRITE = bmux.foo.write;\n\
+                   @capability(FOO_READ)\n\
                    interface foo-state { query ping() -> bool; }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
@@ -761,9 +952,15 @@ mod tests {
     #[test]
     fn emits_operation_id_constants() {
         let src = "plugin p version 1;\n\
+                   capability WINDOWS_READ = bmux.windows.read;\n\
+                   capability WINDOWS_WRITE = bmux.windows.write;\n\
+                   @capability(WINDOWS_READ)\n\
                    interface windows-state {\n\
-                     query list-panes(session: uuid) -> unit;\n\
-                     command focus-pane(id: uuid) -> unit;\n\
+                      query list-panes(session: uuid) -> unit;\n\
+                   }\n\
+                   @capability(WINDOWS_WRITE)\n\
+                   interface windows-commands {\n\
+                      command focus-pane(id: uuid) -> unit;\n\
                    }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
@@ -801,8 +998,10 @@ mod tests {
     #[test]
     fn emits_no_event_bindings_without_events_declaration() {
         let src = "plugin p version 1;\n\
+                   capability WINDOWS_READ = bmux.windows.read;\n\
+                   @capability(WINDOWS_READ)\n\
                    interface windows-state {\n\
-                     query ping() -> bool;\n\
+                      query ping() -> bool;\n\
                    }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
@@ -917,6 +1116,8 @@ mod tests {
     fn emits_qualified_type_via_import_crate_path() {
         let importer = "plugin importer version 1;\n\
                         import windows = bmux.windows;\n\
+                        capability IMPORTER_READ = importer.read;\n\
+                        @capability(IMPORTER_READ)\n\
                         interface my-iface {\n\
                           query pane-ref(id: uuid) -> windows.pane-state;\n\
                         }";
@@ -944,7 +1145,9 @@ mod tests {
     #[test]
     fn emits_qualified_type_via_same_schema_interface() {
         let src = "plugin p version 1;\n\
+                   capability STATE_READ = p.state.read;\n\
                    interface shared-types { record shared-row { id: uuid } }\n\
+                   @capability(STATE_READ)\n\
                    interface state { query row() -> shared-types.shared-row; }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);

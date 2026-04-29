@@ -14,6 +14,7 @@ plugin bmux.contexts version 1;
 capability CONTEXTS_READ = bmux.contexts.read;
 capability CONTEXTS_WRITE = bmux.contexts.write;
 
+@capability(CONTEXTS_READ)
 interface contexts-state {
     // Snapshot of a single context's public state.
     record context-summary {
@@ -40,6 +41,7 @@ interface contexts-state {
     query current-context() -> context-summary?;
 }
 
+@capability(CONTEXTS_WRITE)
 interface contexts-commands {
     // Errors a `create-context` command can produce.
     //

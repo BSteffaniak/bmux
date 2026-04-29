@@ -1,9 +1,10 @@
 //! Smoke test: the BPDL-generated decoration bindings compile and
 //! round-trip through serde.
 
+use bmux_decoration_plugin_api::decoration_commands::NotifyError;
+use bmux_decoration_plugin_api::decoration_events::{DecorationEvent, PaneEvent};
 use bmux_decoration_plugin_api::decoration_state::{
-    BorderStyle, DecorationEvent, NotifyError, PaneActivity, PaneDecoration, PaneEvent,
-    PaneGeometry, PaneLifecycle, SetStyleError,
+    BorderStyle, PaneActivity, PaneDecoration, PaneGeometry, PaneLifecycle, SetStyleError,
 };
 use bmux_scene_protocol::scene_protocol::Rect;
 

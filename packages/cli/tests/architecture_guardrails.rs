@@ -2367,7 +2367,7 @@ fn runtime_action_variants_stay_on_allowlist() {
 /// a domain plugin; everything plumbed between core and it must
 /// route through generic primitives (scene-protocol wire types,
 /// `AttachRenderExtension`, attach-layout-protocol state channel,
-/// typed-client helpers in `bmux_decoration_plugin_api::client`).
+/// typed-client helpers generated into plugin-api interface modules).
 ///
 /// The single permitted exception is the bundled-plugin static
 /// registration macro in `plugin_runtime.rs`, which by design names

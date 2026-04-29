@@ -4,10 +4,9 @@
 
 use bmux_contexts_plugin_api::{
     capabilities::{CONTEXTS_READ, CONTEXTS_WRITE},
-    contexts_commands::{CloseContextError, ContextAck, CreateContextError},
+    contexts_commands::{self, CloseContextError, ContextAck, CreateContextError},
     contexts_events::{self, ContextEvent},
     contexts_state::{self, ContextSelector, ContextSummary},
-    typed_client,
 };
 use bmux_ipc::InvokeServiceKind;
 use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientResult};
@@ -208,8 +207,8 @@ fn typed_client_list_contexts_uses_generated_route() {
     };
     let mut client = FakeClient::new(&vec![context.clone()]);
 
-    let result =
-        block_on(typed_client::list_contexts(&mut client)).expect("list contexts should decode");
+    let result = block_on(contexts_state::client::list_contexts(&mut client))
+        .expect("list contexts should decode");
 
     assert_eq!(result, vec![context]);
     assert_eq!(
@@ -238,7 +237,7 @@ fn typed_client_create_context_encodes_args_and_decodes_ack() {
     let mut attributes = std::collections::BTreeMap::new();
     attributes.insert("project".to_string(), "bmux".to_string());
 
-    let result = block_on(typed_client::create_context(
+    let result = block_on(contexts_commands::client::create_context(
         &mut client,
         Some("work".to_string()),
         attributes,

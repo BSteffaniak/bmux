@@ -114,6 +114,7 @@ pub use typed_dispatch::{
 };
 pub use typed_dispatch_client::{
     TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult,
+    TypedServiceClientError, TypedServiceClientResult, TypedServiceEndpoint, invoke_typed_service,
 };
 pub use version::{ApiVersion, VersionRange};
 pub use wire_event_sink::{

@@ -108,8 +108,20 @@ pub fn validate_with_imports(
         }
     }
 
+    let declared_capabilities: BTreeSet<&str> = schema
+        .capabilities
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+
     for iface in &schema.interfaces {
-        validate_interface(iface, &declared_aliases, imports, &schema_type_names)?;
+        validate_interface(
+            iface,
+            &declared_aliases,
+            imports,
+            &schema_type_names,
+            &declared_capabilities,
+        )?;
     }
     Ok(())
 }
@@ -152,8 +164,10 @@ fn validate_interface(
     declared_aliases: &BTreeSet<&str>,
     imports: &BTreeMap<String, Schema>,
     schema_type_names: &BTreeMap<String, BTreeSet<String>>,
+    declared_capabilities: &BTreeSet<&str>,
 ) -> Result<(), Error> {
     let type_names = collect_and_validate_names(iface)?;
+    validate_interface_shape(iface, declared_capabilities)?;
     resolve_type_references(
         iface,
         &type_names,
@@ -164,6 +178,69 @@ fn validate_interface(
     // Acyclic check on records and variants (compile-follows — `Option<T>`,
     // `list<T>`, and `map<_, T>` value break cycles).
     check_acyclic(iface)?;
+    Ok(())
+}
+
+fn validate_interface_shape(
+    iface: &Interface,
+    declared_capabilities: &BTreeSet<&str>,
+) -> Result<(), Error> {
+    let has_queries = iface
+        .items
+        .iter()
+        .any(|item| matches!(item, InterfaceItem::Query(_)));
+    let has_commands = iface
+        .items
+        .iter()
+        .any(|item| matches!(item, InterfaceItem::Command(_)));
+    let has_events = iface
+        .items
+        .iter()
+        .any(|item| matches!(item, InterfaceItem::Events(_)));
+
+    if has_queries && has_commands {
+        return Err(Error::Validate {
+            message: format!(
+                "interface `{}` mixes queries and commands; split state and command interfaces",
+                iface.name
+            ),
+        });
+    }
+    if has_events && (has_queries || has_commands) {
+        return Err(Error::Validate {
+            message: format!(
+                "interface `{}` mixes events with service operations; split event interfaces from services",
+                iface.name
+            ),
+        });
+    }
+
+    if has_queries || has_commands {
+        let Some(capability) = iface.capability.as_deref() else {
+            return Err(Error::Validate {
+                message: format!(
+                    "service interface `{}` must declare `@capability(NAME)`",
+                    iface.name
+                ),
+            });
+        };
+        if !declared_capabilities.contains(capability) {
+            return Err(Error::Validate {
+                message: format!(
+                    "interface `{}` references unknown capability `{capability}`",
+                    iface.name
+                ),
+            });
+        }
+    } else if iface.capability.is_some() {
+        return Err(Error::Validate {
+            message: format!(
+                "interface `{}` declares `@capability` but has no query or command operations",
+                iface.name
+            ),
+        });
+    }
+
     Ok(())
 }
 
@@ -607,11 +684,50 @@ mod tests {
     #[test]
     fn accepts_valid_schema() {
         let src = "plugin p version 1;\n\
+                   capability I_READ = p.i.read;\n\
+                   @capability(I_READ)\n\
                    interface i {\n\
                      record r { id: uuid }\n\
                      query q() -> r;\n\
                    }";
         let _ = compile(src).expect("valid");
+    }
+
+    #[test]
+    fn rejects_service_interface_without_capability() {
+        let src = "plugin p version 1;\n\
+                   interface i { query q() -> unit; }";
+        let err = compile(src).unwrap_err();
+        assert!(
+            matches!(&err, Error::Validate { message } if message.contains("must declare `@capability")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_query_command_interface() {
+        let src = "plugin p version 1;\n\
+                   capability I_READ = p.i.read;\n\
+                   @capability(I_READ)\n\
+                   interface i { query q() -> unit; command c() -> unit; }";
+        let err = compile(src).unwrap_err();
+        assert!(
+            matches!(&err, Error::Validate { message } if message.contains("mixes queries and commands")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_events_mixed_with_service_operations() {
+        let src = "plugin p version 1;\n\
+                   capability I_READ = p.i.read;\n\
+                   @capability(I_READ)\n\
+                   interface i { record e { id: uuid } query q() -> unit; events e; }";
+        let err = compile(src).unwrap_err();
+        assert!(
+            matches!(&err, Error::Validate { message } if message.contains("mixes events with service operations")),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -628,6 +744,8 @@ mod tests {
     #[test]
     fn rejects_unknown_type_reference() {
         let src = "plugin p version 1;\n\
+                   capability I_READ = p.i.read;\n\
+                   @capability(I_READ)\n\
                    interface i {\n\
                      query q() -> missing;\n\
                    }";
@@ -750,6 +868,8 @@ mod tests {
     #[test]
     fn rejects_unknown_import_alias_in_qualified_ref() {
         let src = "plugin p version 1;\n\
+                   capability I_READ = p.i.read;\n\
+                   @capability(I_READ)\n\
                    interface i {\n\
                      query q() -> windows.pane-state;\n\
                    }";
@@ -764,6 +884,8 @@ mod tests {
         // further resolve the imported type.
         let src = "plugin p version 1;\n\
                    import windows = bmux.windows;\n\
+                   capability I_READ = p.i.read;\n\
+                   @capability(I_READ)\n\
                    interface i {\n\
                      query q() -> windows.pane-state;\n\
                    }";
@@ -773,7 +895,9 @@ mod tests {
     #[test]
     fn accepts_qualified_ref_to_same_schema_interface() {
         let src = "plugin p version 1;\n\
+                   capability STATE_READ = p.state.read;\n\
                    interface shared { record row { id: uuid } }\n\
+                   @capability(STATE_READ)\n\
                    interface state { query q() -> shared.row; }";
         let _ = compile(src).expect("qualified ref to same-schema interface is allowed");
     }
@@ -781,7 +905,9 @@ mod tests {
     #[test]
     fn rejects_unknown_type_in_same_schema_interface_ref() {
         let src = "plugin p version 1;\n\
+                   capability STATE_READ = p.state.read;\n\
                    interface shared { record row { id: uuid } }\n\
+                   @capability(STATE_READ)\n\
                    interface state { query q() -> shared.missing; }";
         let err = compile(src).unwrap_err();
         assert!(matches!(err, Error::Validate { .. }));

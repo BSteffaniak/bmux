@@ -14,6 +14,7 @@ plugin bmux.windows version 1;
 capability WINDOWS_READ = bmux.windows.read;
 capability WINDOWS_WRITE = bmux.windows.write;
 
+@capability(WINDOWS_READ)
 interface windows-state {
     // A pane's current lifecycle status.
     variant pane-status {
@@ -49,6 +50,7 @@ interface windows-state {
     query list-windows(session: string?) -> list<window-entry>;
 }
 
+@capability(WINDOWS_WRITE)
 interface windows-commands {
     // Errors a focus command can produce.
     variant focus-error {

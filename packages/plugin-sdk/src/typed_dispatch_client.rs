@@ -22,6 +22,9 @@
 use std::future::Future;
 
 use bmux_ipc::InvokeServiceKind;
+use serde::{Serialize, de::DeserializeOwned};
+
+use crate::{CapabilityId, InterfaceId, OperationId};
 
 /// Errors returned by [`TypedDispatchClient::invoke_service_raw`].
 ///
@@ -97,6 +100,68 @@ impl TypedDispatchClientError {
 
 /// Result alias for typed-dispatch-client operations.
 pub type TypedDispatchClientResult<T> = std::result::Result<T, TypedDispatchClientError>;
+
+/// Errors returned by generated typed service clients.
+#[derive(Debug, thiserror::Error)]
+pub enum TypedServiceClientError {
+    /// The underlying dispatch transport failed.
+    #[error(transparent)]
+    Dispatch(#[from] TypedDispatchClientError),
+    /// Request encoding failed.
+    #[error("failed to encode {op}: {details}")]
+    Encode { op: String, details: String },
+    /// Response decoding failed.
+    #[error("failed to decode {op}: {details}")]
+    Decode { op: String, details: String },
+}
+
+/// Result alias for generated typed service clients.
+pub type TypedServiceClientResult<T> = std::result::Result<T, TypedServiceClientError>;
+
+/// Compile-time description of one typed service endpoint.
+pub trait TypedServiceEndpoint {
+    type Request: Serialize + Sync;
+    type Response: DeserializeOwned;
+
+    const CAPABILITY: CapabilityId;
+    const KIND: InvokeServiceKind;
+    const INTERFACE_ID: InterfaceId;
+    const OPERATION: OperationId;
+}
+
+/// Invoke a generated typed service endpoint.
+///
+/// # Errors
+///
+/// Returns transport, request encoding, or response decoding failures.
+pub async fn invoke_typed_service<C, E>(
+    client: &mut C,
+    request: &E::Request,
+) -> TypedServiceClientResult<E::Response>
+where
+    C: TypedDispatchClient,
+    E: TypedServiceEndpoint,
+{
+    let operation_id = E::OPERATION;
+    let operation = operation_id.as_str();
+    let payload = bmux_ipc::encode(request).map_err(|err| TypedServiceClientError::Encode {
+        op: operation.to_string(),
+        details: err.to_string(),
+    })?;
+    let response = client
+        .invoke_service_raw(
+            E::CAPABILITY.as_str(),
+            E::KIND,
+            E::INTERFACE_ID.as_str(),
+            operation,
+            payload,
+        )
+        .await?;
+    bmux_ipc::decode(&response).map_err(|err| TypedServiceClientError::Decode {
+        op: operation.to_string(),
+        details: err.to_string(),
+    })
+}
 
 /// A consumer-side transport that can dispatch typed service
 /// invocations to plugins via the kernel IPC boundary.

@@ -298,10 +298,11 @@ mod tests {
     use super::*;
 
     const WINDOWS_V1: &str = "plugin bmux.windows version 1;\n\
+        capability WINDOWS_READ = bmux.windows.read;\n\
+        @capability(WINDOWS_READ)\n\
         interface windows-state {\n\
           record pane-state { id: uuid }\n\
           query pane-state(id: uuid) -> pane-state?;\n\
-          command focus-pane(id: uuid) -> result<unit, string>;\n\
         }";
 
     #[test]
@@ -320,11 +321,12 @@ mod tests {
         reg.register(WINDOWS_V1).expect("provider");
         reg.register(
             "plugin bmux.windows.consumer version 1;\n\
+             capability WINDOWS_READ = bmux.windows.read;\n\
+             @capability(WINDOWS_READ)\n\
              interface windows-state {\n\
                record pane-state { id: uuid }\n\
                query pane-state(id: uuid) -> pane-state?;\n\
-               command focus-pane(id: uuid) -> result<unit, string>;\n\
-             }",
+              }",
         )
         .expect("consumer");
         let r = reg.check_compatibility("bmux.windows", "bmux.windows.consumer", "windows-state");
@@ -337,11 +339,12 @@ mod tests {
         reg.register(WINDOWS_V1).expect("provider");
         reg.register(
             "plugin consumer version 1;\n\
+             capability WINDOWS_READ = bmux.windows.read;\n\
+             @capability(WINDOWS_READ)\n\
              interface windows-state {\n\
                record pane-state { id: uuid }\n\
                query pane-state(id: uuid) -> pane-state;\n\
-               command focus-pane(id: uuid) -> result<unit, string>;\n\
-             }",
+              }",
         )
         .expect("consumer");
         let err = reg
@@ -360,6 +363,8 @@ mod tests {
         reg.register(WINDOWS_V1).expect("provider");
         reg.register(
             "plugin consumer version 1;\n\
+             capability OTHER_READ = consumer.other.read;\n\
+             @capability(OTHER_READ)\n\
              interface other-iface { query q() -> bool; }",
         )
         .expect("consumer");
@@ -379,11 +384,12 @@ mod tests {
         reg.register(WINDOWS_V1).expect("provider");
         reg.register(
             "plugin consumer version 3;\n\
+             capability WINDOWS_READ = bmux.windows.read;\n\
+             @capability(WINDOWS_READ)\n\
              interface windows-state {\n\
                record pane-state { id: uuid }\n\
                query pane-state(id: uuid) -> pane-state?;\n\
-               command focus-pane(id: uuid) -> result<unit, string>;\n\
-             }",
+              }",
         )
         .expect("consumer");
         let err = reg

@@ -22,10 +22,14 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use bmux_decoration_plugin_api::decoration_commands::{
+    DecorationCommandsService, INTERFACE_ID as DECORATION_COMMANDS_INTERFACE_ID, NotifyError,
+};
+use bmux_decoration_plugin_api::decoration_events::{DecorationEvent, PaneEvent};
 use bmux_decoration_plugin_api::decoration_state::{
-    BorderSpec, BorderStyle, DecorationEvent, DecorationStateService, DecorationThemeExtension,
-    INTERFACE_ID as DECORATION_STATE_INTERFACE_ID, NotifyError, PaneActivity, PaneDecoration,
-    PaneEvent, PaneGeometry, PaneLifecycle, SetStyleError, ValidationError, ValidationResult,
+    BorderSpec, BorderStyle, DecorationStateService, DecorationThemeExtension,
+    INTERFACE_ID as DECORATION_STATE_INTERFACE_ID, PaneActivity, PaneDecoration, PaneGeometry,
+    PaneLifecycle, SetStyleError, ValidationError, ValidationResult,
 };
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::prelude::*;
@@ -244,6 +248,24 @@ impl DecorationStateService for DecorationServiceHandle {
         })
     }
 
+    fn current_theme_extension<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Option<DecorationThemeExtension>> + Send + 'a>> {
+        Box::pin(async move {
+            let state = self.state.lock().ok()?;
+            state.current_theme.clone()
+        })
+    }
+
+    fn validate_theme_extension<'a>(
+        &'a self,
+        toml_text: String,
+    ) -> Pin<Box<dyn Future<Output = ValidationResult> + Send + 'a>> {
+        Box::pin(async move { validate_theme_extension_toml(&toml_text) })
+    }
+}
+
+impl DecorationCommandsService for DecorationServiceHandle {
     fn set_pane_border<'a>(
         &'a self,
         pane_id: Uuid,
@@ -285,38 +307,6 @@ impl DecorationStateService for DecorationServiceHandle {
         })
     }
 
-    fn notify_pane_event<'a>(
-        &'a self,
-        event: PaneEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| NotifyError::InvalidArgument {
-                    reason: "decoration state mutex poisoned".to_string(),
-                })?;
-            apply_pane_event(&mut state, &event);
-            Ok(())
-        })
-    }
-
-    fn current_theme_extension<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Option<DecorationThemeExtension>> + Send + 'a>> {
-        Box::pin(async move {
-            let state = self.state.lock().ok()?;
-            state.current_theme.clone()
-        })
-    }
-
-    fn validate_theme_extension<'a>(
-        &'a self,
-        toml_text: String,
-    ) -> Pin<Box<dyn Future<Output = ValidationResult> + Send + 'a>> {
-        Box::pin(async move { validate_theme_extension_toml(&toml_text) })
-    }
-
     fn apply_theme_extension<'a>(
         &'a self,
         toml_text: String,
@@ -333,6 +323,22 @@ impl DecorationStateService for DecorationServiceHandle {
                 &candidates,
                 ScriptHostAccess::default(),
             )
+        })
+    }
+
+    fn notify_pane_event<'a>(
+        &'a self,
+        event: PaneEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| NotifyError::InvalidArgument {
+                    reason: "decoration state mutex poisoned".to_string(),
+                })?;
+            apply_pane_event(&mut state, &event);
+            Ok(())
         })
     }
 }
@@ -1686,9 +1692,9 @@ impl RustPlugin for DecorationPlugin {
         _context: TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
-        let handle: Arc<DecorationServiceHandle> =
-            Arc::new(DecorationServiceHandle::new(self.state.clone_arc()));
-        let service: Arc<dyn DecorationStateService + Send + Sync> = handle;
+        let handle = Arc::new(DecorationServiceHandle::new(self.state.clone_arc()));
+        let state_service: Arc<dyn DecorationStateService + Send + Sync> = handle.clone();
+        let command_service: Arc<dyn DecorationCommandsService + Send + Sync> = handle;
         let (Ok(read_cap), Ok(write_cap)) = (
             HostScope::new("bmux.decoration.read"),
             HostScope::new("bmux.decoration.write"),
@@ -1699,13 +1705,13 @@ impl RustPlugin for DecorationPlugin {
             read_cap,
             ServiceKind::Query,
             DECORATION_STATE_INTERFACE_ID,
-            service.clone(),
+            state_service,
         );
-        registry.insert_typed::<dyn DecorationStateService + Send + Sync>(
+        registry.insert_typed::<dyn DecorationCommandsService + Send + Sync>(
             write_cap,
             ServiceKind::Command,
-            DECORATION_STATE_INTERFACE_ID,
-            service,
+            DECORATION_COMMANDS_INTERFACE_ID,
+            command_service,
         );
     }
 
@@ -1764,7 +1770,7 @@ impl RustPlugin for DecorationPlugin {
             "decoration-state", "validate-theme-extension" => |req: ValidateThemeExtensionArgs, _ctx| {
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(validate_theme_extension_toml(&req.toml))
             },
-            "decoration-state", "set-pane-border" => |req: SetPaneBorderArgs, _ctx| {
+            "decoration-commands", "set-pane-border" => |req: SetPaneBorderArgs, _ctx| {
                 let outcome: Result<(), SetStyleError> = (|| {
                     let mut state = state
                         .lock()
@@ -1783,7 +1789,7 @@ impl RustPlugin for DecorationPlugin {
                 })();
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
-            "decoration-state", "set-default-border" => |req: SetDefaultBorderArgs, _ctx| {
+            "decoration-commands", "set-default-border" => |req: SetDefaultBorderArgs, _ctx| {
                 let outcome: Result<(), SetStyleError> = (|| {
                     let mut state = state
                         .lock()
@@ -1796,7 +1802,7 @@ impl RustPlugin for DecorationPlugin {
                 })();
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
-            "decoration-state", "apply-theme-extension" => |req: ApplyThemeExtensionArgs, ctx| {
+            "decoration-commands", "apply-theme-extension" => |req: ApplyThemeExtensionArgs, ctx| {
                 let candidates = req
                     .config_dir_candidates
                     .into_iter()
@@ -1822,7 +1828,7 @@ impl RustPlugin for DecorationPlugin {
                     script_host_access_from_context(ctx),
                 ))
             },
-            "decoration-state", "notify-pane-event" => |req: NotifyPaneEventArgs, _ctx| {
+            "decoration-commands", "notify-pane-event" => |req: NotifyPaneEventArgs, _ctx| {
                 let outcome: Result<(), NotifyError> = (|| {
                     let mut state = state
                         .lock()
@@ -2315,6 +2321,7 @@ pub use bmux_decoration_plugin_api::decoration_state;
 
 /// Canonical interface ids published by this plugin.
 pub mod interface_ids {
+    pub use bmux_decoration_plugin_api::decoration_commands::INTERFACE_ID as DECORATION_COMMANDS;
     pub use bmux_decoration_plugin_api::decoration_state::INTERFACE_ID as DECORATION_STATE;
     pub use bmux_scene_protocol::scene_protocol::INTERFACE_ID as SCENE_PROTOCOL;
 }
@@ -2337,6 +2344,10 @@ pub const SCENE_PUBLISHED_SIGNAL: &str = "scene-published";
 #[test]
 fn interface_ids_match_bpdl_constants() {
     assert_eq!(DECORATION_STATE_INTERFACE_ID.as_str(), "decoration-state");
+    assert_eq!(
+        DECORATION_COMMANDS_INTERFACE_ID.as_str(),
+        "decoration-commands"
+    );
     assert_eq!(
         bmux_scene_protocol::scene_protocol::INTERFACE_ID.as_str(),
         "scene-protocol"

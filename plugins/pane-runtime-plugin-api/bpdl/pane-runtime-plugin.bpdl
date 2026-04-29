@@ -23,6 +23,7 @@ capability PANE_RUNTIME_WRITE = bmux.pane_runtime.write;
 capability ATTACH_RUNTIME_WRITE = bmux.attach_runtime.write;
 capability ATTACH_RUNTIME_READ = bmux.attach_runtime.read;
 
+@capability(PANE_RUNTIME_READ)
 interface pane-runtime-state {
     record pane-summary {
         id: uuid,
@@ -60,6 +61,7 @@ interface pane-runtime-state {
         -> result<pane-process-identity, pane-state-error>;
 }
 
+@capability(PANE_RUNTIME_WRITE)
 interface pane-runtime-commands {
     // Shared acknowledgement carrying the target pane + session id
     // after a mutating command completes. All mutation commands return
@@ -172,6 +174,7 @@ interface pane-runtime-commands {
     ) -> result<session-ack, session-runtime-command-error>;
 }
 
+@capability(ATTACH_RUNTIME_WRITE)
 interface attach-runtime-commands {
     // Response from `attach-session` / `attach-context`. Carries the
     // attach grant issued by the AttachTokenManager; client re-presents
@@ -278,6 +281,7 @@ interface attach-runtime-commands {
     command detach() -> result<u8, attach-command-error>;
 }
 
+@capability(ATTACH_RUNTIME_READ)
 interface attach-runtime-state {
     record pane-chunk {
         pane_id: uuid,

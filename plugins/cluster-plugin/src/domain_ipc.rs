@@ -10,9 +10,7 @@
 #![allow(dead_code)]
 #![allow(clippy::result_large_err)]
 
-use bmux_contexts_plugin_api::{
-    contexts_state as api_contexts_state, typed_client as contexts_typed_client,
-};
+use bmux_contexts_plugin_api::{contexts_commands, contexts_state as api_contexts_state};
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::{PluginError, Result};
 use serde::{Deserialize, Serialize};
@@ -502,12 +500,13 @@ pub trait KernelOps: ServiceCaller {
         Self: Sync,
     {
         let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
-        let contexts =
-            bmux_plugin::block_on_typed_dispatch(contexts_typed_client::list_contexts(&mut client))
-                .map_err(|err| typed_context_error("context_list", err))?
-                .into_iter()
-                .map(api_context_summary_to_local)
-                .collect();
+        let contexts = bmux_plugin::block_on_typed_dispatch(
+            api_contexts_state::client::list_contexts(&mut client),
+        )
+        .map_err(|err| typed_context_error("context_list", err))?
+        .into_iter()
+        .map(api_context_summary_to_local)
+        .collect();
         Ok(ContextListResponse { contexts })
     }
 
@@ -521,9 +520,9 @@ pub trait KernelOps: ServiceCaller {
         Self: Sync,
     {
         let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
-        let context = bmux_plugin::block_on_typed_dispatch(contexts_typed_client::current_context(
-            &mut client,
-        ))
+        let context = bmux_plugin::block_on_typed_dispatch(
+            api_contexts_state::client::current_context(&mut client),
+        )
         .map_err(|err| typed_context_error("context_current", err))?
         .map(api_context_summary_to_local);
         Ok(ContextCurrentResponse { context })
@@ -539,12 +538,13 @@ pub trait KernelOps: ServiceCaller {
         Self: Sync,
     {
         let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
-        let result = bmux_plugin::block_on_typed_dispatch(contexts_typed_client::create_context(
-            &mut client,
-            request.name.clone(),
-            request.attributes.clone(),
-        ))
-        .map_err(|err| typed_context_error("context_create", err))?;
+        let result =
+            bmux_plugin::block_on_typed_dispatch(contexts_commands::client::create_context(
+                &mut client,
+                request.name.clone(),
+                request.attributes.clone(),
+            ))
+            .map_err(|err| typed_context_error("context_create", err))?;
         match result {
             Ok(ack) => Ok(ContextCreateResponse {
                 context: ContextSummary {
@@ -569,11 +569,12 @@ pub trait KernelOps: ServiceCaller {
         Self: Sync,
     {
         let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
-        let result = bmux_plugin::block_on_typed_dispatch(contexts_typed_client::select_context(
-            &mut client,
-            context_selector_to_api(&request.selector),
-        ))
-        .map_err(|err| typed_context_error("context_select", err))?;
+        let result =
+            bmux_plugin::block_on_typed_dispatch(contexts_commands::client::select_context(
+                &mut client,
+                context_selector_to_api(&request.selector),
+            ))
+            .map_err(|err| typed_context_error("context_select", err))?;
         let ack = result.map_err(|err| PluginError::ServiceProtocol {
             details: format!("context_select failed: {err:?}"),
         })?;
@@ -596,12 +597,13 @@ pub trait KernelOps: ServiceCaller {
         Self: Sync,
     {
         let mut client = bmux_plugin::ServiceCallerDispatchClient::new(self);
-        let result = bmux_plugin::block_on_typed_dispatch(contexts_typed_client::close_context(
-            &mut client,
-            context_selector_to_api(&request.selector),
-            request.force,
-        ))
-        .map_err(|err| typed_context_error("context_close", err))?;
+        let result =
+            bmux_plugin::block_on_typed_dispatch(contexts_commands::client::close_context(
+                &mut client,
+                context_selector_to_api(&request.selector),
+                request.force,
+            ))
+            .map_err(|err| typed_context_error("context_close", err))?;
         let ack = result.map_err(|err| PluginError::ServiceProtocol {
             details: format!("context_close failed: {err:?}"),
         })?;

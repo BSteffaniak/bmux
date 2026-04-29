@@ -1306,7 +1306,6 @@ dependencies = [
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "uuid",
 ]
 
@@ -1363,14 +1362,12 @@ dependencies = [
 name = "bmux_decoration_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_codec",
  "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_scene_protocol",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "uuid",
 ]
 
@@ -1705,6 +1702,7 @@ dependencies = [
 name = "bmux_plugin_schema_macros"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "bmux_plugin_schema",
  "bmux_plugin_sdk",
  "proc-macro2",
@@ -1917,6 +1915,7 @@ dependencies = [
 name = "bmux_sessions_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
@@ -2023,6 +2022,7 @@ dependencies = [
 name = "bmux_windows_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",

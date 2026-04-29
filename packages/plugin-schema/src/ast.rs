@@ -53,6 +53,9 @@ pub struct CapabilityDecl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interface {
     pub name: String,
+    /// Capability constant required to invoke this service interface.
+    /// Present only for query-only or command-only interfaces.
+    pub capability: Option<String>,
     pub items: Vec<InterfaceItem>,
     pub span: Span,
 }
