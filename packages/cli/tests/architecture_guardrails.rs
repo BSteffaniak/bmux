@@ -1225,28 +1225,38 @@ fn plugin_api_crates_do_not_define_public_typed_clients() {
     }
 }
 
-/// Recording and performance service transport is generated from BPDL;
+/// Recording, performance, and snapshot service transport is generated from BPDL;
 /// public API crates must not reintroduce handwritten request/response
 /// envelopes for those service calls.
 #[test]
-fn recording_and_performance_api_crates_use_bpdl_transport() {
-    let recording_api = include_str!("../../../plugins/recording-plugin-api/src/lib.rs");
-    for marker in ["pub enum RecordingRequest", "pub enum RecordingResponse"] {
-        assert!(
-            !recording_api.contains(marker),
-            "plugins/recording-plugin-api must not reintroduce `{marker}`; use BPDL-generated operations",
-        );
-    }
-
-    let performance_api = include_str!("../../../plugins/performance-plugin-api/src/lib.rs");
-    for marker in [
-        "pub enum PerformanceRequest",
-        "pub enum PerformanceResponse",
+fn generated_transport_api_crates_do_not_define_public_envelopes() {
+    for (label, source, markers) in [
+        (
+            "plugins/recording-plugin-api",
+            include_str!("../../../plugins/recording-plugin-api/src/lib.rs"),
+            ["pub enum RecordingRequest", "pub enum RecordingResponse"].as_slice(),
+        ),
+        (
+            "plugins/performance-plugin-api",
+            include_str!("../../../plugins/performance-plugin-api/src/lib.rs"),
+            [
+                "pub enum PerformanceRequest",
+                "pub enum PerformanceResponse",
+            ]
+            .as_slice(),
+        ),
+        (
+            "plugins/snapshot-plugin-api",
+            include_str!("../../../plugins/snapshot-plugin-api/src/lib.rs"),
+            ["pub enum SnapshotRequest", "pub enum SnapshotResponse"].as_slice(),
+        ),
     ] {
-        assert!(
-            !performance_api.contains(marker),
-            "plugins/performance-plugin-api must not reintroduce `{marker}`; use BPDL-generated operations",
-        );
+        for marker in markers {
+            assert!(
+                !source.contains(marker),
+                "{label} must not reintroduce `{marker}`; use BPDL-generated operations",
+            );
+        }
     }
 }
 

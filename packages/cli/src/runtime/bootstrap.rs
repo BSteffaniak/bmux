@@ -1,21 +1,18 @@
 use anyhow::{Context, Result};
 use bmux_cli_schema::{LogLevel, RecordingEventKindArg, RecordingProfileArg};
 use bmux_client::{BmuxClient, ClientError};
+use bmux_clients_plugin_api::clients_state;
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_contexts_plugin_api::contexts_commands::{
-    ContextAck as ContextAckRecord, CreateContextError,
-};
+use bmux_contexts_plugin_api::contexts_commands::{self, ContextAck as ContextAckRecord};
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
 use bmux_recording_plugin_api::{recording_commands, recording_state};
 use bmux_server::BmuxServer;
-use bmux_sessions_plugin_api::sessions_state::SessionSummary;
+use bmux_sessions_plugin_api::sessions_state::{self, SessionSummary};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use tracing::{Level, warn};
 use uuid::Uuid;
-
-use super::{typed_contexts, typed_sessions};
 
 use super::{
     ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_WRITER_GUARD,
@@ -201,7 +198,9 @@ pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Re
         return Ok(session_id);
     }
 
-    let _client_id = super::typed_clients::whoami(client).await?;
+    let _client_id = clients_state::client::current_client(client)
+        .await?
+        .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?;
     let writable_sessions = sessions.clone();
 
     if writable_sessions.is_empty() {
@@ -235,18 +234,9 @@ pub(super) async fn resolve_default_attach_target(client: &mut BmuxClient) -> Re
 /// `BmuxClient::list_sessions` convenience method that predated the
 /// typed plugin contract.
 async fn typed_list_sessions_for_bootstrap(client: &mut BmuxClient) -> Result<Vec<SessionSummary>> {
-    let payload = bmux_codec::to_vec(&()).context("encoding list-sessions args")?;
-    let bytes = client
-        .invoke_service_raw(
-            typed_sessions::SESSIONS_READ_CAPABILITY.as_str(),
-            typed_sessions::QUERY_KIND,
-            typed_sessions::SESSIONS_STATE_INTERFACE.as_str(),
-            typed_sessions::OP_LIST_SESSIONS,
-            payload,
-        )
+    sessions_state::client::list_sessions(client)
         .await
-        .map_err(map_cli_client_error)?;
-    bmux_codec::from_bytes::<Vec<SessionSummary>>(&bytes).context("decoding list-sessions response")
+        .context("sessions-state list-sessions dispatch failed")
 }
 
 /// Typed dispatch wrapper for `contexts-commands:create-context`.
@@ -260,24 +250,10 @@ async fn typed_create_context_for_bootstrap(
     client: &mut BmuxClient,
     name: Option<String>,
 ) -> Result<ContextAckRecord> {
-    let payload = bmux_codec::to_vec(&typed_contexts::CreateContextArgs {
-        name,
-        attributes: BTreeMap::new(),
-    })
-    .context("encoding create-context args")?;
-    let bytes = client
-        .invoke_service_raw(
-            typed_contexts::CONTEXTS_WRITE_CAPABILITY.as_str(),
-            typed_contexts::COMMAND_KIND,
-            typed_contexts::CONTEXTS_COMMANDS_INTERFACE.as_str(),
-            typed_contexts::OP_CREATE_CONTEXT,
-            payload,
-        )
+    contexts_commands::client::create_context(client, name, BTreeMap::new())
         .await
-        .map_err(map_cli_client_error)?;
-    let outcome = bmux_codec::from_bytes::<Result<ContextAckRecord, CreateContextError>>(&bytes)
-        .context("decoding create-context response")?;
-    outcome.map_err(|err| anyhow::anyhow!("failed to create context: {err:?}"))
+        .context("contexts-commands create-context dispatch failed")?
+        .map_err(|err| anyhow::anyhow!("failed to create context: {err:?}"))
 }
 
 pub(super) fn next_default_tab_name(sessions: &[SessionSummary]) -> String {

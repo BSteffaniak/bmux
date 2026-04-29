@@ -1,0 +1,50 @@
+// Public, typed contract of the snapshot plugin.
+
+plugin bmux.snapshot version 1;
+
+capability SNAPSHOT_READ = bmux.snapshot.read;
+capability SNAPSHOT_WRITE = bmux.snapshot.write;
+
+interface snapshot-types {
+    record snapshot-status-payload {
+        enabled: bool,
+        path: string?,
+        snapshot_exists: bool,
+        last_write_epoch_ms: u64?,
+        last_restore_epoch_ms: u64?,
+        last_restore_error: string?,
+    }
+
+    record snapshot-save-result {
+        path: string?,
+    }
+
+    record snapshot-dry-run-result {
+        ok: bool,
+        message: string,
+    }
+
+    record snapshot-apply-summary {
+        restored_plugins: u64,
+        failed_plugins: u64,
+    }
+
+    variant snapshot-error {
+        not-registered { message: string },
+        lock-poisoned { message: string },
+        no-runtime { message: string },
+        failed { code: string, message: string },
+    }
+}
+
+@capability(SNAPSHOT_READ)
+interface snapshot-state {
+    query status() -> result<snapshot-types.snapshot-status-payload, snapshot-types.snapshot-error>;
+    query restore-dry-run() -> result<snapshot-types.snapshot-dry-run-result, snapshot-types.snapshot-error>;
+}
+
+@capability(SNAPSHOT_WRITE)
+interface snapshot-commands {
+    command save-now() -> result<snapshot-types.snapshot-save-result, snapshot-types.snapshot-error>;
+    command restore-apply() -> result<snapshot-types.snapshot-apply-summary, snapshot-types.snapshot-error>;
+}

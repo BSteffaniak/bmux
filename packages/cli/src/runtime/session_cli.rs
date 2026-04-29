@@ -1,18 +1,30 @@
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
+use bmux_clients_plugin_api::clients_state;
 use bmux_clients_plugin_api::clients_state::ClientSummary as TypedClientSummary;
 use bmux_ipc::SessionSelector;
-use bmux_sessions_plugin_api::sessions_commands::{NewSessionError, SessionAck};
-use bmux_sessions_plugin_api::sessions_state::SessionSummary as TypedSessionSummary;
+use bmux_sessions_plugin_api::sessions_commands::{self, NewSessionError, SessionAck};
+use bmux_sessions_plugin_api::sessions_state::{self, SessionSummary as TypedSessionSummary};
 use bmux_snapshot_plugin_api::offline_snapshot::OfflineSessionKillTarget;
 
 use super::attach::runtime::short_uuid;
-use super::typed_clients;
-use super::typed_sessions;
 use super::{
     ConnectionContext, ConnectionPolicyScope, connect_if_running_with_context,
     connect_with_context, map_cli_client_error, offline_kill_sessions, parse_session_selector,
 };
+
+fn ipc_to_session_selector(selector: SessionSelector) -> sessions_state::SessionSelector {
+    match selector {
+        SessionSelector::ById(id) => sessions_state::SessionSelector {
+            id: Some(id),
+            name: None,
+        },
+        SessionSelector::ByName(name) => sessions_state::SessionSelector {
+            id: None,
+            name: Some(name),
+        },
+    }
+}
 
 /// Invoke `sessions-commands:new-session` on a `BmuxClient` via the
 /// generic service-dispatch envelope.
@@ -20,40 +32,16 @@ async fn typed_new_session(
     client: &mut BmuxClient,
     name: Option<String>,
 ) -> Result<Result<SessionAck, NewSessionError>> {
-    #[derive(serde::Serialize)]
-    struct Args {
-        name: Option<String>,
-    }
-    let payload = bmux_codec::to_vec(&Args { name }).context("encoding new-session args")?;
-    let bytes = client
-        .invoke_service_raw(
-            typed_sessions::SESSIONS_WRITE_CAPABILITY.as_str(),
-            typed_sessions::COMMAND_KIND,
-            typed_sessions::SESSIONS_COMMANDS_INTERFACE.as_str(),
-            typed_sessions::OP_NEW_SESSION,
-            payload,
-        )
+    sessions_commands::client::new_session(client, name)
         .await
-        .map_err(map_cli_client_error)?;
-    bmux_codec::from_bytes::<Result<SessionAck, NewSessionError>>(&bytes)
-        .context("decoding new-session response")
+        .context("sessions-commands new-session dispatch failed")
 }
 
 /// Invoke `sessions-state:list-sessions` on a `BmuxClient`.
 async fn typed_list_sessions(client: &mut BmuxClient) -> Result<Vec<TypedSessionSummary>> {
-    let payload = bmux_codec::to_vec(&()).context("encoding list-sessions args")?;
-    let bytes = client
-        .invoke_service_raw(
-            typed_sessions::SESSIONS_READ_CAPABILITY.as_str(),
-            typed_sessions::QUERY_KIND,
-            typed_sessions::SESSIONS_STATE_INTERFACE.as_str(),
-            typed_sessions::OP_LIST_SESSIONS,
-            payload,
-        )
+    sessions_state::client::list_sessions(client)
         .await
-        .map_err(map_cli_client_error)?;
-    bmux_codec::from_bytes::<Vec<TypedSessionSummary>>(&bytes)
-        .context("decoding list-sessions response")
+        .context("sessions-state list-sessions dispatch failed")
 }
 
 /// Invoke `sessions-commands:kill-session` on a `BmuxClient`.
@@ -64,29 +52,15 @@ async fn typed_kill_session(
     selector: SessionSelector,
     force_local: bool,
 ) -> std::result::Result<uuid::Uuid, ClientError> {
-    let args = typed_sessions::KillSessionArgs {
-        selector: typed_sessions::from_ipc_selector(selector),
+    let outcome = sessions_commands::client::kill_session(
+        client,
+        ipc_to_session_selector(selector),
         force_local,
-    };
-    let payload = bmux_codec::to_vec(&args).map_err(|error| ClientError::ServerError {
+    )
+    .await
+    .map_err(|err| ClientError::ServerError {
         code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding kill-session args: {error}"),
-    })?;
-    let bytes = client
-        .invoke_service_raw(
-            typed_sessions::SESSIONS_WRITE_CAPABILITY.as_str(),
-            typed_sessions::COMMAND_KIND,
-            typed_sessions::SESSIONS_COMMANDS_INTERFACE.as_str(),
-            typed_sessions::OP_KILL_SESSION,
-            payload,
-        )
-        .await?;
-    let outcome: std::result::Result<
-        SessionAck,
-        bmux_sessions_plugin_api::sessions_commands::KillSessionError,
-    > = bmux_codec::from_bytes(&bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding kill-session response: {error}"),
+        message: err.to_string(),
     })?;
     outcome
         .map(|ack| ack.id)
@@ -98,19 +72,9 @@ async fn typed_kill_session(
 
 /// Invoke `clients-state:list-clients` on a `BmuxClient`.
 async fn typed_list_clients(client: &mut BmuxClient) -> Result<Vec<TypedClientSummary>> {
-    let payload = bmux_codec::to_vec(&()).context("encoding list-clients args")?;
-    let bytes = client
-        .invoke_service_raw(
-            typed_clients::CLIENTS_READ_CAPABILITY.as_str(),
-            typed_clients::QUERY_KIND,
-            typed_clients::CLIENTS_STATE_INTERFACE.as_str(),
-            typed_clients::OP_LIST_CLIENTS,
-            payload,
-        )
+    clients_state::client::list_clients(client)
         .await
-        .map_err(map_cli_client_error)?;
-    bmux_codec::from_bytes::<Vec<TypedClientSummary>>(&bytes)
-        .context("decoding list-clients response")
+        .context("clients-state list-clients dispatch failed")
 }
 
 fn typed_session_label(session: &TypedSessionSummary) -> String {
@@ -186,7 +150,11 @@ pub(super) async fn run_client_list(
         connection_context,
     )
     .await?;
-    let self_id = typed_clients::whoami(&mut api).await?;
+    let self_id = clients_state::client::current_client(&mut api)
+        .await
+        .context("clients-state current-client dispatch failed")?
+        .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?
+        .id;
     let mut clients = typed_list_clients(&mut api).await?;
     clients.sort_by_key(|client| (client.id != self_id, client.id));
 

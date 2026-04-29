@@ -39,28 +39,6 @@ struct MetricsState {
     worker_started: bool,
 }
 
-enum PerformanceResponse {
-    Settings {
-        settings: bmux_ipc::PerformanceRuntimeSettings,
-    },
-    Watches {
-        watches: Vec<MetricWatch>,
-    },
-    Snapshot {
-        snapshot: MetricsSnapshot,
-    },
-    MetricCapabilities {
-        capabilities: Vec<MetricCapability>,
-    },
-    ThemeHeaderSettings {
-        settings: ThemeHeaderSettings,
-    },
-    PromptForm {
-        request: bmux_plugin_sdk::PromptRequest,
-    },
-    Ack,
-}
-
 impl Default for MetricsState {
     fn default() -> Self {
         let watch = MetricWatch::default().normalized();
@@ -126,69 +104,39 @@ impl RustPlugin for PerformancePlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "performance-state", "get-settings" => |_req: (), _ctx| {
-                let PerformanceResponse::Settings { settings } = handle_get_settings() else {
-                    unreachable!("settings handler returns settings")
-                };
-                Ok::<performance_types::PerformanceRuntimeSettings, ServiceResponse>(settings.into())
+                Ok::<performance_types::PerformanceRuntimeSettings, ServiceResponse>(handle_get_settings().into())
             },
             "performance-commands", "set-settings" => |req: SetSettingsRequest, _ctx| {
-                let PerformanceResponse::Settings { settings } = handle_set_settings(&req.settings.into()) else {
-                    unreachable!("settings handler returns settings")
-                };
-                Ok::<performance_types::PerformanceRuntimeSettings, ServiceResponse>(settings.into())
+                Ok::<performance_types::PerformanceRuntimeSettings, ServiceResponse>(handle_set_settings(&req.settings.into()).into())
             },
             "performance-state", "list-watches" => |_req: (), _ctx| {
-                let PerformanceResponse::Watches { watches } = handle_list_watches() else {
-                    unreachable!("list watches handler returns watches")
-                };
-                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(watches)
+                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(handle_list_watches())
             },
             "performance-commands", "start-watch" => |req: StartWatchRequest, _ctx| {
-                let PerformanceResponse::Watches { watches } = handle_start_watch(req.watch) else {
-                    unreachable!("start watch handler returns watches")
-                };
-                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(watches)
+                Ok::<Vec<performance_types::MetricWatch>, ServiceResponse>(handle_start_watch(req.watch))
             },
             "performance-commands", "stop-watch" => |req: StopWatchRequest, _ctx| {
-                let _ = handle_stop_watch(&req.watch_id);
+                handle_stop_watch(&req.watch_id);
                 Ok::<(), ServiceResponse>(())
             },
             "performance-state", "get-snapshot" => |_req: (), _ctx| {
-                let PerformanceResponse::Snapshot { snapshot } = handle_get_snapshot() else {
-                    unreachable!("snapshot handler returns snapshot")
-                };
-                Ok::<performance_types::MetricsSnapshot, ServiceResponse>(snapshot)
+                Ok::<performance_types::MetricsSnapshot, ServiceResponse>(handle_get_snapshot())
             },
             "performance-state", "get-metric-capabilities" => |_req: (), _ctx| {
-                let PerformanceResponse::MetricCapabilities { capabilities } = handle_get_metric_capabilities() else {
-                    unreachable!("capabilities handler returns capabilities")
-                };
-                Ok::<Vec<performance_types::MetricCapability>, ServiceResponse>(capabilities)
+                Ok::<Vec<performance_types::MetricCapability>, ServiceResponse>(handle_get_metric_capabilities())
             },
             "performance-state", "get-theme-header-settings" => |_req: (), _ctx| {
-                let PerformanceResponse::ThemeHeaderSettings { settings } = handle_get_theme_header_settings() else {
-                    unreachable!("theme settings handler returns settings")
-                };
-                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(settings)
+                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(handle_get_theme_header_settings())
             },
             "performance-commands", "set-theme-header-settings" => |req: SetThemeHeaderSettingsRequest, _ctx| {
-                let PerformanceResponse::ThemeHeaderSettings { settings } = handle_set_theme_header_settings(req.settings) else {
-                    unreachable!("theme settings handler returns settings")
-                };
-                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(settings)
+                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(handle_set_theme_header_settings(req.settings))
             },
             "performance-state", "build-theme-header-settings-form" => |_req: (), _ctx| {
-                let PerformanceResponse::PromptForm { request } = handle_build_theme_header_settings_form() else {
-                    unreachable!("prompt form handler returns prompt form")
-                };
-                Ok::<performance_types::PromptForm, ServiceResponse>(request.into())
+                Ok::<performance_types::PromptForm, ServiceResponse>(handle_build_theme_header_settings_form().into())
             },
             "performance-commands", "apply-theme-header-settings-form" => |req: ApplyThemeHeaderSettingsFormRequest, _ctx| {
                 let values = req.values.into_iter().map(|(key, value)| (key, value.into())).collect();
-                let PerformanceResponse::ThemeHeaderSettings { settings } = handle_apply_theme_header_settings_form(&values) else {
-                    unreachable!("theme settings form handler returns settings")
-                };
-                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(settings)
+                Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(handle_apply_theme_header_settings_form(&values))
             },
         })
     }
@@ -228,17 +176,16 @@ struct ApplyThemeHeaderSettingsFormRequest {
     values: BTreeMap<String, performance_types::PromptFormValue>,
 }
 
-fn handle_list_watches() -> PerformanceResponse {
-    let watches = metrics_state().lock().map_or_else(
+fn handle_list_watches() -> Vec<MetricWatch> {
+    metrics_state().lock().map_or_else(
         |_| Vec::new(),
         |state| state.watches.values().cloned().collect(),
-    );
-    PerformanceResponse::Watches { watches }
+    )
 }
 
-fn handle_start_watch(watch: MetricWatch) -> PerformanceResponse {
+fn handle_start_watch(watch: MetricWatch) -> Vec<MetricWatch> {
     if watch.id.trim().is_empty() {
-        return PerformanceResponse::Ack;
+        return handle_list_watches();
     }
     if let Ok(mut state) = metrics_state().lock() {
         let watch = watch.normalized();
@@ -249,37 +196,32 @@ fn handle_start_watch(watch: MetricWatch) -> PerformanceResponse {
     handle_list_watches()
 }
 
-fn handle_stop_watch(watch_id: &str) -> PerformanceResponse {
+fn handle_stop_watch(watch_id: &str) {
     if let Ok(mut state) = metrics_state().lock() {
         state.watches.remove(watch_id);
         state.snapshot.watches = state.watches.values().cloned().collect();
     }
-    PerformanceResponse::Ack
 }
 
-fn handle_get_snapshot() -> PerformanceResponse {
-    let snapshot = metrics_state().lock().map_or_else(
+fn handle_get_snapshot() -> MetricsSnapshot {
+    metrics_state().lock().map_or_else(
         |_| MetricsSnapshot::default(),
         |state| state.snapshot.clone(),
-    );
-    PerformanceResponse::Snapshot { snapshot }
+    )
 }
 
-fn handle_get_metric_capabilities() -> PerformanceResponse {
-    PerformanceResponse::MetricCapabilities {
-        capabilities: metric_capabilities(),
-    }
+fn handle_get_metric_capabilities() -> Vec<MetricCapability> {
+    metric_capabilities()
 }
 
-fn handle_get_theme_header_settings() -> PerformanceResponse {
-    let settings = metrics_state().lock().map_or_else(
+fn handle_get_theme_header_settings() -> ThemeHeaderSettings {
+    metrics_state().lock().map_or_else(
         |_| ThemeHeaderSettings::default(),
         |state| state.theme_header_settings.clone(),
-    );
-    PerformanceResponse::ThemeHeaderSettings { settings }
+    )
 }
 
-fn handle_set_theme_header_settings(settings: ThemeHeaderSettings) -> PerformanceResponse {
+fn handle_set_theme_header_settings(settings: ThemeHeaderSettings) -> ThemeHeaderSettings {
     let normalized = normalize_theme_header_settings(settings);
     if let Ok(mut state) = metrics_state().lock() {
         state.theme_header_settings = normalized.clone();
@@ -288,24 +230,20 @@ fn handle_set_theme_header_settings(settings: ThemeHeaderSettings) -> Performanc
         state.snapshot.watches = state.watches.values().cloned().collect();
     }
     ensure_metrics_worker();
-    PerformanceResponse::ThemeHeaderSettings {
-        settings: normalized,
-    }
+    normalized
 }
 
-fn handle_build_theme_header_settings_form() -> PerformanceResponse {
+fn handle_build_theme_header_settings_form() -> bmux_plugin_sdk::PromptRequest {
     let settings = metrics_state().lock().map_or_else(
         |_| ThemeHeaderSettings::default(),
         |state| state.theme_header_settings.clone(),
     );
-    PerformanceResponse::PromptForm {
-        request: theme_header_settings_form(&settings),
-    }
+    theme_header_settings_form(&settings)
 }
 
 fn handle_apply_theme_header_settings_form(
     values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
-) -> PerformanceResponse {
+) -> ThemeHeaderSettings {
     handle_set_theme_header_settings(settings_from_form_values(values))
 }
 
@@ -556,35 +494,27 @@ fn metric_from_form_value(value: &str) -> Option<ThemeHeaderMetric> {
     }
 }
 
-fn handle_get_settings() -> PerformanceResponse {
+fn handle_get_settings() -> bmux_ipc::PerformanceRuntimeSettings {
     let Some(handle) = global_plugin_state_registry().get::<PerformanceSettingsHandle>() else {
-        return PerformanceResponse::Settings {
-            settings: PerformanceCaptureSettings::default().to_runtime_settings(),
-        };
+        return PerformanceCaptureSettings::default().to_runtime_settings();
     };
     let Ok(guard) = handle.read() else {
-        return PerformanceResponse::Settings {
-            settings: PerformanceCaptureSettings::default().to_runtime_settings(),
-        };
+        return PerformanceCaptureSettings::default().to_runtime_settings();
     };
-    PerformanceResponse::Settings {
-        settings: guard.0.current().to_runtime_settings(),
-    }
+    guard.0.current().to_runtime_settings()
 }
 
-fn handle_set_settings(requested: &bmux_ipc::PerformanceRuntimeSettings) -> PerformanceResponse {
+fn handle_set_settings(
+    requested: &bmux_ipc::PerformanceRuntimeSettings,
+) -> bmux_ipc::PerformanceRuntimeSettings {
     let normalized_capture = PerformanceCaptureSettings::from_runtime_settings(requested);
     let normalized = normalized_capture.to_runtime_settings();
 
     let Some(handle) = global_plugin_state_registry().get::<PerformanceSettingsHandle>() else {
-        return PerformanceResponse::Settings {
-            settings: normalized,
-        };
+        return normalized;
     };
     let Ok(guard) = handle.read() else {
-        return PerformanceResponse::Settings {
-            settings: normalized,
-        };
+        return normalized;
     };
     guard.0.set(normalized_capture);
 
@@ -601,9 +531,7 @@ fn handle_set_settings(requested: &bmux_ipc::PerformanceRuntimeSettings) -> Perf
         settings: normalized.clone(),
     });
 
-    PerformanceResponse::Settings {
-        settings: normalized,
-    }
+    normalized
 }
 
 fn ensure_metrics_worker() {
@@ -905,17 +833,13 @@ mod tests {
 
     #[test]
     fn start_watch_clamps_and_stores_watch() {
-        let response = handle_start_watch(MetricWatch {
+        let watches = handle_start_watch(MetricWatch {
             id: "test-watch".to_string(),
             target: MetricTarget::System,
             metrics: Vec::new(),
             interval_ms: 1,
             cpu_percent_mode: CpuPercentMode::Normalized,
         });
-
-        let PerformanceResponse::Watches { watches } = response else {
-            panic!("expected watches response");
-        };
         let watch = watches
             .into_iter()
             .find(|watch| watch.id == "test-watch")
@@ -925,6 +849,6 @@ mod tests {
             bmux_performance_plugin_api::MIN_METRICS_INTERVAL_MS
         );
 
-        let _ = handle_stop_watch("test-watch");
+        handle_stop_watch("test-watch");
     }
 }

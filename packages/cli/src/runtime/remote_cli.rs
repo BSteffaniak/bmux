@@ -9,7 +9,7 @@ use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::{InvokeServiceKind, RecordingRollingStartOptions};
 use bmux_plugin_sdk::{PluginCliCommandRequest, PluginCliCommandResponse};
-use bmux_sessions_plugin_api::sessions_state::SessionSummary;
+use bmux_sessions_plugin_api::sessions_state::{self, SessionSummary};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -25,7 +25,7 @@ use super::{
         HostedHostState, hosted_not_ready_reason, status_not_ready_lines, status_ready_lines,
     },
     map_cli_client_error, recording, run_server_start, run_session_attach,
-    run_session_attach_with_client, typed_sessions,
+    run_session_attach_with_client,
 };
 
 /// Typed dispatch wrapper for `sessions-state:list-sessions` via
@@ -33,18 +33,9 @@ use super::{
 /// domain-specific `list_sessions` method — callers route through the
 /// typed sessions-plugin API instead.
 async fn typed_list_sessions_remote(client: &mut BmuxClient) -> Result<Vec<SessionSummary>> {
-    let payload = bmux_codec::to_vec(&()).context("encoding list-sessions args")?;
-    let bytes = client
-        .invoke_service_raw(
-            typed_sessions::SESSIONS_READ_CAPABILITY.as_str(),
-            typed_sessions::QUERY_KIND,
-            typed_sessions::SESSIONS_STATE_INTERFACE.as_str(),
-            typed_sessions::OP_LIST_SESSIONS,
-            payload,
-        )
+    sessions_state::client::list_sessions(client)
         .await
-        .map_err(map_cli_client_error)?;
-    bmux_codec::from_bytes::<Vec<SessionSummary>>(&bytes).context("decoding list-sessions response")
+        .context("sessions-state list-sessions dispatch failed")
 }
 use bmux_cli_schema::HostedModeArg;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, HostedMode, RemoteServerStartMode};

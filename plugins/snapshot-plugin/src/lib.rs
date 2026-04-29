@@ -26,8 +26,7 @@ use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_snapshot_plugin_api::{
-    SNAPSHOT_COMMANDS_INTERFACE, SNAPSHOT_READ, SNAPSHOT_WRITE, SnapshotPluginConfig,
-    SnapshotRequest, SnapshotResponse, SnapshotStatusPayload,
+    SnapshotPluginConfig, snapshot_commands, snapshot_state, snapshot_types,
 };
 use bmux_snapshot_runtime::{
     SnapshotDirtyFlagHandle, SnapshotOrchestratorError, SnapshotOrchestratorHandle,
@@ -118,8 +117,17 @@ impl RustPlugin for SnapshotPlugin {
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
-            "snapshot-commands", "dispatch" => |req: SnapshotRequest, _ctx| {
-                Ok::<SnapshotResponse, ServiceResponse>(handle_request(&req))
+            "snapshot-state", "status" => |_req: (), _ctx| {
+                Ok::<Result<snapshot_types::SnapshotStatusPayload, snapshot_types::SnapshotError>, ServiceResponse>(handle_status())
+            },
+            "snapshot-state", "restore-dry-run" => |_req: (), _ctx| {
+                Ok::<Result<snapshot_types::SnapshotDryRunResult, snapshot_types::SnapshotError>, ServiceResponse>(handle_restore_dry_run())
+            },
+            "snapshot-commands", "save-now" => |_req: (), _ctx| {
+                Ok::<Result<snapshot_types::SnapshotSaveResult, snapshot_types::SnapshotError>, ServiceResponse>(handle_save_now())
+            },
+            "snapshot-commands", "restore-apply" => |_req: (), _ctx| {
+                Ok::<Result<snapshot_types::SnapshotApplySummary, snapshot_types::SnapshotError>, ServiceResponse>(handle_restore_apply())
             },
         })
     }
@@ -129,95 +137,87 @@ impl RustPlugin for SnapshotPlugin {
         _context: TypedServiceRegistrationContext<'_>,
         _registry: &mut TypedServiceRegistry,
     ) {
-        // No typed Arc<dyn Trait> surface today — snapshot operations
-        // dispatch exclusively through the byte-service path.
+        // No typed Arc<dyn Trait> surface today — generated snapshot
+        // operations dispatch through the byte-service path.
     }
 }
 
-fn handle_request(req: &SnapshotRequest) -> SnapshotResponse {
+fn snapshot_handle() -> Result<SnapshotOrchestratorHandle, snapshot_types::SnapshotError> {
     let registry = global_plugin_state_registry();
     let Some(handle_entry) = registry.get::<SnapshotOrchestratorHandle>() else {
-        return SnapshotResponse::Error {
-            code: "not_registered".into(),
+        return Err(snapshot_types::SnapshotError::NotRegistered {
             message: "snapshot orchestrator not registered".into(),
-        };
+        });
     };
-    let orchestrator_handle = match handle_entry.read() {
-        Ok(guard) => guard.clone(),
-        Err(_) => {
-            return SnapshotResponse::Error {
-                code: "lock_poisoned".into(),
-                message: "snapshot orchestrator handle lock poisoned".into(),
-            };
+    handle_entry.read().map(|guard| guard.clone()).map_err(|_| {
+        snapshot_types::SnapshotError::LockPoisoned {
+            message: "snapshot orchestrator handle lock poisoned".into(),
         }
-    };
-    drop(handle_entry);
-
-    // Bundled plugins share the host tokio runtime, but `invoke_service`
-    // is synchronous: hop to a blocking tokio context to drive the
-    // orchestrator's async methods.
-    let rt = tokio::runtime::Handle::try_current();
-    match *req {
-        SnapshotRequest::SaveNow => match rt {
-            Ok(handle) => match futures_block_on(&handle, async move {
-                orchestrator_handle.as_dyn().save_now_boxed().await
-            }) {
-                Ok(path) => SnapshotResponse::Saved {
-                    path: path.map(|p| p.display().to_string()),
-                },
-                Err(err) => error_response("save_failed", &err),
-            },
-            Err(_) => SnapshotResponse::Error {
-                code: "no_runtime".into(),
-                message: "tokio runtime not available for snapshot dispatch".into(),
-            },
-        },
-        SnapshotRequest::Status => {
-            let report = orchestrator_handle.as_dyn().status();
-            SnapshotResponse::Status(SnapshotStatusPayload {
-                enabled: report.enabled,
-                path: report.path,
-                snapshot_exists: report.snapshot_exists,
-                last_write_epoch_ms: report.last_write_epoch_ms,
-                last_restore_epoch_ms: report.last_restore_epoch_ms,
-                last_restore_error: report.last_restore_error,
-            })
-        }
-        SnapshotRequest::RestoreDryRun => match rt {
-            Ok(handle) => match futures_block_on(&handle, async move {
-                orchestrator_handle.as_dyn().dry_run_boxed().await
-            }) {
-                Ok(report) => SnapshotResponse::DryRun {
-                    ok: report.ok,
-                    message: report.message,
-                },
-                Err(err) => error_response("dry_run_failed", &err),
-            },
-            Err(_) => SnapshotResponse::Error {
-                code: "no_runtime".into(),
-                message: "tokio runtime not available for snapshot dispatch".into(),
-            },
-        },
-        SnapshotRequest::RestoreApply => match rt {
-            Ok(handle) => match futures_block_on(&handle, async move {
-                orchestrator_handle.as_dyn().restore_apply_boxed().await
-            }) {
-                Ok(summary) => SnapshotResponse::Applied {
-                    restored_plugins: summary.restored_plugins as u64,
-                    failed_plugins: summary.failed_plugins as u64,
-                },
-                Err(err) => error_response("restore_failed", &err),
-            },
-            Err(_) => SnapshotResponse::Error {
-                code: "no_runtime".into(),
-                message: "tokio runtime not available for snapshot dispatch".into(),
-            },
-        },
-    }
+    })
 }
 
-fn error_response(code: &str, err: &SnapshotOrchestratorError) -> SnapshotResponse {
-    SnapshotResponse::Error {
+fn tokio_handle() -> Result<tokio::runtime::Handle, snapshot_types::SnapshotError> {
+    tokio::runtime::Handle::try_current().map_err(|_| snapshot_types::SnapshotError::NoRuntime {
+        message: "tokio runtime not available for snapshot dispatch".into(),
+    })
+}
+
+fn handle_save_now() -> Result<snapshot_types::SnapshotSaveResult, snapshot_types::SnapshotError> {
+    let orchestrator_handle = snapshot_handle()?;
+    let handle = tokio_handle()?;
+    futures_block_on(&handle, async move {
+        orchestrator_handle.as_dyn().save_now_boxed().await
+    })
+    .map(|path| snapshot_types::SnapshotSaveResult {
+        path: path.map(|p| p.display().to_string()),
+    })
+    .map_err(|err| error_response("save_failed", &err))
+}
+
+fn handle_status() -> Result<snapshot_types::SnapshotStatusPayload, snapshot_types::SnapshotError> {
+    let orchestrator_handle = snapshot_handle()?;
+    let report = orchestrator_handle.as_dyn().status();
+    Ok(snapshot_types::SnapshotStatusPayload {
+        enabled: report.enabled,
+        path: report.path,
+        snapshot_exists: report.snapshot_exists,
+        last_write_epoch_ms: report.last_write_epoch_ms,
+        last_restore_epoch_ms: report.last_restore_epoch_ms,
+        last_restore_error: report.last_restore_error,
+    })
+}
+
+fn handle_restore_dry_run()
+-> Result<snapshot_types::SnapshotDryRunResult, snapshot_types::SnapshotError> {
+    let orchestrator_handle = snapshot_handle()?;
+    let handle = tokio_handle()?;
+    futures_block_on(&handle, async move {
+        orchestrator_handle.as_dyn().dry_run_boxed().await
+    })
+    .map(|report| snapshot_types::SnapshotDryRunResult {
+        ok: report.ok,
+        message: report.message,
+    })
+    .map_err(|err| error_response("dry_run_failed", &err))
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn handle_restore_apply()
+-> Result<snapshot_types::SnapshotApplySummary, snapshot_types::SnapshotError> {
+    let orchestrator_handle = snapshot_handle()?;
+    let handle = tokio_handle()?;
+    futures_block_on(&handle, async move {
+        orchestrator_handle.as_dyn().restore_apply_boxed().await
+    })
+    .map(|summary| snapshot_types::SnapshotApplySummary {
+        restored_plugins: summary.restored_plugins as u64,
+        failed_plugins: summary.failed_plugins as u64,
+    })
+    .map_err(|err| error_response("restore_failed", &err))
+}
+
+fn error_response(code: &str, err: &SnapshotOrchestratorError) -> snapshot_types::SnapshotError {
+    snapshot_types::SnapshotError::Failed {
         code: code.to_string(),
         message: err.to_string(),
     }
@@ -274,4 +274,10 @@ const _KEEPS_CONSTS_ALIVE: (
     bmux_plugin_sdk::CapabilityId,
     bmux_plugin_sdk::CapabilityId,
     bmux_plugin_sdk::InterfaceId,
-) = (SNAPSHOT_READ, SNAPSHOT_WRITE, SNAPSHOT_COMMANDS_INTERFACE);
+    bmux_plugin_sdk::InterfaceId,
+) = (
+    bmux_snapshot_plugin_api::capabilities::SNAPSHOT_READ,
+    bmux_snapshot_plugin_api::capabilities::SNAPSHOT_WRITE,
+    snapshot_state::INTERFACE_ID,
+    snapshot_commands::INTERFACE_ID,
+);

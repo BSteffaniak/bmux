@@ -1957,6 +1957,7 @@ dependencies = [
  "bmux_config",
  "bmux_context_state",
  "bmux_ipc",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_session_models",
  "bmux_session_state",

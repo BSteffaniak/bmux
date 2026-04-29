@@ -32,6 +32,8 @@ mod bootstrap;
 mod built_in_commands;
 mod cli_parse;
 mod config_cli;
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod control_catalog_mapping;
 mod dispatch;
 mod doctor_cli;
 mod hosted_output;
@@ -57,20 +59,6 @@ pub mod slot;
 mod slot_cli;
 mod terminal_doctor;
 mod terminal_protocol;
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) mod typed_clients;
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) mod typed_contexts;
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) mod typed_control_catalog;
-#[allow(clippy::redundant_pub_crate)]
-// Shared invoke primitives consumed by every `typed_<domain>` helper.
-pub(crate) mod typed_service;
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) mod typed_sessions;
-#[allow(clippy::redundant_pub_crate)]
-// Used from sibling playbook module via crate::runtime::typed_windows.
-pub(crate) mod typed_windows;
 
 use self::logs_watch::{
     active_log_file_path, run_logs_profiles_delete, run_logs_profiles_list,

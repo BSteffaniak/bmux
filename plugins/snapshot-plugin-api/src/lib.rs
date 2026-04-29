@@ -1,10 +1,11 @@
 //! Typed public API of the bmux snapshot plugin.
 //!
-//! Hand-written (no BPDL). Hosts the shared config type,
-//! capability/interface ids, typed request/response wire enums, and
-//! the `offline_snapshot` module that backs CLI fallbacks when the
-//! server is down. Transport helpers live in consuming crates so this
-//! public API crate remains focused on stable snapshot types.
+//! The [`snapshot_types`], [`snapshot_state`], and
+//! [`snapshot_commands`] modules are generated from
+//! `bpdl/snapshot-plugin.bpdl` at compile time via the
+//! [`bmux_plugin_schema_macros::schema!`] macro. The handwritten
+//! modules in this crate remain non-transport utilities: snapshot file
+//! envelopes and offline mutation helpers.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
@@ -15,19 +16,9 @@ pub mod offline_snapshot;
 
 use std::path::PathBuf;
 
-use bmux_plugin_sdk::{CapabilityId, InterfaceId};
-use serde::{Deserialize, Serialize};
-
-// ── Capabilities / interfaces ───────────────────────────────────────
-
-/// Capability gating read access to the snapshot plugin (status / dry-run).
-pub const SNAPSHOT_READ: CapabilityId = CapabilityId::from_static("bmux.snapshot.read");
-
-/// Capability gating write access to the snapshot plugin (save / restore-apply).
-pub const SNAPSHOT_WRITE: CapabilityId = CapabilityId::from_static("bmux.snapshot.write");
-
-/// Interface id for the snapshot plugin's typed command surface.
-pub const SNAPSHOT_COMMANDS_INTERFACE: InterfaceId = InterfaceId::from_static("snapshot-commands");
+bmux_plugin_schema_macros::schema! {
+    source: "bpdl/snapshot-plugin.bpdl",
+}
 
 // ── Plugin config (CLI-registered) ──────────────────────────────────
 
@@ -56,67 +47,4 @@ impl SnapshotPluginConfig {
             debounce_ms,
         }
     }
-}
-
-// ── Wire request / response ────────────────────────────────────────
-
-/// Typed request variants for the snapshot plugin's
-/// `snapshot-commands::dispatch(SnapshotRequest) -> SnapshotResponse`
-/// service surface.
-///
-/// Uses external tagging (`rename_all = "snake_case"`, no `tag = "..."`)
-/// because `bmux_codec` does not support `deserialize_any` which
-/// internal tagging requires. Matches BPDL codegen conventions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotRequest {
-    /// Force an immediate save, bypassing the debounce window.
-    SaveNow,
-    /// Return current status (path, whether a snapshot file exists,
-    /// last-write/restore timestamps).
-    Status,
-    /// Decode the on-disk snapshot without applying it; useful for
-    /// `bmux server restore --dry-run`.
-    RestoreDryRun,
-    /// Clear every participant's state and apply the on-disk
-    /// snapshot as a full replacement.
-    RestoreApply,
-}
-
-/// Typed response variants. External tagging — same rationale as
-/// [`SnapshotRequest`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotResponse {
-    /// `SaveNow` completed. `path` is the written file path, or
-    /// `None` when persistence is disabled.
-    Saved { path: Option<String> },
-    /// `Status` result.
-    Status(SnapshotStatusPayload),
-    /// `RestoreDryRun` result.
-    DryRun { ok: bool, message: String },
-    /// `RestoreApply` aggregate counts.
-    Applied {
-        restored_plugins: u64,
-        failed_plugins: u64,
-    },
-    /// Generic per-op error. Carries a short `code` and a human-readable
-    /// `message`.
-    Error { code: String, message: String },
-}
-
-/// Wire payload for `SnapshotResponse::Status`. Mirrors the shape of
-/// `bmux_snapshot_runtime::SnapshotStatusReport` at the wire level.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SnapshotStatusPayload {
-    pub enabled: bool,
-    #[serde(default)]
-    pub path: Option<String>,
-    pub snapshot_exists: bool,
-    #[serde(default)]
-    pub last_write_epoch_ms: Option<u64>,
-    #[serde(default)]
-    pub last_restore_epoch_ms: Option<u64>,
-    #[serde(default)]
-    pub last_restore_error: Option<String>,
 }

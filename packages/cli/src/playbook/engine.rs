@@ -7,13 +7,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bmux_client::BmuxClient;
+use bmux_contexts_plugin_api::contexts_state;
 use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector};
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
 use bmux_plugin_sdk::{
-    PluginCliCommandRequest, PluginCliCommandResponse,
+    PluginCliCommandRequest, PluginCliCommandResponse, TypedServiceEndpoint,
     perf_telemetry::{ALL_PHASE_CHANNELS, PhaseChannel, emit as emit_phase_timing},
 };
 use bmux_recording_plugin_api::recording_commands;
+use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
+use bmux_windows_plugin_api::windows_commands;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
@@ -49,6 +52,77 @@ const VISUAL_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const PLAYBOOK_ATTACH_COMMAND_EXECUTION_ENV: &str = "BMUX_PLAYBOOK_ATTACH_COMMAND_EXECUTION";
 const PLAYBOOK_PRODUCTION_COMMAND_ENV: &str = "BMUX_PLAYBOOK_PRODUCTION_COMMAND_NAME";
 const SELECTED_CONTEXT_METADATA_KEY: &str = "bmux.contexts.selected_context_id";
+
+#[must_use]
+fn ipc_to_session_selector(selector: SessionSelector) -> sessions_state::SessionSelector {
+    match selector {
+        SessionSelector::ById(id) => sessions_state::SessionSelector {
+            id: Some(id),
+            name: None,
+        },
+        SessionSelector::ByName(name) => sessions_state::SessionSelector {
+            id: None,
+            name: Some(name),
+        },
+    }
+}
+
+#[must_use]
+fn ipc_to_windows_selector(selector: SessionSelector) -> windows_commands::Selector {
+    match selector {
+        SessionSelector::ById(id) => windows_commands::Selector {
+            id: Some(id),
+            name: None,
+            index: None,
+        },
+        SessionSelector::ByName(name) => windows_commands::Selector {
+            id: None,
+            name: Some(name),
+            index: None,
+        },
+    }
+}
+
+#[must_use]
+const fn pane_to_windows_selector(selector: &bmux_ipc::PaneSelector) -> windows_commands::Selector {
+    match selector {
+        bmux_ipc::PaneSelector::ById(id) => windows_commands::Selector {
+            id: Some(*id),
+            name: None,
+            index: None,
+        },
+        bmux_ipc::PaneSelector::ByIndex(index) => windows_commands::Selector {
+            id: None,
+            name: None,
+            index: Some(*index),
+        },
+        bmux_ipc::PaneSelector::Active => windows_commands::Selector {
+            id: None,
+            name: None,
+            index: None,
+        },
+    }
+}
+
+#[must_use]
+const fn ipc_split_to_windows_direction(
+    direction: PaneSplitDirection,
+) -> windows_commands::PaneDirection {
+    match direction {
+        PaneSplitDirection::Vertical => windows_commands::PaneDirection::Vertical,
+        PaneSplitDirection::Horizontal => windows_commands::PaneDirection::Horizontal,
+    }
+}
+
+#[must_use]
+const fn ipc_focus_to_windows_direction(
+    direction: PaneFocusDirection,
+) -> windows_commands::PaneDirection {
+    match direction {
+        PaneFocusDirection::Next => windows_commands::PaneDirection::Right,
+        PaneFocusDirection::Prev => windows_commands::PaneDirection::Left,
+    }
+}
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
@@ -612,9 +686,9 @@ where
         .map_err(|error| anyhow::anyhow!("encoding {operation}: {error}"))?;
     let response_bytes = client
         .invoke_service_raw(
-            crate::runtime::typed_windows::WINDOWS_WRITE_CAPABILITY.as_str(),
+            windows_commands::client::FocusPaneEndpoint::CAPABILITY.as_str(),
             bmux_ipc::InvokeServiceKind::Command,
-            crate::runtime::typed_windows::WINDOWS_COMMANDS_INTERFACE.as_str(),
+            windows_commands::INTERFACE_ID.as_str(),
             operation,
             payload,
         )
@@ -796,9 +870,9 @@ where
         .map_err(|error| anyhow::anyhow!("encoding {operation}: {error}"))?;
     let response_bytes = client
         .invoke_service_raw(
-            crate::runtime::typed_sessions::SESSIONS_WRITE_CAPABILITY.as_str(),
+            sessions_commands::client::KillSessionEndpoint::CAPABILITY.as_str(),
             bmux_ipc::InvokeServiceKind::Command,
-            crate::runtime::typed_sessions::SESSIONS_COMMANDS_INTERFACE.as_str(),
+            sessions_commands::INTERFACE_ID.as_str(),
             operation,
             payload,
         )
@@ -811,39 +885,17 @@ where
 async fn current_context_playbook(
     client: &mut BmuxClient,
 ) -> anyhow::Result<Option<bmux_contexts_plugin_api::contexts_state::ContextSummary>> {
-    let payload = bmux_codec::to_vec(&())
-        .map_err(|error| anyhow::anyhow!("encoding current-context args: {error}"))?;
-    let response_bytes = client
-        .invoke_service_raw(
-            crate::runtime::typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
-            crate::runtime::typed_contexts::QUERY_KIND,
-            crate::runtime::typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
-            crate::runtime::typed_contexts::OP_CURRENT_CONTEXT,
-            payload,
-        )
+    contexts_state::client::current_context(client)
         .await
-        .map_err(|e| anyhow::anyhow!("current-context failed: {e}"))?;
-    bmux_codec::from_bytes(&response_bytes)
-        .map_err(|error| anyhow::anyhow!("decoding current-context response: {error}"))
+        .map_err(|error| anyhow::anyhow!("current-context failed: {error}"))
 }
 
 async fn list_contexts_playbook(
     client: &mut BmuxClient,
 ) -> anyhow::Result<Vec<bmux_contexts_plugin_api::contexts_state::ContextSummary>> {
-    let payload = bmux_codec::to_vec(&())
-        .map_err(|error| anyhow::anyhow!("encoding list-contexts args: {error}"))?;
-    let response_bytes = client
-        .invoke_service_raw(
-            crate::runtime::typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
-            crate::runtime::typed_contexts::QUERY_KIND,
-            crate::runtime::typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
-            crate::runtime::typed_contexts::OP_LIST_CONTEXTS,
-            payload,
-        )
+    contexts_state::client::list_contexts(client)
         .await
-        .map_err(|e| anyhow::anyhow!("list-contexts failed: {e}"))?;
-    bmux_codec::from_bytes(&response_bytes)
-        .map_err(|error| anyhow::anyhow!("decoding list-contexts response: {error}"))
+        .map_err(|error| anyhow::anyhow!("list-contexts failed: {error}"))
 }
 
 async fn retarget_attach_to_current_context_playbook(
@@ -1025,8 +1077,8 @@ async fn typed_kill_session_playbook(
     client: &mut BmuxClient,
     selector: SessionSelector,
 ) -> anyhow::Result<Uuid> {
-    let args = crate::runtime::typed_sessions::KillSessionArgs {
-        selector: crate::runtime::typed_sessions::from_ipc_selector(selector),
+    let args = sessions_commands::client::KillSessionRequest {
+        selector: ipc_to_session_selector(selector),
         force_local: false,
     };
     let outcome = invoke_sessions_command_bmux::<
@@ -1132,9 +1184,12 @@ async fn run_playbook_inner(
                 // Create display track writer for GIF export.
                 if let Some(ref sb) = sandbox {
                     let rec_dir = sb.paths().recordings_dir().join(rid.to_string());
-                    let client_id = crate::runtime::typed_clients::whoami(&mut client)
-                        .await
-                        .unwrap_or_else(|_| Uuid::new_v4());
+                    let client_id =
+                        bmux_clients_plugin_api::clients_state::client::current_client(&mut client)
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map_or_else(Uuid::new_v4, |client| client.id);
                     match super::display_track::PlaybookDisplayTrackWriter::new(
                         &rec_dir,
                         client_id,
@@ -2142,14 +2197,10 @@ pub(super) async fn execute_step(
                 invoke_windows_command_bmux(
                     client,
                     "split-pane",
-                    &crate::runtime::typed_windows::args::SplitPane {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(sid),
-                        )),
+                    &windows_commands::client::SplitPaneRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
                         target: None,
-                        direction: crate::runtime::typed_windows::ipc_split_to_typed_direction(
-                            ipc_dir,
-                        ),
+                        direction: ipc_split_to_windows_direction(ipc_dir),
                         ratio_pct: None,
                     },
                 )
@@ -2179,17 +2230,13 @@ pub(super) async fn execute_step(
         Action::FocusPane { target } => {
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
-            let selector = crate::runtime::typed_windows::ipc_pane_to_typed_selector(
-                &bmux_ipc::PaneSelector::ByIndex(*target),
-            );
+            let selector = pane_to_windows_selector(&bmux_ipc::PaneSelector::ByIndex(*target));
             let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
                 invoke_windows_command_bmux(
                     client,
                     "focus-pane-by-selector",
-                    &crate::runtime::typed_windows::args::FocusPaneBySelector {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(sid),
-                        )),
+                    &windows_commands::client::FocusPaneBySelectorRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
                         target: selector,
                     },
                 )
@@ -2203,25 +2250,15 @@ pub(super) async fn execute_step(
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
             let selector = target.as_ref().map_or_else(
-                || {
-                    crate::runtime::typed_windows::ipc_pane_to_typed_selector(
-                        &bmux_ipc::PaneSelector::Active,
-                    )
-                },
-                |idx| {
-                    crate::runtime::typed_windows::ipc_pane_to_typed_selector(
-                        &bmux_ipc::PaneSelector::ByIndex(*idx),
-                    )
-                },
+                || pane_to_windows_selector(&bmux_ipc::PaneSelector::Active),
+                |idx| pane_to_windows_selector(&bmux_ipc::PaneSelector::ByIndex(*idx)),
             );
             let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
                 invoke_windows_command_bmux(
                     client,
                     "close-pane-by-selector",
-                    &crate::runtime::typed_windows::args::ClosePaneBySelector {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(sid),
-                        )),
+                    &windows_commands::client::ClosePaneBySelectorRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
                         target: selector,
                     },
                 )
@@ -2819,12 +2856,12 @@ async fn apply_attach_runtime_actions(
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
                     "split-pane",
-                    &crate::runtime::typed_windows::args::SplitPane {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
+                    &windows_commands::client::SplitPaneRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
                         target: None,
-                        direction: crate::runtime::typed_windows::ipc_split_to_typed_direction(
+                        direction: ipc_split_to_windows_direction(
                             PaneSplitDirection::Vertical,
                         ),
                         ratio_pct: None,
@@ -2837,12 +2874,12 @@ async fn apply_attach_runtime_actions(
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
                     "split-pane",
-                    &crate::runtime::typed_windows::args::SplitPane {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
+                    &windows_commands::client::SplitPaneRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
                         target: None,
-                        direction: crate::runtime::typed_windows::ipc_split_to_typed_direction(
+                        direction: ipc_split_to_windows_direction(
                             PaneSplitDirection::Horizontal,
                         ),
                         ratio_pct: None,
@@ -2855,11 +2892,11 @@ async fn apply_attach_runtime_actions(
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
                     "focus-pane-in-direction",
-                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
-                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                    &windows_commands::client::FocusPaneInDirectionRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
+                        direction: ipc_focus_to_windows_direction(
                             PaneFocusDirection::Next,
                         ),
                     },
@@ -2871,11 +2908,11 @@ async fn apply_attach_runtime_actions(
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
                     "focus-pane-in-direction",
-                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
-                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                    &windows_commands::client::FocusPaneInDirectionRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
+                        direction: ipc_focus_to_windows_direction(
                             PaneFocusDirection::Prev,
                         ),
                     },
@@ -2887,11 +2924,11 @@ async fn apply_attach_runtime_actions(
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
                     "focus-pane-in-direction",
-                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
-                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                    &windows_commands::client::FocusPaneInDirectionRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
+                        direction: ipc_focus_to_windows_direction(
                             PaneFocusDirection::Prev,
                         ),
                     },
@@ -2903,11 +2940,11 @@ async fn apply_attach_runtime_actions(
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
                     "focus-pane-in-direction",
-                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
-                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                    &windows_commands::client::FocusPaneInDirectionRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
+                        direction: ipc_focus_to_windows_direction(
                             PaneFocusDirection::Next,
                         ),
                     },
@@ -2919,11 +2956,11 @@ async fn apply_attach_runtime_actions(
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
                     "focus-pane-in-direction",
-                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
-                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                    &windows_commands::client::FocusPaneInDirectionRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
+                        direction: ipc_focus_to_windows_direction(
                             PaneFocusDirection::Prev,
                         ),
                     },
@@ -2935,11 +2972,11 @@ async fn apply_attach_runtime_actions(
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
                     "focus-pane-in-direction",
-                    &crate::runtime::typed_windows::args::FocusPaneInDirection {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
-                        direction: crate::runtime::typed_windows::ipc_focus_to_typed_direction(
+                    &windows_commands::client::FocusPaneInDirectionRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
+                        direction: ipc_focus_to_windows_direction(
                             PaneFocusDirection::Next,
                         ),
                     },
@@ -2951,10 +2988,10 @@ async fn apply_attach_runtime_actions(
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
                     "close-active-pane",
-                    &crate::runtime::typed_windows::args::CloseActivePane {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
+                    &windows_commands::client::CloseActivePaneRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
                     },
                 )
                 .await
@@ -2967,10 +3004,10 @@ async fn apply_attach_runtime_actions(
                 >(
                     client,
                     "zoom-pane",
-                    &crate::runtime::typed_windows::args::ZoomPane {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
+                    &windows_commands::client::ZoomPaneRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
                     },
                 )
                 .await
@@ -3006,10 +3043,10 @@ async fn apply_attach_runtime_actions(
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
                     "resize-pane",
-                    &crate::runtime::typed_windows::args::ResizePane {
-                        session: Some(crate::runtime::typed_windows::ipc_to_typed_selector(
-                            SessionSelector::ById(runtime.state.attached_id),
-                        )),
+                    &windows_commands::client::ResizePaneRequest {
+                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
+                            runtime.state.attached_id,
+                        ))),
                         target: None,
                         direction,
                         cells: 1,

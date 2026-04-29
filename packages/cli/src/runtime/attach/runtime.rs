@@ -122,10 +122,81 @@ fn emit_attach_plugin_command_timing(
     }));
 }
 
-use super::super::{
-    typed_clients, typed_contexts, typed_control_catalog, typed_sessions, typed_windows,
+use super::super::control_catalog_mapping;
+use bmux_clients_plugin_api::{clients_state, clients_state::ClientSummary};
+use bmux_contexts_plugin_api::{
+    contexts_state, contexts_state::ContextSummary as PluginContextSummary,
 };
 use bmux_performance_plugin_api::performance_state;
+use bmux_plugin_sdk::{TypedServiceClientError, TypedServiceEndpoint};
+use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
+use bmux_windows_plugin_api::{windows_commands, windows_state};
+
+fn typed_client_error(error: &TypedServiceClientError) -> ClientError {
+    ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: error.to_string(),
+    }
+}
+
+#[must_use]
+fn ipc_to_windows_selector(selector: bmux_ipc::SessionSelector) -> windows_commands::Selector {
+    match selector {
+        bmux_ipc::SessionSelector::ById(id) => windows_commands::Selector {
+            id: Some(id),
+            name: None,
+            index: None,
+        },
+        bmux_ipc::SessionSelector::ByName(name) => windows_commands::Selector {
+            id: None,
+            name: Some(name),
+            index: None,
+        },
+    }
+}
+
+#[must_use]
+const fn pane_id_windows_selector(id: Uuid) -> windows_commands::Selector {
+    windows_commands::Selector {
+        id: Some(id),
+        name: None,
+        index: None,
+    }
+}
+
+#[must_use]
+const fn ipc_focus_to_windows_direction(
+    direction: PaneFocusDirection,
+) -> windows_commands::PaneDirection {
+    match direction {
+        PaneFocusDirection::Next => windows_commands::PaneDirection::Right,
+        PaneFocusDirection::Prev => windows_commands::PaneDirection::Left,
+    }
+}
+
+#[must_use]
+const fn ipc_split_to_windows_direction(
+    direction: PaneSplitDirection,
+) -> windows_commands::PaneDirection {
+    match direction {
+        PaneSplitDirection::Vertical => windows_commands::PaneDirection::Vertical,
+        PaneSplitDirection::Horizontal => windows_commands::PaneDirection::Horizontal,
+    }
+}
+
+#[must_use]
+fn ipc_to_session_selector(selector: bmux_ipc::SessionSelector) -> sessions_state::SessionSelector {
+    match selector {
+        bmux_ipc::SessionSelector::ById(id) => sessions_state::SessionSelector {
+            id: Some(id),
+            name: None,
+        },
+        bmux_ipc::SessionSelector::ByName(name) => sessions_state::SessionSelector {
+            id: None,
+            name: Some(name),
+        },
+    }
+}
 
 /// Typed dispatch wrapper for `sessions-commands:kill-session`.
 async fn typed_kill_session_attach(
@@ -139,8 +210,8 @@ async fn typed_kill_session_attach(
     >,
     ClientError,
 > {
-    let args = typed_sessions::KillSessionArgs {
-        selector: typed_sessions::from_ipc_selector(selector),
+    let args = sessions_commands::client::KillSessionRequest {
+        selector: ipc_to_session_selector(selector),
         force_local,
     };
     let payload = bmux_codec::to_vec(&args).map_err(|error| ClientError::ServerError {
@@ -149,10 +220,10 @@ async fn typed_kill_session_attach(
     })?;
     let response_bytes = client
         .invoke_service_raw(
-            typed_sessions::SESSIONS_WRITE_CAPABILITY.as_str(),
-            typed_sessions::COMMAND_KIND,
-            typed_sessions::SESSIONS_COMMANDS_INTERFACE.as_str(),
-            typed_sessions::OP_KILL_SESSION,
+            sessions_commands::client::KillSessionEndpoint::CAPABILITY.as_str(),
+            sessions_commands::client::KillSessionEndpoint::KIND,
+            sessions_commands::client::KillSessionEndpoint::INTERFACE_ID.as_str(),
+            sessions_commands::client::KillSessionEndpoint::OPERATION.as_str(),
             payload,
         )
         .await?;
@@ -165,25 +236,10 @@ async fn typed_kill_session_attach(
 /// Typed dispatch wrapper for `contexts-state:list-contexts`.
 async fn typed_list_contexts_attach(
     client: &mut StreamingBmuxClient,
-) -> std::result::Result<Vec<bmux_contexts_plugin_api::contexts_state::ContextSummary>, ClientError>
-{
-    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding list-contexts args: {error}"),
-    })?;
-    let response_bytes = client
-        .invoke_service_raw(
-            typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
-            typed_contexts::QUERY_KIND,
-            typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
-            typed_contexts::OP_LIST_CONTEXTS,
-            payload,
-        )
-        .await?;
-    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding list-contexts response: {error}"),
-    })
+) -> std::result::Result<Vec<PluginContextSummary>, ClientError> {
+    contexts_state::client::list_contexts(client)
+        .await
+        .map_err(|error| typed_client_error(&error))
 }
 
 /// Typed dispatch wrapper for `windows-state:list-windows`.
@@ -200,30 +256,10 @@ async fn typed_list_contexts_attach(
 /// `ControlCatalogSnapshot` pull-on-connect pattern.
 async fn typed_list_windows_attach(
     client: &mut StreamingBmuxClient,
-) -> std::result::Result<Vec<bmux_windows_plugin_api::windows_state::WindowEntry>, ClientError> {
-    #[derive(serde::Serialize)]
-    struct Args {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        session: Option<String>,
-    }
-    let payload =
-        bmux_codec::to_vec(&Args { session: None }).map_err(|error| ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("encoding list-windows args: {error}"),
-        })?;
-    let response_bytes = client
-        .invoke_service_raw(
-            bmux_windows_plugin_api::capabilities::WINDOWS_READ.as_str(),
-            bmux_ipc::InvokeServiceKind::Query,
-            bmux_windows_plugin_api::windows_state::INTERFACE_ID.as_str(),
-            "list-windows",
-            payload,
-        )
-        .await?;
-    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding list-windows response: {error}"),
-    })
+) -> std::result::Result<Vec<windows_state::WindowEntry>, ClientError> {
+    windows_state::client::list_windows(client, None)
+        .await
+        .map_err(|error| typed_client_error(&error))
 }
 
 /// Pull the theme plugin's retained runtime appearance on attach startup.
@@ -256,76 +292,30 @@ async fn typed_active_runtime_appearance_attach(
 /// Typed dispatch wrapper for `contexts-state:current-context`.
 async fn typed_current_context_attach(
     client: &mut StreamingBmuxClient,
-) -> std::result::Result<
-    Option<bmux_contexts_plugin_api::contexts_state::ContextSummary>,
-    ClientError,
-> {
-    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding current-context args: {error}"),
-    })?;
-    let response_bytes = client
-        .invoke_service_raw(
-            typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
-            typed_contexts::QUERY_KIND,
-            typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
-            typed_contexts::OP_CURRENT_CONTEXT,
-            payload,
-        )
-        .await?;
-    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding current-context response: {error}"),
-    })
+) -> std::result::Result<Option<PluginContextSummary>, ClientError> {
+    contexts_state::client::current_context(client)
+        .await
+        .map_err(|error| typed_client_error(&error))
 }
 
 /// Typed dispatch wrapper for `clients-state:list-clients` on a plain
 /// [`BmuxClient`] (used before streaming upgrade).
 async fn typed_list_clients_bmux(
     client: &mut BmuxClient,
-) -> std::result::Result<Vec<bmux_clients_plugin_api::clients_state::ClientSummary>, ClientError> {
-    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding list-clients args: {error}"),
-    })?;
-    let response_bytes = client
-        .invoke_service_raw(
-            typed_clients::CLIENTS_READ_CAPABILITY.as_str(),
-            typed_clients::QUERY_KIND,
-            typed_clients::CLIENTS_STATE_INTERFACE.as_str(),
-            typed_clients::OP_LIST_CLIENTS,
-            payload,
-        )
-        .await?;
-    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding list-clients response: {error}"),
-    })
+) -> std::result::Result<Vec<ClientSummary>, ClientError> {
+    clients_state::client::list_clients(client)
+        .await
+        .map_err(|error| typed_client_error(&error))
 }
 
 /// Typed dispatch wrapper for `contexts-state:list-contexts` on a
 /// plain [`BmuxClient`].
 async fn typed_list_contexts_bmux(
     client: &mut BmuxClient,
-) -> std::result::Result<Vec<bmux_contexts_plugin_api::contexts_state::ContextSummary>, ClientError>
-{
-    let payload = bmux_codec::to_vec(&()).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("encoding list-contexts args: {error}"),
-    })?;
-    let response_bytes = client
-        .invoke_service_raw(
-            typed_contexts::CONTEXTS_READ_CAPABILITY.as_str(),
-            typed_contexts::QUERY_KIND,
-            typed_contexts::CONTEXTS_STATE_INTERFACE.as_str(),
-            typed_contexts::OP_LIST_CONTEXTS,
-            payload,
-        )
-        .await?;
-    bmux_codec::from_bytes(&response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding list-contexts response: {error}"),
-    })
+) -> std::result::Result<Vec<PluginContextSummary>, ClientError> {
+    contexts_state::client::list_contexts(client)
+        .await
+        .map_err(|error| typed_client_error(&error))
 }
 
 /// Invoke a `windows-commands` typed command by routing through the
@@ -345,9 +335,9 @@ where
     })?;
     let response_bytes = client
         .invoke_service_raw(
-            typed_windows::WINDOWS_WRITE_CAPABILITY.as_str(),
+            windows_commands::client::FocusPaneEndpoint::CAPABILITY.as_str(),
             InvokeServiceKind::Command,
-            typed_windows::WINDOWS_COMMANDS_INTERFACE.as_str(),
+            windows_commands::INTERFACE_ID.as_str(),
             operation,
             payload,
         )
@@ -357,14 +347,6 @@ where
         message: format!("decoding {operation} response: {error}"),
     })
 }
-
-/// Re-export of the shared arg structs for convenience at call sites.
-use typed_windows::args as windows_cmd_args;
-use typed_windows::{ipc_split_to_typed_direction, ipc_to_typed_selector};
-
-// ── legacy in-attach-runtime helpers that were moved to
-// ── `super::super::typed_windows` are deleted below. Anything that
-// ── still needs converter helpers should import them above.
 
 #[derive(Default)]
 pub struct DisplayCaptureFanout {
@@ -989,10 +971,22 @@ pub async fn run_session_attach_with_client(
             .subscribe_events()
             .await
             .map_err(map_attach_client_error)?;
-        typed_clients::follow_client(&mut client, leader_client_id, global).await?;
+        clients_state::client::current_client(&mut client)
+            .await?
+            .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?;
+        bmux_clients_plugin_api::clients_commands::client::set_following(
+            &mut client,
+            Some(leader_client_id),
+            global,
+        )
+        .await?
+        .map_err(|err| anyhow::anyhow!("clients-commands set-following failed: {err:?}"))?;
     }
 
-    let self_client_id = typed_clients::whoami(&mut client).await?;
+    let self_client_id = clients_state::client::current_client(&mut client)
+        .await?
+        .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?
+        .id;
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
         // Inline follow target resolution using BmuxClient (before streaming upgrade).
@@ -2080,7 +2074,12 @@ pub async fn run_session_attach_with_client(
         let _ = client.detach().await;
     }
     if follow_target_id.is_some() {
-        let _ = typed_clients::unfollow(&mut client).await;
+        let _ = bmux_clients_plugin_api::clients_commands::client::set_following(
+            &mut client,
+            None,
+            false,
+        )
+        .await;
     }
     if let Some(message) = attach_exit_message(exit_reason) {
         println!("{message}");
@@ -2486,7 +2485,10 @@ async fn enforce_hot_path_plugin_policy(
         return Ok(execution);
     };
 
-    let client_id = typed_clients::whoami(client).await?;
+    let client_id = clients_state::client::current_client(client)
+        .await?
+        .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?
+        .id;
     let principal_info = client.whoami_principal().await?;
     let request = HotPathExecutionPolicyCheckRequest {
         session_id: attached_session_id,
@@ -3150,10 +3152,10 @@ pub async fn handle_attach_ui_action(
             let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
                 client,
                 "split-pane",
-                &windows_cmd_args::SplitPane {
-                    session: Some(ipc_to_typed_selector(selector)),
+                &windows_commands::client::SplitPaneRequest {
+                    session: Some(ipc_to_windows_selector(selector)),
                     target: None,
-                    direction: ipc_split_to_typed_direction(PaneSplitDirection::Vertical),
+                    direction: ipc_split_to_windows_direction(PaneSplitDirection::Vertical),
                     ratio_pct: None,
                 },
             )
@@ -3164,10 +3166,10 @@ pub async fn handle_attach_ui_action(
             let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
                 client,
                 "split-pane",
-                &windows_cmd_args::SplitPane {
-                    session: Some(ipc_to_typed_selector(selector)),
+                &windows_commands::client::SplitPaneRequest {
+                    session: Some(ipc_to_windows_selector(selector)),
                     target: None,
-                    direction: ipc_split_to_typed_direction(PaneSplitDirection::Horizontal),
+                    direction: ipc_split_to_windows_direction(PaneSplitDirection::Horizontal),
                     ratio_pct: None,
                 },
             )
@@ -3191,9 +3193,9 @@ pub async fn handle_attach_ui_action(
             let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
                 client,
                 "focus-pane-in-direction",
-                &windows_cmd_args::FocusPaneInDirection {
-                    session: Some(ipc_to_typed_selector(selector)),
-                    direction: typed_windows::ipc_focus_to_typed_direction(direction),
+                &windows_commands::client::FocusPaneInDirectionRequest {
+                    session: Some(ipc_to_windows_selector(selector)),
+                    direction: ipc_focus_to_windows_direction(direction),
                 },
             )
             .await?;
@@ -3229,8 +3231,8 @@ pub async fn handle_attach_ui_action(
             let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
                 client,
                 "resize-pane",
-                &windows_cmd_args::ResizePane {
-                    session: Some(ipc_to_typed_selector(selector)),
+                &windows_commands::client::ResizePaneRequest {
+                    session: Some(ipc_to_windows_selector(selector)),
                     target: None,
                     direction,
                     cells: 1,
@@ -3271,8 +3273,8 @@ pub async fn handle_attach_ui_action(
                 invoke_windows_command(
                     client,
                     "zoom-pane",
-                    &windows_cmd_args::ZoomPane {
-                        session: Some(ipc_to_typed_selector(selector)),
+                    &windows_commands::client::ZoomPaneRequest {
+                        session: Some(ipc_to_windows_selector(selector)),
                     },
                 )
                 .await?;
@@ -3284,16 +3286,13 @@ pub async fn handle_attach_ui_action(
             view_state.set_transient_status(status, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
         }
         RuntimeAction::RestartFocusedPane => {
-            #[derive(serde::Serialize)]
-            struct Args {
-                selector: Option<bmux_ipc::SessionSelector>,
-            }
             let selector = attached_session_selector(view_state);
             // Typed dispatch replaces the legacy `BmuxClient::restart_pane`
             // convenience method; route through
             // `windows-commands:restart-pane` directly.
-            let payload = bmux_codec::to_vec(&Args {
-                selector: Some(selector),
+            let payload = bmux_codec::to_vec(&windows_commands::client::RestartPaneRequest {
+                session: Some(ipc_to_windows_selector(selector)),
+                target: None,
             })
             .map_err(|error| ClientError::ServerError {
                 code: bmux_ipc::ErrorCode::Internal,
@@ -3301,10 +3300,10 @@ pub async fn handle_attach_ui_action(
             })?;
             let _response_bytes = client
                 .invoke_service_raw(
-                    typed_windows::WINDOWS_WRITE_CAPABILITY.as_str(),
-                    typed_windows::COMMAND_KIND,
-                    typed_windows::WINDOWS_COMMANDS_INTERFACE.as_str(),
-                    "restart-pane",
+                    windows_commands::client::RestartPaneEndpoint::CAPABILITY.as_str(),
+                    windows_commands::client::RestartPaneEndpoint::KIND,
+                    windows_commands::client::RestartPaneEndpoint::INTERFACE_ID.as_str(),
+                    windows_commands::client::RestartPaneEndpoint::OPERATION.as_str(),
                     payload,
                 )
                 .await?;
@@ -4861,7 +4860,7 @@ pub async fn refresh_attach_status_catalog(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> anyhow::Result<()> {
-    let snapshot = typed_control_catalog::control_catalog_snapshot(
+    let snapshot = control_catalog_mapping::control_catalog_snapshot(
         client,
         Some(view_state.control_catalog_revision),
     )
@@ -6098,14 +6097,14 @@ pub async fn handle_attach_prompt_completion(
                         invoke_windows_command(
                             client,
                             "focus-pane",
-                            &windows_cmd_args::FocusPane { id: pane_id },
+                            &windows_commands::client::FocusPaneRequest { id: pane_id },
                         )
                         .await?;
                     let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
                         invoke_windows_command(
                             client,
                             "close-pane",
-                            &windows_cmd_args::ClosePane { id: pane_id },
+                            &windows_commands::client::ClosePaneRequest { id: pane_id },
                         )
                         .await?;
                     view_state.set_transient_status(
@@ -7027,9 +7026,9 @@ pub async fn focus_attach_pane(
     let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
         client,
         "focus-pane-by-selector",
-        &windows_cmd_args::FocusPaneBySelector {
-            session: Some(ipc_to_typed_selector(selector)),
-            target: typed_windows::pane_selector_by_id(pane_id),
+        &windows_commands::client::FocusPaneBySelectorRequest {
+            session: Some(ipc_to_windows_selector(selector)),
+            target: pane_id_windows_selector(pane_id),
         },
     )
     .await?;
@@ -7053,9 +7052,9 @@ async fn resize_attach_pane(
     let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
         client,
         "resize-pane",
-        &windows_cmd_args::ResizePane {
-            session: Some(ipc_to_typed_selector(selector)),
-            target: Some(typed_windows::pane_selector_by_id(pane_id)),
+        &windows_commands::client::ResizePaneRequest {
+            session: Some(ipc_to_windows_selector(selector)),
+            target: Some(pane_id_windows_selector(pane_id)),
             direction,
             cells: cells.max(1),
         },

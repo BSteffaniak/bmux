@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use bmux_clients_plugin_api::clients_commands;
 use bmux_ipc::SessionSelector;
 use uuid::Uuid;
 
@@ -28,7 +29,10 @@ pub(super) async fn run_follow(
         connection_context,
     )
     .await?;
-    super::typed_clients::follow_client(&mut client, target_client_id, global).await?;
+    clients_commands::client::set_following(&mut client, Some(target_client_id), global)
+        .await
+        .context("clients-commands set-following dispatch failed")?
+        .map_err(|err| anyhow::anyhow!("clients-commands set-following failed: {err:?}"))?;
     println!(
         "following client: {}{}",
         target_client_id,
@@ -44,7 +48,10 @@ pub(super) async fn run_unfollow(connection_context: ConnectionContext<'_>) -> R
         connection_context,
     )
     .await?;
-    super::typed_clients::unfollow(&mut client).await?;
+    clients_commands::client::set_following(&mut client, None, false)
+        .await
+        .context("clients-commands set-following dispatch failed")?
+        .map_err(|err| anyhow::anyhow!("clients-commands set-following failed: {err:?}"))?;
     println!("follow stopped");
     Ok(0)
 }

@@ -93,51 +93,6 @@ struct PruneRequest {
     older_than_days: Option<u64>,
 }
 
-enum RecordingResponse {
-    Started {
-        recording: RecordingSummary,
-    },
-    Stopped {
-        recording_id: Option<uuid::Uuid>,
-    },
-    Status {
-        status: RecordingStatus,
-    },
-    List {
-        recordings: Vec<RecordingSummary>,
-    },
-    Deleted {
-        recording_id: uuid::Uuid,
-    },
-    CustomEventWritten {
-        accepted: bool,
-    },
-    DeleteAll {
-        removed_count: usize,
-    },
-    Cut {
-        recording: RecordingSummary,
-    },
-    RollingStarted {
-        recording: RecordingSummary,
-    },
-    RollingStopped {
-        recording_id: Option<uuid::Uuid>,
-    },
-    RollingStatus {
-        status: RecordingRollingStatus,
-    },
-    RollingCleared {
-        report: bmux_ipc::RecordingRollingClearReport,
-    },
-    CaptureTargets {
-        targets: Vec<RecordingCaptureTarget>,
-    },
-    Pruned {
-        pruned_count: usize,
-    },
-}
-
 /// `RecordingSink` impl that fans out each record to both the manual
 /// and rolling runtimes. Registered behind a
 /// `bmux_recording_runtime::RecordingSinkHandle` in the plugin state
@@ -363,147 +318,99 @@ fn generated_failed(reason: impl Into<String>) -> recording_types::RecordingErro
 }
 
 fn recording_status_generated() -> recording_types::RecordingStatus {
-    match handle_status() {
-        RecordingResponse::Status { status } => status.into(),
-        _ => empty_status().into(),
-    }
+    handle_status().into()
 }
 
 fn recording_list_generated() -> Vec<recording_types::RecordingSummary> {
-    match handle_list() {
-        RecordingResponse::List { recordings } => recordings.into_iter().map(Into::into).collect(),
-        _ => Vec::new(),
-    }
+    handle_list().into_iter().map(Into::into).collect()
 }
 
 fn recording_rolling_status_generated() -> recording_types::RecordingRollingStatus {
-    match handle_rolling_status() {
-        RecordingResponse::RollingStatus { status } => status.into(),
-        _ => empty_rolling_status(String::new()).into(),
-    }
+    handle_rolling_status().into()
 }
 
 fn recording_capture_targets_generated() -> Vec<recording_types::RecordingCaptureTarget> {
-    match handle_capture_targets() {
-        RecordingResponse::CaptureTargets { targets } => {
-            targets.into_iter().map(Into::into).collect()
-        }
-        _ => Vec::new(),
-    }
+    handle_capture_targets()
+        .into_iter()
+        .map(Into::into)
+        .collect()
 }
 
 fn recording_start_generated(
     req: StartRequest,
 ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
-    match handle_start(
+    handle_start(
         req.session_id,
         req.capture_input,
         req.name,
         req.profile.map(Into::into),
         req.event_kinds
             .map(|kinds| kinds.into_iter().map(Into::into).collect()),
-    ) {
-        RecordingResponse::Started { recording } => Ok(recording.into()),
-        _ => Err(generated_failed("recording start failed")),
-    }
+    )
+    .map(Into::into)
+    .ok_or_else(|| generated_failed("recording start failed"))
 }
 
 fn recording_stop_generated(
     recording_id: Option<uuid::Uuid>,
 ) -> Result<uuid::Uuid, recording_types::RecordingError> {
-    match handle_stop(recording_id) {
-        RecordingResponse::Stopped {
-            recording_id: Some(id),
-        } => Ok(id),
-        _ => Err(recording_types::RecordingError::NoActive),
-    }
+    handle_stop(recording_id).ok_or(recording_types::RecordingError::NoActive)
 }
 
 fn recording_write_custom_event_generated(
     req: WriteCustomEventRequest,
 ) -> Result<(), recording_types::RecordingError> {
-    match handle_write_custom_event(
+    if handle_write_custom_event(
         req.session_id,
         req.pane_id,
         req.source,
         req.name,
         req.payload,
     ) {
-        RecordingResponse::CustomEventWritten { accepted: true } => Ok(()),
-        _ => Err(generated_failed("custom recording event was not accepted")),
+        Ok(())
+    } else {
+        Err(generated_failed("custom recording event was not accepted"))
     }
 }
 
 fn recording_delete_generated(
     recording_id: uuid::Uuid,
 ) -> Result<uuid::Uuid, recording_types::RecordingError> {
-    match handle_delete(recording_id) {
-        RecordingResponse::Deleted { recording_id } => Ok(recording_id),
-        _ => Err(generated_failed("recording delete failed")),
-    }
+    handle_delete(recording_id).ok_or_else(|| generated_failed("recording delete failed"))
 }
 
 fn recording_delete_all_generated() -> u64 {
-    match handle_delete_all() {
-        RecordingResponse::DeleteAll { removed_count } => {
-            u64::try_from(removed_count).unwrap_or(u64::MAX)
-        }
-        _ => 0,
-    }
+    u64::try_from(handle_delete_all()).unwrap_or(u64::MAX)
 }
 
 fn recording_cut_generated(
     req: CutRequest,
 ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
-    match handle_cut(req.last_seconds, req.name) {
-        RecordingResponse::Cut { recording } => Ok(recording.into()),
-        _ => Err(generated_failed("recording cut failed")),
-    }
+    handle_cut(req.last_seconds, req.name)
+        .map(Into::into)
+        .ok_or_else(|| generated_failed("recording cut failed"))
 }
 
 fn recording_rolling_start_generated(
     options: recording_types::RecordingRollingStartOptions,
 ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
-    match handle_rolling_start(options.into()) {
-        RecordingResponse::RollingStarted { recording } => Ok(recording.into()),
-        _ => Err(recording_types::RecordingError::Unavailable),
-    }
+    handle_rolling_start(options.into())
+        .map(Into::into)
+        .ok_or(recording_types::RecordingError::Unavailable)
 }
 
 fn recording_rolling_stop_generated() -> Result<uuid::Uuid, recording_types::RecordingError> {
-    match handle_rolling_stop() {
-        RecordingResponse::RollingStopped {
-            recording_id: Some(id),
-        } => Ok(id),
-        _ => Err(recording_types::RecordingError::NoActive),
-    }
+    handle_rolling_stop().ok_or(recording_types::RecordingError::NoActive)
 }
 
 fn recording_rolling_clear_generated(
     restart_if_active: bool,
 ) -> recording_types::RecordingRollingClearReport {
-    match handle_rolling_clear(restart_if_active) {
-        RecordingResponse::RollingCleared { report } => report.into(),
-        _ => bmux_ipc::RecordingRollingClearReport {
-            root_path: String::new(),
-            was_active: false,
-            restarted: false,
-            stopped_recording_id: None,
-            restarted_recording: None,
-            usage_before: bmux_ipc::RecordingRollingUsage::default(),
-            usage_after: bmux_ipc::RecordingRollingUsage::default(),
-        }
-        .into(),
-    }
+    handle_rolling_clear(restart_if_active).into()
 }
 
 fn recording_prune_generated(older_than_days: Option<u64>) -> u64 {
-    match handle_prune(older_than_days) {
-        RecordingResponse::Pruned { pruned_count } => {
-            u64::try_from(pruned_count).unwrap_or(u64::MAX)
-        }
-        _ => 0,
-    }
+    u64::try_from(handle_prune(older_than_days)).unwrap_or(u64::MAX)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -532,41 +439,23 @@ fn handle_start(
     name: Option<String>,
     profile: Option<RecordingProfile>,
     event_kinds: Option<Vec<RecordingEventKind>>,
-) -> RecordingResponse {
-    let Some(handle) = manual_handle() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
-    };
-    let Ok(guard) = handle.read() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
-    };
-    let Ok(mut runtime) = guard.0.lock() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
-    };
+) -> Option<RecordingSummary> {
+    let handle = manual_handle()?;
+    let guard = handle.read().ok()?;
+    let mut runtime = guard.0.lock().ok()?;
 
     let profile = profile.unwrap_or(RecordingProfile::Full);
     let event_kinds = event_kinds.unwrap_or_else(default_event_kinds);
-    match runtime.start(session_id, capture_input, name, profile, event_kinds) {
-        Ok(recording) => RecordingResponse::Started { recording },
-        Err(_) => RecordingResponse::CustomEventWritten { accepted: false },
-    }
+    runtime
+        .start(session_id, capture_input, name, profile, event_kinds)
+        .ok()
 }
 
-fn handle_stop(recording_id: Option<uuid::Uuid>) -> RecordingResponse {
-    let Some(handle) = manual_handle() else {
-        return RecordingResponse::Stopped { recording_id: None };
-    };
-    let Ok(guard) = handle.read() else {
-        return RecordingResponse::Stopped { recording_id: None };
-    };
-    let Ok(mut runtime) = guard.0.lock() else {
-        return RecordingResponse::Stopped { recording_id: None };
-    };
-    match runtime.stop(recording_id) {
-        Ok(summary) => RecordingResponse::Stopped {
-            recording_id: Some(summary.id),
-        },
-        Err(_) => RecordingResponse::Stopped { recording_id: None },
-    }
+fn handle_stop(recording_id: Option<uuid::Uuid>) -> Option<uuid::Uuid> {
+    let handle = manual_handle()?;
+    let guard = handle.read().ok()?;
+    let mut runtime = guard.0.lock().ok()?;
+    runtime.stop(recording_id).ok().map(|summary| summary.id)
 }
 
 fn empty_status() -> RecordingStatus {
@@ -576,94 +465,63 @@ fn empty_status() -> RecordingStatus {
     }
 }
 
-fn handle_status() -> RecordingResponse {
+fn handle_status() -> RecordingStatus {
     let Some(handle) = manual_handle() else {
-        return RecordingResponse::Status {
-            status: empty_status(),
-        };
+        return empty_status();
     };
     let Ok(guard) = handle.read() else {
-        return RecordingResponse::Status {
-            status: empty_status(),
-        };
+        return empty_status();
     };
     let Ok(runtime) = guard.0.lock() else {
-        return RecordingResponse::Status {
-            status: empty_status(),
-        };
+        return empty_status();
     };
-    RecordingResponse::Status {
-        status: runtime.status(),
-    }
+    runtime.status()
 }
 
-fn handle_list() -> RecordingResponse {
+fn handle_list() -> Vec<RecordingSummary> {
     let Some(handle) = manual_handle() else {
-        return RecordingResponse::List {
-            recordings: Vec::new(),
-        };
+        return Vec::new();
     };
     let Ok(guard) = handle.read() else {
-        return RecordingResponse::List {
-            recordings: Vec::new(),
-        };
+        return Vec::new();
     };
     let Ok(runtime) = guard.0.lock() else {
-        return RecordingResponse::List {
-            recordings: Vec::new(),
-        };
+        return Vec::new();
     };
-    RecordingResponse::List {
-        recordings: runtime.list().unwrap_or_default(),
-    }
+    runtime.list().unwrap_or_default()
 }
 
-fn handle_delete(recording_id: uuid::Uuid) -> RecordingResponse {
+fn handle_delete(recording_id: uuid::Uuid) -> Option<uuid::Uuid> {
+    let handle = manual_handle()?;
+    let guard = handle.read().ok()?;
+    let mut runtime = guard.0.lock().ok()?;
+    runtime.delete(recording_id).ok().map(|summary| summary.id)
+}
+
+fn handle_delete_all() -> usize {
     let Some(handle) = manual_handle() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return 0;
     };
     let Ok(guard) = handle.read() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return 0;
     };
     let Ok(mut runtime) = guard.0.lock() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return 0;
     };
-    match runtime.delete(recording_id) {
-        Ok(summary) => RecordingResponse::Deleted {
-            recording_id: summary.id,
-        },
-        Err(_) => RecordingResponse::CustomEventWritten { accepted: false },
-    }
+    runtime.delete_all().unwrap_or(0)
 }
 
-fn handle_delete_all() -> RecordingResponse {
+fn handle_prune(older_than_days: Option<u64>) -> usize {
     let Some(handle) = manual_handle() else {
-        return RecordingResponse::DeleteAll { removed_count: 0 };
+        return 0;
     };
     let Ok(guard) = handle.read() else {
-        return RecordingResponse::DeleteAll { removed_count: 0 };
-    };
-    let Ok(mut runtime) = guard.0.lock() else {
-        return RecordingResponse::DeleteAll { removed_count: 0 };
-    };
-    RecordingResponse::DeleteAll {
-        removed_count: runtime.delete_all().unwrap_or(0),
-    }
-}
-
-fn handle_prune(older_than_days: Option<u64>) -> RecordingResponse {
-    let Some(handle) = manual_handle() else {
-        return RecordingResponse::Pruned { pruned_count: 0 };
-    };
-    let Ok(guard) = handle.read() else {
-        return RecordingResponse::Pruned { pruned_count: 0 };
+        return 0;
     };
     let Ok(runtime) = guard.0.lock() else {
-        return RecordingResponse::Pruned { pruned_count: 0 };
+        return 0;
     };
-    RecordingResponse::Pruned {
-        pruned_count: runtime.prune(older_than_days).unwrap_or(0),
-    }
+    runtime.prune(older_than_days).unwrap_or(0)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -676,7 +534,7 @@ fn handle_write_custom_event(
     source: String,
     name: String,
     payload: Vec<u8>,
-) -> RecordingResponse {
+) -> bool {
     let payload = RecordingPayload::Custom {
         source,
         name,
@@ -705,14 +563,14 @@ fn handle_write_custom_event(
         accepted |= recorded;
     }
 
-    RecordingResponse::CustomEventWritten { accepted }
+    accepted
 }
 
 // ────────────────────────────────────────────────────────────────────
 // Capture-targets query
 // ────────────────────────────────────────────────────────────────────
 
-fn handle_capture_targets() -> RecordingResponse {
+fn handle_capture_targets() -> Vec<RecordingCaptureTarget> {
     let mut targets: Vec<RecordingCaptureTarget> = Vec::new();
 
     if let Some(handle) = manual_handle()
@@ -739,7 +597,7 @@ fn handle_capture_targets() -> RecordingResponse {
         });
     }
 
-    RecordingResponse::CaptureTargets { targets }
+    targets
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -758,16 +616,12 @@ fn empty_rolling_status(root_path: String) -> RecordingRollingStatus {
     }
 }
 
-fn handle_rolling_status() -> RecordingResponse {
+fn handle_rolling_status() -> RecordingRollingStatus {
     let Some(config) = config_handle() else {
-        return RecordingResponse::RollingStatus {
-            status: empty_rolling_status(String::new()),
-        };
+        return empty_rolling_status(String::new());
     };
     let Ok(cfg) = config.read() else {
-        return RecordingResponse::RollingStatus {
-            status: empty_rolling_status(String::new()),
-        };
+        return empty_rolling_status(String::new());
     };
     let root_path = cfg.rolling_recordings_dir.display().to_string();
     let defaults = cfg.rolling_defaults.clone();
@@ -790,49 +644,30 @@ fn handle_rolling_status() -> RecordingResponse {
         })
         .unwrap_or((None, None, defaults.event_kinds.clone()));
 
-    RecordingResponse::RollingStatus {
-        status: RecordingRollingStatus {
-            root_path,
-            auto_start: defaults.is_available(),
-            available: defaults.is_available(),
-            active,
-            rolling_window_secs: rolling_window_secs.or(Some(defaults.window_secs)),
-            event_kinds,
-            usage,
-        },
+    RecordingRollingStatus {
+        root_path,
+        auto_start: defaults.is_available(),
+        available: defaults.is_available(),
+        active,
+        rolling_window_secs: rolling_window_secs.or(Some(defaults.window_secs)),
+        event_kinds,
+        usage,
     }
 }
 
-fn handle_rolling_stop() -> RecordingResponse {
-    let Some(handle) = rolling_handle() else {
-        return RecordingResponse::RollingStopped { recording_id: None };
-    };
-    let Ok(guard) = handle.read() else {
-        return RecordingResponse::RollingStopped { recording_id: None };
-    };
-    let Ok(mut rolling) = guard.0.lock() else {
-        return RecordingResponse::RollingStopped { recording_id: None };
-    };
-    let Some(runtime) = rolling.as_mut() else {
-        return RecordingResponse::RollingStopped { recording_id: None };
-    };
-    if runtime.status().active.is_none() {
-        return RecordingResponse::RollingStopped { recording_id: None };
-    }
-    match runtime.stop(None) {
-        Ok(summary) => RecordingResponse::RollingStopped {
-            recording_id: Some(summary.id),
-        },
-        Err(_) => RecordingResponse::RollingStopped { recording_id: None },
-    }
+fn handle_rolling_stop() -> Option<uuid::Uuid> {
+    let handle = rolling_handle()?;
+    let guard = handle.read().ok()?;
+    let mut rolling = guard.0.lock().ok()?;
+    let runtime = rolling.as_mut()?;
+    runtime.status().active.as_ref()?;
+    runtime.stop(None).ok().map(|summary| summary.id)
 }
 
-fn handle_rolling_start(options: RecordingRollingStartOptions) -> RecordingResponse {
-    let Some(config) = config_handle() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
-    };
+fn handle_rolling_start(options: RecordingRollingStartOptions) -> Option<RecordingSummary> {
+    let config = config_handle()?;
     let Ok(cfg) = config.read() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return None;
     };
     let resolved = apply_rolling_start_options(&cfg.rolling_defaults, &options);
     let rolling_dir = cfg.rolling_recordings_dir.clone();
@@ -840,17 +675,15 @@ fn handle_rolling_start(options: RecordingRollingStartOptions) -> RecordingRespo
     drop(cfg);
 
     if !resolved.is_available() {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return None;
     }
 
-    let Some(handle) = rolling_handle() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
-    };
+    let handle = rolling_handle()?;
     let Ok(guard) = handle.read() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return None;
     };
     let Ok(mut rolling) = guard.0.lock() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return None;
     };
 
     if rolling.is_none() {
@@ -862,15 +695,13 @@ fn handle_rolling_start(options: RecordingRollingStartOptions) -> RecordingRespo
     }
 
     let options_empty = rolling_start_options_is_empty(&options);
-    let Some(runtime) = rolling.as_mut() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
-    };
+    let runtime = rolling.as_mut()?;
 
     if let Some(active) = runtime.status().active {
         if options_empty {
-            return RecordingResponse::RollingStarted { recording: active };
+            return Some(active);
         }
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return None;
     }
 
     if runtime.rolling_window_secs() != Some(resolved.window_secs) {
@@ -884,47 +715,38 @@ fn handle_rolling_start(options: RecordingRollingStartOptions) -> RecordingRespo
         RecordingProfile::Full,
         resolved.event_kinds.clone(),
     ) else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return None;
     };
 
-    RecordingResponse::RollingStarted { recording }
+    Some(recording)
 }
 
-fn handle_cut(last_seconds: Option<u64>, name: Option<String>) -> RecordingResponse {
-    let Some(config) = config_handle() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
-    };
+fn handle_cut(last_seconds: Option<u64>, name: Option<String>) -> Option<RecordingSummary> {
+    let config = config_handle()?;
     let Ok(cfg) = config.read() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return None;
     };
     let output_root = cfg.recordings_dir.clone();
     drop(cfg);
 
-    let Some(handle) = rolling_handle() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
-    };
+    let handle = rolling_handle()?;
     let Ok(guard) = handle.read() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return None;
     };
     let Ok(mut rolling) = guard.0.lock() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return None;
     };
-    let Some(runtime) = rolling.as_mut() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
-    };
+    let runtime = rolling.as_mut()?;
 
-    match runtime.cut(&output_root, last_seconds, name) {
-        Ok(recording) => RecordingResponse::Cut { recording },
-        Err(_) => RecordingResponse::CustomEventWritten { accepted: false },
-    }
+    runtime.cut(&output_root, last_seconds, name).ok()
 }
 
-fn handle_rolling_clear(restart_if_active: bool) -> RecordingResponse {
+fn handle_rolling_clear(restart_if_active: bool) -> bmux_ipc::RecordingRollingClearReport {
     let Some(config) = config_handle() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return empty_clear_report();
     };
     let Ok(cfg) = config.read() else {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return empty_clear_report();
     };
     let root = cfg.rolling_recordings_dir.clone();
     let segment_mb = cfg.rolling_segment_mb;
@@ -963,7 +785,7 @@ fn handle_rolling_clear(restart_if_active: bool) -> RecordingResponse {
     };
 
     if clear_rolling_root(&root).is_err() {
-        return RecordingResponse::CustomEventWritten { accepted: false };
+        return empty_clear_report();
     }
 
     let (restarted, restarted_recording) = if restart_if_active && was_active {
@@ -1129,18 +951,28 @@ fn clear_report_response(
     stopped_recording_id: Option<uuid::Uuid>,
     restarted_recording: Option<RecordingSummary>,
     usage_before: &RecordingRollingUsage,
-) -> RecordingResponse {
+) -> bmux_ipc::RecordingRollingClearReport {
     let usage_after = collect_rolling_usage(root).unwrap_or_default();
-    RecordingResponse::RollingCleared {
-        report: bmux_ipc::RecordingRollingClearReport {
-            root_path: root.display().to_string(),
-            was_active,
-            restarted,
-            stopped_recording_id,
-            restarted_recording,
-            usage_before: usage_before.clone(),
-            usage_after,
-        },
+    bmux_ipc::RecordingRollingClearReport {
+        root_path: root.display().to_string(),
+        was_active,
+        restarted,
+        stopped_recording_id,
+        restarted_recording,
+        usage_before: usage_before.clone(),
+        usage_after,
+    }
+}
+
+fn empty_clear_report() -> bmux_ipc::RecordingRollingClearReport {
+    bmux_ipc::RecordingRollingClearReport {
+        root_path: String::new(),
+        was_active: false,
+        restarted: false,
+        stopped_recording_id: None,
+        restarted_recording: None,
+        usage_before: bmux_ipc::RecordingRollingUsage::default(),
+        usage_after: bmux_ipc::RecordingRollingUsage::default(),
     }
 }
 
