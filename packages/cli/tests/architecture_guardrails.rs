@@ -1211,16 +1211,10 @@ fn plugin_api_crates_have_no_concrete_state() {
 /// progress.
 #[test]
 fn plugin_api_crates_expose_typed_client_helpers() {
-    let crates = [
-        (
-            "plugins/recording-plugin-api",
-            include_str!("../../../plugins/recording-plugin-api/src/typed_client.rs"),
-        ),
-        (
-            "plugins/control-catalog-plugin-api",
-            include_str!("../../../plugins/control-catalog-plugin-api/src/typed_client.rs"),
-        ),
-    ];
+    let crates = [(
+        "plugins/recording-plugin-api",
+        include_str!("../../../plugins/recording-plugin-api/src/typed_client.rs"),
+    )];
     for (path, src) in crates {
         assert!(
             src.contains("TypedDispatchClient"),

@@ -1332,7 +1332,6 @@ dependencies = [
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
- "thiserror 2.0.18",
  "uuid",
 ]
 

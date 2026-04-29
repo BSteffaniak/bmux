@@ -122,7 +122,8 @@ fn emit_attach_plugin_command_timing(
 }
 
 use super::super::{
-    typed_clients, typed_contexts, typed_performance, typed_sessions, typed_windows,
+    typed_clients, typed_contexts, typed_control_catalog, typed_performance, typed_sessions,
+    typed_windows,
 };
 
 /// Typed dispatch wrapper for `sessions-commands:kill-session`.
@@ -4860,7 +4861,7 @@ pub async fn refresh_attach_status_catalog(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> anyhow::Result<()> {
-    let snapshot = bmux_control_catalog_plugin_api::typed_client::control_catalog_snapshot(
+    let snapshot = typed_control_catalog::control_catalog_snapshot(
         client,
         Some(view_state.control_catalog_revision),
     )
