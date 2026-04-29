@@ -249,6 +249,10 @@ execution     = "provider_exec"     # default: "provider_exec"
 description   = "Longer help"       # optional
 ```
 
+`execution = "provider_exec"` runs the command in the plugin provider process.
+Use `execution = "caller_process"` for commands that need caller-local runtime
+facilities, such as an attach client's prompt/modal host.
+
 #### Command Arguments
 
 ```toml

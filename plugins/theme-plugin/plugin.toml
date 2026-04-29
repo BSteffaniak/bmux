@@ -22,6 +22,7 @@ kind                         = "bmux.runtime/appearance"
 
 [[commands]]
 accepts_repeat = false
+execution      = "caller_process"
 expose_in_cli  = false
 name           = "pick-theme"
 path           = ["theme", "pick"]

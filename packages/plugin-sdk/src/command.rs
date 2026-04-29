@@ -4,8 +4,16 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandExecutionKind {
+    /// Run the command in the plugin provider process.
     ProviderExec,
+    /// Run the command as a provider-owned background task.
     BackgroundTask,
+    /// Run the command in the process that invoked it.
+    ///
+    /// Attach-local commands use this when they need caller-local facilities
+    /// such as the active prompt/modal host.
+    CallerProcess,
+    /// Run the command as a runtime hot-path hook.
     RuntimeHook,
 }
 
@@ -277,5 +285,24 @@ impl PluginCommandArgument {
     pub const fn position(mut self, position: usize) -> Self {
         self.position = Some(position);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandExecutionKind, PluginCommand};
+
+    #[test]
+    fn caller_process_execution_deserializes_from_manifest_value() {
+        let command: PluginCommand = toml::from_str(
+            r#"
+name = "pick-theme"
+summary = "Open picker"
+execution = "caller_process"
+"#,
+        )
+        .expect("caller_process command execution should parse");
+
+        assert_eq!(command.execution, CommandExecutionKind::CallerProcess);
     }
 }

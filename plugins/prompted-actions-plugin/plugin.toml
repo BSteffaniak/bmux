@@ -6,6 +6,7 @@ provided_features = ["bmux.prompted_actions"]
 version           = "0.0.1-alpha.0"
 
 [[commands]]
+execution     = "caller_process"
 expose_in_cli = true
 name          = "run"
 path          = ["prompted-action", "run"]

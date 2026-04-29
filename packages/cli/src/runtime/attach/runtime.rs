@@ -51,7 +51,7 @@ use super::super::{
     effective_enabled_plugins, enter_host_kernel_connection, host_kernel_bridge, load_plugin,
     map_attach_client_error, merged_runtime_keybindings, parse_session_selector, parse_uuid_value,
     plugin_command_policy_hints, plugin_host_metadata, recording, resolve_plugin_search_paths,
-    scan_available_plugins,
+    run_plugin_keybinding_command, scan_available_plugins,
 };
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent};
@@ -2461,26 +2461,27 @@ async fn enforce_hot_path_plugin_policy(
     command_name: &str,
     attached_session_id: Uuid,
     attached_context_id: Option<Uuid>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bmux_plugin_sdk::CommandExecutionKind> {
     let hints = plugin_command_policy_hints(plugin_id, command_name).map_err(|error| {
         ClientError::ServerError {
             code: bmux_ipc::ErrorCode::InvalidRequest,
             message: error.to_string(),
         }
     })?;
+    let execution = hints.execution.clone();
 
     if !matches!(
-        hints.execution,
+        execution,
         bmux_plugin_sdk::CommandExecutionKind::RuntimeHook
     ) {
-        return Ok(());
+        return Ok(execution);
     }
 
     if matches!(
         hints.execution_class,
         bmux_plugin::PluginExecutionClass::NativeFast
     ) {
-        return Ok(());
+        return Ok(execution);
     }
 
     let Some(hot_path_capability) = hints
@@ -2488,7 +2489,7 @@ async fn enforce_hot_path_plugin_policy(
         .iter()
         .find(|capability| capability.is_hot_path())
     else {
-        return Ok(());
+        return Ok(execution);
     };
 
     let client_id = bmux_clients_plugin_api::typed_client::whoami(client).await?;
@@ -2531,7 +2532,7 @@ async fn enforce_hot_path_plugin_policy(
             }
         })?;
     if response.allowed {
-        Ok(())
+        Ok(execution)
     } else {
         Err(ClientError::ServerError {
             code: bmux_ipc::ErrorCode::InvalidRequest,
@@ -2545,6 +2546,52 @@ async fn enforce_hot_path_plugin_policy(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachPluginCommandExecutionRoute {
+    ProviderPipeline,
+    CallerProcess,
+}
+
+const fn attach_plugin_command_execution_route(
+    execution: &bmux_plugin_sdk::CommandExecutionKind,
+) -> AttachPluginCommandExecutionRoute {
+    match execution {
+        bmux_plugin_sdk::CommandExecutionKind::CallerProcess => {
+            AttachPluginCommandExecutionRoute::CallerProcess
+        }
+        bmux_plugin_sdk::CommandExecutionKind::ProviderExec
+        | bmux_plugin_sdk::CommandExecutionKind::BackgroundTask
+        | bmux_plugin_sdk::CommandExecutionKind::RuntimeHook => {
+            AttachPluginCommandExecutionRoute::ProviderPipeline
+        }
+    }
+}
+
+fn run_attach_plugin_command_local(
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+    kernel_client_factory: Option<&KernelClientFactory>,
+    caller_client_id: Option<Uuid>,
+) -> std::result::Result<AttachPluginCommandPipelineExecution, ClientError> {
+    let execution = run_plugin_keybinding_command(
+        plugin_id,
+        command_name,
+        args,
+        kernel_client_factory,
+        caller_client_id,
+    )
+    .map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("local plugin command failed: {error:#}"),
+    })?;
+
+    Ok(AttachPluginCommandPipelineExecution {
+        status: execution.status,
+        outcome: execution.outcome,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn handle_attach_plugin_command_action(
     client: &mut StreamingBmuxClient,
@@ -2552,7 +2599,7 @@ pub async fn handle_attach_plugin_command_action(
     command_name: &str,
     args: &[String],
     view_state: &mut AttachViewState,
-    _kernel_client_factory: Option<&KernelClientFactory>,
+    kernel_client_factory: Option<&KernelClientFactory>,
 ) -> std::result::Result<(), ClientError> {
     let total_started = Instant::now();
     let before_started = Instant::now();
@@ -2578,7 +2625,7 @@ pub async fn handle_attach_plugin_command_action(
         "attach.plugin_command.start"
     );
     let policy_started = Instant::now();
-    if let Err(error) = enforce_hot_path_plugin_policy(
+    let execution_kind = match enforce_hot_path_plugin_policy(
         client,
         plugin_id,
         command_name,
@@ -2587,51 +2634,66 @@ pub async fn handle_attach_plugin_command_action(
     )
     .await
     {
-        let policy_us = policy_started.elapsed().as_micros();
-        warn!(
-            plugin_id = %plugin_id,
-            command_name = %command_name,
-            error = %error,
-            attached_context_id = ?view_state.attached_context_id,
-            attached_session_id = %view_state.attached_id,
-            "attach.plugin_command.policy_denied"
-        );
-        view_state.set_transient_status(
-            format!("plugin action denied by policy: {error:#}"),
-            Instant::now(),
-            ATTACH_TRANSIENT_STATUS_TTL,
-        );
-        emit_attach_plugin_command_timing(
-            plugin_id,
-            command_name,
-            "policy_denied",
-            before_context_id,
-            None,
-            view_state.attached_context_id,
-            view_state.attached_id,
-            before_us,
-            policy_us,
-            0,
-            0,
-            0,
-            0,
-            total_started.elapsed().as_micros(),
-        );
-        return Ok(());
-    }
+        Ok(execution) => execution,
+        Err(error) => {
+            let policy_us = policy_started.elapsed().as_micros();
+            warn!(
+                plugin_id = %plugin_id,
+                command_name = %command_name,
+                error = %error,
+                attached_context_id = ?view_state.attached_context_id,
+                attached_session_id = %view_state.attached_id,
+                "attach.plugin_command.policy_denied"
+            );
+            view_state.set_transient_status(
+                format!("plugin action denied by policy: {error:#}"),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            emit_attach_plugin_command_timing(
+                plugin_id,
+                command_name,
+                "policy_denied",
+                before_context_id,
+                None,
+                view_state.attached_context_id,
+                view_state.attached_id,
+                before_us,
+                policy_us,
+                0,
+                0,
+                0,
+                0,
+                total_started.elapsed().as_micros(),
+            );
+            return Ok(());
+        }
+    };
     let policy_us = policy_started.elapsed().as_micros();
     let run_started = Instant::now();
-    match run_attach_plugin_command_pipeline(client, plugin_id, command_name, args).await {
+    let command_execution = match attach_plugin_command_execution_route(&execution_kind) {
+        AttachPluginCommandExecutionRoute::ProviderPipeline => {
+            run_attach_plugin_command_pipeline(client, plugin_id, command_name, args).await
+        }
+        AttachPluginCommandExecutionRoute::CallerProcess => run_attach_plugin_command_local(
+            plugin_id,
+            command_name,
+            args,
+            kernel_client_factory,
+            view_state.self_client_id,
+        ),
+    };
+    match command_execution {
         Err(error) => {
             let run_us = run_started.elapsed().as_micros();
             warn!(
                 plugin_id = %plugin_id,
                 command_name = %command_name,
                 error = %error,
-                "attach.plugin_command.pipeline_failed"
+                "attach.plugin_command.run_failed"
             );
             view_state.set_transient_status(
-                format!("plugin pipeline failed: {}", map_attach_client_error(error)),
+                format!("plugin command failed: {}", map_attach_client_error(error)),
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
@@ -7455,6 +7517,30 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
+
+    #[test]
+    fn caller_process_command_execution_routes_to_caller_process() {
+        assert_eq!(
+            attach_plugin_command_execution_route(
+                &bmux_plugin_sdk::CommandExecutionKind::CallerProcess
+            ),
+            AttachPluginCommandExecutionRoute::CallerProcess
+        );
+    }
+
+    #[test]
+    fn provider_command_executions_route_to_provider_pipeline() {
+        for execution in [
+            bmux_plugin_sdk::CommandExecutionKind::ProviderExec,
+            bmux_plugin_sdk::CommandExecutionKind::BackgroundTask,
+            bmux_plugin_sdk::CommandExecutionKind::RuntimeHook,
+        ] {
+            assert_eq!(
+                attach_plugin_command_execution_route(&execution),
+                AttachPluginCommandExecutionRoute::ProviderPipeline
+            );
+        }
+    }
 
     fn test_pane_surface(pane_id: Uuid, rect: AttachRect) -> AttachSurface {
         AttachSurface {
