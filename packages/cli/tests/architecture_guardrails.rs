@@ -1206,22 +1206,23 @@ fn plugin_api_crates_have_no_concrete_state() {
     );
 }
 
-/// Verify migrated plugin API crates do not reintroduce public
-/// handwritten transport-client modules.
+/// Public plugin API crates must not host handwritten transport-client
+/// modules. Callers should use generated clients or consuming-crate
+/// private helpers instead.
 #[test]
-fn plugin_api_crates_do_not_reintroduce_migrated_typed_clients() {
-    let repo = repo_root();
-    for path in [
-        "plugins/clients-plugin-api/src/typed_client.rs",
-        "plugins/control-catalog-plugin-api/src/typed_client.rs",
-        "plugins/pane-runtime-plugin-api/src/typed_client.rs",
-        "plugins/performance-plugin-api/src/typed_client.rs",
-        "plugins/recording-plugin-api/src/typed_client.rs",
-        "plugins/snapshot-plugin-api/src/typed_client.rs",
-    ] {
+fn plugin_api_crates_do_not_define_public_typed_clients() {
+    for plugin_api_dir in iter_plugin_crate_dirs().into_iter().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("-plugin-api"))
+    }) {
+        let typed_client = plugin_api_dir.join("src/typed_client.rs");
+        let relative = typed_client
+            .strip_prefix(repo_root())
+            .unwrap_or(typed_client.as_path())
+            .display();
         assert!(
-            !repo.join(path).exists(),
-            "{path} must stay deleted; callers should use generated clients or crate-private helpers",
+            !typed_client.exists(),
+            "{relative} must not exist; callers should use generated clients or consuming-crate private helpers",
         );
     }
 }
