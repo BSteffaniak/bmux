@@ -733,9 +733,7 @@ async fn refresh_perf_emitter_settings_from_server(
     perf_emitter: &mut recording::PerfEventEmitter,
     client: &mut BmuxClient,
 ) {
-    if let Ok(settings) =
-        bmux_performance_plugin_api::typed_client::performance_status(client).await
-    {
+    if let Ok(settings) = super::typed_performance::performance_status(client).await {
         perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
             &settings,
         ));

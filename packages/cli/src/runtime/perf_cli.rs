@@ -4,6 +4,7 @@ use bmux_ipc::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
 
 use super::{
     ConnectionContext, ConnectionPolicyScope, cleanup_stale_pid_file, connect_with_context,
+    typed_performance,
 };
 
 const fn performance_level_name(level: PerformanceRecordingLevel) -> &'static str {
@@ -47,8 +48,7 @@ pub(super) async fn run_perf_status(
         connection_context,
     )
     .await?;
-    let settings =
-        bmux_performance_plugin_api::typed_client::performance_status(&mut client).await?;
+    let settings = typed_performance::performance_status(&mut client).await?;
 
     if json {
         println!(
@@ -75,11 +75,9 @@ pub(super) async fn run_perf_on(
         connection_context,
     )
     .await?;
-    let mut settings =
-        bmux_performance_plugin_api::typed_client::performance_status(&mut client).await?;
+    let mut settings = typed_performance::performance_status(&mut client).await?;
     settings.recording_level = profile_to_level(profile);
-    let updated =
-        bmux_performance_plugin_api::typed_client::performance_set(&mut client, settings).await?;
+    let updated = typed_performance::performance_set(&mut client, settings).await?;
 
     if json {
         println!(
@@ -109,11 +107,9 @@ pub(super) async fn run_perf_off(
         connection_context,
     )
     .await?;
-    let mut settings =
-        bmux_performance_plugin_api::typed_client::performance_status(&mut client).await?;
+    let mut settings = typed_performance::performance_status(&mut client).await?;
     settings.recording_level = PerformanceRecordingLevel::Off;
-    let updated =
-        bmux_performance_plugin_api::typed_client::performance_set(&mut client, settings).await?;
+    let updated = typed_performance::performance_set(&mut client, settings).await?;
 
     if json {
         println!(

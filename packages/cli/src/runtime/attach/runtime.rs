@@ -121,7 +121,9 @@ fn emit_attach_plugin_command_timing(
     }));
 }
 
-use super::super::{typed_clients, typed_contexts, typed_sessions, typed_windows};
+use super::super::{
+    typed_clients, typed_contexts, typed_performance, typed_sessions, typed_windows,
+};
 
 /// Typed dispatch wrapper for `sessions-commands:kill-session`.
 async fn typed_kill_session_attach(
@@ -956,9 +958,7 @@ pub async fn run_session_attach_with_client(
     let mut perf_emitter = recording::PerfEventEmitter::new(
         recording::PerfCaptureSettings::from_config(&attach_config),
     );
-    if let Ok(settings) =
-        bmux_performance_plugin_api::typed_client::performance_status(&mut client).await
-    {
+    if let Ok(settings) = typed_performance::performance_status(&mut client).await {
         perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
             &settings,
         ));
