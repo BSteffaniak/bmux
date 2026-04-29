@@ -1,0 +1,146 @@
+// Public, typed contract of the recording plugin.
+
+plugin bmux.recording version 1;
+
+capability RECORDING_READ = bmux.recording.read;
+capability RECORDING_WRITE = bmux.recording.write;
+
+interface recording-types {
+    enum recording-profile {
+        full,
+        functional,
+        visual,
+    }
+
+    enum recording-event-kind {
+        pane-input-raw,
+        pane-output-raw,
+        protocol-reply-raw,
+        pane-image,
+        server-event,
+        request-start,
+        request-done,
+        request-error,
+        custom,
+    }
+
+    record recording-summary {
+        id: uuid,
+        name: string?,
+        format_version: u32,
+        session_id: uuid?,
+        capture_input: bool,
+        profile: recording-profile,
+        event_kinds: list<recording-event-kind>,
+        started_epoch_ms: u64,
+        ended_epoch_ms: u64?,
+        event_count: u64,
+        payload_bytes: u64,
+        path: string,
+        segments: list<string>,
+        total_segment_bytes: u64,
+    }
+
+    record recording-status {
+        active: recording-summary?,
+        queue_len: u64,
+    }
+
+    record recording-capture-target {
+        recording_id: uuid,
+        path: string,
+        rolling_window_secs: u64?,
+    }
+
+    record recording-rolling-start-options {
+        window_secs: u64?,
+        name: string?,
+        event_kinds: list<recording-event-kind>?,
+        capture_input: bool?,
+        capture_output: bool?,
+        capture_events: bool?,
+        capture_protocol_replies: bool?,
+        capture_images: bool?,
+    }
+
+    record recording-rolling-usage {
+        bytes: u64,
+        files: u64,
+        directories: u64,
+        recording_dirs: u64,
+    }
+
+    record recording-rolling-status {
+        root_path: string,
+        auto_start: bool,
+        available: bool,
+        active: recording-summary?,
+        rolling_window_secs: u64?,
+        event_kinds: list<recording-event-kind>,
+        usage: recording-rolling-usage,
+    }
+
+    record recording-rolling-clear-report {
+        root_path: string,
+        was_active: bool,
+        restarted: bool,
+        stopped_recording_id: uuid?,
+        restarted_recording: recording-summary?,
+        usage_before: recording-rolling-usage,
+        usage_after: recording-rolling-usage,
+    }
+
+    variant recording-error {
+        no-active,
+        unavailable,
+        failed { reason: string },
+    }
+}
+
+@capability(RECORDING_READ)
+interface recording-state {
+    query status() -> recording-types.recording-status;
+    query list-recordings() -> list<recording-types.recording-summary>;
+    query rolling-status() -> recording-types.recording-rolling-status;
+    query capture-targets() -> list<recording-types.recording-capture-target>;
+}
+
+@capability(RECORDING_WRITE)
+interface recording-commands {
+    command start(
+        session_id: uuid?,
+        capture_input: bool,
+        name: string?,
+        profile: recording-types.recording-profile?,
+        event_kinds: list<recording-types.recording-event-kind>?,
+    ) -> result<recording-types.recording-summary, recording-types.recording-error>;
+
+    command stop(recording_id: uuid?)
+        -> result<uuid, recording-types.recording-error>;
+
+    command write-custom-event(
+        session_id: uuid?,
+        pane_id: uuid?,
+        source: string,
+        name: string,
+        payload: bytes,
+    ) -> result<unit, recording-types.recording-error>;
+
+    command delete(recording_id: uuid)
+        -> result<uuid, recording-types.recording-error>;
+
+    command delete-all() -> u64;
+
+    command cut(last_seconds: u64?, name: string?)
+        -> result<recording-types.recording-summary, recording-types.recording-error>;
+
+    command rolling-start(options: recording-types.recording-rolling-start-options)
+        -> result<recording-types.recording-summary, recording-types.recording-error>;
+
+    command rolling-stop() -> result<uuid, recording-types.recording-error>;
+
+    command rolling-clear(restart_if_active: bool)
+        -> recording-types.recording-rolling-clear-report;
+
+    command prune(older_than_days: u64?) -> u64;
+}

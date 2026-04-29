@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Typed public API of the bmux recording plugin (RecordingRuntime type + RecordingSink trait + typed request/response enums)"
+description = "Typed public API of the bmux recording plugin (BPDL-generated bindings + config)"
 edition     = { workspace = true }
 keywords    = ["bmux", "plugin", "api", "recording"]
 license     = { workspace = true }
@@ -11,13 +11,21 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-anyhow          = { workspace = true, features = ["std"] }
-bmux_ipc        = { workspace = true }
-bmux_plugin_sdk = { workspace = true }
-serde           = { workspace = true, features = ["derive", "std"] }
-serde_json      = { workspace = true, features = ["std"] }
-tracing         = { workspace = true, features = ["std"] }
-uuid            = { workspace = true, features = ["serde", "std", "v4"] }
+anyhow                    = { workspace = true, features = ["std"] }
+bmux_codec                = { workspace = true }
+bmux_ipc                  = { workspace = true }
+bmux_plugin_schema_macros = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+serde_json                = { workspace = true, features = ["std"] }
+tracing                   = { workspace = true, features = ["std"] }
+uuid                      = { workspace = true, features = ["serde", "std", "v4"] }
+
+[package.metadata.cargo-machete]
+# These deps are consumed by code generated from the BPDL schema via the
+# `bmux_plugin_schema_macros::schema!` proc macro; cargo-machete cannot see
+# into proc-macro-generated source.
+ignored = ["bmux_codec", "bmux_ipc", "bmux_plugin_sdk", "serde", "uuid"]
 
 [features]
 default          = []

@@ -9,7 +9,7 @@ use bmux_appearance::{
     RuntimeContentEffectPatch, RuntimeContentEffectScope, RuntimeStatusAppearancePatch,
 };
 use bmux_ipc::Request as IpcRequest;
-use bmux_performance_plugin_api::{PERFORMANCE_READ, PERFORMANCE_WRITE, PerformanceResponse};
+use bmux_performance_plugin_api::{capabilities, performance_commands, performance_state};
 use bmux_plugin::prompt;
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
@@ -472,21 +472,22 @@ async fn configure_performance_theme_header(
     context: &NativeCommandContext,
     persistence: ThemePersistence,
 ) {
-    let response = match context.call_service::<(), PerformanceResponse>(
-        PERFORMANCE_READ.as_str(),
-        ServiceKind::Query,
-        "performance-commands",
-        "build-theme-header-settings-form",
-        &(),
-    ) {
+    let response = match context
+        .call_service::<(), bmux_performance_plugin_api::performance_types::PromptForm>(
+            capabilities::PERFORMANCE_READ.as_str(),
+            ServiceKind::Query,
+            performance_state::INTERFACE_ID.as_str(),
+            performance_state::OP_BUILD_THEME_HEADER_SETTINGS_FORM.as_str(),
+            &(),
+        ) {
         Ok(response) => response,
         Err(error) => {
             warn!(%error, "failed building performance theme settings form");
             return;
         }
     };
-    let PerformanceResponse::PromptForm { request } = response else {
-        warn!("performance settings form service returned unexpected response");
+    let Ok(request) = bmux_plugin_sdk::PromptRequest::try_from(response) else {
+        warn!("performance settings form service returned invalid prompt form");
         return;
     };
     let request = request
@@ -503,20 +504,25 @@ async fn configure_performance_theme_header(
     let PromptResponse::Submitted(PromptValue::Form(values)) = response else {
         return;
     };
-    let response = context.call_service::<_, PerformanceResponse>(
-        PERFORMANCE_WRITE.as_str(),
-        ServiceKind::Command,
-        "performance-commands",
-        "apply-theme-header-settings-form",
-        &values,
-    );
-    let Ok(PerformanceResponse::ThemeHeaderSettings { settings }) = response else {
-        if let Err(error) = response {
+    let values = values
+        .into_iter()
+        .map(|(key, value)| (key, value.into()))
+        .collect();
+    let request = performance_commands::client::ApplyThemeHeaderSettingsFormRequest { values };
+    let response = context
+        .call_service::<_, bmux_performance_plugin_api::performance_types::ThemeHeaderSettings>(
+            capabilities::PERFORMANCE_WRITE.as_str(),
+            ServiceKind::Command,
+            performance_commands::INTERFACE_ID.as_str(),
+            performance_commands::OP_APPLY_THEME_HEADER_SETTINGS_FORM.as_str(),
+            &request,
+        );
+    let settings = match response {
+        Ok(settings) => settings.into(),
+        Err(error) => {
             warn!(%error, "failed applying performance theme settings form");
-        } else {
-            warn!("performance settings apply service returned unexpected response");
+            return;
         }
-        return;
     };
     if matches!(persistence, ThemePersistence::PersistBetweenConnects) {
         persist_performance_theme_settings(context, &settings);
@@ -554,13 +560,17 @@ fn apply_persisted_performance_theme_settings(context: &impl ServiceCaller) {
     else {
         return;
     };
-    let _ = context.call_service::<_, PerformanceResponse>(
-        PERFORMANCE_WRITE.as_str(),
-        ServiceKind::Command,
-        "performance-commands",
-        "set-theme-header-settings",
-        &settings,
-    );
+    let request = performance_commands::client::SetThemeHeaderSettingsRequest {
+        settings: settings.into(),
+    };
+    let _ = context
+        .call_service::<_, bmux_performance_plugin_api::performance_types::ThemeHeaderSettings>(
+            capabilities::PERFORMANCE_WRITE.as_str(),
+            ServiceKind::Command,
+            performance_commands::INTERFACE_ID.as_str(),
+            performance_commands::OP_SET_THEME_HEADER_SETTINGS.as_str(),
+            &request,
+        );
 }
 
 fn parse_settings(settings: Option<&toml::Value>) -> ThemePluginSettings {

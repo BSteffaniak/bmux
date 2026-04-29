@@ -13,6 +13,7 @@ use bmux_plugin_sdk::{
     PluginCliCommandRequest, PluginCliCommandResponse,
     perf_telemetry::{ALL_PHASE_CHANNELS, PhaseChannel, emit as emit_phase_timing},
 };
+use bmux_recording_plugin_api::recording_commands;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
@@ -1466,12 +1467,16 @@ async fn run_playbook_inner(
     let mut recording_path: Option<std::path::PathBuf> = None;
     if let (Some(rid), Some(sb)) = (recording_id, &sandbox) {
         // Stop recording first so the server finalizes the binary files.
-        match crate::runtime::typed_recording::recording_stop(&mut client, Some(rid)).await {
-            Ok(stopped_id) => {
+        match recording_commands::client::stop(&mut client, Some(rid)).await {
+            Ok(Ok(stopped_id)) => {
                 info!("recording stopped: {stopped_id}");
             }
-            Err(e) => {
-                warn!("failed to stop recording: {e}");
+            Ok(Err(error)) => {
+                let error = crate::runtime::recording_plugin_error(error);
+                warn!("failed to stop recording: {error}");
+            }
+            Err(error) => {
+                warn!("failed to stop recording: {error}");
             }
         }
 
@@ -2006,13 +2011,15 @@ pub(super) async fn start_recording(
     client: &mut BmuxClient,
     session_id: Option<Uuid>,
 ) -> Result<Uuid> {
-    let summary = crate::runtime::typed_recording::recording_start(
+    let summary: bmux_ipc::RecordingSummary = recording_commands::client::start(
         client, session_id, true, // capture_input
         None, // name
         None, // profile: server default (Functional)
         None, // event_kinds: server default
     )
-    .await
+    .await?
+    .map(Into::into)
+    .map_err(crate::runtime::recording_plugin_error)
     .map_err(|e| anyhow::anyhow!("recording start failed: {e}"))?;
     Ok(summary.id)
 }

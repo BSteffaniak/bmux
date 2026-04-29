@@ -7,6 +7,7 @@ use bmux_cli_schema::GatewayHostMode;
 use bmux_config::ConfigPaths;
 use bmux_ipc::transport::LocalIpcStream;
 use bmux_ipc::{IpcEndpoint, RecordingRollingStartOptions};
+use bmux_recording_plugin_api::{recording_commands, recording_state};
 use iroh::{Endpoint, endpoint::presets};
 use std::process::{Command as ProcessCommand, Stdio};
 use uuid::Uuid;
@@ -15,7 +16,7 @@ use super::{
     ConnectionContext, ConnectionPolicyScope, SERVER_STATUS_TIMEOUT, SERVER_STOP_TIMEOUT,
     ServerRuntimeMetadata, active_runtime_name, cleanup_stale_pid_file, connect_raw_with_context,
     connect_with_context, current_cli_build_id, fetch_server_status, is_pid_running,
-    map_cli_client_error, read_server_pid_file, read_server_runtime_metadata,
+    map_cli_client_error, read_server_pid_file, read_server_runtime_metadata, recording,
     recording_event_kind_name, remove_server_pid_file, try_kill_pid, wait_for_process_exit,
     wait_until_server_stopped,
 };
@@ -385,8 +386,11 @@ pub(super) async fn run_server_recording_start(
         connection_context,
     )
     .await?;
-    let recording =
-        crate::runtime::typed_recording::recording_rolling_start(&mut client, options).await?;
+    let recording: bmux_ipc::RecordingSummary =
+        recording_commands::client::rolling_start(&mut client, options.into())
+            .await?
+            .map(Into::into)
+            .map_err(recording::recording_plugin_error)?;
     let name_display = recording.name.as_deref().unwrap_or("-");
     println!(
         "server rolling recording started: {} name={} path={}",
@@ -405,7 +409,9 @@ pub(super) async fn run_server_recording_stop(
         connection_context,
     )
     .await?;
-    let recording_id = crate::runtime::typed_recording::recording_rolling_stop(&mut client).await?;
+    let recording_id = recording_commands::client::rolling_stop(&mut client)
+        .await?
+        .map_err(recording::recording_plugin_error)?;
     println!("server rolling recording stopped: {recording_id}");
     Ok(0)
 }
@@ -420,7 +426,9 @@ async fn fetch_server_recording_rolling_status(
         connection_context,
     )
     .await?;
-    crate::runtime::typed_recording::recording_rolling_status(&mut client).await
+    Ok(recording_state::client::rolling_status(&mut client)
+        .await?
+        .into())
 }
 
 pub(super) async fn run_server_recording_status(
@@ -521,8 +529,10 @@ pub(super) async fn run_server_recording_clear(
         connection_context,
     )
     .await?;
-    let report =
-        crate::runtime::typed_recording::recording_rolling_clear(&mut client, !no_restart).await?;
+    let report: bmux_ipc::RecordingRollingClearReport =
+        recording_commands::client::rolling_clear(&mut client, !no_restart)
+            .await?
+            .into();
 
     if json {
         println!(

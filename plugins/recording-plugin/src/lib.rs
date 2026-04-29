@@ -1,10 +1,9 @@
 //! bmux recording plugin — typed recording lifecycle handlers.
 //!
-//! The plugin implements a typed byte-dispatch service for
-//! `recording-commands` that accepts [`RecordingRequest`] payloads and
-//! returns [`RecordingResponse`] payloads. Each operation reads the
+//! The plugin implements BPDL-generated typed services for
+//! `recording-state` and `recording-commands`. Each operation reads the
 //! manual / rolling runtime handles out of `PluginStateRegistry`,
-//! performs the lifecycle operation, and returns the typed response.
+//! performs the lifecycle operation, and returns the generated response.
 //!
 //! The plugin itself owns construction of both runtimes. During
 //! `activate` it reads the CLI-provided [`RecordingPluginConfig`] from
@@ -29,10 +28,7 @@ use bmux_ipc::{
 use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
-use bmux_recording_plugin_api::{
-    RECORDING_COMMANDS_INTERFACE, RECORDING_READ, RECORDING_WRITE, RecordingPluginConfig,
-    RecordingRequest, RecordingResponse, RollingRecordingSettings,
-};
+use bmux_recording_plugin_api::{RecordingPluginConfig, RollingRecordingSettings, recording_types};
 use bmux_recording_runtime::{RecordMeta, RecordingSink, RecordingSinkHandle};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -46,6 +42,101 @@ pub struct ManualRecordingRuntimeHandle(pub Arc<Mutex<RecordingRuntime>>);
 /// handle in [`bmux_plugin::PluginStateRegistry`]. The inner option
 /// is `None` when rolling recording is disabled in config.
 pub struct RollingRecordingRuntimeHandle(pub Arc<Mutex<Option<RecordingRuntime>>>);
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct StartRequest {
+    session_id: Option<uuid::Uuid>,
+    capture_input: bool,
+    name: Option<String>,
+    profile: Option<recording_types::RecordingProfile>,
+    event_kinds: Option<Vec<recording_types::RecordingEventKind>>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct StopRequest {
+    recording_id: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct WriteCustomEventRequest {
+    session_id: Option<uuid::Uuid>,
+    pane_id: Option<uuid::Uuid>,
+    source: String,
+    name: String,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DeleteRequest {
+    recording_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CutRequest {
+    last_seconds: Option<u64>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RollingStartRequest {
+    options: recording_types::RecordingRollingStartOptions,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RollingClearRequest {
+    restart_if_active: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PruneRequest {
+    older_than_days: Option<u64>,
+}
+
+enum RecordingResponse {
+    Started {
+        recording: RecordingSummary,
+    },
+    Stopped {
+        recording_id: Option<uuid::Uuid>,
+    },
+    Status {
+        status: RecordingStatus,
+    },
+    List {
+        recordings: Vec<RecordingSummary>,
+    },
+    Deleted {
+        recording_id: uuid::Uuid,
+    },
+    CustomEventWritten {
+        accepted: bool,
+    },
+    DeleteAll {
+        removed_count: usize,
+    },
+    Cut {
+        recording: RecordingSummary,
+    },
+    RollingStarted {
+        recording: RecordingSummary,
+    },
+    RollingStopped {
+        recording_id: Option<uuid::Uuid>,
+    },
+    RollingStatus {
+        status: RecordingRollingStatus,
+    },
+    RollingCleared {
+        report: bmux_ipc::RecordingRollingClearReport,
+    },
+    CaptureTargets {
+        targets: Vec<RecordingCaptureTarget>,
+    },
+    Pruned {
+        pruned_count: usize,
+    },
+}
 
 /// `RecordingSink` impl that fans out each record to both the manual
 /// and rolling runtimes. Registered behind a
@@ -157,8 +248,63 @@ impl RustPlugin for RecordingPlugin {
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
-            "recording-commands", "dispatch" => |req: RecordingRequest, _ctx| {
-                Ok::<RecordingResponse, ServiceResponse>(handle_recording_request(req))
+            "recording-state", "status" => |_req: (), _ctx| {
+                Ok::<recording_types::RecordingStatus, ServiceResponse>(recording_status_generated())
+            },
+            "recording-state", "list-recordings" => |_req: (), _ctx| {
+                Ok::<Vec<recording_types::RecordingSummary>, ServiceResponse>(recording_list_generated())
+            },
+            "recording-state", "rolling-status" => |_req: (), _ctx| {
+                Ok::<recording_types::RecordingRollingStatus, ServiceResponse>(recording_rolling_status_generated())
+            },
+            "recording-state", "capture-targets" => |_req: (), _ctx| {
+                Ok::<Vec<recording_types::RecordingCaptureTarget>, ServiceResponse>(recording_capture_targets_generated())
+            },
+            "recording-commands", "start" => |req: StartRequest, _ctx| {
+                Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
+                    recording_start_generated(req),
+                )
+            },
+            "recording-commands", "stop" => |req: StopRequest, _ctx| {
+                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
+                    recording_stop_generated(req.recording_id),
+                )
+            },
+            "recording-commands", "write-custom-event" => |req: WriteCustomEventRequest, _ctx| {
+                Ok::<Result<(), recording_types::RecordingError>, ServiceResponse>(
+                    recording_write_custom_event_generated(req),
+                )
+            },
+            "recording-commands", "delete" => |req: DeleteRequest, _ctx| {
+                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
+                    recording_delete_generated(req.recording_id),
+                )
+            },
+            "recording-commands", "delete-all" => |_req: (), _ctx| {
+                Ok::<u64, ServiceResponse>(recording_delete_all_generated())
+            },
+            "recording-commands", "cut" => |req: CutRequest, _ctx| {
+                Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
+                    recording_cut_generated(req),
+                )
+            },
+            "recording-commands", "rolling-start" => |req: RollingStartRequest, _ctx| {
+                Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
+                    recording_rolling_start_generated(req.options),
+                )
+            },
+            "recording-commands", "rolling-stop" => |_req: (), _ctx| {
+                Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
+                    recording_rolling_stop_generated(),
+                )
+            },
+            "recording-commands", "rolling-clear" => |req: RollingClearRequest, _ctx| {
+                Ok::<recording_types::RecordingRollingClearReport, ServiceResponse>(
+                    recording_rolling_clear_generated(req.restart_if_active),
+                )
+            },
+            "recording-commands", "prune" => |req: PruneRequest, _ctx| {
+                Ok::<u64, ServiceResponse>(recording_prune_generated(req.older_than_days))
             },
         })
     }
@@ -210,37 +356,153 @@ fn auto_start_rolling(
     );
 }
 
-#[allow(clippy::too_many_lines)]
-fn handle_recording_request(req: RecordingRequest) -> RecordingResponse {
-    match req {
-        RecordingRequest::Start {
-            session_id,
-            capture_input,
-            name,
-            profile,
-            event_kinds,
-        } => handle_start(session_id, capture_input, name, profile, event_kinds),
-        RecordingRequest::Stop { recording_id } => handle_stop(recording_id),
-        RecordingRequest::Status => handle_status(),
-        RecordingRequest::List => handle_list(),
-        RecordingRequest::Delete { recording_id } => handle_delete(recording_id),
-        RecordingRequest::DeleteAll => handle_delete_all(),
-        RecordingRequest::Prune { older_than_days } => handle_prune(older_than_days),
-        RecordingRequest::WriteCustomEvent {
-            session_id,
-            pane_id,
-            source,
-            name,
-            payload,
-        } => handle_write_custom_event(session_id, pane_id, source, name, payload),
-        RecordingRequest::CaptureTargets => handle_capture_targets(),
-        RecordingRequest::RollingStatus => handle_rolling_status(),
-        RecordingRequest::RollingStop => handle_rolling_stop(),
-        RecordingRequest::RollingStart { options } => handle_rolling_start(options),
-        RecordingRequest::Cut { last_seconds, name } => handle_cut(last_seconds, name),
-        RecordingRequest::RollingClear { restart_if_active } => {
-            handle_rolling_clear(restart_if_active)
+fn generated_failed(reason: impl Into<String>) -> recording_types::RecordingError {
+    recording_types::RecordingError::Failed {
+        reason: reason.into(),
+    }
+}
+
+fn recording_status_generated() -> recording_types::RecordingStatus {
+    match handle_status() {
+        RecordingResponse::Status { status } => status.into(),
+        _ => empty_status().into(),
+    }
+}
+
+fn recording_list_generated() -> Vec<recording_types::RecordingSummary> {
+    match handle_list() {
+        RecordingResponse::List { recordings } => recordings.into_iter().map(Into::into).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn recording_rolling_status_generated() -> recording_types::RecordingRollingStatus {
+    match handle_rolling_status() {
+        RecordingResponse::RollingStatus { status } => status.into(),
+        _ => empty_rolling_status(String::new()).into(),
+    }
+}
+
+fn recording_capture_targets_generated() -> Vec<recording_types::RecordingCaptureTarget> {
+    match handle_capture_targets() {
+        RecordingResponse::CaptureTargets { targets } => {
+            targets.into_iter().map(Into::into).collect()
         }
+        _ => Vec::new(),
+    }
+}
+
+fn recording_start_generated(
+    req: StartRequest,
+) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
+    match handle_start(
+        req.session_id,
+        req.capture_input,
+        req.name,
+        req.profile.map(Into::into),
+        req.event_kinds
+            .map(|kinds| kinds.into_iter().map(Into::into).collect()),
+    ) {
+        RecordingResponse::Started { recording } => Ok(recording.into()),
+        _ => Err(generated_failed("recording start failed")),
+    }
+}
+
+fn recording_stop_generated(
+    recording_id: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, recording_types::RecordingError> {
+    match handle_stop(recording_id) {
+        RecordingResponse::Stopped {
+            recording_id: Some(id),
+        } => Ok(id),
+        _ => Err(recording_types::RecordingError::NoActive),
+    }
+}
+
+fn recording_write_custom_event_generated(
+    req: WriteCustomEventRequest,
+) -> Result<(), recording_types::RecordingError> {
+    match handle_write_custom_event(
+        req.session_id,
+        req.pane_id,
+        req.source,
+        req.name,
+        req.payload,
+    ) {
+        RecordingResponse::CustomEventWritten { accepted: true } => Ok(()),
+        _ => Err(generated_failed("custom recording event was not accepted")),
+    }
+}
+
+fn recording_delete_generated(
+    recording_id: uuid::Uuid,
+) -> Result<uuid::Uuid, recording_types::RecordingError> {
+    match handle_delete(recording_id) {
+        RecordingResponse::Deleted { recording_id } => Ok(recording_id),
+        _ => Err(generated_failed("recording delete failed")),
+    }
+}
+
+fn recording_delete_all_generated() -> u64 {
+    match handle_delete_all() {
+        RecordingResponse::DeleteAll { removed_count } => {
+            u64::try_from(removed_count).unwrap_or(u64::MAX)
+        }
+        _ => 0,
+    }
+}
+
+fn recording_cut_generated(
+    req: CutRequest,
+) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
+    match handle_cut(req.last_seconds, req.name) {
+        RecordingResponse::Cut { recording } => Ok(recording.into()),
+        _ => Err(generated_failed("recording cut failed")),
+    }
+}
+
+fn recording_rolling_start_generated(
+    options: recording_types::RecordingRollingStartOptions,
+) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
+    match handle_rolling_start(options.into()) {
+        RecordingResponse::RollingStarted { recording } => Ok(recording.into()),
+        _ => Err(recording_types::RecordingError::Unavailable),
+    }
+}
+
+fn recording_rolling_stop_generated() -> Result<uuid::Uuid, recording_types::RecordingError> {
+    match handle_rolling_stop() {
+        RecordingResponse::RollingStopped {
+            recording_id: Some(id),
+        } => Ok(id),
+        _ => Err(recording_types::RecordingError::NoActive),
+    }
+}
+
+fn recording_rolling_clear_generated(
+    restart_if_active: bool,
+) -> recording_types::RecordingRollingClearReport {
+    match handle_rolling_clear(restart_if_active) {
+        RecordingResponse::RollingCleared { report } => report.into(),
+        _ => bmux_ipc::RecordingRollingClearReport {
+            root_path: String::new(),
+            was_active: false,
+            restarted: false,
+            stopped_recording_id: None,
+            restarted_recording: None,
+            usage_before: bmux_ipc::RecordingRollingUsage::default(),
+            usage_after: bmux_ipc::RecordingRollingUsage::default(),
+        }
+        .into(),
+    }
+}
+
+fn recording_prune_generated(older_than_days: Option<u64>) -> u64 {
+    match handle_prune(older_than_days) {
+        RecordingResponse::Pruned { pruned_count } => {
+            u64::try_from(pruned_count).unwrap_or(u64::MAX)
+        }
+        _ => 0,
     }
 }
 
@@ -881,17 +1143,5 @@ fn clear_report_response(
         },
     }
 }
-
-// Silence unused-variable warnings on the constants until the full
-// handler set lands.
-const _KEEPS_CONSTS_ALIVE: (
-    bmux_plugin_sdk::CapabilityId,
-    bmux_plugin_sdk::CapabilityId,
-    bmux_plugin_sdk::InterfaceId,
-) = (
-    RECORDING_READ,
-    RECORDING_WRITE,
-    RECORDING_COMMANDS_INTERFACE,
-);
 
 bmux_plugin_sdk::export_plugin!(RecordingPlugin, include_str!("../plugin.toml"));

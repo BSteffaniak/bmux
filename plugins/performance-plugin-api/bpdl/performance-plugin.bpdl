@@ -1,0 +1,195 @@
+// Public, typed contract of the performance plugin.
+
+plugin bmux.performance version 1;
+
+capability PERFORMANCE_READ = bmux.performance.read;
+capability PERFORMANCE_WRITE = bmux.performance.write;
+
+interface performance-types {
+    enum performance-recording-level {
+        off,
+        basic,
+        detailed,
+        trace,
+    }
+
+    record performance-runtime-settings {
+        recording_level: performance-recording-level,
+        window_ms: u64,
+        max_events_per_sec: u32,
+        max_payload_bytes_per_sec: u64,
+    }
+
+    variant metric-target {
+        system,
+        process { pid: u32 },
+        pane { pane_id: uuid },
+    }
+
+    enum metric-name {
+        cpu-percent,
+        memory-bytes,
+        process-count,
+        disk-read-bytes-per-sec,
+        disk-write-bytes-per-sec,
+        network-rx-bytes-per-sec,
+        network-tx-bytes-per-sec,
+    }
+
+    enum theme-header-metric {
+        cpu,
+        memory,
+        process-count,
+        disk-read,
+        disk-write,
+        network-rx,
+        network-tx,
+    }
+
+    enum metric-target-kind {
+        system,
+        process,
+        pane,
+    }
+
+    enum metric-accuracy {
+        exact,
+        estimated,
+    }
+
+    enum cpu-percent-mode {
+        @default normalized,
+        raw-core-sum,
+    }
+
+    enum theme-header-scope {
+        @default pane,
+        system,
+        both,
+    }
+
+    enum theme-header-style {
+        @default compact,
+        detailed,
+        heat-only,
+    }
+
+    record metric-capability {
+        metric: theme-header-metric,
+        target: metric-target-kind,
+        supported: bool,
+        disabled_reason: string?,
+        accuracy: metric-accuracy?,
+    }
+
+    record theme-header-settings {
+        enabled: bool,
+        sample_interval_ms: u64,
+        scope: theme-header-scope,
+        style: theme-header-style,
+        cpu_percent_mode: cpu-percent-mode,
+        metrics: list<theme-header-metric>,
+    }
+
+    record metric-watch {
+        id: string,
+        target: metric-target,
+        metrics: list<metric-name>,
+        interval_ms: u64,
+        cpu_percent_mode: cpu-percent-mode,
+    }
+
+    record system-metrics-snapshot {
+        cpu_percent: string,
+        cpu_raw_percent: string,
+        cpu_normalized_percent: string,
+        memory_used_bytes: u64,
+        memory_total_bytes: u64,
+    }
+
+    record process-metrics-snapshot {
+        pid: u32,
+        cpu_percent: string,
+        cpu_raw_percent: string,
+        cpu_normalized_percent: string,
+        memory_bytes: u64,
+        process_count: u32,
+    }
+
+    record pane-metrics-snapshot {
+        pane_id: uuid,
+        session_id: uuid?,
+        pid: u32?,
+        process_group_id: i32?,
+        cpu_percent: string,
+        cpu_raw_percent: string,
+        cpu_normalized_percent: string,
+        memory_bytes: u64,
+        process_count: u32,
+        available: bool,
+    }
+
+    record metrics-snapshot {
+        sampled_at_epoch_ms: u64,
+        watches: list<metric-watch>,
+        system: system-metrics-snapshot,
+        processes: map<u32, process-metrics-snapshot>,
+        panes: map<uuid, pane-metrics-snapshot>,
+    }
+
+    variant prompt-form-value {
+        bool { value: bool },
+        text { value: string },
+        integer { value: i64 },
+        number { value: string },
+        single { value: string },
+        multi { values: list<string> },
+    }
+
+    record prompt-form {
+        encoded: bytes,
+    }
+}
+
+@capability(PERFORMANCE_READ)
+interface performance-state {
+    query get-settings() -> performance-types.performance-runtime-settings;
+    query list-watches() -> list<performance-types.metric-watch>;
+    query get-snapshot() -> performance-types.metrics-snapshot;
+    query get-metric-capabilities() -> list<performance-types.metric-capability>;
+    query get-theme-header-settings() -> performance-types.theme-header-settings;
+    query build-theme-header-settings-form() -> performance-types.prompt-form;
+}
+
+@capability(PERFORMANCE_WRITE)
+interface performance-commands {
+    command set-settings(settings: performance-types.performance-runtime-settings)
+        -> performance-types.performance-runtime-settings;
+    command start-watch(watch: performance-types.metric-watch)
+        -> list<performance-types.metric-watch>;
+    command stop-watch(watch_id: string) -> unit;
+    command set-theme-header-settings(settings: performance-types.theme-header-settings)
+        -> performance-types.theme-header-settings;
+    command apply-theme-header-settings-form(values: map<string, performance-types.prompt-form-value>)
+        -> performance-types.theme-header-settings;
+}
+
+interface performance-events {
+    variant performance-event {
+        settings-updated { settings: performance-types.performance-runtime-settings },
+    }
+
+    events performance-event;
+}
+
+interface metric-events {
+    variant metric-event {
+        snapshot-updated { sampled_at_epoch_ms: u64 },
+    }
+
+    events metric-event;
+}
+
+interface metrics-state {
+    @state events performance-types.metrics-snapshot;
+}

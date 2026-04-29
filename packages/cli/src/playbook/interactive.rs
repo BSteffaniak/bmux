@@ -12,6 +12,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use bmux_recording_plugin_api::recording_commands;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -807,9 +808,13 @@ async fn run_interactive_session_managed(
 
     // Stop recording if active.
     if let Some(rid) = recording_id {
-        match crate::runtime::typed_recording::recording_stop(&mut client, Some(rid)).await {
-            Ok(stopped) => info!("recording stopped: {stopped}"),
-            Err(e) => warn!("failed to stop recording: {e}"),
+        match recording_commands::client::stop(&mut client, Some(rid)).await {
+            Ok(Ok(stopped)) => info!("recording stopped: {stopped}"),
+            Ok(Err(error)) => {
+                let error = crate::runtime::recording_plugin_error(error);
+                warn!("failed to stop recording: {error}");
+            }
+            Err(error) => warn!("failed to stop recording: {error}"),
         }
     }
 

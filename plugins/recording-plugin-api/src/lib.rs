@@ -1,23 +1,16 @@
 //! Typed public API of the bmux recording plugin.
 //!
-//! Unlike most plugin-api crates, this one does not use BPDL codegen.
-//! Recording operations carry rich typed payloads (`RecordingProfile`,
-//! `RecordingEventKind`, `RecordingRollingStartOptions`, etc.) that
-//! already live in `bmux_ipc`, and duplicating them into a BPDL schema
-//! would be noise. Instead this crate exposes:
+//! The [`recording_types`], [`recording_state`], and
+//! [`recording_commands`] modules are generated from
+//! `bpdl/recording-plugin.bpdl` at compile time via the
+//! [`bmux_plugin_schema_macros::schema!`] macro. This crate also exposes:
 //!
-//! - [`RecordingRequest`] / [`RecordingResponse`] — hand-written wire
-//!   enums the recording plugin's typed service dispatches over.
 //! - [`RollingRecordingSettings`] — normalized rolling-recording
 //!   configuration (window-secs + event kinds); registered into the
 //!   plugin state registry by CLI startup so the recording plugin can
 //!   read it during `activate`.
 //! - [`RecordingPluginConfig`] — recordings/rolling-recordings
 //!   directory paths + segment size; registered by CLI startup.
-//! - Constants for the interface id and capability ids.
-//!
-//! Transport helpers live in the consuming crates so this public API
-//! crate remains focused on stable recording request/response types.
 //!
 //! The `RecordingRuntime` concrete type + the `DualRuntimeSink`
 //! fan-out impl + `ManualRecordingRuntimeHandle` /
@@ -33,23 +26,258 @@ pub mod offline_prune;
 
 pub use offline_prune::prune_old_recordings;
 
-use bmux_ipc::{
-    RecordingEventKind, RecordingProfile, RecordingRollingStartOptions, RecordingStatus,
-    RecordingSummary,
-};
-use bmux_plugin_sdk::{CapabilityId, InterfaceId};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+bmux_plugin_schema_macros::schema! {
+    source: "bpdl/recording-plugin.bpdl",
+}
 
-/// Canonical capability for the recording plugin's read surface.
-pub const RECORDING_READ: CapabilityId = CapabilityId::from_static("bmux.recording.read");
+use bmux_ipc::RecordingEventKind;
+impl From<recording_types::RecordingProfile> for bmux_ipc::RecordingProfile {
+    fn from(value: recording_types::RecordingProfile) -> Self {
+        match value {
+            recording_types::RecordingProfile::Full => Self::Full,
+            recording_types::RecordingProfile::Functional => Self::Functional,
+            recording_types::RecordingProfile::Visual => Self::Visual,
+        }
+    }
+}
 
-/// Canonical capability for the recording plugin's write surface.
-pub const RECORDING_WRITE: CapabilityId = CapabilityId::from_static("bmux.recording.write");
+impl From<bmux_ipc::RecordingProfile> for recording_types::RecordingProfile {
+    fn from(value: bmux_ipc::RecordingProfile) -> Self {
+        match value {
+            bmux_ipc::RecordingProfile::Full => Self::Full,
+            bmux_ipc::RecordingProfile::Functional => Self::Functional,
+            bmux_ipc::RecordingProfile::Visual => Self::Visual,
+        }
+    }
+}
 
-/// Interface id for recording control operations (typed dispatch).
-pub const RECORDING_COMMANDS_INTERFACE: InterfaceId =
-    InterfaceId::from_static("recording-commands");
+impl From<recording_types::RecordingEventKind> for bmux_ipc::RecordingEventKind {
+    fn from(value: recording_types::RecordingEventKind) -> Self {
+        match value {
+            recording_types::RecordingEventKind::PaneInputRaw => Self::PaneInputRaw,
+            recording_types::RecordingEventKind::PaneOutputRaw => Self::PaneOutputRaw,
+            recording_types::RecordingEventKind::ProtocolReplyRaw => Self::ProtocolReplyRaw,
+            recording_types::RecordingEventKind::PaneImage => Self::PaneImage,
+            recording_types::RecordingEventKind::ServerEvent => Self::ServerEvent,
+            recording_types::RecordingEventKind::RequestStart => Self::RequestStart,
+            recording_types::RecordingEventKind::RequestDone => Self::RequestDone,
+            recording_types::RecordingEventKind::RequestError => Self::RequestError,
+            recording_types::RecordingEventKind::Custom => Self::Custom,
+        }
+    }
+}
+
+impl From<bmux_ipc::RecordingEventKind> for recording_types::RecordingEventKind {
+    fn from(value: bmux_ipc::RecordingEventKind) -> Self {
+        match value {
+            bmux_ipc::RecordingEventKind::PaneInputRaw => Self::PaneInputRaw,
+            bmux_ipc::RecordingEventKind::PaneOutputRaw => Self::PaneOutputRaw,
+            bmux_ipc::RecordingEventKind::ProtocolReplyRaw => Self::ProtocolReplyRaw,
+            bmux_ipc::RecordingEventKind::PaneImage => Self::PaneImage,
+            bmux_ipc::RecordingEventKind::ServerEvent => Self::ServerEvent,
+            bmux_ipc::RecordingEventKind::RequestStart => Self::RequestStart,
+            bmux_ipc::RecordingEventKind::RequestDone => Self::RequestDone,
+            bmux_ipc::RecordingEventKind::RequestError => Self::RequestError,
+            bmux_ipc::RecordingEventKind::Custom => Self::Custom,
+        }
+    }
+}
+
+impl From<bmux_ipc::RecordingSummary> for recording_types::RecordingSummary {
+    fn from(value: bmux_ipc::RecordingSummary) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            format_version: value.format_version,
+            session_id: value.session_id,
+            capture_input: value.capture_input,
+            profile: value.profile.into(),
+            event_kinds: value.event_kinds.into_iter().map(Into::into).collect(),
+            started_epoch_ms: value.started_epoch_ms,
+            ended_epoch_ms: value.ended_epoch_ms,
+            event_count: value.event_count,
+            payload_bytes: value.payload_bytes,
+            path: value.path,
+            segments: value.segments,
+            total_segment_bytes: value.total_segment_bytes,
+        }
+    }
+}
+
+impl From<recording_types::RecordingSummary> for bmux_ipc::RecordingSummary {
+    fn from(value: recording_types::RecordingSummary) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            format_version: value.format_version,
+            session_id: value.session_id,
+            capture_input: value.capture_input,
+            profile: value.profile.into(),
+            event_kinds: value.event_kinds.into_iter().map(Into::into).collect(),
+            started_epoch_ms: value.started_epoch_ms,
+            ended_epoch_ms: value.ended_epoch_ms,
+            event_count: value.event_count,
+            payload_bytes: value.payload_bytes,
+            path: value.path,
+            segments: value.segments,
+            total_segment_bytes: value.total_segment_bytes,
+        }
+    }
+}
+
+impl From<bmux_ipc::RecordingStatus> for recording_types::RecordingStatus {
+    fn from(value: bmux_ipc::RecordingStatus) -> Self {
+        Self {
+            active: value.active.map(Into::into),
+            queue_len: u64::try_from(value.queue_len).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+impl From<recording_types::RecordingStatus> for bmux_ipc::RecordingStatus {
+    fn from(value: recording_types::RecordingStatus) -> Self {
+        Self {
+            active: value.active.map(Into::into),
+            queue_len: usize::try_from(value.queue_len).unwrap_or(usize::MAX),
+        }
+    }
+}
+
+impl From<bmux_ipc::RecordingCaptureTarget> for recording_types::RecordingCaptureTarget {
+    fn from(value: bmux_ipc::RecordingCaptureTarget) -> Self {
+        Self {
+            recording_id: value.recording_id,
+            path: value.path,
+            rolling_window_secs: value.rolling_window_secs,
+        }
+    }
+}
+
+impl From<recording_types::RecordingCaptureTarget> for bmux_ipc::RecordingCaptureTarget {
+    fn from(value: recording_types::RecordingCaptureTarget) -> Self {
+        Self {
+            recording_id: value.recording_id,
+            path: value.path,
+            rolling_window_secs: value.rolling_window_secs,
+        }
+    }
+}
+
+impl From<recording_types::RecordingRollingStartOptions>
+    for bmux_ipc::RecordingRollingStartOptions
+{
+    fn from(value: recording_types::RecordingRollingStartOptions) -> Self {
+        Self {
+            window_secs: value.window_secs,
+            name: value.name,
+            event_kinds: value
+                .event_kinds
+                .map(|kinds| kinds.into_iter().map(Into::into).collect()),
+            capture_input: value.capture_input,
+            capture_output: value.capture_output,
+            capture_events: value.capture_events,
+            capture_protocol_replies: value.capture_protocol_replies,
+            capture_images: value.capture_images,
+        }
+    }
+}
+
+impl From<bmux_ipc::RecordingRollingStartOptions>
+    for recording_types::RecordingRollingStartOptions
+{
+    fn from(value: bmux_ipc::RecordingRollingStartOptions) -> Self {
+        Self {
+            window_secs: value.window_secs,
+            name: value.name,
+            event_kinds: value
+                .event_kinds
+                .map(|kinds| kinds.into_iter().map(Into::into).collect()),
+            capture_input: value.capture_input,
+            capture_output: value.capture_output,
+            capture_events: value.capture_events,
+            capture_protocol_replies: value.capture_protocol_replies,
+            capture_images: value.capture_images,
+        }
+    }
+}
+
+impl From<bmux_ipc::RecordingRollingUsage> for recording_types::RecordingRollingUsage {
+    fn from(value: bmux_ipc::RecordingRollingUsage) -> Self {
+        Self {
+            bytes: value.bytes,
+            files: value.files,
+            directories: value.directories,
+            recording_dirs: value.recording_dirs,
+        }
+    }
+}
+
+impl From<recording_types::RecordingRollingUsage> for bmux_ipc::RecordingRollingUsage {
+    fn from(value: recording_types::RecordingRollingUsage) -> Self {
+        Self {
+            bytes: value.bytes,
+            files: value.files,
+            directories: value.directories,
+            recording_dirs: value.recording_dirs,
+        }
+    }
+}
+
+impl From<bmux_ipc::RecordingRollingStatus> for recording_types::RecordingRollingStatus {
+    fn from(value: bmux_ipc::RecordingRollingStatus) -> Self {
+        Self {
+            root_path: value.root_path,
+            auto_start: value.auto_start,
+            available: value.available,
+            active: value.active.map(Into::into),
+            rolling_window_secs: value.rolling_window_secs,
+            event_kinds: value.event_kinds.into_iter().map(Into::into).collect(),
+            usage: value.usage.into(),
+        }
+    }
+}
+
+impl From<recording_types::RecordingRollingStatus> for bmux_ipc::RecordingRollingStatus {
+    fn from(value: recording_types::RecordingRollingStatus) -> Self {
+        Self {
+            root_path: value.root_path,
+            auto_start: value.auto_start,
+            available: value.available,
+            active: value.active.map(Into::into),
+            rolling_window_secs: value.rolling_window_secs,
+            event_kinds: value.event_kinds.into_iter().map(Into::into).collect(),
+            usage: value.usage.into(),
+        }
+    }
+}
+
+impl From<bmux_ipc::RecordingRollingClearReport> for recording_types::RecordingRollingClearReport {
+    fn from(value: bmux_ipc::RecordingRollingClearReport) -> Self {
+        Self {
+            root_path: value.root_path,
+            was_active: value.was_active,
+            restarted: value.restarted,
+            stopped_recording_id: value.stopped_recording_id,
+            restarted_recording: value.restarted_recording.map(Into::into),
+            usage_before: value.usage_before.into(),
+            usage_after: value.usage_after.into(),
+        }
+    }
+}
+
+impl From<recording_types::RecordingRollingClearReport> for bmux_ipc::RecordingRollingClearReport {
+    fn from(value: recording_types::RecordingRollingClearReport) -> Self {
+        Self {
+            root_path: value.root_path,
+            was_active: value.was_active,
+            restarted: value.restarted,
+            stopped_recording_id: value.stopped_recording_id,
+            restarted_recording: value.restarted_recording.map(Into::into),
+            usage_before: value.usage_before.into(),
+            usage_after: value.usage_after.into(),
+        }
+    }
+}
 
 /// Default rolling-recording configuration (window seconds + enabled
 /// event kinds).
@@ -91,113 +319,4 @@ pub struct RecordingPluginConfig {
     pub rolling_defaults: RollingRecordingSettings,
     /// Whether to auto-start a rolling recording on plugin activation.
     pub rolling_auto_start: bool,
-}
-
-/// Typed request variants for the recording plugin's typed service
-/// dispatch surface. Replaces the former `Request::Recording*`
-/// variants that used to live on `bmux_ipc::Request` before the
-/// recording plugin migration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum RecordingRequest {
-    Start {
-        #[serde(default)]
-        session_id: Option<Uuid>,
-        capture_input: bool,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        profile: Option<RecordingProfile>,
-        #[serde(default)]
-        event_kinds: Option<Vec<RecordingEventKind>>,
-    },
-    Stop {
-        #[serde(default)]
-        recording_id: Option<Uuid>,
-    },
-    Status,
-    List,
-    Delete {
-        recording_id: Uuid,
-    },
-    WriteCustomEvent {
-        #[serde(default)]
-        session_id: Option<Uuid>,
-        #[serde(default)]
-        pane_id: Option<Uuid>,
-        source: String,
-        name: String,
-        payload: Vec<u8>,
-    },
-    DeleteAll,
-    Cut {
-        #[serde(default)]
-        last_seconds: Option<u64>,
-        #[serde(default)]
-        name: Option<String>,
-    },
-    RollingStart {
-        #[serde(default)]
-        options: RecordingRollingStartOptions,
-    },
-    RollingStop,
-    RollingStatus,
-    RollingClear {
-        restart_if_active: bool,
-    },
-    CaptureTargets,
-    Prune {
-        #[serde(default)]
-        older_than_days: Option<u64>,
-    },
-}
-
-/// Typed response variants for the recording plugin's typed service
-/// dispatch surface. Replaces the former
-/// `ResponsePayload::Recording*` variants.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RecordingResponse {
-    Started {
-        recording: RecordingSummary,
-    },
-    Stopped {
-        recording_id: Option<Uuid>,
-    },
-    Status {
-        status: RecordingStatus,
-    },
-    List {
-        recordings: Vec<RecordingSummary>,
-    },
-    Deleted {
-        recording_id: Uuid,
-    },
-    CustomEventWritten {
-        accepted: bool,
-    },
-    DeleteAll {
-        removed_count: usize,
-    },
-    Cut {
-        recording: RecordingSummary,
-    },
-    RollingStarted {
-        recording: RecordingSummary,
-    },
-    RollingStopped {
-        recording_id: Option<Uuid>,
-    },
-    RollingStatus {
-        status: bmux_ipc::RecordingRollingStatus,
-    },
-    RollingCleared {
-        report: bmux_ipc::RecordingRollingClearReport,
-    },
-    CaptureTargets {
-        targets: Vec<bmux_ipc::RecordingCaptureTarget>,
-    },
-    Pruned {
-        pruned_count: usize,
-    },
 }

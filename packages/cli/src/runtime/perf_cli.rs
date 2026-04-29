@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use bmux_cli_schema::PerfProfileArg;
 use bmux_ipc::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
+use bmux_performance_plugin_api::{performance_commands, performance_state};
 
 use super::{
     ConnectionContext, ConnectionPolicyScope, cleanup_stale_pid_file, connect_with_context,
-    typed_performance,
 };
 
 const fn performance_level_name(level: PerformanceRecordingLevel) -> &'static str {
@@ -48,7 +48,9 @@ pub(super) async fn run_perf_status(
         connection_context,
     )
     .await?;
-    let settings = typed_performance::performance_status(&mut client).await?;
+    let settings = performance_state::client::get_settings(&mut client)
+        .await?
+        .into();
 
     if json {
         println!(
@@ -75,9 +77,15 @@ pub(super) async fn run_perf_on(
         connection_context,
     )
     .await?;
-    let mut settings = typed_performance::performance_status(&mut client).await?;
+    let mut settings: PerformanceRuntimeSettings =
+        performance_state::client::get_settings(&mut client)
+            .await?
+            .into();
     settings.recording_level = profile_to_level(profile);
-    let updated = typed_performance::performance_set(&mut client, settings).await?;
+    let updated: PerformanceRuntimeSettings =
+        performance_commands::client::set_settings(&mut client, settings.into())
+            .await?
+            .into();
 
     if json {
         println!(
@@ -107,9 +115,15 @@ pub(super) async fn run_perf_off(
         connection_context,
     )
     .await?;
-    let mut settings = typed_performance::performance_status(&mut client).await?;
+    let mut settings: PerformanceRuntimeSettings =
+        performance_state::client::get_settings(&mut client)
+            .await?
+            .into();
     settings.recording_level = PerformanceRecordingLevel::Off;
-    let updated = typed_performance::performance_set(&mut client, settings).await?;
+    let updated: PerformanceRuntimeSettings =
+        performance_commands::client::set_settings(&mut client, settings.into())
+            .await?
+            .into();
 
     if json {
         println!(

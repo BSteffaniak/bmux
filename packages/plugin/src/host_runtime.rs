@@ -185,33 +185,32 @@ pub trait HostRuntimeApi: ServiceCaller {
         &self,
         request: &RecordingWriteEventRequest,
     ) -> Result<RecordingWriteEventResponse> {
-        use bmux_recording_plugin_api::{RecordingRequest, RecordingResponse};
-
-        let recording_request = RecordingRequest::WriteCustomEvent {
-            session_id: recording_attribute_uuid(request, "bmux.session_id"),
-            pane_id: recording_attribute_uuid(request, "bmux.pane_id"),
-            // `HostRuntimeApi` doesn't know which plugin is calling,
-            // so we pass an empty source. The caller-side code that
-            // needs source identity should dispatch directly via
-            // `recording-commands::dispatch` instead.
-            source: String::new(),
-            name: request.name.clone(),
-            payload: serde_json::to_vec(&request.payload).unwrap_or_default(),
-        };
-        let response: RecordingResponse = self.call_service(
-            "bmux.recording.read",
+        let recording_request =
+            bmux_recording_plugin_api::recording_commands::client::WriteCustomEventRequest {
+                session_id: recording_attribute_uuid(request, "bmux.session_id"),
+                pane_id: recording_attribute_uuid(request, "bmux.pane_id"),
+                // `HostRuntimeApi` doesn't know which plugin is calling,
+                // so we pass an empty source. The caller-side code that
+                // needs source identity should dispatch directly via
+                // `recording-commands::write-custom-event` instead.
+                source: String::new(),
+                name: request.name.clone(),
+                payload: serde_json::to_vec(&request.payload).unwrap_or_default(),
+            };
+        let response: std::result::Result<
+            (),
+            bmux_recording_plugin_api::recording_types::RecordingError,
+        > = self.call_service(
+            bmux_recording_plugin_api::capabilities::RECORDING_WRITE.as_str(),
             ServiceKind::Command,
-            "recording-commands",
-            "dispatch",
+            bmux_recording_plugin_api::recording_commands::INTERFACE_ID.as_str(),
+            bmux_recording_plugin_api::recording_commands::OP_WRITE_CUSTOM_EVENT.as_str(),
             &recording_request,
         )?;
-        match response {
-            RecordingResponse::CustomEventWritten { accepted } => {
-                Ok(RecordingWriteEventResponse { accepted })
-            }
-            _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
-                details: "unexpected response payload for recording-commands::dispatch".to_string(),
-            }),
+        if response.is_ok() {
+            Ok(RecordingWriteEventResponse { accepted: true })
+        } else {
+            Ok(RecordingWriteEventResponse { accepted: false })
         }
     }
 }

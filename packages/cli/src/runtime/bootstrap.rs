@@ -6,6 +6,7 @@ use bmux_contexts_plugin_api::contexts_commands::{
     ContextAck as ContextAckRecord, CreateContextError,
 };
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
+use bmux_recording_plugin_api::{recording_commands, recording_state};
 use bmux_server::BmuxServer;
 use bmux_sessions_plugin_api::sessions_state::SessionSummary;
 use std::collections::BTreeMap;
@@ -55,19 +56,22 @@ pub(super) async fn run_default_server_attach(
             connection_context,
         )
         .await?;
-        let started = crate::runtime::typed_recording::recording_start(
+        let started: bmux_ipc::RecordingSummary = recording_commands::client::start(
             &mut recording_client,
             None,
             options.capture_input,
             options.name.clone(),
-            recording::recording_profile_arg_to_ipc(options.profile),
+            recording::recording_profile_arg_to_ipc(options.profile).map(Into::into),
             recording::resolve_event_kind_override(
                 options.profile,
                 &options.event_kinds,
                 options.capture_input,
-            ),
+            )
+            .map(|kinds| kinds.into_iter().map(Into::into).collect()),
         )
-        .await?;
+        .await?
+        .map(Into::into)
+        .map_err(recording::recording_plugin_error)?;
         active_recording_id = Some(started.id);
         let name_display = started.name.as_deref().unwrap_or("-");
         println!(
@@ -100,19 +104,20 @@ pub(super) async fn run_default_server_attach(
             connection_context,
         )
         .await?;
-        let stopped_id =
-            crate::runtime::typed_recording::recording_stop(&mut stop_client, Some(recording_id))
-                .await
-                .with_context(|| format!("failed stopping recording {recording_id}"))?;
+        let stopped_id = recording_commands::client::stop(&mut stop_client, Some(recording_id))
+            .await?
+            .map_err(recording::recording_plugin_error)
+            .with_context(|| format!("failed stopping recording {recording_id}"))?;
         let mut list_client = connect_with_context(
             ConnectionPolicyScope::Normal,
             "bmux-cli-default-attach-recording-list",
             connection_context,
         )
         .await?;
-        let recording = crate::runtime::typed_recording::recording_list(&mut list_client)
+        let recording = recording_state::client::list_recordings(&mut list_client)
             .await?
             .into_iter()
+            .map(bmux_ipc::RecordingSummary::from)
             .find(|summary| summary.id == stopped_id);
         if let Some(recording) = recording {
             let name_display = recording.name.as_deref().unwrap_or("-");

@@ -21,6 +21,7 @@ use bmux_plugin_sdk::{
     HostScope, PluginCommandOutcome, ServiceKind, ServiceRequest,
     perf_telemetry::{PhaseChannel, emit as emit_phase_timing},
 };
+use bmux_recording_plugin_api::recording_state;
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -122,9 +123,9 @@ fn emit_attach_plugin_command_timing(
 }
 
 use super::super::{
-    typed_clients, typed_contexts, typed_control_catalog, typed_performance, typed_sessions,
-    typed_windows,
+    typed_clients, typed_contexts, typed_control_catalog, typed_sessions, typed_windows,
 };
+use bmux_performance_plugin_api::performance_state;
 
 /// Typed dispatch wrapper for `sessions-commands:kill-session`.
 async fn typed_kill_session_attach(
@@ -959,7 +960,8 @@ pub async fn run_session_attach_with_client(
     let mut perf_emitter = recording::PerfEventEmitter::new(
         recording::PerfCaptureSettings::from_config(&attach_config),
     );
-    if let Ok(settings) = typed_performance::performance_status(&mut client).await {
+    if let Ok(settings) = performance_state::client::get_settings(&mut client).await {
+        let settings = settings.into();
         perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
             &settings,
         ));
@@ -1050,14 +1052,13 @@ pub async fn run_session_attach_with_client(
         println!("attached to session: {}", attach_info.session_id);
     }
 
-    let capture_targets =
-        match crate::runtime::typed_recording::recording_capture_targets(&mut client).await {
-            Ok(targets) => targets,
-            Err(error) => {
-                tracing::warn!("failed querying recording capture targets on attach: {error}");
-                Vec::new()
-            }
-        };
+    let capture_targets = match recording_state::client::capture_targets(&mut client).await {
+        Ok(targets) => targets.into_iter().map(Into::into).collect(),
+        Err(error) => {
+            tracing::warn!("failed querying recording capture targets on attach: {error}");
+            Vec::new()
+        }
+    };
 
     // Upgrade to streaming client for event-driven operation.
     // All subsequent operations use the streaming client.

@@ -1626,8 +1626,10 @@ dependencies = [
 name = "bmux_performance_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_codec",
  "bmux_ipc",
  "bmux_performance_state",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
@@ -1774,6 +1776,7 @@ name = "bmux_recording_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
+ "bmux_codec",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
@@ -1791,7 +1794,9 @@ name = "bmux_recording_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
+ "bmux_codec",
  "bmux_ipc",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
  "serde_json",

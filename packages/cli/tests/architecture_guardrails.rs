@@ -1066,10 +1066,8 @@ fn recording_plugin_exists() {
 /// Verify that `Request::Recording*` (15 variants) and
 /// `ResponsePayload::Recording*` variants have been deleted from
 /// `bmux_ipc`. Recording lifecycle operations are served by the
-/// `bmux.recording` plugin's typed `recording-commands::dispatch`
-/// service, which takes a `RecordingRequest` and returns a
-/// `RecordingResponse` (both defined in
-/// `bmux_recording_plugin_api`).
+/// `bmux.recording` plugin's BPDL-generated `recording-state` and
+/// `recording-commands` service operations.
 #[test]
 fn recording_ipc_variants_are_absent() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
@@ -1114,7 +1112,7 @@ fn recording_ipc_variants_are_absent() {
             !ipc_source.contains(marker),
             "packages/ipc/src/lib.rs must not reintroduce {marker}; \
              recording lifecycle operations go through \
-             `recording-commands::dispatch` typed dispatch provided \
+             BPDL-generated typed dispatch provided \
              by the `bmux.recording` plugin",
         );
     }
@@ -1223,6 +1221,31 @@ fn plugin_api_crates_do_not_define_public_typed_clients() {
         assert!(
             !typed_client.exists(),
             "{relative} must not exist; callers should use generated clients or consuming-crate private helpers",
+        );
+    }
+}
+
+/// Recording and performance service transport is generated from BPDL;
+/// public API crates must not reintroduce handwritten request/response
+/// envelopes for those service calls.
+#[test]
+fn recording_and_performance_api_crates_use_bpdl_transport() {
+    let recording_api = include_str!("../../../plugins/recording-plugin-api/src/lib.rs");
+    for marker in ["pub enum RecordingRequest", "pub enum RecordingResponse"] {
+        assert!(
+            !recording_api.contains(marker),
+            "plugins/recording-plugin-api must not reintroduce `{marker}`; use BPDL-generated operations",
+        );
+    }
+
+    let performance_api = include_str!("../../../plugins/performance-plugin-api/src/lib.rs");
+    for marker in [
+        "pub enum PerformanceRequest",
+        "pub enum PerformanceResponse",
+    ] {
+        assert!(
+            !performance_api.contains(marker),
+            "plugins/performance-plugin-api must not reintroduce `{marker}`; use BPDL-generated operations",
         );
     }
 }

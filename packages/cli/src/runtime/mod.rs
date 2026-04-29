@@ -64,10 +64,6 @@ pub(crate) mod typed_contexts;
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) mod typed_control_catalog;
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) mod typed_performance;
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) mod typed_recording;
-#[allow(clippy::redundant_pub_crate)]
 // Shared invoke primitives consumed by every `typed_<domain>` helper.
 pub(crate) mod typed_service;
 #[allow(clippy::redundant_pub_crate)]
@@ -135,6 +131,7 @@ pub use prompt::{
     PromptEvent, PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse,
     PromptSubmitError, PromptValidation, PromptValue, PromptWidth,
 };
+pub use recording::recording_plugin_error;
 use recording_cli::{
     recording_event_kind_name, replay_interactive, replay_verify, replay_watch,
     run_recording_analyze, run_recording_cut, run_recording_delete, run_recording_delete_all,
