@@ -1300,10 +1300,12 @@ dependencies = [
 name = "bmux_contexts_plugin_api"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "uuid",
 ]
 

@@ -11,9 +11,11 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_ipc                  = { workspace = true }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std"] }
+thiserror                 = { workspace = true }
 uuid                      = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
@@ -23,9 +25,7 @@ serde_json = { workspace = true }
 # `serde` is consumed by code generated from the BPDL schema via the
 # `bmux_plugin_schema_macros::schema!` proc macro; cargo-machete cannot
 # see into proc-macro-generated source.
-# `bmux_plugin_sdk` is referenced by generated code for typed identifier
-# constants (`CapabilityId`, `InterfaceId`, `OperationId`, event kinds).
-ignored = ["serde", "bmux_plugin_sdk"]
+ignored = ["serde"]
 
 [features]
 default          = []
