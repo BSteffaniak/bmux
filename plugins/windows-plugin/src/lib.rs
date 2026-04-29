@@ -2591,9 +2591,7 @@ mod tests {
         decode_service_message, encode_service_message,
     };
     use domain_ipc::{
-        ContextCloseRequest, ContextCreateRequest, ContextListResponse, ContextSelectRequest,
-        ContextSelectResponse, ContextSelector as SessionSelector,
-        ContextSummary as SessionSummary,
+        ContextCloseRequest, ContextSelector as SessionSelector, ContextSummary as SessionSummary,
     };
     use std::sync::Mutex;
 
@@ -2802,19 +2800,19 @@ mod tests {
             RegisteredService {
                 capability: HostScope::new("bmux.contexts.read").expect("capability should parse"),
                 kind: ServiceKind::Query,
-                interface_id: "context-query/v1".to_string(),
+                interface_id: "contexts-state".to_string(),
                 provider: ProviderId::Host,
             },
             RegisteredService {
                 capability: HostScope::new("bmux.contexts.write").expect("capability should parse"),
                 kind: ServiceKind::Command,
-                interface_id: "context-command/v1".to_string(),
+                interface_id: "contexts-commands".to_string(),
                 provider: ProviderId::Host,
             },
             RegisteredService {
                 capability: HostScope::new("bmux.clients.read").expect("capability should parse"),
                 kind: ServiceKind::Query,
-                interface_id: "client-query/v1".to_string(),
+                interface_id: "clients-state".to_string(),
                 provider: ProviderId::Host,
             },
             RegisteredService {
@@ -3232,118 +3230,7 @@ mod tests {
                     });
                     encode_service_message(&ok)
                 }
-                // Legacy context-query/v1 + context-command/v1 retained
-                // for tests that still exercise those paths directly.
-                ("context-query/v1", "list") => {
-                    let mru_ids = self
-                        .mru_context_ids
-                        .lock()
-                        .expect("mru context lock should succeed")
-                        .clone();
-                    let mut by_id = self
-                        .sessions
-                        .iter()
-                        .cloned()
-                        .map(|context| (context.id, context))
-                        .collect::<BTreeMap<_, _>>();
-                    let mut contexts = Vec::with_capacity(by_id.len());
-                    for context_id in mru_ids {
-                        if let Some(context) = by_id.remove(&context_id) {
-                            contexts.push(context);
-                        }
-                    }
-                    contexts.extend(by_id.into_values());
-                    encode_service_message(&ContextListResponse { contexts })
-                }
-                ("context-command/v1", "create") => {
-                    if self.fail_create {
-                        return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
-                            details: "mock create failure".to_string(),
-                        });
-                    }
-                    let request: ContextCreateRequest = decode_service_message(&payload)?;
-                    self.creates
-                        .lock()
-                        .expect("create log lock should succeed")
-                        .push(request.name.clone());
-                    encode_service_message(&domain_ipc::ContextCreateResponse {
-                        context: SessionSummary {
-                            id: Uuid::new_v4(),
-                            name: request.name,
-                            attributes: request.attributes,
-                        },
-                    })
-                }
-                ("context-command/v1", "close") => {
-                    if self.fail_kill {
-                        return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
-                            details: "mock kill failure".to_string(),
-                        });
-                    }
-                    let request: ContextCloseRequest = decode_service_message(&payload)?;
-                    self.kills
-                        .lock()
-                        .expect("kill log lock should succeed")
-                        .push(request.clone());
-                    encode_service_message(&domain_ipc::ContextCloseResponse {
-                        id: match request.selector {
-                            SessionSelector::ById(id) => id,
-                            SessionSelector::ByName(_) => Uuid::new_v4(),
-                        },
-                    })
-                }
-                ("context-command/v1", "select") => {
-                    if self.fail_kill {
-                        return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
-                            details: "mock select failure".to_string(),
-                        });
-                    }
-                    let request: ContextSelectRequest = decode_service_message(&payload)?;
-                    let selected = match request.selector {
-                        SessionSelector::ById(id) => id,
-                        SessionSelector::ByName(name) => self
-                            .sessions
-                            .iter()
-                            .find(|session| session.name.as_deref() == Some(name.as_str()))
-                            .map(|session| session.id)
-                            .ok_or_else(|| bmux_plugin_sdk::PluginError::ServiceProtocol {
-                                details: "mock select target not found".to_string(),
-                            })?,
-                    };
-                    *self
-                        .selected_session_id
-                        .lock()
-                        .expect("selected session lock should succeed") = Some(selected);
-                    {
-                        let mut mru_context_ids = self
-                            .mru_context_ids
-                            .lock()
-                            .expect("mru context lock should succeed");
-                        mru_context_ids.retain(|id| *id != selected);
-                        mru_context_ids.insert(0, selected);
-                    }
-                    self.selects
-                        .lock()
-                        .expect("select log lock should succeed")
-                        .push(selected);
-                    encode_service_message(&ContextSelectResponse {
-                        context: SessionSummary {
-                            id: selected,
-                            name: Some("selected".to_string()),
-                            attributes: BTreeMap::new(),
-                        },
-                    })
-                }
-                ("context-query/v1", "current") => {
-                    let current_context_id = *self
-                        .selected_session_id
-                        .lock()
-                        .expect("selected context lock should succeed");
-                    let context = current_context_id
-                        .and_then(|id| self.sessions.iter().find(|entry| entry.id == id).cloned());
-                    encode_service_message(&domain_ipc::ContextCurrentResponse { context })
-                }
-                ("client-query/v1", "current") => {
+                ("clients-state", "current-client") => {
                     if self.fail_current_client {
                         return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
                             details: "mock current client failure".to_string(),
@@ -3353,12 +3240,18 @@ mod tests {
                         .selected_session_id
                         .lock()
                         .expect("selected session lock should succeed");
-                    encode_service_message(&domain_ipc::CurrentClientResponse {
+                    let summary = bmux_clients_plugin_api::clients_state::ClientSummary {
                         id: self.current_client_id,
                         selected_session_id,
+                        selected_context_id: None,
                         following_client_id: None,
                         following_global: false,
-                    })
+                    };
+                    let result: Result<
+                        bmux_clients_plugin_api::clients_state::ClientSummary,
+                        bmux_clients_plugin_api::clients_state::ClientQueryError,
+                    > = Ok(summary);
+                    encode_service_message(&result)
                 }
                 ("storage-query/v1", "get") => {
                     let request: StorageGetRequest = decode_service_message(&payload)?;

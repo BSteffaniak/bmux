@@ -46,38 +46,6 @@ struct ContextSummary {
     attributes: BTreeMap<String, String>,
 }
 
-/// Legacy `session-query/v1` response envelope (used by test fixtures).
-#[cfg(test)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionListResponse {
-    sessions: Vec<SessionSummary>,
-}
-
-/// Legacy `context-query/v1` response envelope (used by test fixtures).
-#[cfg(test)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ContextListResponse {
-    contexts: Vec<ContextSummary>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CurrentClientResponse {
-    id: Uuid,
-    #[serde(default)]
-    selected_session_id: Option<Uuid>,
-    #[serde(default)]
-    following_client_id: Option<Uuid>,
-    #[serde(default)]
-    following_global: bool,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ContextCurrentResponse {
-    context: Option<ContextSummary>,
-}
-
 /// Current-client view reduced to the fields permissions-plugin uses.
 #[derive(Debug, Clone, Copy)]
 struct CurrentClientSnapshot {
@@ -1272,15 +1240,10 @@ mod tests {
             payload: Vec<u8>,
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
             match (interface_id, operation) {
-                ("session-query/v1", "list") => encode_service_message(&SessionListResponse {
-                    sessions: self.sessions.clone(),
-                }),
-                ("client-query/v1", "current") => encode_service_message(&CurrentClientResponse {
-                    id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
-                    selected_session_id: self.selected_session_id,
-                    following_client_id: None,
-                    following_global: false,
-                }),
+                // Typed host surfaces used by permissions-plugin's
+                // domain helpers. Keep test fixtures aligned with the
+                // production plugin-api contracts so legacy host
+                // interfaces do not linger in tests.
                 ("storage-query/v1", "get") => {
                     let request: StorageGetRequest = decode_service_message(&payload)?;
                     let value = self
@@ -1299,23 +1262,11 @@ mod tests {
                         .insert(request.key, request.value);
                     encode_service_message(&())
                 }
-                ("context-query/v1", "list") => encode_service_message(&ContextListResponse {
-                    contexts: self.contexts.clone(),
-                }),
-                ("context-query/v1", "current") => {
-                    encode_service_message(&ContextCurrentResponse {
-                        context: self.contexts.first().cloned(),
-                    })
-                }
-                // Typed contexts-state surface used by this plugin's
-                // context_list / context_current helpers.
                 ("contexts-state", "list-contexts") => encode_service_message(&self.contexts),
                 ("contexts-state", "current-context") => {
                     let current = self.contexts.first().cloned();
                     encode_service_message(&current)
                 }
-                // Typed sessions-state surface used by this plugin's
-                // list_sessions helper.
                 ("sessions-state", "list-sessions") => {
                     #[derive(serde::Serialize)]
                     struct Entry {
@@ -1334,7 +1285,6 @@ mod tests {
                         .collect();
                     encode_service_message(&entries)
                 }
-                // Typed clients-state surface used by `current_client_snapshot`.
                 ("clients-state", "current-client") => {
                     let summary = bmux_clients_plugin_api::clients_state::ClientSummary {
                         id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
@@ -1435,21 +1385,19 @@ mod tests {
             RegisteredService {
                 capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
                 kind: ServiceKind::Query,
-                interface_id: "session-query/v1".to_string(),
-                provider: ProviderId::Host,
-            },
-            // Typed `sessions-state` surface used by the migrated
-            // `list_sessions` helper.
-            RegisteredService {
-                capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
-                kind: ServiceKind::Query,
                 interface_id: "sessions-state".to_string(),
                 provider: ProviderId::Host,
             },
             RegisteredService {
                 capability: HostScope::new("bmux.clients.read").expect("capability should parse"),
                 kind: ServiceKind::Query,
-                interface_id: "client-query/v1".to_string(),
+                interface_id: "clients-state".to_string(),
+                provider: ProviderId::Host,
+            },
+            RegisteredService {
+                capability: HostScope::new("bmux.contexts.read").expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "contexts-state".to_string(),
                 provider: ProviderId::Host,
             },
             RegisteredService {
