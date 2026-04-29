@@ -33,6 +33,18 @@ BMUX core must remain domain-agnostic. Windows, sessions, contexts, clients, and
 - If a feature seems domain-specific, place it in a plugin unless there is a strong, documented reason it must be core-agnostic runtime plumbing.
 - When a plugin needs to reach core kernel state (sessions, contexts, panes), use `ServiceCaller::execute_kernel_request(bmux_ipc::Request::*)` directly. Foundational plugins (sessions, contexts, clients, windows) are allowed to call core IPC this way; other plugins must go through typed BPDL services exposed by the foundational plugins.
 
+### Plugin API Crate Boundary (REQUIRED)
+
+`plugins/*-plugin-api/**` crates are stable typed contracts, not runtime implementation crates.
+
+- Plugin API crates may contain BPDL schemas, generated service/client/event/capability modules, stable wire/model types, schema smoke tests, and intentional re-exports from neutral primitive crates.
+- Plugin API crates must not contain concrete runtime state implementations (`FollowState`, `ContextState`, `SessionManager`, runtime managers, registries, rate limiters, sinks, lifecycle state machines, etc.). Concrete runtime state belongs in the matching `plugins/*-plugin/**` crate unless it is deliberately neutral primitive state.
+- Shared handles, reader/writer traits, no-op fallbacks, and support types used by core must live in neutral primitive crates such as `packages/*-state` or `packages/*-runtime`, not in plugin API crates.
+- Plugin API crates must not contain plugin activation/lifecycle behavior, host registry wiring, background tasks, runtime IO, permission checks, or product orchestration logic.
+- Plugin API crates must not expose handwritten public transport-client modules such as `src/typed_client.rs`; use BPDL-generated clients or consuming-crate-private helpers.
+- Once a service is modeled in BPDL, plugin API crates must not reintroduce public handwritten request/response transport envelopes for that service.
+- Re-exporting neutral primitive types from a plugin API crate is acceptable for ergonomics, but ownership remains with the neutral crate and core should import the neutral crate directly.
+
 ### Review Gate Before Finishing (REQUIRED)
 
 For any non-doc code change, verify no forbidden domain leakage was introduced in core architecture:
@@ -40,6 +52,7 @@ For any non-doc code change, verify no forbidden domain leakage was introduced i
 - Run content checks (or equivalent) to confirm no new core references to windows/permissions/sessions/contexts/clients/panes domain concepts.
 - `HostRuntimeApi` must remain domain-agnostic — only `core_cli_command_run_path`, `plugin_command_run`, `storage_get`, `storage_set`, `log_write`, `recording_write_event`.
 - Domain convenience helpers belong in plugins (as private modules) or are reached through typed BPDL services, not in `HostRuntimeApi` or any other core crate.
+- For plugin API changes, confirm no public `plugins/*-plugin-api/src/typed_client.rs`, no new concrete runtime state implementations in plugin API crates, and no public handwritten request/response envelopes where generated BPDL transport exists.
 - If any core-side domain leakage is found, treat as blocking and refactor before finishing.
 
 These boundary rules are strict and take precedence over convenience.

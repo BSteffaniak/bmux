@@ -538,13 +538,11 @@ fn event_models_crate_has_no_domain_dependencies() {
     }
 }
 
-/// Verify that `FollowState` is defined in `bmux_clients_plugin_api`
-/// and not in `packages/server`. The clients plugin owns the type; it
-/// lives in the plugin-api crate so server imports it via
-/// `use bmux_clients_plugin_api::FollowState` without depending on the
-/// plugin impl crate. The plugin registers a canonical handle into
-/// [`bmux_plugin::PluginStateRegistry`] on `activate` for other
-/// observers.
+/// Verify that `FollowState` is defined in the clients plugin impl
+/// crate and not in `packages/server` or the plugin API crate. The
+/// clients plugin owns the concrete type; server observes it through a
+/// neutral `bmux_client_state::FollowStateHandle` registered into
+/// [`bmux_plugin::PluginStateRegistry`] on `activate`.
 #[test]
 fn follow_state_is_owned_by_clients_plugin() {
     let server_source = include_str!("../../server/src/lib.rs");
@@ -561,13 +559,13 @@ fn follow_state_is_owned_by_clients_plugin() {
         assert!(
             !server_source.contains(marker),
             "packages/server/src/lib.rs must not define {marker}; \
-             FollowState lives in bmux_clients_plugin_api",
+             FollowState lives in plugins/clients-plugin/src/follow_state.rs",
         );
     }
 
     // Server must reach follow-state through the domain-agnostic
     // `FollowStateHandle` from `bmux_client_state`, not through the
-    // concrete plugin-api type. Core must not depend on the plugin
+    // concrete plugin-owned type. Core must not depend on the plugin
     // impl crate.
     assert!(
         server_source.contains("FollowStateHandle"),
@@ -597,8 +595,8 @@ fn follow_state_is_owned_by_clients_plugin() {
 }
 
 /// Verify that `ContextState` is defined in the contexts plugin impl
-/// crate and not in `packages/server`.
-/// the plugin impl crate.
+/// crate and not in `packages/server` or the plugin API crate. Server
+/// observes it through a neutral `bmux_context_state::ContextStateHandle`.
 #[test]
 fn context_state_is_owned_by_contexts_plugin() {
     let server_source = include_str!("../../server/src/lib.rs");
@@ -614,13 +612,13 @@ fn context_state_is_owned_by_contexts_plugin() {
         assert!(
             !server_source.contains(marker),
             "packages/server/src/lib.rs must not define {marker}; \
-             ContextState lives in bmux_contexts_plugin_api",
+             ContextState lives in plugins/contexts-plugin/src/context_state.rs",
         );
     }
 
     // Server must reach context-state through the domain-agnostic
     // `ContextStateHandle` from `bmux_context_state`, not through the
-    // concrete plugin-api type. Core must not depend on the plugin
+    // concrete plugin-owned type. Core must not depend on the plugin
     // impl crate.
     assert!(
         server_source.contains("ContextStateHandle"),
@@ -647,11 +645,10 @@ fn context_state_is_owned_by_contexts_plugin() {
     );
 }
 
-/// Verify that `SessionManager` is defined in `bmux_sessions_plugin_api`
-/// and not in `packages/session` or `packages/server`. The sessions
-/// plugin owns the type; it lives in the plugin-api crate so server
-/// imports it via `use bmux_sessions_plugin_api::SessionManager`
-/// without depending on the plugin impl crate.
+/// Verify that `SessionManager` is defined in the sessions plugin impl
+/// crate and not in `packages/session`, `packages/server`, or the plugin
+/// API crate. Server observes it through a neutral
+/// `bmux_session_state::SessionManagerHandle`.
 #[test]
 fn session_manager_is_owned_by_sessions_plugin() {
     // `packages/session` is absent; SessionManager lives in
@@ -681,13 +678,13 @@ fn session_manager_is_owned_by_sessions_plugin() {
         assert!(
             !server_source.contains(marker),
             "packages/server/src/lib.rs must not define {marker}; \
-             SessionManager lives in bmux_sessions_plugin_api",
+             SessionManager lives in plugins/sessions-plugin/src/session_manager.rs",
         );
     }
 
     // Server must reach session-manager state through the
     // domain-agnostic `SessionManagerHandle` from `bmux_session_state`,
-    // not through the concrete plugin-api type. Core must not depend
+    // not through the concrete plugin-owned type. Core must not depend
     // on the plugin impl crate.
     assert!(
         server_source.contains("SessionManagerHandle"),
@@ -1209,8 +1206,8 @@ fn server_state_holds_no_concrete_domain_state() {
 
 /// Verify that plugin-api crates don't define concrete state types.
 /// Plugin-api crates host stable wire contracts (BPDL-generated types,
-/// typed request/response enums, typed-client helpers). Concrete
-/// state types live in plugin impl crates so the plugin owns
+/// generated clients, events, capabilities, and stable models).
+/// Concrete state types live in plugin impl crates so the plugin owns
 /// construction and the server never names them.
 #[test]
 fn plugin_api_crates_have_no_concrete_state() {

@@ -60,10 +60,25 @@ Plugins live under `plugins/`. Each "real" plugin ships **two crates**:
 
 1. **`<name>-plugin-api`** — the stable typed contract. Generated from a
    `.bpdl` file via `bmux_plugin_schema_macros::schema!`. Contains no
-   runtime logic. Consumers of the plugin depend on this crate alone.
+   runtime logic. It may expose generated service/client/event modules,
+   stable wire/model types, schema tests, and intentional re-exports from
+   neutral primitive crates. Consumers of the plugin depend on this crate
+   alone.
 2. **`<name>-plugin`** — the implementation. Depends on its `-api`
    crate and whatever other APIs it consumes. Registered with the host
    at runtime.
+
+Plugin API crates are contracts, not implementation crates. They do not
+own concrete runtime state (`FollowState`, `ContextState`,
+`SessionManager`, runtime managers, sinks, registries, lifecycle state
+machines), plugin activation/lifecycle behavior, host registry wiring,
+runtime IO, permission checks, or product orchestration. Those belong in
+the matching `*-plugin` crate or in deliberately neutral primitive crates
+under `packages/*-state` / `packages/*-runtime` when core also needs the
+type. Public handwritten transport helpers such as `src/typed_client.rs`
+and public handwritten request/response envelopes are also avoided once a
+service is modeled in BPDL; callers use generated clients or
+consuming-crate-private adapters.
 
 Examples currently in tree:
 
@@ -203,9 +218,11 @@ Plugin-owned state type locations:
 | `PerformanceCaptureSettings` + rate limiter | `performance-plugin`     | `packages/performance-state/src/lib.rs` + `plugins/performance-plugin-api/src/lib.rs`         |
 | Catalog revision counter + snapshot         | `control-catalog-plugin` | `plugins/control-catalog-plugin/src/lib.rs`                                                   |
 
-Concrete state types live in each plugin's impl crate; the matching
-`*-plugin-api` / `*-state` crates expose only the reader/writer traits
-and handle newtypes used by core. Core crates (`packages/server`,
+Concrete state types live in each plugin's impl crate. Stable wire
+contracts live in matching `*-plugin-api` crates, while shared
+reader/writer traits, handle newtypes, no-op fallbacks, and support
+types used by core live in neutral `packages/*-state` or
+`packages/*-runtime` crates. Core crates (`packages/server`,
 `packages/client`) reach domain state exclusively through those trait
 objects registered in \[`bmux_plugin::PluginStateRegistry`\] — the
 "core must not depend on plugin impl crates" rule is enforced
