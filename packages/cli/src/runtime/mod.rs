@@ -66,6 +66,8 @@ pub(crate) mod typed_control_catalog;
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) mod typed_performance;
 #[allow(clippy::redundant_pub_crate)]
+pub(crate) mod typed_recording;
+#[allow(clippy::redundant_pub_crate)]
 // Shared invoke primitives consumed by every `typed_<domain>` helper.
 pub(crate) mod typed_service;
 #[allow(clippy::redundant_pub_crate)]

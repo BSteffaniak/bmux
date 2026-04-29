@@ -57,7 +57,7 @@ pub(super) async fn run_recording_start(
     } else {
         Some(default_event_kinds_from_config(capture_input))
     };
-    let summary = bmux_recording_plugin_api::typed_client::recording_start(
+    let summary = crate::runtime::typed_recording::recording_start(
         &mut client,
         session_id,
         capture_input,
@@ -482,7 +482,7 @@ impl PerfEventEmitter {
             return Ok(());
         }
 
-        bmux_recording_plugin_api::typed_client::recording_write_custom_event(
+        crate::runtime::typed_recording::recording_write_custom_event(
             client,
             session_id,
             pane_id,
@@ -491,7 +491,6 @@ impl PerfEventEmitter {
             encoded,
         )
         .await
-        .map_err(anyhow::Error::from)
     }
 
     pub(super) async fn emit_with_streaming_client(
@@ -512,7 +511,7 @@ impl PerfEventEmitter {
             return Ok(());
         }
 
-        bmux_recording_plugin_api::typed_client::recording_write_custom_event(
+        crate::runtime::typed_recording::recording_write_custom_event(
             client,
             session_id,
             pane_id,
@@ -521,7 +520,6 @@ impl PerfEventEmitter {
             encoded,
         )
         .await
-        .map_err(anyhow::Error::from)
     }
 }
 
@@ -929,7 +927,7 @@ pub(super) async fn run_recording_stop(
         None => None,
     };
     let stopped_id =
-        bmux_recording_plugin_api::typed_client::recording_stop(&mut client, recording_id).await?;
+        crate::runtime::typed_recording::recording_stop(&mut client, recording_id).await?;
     println!("recording stopped: {stopped_id}");
     maybe_auto_export_recording(stopped_id, None).await;
     Ok(0)
@@ -948,9 +946,7 @@ pub(super) async fn run_recording_status(
     )
     .await?
     {
-        Some(mut client) => {
-            bmux_recording_plugin_api::typed_client::recording_status(&mut client).await?
-        }
+        Some(mut client) => crate::runtime::typed_recording::recording_status(&mut client).await?,
         None => offline_recording_status(),
     };
     let (config, root_path) = recording_config_and_root();
@@ -1092,9 +1088,7 @@ pub(super) async fn run_recording_list(
     )
     .await?
     {
-        Some(mut client) => {
-            bmux_recording_plugin_api::typed_client::recording_list(&mut client).await?
-        }
+        Some(mut client) => crate::runtime::typed_recording::recording_list(&mut client).await?,
         None => list_recordings_from_disk()?,
     };
 
@@ -1170,9 +1164,8 @@ pub(super) async fn run_recording_delete(
     )
     .await?
     {
-        let status = bmux_recording_plugin_api::typed_client::recording_status(&mut client).await?;
-        let recordings =
-            bmux_recording_plugin_api::typed_client::recording_list(&mut client).await?;
+        let status = crate::runtime::typed_recording::recording_status(&mut client).await?;
+        let recordings = crate::runtime::typed_recording::recording_list(&mut client).await?;
         let resolved = resolve_recording_id_prefix(recording_id_or_prefix, &recordings)?;
 
         if status
@@ -1180,17 +1173,14 @@ pub(super) async fn run_recording_delete(
             .as_ref()
             .is_some_and(|active| active.id == resolved)
         {
-            let stopped_id = bmux_recording_plugin_api::typed_client::recording_stop(
-                &mut client,
-                Some(resolved),
-            )
-            .await?;
+            let stopped_id =
+                crate::runtime::typed_recording::recording_stop(&mut client, Some(resolved))
+                    .await?;
             println!("stopped active recording {stopped_id} before delete");
         }
 
         let deleted_id =
-            bmux_recording_plugin_api::typed_client::recording_delete(&mut client, resolved)
-                .await?;
+            crate::runtime::typed_recording::recording_delete(&mut client, resolved).await?;
         println!("deleted recording {deleted_id}");
     } else {
         let recordings = list_recordings_from_disk()?;
@@ -1218,17 +1208,15 @@ pub(super) async fn run_recording_delete_all(
     )
     .await?
     {
-        let status = bmux_recording_plugin_api::typed_client::recording_status(&mut client).await?;
+        let status = crate::runtime::typed_recording::recording_status(&mut client).await?;
         if let Some(active) = status.active {
-            let stopped_id = bmux_recording_plugin_api::typed_client::recording_stop(
-                &mut client,
-                Some(active.id),
-            )
-            .await?;
+            let stopped_id =
+                crate::runtime::typed_recording::recording_stop(&mut client, Some(active.id))
+                    .await?;
             println!("stopped active recording {stopped_id} before delete");
         }
         let deleted_count =
-            bmux_recording_plugin_api::typed_client::recording_delete_all(&mut client).await?;
+            crate::runtime::typed_recording::recording_delete_all(&mut client).await?;
         println!("deleted {deleted_count} recordings");
     } else {
         let deleted_count = delete_all_recordings_from_disk()?;
@@ -1257,8 +1245,7 @@ pub(super) async fn run_recording_cut(
     })?;
 
     let recording =
-        bmux_recording_plugin_api::typed_client::recording_cut(&mut client, last_seconds, name)
-            .await?;
+        crate::runtime::typed_recording::recording_cut(&mut client, last_seconds, name).await?;
     let name_display = recording.name.as_deref().unwrap_or("-");
     tracing::info!(
         id = %recording.id,
@@ -1290,7 +1277,7 @@ pub(super) async fn run_recording_prune(
     )
     .await?
     {
-        bmux_recording_plugin_api::typed_client::recording_prune(&mut client, older_than).await?
+        crate::runtime::typed_recording::recording_prune(&mut client, older_than).await?
     } else {
         let root = recordings_root_dir();
         let config = bmux_config::BmuxConfig::load().unwrap_or_default();

@@ -1,47 +1,22 @@
-//! Typed-client helpers for the `bmux.recording` plugin.
-//!
-//! Free functions accepting any `C: TypedDispatchClient` that wrap
-//! the `recording-commands::dispatch(RecordingRequest) ->
-//! RecordingResponse` typed service call so callers don't have to
-//! repeat the interface/operation strings + serde boilerplate.
-
+use anyhow::{Context, Result, anyhow, bail};
 use bmux_ipc::{
     InvokeServiceKind, RecordingCaptureTarget, RecordingEventKind, RecordingProfile,
     RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
     RecordingStatus, RecordingSummary,
 };
-use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError};
-use uuid::Uuid;
-
-use crate::{
+use bmux_plugin_sdk::TypedDispatchClient;
+use bmux_recording_plugin_api::{
     RECORDING_COMMANDS_INTERFACE, RECORDING_READ, RECORDING_WRITE, RecordingRequest,
     RecordingResponse,
 };
-
-/// Errors returned by recording-plugin typed-client helpers.
-#[derive(Debug, thiserror::Error)]
-pub enum RecordingTypedClientError {
-    #[error(transparent)]
-    Dispatch(#[from] TypedDispatchClientError),
-    #[error("failed to encode recording request: {0}")]
-    Encode(String),
-    #[error("failed to decode recording response: {0}")]
-    Decode(String),
-    #[error("unexpected recording response: {0}")]
-    Unexpected(&'static str),
-    #[error("no active recording to stop")]
-    NoActiveRecording,
-}
-
-type Result<T> = core::result::Result<T, RecordingTypedClientError>;
+use uuid::Uuid;
 
 async fn dispatch<C: TypedDispatchClient>(
     client: &mut C,
     capability: &str,
     request: RecordingRequest,
 ) -> Result<RecordingResponse> {
-    let payload =
-        bmux_ipc::encode(&request).map_err(|e| RecordingTypedClientError::Encode(e.to_string()))?;
+    let payload = bmux_ipc::encode(&request).context("encoding recording request")?;
     let response_bytes = client
         .invoke_service_raw(
             capability,
@@ -50,15 +25,11 @@ async fn dispatch<C: TypedDispatchClient>(
             "dispatch",
             payload,
         )
-        .await?;
-    bmux_ipc::decode(&response_bytes).map_err(|e| RecordingTypedClientError::Decode(e.to_string()))
+        .await
+        .map_err(|err| anyhow!("recording dispatch failed: {err}"))?;
+    bmux_ipc::decode(&response_bytes).context("decoding recording response")
 }
 
-/// Start a new recording session.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_start<C: TypedDispatchClient>(
     client: &mut C,
     session_id: Option<Uuid>,
@@ -81,17 +52,10 @@ pub async fn recording_start<C: TypedDispatchClient>(
     .await?
     {
         RecordingResponse::Started { recording } => Ok(recording),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording started",
-        )),
+        _ => bail!("unexpected recording response: expected recording started"),
     }
 }
 
-/// Stop an active recording session.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_stop<C: TypedDispatchClient>(
     client: &mut C,
     recording_id: Option<Uuid>,
@@ -104,19 +68,12 @@ pub async fn recording_stop<C: TypedDispatchClient>(
     .await?
     {
         RecordingResponse::Stopped { recording_id } => {
-            recording_id.ok_or(RecordingTypedClientError::NoActiveRecording)
+            recording_id.ok_or_else(|| anyhow!("no active recording to stop"))
         }
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording stopped",
-        )),
+        _ => bail!("unexpected recording response: expected recording stopped"),
     }
 }
 
-/// Write a custom event into the active recording.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_write_custom_event<C: TypedDispatchClient>(
     client: &mut C,
     session_id: Option<Uuid>,
@@ -139,47 +96,26 @@ pub async fn recording_write_custom_event<C: TypedDispatchClient>(
     .await?
     {
         RecordingResponse::CustomEventWritten { .. } => Ok(()),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording custom event written",
-        )),
+        _ => bail!("unexpected recording response: expected custom event written"),
     }
 }
 
-/// Query recording runtime status.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_status<C: TypedDispatchClient>(client: &mut C) -> Result<RecordingStatus> {
     match dispatch(client, RECORDING_READ.as_str(), RecordingRequest::Status).await? {
         RecordingResponse::Status { status } => Ok(status),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording status",
-        )),
+        _ => bail!("unexpected recording response: expected recording status"),
     }
 }
 
-/// List known recordings.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_list<C: TypedDispatchClient>(
     client: &mut C,
 ) -> Result<Vec<RecordingSummary>> {
     match dispatch(client, RECORDING_READ.as_str(), RecordingRequest::List).await? {
         RecordingResponse::List { recordings } => Ok(recordings),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording list",
-        )),
+        _ => bail!("unexpected recording response: expected recording list"),
     }
 }
 
-/// Delete one recording by id.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_delete<C: TypedDispatchClient>(
     client: &mut C,
     recording_id: Uuid,
@@ -192,17 +128,10 @@ pub async fn recording_delete<C: TypedDispatchClient>(
     .await?
     {
         RecordingResponse::Deleted { recording_id } => Ok(recording_id),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording deleted",
-        )),
+        _ => bail!("unexpected recording response: expected recording deleted"),
     }
 }
 
-/// Delete all recordings.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_delete_all<C: TypedDispatchClient>(client: &mut C) -> Result<usize> {
     match dispatch(
         client,
@@ -212,17 +141,10 @@ pub async fn recording_delete_all<C: TypedDispatchClient>(client: &mut C) -> Res
     .await?
     {
         RecordingResponse::DeleteAll { removed_count } => Ok(removed_count),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording delete-all response",
-        )),
+        _ => bail!("unexpected recording response: expected recording delete-all"),
     }
 }
 
-/// Create a bounded snapshot from the active rolling recording.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_cut<C: TypedDispatchClient>(
     client: &mut C,
     last_seconds: Option<u64>,
@@ -236,17 +158,10 @@ pub async fn recording_cut<C: TypedDispatchClient>(
     .await?
     {
         RecordingResponse::Cut { recording } => Ok(recording),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording cut response",
-        )),
+        _ => bail!("unexpected recording response: expected recording cut"),
     }
 }
 
-/// Start hidden rolling recording on a running server.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_rolling_start<C: TypedDispatchClient>(
     client: &mut C,
     options: RecordingRollingStartOptions,
@@ -259,17 +174,10 @@ pub async fn recording_rolling_start<C: TypedDispatchClient>(
     .await?
     {
         RecordingResponse::RollingStarted { recording } => Ok(recording),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording started response",
-        )),
+        _ => bail!("unexpected recording response: expected rolling recording started"),
     }
 }
 
-/// Stop hidden rolling recording on a running server.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_rolling_stop<C: TypedDispatchClient>(client: &mut C) -> Result<Uuid> {
     match dispatch(
         client,
@@ -279,19 +187,12 @@ pub async fn recording_rolling_stop<C: TypedDispatchClient>(client: &mut C) -> R
     .await?
     {
         RecordingResponse::RollingStopped { recording_id } => {
-            recording_id.ok_or(RecordingTypedClientError::NoActiveRecording)
+            recording_id.ok_or_else(|| anyhow!("no active recording to stop"))
         }
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording stopped response",
-        )),
+        _ => bail!("unexpected recording response: expected rolling recording stopped"),
     }
 }
 
-/// Fetch hidden rolling recording status and usage details.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_rolling_status<C: TypedDispatchClient>(
     client: &mut C,
 ) -> Result<RecordingRollingStatus> {
@@ -303,17 +204,10 @@ pub async fn recording_rolling_status<C: TypedDispatchClient>(
     .await?
     {
         RecordingResponse::RollingStatus { status } => Ok(status),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording rolling status response",
-        )),
+        _ => bail!("unexpected recording response: expected rolling recording status"),
     }
 }
 
-/// Clear hidden rolling recording data and optionally restart when active.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_rolling_clear<C: TypedDispatchClient>(
     client: &mut C,
     restart_if_active: bool,
@@ -326,17 +220,10 @@ pub async fn recording_rolling_clear<C: TypedDispatchClient>(
     .await?
     {
         RecordingResponse::RollingCleared { report } => Ok(report),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording rolling cleared response",
-        )),
+        _ => bail!("unexpected recording response: expected rolling recording cleared"),
     }
 }
 
-/// Return active recording capture targets for display-track writing.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_capture_targets<C: TypedDispatchClient>(
     client: &mut C,
 ) -> Result<Vec<RecordingCaptureTarget>> {
@@ -348,17 +235,10 @@ pub async fn recording_capture_targets<C: TypedDispatchClient>(
     .await?
     {
         RecordingResponse::CaptureTargets { targets } => Ok(targets),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording capture targets response",
-        )),
+        _ => bail!("unexpected recording response: expected recording capture targets"),
     }
 }
 
-/// Prune completed recordings older than the specified retention period.
-///
-/// # Errors
-///
-/// Returns an error if transport, encoding, or server-side operation fails.
 pub async fn recording_prune<C: TypedDispatchClient>(
     client: &mut C,
     older_than_days: Option<u64>,
@@ -371,8 +251,6 @@ pub async fn recording_prune<C: TypedDispatchClient>(
     .await?
     {
         RecordingResponse::Pruned { pruned_count } => Ok(pruned_count),
-        _ => Err(RecordingTypedClientError::Unexpected(
-            "expected recording pruned response",
-        )),
+        _ => bail!("unexpected recording response: expected recording pruned"),
     }
 }

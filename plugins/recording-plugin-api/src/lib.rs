@@ -15,9 +15,9 @@
 //! - [`RecordingPluginConfig`] — recordings/rolling-recordings
 //!   directory paths + segment size; registered by CLI startup.
 //! - Constants for the interface id and capability ids.
-//! - [`typed_client`] helpers for downstream callers (CLI, tests) that
-//!   want to invoke recording operations through any
-//!   `TypedDispatchClient` transport.
+//!
+//! Transport helpers live in the consuming crates so this public API
+//! crate remains focused on stable recording request/response types.
 //!
 //! The `RecordingRuntime` concrete type + the `DualRuntimeSink`
 //! fan-out impl + `ManualRecordingRuntimeHandle` /
@@ -30,7 +30,6 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod offline_prune;
-pub mod typed_client;
 
 pub use offline_prune::prune_old_recordings;
 

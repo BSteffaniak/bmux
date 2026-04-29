@@ -1466,8 +1466,7 @@ async fn run_playbook_inner(
     let mut recording_path: Option<std::path::PathBuf> = None;
     if let (Some(rid), Some(sb)) = (recording_id, &sandbox) {
         // Stop recording first so the server finalizes the binary files.
-        match bmux_recording_plugin_api::typed_client::recording_stop(&mut client, Some(rid)).await
-        {
+        match crate::runtime::typed_recording::recording_stop(&mut client, Some(rid)).await {
             Ok(stopped_id) => {
                 info!("recording stopped: {stopped_id}");
             }
@@ -2007,7 +2006,7 @@ pub(super) async fn start_recording(
     client: &mut BmuxClient,
     session_id: Option<Uuid>,
 ) -> Result<Uuid> {
-    let summary = bmux_recording_plugin_api::typed_client::recording_start(
+    let summary = crate::runtime::typed_recording::recording_start(
         client, session_id, true, // capture_input
         None, // name
         None, // profile: server default (Functional)

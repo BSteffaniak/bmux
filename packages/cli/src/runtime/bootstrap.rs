@@ -55,7 +55,7 @@ pub(super) async fn run_default_server_attach(
             connection_context,
         )
         .await?;
-        let started = bmux_recording_plugin_api::typed_client::recording_start(
+        let started = crate::runtime::typed_recording::recording_start(
             &mut recording_client,
             None,
             options.capture_input,
@@ -100,19 +100,17 @@ pub(super) async fn run_default_server_attach(
             connection_context,
         )
         .await?;
-        let stopped_id = bmux_recording_plugin_api::typed_client::recording_stop(
-            &mut stop_client,
-            Some(recording_id),
-        )
-        .await
-        .with_context(|| format!("failed stopping recording {recording_id}"))?;
+        let stopped_id =
+            crate::runtime::typed_recording::recording_stop(&mut stop_client, Some(recording_id))
+                .await
+                .with_context(|| format!("failed stopping recording {recording_id}"))?;
         let mut list_client = connect_with_context(
             ConnectionPolicyScope::Normal,
             "bmux-cli-default-attach-recording-list",
             connection_context,
         )
         .await?;
-        let recording = bmux_recording_plugin_api::typed_client::recording_list(&mut list_client)
+        let recording = crate::runtime::typed_recording::recording_list(&mut list_client)
             .await?
             .into_iter()
             .find(|summary| summary.id == stopped_id);

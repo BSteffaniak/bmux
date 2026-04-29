@@ -1051,8 +1051,7 @@ pub async fn run_session_attach_with_client(
     }
 
     let capture_targets =
-        match bmux_recording_plugin_api::typed_client::recording_capture_targets(&mut client).await
-        {
+        match crate::runtime::typed_recording::recording_capture_targets(&mut client).await {
             Ok(targets) => targets,
             Err(error) => {
                 tracing::warn!("failed querying recording capture targets on attach: {error}");

@@ -1206,26 +1206,22 @@ fn plugin_api_crates_have_no_concrete_state() {
     );
 }
 
-/// Verify that remaining handwritten typed-client helper modules expose
-/// transport-agnostic helpers while generated-client migrations are in
-/// progress.
+/// Verify migrated plugin API crates do not reintroduce public
+/// handwritten transport-client modules.
 #[test]
-fn plugin_api_crates_expose_typed_client_helpers() {
-    let crates = [(
-        "plugins/recording-plugin-api",
-        include_str!("../../../plugins/recording-plugin-api/src/typed_client.rs"),
-    )];
-    for (path, src) in crates {
+fn plugin_api_crates_do_not_reintroduce_migrated_typed_clients() {
+    let repo = repo_root();
+    for path in [
+        "plugins/clients-plugin-api/src/typed_client.rs",
+        "plugins/control-catalog-plugin-api/src/typed_client.rs",
+        "plugins/pane-runtime-plugin-api/src/typed_client.rs",
+        "plugins/performance-plugin-api/src/typed_client.rs",
+        "plugins/recording-plugin-api/src/typed_client.rs",
+        "plugins/snapshot-plugin-api/src/typed_client.rs",
+    ] {
         assert!(
-            src.contains("TypedDispatchClient"),
-            "{path}/src/typed_client.rs must reference \
-             `TypedDispatchClient` so callers can drive the helpers \
-             through any transport",
-        );
-        assert!(
-            src.contains("pub async fn "),
-            "{path}/src/typed_client.rs must expose at least one \
-             `pub async fn` helper",
+            !repo.join(path).exists(),
+            "{path} must stay deleted; callers should use generated clients or crate-private helpers",
         );
     }
 }

@@ -2468,7 +2468,7 @@ impl StreamingBmuxClient {
     }
 
     // Typed recording methods removed from StreamingBmuxClient; callers
-    // migrate to `bmux_recording_plugin_api::typed_client::*` helpers.
+    // migrate to typed recording helpers in the CLI/runtime layer.
 }
 
 impl TypedDispatchClient for StreamingBmuxClient {

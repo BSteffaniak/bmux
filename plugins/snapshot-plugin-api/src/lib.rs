@@ -1,9 +1,10 @@
 //! Typed public API of the bmux snapshot plugin.
 //!
 //! Hand-written (no BPDL). Hosts the shared config type,
-//! capability/interface ids, typed request/response wire enums, the
-//! `typed_client` helper module, and the `offline_snapshot` module
-//! that backs CLI fallbacks when the server is down.
+//! capability/interface ids, typed request/response wire enums, and
+//! the `offline_snapshot` module that backs CLI fallbacks when the
+//! server is down. Transport helpers live in consuming crates so this
+//! public API crate remains focused on stable snapshot types.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
@@ -11,7 +12,6 @@
 
 pub mod envelope;
 pub mod offline_snapshot;
-pub mod typed_client;
 
 use std::path::PathBuf;
 

@@ -386,8 +386,7 @@ pub(super) async fn run_server_recording_start(
     )
     .await?;
     let recording =
-        bmux_recording_plugin_api::typed_client::recording_rolling_start(&mut client, options)
-            .await?;
+        crate::runtime::typed_recording::recording_rolling_start(&mut client, options).await?;
     let name_display = recording.name.as_deref().unwrap_or("-");
     println!(
         "server rolling recording started: {} name={} path={}",
@@ -406,8 +405,7 @@ pub(super) async fn run_server_recording_stop(
         connection_context,
     )
     .await?;
-    let recording_id =
-        bmux_recording_plugin_api::typed_client::recording_rolling_stop(&mut client).await?;
+    let recording_id = crate::runtime::typed_recording::recording_rolling_stop(&mut client).await?;
     println!("server rolling recording stopped: {recording_id}");
     Ok(0)
 }
@@ -422,7 +420,7 @@ async fn fetch_server_recording_rolling_status(
         connection_context,
     )
     .await?;
-    Ok(bmux_recording_plugin_api::typed_client::recording_rolling_status(&mut client).await?)
+    crate::runtime::typed_recording::recording_rolling_status(&mut client).await
 }
 
 pub(super) async fn run_server_recording_status(
@@ -524,8 +522,7 @@ pub(super) async fn run_server_recording_clear(
     )
     .await?;
     let report =
-        bmux_recording_plugin_api::typed_client::recording_rolling_clear(&mut client, !no_restart)
-            .await?;
+        crate::runtime::typed_recording::recording_rolling_clear(&mut client, !no_restart).await?;
 
     if json {
         println!(
