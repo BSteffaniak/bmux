@@ -936,10 +936,6 @@ pub fn bundled_decoration_scripts() -> &'static [(&'static str, &'static str)] {
                 "performance_header",
                 include_str!("../assets/decorations/performance_header.lua"),
             ),
-            (
-                "cpu_heat",
-                include_str!("../assets/decorations/cpu_heat.lua"),
-            ),
         ]
     }
     #[cfg(not(feature = "bundled-decoration-scripts"))]
@@ -1247,12 +1243,12 @@ mod tests {
         }
 
         #[test]
-        fn bundled_cpu_heat_script_uses_metrics_state() {
+        fn bundled_performance_header_script_uses_metrics_state() {
             let backend = make_backend(ScriptHostAccess::default());
             backend
                 .compile(
-                    Path::new("cpu_heat.lua"),
-                    include_str!("../assets/decorations/cpu_heat.lua"),
+                    Path::new("performance_header.lua"),
+                    include_str!("../assets/decorations/performance_header.lua"),
                 )
                 .expect("compile");
             backend
@@ -1267,7 +1263,9 @@ mod tests {
                             "test-pane": {
                                 "available": true,
                                 "cpu_percent": 450.0,
-                                "cpu_normalized_percent": 86.0
+                                "cpu_normalized_percent": 86.0,
+                                "memory_bytes": 104_857_600,
+                                "process_count": 17
                             }
                         }
                     }),
@@ -1281,17 +1279,17 @@ mod tests {
             )));
             assert!(commands.iter().any(|command| matches!(
                 command,
-                bmux_scene_protocol::scene_protocol::PaintCommand::Text { .. }
+                bmux_scene_protocol::scene_protocol::PaintCommand::Text { text, .. } if text == " CPU 86% MEM 100M P 17 "
             )));
         }
 
         #[test]
-        fn bundled_cpu_heat_script_formats_zero_without_padding() {
+        fn bundled_performance_header_script_formats_zero_without_padding() {
             let backend = make_backend(ScriptHostAccess::default());
             backend
                 .compile(
-                    Path::new("cpu_heat.lua"),
-                    include_str!("../assets/decorations/cpu_heat.lua"),
+                    Path::new("performance_header.lua"),
+                    include_str!("../assets/decorations/performance_header.lua"),
                 )
                 .expect("compile");
             backend
@@ -1306,7 +1304,9 @@ mod tests {
                             "test-pane": {
                                 "available": true,
                                 "cpu_percent": 0.0,
-                                "cpu_normalized_percent": 0.0
+                                "cpu_normalized_percent": 0.0,
+                                "memory_bytes": 0,
+                                "process_count": 0
                             }
                         }
                     }),
@@ -1316,7 +1316,7 @@ mod tests {
             let commands = &outcome.surfaces["test-pane"];
             assert!(commands.iter().any(|command| matches!(
                 command,
-                bmux_scene_protocol::scene_protocol::PaintCommand::Text { text, .. } if text == " CPU 0% "
+                bmux_scene_protocol::scene_protocol::PaintCommand::Text { text, .. } if text == " CPU 0% MEM 0M P 0 "
             )));
         }
     }

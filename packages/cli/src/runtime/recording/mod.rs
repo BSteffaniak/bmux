@@ -1655,7 +1655,7 @@ fn analyze_perf_events(
         .collect();
     report
         .outlier_samples
-        .sort_by(|left, right| right.value_ms.cmp(&left.value_ms));
+        .sort_by_key(|sample| std::cmp::Reverse(sample.value_ms));
     report.outlier_samples.truncate(20);
 
     if let (Some(connect_ts_epoch_ms), Some(first_frame_ts_epoch_ms)) = (
@@ -5486,7 +5486,7 @@ pub(super) fn list_recordings_from_dir(recordings_root: &Path) -> Result<Vec<Rec
         }
     }
 
-    recordings.sort_by(|a, b| b.started_epoch_ms.cmp(&a.started_epoch_ms));
+    recordings.sort_by_key(|recording| std::cmp::Reverse(recording.started_epoch_ms));
     Ok(recordings)
 }
 

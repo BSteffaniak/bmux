@@ -557,8 +557,7 @@ impl AttachInputRuntime {
         let timeout_ms = config
             .keybindings
             .resolve_timeout()
-            .map(|timeout| timeout.timeout_ms())
-            .unwrap_or(None);
+            .map_or(None, |timeout| timeout.timeout_ms());
         let modes = config
             .keybindings
             .modes
@@ -1588,7 +1587,7 @@ fn parse_interactive_prompt_command(raw: &str) -> Result<InteractivePromptComman
         return Ok(InteractivePromptCommand::RunDsl(dsl.to_string()));
     }
 
-    bail!("unknown interactive command '{trimmed}' (expected n/c/l/s/:<dsl>/q/help)",)
+    bail!("unknown interactive command '{trimmed}' (expected n/c/l/s/:<dsl>/q/help)")
 }
 
 fn read_interactive_prompt_line() -> Result<Option<String>> {

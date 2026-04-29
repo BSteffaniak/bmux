@@ -549,11 +549,9 @@ impl Default for GatewayCandidateHealth {
 impl GatewayCandidateHealth {
     fn stability_score(&self) -> u64 {
         let samples = u64::from(self.successes) + u64::from(self.failures);
-        let failure_rate_bps = if samples == 0 {
-            5000
-        } else {
-            (u64::from(self.failures) * 10_000) / samples
-        };
+        let failure_rate_bps = (u64::from(self.failures) * 10_000)
+            .checked_div(samples)
+            .unwrap_or(5000);
         let breaker_penalty: u64 = match self.breaker_state {
             GatewayBreakerState::Closed => 0,
             GatewayBreakerState::HalfOpen => 80_000,
@@ -2740,15 +2738,13 @@ fn clear_cluster_gateway_runtime_state(paths: &ConfigPaths) -> Result<bool> {
 fn current_unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_secs().cast_signed())
-        .unwrap_or(0)
+        .map_or(0, |value| value.as_secs().cast_signed())
 }
 
 fn current_unix_timestamp_ms_u64() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(duration_millis_u64)
-        .unwrap_or(0)
+        .map_or(0, duration_millis_u64)
 }
 
 const fn build_create_share_request(
@@ -4849,8 +4845,7 @@ fn cluster_gateway_state_map() -> &'static Mutex<BTreeMap<String, ClusterGateway
 fn ensure_gateway_runtime_state_loaded() {
     let should_load = cluster_gateway_state_map()
         .lock()
-        .map(|state_map| state_map.is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|state_map| state_map.is_empty());
     if !should_load {
         return;
     }
@@ -5570,8 +5565,7 @@ fn clear_gateway_runtime_state_all() -> Result<bool> {
     ensure_gateway_runtime_state_loaded();
     let had_entries = cluster_gateway_state_map()
         .lock()
-        .map(|state_map| !state_map.is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|state_map| !state_map.is_empty());
     if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
         state_map.clear();
     }
@@ -6482,7 +6476,7 @@ fn gateway_doctor_slo_snapshot(
         cluster_name,
         definition,
         &GatewayHistoryQuery {
-            since: Some(Duration::from_secs(300)),
+            since: Some(Duration::from_mins(5)),
             ..GatewayHistoryQuery::default()
         },
     );
@@ -9658,7 +9652,7 @@ mod tests {
             && let Some(first) = cluster_state.history.first_mut()
         {
             first.observed_at = Instant::now()
-                .checked_sub(Duration::from_secs(3600))
+                .checked_sub(Duration::from_hours(1))
                 .expect("checked_sub should support one hour");
         }
 
@@ -9666,7 +9660,7 @@ mod tests {
             "prod",
             &ClusterGatewayDefinition::default(),
             &GatewayHistoryQuery {
-                since: Some(Duration::from_secs(60)),
+                since: Some(Duration::from_mins(1)),
                 ..GatewayHistoryQuery::default()
             },
         );

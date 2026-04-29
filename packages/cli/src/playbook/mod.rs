@@ -191,13 +191,13 @@ pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
             types::Action::SendKeys {
                 pane: Some(idx), ..
             }
-            | types::Action::FocusPane { target: idx } => {
-                if expected_pane_count < 2 && *idx > 1 {
-                    errors.push(format!(
-                        "step {}: targets pane {} but only {} pane(s) expected at this point",
-                        step.index, idx, expected_pane_count
-                    ));
-                }
+            | types::Action::FocusPane { target: idx }
+                if expected_pane_count < 2 && *idx > 1 =>
+            {
+                errors.push(format!(
+                    "step {}: targets pane {} but only {} pane(s) expected at this point",
+                    step.index, idx, expected_pane_count
+                ));
             }
 
             _ => {}
@@ -326,7 +326,7 @@ fn resolve_includes(
 
     // Insert included steps at their declared positions (in reverse order
     // to preserve indices as we insert).
-    insertions.sort_by(|a, b| b.0.cmp(&a.0)); // reverse sort by position
+    insertions.sort_by_key(|insertion| std::cmp::Reverse(insertion.0)); // reverse sort by position
     for (insert_at, steps) in insertions {
         let pos = insert_at.min(playbook.steps.len());
         for (i, step) in steps.into_iter().enumerate() {

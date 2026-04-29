@@ -11,7 +11,7 @@ and adjust the decoration style.
 The plugin ships four built-in border styles (`none`, `ascii`, `single`,
 `double`) plus a handful of bundled themes under `assets/themes/`
 (`hacker`, `cyberpunk`, `minimal`, `pulse-demo`, `rainbow-snake`,
-`cpu-heat`). ASCII is the default, matching the characters the core renderer
+`performance`). ASCII is the default, matching the characters the core renderer
 falls back to when no theme is active.
 
 ## Startup ready gate

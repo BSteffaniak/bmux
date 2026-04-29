@@ -2910,8 +2910,7 @@ minimum = "1.0"
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+            .is_ok_and(|status| status.success())
     }
 
     #[cfg(unix)]

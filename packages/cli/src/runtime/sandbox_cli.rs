@@ -22,7 +22,7 @@ use crate::sandbox_meta::{
 
 const SANDBOX_PREFIX: &str = "bmux-sbx-";
 const PID_MARKER_FILE: &str = "sandbox.pid";
-const DEFAULT_CLEANUP_MIN_AGE: Duration = Duration::from_secs(300);
+const DEFAULT_CLEANUP_MIN_AGE: Duration = Duration::from_mins(5);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const LOCK_FRESHNESS: Duration = Duration::from_secs(15);
 const SANDBOX_JSON_SCHEMA_VERSION: u32 = 1;
@@ -660,7 +660,7 @@ pub(super) fn run_sandbox_list(
         .map(|candidate| sandbox_list_entry(&candidate))
         .collect::<Vec<_>>();
 
-    entries.sort_by(|left, right| left.age_secs.cmp(&right.age_secs));
+    entries.sort_by_key(|entry| entry.age_secs);
 
     if let Some(filter) = status_filter {
         entries.retain(|entry| entry.status == filter);

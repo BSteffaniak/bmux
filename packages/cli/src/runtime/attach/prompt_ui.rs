@@ -918,10 +918,10 @@ fn validate_form_field(
                 run_prompt_validation(rule, value)?;
             }
         }
-        (PromptFormFieldKind::Integer { min, max, .. }, PromptFormValue::Integer(value)) => {
-            if min.is_some_and(|min| *value < min) || max.is_some_and(|max| *value > max) {
-                return Err("value is out of range".to_string());
-            }
+        (PromptFormFieldKind::Integer { min, max, .. }, PromptFormValue::Integer(value))
+            if min.is_some_and(|min| *value < min) || max.is_some_and(|max| *value > max) =>
+        {
+            return Err("value is out of range".to_string());
         }
         (PromptFormFieldKind::Number { min, max, .. }, PromptFormValue::Number(value)) => {
             let parsed = value
@@ -940,10 +940,10 @@ fn validate_form_field(
                 return Err("value is out of range".to_string());
             }
         }
-        (PromptFormFieldKind::MultiToggle { min_selected, .. }, PromptFormValue::Multi(values)) => {
-            if values.len() < *min_selected {
-                return Err(format!("select at least {min_selected}"));
-            }
+        (PromptFormFieldKind::MultiToggle { min_selected, .. }, PromptFormValue::Multi(values))
+            if values.len() < *min_selected =>
+        {
+            return Err(format!("select at least {min_selected}"));
         }
         _ => {}
     }

@@ -717,7 +717,7 @@ mod tests {
         let action = Action::WaitFor {
             pattern: "hello".to_string(),
             pane: None,
-            timeout: Duration::from_millis(5000),
+            timeout: Duration::from_secs(5),
             retry: 1,
         };
         let (dsl, parsed) = round_trip(&action);
@@ -731,7 +731,7 @@ mod tests {
                 pattern, timeout, ..
             } => {
                 assert_eq!(pattern, "hello");
-                assert_eq!(timeout, Duration::from_millis(5000));
+                assert_eq!(timeout, Duration::from_secs(5));
             }
             other => panic!("expected WaitFor, got {other:?}"),
         }
@@ -742,7 +742,7 @@ mod tests {
         let action = Action::WaitFor {
             pattern: "prompt\\$".to_string(),
             pane: Some(1),
-            timeout: Duration::from_millis(10000),
+            timeout: Duration::from_secs(10),
             retry: 1,
         };
         let (dsl, parsed) = round_trip(&action);
@@ -759,7 +759,7 @@ mod tests {
             } => {
                 assert_eq!(pattern, "prompt\\$");
                 assert_eq!(pane, Some(1));
-                assert_eq!(timeout, Duration::from_millis(10000));
+                assert_eq!(timeout, Duration::from_secs(10));
             }
             other => panic!("expected WaitFor, got {other:?}"),
         }
@@ -878,14 +878,14 @@ mod tests {
     fn to_dsl_round_trip_wait_for_event() {
         let action = Action::WaitForEvent {
             event: "session_created".to_string(),
-            timeout: Duration::from_millis(5000),
+            timeout: Duration::from_secs(5),
         };
         let (dsl, parsed) = round_trip(&action);
         assert!(!dsl.contains("timeout="), "default timeout omitted: {dsl}");
         match parsed {
             Action::WaitForEvent { event, timeout } => {
                 assert_eq!(event, "session_created");
-                assert_eq!(timeout, Duration::from_millis(5000));
+                assert_eq!(timeout, Duration::from_secs(5));
             }
             other => panic!("expected WaitForEvent, got {other:?}"),
         }
@@ -933,7 +933,7 @@ mod tests {
         let action = Action::WaitFor {
             pattern: "hello".to_string(),
             pane: None,
-            timeout: Duration::from_millis(5000),
+            timeout: Duration::from_secs(5),
             retry: 3,
         };
         let (dsl, parsed) = round_trip(&action);

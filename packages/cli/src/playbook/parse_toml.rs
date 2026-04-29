@@ -386,7 +386,7 @@ contains = "hello"
         assert_eq!(playbook.config.viewport.cols, 120);
         assert_eq!(playbook.config.viewport.rows, 50);
         assert_eq!(playbook.config.shell.as_deref(), Some("/bin/bash"));
-        assert_eq!(playbook.config.timeout, Duration::from_millis(15000));
+        assert_eq!(playbook.config.timeout, Duration::from_secs(15));
         assert!(playbook.config.record);
         assert_eq!(playbook.config.plugins.enable, vec!["bmux.windows"]);
         assert_eq!(playbook.steps.len(), 5);

@@ -530,7 +530,7 @@ snapshot id=final
         assert_eq!(playbook.config.name.as_deref(), Some("test-playbook"));
         assert_eq!(playbook.config.viewport.cols, 120);
         assert_eq!(playbook.config.viewport.rows, 50);
-        assert_eq!(playbook.config.timeout, Duration::from_millis(10000));
+        assert_eq!(playbook.config.timeout, Duration::from_secs(10));
         assert_eq!(playbook.steps.len(), 5);
         assert_eq!(playbook.steps[0].action.name(), "new-session");
         assert_eq!(playbook.steps[1].action.name(), "send-keys");

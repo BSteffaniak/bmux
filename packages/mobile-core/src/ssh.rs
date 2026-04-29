@@ -407,20 +407,14 @@ pub fn parse_ssh_target(value: &str) -> Result<SshTarget> {
                 "strict" | "strict_host_key_checking" => {
                     strict_host_key_checking = parse_bool_flag(value)?;
                 }
-                "host_key_fp" | "host_key_fingerprint" | "host_key_sha256" => {
-                    if !value.is_empty() {
-                        host_key_fingerprint_sha256 = Some(normalize_sha256_fingerprint(value)?);
-                    }
+                "host_key_fp" | "host_key_fingerprint" | "host_key_sha256" if !value.is_empty() => {
+                    host_key_fingerprint_sha256 = Some(normalize_sha256_fingerprint(value)?);
                 }
-                "known_hosts" | "known_hosts_file" => {
-                    if !value.is_empty() {
-                        known_hosts_file = Some(PathBuf::from(value));
-                    }
+                "known_hosts" | "known_hosts_file" if !value.is_empty() => {
+                    known_hosts_file = Some(PathBuf::from(value));
                 }
-                "identity" | "identity_file" => {
-                    if !value.is_empty() {
-                        identity_file = Some(PathBuf::from(value));
-                    }
+                "identity" | "identity_file" if !value.is_empty() => {
+                    identity_file = Some(PathBuf::from(value));
                 }
                 _ => {}
             }

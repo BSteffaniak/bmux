@@ -307,11 +307,7 @@ fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
         &all_plugin_ids,
         &context.connection.config_dir_candidates,
     );
-    if active
-        .stack
-        .iter()
-        .any(|name| name == "performance" || name == "cpu-heat")
-    {
+    if active.stack.iter().any(|name| name == "performance") {
         apply_persisted_performance_theme_settings(context);
     }
 }
@@ -456,7 +452,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
         ) {
             persist_theme_name(&context, &name);
         }
-        if name == "performance" || name == "cpu-heat" {
+        if name == "performance" {
             configure_performance_theme_header(&context, settings.persistence).await;
         }
         debug!(theme = %name, "theme selected");
@@ -816,7 +812,6 @@ const fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
             "performance",
             include_str!("../assets/themes/performance.toml"),
         ),
-        ("cpu-heat", include_str!("../assets/themes/cpu-heat.toml")),
         (
             "mode-aware",
             include_str!("../assets/themes/mode-aware.toml"),

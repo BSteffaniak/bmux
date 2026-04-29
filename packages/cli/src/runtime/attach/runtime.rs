@@ -796,17 +796,11 @@ async fn maybe_emit_attach_perf_window(
             "render_ms_max".to_string(),
             serde_json::Value::from(window.render_ms_max),
         );
-        if window.drain_ipc_calls > 0 {
-            object.insert(
-                "drain_ipc_ms_avg".to_string(),
-                serde_json::Value::from(window.drain_ipc_ms_sum / window.drain_ipc_calls),
-            );
+        if let Some(avg) = window.drain_ipc_ms_sum.checked_div(window.drain_ipc_calls) {
+            object.insert("drain_ipc_ms_avg".to_string(), serde_json::Value::from(avg));
         }
-        if window.render_frames > 0 {
-            object.insert(
-                "render_ms_avg".to_string(),
-                serde_json::Value::from(window.render_ms_sum / window.render_frames),
-            );
+        if let Some(avg) = window.render_ms_sum.checked_div(window.render_frames) {
+            object.insert("render_ms_avg".to_string(), serde_json::Value::from(avg));
         }
     }
     if trace && let Some(object) = payload.as_object_mut() {
@@ -3078,17 +3072,13 @@ pub async fn handle_attach_ui_action(
                 attach_scrollback_page_size(view_state).cast_signed(),
             );
         }
-        RuntimeAction::ScrollTop => {
-            if view_state.scrollback_active {
-                view_state.scrollback_offset = max_attach_scrollback(view_state);
-                clamp_attach_scrollback_cursor(view_state);
-            }
+        RuntimeAction::ScrollTop if view_state.scrollback_active => {
+            view_state.scrollback_offset = max_attach_scrollback(view_state);
+            clamp_attach_scrollback_cursor(view_state);
         }
-        RuntimeAction::ScrollBottom => {
-            if view_state.scrollback_active {
-                view_state.scrollback_offset = 0;
-                clamp_attach_scrollback_cursor(view_state);
-            }
+        RuntimeAction::ScrollBottom if view_state.scrollback_active => {
+            view_state.scrollback_offset = 0;
+            clamp_attach_scrollback_cursor(view_state);
         }
         RuntimeAction::MoveCursorLeft => {
             move_attach_scrollback_cursor_horizontal(view_state, -1);
@@ -3102,14 +3092,12 @@ pub async fn handle_attach_ui_action(
         RuntimeAction::MoveCursorDown => {
             move_attach_scrollback_cursor_vertical(view_state, 1);
         }
-        RuntimeAction::BeginSelection => {
-            if begin_attach_selection(view_state) {
-                view_state.set_transient_status(
-                    ATTACH_SELECTION_STARTED_STATUS,
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            }
+        RuntimeAction::BeginSelection if begin_attach_selection(view_state) => {
+            view_state.set_transient_status(
+                ATTACH_SELECTION_STARTED_STATUS,
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
         }
         RuntimeAction::CopyScrollback => {
             copy_attach_selection(view_state, false);
@@ -4900,8 +4888,7 @@ pub fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
     let timeout_ms = config
         .keybindings
         .resolve_timeout()
-        .map(|timeout| timeout.timeout_ms())
-        .unwrap_or(None);
+        .map_or(None, |timeout| timeout.timeout_ms());
     let modal_modes = config
         .keybindings
         .modes

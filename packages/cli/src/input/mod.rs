@@ -661,11 +661,7 @@ impl InputProcessor {
     }
 
     fn resolve_pending(&mut self, actions: &mut Vec<RuntimeAction>, force_timeout: bool) {
-        loop {
-            let Some(pending) = &self.pending else {
-                break;
-            };
-
+        while let Some(pending) = &self.pending {
             let strokes: Vec<KeyStroke> = pending.decoded.iter().map(|item| item.stroke).collect();
 
             if self.scroll_mode {

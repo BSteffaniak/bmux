@@ -1297,7 +1297,7 @@ async fn run_repl(
         }
 
         // Use a far-future deadline for individual steps if no session timeout.
-        let step_deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+        let step_deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_hours(1));
 
         let step_start = Instant::now();
         let mut no_display_track: Option<super::display_track::PlaybookDisplayTrackWriter> = None;

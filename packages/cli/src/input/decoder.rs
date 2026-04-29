@@ -23,10 +23,7 @@ impl ByteDecoder {
         self.pending.extend_from_slice(bytes);
         let mut events = Vec::new();
 
-        loop {
-            let Some((stroke, consumed)) = decode_one(&self.pending) else {
-                break;
-            };
+        while let Some((stroke, consumed)) = decode_one(&self.pending) {
             self.pending.drain(0..consumed);
             events.push(InputEvent::Key(stroke));
         }
