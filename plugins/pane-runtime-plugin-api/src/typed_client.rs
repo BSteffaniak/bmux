@@ -512,8 +512,23 @@ fn session_selector_from_ipc(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AttachContextArgs {
-    selector: bmux_ipc::ContextSelector,
+    selector: attach_runtime_commands::ContextSelector,
     can_write: bool,
+}
+
+fn context_selector_from_ipc(
+    selector: bmux_ipc::ContextSelector,
+) -> attach_runtime_commands::ContextSelector {
+    match selector {
+        bmux_ipc::ContextSelector::ById(id) => attach_runtime_commands::ContextSelector {
+            id: Some(id),
+            name: None,
+        },
+        bmux_ipc::ContextSelector::ByName(name) => attach_runtime_commands::ContextSelector {
+            id: None,
+            name: Some(name),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -616,7 +631,7 @@ pub async fn attach_context<C: TypedDispatchClient>(
         attach_runtime_commands::INTERFACE_ID.as_str(),
         attach_runtime_commands::OP_ATTACH_CONTEXT.as_str(),
         &AttachContextArgs {
-            selector,
+            selector: context_selector_from_ipc(selector),
             can_write,
         },
     )

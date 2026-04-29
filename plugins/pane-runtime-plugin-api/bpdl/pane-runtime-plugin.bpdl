@@ -228,6 +228,13 @@ interface attach-runtime-commands {
         name: string?,
     }
 
+    // Selector identifying a context. Exactly one of `id` or `name`
+    // should be populated; `id` wins when both are set.
+    record context-selector {
+        id: uuid?,
+        name: string?,
+    }
+
     variant attach-command-error {
         session-not-found,
         invalid-grant,
@@ -242,12 +249,13 @@ interface attach-runtime-commands {
     ) -> result<attach-grant, attach-command-error>;
 
     command attach-context(
-        context_id: uuid,
+        selector: context-selector,
         can_write: bool,
     ) -> result<attach-grant, attach-command-error>;
 
     command attach-open(
-        grant_token: uuid,
+        session_id: uuid,
+        attach_token: uuid,
     ) -> result<attach-ready, attach-command-error>;
 
     command attach-input(

@@ -9,10 +9,10 @@
 //! and wire-event emission.
 
 use bmux_attach_token_state::AttachTokenValidationError;
-use bmux_ipc::{AttachGrant, ContextSelector, Event};
+use bmux_ipc::{AttachGrant, ContextSelector as IpcContextSelector, Event};
 use bmux_pane_runtime_plugin_api::attach_runtime_commands::{
     AttachCommandError, AttachGrant as AttachGrantRecord, AttachOutput as AttachOutputRecord,
-    AttachReady, AttachRetargetReady, AttachViewportSet, SessionSelector,
+    AttachReady, AttachRetargetReady, AttachViewportSet, ContextSelector, SessionSelector,
 };
 use bmux_pane_runtime_state::SessionRuntimeError;
 use bmux_plugin::global_plugin_state_registry;
@@ -240,6 +240,18 @@ fn resolve_session_by_selector(
     })
 }
 
+fn context_selector_to_ipc(
+    selector: &ContextSelector,
+) -> Result<IpcContextSelector, AttachCommandError> {
+    if let Some(id) = selector.id {
+        Ok(IpcContextSelector::ById(id))
+    } else if let Some(name) = selector.name.clone() {
+        Ok(IpcContextSelector::ByName(name))
+    } else {
+        Err(failed("attach-context requires a context selector"))
+    }
+}
+
 fn to_api_grant(grant: &AttachGrant) -> AttachGrantRecord {
     AttachGrantRecord {
         token: grant.attach_token,
@@ -309,7 +321,7 @@ pub fn attach_context(
 
     let context = contexts
         .0
-        .select_for_client(client_id, &req.selector)
+        .select_for_client(client_id, &context_selector_to_ipc(&req.selector)?)
         .map_err(|m| failed(m.to_string()))?;
 
     let Some(next_session_id) = contexts.0.current_session_for_client(client_id) else {
@@ -533,7 +545,7 @@ pub fn attach_retarget_context(
         } else {
             let context = contexts
                 .0
-                .select_for_client(client_id, &ContextSelector::ById(req.context_id))
+                .select_for_client(client_id, &IpcContextSelector::ById(req.context_id))
                 .map_err(|m| failed(m.to_string()))?;
             let Some(selected_session_id) = contexts.0.current_session_for_client(client_id) else {
                 return Err(failed("context has no attached runtime"));
