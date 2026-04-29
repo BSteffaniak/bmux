@@ -262,6 +262,44 @@ fn pane_input_mode_from_record(
     })
 }
 
+fn pane_runtime_session_selector(
+    selector: SessionSelector,
+) -> bmux_pane_runtime_plugin_api::attach_runtime_commands::SessionSelector {
+    match selector {
+        SessionSelector::ById(id) => {
+            bmux_pane_runtime_plugin_api::attach_runtime_commands::SessionSelector {
+                id: Some(id),
+                name: None,
+            }
+        }
+        SessionSelector::ByName(name) => {
+            bmux_pane_runtime_plugin_api::attach_runtime_commands::SessionSelector {
+                id: None,
+                name: Some(name),
+            }
+        }
+    }
+}
+
+fn pane_runtime_context_selector(
+    selector: ContextSelector,
+) -> bmux_pane_runtime_plugin_api::attach_runtime_commands::ContextSelector {
+    match selector {
+        ContextSelector::ById(id) => {
+            bmux_pane_runtime_plugin_api::attach_runtime_commands::ContextSelector {
+                id: Some(id),
+                name: None,
+            }
+        }
+        ContextSelector::ByName(name) => {
+            bmux_pane_runtime_plugin_api::attach_runtime_commands::ContextSelector {
+                id: None,
+                name: Some(name),
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ClientStream {
     Local(LocalIpcStream),
@@ -776,7 +814,12 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_grant(&mut self, selector: SessionSelector) -> Result<AttachGrant> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_session(self, selector, true).await
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_session(
+            self,
+            pane_runtime_session_selector(selector),
+            true,
+        )
+        .await
         {
             Ok(Ok(grant)) => Ok(AttachGrant {
                 attach_token: grant.token,
@@ -801,7 +844,12 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_context_grant(&mut self, selector: ContextSelector) -> Result<AttachGrant> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_context(self, selector, true).await
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_context(
+            self,
+            pane_runtime_context_selector(selector),
+            true,
+        )
+        .await
         {
             Ok(Ok(grant)) => Ok(AttachGrant {
                 attach_token: grant.token,
@@ -848,7 +896,7 @@ impl BmuxClient {
         status_top_inset: u16,
         status_bottom_inset: u16,
     ) -> Result<AttachOpenInfo> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_retarget_context(
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_retarget_context(
             self,
             context_id,
             true,
@@ -893,7 +941,7 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn open_attach_stream_info(&mut self, grant: &AttachGrant) -> Result<AttachOpenInfo> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_open(
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_open(
             self,
             grant.session_id,
             grant.attach_token,
@@ -922,7 +970,7 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn detach(&mut self) -> Result<()> {
-        match bmux_pane_runtime_plugin_api::typed_client::detach(self).await {
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::detach(self).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(err)) => Err(ClientError::ServerError {
                 code: bmux_ipc::ErrorCode::Internal,
@@ -941,7 +989,7 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn set_attach_policy(&mut self, allow_detach: bool) -> Result<()> {
-        match bmux_pane_runtime_plugin_api::typed_client::set_client_attach_policy(
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::set_client_attach_policy(
             self,
             allow_detach,
         )
@@ -965,7 +1013,10 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> Result<usize> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_input(self, session_id, data).await
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_input(
+            self, session_id, data,
+        )
+        .await
         {
             Ok(Ok(accepted)) => Ok(accepted.bytes as usize),
             Ok(Err(err)) => Err(ClientError::ServerError {
@@ -991,7 +1042,7 @@ impl BmuxClient {
         data: Vec<u8>,
     ) -> Result<usize> {
         let bytes_len = data.len();
-        match bmux_pane_runtime_plugin_api::typed_client::pane_direct_input(
+        match bmux_pane_runtime_plugin_api::pane_runtime_commands::client::pane_direct_input(
             self, session_id, pane_id, data,
         )
         .await
@@ -1036,7 +1087,7 @@ impl BmuxClient {
         status_top_inset: u16,
         status_bottom_inset: u16,
     ) -> Result<(u16, u16)> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_set_viewport(
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_set_viewport(
             self,
             session_id,
             cols,
@@ -1067,7 +1118,7 @@ impl BmuxClient {
     /// Returns an error if request or response validation fails.
     pub async fn attach_output(&mut self, session_id: Uuid, max_bytes: usize) -> Result<Vec<u8>> {
         let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
-        match bmux_pane_runtime_plugin_api::typed_client::attach_output(
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_output(
             self,
             session_id,
             max_bytes_u32,
@@ -1092,8 +1143,10 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_layout(&mut self, session_id: Uuid) -> Result<AttachLayoutState> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_layout_state(self, session_id)
-            .await
+        match bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_layout_state(
+            self, session_id,
+        )
+        .await
         {
             Ok(Ok(layout)) => decode_attach_layout(&layout),
             Ok(Err(err)) => Err(ClientError::ServerError {
@@ -1119,7 +1172,7 @@ impl BmuxClient {
         max_bytes: usize,
     ) -> Result<PaneOutputBatchResult> {
         let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
-        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_output_batch(
+        match bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_pane_output_batch(
             self,
             session_id,
             pane_ids,
@@ -1157,7 +1210,7 @@ impl BmuxClient {
         pane_ids: Vec<Uuid>,
         since_sequences: Vec<u64>,
     ) -> Result<Vec<AttachPaneImageDelta>> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_images(
+        match bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_pane_images(
             self,
             session_id,
             pane_ids,
@@ -1192,7 +1245,7 @@ impl BmuxClient {
         max_bytes_per_pane: usize,
     ) -> Result<AttachSnapshotState> {
         let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
-        match bmux_pane_runtime_plugin_api::typed_client::attach_snapshot_state(
+        match bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_snapshot_state(
             self,
             session_id,
             max_bytes_u32,
@@ -1223,7 +1276,7 @@ impl BmuxClient {
         max_bytes_per_pane: usize,
     ) -> Result<AttachPaneSnapshotState> {
         let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
-        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_snapshot_state(
+        match bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_pane_snapshot_state(
             self,
             session_id,
             pane_ids,
@@ -1877,7 +1930,12 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_grant(&mut self, selector: SessionSelector) -> Result<AttachGrant> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_session(self, selector, true).await
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_session(
+            self,
+            pane_runtime_session_selector(selector),
+            true,
+        )
+        .await
         {
             Ok(Ok(grant)) => Ok(AttachGrant {
                 attach_token: grant.token,
@@ -1902,7 +1960,12 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_context_grant(&mut self, selector: ContextSelector) -> Result<AttachGrant> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_context(self, selector, true).await
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_context(
+            self,
+            pane_runtime_context_selector(selector),
+            true,
+        )
+        .await
         {
             Ok(Ok(grant)) => Ok(AttachGrant {
                 attach_token: grant.token,
@@ -1934,7 +1997,7 @@ impl StreamingBmuxClient {
         status_top_inset: u16,
         status_bottom_inset: u16,
     ) -> Result<AttachOpenInfo> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_retarget_context(
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_retarget_context(
             self,
             context_id,
             true,
@@ -1969,7 +2032,7 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn open_attach_stream_info(&mut self, grant: &AttachGrant) -> Result<AttachOpenInfo> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_open(
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_open(
             self,
             grant.session_id,
             grant.attach_token,
@@ -2005,7 +2068,7 @@ impl StreamingBmuxClient {
         status_top_inset: u16,
         status_bottom_inset: u16,
     ) -> Result<(u16, u16)> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_set_viewport(
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_set_viewport(
             self,
             session_id,
             cols,
@@ -2035,7 +2098,10 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> Result<()> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_input(self, session_id, data).await
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::attach_input(
+            self, session_id, data,
+        )
+        .await
         {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(err)) => Err(ClientError::ServerError {
@@ -2055,8 +2121,10 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach_layout(&mut self, session_id: Uuid) -> Result<AttachLayoutState> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_layout_state(self, session_id)
-            .await
+        match bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_layout_state(
+            self, session_id,
+        )
+        .await
         {
             Ok(Ok(layout)) => decode_attach_layout(&layout),
             Ok(Err(err)) => Err(ClientError::ServerError {
@@ -2082,7 +2150,7 @@ impl StreamingBmuxClient {
         max_bytes: usize,
     ) -> Result<PaneOutputBatchResult> {
         let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
-        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_output_batch(
+        match bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_pane_output_batch(
             self,
             session_id,
             pane_ids,
@@ -2120,7 +2188,7 @@ impl StreamingBmuxClient {
         pane_ids: Vec<Uuid>,
         since_sequences: Vec<u64>,
     ) -> Result<Vec<AttachPaneImageDelta>> {
-        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_images(
+        match bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_pane_images(
             self,
             session_id,
             pane_ids,
@@ -2155,7 +2223,7 @@ impl StreamingBmuxClient {
         max_bytes_per_pane: usize,
     ) -> Result<AttachSnapshotState> {
         let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
-        match bmux_pane_runtime_plugin_api::typed_client::attach_snapshot_state(
+        match bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_snapshot_state(
             self,
             session_id,
             max_bytes_u32,
@@ -2186,7 +2254,7 @@ impl StreamingBmuxClient {
         max_bytes_per_pane: usize,
     ) -> Result<AttachPaneSnapshotState> {
         let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
-        match bmux_pane_runtime_plugin_api::typed_client::attach_pane_snapshot_state(
+        match bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_pane_snapshot_state(
             self,
             session_id,
             pane_ids,
@@ -2228,7 +2296,7 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn detach(&mut self) -> Result<()> {
-        match bmux_pane_runtime_plugin_api::typed_client::detach(self).await {
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::detach(self).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(err)) => Err(ClientError::ServerError {
                 code: bmux_ipc::ErrorCode::Internal,
@@ -2247,7 +2315,7 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn set_attach_policy(&mut self, allow_detach: bool) -> Result<()> {
-        match bmux_pane_runtime_plugin_api::typed_client::set_client_attach_policy(
+        match bmux_pane_runtime_plugin_api::attach_runtime_commands::client::set_client_attach_policy(
             self,
             allow_detach,
         )
@@ -2382,7 +2450,7 @@ impl StreamingBmuxClient {
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> Result<()> {
-        match bmux_pane_runtime_plugin_api::typed_client::pane_direct_input(
+        match bmux_pane_runtime_plugin_api::pane_runtime_commands::client::pane_direct_input(
             self, session_id, pane_id, data,
         )
         .await

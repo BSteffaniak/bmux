@@ -1761,11 +1761,9 @@ fn pane_runtime_plugin_owns_orchestration() {
     }
 }
 
-/// The BPDL contract, typed-client helper, and plugin handler must
-/// agree on the `resize-pane` wire shape. A stale schema here silently
-/// breaks cross-process typed dispatch because callers encode the
-/// hand-written helper shape while generated docs/traits advertise a
-/// different operation shape.
+/// The BPDL contract and plugin handler must agree on the `resize-pane`
+/// wire shape. A stale schema here silently breaks cross-process typed
+/// dispatch because generated clients encode the BPDL shape.
 #[test]
 fn pane_runtime_resize_contract_uses_direction_and_cells() {
     let repo = repo_root();
@@ -1773,9 +1771,6 @@ fn pane_runtime_resize_contract_uses_direction_and_cells() {
         repo.join("plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl"),
     )
     .expect("pane-runtime BPDL should be readable");
-    let typed_client =
-        std::fs::read_to_string(repo.join("plugins/pane-runtime-plugin-api/src/typed_client.rs"))
-            .expect("pane-runtime typed_client.rs should be readable");
     let handler = std::fs::read_to_string(
         repo.join("plugins/pane-runtime-plugin/src/handlers/pane_commands.rs"),
     )
@@ -1788,15 +1783,13 @@ fn pane_runtime_resize_contract_uses_direction_and_cells() {
             && !bpdl.contains("delta_percent"),
         "pane-runtime BPDL resize-pane contract must use direction + cells",
     );
-    for source in [typed_client.as_str(), handler.as_str()] {
-        assert!(
-            source.contains("struct ResizePaneArgs")
-                && source.contains("direction: String")
-                && source.contains("cells: u16")
-                && !source.contains("delta_percent"),
-            "pane-runtime resize typed-client and handler args must match BPDL direction + cells shape",
-        );
-    }
+    assert!(
+        handler.contains("struct ResizePaneArgs")
+            && handler.contains("direction: String")
+            && handler.contains("cells: u16")
+            && !handler.contains("delta_percent"),
+        "pane-runtime resize handler args must match BPDL direction + cells shape",
+    );
 }
 
 // ── Capability-declaration guardrail ─────────────────────────────────────────

@@ -16,14 +16,13 @@ bmux_ipc                  = { workspace = true }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std"] }
-thiserror                 = { workspace = true }
 uuid                      = { workspace = true, features = ["serde", "std"] }
 
 [package.metadata.cargo-machete]
-# `bmux_codec`, `serde`, and `uuid` are consumed by code generated from the BPDL
+# `bmux_codec`, `bmux_ipc`, `bmux_plugin_sdk`, and `uuid` are consumed by code generated from the BPDL
 # schema via the `bmux_plugin_schema_macros::schema!` proc macro;
 # cargo-machete cannot see into proc-macro-generated source.
-ignored = ["bmux_codec", "serde", "uuid"]
+ignored = ["bmux_codec", "bmux_ipc", "bmux_plugin_sdk", "uuid"]
 
 [features]
 default          = []

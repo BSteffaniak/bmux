@@ -31,7 +31,3 @@ pub struct PaneRuntimePluginConfig {
     #[serde(default)]
     pub shell_integration_root: Option<std::path::PathBuf>,
 }
-
-/// Typed-client helpers for invoking this plugin's services from any
-/// `TypedDispatchClient` (production `bmux_client`, tests, mocks).
-pub mod typed_client;
