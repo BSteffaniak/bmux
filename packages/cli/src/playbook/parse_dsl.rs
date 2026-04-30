@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use super::types::{
-    Action, Playbook, PlaybookConfig, PlaybookRenderRowRef, RenderAssertion, ServiceKind,
-    SplitDirection, Step,
+    Action, Playbook, PlaybookConfig, PlaybookRenderRowRef, PlaybookRenderRowSegmentRef,
+    RenderAssertion, ServiceKind, SplitDirection, Step,
 };
 
 /// Parse a playbook from the line-oriented DSL format.
@@ -407,6 +407,10 @@ fn parse_render_assertion(args: &BTreeMap<String, String>) -> Result<RenderAsser
         .get("expected_emitted_rows")
         .map(|value| parse_render_row_refs(value))
         .transpose()?;
+    assertion.expected_emitted_row_segments = args
+        .get("expected_emitted_row_segments")
+        .map(|value| parse_render_row_segment_refs(value))
+        .transpose()?;
     Ok(assertion)
 }
 
@@ -424,6 +428,36 @@ fn parse_render_row_refs(value: &str) -> Result<Vec<PlaybookRenderRowRef>> {
             Ok(PlaybookRenderRowRef {
                 pane: pane.parse().context("invalid render row pane")?,
                 row: row.parse().context("invalid render row index")?,
+            })
+        })
+        .collect()
+}
+
+fn parse_render_row_segment_refs(value: &str) -> Result<Vec<PlaybookRenderRowSegmentRef>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    trimmed
+        .split(',')
+        .map(|entry| {
+            let parts = entry.split(':').collect::<Vec<_>>();
+            if parts.len() != 4 {
+                bail!(
+                    "invalid render row segment ref '{entry}', expected pane:row:start_col:cells"
+                );
+            }
+            Ok(PlaybookRenderRowSegmentRef {
+                pane: parts[0]
+                    .parse()
+                    .context("invalid render row segment pane")?,
+                row: parts[1].parse().context("invalid render row segment row")?,
+                start_col: parts[2]
+                    .parse()
+                    .context("invalid render row segment start_col")?,
+                cells: parts[3]
+                    .parse()
+                    .context("invalid render row segment cells")?,
             })
         })
         .collect()

@@ -41,9 +41,9 @@ use super::sandbox::SandboxServer;
 use super::screen::ScreenInspector;
 use super::subst::RuntimeVars;
 use super::types::{
-    Action, PaneCapture, Playbook, PlaybookRenderRowRef, PlaybookRenderSummary, PlaybookResult,
-    RenderAssertion, ServiceKind, SnapshotCapture, SplitDirection, Step, StepFailure, StepResult,
-    StepStatus,
+    Action, PaneCapture, Playbook, PlaybookRenderRowRef, PlaybookRenderRowSegmentRef,
+    PlaybookRenderSummary, PlaybookResult, RenderAssertion, ServiceKind, SnapshotCapture,
+    SplitDirection, Step, StepFailure, StepResult, StepStatus,
 };
 
 /// Default timeout for waiting for the sandbox server to start.
@@ -733,21 +733,32 @@ fn summarize_playbook_render_delta(
     for pane in after {
         let Some(previous) = before_by_index.get(&pane.index) else {
             full_frame = true;
-            let changed_rows = new_pane_render_rows(pane);
+            let (changed_rows, changed_segments) = new_pane_render_rows(pane);
             summary.rows_emitted = summary
                 .rows_emitted
                 .saturating_add(u64::try_from(changed_rows.len()).unwrap_or(u64::MAX));
-            summary.cells_emitted = summary
-                .cells_emitted
-                .saturating_add(u64::try_from(pane.screen_text.len()).unwrap_or(u64::MAX));
+            summary.row_segments_emitted = summary
+                .row_segments_emitted
+                .saturating_add(u64::try_from(changed_segments.len()).unwrap_or(u64::MAX));
+            summary.cells_emitted = summary.cells_emitted.saturating_add(
+                changed_segments
+                    .iter()
+                    .map(|segment| u64::from(segment.cells))
+                    .sum(),
+            );
             summary.emitted_rows.extend(changed_rows);
+            summary.emitted_row_segments.extend(changed_segments);
             continue;
         };
-        let (rows, cells, emitted_rows) =
+        let (rows, cells, emitted_rows, emitted_segments) =
             changed_render_rows(pane.index, &previous.screen_text, &pane.screen_text);
         summary.rows_emitted = summary.rows_emitted.saturating_add(rows);
+        summary.row_segments_emitted = summary
+            .row_segments_emitted
+            .saturating_add(u64::try_from(emitted_segments.len()).unwrap_or(u64::MAX));
         summary.cells_emitted = summary.cells_emitted.saturating_add(cells);
         summary.emitted_rows.extend(emitted_rows);
+        summary.emitted_row_segments.extend(emitted_segments);
     }
     if summary.rows_emitted > 0 || full_frame {
         summary.frames = 1;
@@ -761,41 +772,96 @@ fn summarize_playbook_render_delta(
     summary
 }
 
-fn new_pane_render_rows(pane: &PaneCapture) -> Vec<PlaybookRenderRowRef> {
+fn new_pane_render_rows(
+    pane: &PaneCapture,
+) -> (Vec<PlaybookRenderRowRef>, Vec<PlaybookRenderRowSegmentRef>) {
     pane.screen_text
         .lines()
         .enumerate()
-        .map(|(row, _line)| PlaybookRenderRowRef {
-            pane: pane.index,
-            row: u16::try_from(row).unwrap_or(u16::MAX),
+        .map(|(row, line)| {
+            let row = u16::try_from(row).unwrap_or(u16::MAX);
+            (
+                PlaybookRenderRowRef {
+                    pane: pane.index,
+                    row,
+                },
+                PlaybookRenderRowSegmentRef {
+                    pane: pane.index,
+                    row,
+                    start_col: 0,
+                    cells: u16::try_from(line.len()).unwrap_or(u16::MAX),
+                },
+            )
         })
-        .collect()
+        .unzip()
 }
 
 fn changed_render_rows(
     pane_index: u32,
     before: &str,
     after: &str,
-) -> (u64, u64, Vec<PlaybookRenderRowRef>) {
+) -> (
+    u64,
+    u64,
+    Vec<PlaybookRenderRowRef>,
+    Vec<PlaybookRenderRowSegmentRef>,
+) {
     let before_lines = before.lines().collect::<Vec<_>>();
     let after_lines = after.lines().collect::<Vec<_>>();
     let max_len = before_lines.len().max(after_lines.len());
     let mut rows = 0_u64;
     let mut cells = 0_u64;
     let mut emitted_rows = Vec::new();
+    let mut emitted_segments = Vec::new();
     for index in 0..max_len {
         let before_line = before_lines.get(index).copied().unwrap_or_default();
         let after_line = after_lines.get(index).copied().unwrap_or_default();
         if before_line != after_line {
+            let segment = changed_render_row_segment(pane_index, index, before_line, after_line);
             rows = rows.saturating_add(1);
-            cells = cells.saturating_add(u64::try_from(after_line.len()).unwrap_or(u64::MAX));
+            cells = cells.saturating_add(u64::from(segment.cells));
             emitted_rows.push(PlaybookRenderRowRef {
                 pane: pane_index,
                 row: u16::try_from(index).unwrap_or(u16::MAX),
             });
+            emitted_segments.push(segment);
         }
     }
-    (rows, cells, emitted_rows)
+    (rows, cells, emitted_rows, emitted_segments)
+}
+
+fn changed_render_row_segment(
+    pane_index: u32,
+    row: usize,
+    before: &str,
+    after: &str,
+) -> PlaybookRenderRowSegmentRef {
+    let before_bytes = before.as_bytes();
+    let after_bytes = after.as_bytes();
+    let min_len = before_bytes.len().min(after_bytes.len());
+    let start_col = before_bytes
+        .iter()
+        .zip(after_bytes.iter())
+        .take_while(|(before, after)| before == after)
+        .count();
+    let suffix = before_bytes[start_col..]
+        .iter()
+        .rev()
+        .zip(after_bytes[start_col..].iter().rev())
+        .take(min_len.saturating_sub(start_col))
+        .take_while(|(before, after)| before == after)
+        .count();
+    let changed_extent = before_bytes
+        .len()
+        .max(after_bytes.len())
+        .saturating_sub(start_col)
+        .saturating_sub(suffix);
+    PlaybookRenderRowSegmentRef {
+        pane: pane_index,
+        row: u16::try_from(row).unwrap_or(u16::MAX),
+        start_col: u16::try_from(start_col).unwrap_or(u16::MAX),
+        cells: u16::try_from(changed_extent).unwrap_or(u16::MAX),
+    }
 }
 
 fn aggregate_render_summaries(summaries: &[PlaybookRenderSummary]) -> PlaybookRenderSummary {
@@ -827,6 +893,8 @@ fn aggregate_render_summaries(summaries: &[PlaybookRenderSummary]) -> PlaybookRe
                 .saturating_add(summary.overlay_rendered_frames);
             acc.emitted_rows
                 .extend(summary.emitted_rows.iter().copied());
+            acc.emitted_row_segments
+                .extend(summary.emitted_row_segments.iter().copied());
             acc
         })
 }
@@ -896,6 +964,15 @@ fn validate_render_assertion(
             "assert-render since='{since}': expected_emitted_rows expected {}, got {}",
             super::types::render_row_refs_to_dsl(expected),
             super::types::render_row_refs_to_dsl(&summary.emitted_rows)
+        );
+    }
+    if let Some(expected) = assertion.expected_emitted_row_segments.as_deref()
+        && summary.emitted_row_segments != expected
+    {
+        bail!(
+            "assert-render since='{since}': expected_emitted_row_segments expected {}, got {}",
+            super::types::render_row_segment_refs_to_dsl(expected),
+            super::types::render_row_segment_refs_to_dsl(&summary.emitted_row_segments)
         );
     }
     Ok(())

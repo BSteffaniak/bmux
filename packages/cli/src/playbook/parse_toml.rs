@@ -6,8 +6,8 @@ use serde::Deserialize;
 
 use super::parse_dsl::decode_c_escapes;
 use super::types::{
-    Action, Playbook, PlaybookConfig, PlaybookRenderRowRef, PluginConfig, RenderAssertion,
-    ServiceKind, SplitDirection, Step, Viewport,
+    Action, Playbook, PlaybookConfig, PlaybookRenderRowRef, PlaybookRenderRowSegmentRef,
+    PluginConfig, RenderAssertion, ServiceKind, SplitDirection, Step, Viewport,
 };
 
 /// Parse a playbook from a TOML string.
@@ -258,6 +258,11 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
                         .as_deref()
                         .map(parse_render_row_refs_toml)
                         .transpose()?,
+                    expected_emitted_row_segments: step
+                        .expected_emitted_row_segments
+                        .as_deref()
+                        .map(parse_render_row_segment_refs_toml)
+                        .transpose()?,
                 },
             })
         }
@@ -274,6 +279,34 @@ fn parse_render_row_refs_toml(rows: &[String]) -> Result<Vec<PlaybookRenderRowRe
             Ok(PlaybookRenderRowRef {
                 pane: pane.parse().context("invalid render row pane")?,
                 row: row.parse().context("invalid render row index")?,
+            })
+        })
+        .collect()
+}
+
+fn parse_render_row_segment_refs_toml(
+    segments: &[String],
+) -> Result<Vec<PlaybookRenderRowSegmentRef>> {
+    segments
+        .iter()
+        .map(|entry| {
+            let parts = entry.split(':').collect::<Vec<_>>();
+            if parts.len() != 4 {
+                bail!(
+                    "invalid render row segment ref '{entry}', expected pane:row:start_col:cells"
+                );
+            }
+            Ok(PlaybookRenderRowSegmentRef {
+                pane: parts[0]
+                    .parse()
+                    .context("invalid render row segment pane")?,
+                row: parts[1].parse().context("invalid render row segment row")?,
+                start_col: parts[2]
+                    .parse()
+                    .context("invalid render row segment start_col")?,
+                cells: parts[3]
+                    .parse()
+                    .context("invalid render row segment cells")?,
             })
         })
         .collect()
@@ -384,6 +417,7 @@ struct RawStep {
     status_rendered: Option<bool>,
     overlay_rendered: Option<bool>,
     expected_emitted_rows: Option<Vec<String>>,
+    expected_emitted_row_segments: Option<Vec<String>>,
 }
 
 #[cfg(test)]

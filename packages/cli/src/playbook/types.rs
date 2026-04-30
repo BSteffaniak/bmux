@@ -250,12 +250,21 @@ pub struct RenderAssertion {
     pub status_rendered: Option<bool>,
     pub overlay_rendered: Option<bool>,
     pub expected_emitted_rows: Option<Vec<PlaybookRenderRowRef>>,
+    pub expected_emitted_row_segments: Option<Vec<PlaybookRenderRowSegmentRef>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlaybookRenderRowRef {
     pub pane: u32,
     pub row: u16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaybookRenderRowSegmentRef {
+    pub pane: u32,
+    pub row: u16,
+    pub start_col: u16,
+    pub cells: u16,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,6 +282,8 @@ pub struct PlaybookRenderSummary {
     pub overlay_rendered_frames: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emitted_rows: Vec<PlaybookRenderRowRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emitted_row_segments: Vec<PlaybookRenderRowSegmentRef>,
 }
 
 /// Plugin service invocation kind.
@@ -617,12 +628,34 @@ fn append_render_assertion_dsl(line: &mut String, assertion: &RenderAssertion) {
         )
         .unwrap();
     }
+    if let Some(segments) = &assertion.expected_emitted_row_segments {
+        write!(
+            line,
+            " expected_emitted_row_segments='{}'",
+            render_row_segment_refs_to_dsl(segments)
+        )
+        .unwrap();
+    }
 }
 
 #[must_use]
 pub fn render_row_refs_to_dsl(rows: &[PlaybookRenderRowRef]) -> String {
     rows.iter()
         .map(|row| format!("{}:{}", row.pane, row.row))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[must_use]
+pub fn render_row_segment_refs_to_dsl(segments: &[PlaybookRenderRowSegmentRef]) -> String {
+    segments
+        .iter()
+        .map(|segment| {
+            format!(
+                "{}:{}:{}:{}",
+                segment.pane, segment.row, segment.start_col, segment.cells
+            )
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -1046,6 +1079,12 @@ mod tests {
                     PlaybookRenderRowRef { pane: 1, row: 0 },
                     PlaybookRenderRowRef { pane: 1, row: 1 },
                 ]),
+                expected_emitted_row_segments: Some(vec![PlaybookRenderRowSegmentRef {
+                    pane: 1,
+                    row: 1,
+                    start_col: 3,
+                    cells: 5,
+                }]),
                 ..RenderAssertion::default()
             },
         });
@@ -1062,6 +1101,15 @@ mod tests {
                         PlaybookRenderRowRef { pane: 1, row: 0 },
                         PlaybookRenderRowRef { pane: 1, row: 1 },
                     ])
+                );
+                assert_eq!(
+                    assertion.expected_emitted_row_segments,
+                    Some(vec![PlaybookRenderRowSegmentRef {
+                        pane: 1,
+                        row: 1,
+                        start_col: 3,
+                        cells: 5,
+                    }])
                 );
             }
             other => panic!("expected AssertRender, got {other:?}"),
