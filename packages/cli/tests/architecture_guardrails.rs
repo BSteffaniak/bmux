@@ -976,8 +976,8 @@ fn control_catalog_snapshot_ipc_variant_is_absent() {
 /// Verify that the `bmux.control_catalog` plugin crate exists and
 /// owns the catalog revision counter. The counter used to live in
 /// `ServerState.control_catalog_revision`; after the migration the
-/// plugin owns it and server only bridges the typed `CatalogEvent`
-/// into `Event::ControlCatalogChanged` for cross-process subscribers.
+/// plugin owns it and streaming clients receive generated
+/// `control-catalog-events` through the generic plugin-bus forwarder.
 #[test]
 fn control_catalog_plugin_exists() {
     let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1004,8 +1004,8 @@ fn control_catalog_plugin_exists() {
         !server_source.contains("fn emit_control_catalog_changed("),
         "packages/server/src/lib.rs must not define \
          `emit_control_catalog_changed`; the control-catalog plugin \
-         now publishes `Event::ControlCatalogChanged` directly \
-         through the registered `WireEventSinkHandle`",
+         emits generated `control-catalog-events` forwarded through \
+         the generic plugin-bus bridge",
     );
     assert!(
         server_source.contains("register_wire_event_sink"),

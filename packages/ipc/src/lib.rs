@@ -578,14 +578,6 @@ pub struct ContextSummary {
     pub attributes: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlCatalogScope {
-    Sessions,
-    Contexts,
-    Bindings,
-}
-
 /// Summary returned when listing panes in the active session runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSummary {
@@ -1260,14 +1252,6 @@ pub enum Event {
     RecordingStopped {
         recording_id: Uuid,
     },
-    /// Control-plane catalog state changed (sessions/contexts/bindings).
-    /// Clients should refresh through the control-catalog plugin and reconcile local caches.
-    ControlCatalogChanged {
-        revision: u64,
-        scopes: Vec<ControlCatalogScope>,
-        #[serde(default)]
-        full_resync: bool,
-    },
     /// Plugin-bus emission forwarded from the server for client-side
     /// consumption. Forwarded kinds are declared in each plugin's
     /// manifest (`[[event_publications]] forward_to_streaming_clients
@@ -1923,11 +1907,6 @@ mod tests {
                 session_id: id,
                 pane_id: id2,
             },
-            Event::ControlCatalogChanged {
-                revision: 9,
-                scopes: vec![ControlCatalogScope::Sessions, ControlCatalogScope::Bindings],
-                full_resync: true,
-            },
         ];
 
         for (i, variant) in variants.iter().enumerate() {
@@ -2304,18 +2283,6 @@ mod tests {
         ];
         for sel in &selectors {
             assert_roundtrip(sel);
-        }
-    }
-
-    #[test]
-    fn control_catalog_scope_all_variants_roundtrip() {
-        let scopes = [
-            ControlCatalogScope::Sessions,
-            ControlCatalogScope::Contexts,
-            ControlCatalogScope::Bindings,
-        ];
-        for scope in &scopes {
-            assert_roundtrip(scope);
         }
     }
 

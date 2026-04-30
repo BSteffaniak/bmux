@@ -1319,7 +1319,6 @@ dependencies = [
  "bmux_context_state",
  "bmux_contexts_plugin_api",
  "bmux_control_catalog_plugin_api",
- "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_session_state",

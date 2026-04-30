@@ -10,12 +10,12 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_context_state::ContextStateHandle;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector,
-    ControlCatalogScope, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint,
-    PerformanceRecordingLevel, ProtocolContract, RecordingEventKind, RecordingPayload,
-    RecordingRollingStartOptions, Request, Response, ResponsePayload, ServerSnapshotStatus,
-    ServicePipelinePayload, ServicePipelineRequest, ServicePipelineStepResult, decode,
-    default_supported_capabilities, encode, negotiate_protocol,
+    AttachGrant, AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector, Envelope,
+    EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PerformanceRecordingLevel,
+    ProtocolContract, RecordingEventKind, RecordingPayload, RecordingRollingStartOptions, Request,
+    Response, ResponsePayload, ServerSnapshotStatus, ServicePipelinePayload,
+    ServicePipelineRequest, ServicePipelineStepResult, decode, default_supported_capabilities,
+    encode, negotiate_protocol,
 };
 use bmux_perf_telemetry::{
     PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing, flush as flush_phase_timing,
@@ -1962,7 +1962,6 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         | Event::FollowTargetGone { .. }
         | Event::RecordingStarted { .. }
         | Event::RecordingStopped { .. }
-        | Event::ControlCatalogChanged { .. }
         | Event::PluginBusEvent { .. } => None,
     };
     record_to_all_runtimes(
@@ -2088,14 +2087,17 @@ fn lag_recovery_attach_view_events_for_client(
 }
 
 fn control_catalog_full_resync_event() -> Event {
-    Event::ControlCatalogChanged {
-        revision: 0,
-        scopes: vec![
-            ControlCatalogScope::Sessions,
-            ControlCatalogScope::Contexts,
-            ControlCatalogScope::Bindings,
-        ],
-        full_resync: true,
+    Event::PluginBusEvent {
+        kind: "bmux.control_catalog/control-catalog-events".to_string(),
+        payload: serde_json::json!({
+            "changed": {
+                "revision": 0,
+                "scopes": ["sessions", "contexts", "bindings"],
+                "full_resync": true,
+            },
+        })
+        .to_string()
+        .into_bytes(),
     }
 }
 
@@ -3098,17 +3100,13 @@ mod tests {
     fn lag_recovery_control_catalog_event_forces_full_resync() {
         let event = control_catalog_full_resync_event();
 
+        let Event::PluginBusEvent { kind, payload } = event else {
+            panic!("expected plugin-bus control catalog event");
+        };
+        assert_eq!(kind, "bmux.control_catalog/control-catalog-events");
         assert_eq!(
-            event,
-            Event::ControlCatalogChanged {
-                revision: 0,
-                scopes: vec![
-                    ControlCatalogScope::Sessions,
-                    ControlCatalogScope::Contexts,
-                    ControlCatalogScope::Bindings,
-                ],
-                full_resync: true,
-            }
+            String::from_utf8(payload).expect("valid json"),
+            r#"{"changed":{"full_resync":true,"revision":0,"scopes":["sessions","contexts","bindings"]}}"#,
         );
     }
 }

@@ -31,3 +31,8 @@ kind         = "query"
 capability   = "bmux.control_catalog.read"
 interface_id = "control-catalog-events"
 kind         = "event"
+
+[[event_publications]]
+delivery                     = "broadcast"
+forward_to_streaming_clients = true
+kind                         = "bmux.control_catalog/control-catalog-events"

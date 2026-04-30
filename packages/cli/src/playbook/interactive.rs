@@ -2603,7 +2603,6 @@ const fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
         bmux_client::ServerEvent::PaneRestarted { .. } => "pane_restarted",
         bmux_client::ServerEvent::RecordingStarted { .. } => "recording_started",
         bmux_client::ServerEvent::RecordingStopped { .. } => "recording_stopped",
-        bmux_client::ServerEvent::ControlCatalogChanged { .. } => "control_catalog_changed",
         bmux_client::ServerEvent::PluginBusEvent { .. } => "plugin_bus_event",
     }
 }

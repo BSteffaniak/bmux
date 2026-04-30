@@ -2442,6 +2442,29 @@ async fn handle_attach_stream_server_event(
                     );
                 }
             }
+        } else if kind.as_str()
+            == bmux_control_catalog_plugin_api::control_catalog_events::EVENT_KIND.as_str()
+        {
+            match serde_json::from_slice::<
+                bmux_control_catalog_plugin_api::control_catalog_events::CatalogEvent,
+            >(payload)
+            {
+                Ok(bmux_control_catalog_plugin_api::control_catalog_events::CatalogEvent::Changed {
+                    revision,
+                    full_resync,
+                    ..
+                }) => {
+                    handle_control_catalog_changed(client, view_state, revision, full_resync)
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded control-catalog event payload",
+                    );
+                }
+            }
         } else if kind.as_str() == bmux_scene_protocol::scene_protocol::STATE_KIND.as_str() {
             match serde_json::from_slice::<bmux_scene_protocol::scene_protocol::DecorationScene>(
                 payload,
@@ -6079,33 +6102,6 @@ pub async fn handle_attach_server_event(
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
-        bmux_client::ServerEvent::ControlCatalogChanged {
-            revision,
-            full_resync,
-            ..
-        } => {
-            if full_resync || revision > view_state.control_catalog_revision {
-                if let Err(error) = refresh_attach_status_catalog(client, view_state).await {
-                    view_state.set_transient_status(
-                        format!("catalog refresh failed: {error:#}"),
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                } else if let Err(error) =
-                    reconcile_attached_session_from_catalog(client, view_state).await
-                {
-                    view_state.set_transient_status(
-                        format!(
-                            "catalog reconcile failed: {}",
-                            map_attach_client_error(error)
-                        ),
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                }
-            }
-            view_state.dirty.status_needs_redraw = true;
-        }
         bmux_client::ServerEvent::AttachViewChanged {
             context_id,
             session_id,
@@ -6141,6 +6137,34 @@ pub async fn handle_attach_server_event(
     }
 
     Ok(AttachLoopControl::Continue)
+}
+
+async fn handle_control_catalog_changed(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    revision: u64,
+    full_resync: bool,
+) {
+    if full_resync || revision > view_state.control_catalog_revision {
+        if let Err(error) = refresh_attach_status_catalog(client, view_state).await {
+            view_state.set_transient_status(
+                format!("catalog refresh failed: {error:#}"),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+        } else if let Err(error) = reconcile_attached_session_from_catalog(client, view_state).await
+        {
+            view_state.set_transient_status(
+                format!(
+                    "catalog reconcile failed: {}",
+                    map_attach_client_error(error)
+                ),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+        }
+    }
+    view_state.dirty.status_needs_redraw = true;
 }
 
 pub fn apply_attach_view_change_components(
