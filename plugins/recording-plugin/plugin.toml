@@ -11,3 +11,8 @@ version               = "0.0.1-alpha.0"
 capability   = "bmux.recording.read"
 interface_id = "recording-commands"
 kind         = "command"
+
+[[event_publications]]
+delivery                     = "broadcast"
+forward_to_streaming_clients = true
+kind                         = "bmux.recording/recording-events"

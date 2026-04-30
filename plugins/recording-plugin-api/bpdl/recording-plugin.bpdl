@@ -97,6 +97,15 @@ interface recording-types {
     }
 }
 
+interface recording-events {
+    variant recording-event {
+        started { target: recording-types.recording-capture-target },
+        stopped { recording_id: uuid },
+    }
+
+    events recording-event;
+}
+
 @capability(RECORDING_READ)
 interface recording-state {
     query status() -> recording-types.recording-status;

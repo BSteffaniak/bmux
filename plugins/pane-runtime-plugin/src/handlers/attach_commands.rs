@@ -10,14 +10,14 @@
 
 use bmux_attach_token_state::{AttachGrant, AttachTokenValidationError};
 use bmux_context_state::ContextSelector as PrimitiveContextSelector;
-use bmux_ipc::Event;
 use bmux_pane_runtime_plugin_api::attach_runtime_commands::{
     AttachCommandError, AttachGrant as AttachGrantRecord, AttachOutput as AttachOutputRecord,
     AttachReady, AttachRetargetReady, AttachViewportSet, ContextSelector, SessionSelector,
 };
+use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, PaneEvent};
 use bmux_pane_runtime_state::SessionRuntimeError;
 use bmux_plugin::global_plugin_state_registry;
-use bmux_plugin_sdk::{NativeServiceContext, WireEventSinkHandle};
+use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -102,13 +102,8 @@ fn caller_client_id(ctx: &NativeServiceContext) -> Result<ClientId, AttachComman
         .ok_or_else(|| failed("attach operation requires a caller client id"))
 }
 
-fn publish_event(event: Event) {
-    if let Some(sink) = global_plugin_state_registry()
-        .get::<WireEventSinkHandle>()
-        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
-    {
-        let _ = sink.0.publish(event);
-    }
+fn publish_pane_event(event: PaneEvent) {
+    let _ = bmux_plugin::global_event_bus().emit(&pane_runtime_events::EVENT_KIND, event);
 }
 
 #[allow(
@@ -178,13 +173,13 @@ fn retarget_attach_stream(
     match retarget_result {
         Ok(viewport) => {
             if let Some(prev) = previous_to_detach {
-                publish_event(Event::ClientDetached { id: prev.0 });
+                publish_pane_event(PaneEvent::ClientDetached { session_id: prev.0 });
             }
             follow
                 .0
                 .set_attached_stream_session(client_id, Some(next_session_id));
-            publish_event(Event::ClientAttached {
-                id: next_session_id.0,
+            publish_pane_event(PaneEvent::ClientAttached {
+                session_id: next_session_id.0,
             });
             Ok(viewport)
         }
@@ -393,7 +388,7 @@ pub fn attach_open(
         && prev != session_id
     {
         runtime.0.end_attach(prev, client_id);
-        publish_event(Event::ClientDetached { id: prev.0 });
+        publish_pane_event(PaneEvent::ClientDetached { session_id: prev.0 });
     }
 
     // Begin attach with restart-on-NotFound/Closed semantics.
@@ -422,7 +417,9 @@ pub fn attach_open(
                 .0
                 .current_for_client(client_id)
                 .map(|c| c.id);
-            publish_event(Event::ClientAttached { id: session_id.0 });
+            publish_pane_event(PaneEvent::ClientAttached {
+                session_id: session_id.0,
+            });
             // Publish focus state so the newly-attached client's
             // consumers (decoration, future status plugins) observe
             // the current focused pane without an extra round-trip.
@@ -619,8 +616,8 @@ pub fn detach(ctx: &NativeServiceContext) -> Result<u8, AttachCommandError> {
     if let Some(stream_session) = follow.0.attached_stream_session(client_id) {
         runtime.0.end_attach(stream_session, client_id);
         follow.0.set_attached_stream_session(client_id, None);
-        publish_event(Event::ClientDetached {
-            id: stream_session.0,
+        publish_pane_event(PaneEvent::ClientDetached {
+            session_id: stream_session.0,
         });
     }
     // Clear the selected session so future follow-state lookups see

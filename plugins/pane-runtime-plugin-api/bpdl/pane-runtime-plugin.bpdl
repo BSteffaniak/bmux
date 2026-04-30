@@ -398,6 +398,8 @@ interface pane-runtime-events {
     }
 
     variant pane-event {
+        client-attached { session_id: uuid },
+        client-detached { session_id: uuid },
         exited { session_id: uuid, pane_id: uuid, reason: string? },
         restarted { session_id: uuid, pane_id: uuid },
         output-available { session_id: uuid, pane_id: uuid },

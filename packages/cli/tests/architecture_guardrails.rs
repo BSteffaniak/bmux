@@ -1131,11 +1131,8 @@ fn recording_plugin_exists() {
 #[test]
 fn recording_ipc_variants_are_absent() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
-    // These patterns match only `Request` / `ResponsePayload` variant
-    // definitions. We intentionally do NOT match `Event::RecordingStarted`
-    // or `Event::RecordingStopped` — those remain on the `Event` enum
-    // because attach clients still consume them to coordinate display-
-    // track writes.
+    // Recording lifecycle operations and streaming notifications are
+    // served by the recording plugin's generated services/events.
     let denied = [
         // Request variants (the `Request` enum uses indent = 4 spaces
         // and always has at least one named field record shape).
@@ -1152,6 +1149,10 @@ fn recording_ipc_variants_are_absent() {
         "Request::RecordingRollingStatus",
         "Request::RecordingRollingClear",
         "Request::RecordingCaptureTargets",
+        "Event::RecordingStarted",
+        "Event::RecordingStopped",
+        "    RecordingStarted {",
+        "    RecordingStopped {",
         "Request::RecordingPrune",
         // DTO ownership: recording protocol DTOs live in
         // `bmux_recording_protocol`; IPC must not re-export or alias them.
@@ -1894,6 +1895,8 @@ fn pane_mutation_ipc_variants_are_absent() {
         "    PaneImageAvailable {",
         "    PaneExited {",
         "    PaneRestarted {",
+        "    ClientAttached {",
+        "    ClientDetached {",
     ];
     for marker in denied {
         assert!(

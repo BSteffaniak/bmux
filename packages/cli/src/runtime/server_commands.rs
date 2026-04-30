@@ -319,10 +319,6 @@ pub(super) fn server_event_name(event: &bmux_client::ServerEvent) -> &'static st
     match event {
         bmux_client::ServerEvent::ServerStarted => "server_started",
         bmux_client::ServerEvent::ServerStopping => "server_stopping",
-        bmux_client::ServerEvent::ClientAttached { .. } => "client_attached",
-        bmux_client::ServerEvent::ClientDetached { .. } => "client_detached",
-        bmux_client::ServerEvent::RecordingStarted { .. } => "recording_started",
-        bmux_client::ServerEvent::RecordingStopped { .. } => "recording_stopped",
         bmux_client::ServerEvent::PluginBusEvent { kind, payload } => {
             plugin_bus_event_name(kind, payload)
         }
@@ -380,6 +376,12 @@ fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
             bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent,
         >(payload)
         .map_or("plugin_bus_event", |event| match event {
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::ClientAttached {
+                ..
+            } => "client_attached",
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::ClientDetached {
+                ..
+            } => "client_detached",
             bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::Exited { .. } => {
                 "pane_exited"
             }
@@ -395,6 +397,19 @@ fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
             bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::AttachViewChanged {
                 ..
             } => "attach_view_changed",
+        });
+    }
+    if kind == bmux_recording_plugin_api::recording_events::EVENT_KIND.as_str() {
+        return serde_json::from_slice::<
+            bmux_recording_plugin_api::recording_events::RecordingEvent,
+        >(payload)
+        .map_or("plugin_bus_event", |event| match event {
+            bmux_recording_plugin_api::recording_events::RecordingEvent::Started { .. } => {
+                "recording_started"
+            }
+            bmux_recording_plugin_api::recording_events::RecordingEvent::Stopped { .. } => {
+                "recording_stopped"
+            }
         });
     }
     "plugin_bus_event"

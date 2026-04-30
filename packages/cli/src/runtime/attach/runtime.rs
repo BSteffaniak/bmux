@@ -2812,20 +2812,7 @@ async fn handle_attach_stream_server_event(
 ) -> Result<AttachServerEventHandling> {
     let mut image_fetch_requested = false;
 
-    if let bmux_client::ServerEvent::RecordingStarted {
-        recording_id,
-        ref path,
-    } = server_event
-    {
-        let target = RecordingCaptureTarget {
-            recording_id,
-            path: path.clone(),
-            rolling_window_secs: None,
-        };
-        display_capture.open_target(&target, self_client_id);
-    } else if let bmux_client::ServerEvent::RecordingStopped { recording_id } = server_event {
-        display_capture.close_recording(recording_id);
-    } else if let bmux_client::ServerEvent::PluginBusEvent {
+    if let bmux_client::ServerEvent::PluginBusEvent {
         ref kind,
         ref payload,
     } = server_event
@@ -2842,6 +2829,33 @@ async fn handle_attach_stream_server_event(
                         kind = %kind,
                         error = %error,
                         "decoding forwarded performance event payload",
+                    );
+                }
+            }
+        } else if kind.as_str() == bmux_recording_plugin_api::recording_events::EVENT_KIND.as_str()
+        {
+            match serde_json::from_slice::<
+                bmux_recording_plugin_api::recording_events::RecordingEvent,
+            >(payload)
+            {
+                Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::Started {
+                    target,
+                }) => {
+                    let target = RecordingCaptureTarget {
+                        recording_id: target.recording_id,
+                        path: target.path,
+                        rolling_window_secs: target.rolling_window_secs,
+                    };
+                    display_capture.open_target(&target, self_client_id);
+                }
+                Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::Stopped {
+                    recording_id,
+                }) => display_capture.close_recording(recording_id),
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded recording event payload",
                     );
                 }
             }

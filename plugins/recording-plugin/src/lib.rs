@@ -23,7 +23,7 @@ pub use recording_runtime::{
 use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
-use bmux_recording_plugin_api::{RecordingPluginConfig, recording_types};
+use bmux_recording_plugin_api::{RecordingPluginConfig, recording_events, recording_types};
 use bmux_recording_protocol::{
     RecordingCaptureTarget, RecordingEventKind, RecordingPayload as ProtocolRecordingPayload,
     RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
@@ -135,6 +135,8 @@ impl RustPlugin for RecordingPlugin {
         else {
             return Ok(bmux_plugin_sdk::EXIT_OK);
         };
+        bmux_plugin::global_event_bus()
+            .register_channel::<recording_events::RecordingEvent>(recording_events::EVENT_KIND);
         let Ok(config) = config_handle.read() else {
             return Ok(bmux_plugin_sdk::EXIT_OK);
         };
@@ -343,7 +345,7 @@ fn recording_capture_targets_generated() -> Vec<recording_types::RecordingCaptur
 fn recording_start_generated(
     req: StartRequest,
 ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
-    handle_start(
+    let recording = handle_start(
         req.session_id,
         req.capture_input,
         req.name,
@@ -351,14 +353,18 @@ fn recording_start_generated(
         req.event_kinds
             .map(|kinds| kinds.into_iter().map(Into::into).collect()),
     )
-    .map(Into::into)
-    .ok_or_else(|| generated_failed("recording start failed"))
+    .ok_or_else(|| generated_failed("recording start failed"))?;
+    publish_recording_started(&recording, None);
+    Ok(recording.into())
 }
 
 fn recording_stop_generated(
     recording_id: Option<uuid::Uuid>,
 ) -> Result<uuid::Uuid, recording_types::RecordingError> {
-    handle_stop(recording_id).ok_or(recording_types::RecordingError::NoActive)
+    let recording_id =
+        handle_stop(recording_id).ok_or(recording_types::RecordingError::NoActive)?;
+    publish_recording_stopped(recording_id);
+    Ok(recording_id)
 }
 
 fn recording_write_custom_event_generated(
@@ -398,19 +404,29 @@ fn recording_cut_generated(
 fn recording_rolling_start_generated(
     options: recording_types::RecordingRollingStartOptions,
 ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
-    handle_rolling_start(options.into())
-        .map(Into::into)
-        .ok_or(recording_types::RecordingError::Unavailable)
+    let recording =
+        handle_rolling_start(options.into()).ok_or(recording_types::RecordingError::Unavailable)?;
+    publish_recording_started(&recording, None);
+    Ok(recording.into())
 }
 
 fn recording_rolling_stop_generated() -> Result<uuid::Uuid, recording_types::RecordingError> {
-    handle_rolling_stop().ok_or(recording_types::RecordingError::NoActive)
+    let recording_id = handle_rolling_stop().ok_or(recording_types::RecordingError::NoActive)?;
+    publish_recording_stopped(recording_id);
+    Ok(recording_id)
 }
 
 fn recording_rolling_clear_generated(
     restart_if_active: bool,
 ) -> recording_types::RecordingRollingClearReport {
-    handle_rolling_clear(restart_if_active).into()
+    let report = handle_rolling_clear(restart_if_active);
+    if let Some(recording_id) = report.stopped_recording_id {
+        publish_recording_stopped(recording_id);
+    }
+    if let Some(recording) = report.restarted_recording.as_ref() {
+        publish_recording_started(recording, None);
+    }
+    report.into()
 }
 
 fn recording_prune_generated(older_than_days: Option<u64>) -> u64 {
@@ -431,6 +447,25 @@ fn rolling_handle() -> Option<Arc<RwLock<RollingRecordingRuntimeHandle>>> {
 
 fn config_handle() -> Option<Arc<RwLock<RecordingPluginConfig>>> {
     global_plugin_state_registry().get::<RecordingPluginConfig>()
+}
+
+fn publish_recording_started(recording: &RecordingSummary, rolling_window_secs: Option<u64>) {
+    let target = recording_types::RecordingCaptureTarget {
+        recording_id: recording.id,
+        path: recording.path.clone(),
+        rolling_window_secs,
+    };
+    let _ = bmux_plugin::global_event_bus().emit(
+        &recording_events::EVENT_KIND,
+        recording_events::RecordingEvent::Started { target },
+    );
+}
+
+fn publish_recording_stopped(recording_id: uuid::Uuid) {
+    let _ = bmux_plugin::global_event_bus().emit(
+        &recording_events::EVENT_KIND,
+        recording_events::RecordingEvent::Stopped { recording_id },
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────

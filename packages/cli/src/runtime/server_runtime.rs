@@ -261,10 +261,8 @@ mod tests {
             "server_started"
         );
         assert_eq!(
-            server_event_name(&bmux_client::ServerEvent::ClientDetached {
-                id: uuid::Uuid::new_v4()
-            }),
-            "client_detached"
+            server_event_name(&bmux_client::ServerEvent::ServerStopping),
+            "server_stopping"
         );
     }
 }

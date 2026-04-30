@@ -221,18 +221,6 @@ fn target_selector(target: Option<Uuid>) -> Option<PaneSelector> {
     target.map(PaneSelector::ById)
 }
 
-/// Publish a wire event through the registered `WireEventSinkHandle`.
-/// When no sink is registered (tests/headless tooling) the publish
-/// is silently dropped.
-fn publish_wire_event(event: bmux_ipc::Event) {
-    if let Some(sink) = bmux_plugin::global_plugin_state_registry()
-        .get::<bmux_plugin_sdk::WireEventSinkHandle>()
-        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
-    {
-        let _ = sink.0.publish(event);
-    }
-}
-
 fn publish_session_removed_event(session_id: SessionId) {
     let _ = bmux_plugin::global_event_bus().emit(
         &sessions_events::EVENT_KIND,
@@ -427,7 +415,9 @@ pub fn close_pane(
         }
 
         if had_attached_clients {
-            publish_wire_event(bmux_ipc::Event::ClientDetached { id: session_id.0 });
+            publish_pane_event(PaneEvent::ClientDetached {
+                session_id: session_id.0,
+            });
         }
         publish_session_removed_event(session_id);
     }
@@ -571,10 +561,6 @@ pub fn kill_session_runtime(
         .get::<bmux_client_state::FollowStateHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed_session("follow state handle not registered"))?;
-    let wire_sink = global_plugin_state_registry()
-        .get::<bmux_plugin_sdk::WireEventSinkHandle>()
-        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()));
-
     let session_id = SessionId(req.session_id);
     let _ = req.force_local; // admin-principal gate + remote tear-down remain server-side for now.
 
@@ -596,12 +582,10 @@ pub fn kill_session_runtime(
     runtime_handle.0.shutdown_removed_runtime(removed_runtime);
     attach_token_handle.0.remove_for_session(session_id);
 
-    if let Some(sink) = wire_sink
-        && had_attached_clients
-    {
-        let _ = sink
-            .0
-            .publish(bmux_ipc::Event::ClientDetached { id: session_id.0 });
+    if had_attached_clients {
+        publish_pane_event(PaneEvent::ClientDetached {
+            session_id: session_id.0,
+        });
     }
 
     publish_session_removed_event(session_id);

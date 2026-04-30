@@ -559,23 +559,6 @@ pub enum Response {
 pub enum Event {
     ServerStarted,
     ServerStopping,
-    ClientAttached {
-        id: Uuid,
-    },
-    ClientDetached {
-        id: Uuid,
-    },
-    /// A server-side recording has started.  Attached clients use this to
-    /// begin writing their own display tracks into the recording directory.
-    RecordingStarted {
-        recording_id: Uuid,
-        path: String,
-    },
-    /// A server-side recording has stopped.  Attached clients use this to
-    /// flush and close any in-progress display track.
-    RecordingStopped {
-        recording_id: Uuid,
-    },
     /// Plugin-bus emission forwarded from the server for client-side
     /// consumption. Forwarded kinds are declared in each plugin's
     /// manifest (`[[event_publications]] forward_to_streaming_clients
@@ -972,14 +955,7 @@ mod tests {
 
     #[test]
     fn event_all_variants_roundtrip() {
-        let id = Uuid::from_u128(1);
-
-        let variants: Vec<Event> = vec![
-            Event::ServerStarted,
-            Event::ServerStopping,
-            Event::ClientAttached { id },
-            Event::ClientDetached { id },
-        ];
+        let variants: Vec<Event> = vec![Event::ServerStarted, Event::ServerStopping];
 
         for (i, variant) in variants.iter().enumerate() {
             let bytes =

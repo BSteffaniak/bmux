@@ -1355,14 +1355,6 @@ impl BmuxServer {
 
         let removed_runtimes = session_runtime_handle().0.remove_all_runtimes();
         for removed_runtime in removed_runtimes {
-            if !removed_runtime.attached_clients.is_empty() {
-                let _ = emit_event(
-                    &self.state,
-                    Event::ClientDetached {
-                        id: removed_runtime.session_id.0,
-                    },
-                );
-            }
             shutdown_runtime_info(removed_runtime);
         }
         session_handle()
@@ -1860,7 +1852,7 @@ async fn handle_connection(
         client_id,
         &mut selected_session,
         &mut attached_stream_session,
-    )?;
+    );
     disconnect_follow_state(client_id);
     {
         let mut principals = state
@@ -1878,12 +1870,7 @@ async fn handle_connection(
 
 fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
     let session_id = match &event {
-        Event::ClientAttached { id } | Event::ClientDetached { id } => Some(*id),
-        Event::ServerStarted
-        | Event::ServerStopping
-        | Event::RecordingStarted { .. }
-        | Event::RecordingStopped { .. }
-        | Event::PluginBusEvent { .. } => None,
+        Event::ServerStarted | Event::ServerStopping | Event::PluginBusEvent { .. } => None,
     };
     record_to_all_runtimes(
         RecordingEventKind::ServerEvent,
@@ -2422,9 +2409,7 @@ async fn handle_request(
 
     // Catalog-changed events are fired by the control-catalog plugin
     // in response to session/context/client events on the event bus.
-    // Server no longer emits catalog-changed directly. Attach-side
-    // `ClientAttached` events are emitted by the pane-runtime plugin's
-    // attach-open handler.
+    // Server no longer emits catalog-changed directly.
 
     if response_requires_snapshot(&response) {
         mark_snapshot_dirty(state);
@@ -2728,18 +2713,18 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
 }
 
 fn detach_client_state_on_disconnect(
-    state: &Arc<ServerState>,
+    _state: &Arc<ServerState>,
     client_id: ClientId,
     selected_session: &mut Option<SessionId>,
     attached_stream_session: &mut Option<SessionId>,
-) -> Result<()> {
+) {
     let previous_selected = selected_session.take();
     let previous_stream = attached_stream_session.take();
 
     context_handle().0.disconnect_client(client_id);
 
     if previous_selected.is_none() && previous_stream.is_none() {
-        return Ok(());
+        return;
     }
 
     if let Some(session_id) = previous_selected {
@@ -2750,16 +2735,7 @@ fn detach_client_state_on_disconnect(
         session_runtime_handle()
             .0
             .end_attach(stream_session_id, client_id);
-
-        emit_event(
-            state,
-            Event::ClientDetached {
-                id: stream_session_id.0,
-            },
-        )?;
     }
-
-    Ok(())
 }
 
 fn parse_request(envelope: &Envelope) -> Result<Request> {

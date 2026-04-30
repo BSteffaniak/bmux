@@ -3862,8 +3862,6 @@ fn event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
         (event, name),
         (bmux_ipc::Event::ServerStarted, "server_started")
             | (bmux_ipc::Event::ServerStopping, "server_stopping")
-            | (bmux_ipc::Event::ClientAttached { .. }, "client_attached")
-            | (bmux_ipc::Event::ClientDetached { .. }, "client_detached")
     ) || plugin_bus_event_matches(event, name)
 }
 
@@ -3873,6 +3871,9 @@ fn plugin_bus_event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
     };
     if kind == bmux_pane_runtime_plugin_api::pane_runtime_events::EVENT_KIND.as_str() {
         return pane_runtime_plugin_bus_event_matches(payload, name);
+    }
+    if kind == bmux_recording_plugin_api::recording_events::EVENT_KIND.as_str() {
+        return recording_plugin_bus_event_matches(payload, name);
     }
     if kind != bmux_clients_plugin_api::clients_events::EVENT_KIND.as_str() {
         return session_plugin_bus_event_matches(kind, payload, name);
@@ -3911,6 +3912,12 @@ fn pane_runtime_plugin_bus_event_matches(payload: &[u8], name: &str) -> bool {
             matches!(
                 (event, name),
                 (
+                    bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::ClientAttached { .. },
+                    "client_attached"
+                ) | (
+                    bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::ClientDetached { .. },
+                    "client_detached"
+                ) | (
                     bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::Exited { .. },
                     "pane_exited"
                 ) | (
@@ -3925,6 +3932,22 @@ fn pane_runtime_plugin_bus_event_matches(payload: &[u8], name: &str) -> bool {
                 ) | (
                     bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::AttachViewChanged { .. },
                     "attach_view_changed"
+                )
+            )
+        })
+}
+
+fn recording_plugin_bus_event_matches(payload: &[u8], name: &str) -> bool {
+    serde_json::from_slice::<bmux_recording_plugin_api::recording_events::RecordingEvent>(payload)
+        .is_ok_and(|event| {
+            matches!(
+                (event, name),
+                (
+                    bmux_recording_plugin_api::recording_events::RecordingEvent::Started { .. },
+                    "recording_started"
+                ) | (
+                    bmux_recording_plugin_api::recording_events::RecordingEvent::Stopped { .. },
+                    "recording_stopped"
                 )
             )
         })
