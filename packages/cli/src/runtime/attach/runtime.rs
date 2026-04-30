@@ -18,6 +18,7 @@ use bmux_ipc::{
     PaneFocusDirection, PaneSplitDirection, SessionSelector,
 };
 use bmux_keybind::{action_to_config_name, parse_action};
+use bmux_permissions_plugin_api::session_policy_state;
 use bmux_plugin_sdk::{
     HostScope, PluginCommandOutcome, ServiceKind, ServiceRequest,
     perf_telemetry::{PhaseChannel, emit as emit_phase_timing},
@@ -34,7 +35,6 @@ use crossterm::terminal;
 use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::Path;
@@ -2862,25 +2862,6 @@ async fn run_attach_plugin_command_pipeline(
     Ok(execution)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct HotPathExecutionPolicyCheckRequest {
-    session_id: Uuid,
-    #[serde(default)]
-    context_id: Option<Uuid>,
-    client_id: Uuid,
-    principal_id: Uuid,
-    action: String,
-    plugin_id: String,
-    capability: String,
-    execution_class: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct HotPathExecutionPolicyCheckResponse {
-    allowed: bool,
-    reason: Option<String>,
-}
-
 async fn enforce_hot_path_plugin_policy(
     client: &mut StreamingBmuxClient,
     plugin_id: &str,
@@ -2923,43 +2904,24 @@ async fn enforce_hot_path_plugin_policy(
         .map_err(|err| anyhow::anyhow!("clients-state current-client failed: {err:?}"))?
         .id;
     let principal_info = client.whoami_principal().await?;
-    let request = HotPathExecutionPolicyCheckRequest {
-        session_id: attached_session_id,
-        context_id: attached_context_id,
+    let execution_class = match hints.execution_class {
+        bmux_plugin::PluginExecutionClass::NativeFast => "native_fast",
+        bmux_plugin::PluginExecutionClass::NativeStandard => "native_standard",
+        bmux_plugin::PluginExecutionClass::Interpreter => "interpreter",
+    }
+    .to_string();
+    let response = session_policy_state::client::check(
+        client,
+        attached_session_id,
+        attached_context_id,
         client_id,
-        principal_id: principal_info.principal_id,
-        action: "hot_path_execution".to_string(),
-        plugin_id: plugin_id.to_string(),
-        capability: hot_path_capability.to_string(),
-        execution_class: match hints.execution_class {
-            bmux_plugin::PluginExecutionClass::NativeFast => "native_fast",
-            bmux_plugin::PluginExecutionClass::NativeStandard => "native_standard",
-            bmux_plugin::PluginExecutionClass::Interpreter => "interpreter",
-        }
-        .to_string(),
-    };
-    let payload = bmux_plugin_sdk::encode_service_message(&request).map_err(|error| {
-        ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("failed to encode hot-path policy request: {error}"),
-        }
-    })?;
-    let response_payload = client
-        .invoke_service_raw(
-            "bmux.sessions.policy",
-            InvokeServiceKind::Query,
-            "session-policy-query/v1",
-            "check",
-            payload,
-        )
-        .await?;
-    let response: HotPathExecutionPolicyCheckResponse =
-        bmux_plugin_sdk::decode_service_message(&response_payload).map_err(|error| {
-            ClientError::ServerError {
-                code: bmux_ipc::ErrorCode::Internal,
-                message: format!("failed to decode hot-path policy response: {error}"),
-            }
-        })?;
+        principal_info.principal_id,
+        "hot_path_execution".to_string(),
+        Some(plugin_id.to_string()),
+        Some(hot_path_capability.to_string()),
+        Some(execution_class),
+    )
+    .await?;
     if response.allowed {
         Ok(execution)
     } else {

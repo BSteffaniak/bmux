@@ -117,6 +117,9 @@ pub trait BmuxPaneRuntimeClientExt {
         max_bytes: usize,
     ) -> impl Future<Output = ClientResult<PaneOutputBatchResult>> + Send;
 
+    // Used by the attach runtime binary path; `cargo check -p bmux_cli` checks the
+    // library target separately and reports this trait item as otherwise unused.
+    #[allow(dead_code)]
     fn attach_pane_images(
         &mut self,
         session_id: Uuid,

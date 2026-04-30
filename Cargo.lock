@@ -1068,6 +1068,7 @@ dependencies = [
  "bmux_performance_plugin",
  "bmux_performance_plugin_api",
  "bmux_permissions_plugin",
+ "bmux_permissions_plugin_api",
  "bmux_plugin",
  "bmux_plugin_cli_plugin",
  "bmux_plugin_sdk",
@@ -1558,6 +1559,7 @@ dependencies = [
  "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
  "bmux_pane_runtime_state",
+ "bmux_permissions_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_recording_runtime",
@@ -1668,11 +1670,23 @@ dependencies = [
  "bmux_clients_plugin_api",
  "bmux_contexts_plugin_api",
  "bmux_ipc",
+ "bmux_permissions_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_sessions_plugin_api",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_permissions_plugin_api"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
  "uuid",
 ]
 

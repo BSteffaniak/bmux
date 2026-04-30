@@ -321,7 +321,7 @@ mod tests {
                 capability: HostScope::new("bmux.permissions.read")
                     .expect("capability should parse"),
                 kind: ServiceKind::Query,
-                interface_id: "permission-query/v1".to_string(),
+                interface_id: "permissions-state".to_string(),
                 provider: ProviderId::Plugin("bmux.permissions".to_string()),
             },
             operation: "list".to_string(),

@@ -76,8 +76,8 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
     let response = match context.call_service::<ListPermissionsRequest, ListPermissionsResponse>(
         "bmux.permissions.read",
         ServiceKind::Query,
-        "permission-query/v1",
-        "list",
+        "permissions-state",
+        "list-permissions",
         &ListPermissionsRequest {
             session: session.clone(),
         },
@@ -89,7 +89,7 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
         }
     };
 
-    if response.permissions.is_empty() {
+    if response.is_empty() {
         println!("example.native: no explicit role assignments");
     } else {
         println!("example.native permissions:");
@@ -97,11 +97,8 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
             TableColumn::new("CLIENT_ID").min_width(36),
             TableColumn::new("ROLE"),
         ]);
-        for permission in response.permissions {
-            table.push_row(vec![
-                permission.client_id.to_string(),
-                session_role_name(permission.role).to_string(),
-            ]);
+        for permission in response {
+            table.push_row(vec![permission.client_id, permission.role]);
         }
         if let Err(error) = write_stdout_table(&table) {
             eprintln!("example.native: failed rendering permissions table: {error}");
@@ -149,15 +146,15 @@ fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
         return EXIT_USAGE;
     };
 
-    let response = match context.call_service::<GrantPermissionRequest, GrantPermissionResponse>(
+    let _response = match context.call_service::<GrantPermissionRequest, PermissionCommandAck>(
         "bmux.permissions.write",
         ServiceKind::Command,
-        "permission-command/v1",
+        "permissions-commands",
         "grant",
         &GrantPermissionRequest {
             session: session.clone(),
-            client_id,
-            role,
+            client_id: client_id.to_string(),
+            role: session_role_name(role).to_string(),
         },
     ) {
         Ok(response) => response,
@@ -169,8 +166,8 @@ fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
 
     println!(
         "granted role {} to client {}",
-        session_role_name(response.role),
-        response.client_id
+        session_role_name(role),
+        client_id
     );
     EXIT_OK
 }
@@ -202,14 +199,14 @@ fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
         return EXIT_USAGE;
     };
 
-    let response = match context.call_service::<RevokePermissionRequest, RevokePermissionResponse>(
+    let _response = match context.call_service::<RevokePermissionRequest, PermissionCommandAck>(
         "bmux.permissions.write",
         ServiceKind::Command,
-        "permission-command/v1",
+        "permissions-commands",
         "revoke",
         &RevokePermissionRequest {
             session: session.clone(),
-            client_id,
+            client_id: client_id.to_string(),
         },
     ) {
         Ok(response) => response,
@@ -219,7 +216,7 @@ fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
         }
     };
 
-    println!("revoked explicit role for client {}", response.client_id);
+    println!("revoked explicit role for client {client_id}");
     EXIT_OK
 }
 
@@ -592,15 +589,12 @@ struct ListPermissionsRequest {
     session: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListPermissionsResponse {
-    permissions: Vec<PermissionSummary>,
-}
+type ListPermissionsResponse = Vec<PermissionSummary>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PermissionSummary {
-    client_id: uuid::Uuid,
-    role: SessionRole,
+    client_id: String,
+    role: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -614,25 +608,19 @@ enum SessionRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GrantPermissionRequest {
     session: String,
-    client_id: uuid::Uuid,
-    role: SessionRole,
+    client_id: String,
+    role: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantPermissionResponse {
-    client_id: uuid::Uuid,
-    role: SessionRole,
+struct PermissionCommandAck {
+    ok: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RevokePermissionRequest {
     session: String,
-    client_id: uuid::Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RevokePermissionResponse {
-    client_id: uuid::Uuid,
+    client_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

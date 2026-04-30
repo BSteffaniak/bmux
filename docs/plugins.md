@@ -108,7 +108,7 @@ pane mutation, and attach orchestration. It exposes four BPDL interfaces:
   `zoom-pane`, `pane-direct-input`, `new-session-with-runtime`,
   `kill-session-runtime`, `restore-session-runtime`. Each handler
   performs its own permission check through the sessions-plugin's
-  `session-policy-query/v1::check` typed service, runs the
+  `session-policy-state::check` typed service, runs the
   `SessionRuntimeManagerHandle` operation, and publishes the
   corresponding `Event::*` through the registered `WireEventSinkHandle`.
 - **`pane-runtime-state`** — `list-panes` (session_id is optional;

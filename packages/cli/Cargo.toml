@@ -35,6 +35,7 @@ bmux_keybind                    = { workspace = true }
 bmux_keyboard                   = { workspace = true }
 bmux_pane_runtime_plugin_api    = { workspace = true }
 bmux_performance_plugin_api     = { workspace = true }
+bmux_permissions_plugin_api     = { workspace = true }
 bmux_plugin                     = { workspace = true }
 bmux_plugin_sdk                 = { workspace = true }
 bmux_recording_plugin_api       = { workspace = true }
@@ -197,6 +198,7 @@ fail-on-warnings = [
     "bmux_keybind/fail-on-warnings",
     "bmux_keyboard/fail-on-warnings",
     "bmux_pane_runtime_plugin?/fail-on-warnings",
+    "bmux_permissions_plugin_api/fail-on-warnings",
     "bmux_permissions_plugin?/fail-on-warnings",
     "bmux_performance_plugin?/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",

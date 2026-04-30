@@ -3224,7 +3224,7 @@ minimum = "1.0"
                 capability: bmux_plugin_sdk::HostScope::new("bmux.permissions.read")
                     .expect("capability should parse"),
                 kind: bmux_plugin_sdk::ServiceKind::Query,
-                interface_id: "permission-query/v1".to_string(),
+                interface_id: "permissions-state".to_string(),
                 provider: bmux_plugin_sdk::ProviderId::Plugin("bmux.permissions".to_string()),
             }],
             available_capabilities: vec!["bmux.permissions.read".to_string()],
@@ -3255,7 +3255,7 @@ minimum = "1.0"
             .call_service_raw(
                 "bmux.permissions.read",
                 bmux_plugin_sdk::ServiceKind::Query,
-                "permission-query/v1",
+                "permissions-state",
                 "list",
                 Vec::new(),
             )
@@ -3300,7 +3300,7 @@ minimum = "1.0"
             .call_service_raw(
                 "bmux.permissions.read",
                 bmux_plugin_sdk::ServiceKind::Query,
-                "permission-query/v1",
+                "permissions-state",
                 "list",
                 Vec::new(),
             )
@@ -3758,7 +3758,7 @@ minimum = "1.0"
                     capability: bmux_plugin_sdk::HostScope::new("bmux.permissions.read")
                         .expect("capability should parse"),
                     kind: bmux_plugin_sdk::ServiceKind::Query,
-                    interface_id: "permission-query/v1".to_string(),
+                    interface_id: "permissions-state".to_string(),
                     provider: bmux_plugin_sdk::ProviderId::Plugin("bmux.permissions".to_string()),
                 },
                 operation: "list".to_string(),

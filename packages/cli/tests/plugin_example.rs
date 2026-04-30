@@ -171,7 +171,7 @@ fn bundled_permissions_manifest_exposes_policy_service_interface() {
     let permissions = bundled_manifest("bmux.permissions");
 
     assert!(permissions.services.iter().any(|service| {
-        service.interface_id == "session-policy-query/v1"
+        service.interface_id == "session-policy-state"
             && service.kind == bmux_plugin_sdk::ServiceKind::Query
     }));
 }

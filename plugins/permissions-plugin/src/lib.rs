@@ -2,6 +2,11 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use bmux_permissions_plugin_api::permissions_commands::CommandAck;
+use bmux_permissions_plugin_api::permissions_state::PermissionEntry;
+use bmux_permissions_plugin_api::session_policy_state::{
+    HotPathDecisionResponse, HotPathOverrideEntry, SessionPolicyCheckResponse,
+};
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{StorageGetRequest, StorageSetRequest};
@@ -129,41 +134,41 @@ impl RustPlugin for PermissionsPlugin {
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
-            "permission-query/v1", "list" => |req: ListPermissionsRequest, ctx| {
+            "permissions-state", "list-permissions" => |req: ListPermissionsRequest, ctx| {
                 let entries = list_entries(ctx, &req.session)
                     .map_err(|e| ServiceResponse::error("list_failed", e))?;
-                Ok(ListPermissionsResponse { entries })
+                Ok(entries)
             },
-            "permission-command/v1", "grant" => |req: GrantRequest, ctx| {
+            "permissions-commands", "grant" => |req: GrantRequest, ctx| {
                 grant_entry(ctx, req).map_err(|e| ServiceResponse::error("grant_failed", e))?;
-                Ok(CommandAckResponse { ok: true })
+                Ok(CommandAck { ok: true })
             },
-            "permission-command/v1", "revoke" => |req: RevokeRequest, ctx| {
+            "permissions-commands", "revoke" => |req: RevokeRequest, ctx| {
                 revoke_entry(ctx, &req)
                     .map_err(|e| ServiceResponse::error("revoke_failed", e))?;
-                Ok(CommandAckResponse { ok: true })
+                Ok(CommandAck { ok: true })
             },
-            "session-policy-query/v1", "check" => |req: SessionPolicyCheckRequest, ctx| {
+            "session-policy-state", "check" => |req: SessionPolicyCheckRequest, ctx| {
                 evaluate_policy(ctx, &req)
                     .map_err(|e| ServiceResponse::error("policy_failed", e))
             },
-            "session-policy-query/v1", "list-hot-path-overrides" => |req: ListHotPathOverridesRequest, ctx| {
+            "session-policy-state", "list-hot-path-overrides" => |req: ListHotPathOverridesRequest, ctx| {
                 list_hot_path_overrides(ctx, req)
                     .map_err(|e| ServiceResponse::error("list_hot_path_overrides_failed", e))
             },
-            "session-policy-query/v1", "resolve-hot-path-decision" => |req: CheckHotPathDecisionRequest, ctx| {
+            "session-policy-state", "resolve-hot-path-decision" => |req: CheckHotPathDecisionRequest, ctx| {
                 inspect_hot_path_decision(ctx, &req)
                     .map_err(|e| ServiceResponse::error("resolve_hot_path_decision_failed", e))
             },
-            "session-policy-command/v1", "grant-hot-path-override" => |req: GrantHotPathOverrideRequest, ctx| {
+            "session-policy-commands", "grant-hot-path-override" => |req: GrantHotPathOverrideRequest, ctx| {
                 grant_hot_path_override(ctx, req)
                     .map_err(|e| ServiceResponse::error("grant_hot_path_override_failed", e))?;
-                Ok(CommandAckResponse { ok: true })
+                Ok(bmux_permissions_plugin_api::session_policy_commands::CommandAck { ok: true })
             },
-            "session-policy-command/v1", "revoke-hot-path-override" => |req: RevokeHotPathOverrideRequest, ctx| {
+            "session-policy-commands", "revoke-hot-path-override" => |req: RevokeHotPathOverrideRequest, ctx| {
                 revoke_hot_path_override(ctx, &req)
                     .map_err(|e| ServiceResponse::error("revoke_hot_path_override_failed", e))?;
-                Ok(CommandAckResponse { ok: true })
+                Ok(bmux_permissions_plugin_api::session_policy_commands::CommandAck { ok: true })
             },
         })
     }
@@ -189,8 +194,9 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
             let entries = list_entries(context, &session)?;
             if emit_to_stdout {
                 if as_json {
-                    let output = serde_json::to_string_pretty(&ListPermissionsResponse { entries })
-                        .map_err(|error| error.to_string())?;
+                    let output =
+                        serde_json::to_string_pretty(&serde_json::json!({ "entries": entries }))
+                            .map_err(|error| error.to_string())?;
                     println!("{output}");
                 } else if entries.is_empty() {
                     println!("no explicit permissions for session {session}");
@@ -208,8 +214,9 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
             let entries = list_entries(context, &session)?;
             if emit_to_stdout {
                 if as_json {
-                    let output = serde_json::to_string_pretty(&ListPermissionsResponse { entries })
-                        .map_err(|error| error.to_string())?;
+                    let output =
+                        serde_json::to_string_pretty(&serde_json::json!({ "entries": entries }))
+                            .map_err(|error| error.to_string())?;
                     println!("{output}");
                 } else if entries.is_empty() {
                     println!("no explicit permissions for session {session}");
@@ -224,7 +231,7 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
         "grant" => {
             let request = GrantRequest {
                 session: required_option_value(&context.arguments, "session")?,
-                client: required_option_value(&context.arguments, "client")?,
+                client_id: required_option_value(&context.arguments, "client")?,
                 role: required_option_value(&context.arguments, "role")?,
             };
             grant_entry(context, request)?;
@@ -236,7 +243,7 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
         "revoke" => {
             let request = RevokeRequest {
                 session: required_option_value(&context.arguments, "session")?,
-                client: required_option_value(&context.arguments, "client")?,
+                client_id: required_option_value(&context.arguments, "client")?,
             };
             revoke_entry(context, &request)?;
             if emit_to_stdout {
@@ -285,10 +292,10 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                     let output = serde_json::to_string_pretty(&response)
                         .map_err(|error| error.to_string())?;
                     println!("{output}");
-                } else if response.entries.is_empty() {
+                } else if response.is_empty() {
                     println!("no hot-path overrides configured");
                 } else {
-                    for entry in response.entries {
+                    for entry in response {
                         println!(
                             "{}\t{}\t{}\t{}\t{}\t{}",
                             entry.plugin_id,
@@ -406,12 +413,12 @@ fn grant_entry(caller: &(impl HostRuntimeApi + Sync), request: GrantRequest) -> 
     let entries = state.by_session_id.entry(session_id).or_default();
     if let Some(entry) = entries
         .iter_mut()
-        .find(|entry| entry.client_id == request.client)
+        .find(|entry| entry.client_id == request.client_id)
     {
         entry.role = request.role;
     } else {
         entries.push(PermissionEntry {
-            client_id: request.client,
+            client_id: request.client_id,
             role: request.role,
         });
     }
@@ -425,7 +432,7 @@ fn revoke_entry(
     let session_id = resolve_session_id(caller, &request.session)?;
     let mut state = load_state(caller)?;
     if let Some(entries) = state.by_session_id.get_mut(&session_id) {
-        entries.retain(|entry| entry.client_id != request.client);
+        entries.retain(|entry| entry.client_id != request.client_id);
     }
     save_state(caller, &state)
 }
@@ -515,7 +522,7 @@ fn evaluate_hot_path_execution_policy(
 fn list_hot_path_overrides(
     caller: &(impl HostRuntimeApi + Sync),
     request: ListHotPathOverridesRequest,
-) -> Result<ListHotPathOverridesResponse, String> {
+) -> Result<Vec<HotPathOverrideEntry>, String> {
     let session_id = match request.session {
         Some(session) => Some(resolve_session_id(caller, &session)?),
         None => None,
@@ -532,7 +539,7 @@ fn list_hot_path_overrides(
         .filter(|entry| session_id.is_none_or(|id| entry.session_id == Some(id)))
         .filter(|entry| context_id.is_none_or(|id| entry.context_id == Some(id)))
         .collect();
-    Ok(ListHotPathOverridesResponse { entries })
+    Ok(entries)
 }
 
 fn grant_hot_path_override(
@@ -685,7 +692,7 @@ fn resolve_override_scope(
 fn inspect_hot_path_decision(
     caller: &(impl HostRuntimeApi + Sync),
     request: &CheckHotPathDecisionRequest,
-) -> Result<CheckHotPathDecisionResponse, String> {
+) -> Result<HotPathDecisionResponse, String> {
     if request.plugin_id.trim().is_empty() {
         return Err("plugin_id must not be empty".to_string());
     }
@@ -744,7 +751,7 @@ fn inspect_hot_path_decision(
         ))
     };
 
-    Ok(CheckHotPathDecisionResponse {
+    Ok(HotPathDecisionResponse {
         allowed,
         reason,
         matched_scope,
@@ -763,7 +770,7 @@ fn watch_hot_path_policy_decision(
     iterations: usize,
 ) -> Result<(), String> {
     let mut printed = 0usize;
-    let mut last: Option<CheckHotPathDecisionResponse> = None;
+    let mut last: Option<HotPathDecisionResponse> = None;
     loop {
         let decision = inspect_hot_path_decision(caller, request)?;
         if !watch || last.as_ref() != Some(&decision) {
@@ -802,7 +809,7 @@ fn watch_hot_path_policy_decision(
     Ok(())
 }
 
-fn format_hot_path_decision_compact(decision: &CheckHotPathDecisionResponse) -> String {
+fn format_hot_path_decision_compact(decision: &HotPathDecisionResponse) -> String {
     let status = if decision.allowed { "allow" } else { "deny" };
     let scope = decision.matched_scope.as_deref().unwrap_or("none");
     let session = decision
@@ -1042,14 +1049,16 @@ struct ListPermissionsRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GrantRequest {
     session: String,
-    client: String,
+    #[serde(alias = "client")]
+    client_id: String,
     role: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RevokeRequest {
     session: String,
-    client: String,
+    #[serde(alias = "client")]
+    client_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1066,12 +1075,6 @@ struct SessionPolicyCheckRequest {
     capability: Option<String>,
     #[serde(default)]
     execution_class: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SessionPolicyCheckResponse {
-    allowed: bool,
-    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1107,11 +1110,6 @@ struct ListHotPathOverridesRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListHotPathOverridesResponse {
-    entries: Vec<HotPathOverrideEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CheckHotPathDecisionRequest {
     plugin_id: String,
     capability: String,
@@ -1120,46 +1118,6 @@ struct CheckHotPathDecisionRequest {
     session: Option<String>,
     #[serde(default)]
     context: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CheckHotPathDecisionResponse {
-    allowed: bool,
-    reason: Option<String>,
-    #[serde(default)]
-    matched_scope: Option<String>,
-    #[serde(default)]
-    session_id: Option<Uuid>,
-    #[serde(default)]
-    context_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct HotPathOverrideEntry {
-    plugin_id: String,
-    capability: String,
-    execution_class: String,
-    scope: String,
-    #[serde(default)]
-    session_id: Option<Uuid>,
-    #[serde(default)]
-    context_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PermissionEntry {
-    client_id: String,
-    role: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListPermissionsResponse {
-    entries: Vec<PermissionEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CommandAckResponse {
-    ok: bool,
 }
 
 bmux_plugin_sdk::export_plugin!(PermissionsPlugin, include_str!("../plugin.toml"));
@@ -1530,7 +1488,7 @@ mod tests {
             &host,
             GrantRequest {
                 session: "alpha".to_string(),
-                client: client_id.to_string(),
+                client_id: client_id.to_string(),
                 role: "observer".to_string(),
             },
         )
@@ -1579,7 +1537,7 @@ mod tests {
             &host,
             GrantRequest {
                 session: "alpha".to_string(),
-                client: client_id.to_string(),
+                client_id: client_id.to_string(),
                 role: "writer".to_string(),
             },
         )
@@ -1628,7 +1586,7 @@ mod tests {
             &host,
             GrantRequest {
                 session: "alpha".to_string(),
-                client: client_id.to_string(),
+                client_id: client_id.to_string(),
                 role: "owner".to_string(),
             },
         )
@@ -1661,7 +1619,7 @@ mod tests {
             &host,
             GrantRequest {
                 session: "alpha".to_string(),
-                client: client_id.to_string(),
+                client_id: client_id.to_string(),
                 role: "observer".to_string(),
             },
         )
@@ -1694,7 +1652,7 @@ mod tests {
             &host,
             GrantRequest {
                 session: "alpha".to_string(),
-                client: client_id.to_string(),
+                client_id: client_id.to_string(),
                 role: "writer".to_string(),
             },
         )
@@ -1727,7 +1685,7 @@ mod tests {
             &host,
             GrantRequest {
                 session: "alpha".to_string(),
-                client: client_id.to_string(),
+                client_id: client_id.to_string(),
                 role: "writer".to_string(),
             },
         )
@@ -1789,7 +1747,7 @@ mod tests {
             &host,
             GrantRequest {
                 session: "alpha".to_string(),
-                client: client_id.to_string(),
+                client_id: client_id.to_string(),
                 role: "observer".to_string(),
             },
         )
@@ -1798,7 +1756,7 @@ mod tests {
             &host,
             &RevokeRequest {
                 session: "alpha".to_string(),
-                client: client_id.to_string(),
+                client_id: client_id.to_string(),
             },
         )
         .expect("revoke should succeed");
@@ -1828,11 +1786,11 @@ mod tests {
         let session_id = service_test_session_id().to_string();
 
         let grant_context = service_test_context(
-            "permission-command/v1",
+            "permissions-commands",
             "grant",
             encode_service_message(&GrantRequest {
                 session: session_id.clone(),
-                client: client_id.clone(),
+                client_id: client_id.clone(),
                 role: "observer".to_string(),
             })
             .expect("grant request should encode"),
@@ -1848,8 +1806,8 @@ mod tests {
         );
 
         let list_context = service_test_context(
-            "permission-query/v1",
-            "list",
+            "permissions-state",
+            "list-permissions",
             encode_service_message(&ListPermissionsRequest {
                 session: session_id.clone(),
             })
@@ -1864,18 +1822,18 @@ mod tests {
             "unexpected list error: {:?}",
             listed.error
         );
-        let listed_payload: ListPermissionsResponse =
+        let listed_payload: Vec<PermissionEntry> =
             decode_service_message(&listed.payload).expect("list response should decode");
-        assert_eq!(listed_payload.entries.len(), 1);
-        assert_eq!(listed_payload.entries[0].client_id, client_id);
-        assert_eq!(listed_payload.entries[0].role, "observer");
+        assert_eq!(listed_payload.len(), 1);
+        assert_eq!(listed_payload[0].client_id, client_id);
+        assert_eq!(listed_payload[0].role, "observer");
 
         let revoke_context = service_test_context(
-            "permission-command/v1",
+            "permissions-commands",
             "revoke",
             encode_service_message(&RevokeRequest {
                 session: session_id.clone(),
-                client: listed_payload.entries[0].client_id.clone(),
+                client_id: listed_payload[0].client_id.clone(),
             })
             .expect("revoke request should encode"),
             "bmux.permissions.write",
@@ -1890,8 +1848,8 @@ mod tests {
         );
 
         let relist_context = service_test_context(
-            "permission-query/v1",
-            "list",
+            "permissions-state",
+            "list-permissions",
             encode_service_message(&ListPermissionsRequest {
                 session: session_id,
             })
@@ -1906,9 +1864,9 @@ mod tests {
             "unexpected relist error: {:?}",
             relisted.error
         );
-        let relisted_payload: ListPermissionsResponse =
+        let relisted_payload: Vec<PermissionEntry> =
             decode_service_message(&relisted.payload).expect("relist response should decode");
-        assert!(relisted_payload.entries.is_empty());
+        assert!(relisted_payload.is_empty());
     }
 
     #[test]
@@ -1919,11 +1877,11 @@ mod tests {
         let session_id = service_test_session_id().to_string();
 
         let grant_context = service_test_context(
-            "permission-command/v1",
+            "permissions-commands",
             "grant",
             encode_service_message(&GrantRequest {
                 session: session_id,
-                client: client_id.to_string(),
+                client_id: client_id.to_string(),
                 role: "observer".to_string(),
             })
             .expect("grant request should encode"),
@@ -1939,7 +1897,7 @@ mod tests {
         );
 
         let policy_context = service_test_context(
-            "session-policy-query/v1",
+            "session-policy-state",
             "check",
             encode_service_message(&SessionPolicyCheckRequest {
                 session_id: service_test_session_id(),
@@ -1973,11 +1931,11 @@ mod tests {
         let mut plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
-            "permission-command/v1",
+            "permissions-commands",
             "grant",
             encode_service_message(&GrantRequest {
                 session: "alpha".to_string(),
-                client: Uuid::new_v4().to_string(),
+                client_id: Uuid::new_v4().to_string(),
                 role: "invalid".to_string(),
             })
             .expect("grant request should encode"),
@@ -1997,7 +1955,7 @@ mod tests {
         let mut plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
-            "permission-command/v1",
+            "permissions-commands",
             "grant",
             vec![1, 2, 3],
             "bmux.permissions.write",
@@ -2015,8 +1973,8 @@ mod tests {
         let mut plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
-            "permission-query/v1",
-            "list",
+            "permissions-state",
+            "list-permissions",
             encode_service_message(&ListPermissionsRequest {
                 session: "missing-session".to_string(),
             })
@@ -2037,7 +1995,7 @@ mod tests {
         let mut plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
-            "session-policy-query/v1",
+            "session-policy-state",
             "check",
             encode_service_message(&SessionPolicyCheckRequest {
                 session_id: service_test_session_id(),
@@ -2072,7 +2030,7 @@ mod tests {
         let mut plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
-            "session-policy-query/v1",
+            "session-policy-state",
             "check",
             vec![1, 2, 3],
             "bmux.sessions.policy",
@@ -2090,7 +2048,7 @@ mod tests {
         let mut plugin = PermissionsPlugin;
         let data_dir = service_test_data_dir();
         let context = service_test_context(
-            "permission-command/v1",
+            "permissions-commands",
             "unknown",
             Vec::new(),
             "bmux.permissions.write",
@@ -2113,11 +2071,11 @@ mod tests {
         let session_id = service_test_session_id().to_string();
 
         let grant_context = service_test_context(
-            "permission-command/v1",
+            "permissions-commands",
             "grant",
             encode_service_message(&GrantRequest {
                 session: session_id,
-                client: client_id.to_string(),
+                client_id: client_id.to_string(),
                 role: "observer".to_string(),
             })
             .expect("grant request should encode"),
@@ -2133,7 +2091,7 @@ mod tests {
         );
 
         let context = service_test_context(
-            "session-policy-query/v1",
+            "session-policy-state",
             "check",
             encode_service_message(&SessionPolicyCheckRequest {
                 session_id: service_test_session_id(),
@@ -2289,7 +2247,7 @@ mod tests {
 
     #[test]
     fn compact_hot_path_decision_format_includes_reason_for_denies() {
-        let line = format_hot_path_decision_compact(&CheckHotPathDecisionResponse {
+        let line = format_hot_path_decision_compact(&HotPathDecisionResponse {
             allowed: false,
             reason: Some("denied by policy".to_string()),
             matched_scope: None,

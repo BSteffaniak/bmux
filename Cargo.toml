@@ -65,6 +65,7 @@ members = [
     "plugins/pane-runtime-plugin",
     "plugins/pane-runtime-plugin-api",
     "plugins/plugin-cli-plugin",
+    "plugins/permissions-plugin-api",
     "plugins/permissions-plugin",
     "plugins/performance-plugin",
     "plugins/performance-plugin-api",
@@ -183,6 +184,7 @@ bmux_pane_runtime_plugin_api    = { version = "0.0.1-alpha.0", default-features 
 bmux_performance_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/performance-plugin" }
 bmux_performance_plugin_api     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/performance-plugin-api" }
 bmux_permissions_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/permissions-plugin" }
+bmux_permissions_plugin_api     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/permissions-plugin-api" }
 bmux_plugin_cli_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/plugin-cli-plugin" }
 bmux_prompted_actions_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/prompted-actions-plugin" }
 bmux_recording_plugin           = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/recording-plugin" }

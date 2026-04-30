@@ -1,0 +1,101 @@
+// Public, typed contract of the permissions plugin.
+
+plugin bmux.permissions version 1;
+
+capability PERMISSIONS_READ = bmux.permissions.read;
+capability PERMISSIONS_WRITE = bmux.permissions.write;
+capability SESSIONS_POLICY = bmux.sessions.policy;
+
+@capability(PERMISSIONS_READ)
+interface permissions-state {
+    record permission-entry {
+        client-id: string,
+        role: string,
+    }
+
+    query list-permissions(session: string) -> list<permission-entry>;
+}
+
+@capability(PERMISSIONS_WRITE)
+interface permissions-commands {
+    record command-ack {
+        ok: bool,
+    }
+
+    command grant(session: string, client-id: string, role: string) -> command-ack;
+    command revoke(session: string, client-id: string) -> command-ack;
+}
+
+@capability(SESSIONS_POLICY)
+interface session-policy-state {
+    record session-policy-check-response {
+        allowed: bool,
+        reason: string?,
+    }
+
+    record hot-path-override-entry {
+        plugin-id: string,
+        capability: string,
+        execution-class: string,
+        scope: string,
+        session-id: uuid?,
+        context-id: uuid?,
+    }
+
+    record hot-path-decision-response {
+        allowed: bool,
+        reason: string?,
+        matched-scope: string?,
+        session-id: uuid?,
+        context-id: uuid?,
+    }
+
+    query check(
+        session-id: uuid,
+        context-id: uuid?,
+        client-id: uuid,
+        principal-id: uuid,
+        action: string,
+        plugin-id: string?,
+        capability: string?,
+        execution-class: string?,
+    ) -> session-policy-check-response;
+
+    query list-hot-path-overrides(
+        session: string?,
+        context: string?,
+    ) -> list<hot-path-override-entry>;
+
+    query resolve-hot-path-decision(
+        plugin-id: string,
+        capability: string,
+        execution-class: string,
+        session: string?,
+        context: string?,
+    ) -> hot-path-decision-response;
+}
+
+@capability(SESSIONS_POLICY)
+interface session-policy-commands {
+    record command-ack {
+        ok: bool,
+    }
+
+    command grant-hot-path-override(
+        plugin-id: string,
+        capability: string,
+        execution-class: string,
+        scope: string,
+        session: string?,
+        context: string?,
+    ) -> command-ack;
+
+    command revoke-hot-path-override(
+        plugin-id: string,
+        capability: string,
+        execution-class: string,
+        scope: string,
+        session: string?,
+        context: string?,
+    ) -> command-ack;
+}

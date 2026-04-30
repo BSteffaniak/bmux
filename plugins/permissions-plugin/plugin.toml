@@ -29,22 +29,22 @@ version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.permissions.read"
-interface_id = "permission-query/v1"
+interface_id = "permissions-state"
 kind         = "query"
 
 [[services]]
 capability   = "bmux.permissions.write"
-interface_id = "permission-command/v1"
+interface_id = "permissions-commands"
 kind         = "command"
 
 [[services]]
 capability   = "bmux.sessions.policy"
-interface_id = "session-policy-query/v1"
+interface_id = "session-policy-state"
 kind         = "query"
 
 [[services]]
 capability   = "bmux.sessions.policy"
-interface_id = "session-policy-command/v1"
+interface_id = "session-policy-commands"
 kind         = "command"
 
 [[commands]]

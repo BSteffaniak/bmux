@@ -18,7 +18,7 @@ latency-sensitive permission checks.
 
 ## Services
 
-- **`permission-query/v1`** -- `list` permissions for a session
-- **`permission-command/v1`** -- `grant` / `revoke` roles
-- **`session-policy-query/v1`** -- `check` / `list-hot-path-overrides` / `resolve-hot-path-decision`
-- **`session-policy-command/v1`** -- `grant-hot-path-override` / `revoke-hot-path-override`
+- **`permissions-state`** -- `list` permissions for a session
+- **`permissions-commands`** -- `grant` / `revoke` roles
+- **`session-policy-state`** -- `check` / `list-hot-path-overrides` / `resolve-hot-path-decision`
+- **`session-policy-commands`** -- `grant-hot-path-override` / `revoke-hot-path-override`
