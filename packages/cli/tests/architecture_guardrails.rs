@@ -1158,6 +1158,13 @@ fn recording_ipc_variants_are_absent() {
         // compatibility.
         "pub enum RecordingProfile",
         "pub enum RecordingEventKind",
+        "pub struct RecordingSummary",
+        "pub struct RecordingStatus",
+        "pub struct RecordingCaptureTarget",
+        "pub struct RecordingRollingStartOptions",
+        "pub struct RecordingRollingUsage",
+        "pub struct RecordingRollingStatus",
+        "pub struct RecordingRollingClearReport",
         // ResponsePayload variants.
         "ResponsePayload::RecordingStarted",
         "ResponsePayload::RecordingStopped",
