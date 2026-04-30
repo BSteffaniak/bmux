@@ -3,6 +3,7 @@ use bmux_appearance::{RUNTIME_APPEARANCE_STATE_KIND, RuntimeAppearance};
 use bmux_attach_layout_protocol::attach_layout_protocol::{
     AttachLayoutSnapshot, AttachSurfaceSummary, STATE_KIND as ATTACH_LAYOUT_STATE_KIND,
 };
+use bmux_attach_layout_protocol::{PaneFocusDirection, PaneSplitDirection};
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
     apply_attach_output_chunk_with, attach_scene_damage_between,
@@ -17,10 +18,7 @@ use bmux_client::{
 };
 use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
 use bmux_context_state::ContextSelector;
-use bmux_ipc::{
-    AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, InvokeServiceKind, PaneFocusDirection,
-    PaneSplitDirection,
-};
+use bmux_ipc::{AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, InvokeServiceKind};
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_permissions_plugin_api::session_policy_state;
 use bmux_plugin_sdk::{
@@ -8871,14 +8869,14 @@ mod tests {
         AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRenderBuffer,
     };
 
-    use bmux_attach_layout_protocol::{PaneState, PaneSummary};
+    use bmux_attach_layout_protocol::{PaneLayoutNode, PaneState, PaneSummary};
     use bmux_client::{AttachLayoutState, AttachOpenInfo};
     use bmux_config::{
         BmuxConfig, MouseClickPropagation, MouseSelectionReleaseBehavior, MouseWheelPropagation,
     };
     use bmux_ipc::{
         AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        AttachViewComponent, PaneLayoutNode,
+        AttachViewComponent,
     };
 
     use crossterm::event::{
@@ -9982,7 +9980,7 @@ mod tests {
             state_reason: None,
         });
         next.layout_root = PaneLayoutNode::Split {
-            direction: bmux_ipc::PaneSplitDirection::Vertical,
+            direction: PaneSplitDirection::Vertical,
             ratio_percent: 50,
             first: Box::new(PaneLayoutNode::Leaf {
                 pane_id: existing_pane,

@@ -6,9 +6,10 @@ use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use bmux_attach_layout_protocol::{PaneFocusDirection, PaneSelector, PaneSplitDirection};
 use bmux_client::BmuxClient;
 use bmux_contexts_plugin_api::contexts_state;
-use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection};
+use bmux_ipc::InvokeServiceKind;
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
 use bmux_plugin_sdk::{
     PluginCliCommandRequest, PluginCliCommandResponse, TypedServiceEndpoint,
@@ -87,19 +88,19 @@ fn ipc_to_windows_selector(selector: SessionSelector) -> windows_commands::Selec
 }
 
 #[must_use]
-const fn pane_to_windows_selector(selector: &bmux_ipc::PaneSelector) -> windows_commands::Selector {
+const fn pane_to_windows_selector(selector: &PaneSelector) -> windows_commands::Selector {
     match selector {
-        bmux_ipc::PaneSelector::ById(id) => windows_commands::Selector {
+        PaneSelector::ById(id) => windows_commands::Selector {
             id: Some(*id),
             name: None,
             index: None,
         },
-        bmux_ipc::PaneSelector::ByIndex(index) => windows_commands::Selector {
+        PaneSelector::ByIndex(index) => windows_commands::Selector {
             id: None,
             name: None,
             index: Some(*index),
         },
-        bmux_ipc::PaneSelector::Active => windows_commands::Selector {
+        PaneSelector::Active => windows_commands::Selector {
             id: None,
             name: None,
             index: None,
@@ -2233,7 +2234,7 @@ pub(super) async fn execute_step(
         Action::FocusPane { target } => {
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
-            let selector = pane_to_windows_selector(&bmux_ipc::PaneSelector::ByIndex(*target));
+            let selector = pane_to_windows_selector(&PaneSelector::ByIndex(*target));
             let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
                 invoke_windows_command_bmux(
                     client,
@@ -2253,8 +2254,8 @@ pub(super) async fn execute_step(
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
             let selector = target.as_ref().map_or_else(
-                || pane_to_windows_selector(&bmux_ipc::PaneSelector::Active),
-                |idx| pane_to_windows_selector(&bmux_ipc::PaneSelector::ByIndex(*idx)),
+                || pane_to_windows_selector(&PaneSelector::Active),
+                |idx| pane_to_windows_selector(&PaneSelector::ByIndex(*idx)),
             );
             let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
                 invoke_windows_command_bmux(

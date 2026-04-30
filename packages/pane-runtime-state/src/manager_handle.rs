@@ -16,11 +16,11 @@ use crate::{
     AttachViewport, FloatingSurfaceRuntime, PaneLayoutNode, PaneResizeDirection, PaneRuntimeMeta,
     SessionRuntimeError,
 };
-use bmux_attach_layout_protocol::{PaneState, PaneSummary};
-use bmux_ipc::{
-    AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene, PaneFocusDirection,
-    PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection,
+use bmux_attach_layout_protocol::{
+    PaneFocusDirection, PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
+    PaneSplitDirection, PaneState, PaneSummary,
 };
+use bmux_ipc::{AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene};
 use bmux_session_models::{ClientId, SessionId};
 use std::collections::BTreeSet;
 use std::sync::Arc;

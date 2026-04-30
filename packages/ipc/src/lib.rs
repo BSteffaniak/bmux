@@ -300,59 +300,12 @@ impl Envelope {
     }
 }
 
-/// Pane selector accepted by commands and protocol requests.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PaneSelector {
-    ById(Uuid),
-    ByIndex(u32),
-    Active,
-}
-
 /// Generic service invocation kind for plugin-dispatched RPC calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvokeServiceKind {
     Query,
     Command,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PaneSplitDirection {
-    Vertical,
-    Horizontal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneLaunchCommand {
-    pub program: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PaneFocusDirection {
-    Next,
-    Prev,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PaneLayoutNode {
-    Leaf {
-        pane_id: Uuid,
-    },
-    Split {
-        direction: PaneSplitDirection,
-        ratio_percent: u8,
-        first: Box<Self>,
-        second: Box<Self>,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1615,26 +1568,6 @@ mod tests {
         }
     }
 
-    fn sample_layout_tree() -> PaneLayoutNode {
-        PaneLayoutNode::Split {
-            direction: PaneSplitDirection::Horizontal,
-            ratio_percent: 50,
-            first: Box::new(PaneLayoutNode::Leaf {
-                pane_id: Uuid::from_u128(10),
-            }),
-            second: Box::new(PaneLayoutNode::Split {
-                direction: PaneSplitDirection::Vertical,
-                ratio_percent: 60,
-                first: Box::new(PaneLayoutNode::Leaf {
-                    pane_id: Uuid::from_u128(11),
-                }),
-                second: Box::new(PaneLayoutNode::Leaf {
-                    pane_id: Uuid::from_u128(12),
-                }),
-            }),
-        }
-    }
-
     #[test]
     #[allow(clippy::too_many_lines)]
     fn response_payload_all_variants_roundtrip() {
@@ -2127,23 +2060,6 @@ mod tests {
         ];
         for layer in &layers {
             assert_roundtrip(layer);
-        }
-    }
-
-    #[test]
-    fn pane_layout_node_split_roundtrip() {
-        assert_roundtrip(&sample_layout_tree());
-    }
-
-    #[test]
-    fn pane_selector_all_variants_roundtrip() {
-        let selectors = [
-            PaneSelector::ById(Uuid::from_u128(1)),
-            PaneSelector::ByIndex(42),
-            PaneSelector::Active,
-        ];
-        for sel in &selectors {
-            assert_roundtrip(sel);
         }
     }
 }

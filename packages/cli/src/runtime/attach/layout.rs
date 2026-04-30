@@ -1,5 +1,5 @@
 use super::state::PaneRect;
-use bmux_ipc::{PaneLayoutNode, PaneSplitDirection};
+use bmux_attach_layout_protocol::{PaneLayoutNode, PaneSplitDirection};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 

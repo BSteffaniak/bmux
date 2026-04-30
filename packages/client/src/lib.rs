@@ -4,7 +4,7 @@
 
 //! Client component for bmux terminal multiplexer.
 
-use bmux_attach_layout_protocol::PaneSummary;
+use bmux_attach_layout_protocol::{PaneLayoutNode, PaneSummary};
 use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{
@@ -14,9 +14,9 @@ use bmux_ipc::transport::{
 use bmux_ipc::{
     AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene,
     CORE_PROTOCOL_CAPABILITIES, Envelope, EnvelopeKind, ErrorCode, IncompatibilityReason,
-    InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, PaneLayoutNode, ProtocolContract, Request,
-    Response, ResponsePayload, ServerSnapshotStatus, ServicePipelineRequest,
-    ServicePipelineStepResult, decode, default_supported_capabilities, encode,
+    InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, ProtocolContract, Request, Response,
+    ResponsePayload, ServerSnapshotStatus, ServicePipelineRequest, ServicePipelineStepResult,
+    decode, default_supported_capabilities, encode,
 };
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing};
 use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult};

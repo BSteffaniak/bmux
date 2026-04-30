@@ -1,6 +1,6 @@
 //! Layout tree + floating surface types.
 
-use bmux_ipc::PaneSplitDirection;
+use bmux_attach_layout_protocol::PaneSplitDirection;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -330,7 +330,7 @@ pub fn contains_pane(node: &PaneLayoutNode, pane_id: Uuid) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{LayoutRect, PaneLayoutNode, PaneResizeDirection, contains_pane};
-    use bmux_ipc::PaneSplitDirection;
+    use bmux_attach_layout_protocol::PaneSplitDirection;
     use uuid::Uuid;
 
     fn leaf(id: Uuid) -> PaneLayoutNode {

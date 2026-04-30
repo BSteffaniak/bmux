@@ -6,7 +6,9 @@
 //! (`session_runtime_handle()` returns `None`), the handler reports a
 //! `PaneCommandError::Failed { reason }` / `SessionRuntimeCommandError::Failed`.
 
-use bmux_ipc::{PaneFocusDirection, PaneLaunchCommand, PaneSelector, PaneSplitDirection};
+use bmux_attach_layout_protocol::{
+    PaneFocusDirection, PaneLaunchCommand, PaneSelector, PaneSplitDirection,
+};
 use bmux_pane_runtime_plugin_api::pane_runtime_commands::{
     PaneAck, PaneCommandError, SessionAck, SessionRuntimeCommandError,
 };

@@ -1810,7 +1810,15 @@ fn client_state_dtos_are_absent_from_ipc() {
 #[test]
 fn pane_summary_dtos_are_absent_from_ipc() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
-    let denied = ["pub struct PaneSummary", "pub enum PaneState"];
+    let denied = [
+        "pub enum PaneSelector",
+        "pub enum PaneSplitDirection",
+        "pub struct PaneLaunchCommand",
+        "pub enum PaneFocusDirection",
+        "pub enum PaneLayoutNode",
+        "pub struct PaneSummary",
+        "pub enum PaneState",
+    ];
     for marker in denied {
         assert!(
             !ipc_source.contains(marker),

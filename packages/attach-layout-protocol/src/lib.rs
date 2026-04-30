@@ -13,6 +13,53 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+/// Pane selector accepted by pane-runtime commands and protocol helpers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PaneSelector {
+    ById(::uuid::Uuid),
+    ByIndex(u32),
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneSplitDirection {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaneLaunchCommand {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: ::std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneFocusDirection {
+    Next,
+    Prev,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneLayoutNode {
+    Leaf {
+        pane_id: ::uuid::Uuid,
+    },
+    Split {
+        direction: PaneSplitDirection,
+        ratio_percent: u8,
+        first: Box<Self>,
+        second: Box<Self>,
+    },
+}
+
 /// Summary returned when listing panes in the active session runtime.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaneSummary {

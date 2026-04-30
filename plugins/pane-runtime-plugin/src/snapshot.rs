@@ -6,7 +6,7 @@
 //! a combined envelope; this module registers the pane-runtime participant
 //! so that state is persisted alongside the other plugin-owned slices.
 
-use bmux_ipc::PaneLaunchCommand;
+use bmux_attach_layout_protocol::{PaneLaunchCommand, PaneSplitDirection};
 use bmux_plugin_sdk::{
     PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
     StatefulPluginResult, StatefulPluginSnapshot,
@@ -18,7 +18,6 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::runtime::{session_handle, session_runtime_handle};
-use bmux_ipc::PaneSplitDirection;
 use bmux_pane_runtime_state::{
     FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec, PaneLayoutNode,
     PaneResurrectionSnapshot, PaneRuntimeMeta,
@@ -403,7 +402,7 @@ mod tests {
         PaneRuntimeSnapshotV1Layout, PaneRuntimeSnapshotV1Pane,
         PaneRuntimeSnapshotV1SplitDirection,
     };
-    use bmux_ipc::PaneLaunchCommand;
+    use bmux_attach_layout_protocol::PaneLaunchCommand;
     use bmux_pane_runtime_state::PaneCommandSource;
     use std::collections::BTreeMap;
     use uuid::Uuid;
