@@ -1,3 +1,4 @@
+use bmux_plugin::{ExtensionRect, RenderDamage};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -28,12 +29,22 @@ pub struct AttachScrollbackPosition {
     pub col: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionRenderCacheEntry {
+    pub surface_id: Uuid,
+    pub surface_rect: ExtensionRect,
+    pub damage: RenderDamage,
+    pub revision: u64,
+    pub bytes: Vec<u8>,
+}
+
 pub struct PaneRenderBuffer {
     pub parser: vt100::Parser,
     pub last_alternate_screen: bool,
     pub prev_rows: Vec<String>,
     pub sync_update_in_progress: bool,
     pub expected_stream_start: Option<u64>,
+    pub extension_render_cache: BTreeMap<(String, Uuid), ExtensionRenderCacheEntry>,
 }
 
 impl Default for PaneRenderBuffer {
@@ -44,6 +55,7 @@ impl Default for PaneRenderBuffer {
             prev_rows: Vec::new(),
             sync_update_in_progress: false,
             expected_stream_start: None,
+            extension_render_cache: BTreeMap::new(),
         }
     }
 }

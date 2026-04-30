@@ -65,9 +65,12 @@ struct State {
     /// `BorderStyle::default()` yields `BorderStyle::Ascii`.
     default_border: BorderStyle,
     /// Monotonic revision counter for published decoration scenes.
-    /// Incremented every time internal state changes so consumers can
-    /// discard stale snapshots cheaply.
+    /// Incremented only when generated scene output changes so consumers
+    /// can discard stale snapshots cheaply without repainting no-op ticks.
     scene_revision: u64,
+    /// Last generated scene output that was published on the retained bus.
+    /// The revision field is ignored when comparing future scene output.
+    last_published_scene: Option<DecorationScene>,
     /// Currently-loaded extension supplied through `theme-extension:apply`;
     /// `None` means "no extension observed; paint with built-in ASCII defaults".
     current_theme: Option<DecorationThemeExtension>,
@@ -701,20 +704,36 @@ fn empty_scene() -> DecorationScene {
     }
 }
 
-/// Bump the scene revision and publish the updated [`DecorationScene`] as
-/// retained state on the typed plugin event bus. Called from every mutator so
+/// Publish the updated [`DecorationScene`] as retained state on the typed plugin
+/// event bus when generated output changed. Called from every mutator so
 /// consumers (e.g. the attach runtime) can refresh their scene cache
 /// incrementally while late subscribers can still hydrate from the current
 /// value. Publication silently no-ops if the event-bus channel has not been
 /// registered yet (the decoration plugin registers it in
 /// [`DecorationPlugin::activate`]).
 fn bump_revision(state: &mut State) {
+    // Build while we still hold the lock so script render output and revision
+    // updates stay ordered from subscribers' perspective. The candidate scene
+    // is compared without its revision so animation ticks that do not change
+    // visible output do not force attach clients to repaint.
+    let mut scene = build_scene(state);
+    if state
+        .last_published_scene
+        .as_ref()
+        .is_some_and(|previous| scene_output_matches(previous, &scene))
+    {
+        return;
+    }
+
     state.scene_revision = state.scene_revision.saturating_add(1);
-    // Build + publish while we still hold the lock: this keeps the revision
-    // monotonic from subscribers' perspective.
-    let scene = build_scene(state);
+    scene.revision = state.scene_revision;
+    state.last_published_scene = Some(scene.clone());
     let _ = bmux_plugin::global_event_bus()
         .publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
+}
+
+fn scene_output_matches(left: &DecorationScene, right: &DecorationScene) -> bool {
+    left.surfaces == right.surfaces && left.animation == right.animation
 }
 
 /// Parse a TOML string against the [`DecorationThemeExtension`]
@@ -2506,6 +2525,48 @@ mod tests {
         let scene = plugin.build_scene();
         assert_eq!(scene.revision, 0);
         assert!(scene.surfaces.is_empty());
+    }
+
+    #[test]
+    fn bump_revision_skips_publishing_when_scene_output_is_unchanged() {
+        let mut state = State::default();
+        let pane = Uuid::from_u128(0xa11);
+        state.geometry.insert(
+            pane,
+            PaneGeometry {
+                pane_id: pane,
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 12,
+                    h: 5,
+                },
+                content_rect: Rect {
+                    x: 1,
+                    y: 1,
+                    w: 10,
+                    h: 3,
+                },
+            },
+        );
+        state.activity.insert(
+            pane,
+            PaneActivity {
+                pane_id: pane,
+                focused: false,
+                zoomed: false,
+                status: PaneLifecycle::Running,
+            },
+        );
+
+        bump_revision(&mut state);
+        assert_eq!(state.scene_revision, 1);
+        bump_revision(&mut state);
+        assert_eq!(state.scene_revision, 1);
+
+        state.activity_mut(pane).focused = true;
+        bump_revision(&mut state);
+        assert_eq!(state.scene_revision, 2);
     }
 
     // Helpers shared by the new theme-aware build-scene tests below.

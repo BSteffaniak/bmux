@@ -8304,6 +8304,7 @@ mod tests {
                 prev_rows: Vec::new(),
                 sync_update_in_progress: false,
                 expected_stream_start: None,
+                extension_render_cache: BTreeMap::new(),
             });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
         view_state
@@ -9448,6 +9449,7 @@ mod tests {
                 prev_rows: Vec::new(),
                 sync_update_in_progress: false,
                 expected_stream_start: None,
+                extension_render_cache: BTreeMap::new(),
             });
         // Enable SGR + press/release so the pane protocol reports clicks.
         append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
@@ -9568,6 +9570,7 @@ mod tests {
                 prev_rows: Vec::new(),
                 sync_update_in_progress: false,
                 expected_stream_start: None,
+                extension_render_cache: BTreeMap::new(),
             });
         append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
 
@@ -9732,6 +9735,7 @@ mod tests {
                 prev_rows: Vec::new(),
                 sync_update_in_progress: false,
                 expected_stream_start: None,
+                extension_render_cache: BTreeMap::new(),
             });
         append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
 

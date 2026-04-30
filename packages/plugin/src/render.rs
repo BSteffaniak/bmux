@@ -222,6 +222,14 @@ pub trait AttachRenderExtension: Send + Sync {
         RenderDamage::FullSurface
     }
 
+    /// Return an optional revision token for render output on this
+    /// surface. Declarative render ops are cached only when this
+    /// returns `Some`; increment or otherwise change the token whenever
+    /// the extension's output for the surface can change.
+    fn render_revision(&self, _surface_id: Uuid) -> Option<u64> {
+        None
+    }
+
     /// Paint per-surface output onto `stdout` for the damaged region
     /// of `surface_rect`. Returns `Ok(true)` when any bytes were
     /// written, or `Ok(false)` when the extension had nothing to paint.

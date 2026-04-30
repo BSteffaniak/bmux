@@ -1,5 +1,6 @@
 use crate::types::{
-    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
+    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, ExtensionRenderCacheEntry,
+    PaneRect, PaneRenderBuffer,
 };
 use anyhow::{Context, Result};
 use bmux_appearance::{
@@ -1106,14 +1107,53 @@ pub fn render_attach_scene<W: io::Write>(
                 if damage.is_none() {
                     continue;
                 }
+
+                let revision = ext.render_revision(surface.id);
+                let cache_key = (ext.name().to_string(), surface.id);
+                if let Some(revision) = revision
+                    && let Some(entry) = pane_buffers
+                        .get(&pane_id)
+                        .and_then(|buffer| buffer.extension_render_cache.get(&cache_key))
+                    && entry.surface_rect == ext_rect
+                    && entry.damage == damage
+                    && entry.revision == revision
+                {
+                    stdout
+                        .write_all(&entry.bytes)
+                        .context("failed replaying cached declarative render ops")?;
+                    continue;
+                }
+
                 if let Some(ops) = ext.render_ops(surface.id, &ext_rect, &damage) {
-                    if let Err(err) = queue_render_ops(stdout, ext_rect, &damage, &ops) {
-                        tracing::warn!(
-                            extension = ext.name(),
-                            surface_id = %surface.id,
-                            error = %err,
-                            "render extension render_ops failed",
-                        );
+                    let mut bytes = Vec::new();
+                    match queue_render_ops(&mut bytes, ext_rect, &damage, &ops) {
+                        Ok(_) => {
+                            stdout
+                                .write_all(&bytes)
+                                .context("failed writing declarative render op bytes")?;
+                            if let Some(revision) = revision
+                                && let Some(buffer) = pane_buffers.get_mut(&pane_id)
+                            {
+                                buffer.extension_render_cache.insert(
+                                    cache_key,
+                                    ExtensionRenderCacheEntry {
+                                        surface_id: surface.id,
+                                        surface_rect: ext_rect,
+                                        damage,
+                                        revision,
+                                        bytes,
+                                    },
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                extension = ext.name(),
+                                surface_id = %surface.id,
+                                error = %err,
+                                "render extension render_ops failed",
+                            );
+                        }
                     }
                 } else {
                     // Re-bind through `&mut dyn io::Write` so the extension
@@ -1775,17 +1815,27 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Test covers render-op execution and cache replay in one fixture.
     fn render_attach_scene_prefers_declarative_render_extension_ops() {
         use bmux_plugin::AttachRenderExtension;
         use std::io;
-        use std::sync::Arc;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
 
-        struct DeclarativeExtension;
+        struct DeclarativeExtension {
+            calls: Arc<AtomicUsize>,
+        }
 
         impl AttachRenderExtension for DeclarativeExtension {
             #[allow(clippy::unnecessary_literal_bound)]
             fn name(&self) -> &str {
                 "test.declarative"
+            }
+
+            fn render_revision(&self, _surface_id: Uuid) -> Option<u64> {
+                Some(7)
             }
 
             fn render_surface(
@@ -1804,6 +1854,7 @@ mod tests {
                 _surface_rect: &ExtensionRect,
                 _damage: &RenderDamage,
             ) -> Option<Vec<RenderOp>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
                 Some(vec![RenderOp::TextRun {
                     x: 2,
                     y: 1,
@@ -1848,8 +1899,11 @@ mod tests {
         };
         let mut pane_buffers = BTreeMap::new();
         pane_buffers.insert(pane_id, PaneRenderBuffer::default());
-        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
-            vec![Arc::new(DeclarativeExtension) as Arc<dyn AttachRenderExtension>];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> = vec![Arc::new(DeclarativeExtension {
+            calls: Arc::clone(&calls),
+        })
+            as Arc<dyn AttachRenderExtension>];
 
         let mut output = Vec::new();
         let _ = render_attach_scene(
@@ -1876,6 +1930,34 @@ mod tests {
         assert!(rendered.contains("OPS"));
         assert!(rendered.contains("\x1b[38;2;1;2;3m"));
         assert!(rendered.contains("\x1b[1m"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let mut cached_output = Vec::new();
+        let _ = render_attach_scene(
+            &mut cached_output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("cached render should succeed");
+        assert!(
+            String::from_utf8(cached_output)
+                .expect("cached render output should be utf8")
+                .contains("OPS")
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
