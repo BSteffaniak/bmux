@@ -4,6 +4,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+use bmux_attach_image_protocol::AttachPaneImage;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -101,6 +102,73 @@ pub struct RecordingEventEnvelope<ServerEvent, RequestErrorCode> {
     pub client_id: Option<Uuid>,
     pub kind: RecordingEventKind,
     pub payload: RecordingPayload<ServerEvent, RequestErrorCode>,
+}
+
+/// Display track event shared by recording writers and exporters.
+///
+/// The `terminal_profile` field stores pre-serialized bytes (codec-encoded
+/// terminal profile data) to avoid cross-crate type dependencies. Use `None`
+/// when no terminal profile is available, such as headless playbook execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayTrackEvent {
+    StreamOpened {
+        client_id: Uuid,
+        recording_id: Uuid,
+        cell_width_px: Option<u16>,
+        cell_height_px: Option<u16>,
+        window_width_px: Option<u16>,
+        window_height_px: Option<u16>,
+        /// Pre-serialized terminal profile bytes (binary-encoded), or `None`.
+        #[serde(with = "bmux_codec::serde_bytes_vec::option")]
+        terminal_profile: Option<Vec<u8>>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    FrameBytes {
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        data: Vec<u8>,
+    },
+    CursorSnapshot {
+        x: u16,
+        y: u16,
+        visible: bool,
+        shape: DisplayCursorShape,
+        blink_enabled: bool,
+    },
+    Activity {
+        kind: DisplayActivityKind,
+    },
+    StreamClosed,
+    /// Snapshot of all visible images for a set of panes at frame time.
+    ImageUpdate {
+        images: Vec<AttachPaneImage>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayCursorShape {
+    Block,
+    Bar,
+    Underline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayActivityKind {
+    Input,
+    Output,
+    Cursor,
+}
+
+/// Display track envelope wraps an event with a monotonic timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayTrackEnvelope {
+    pub mono_ns: u64,
+    pub event: DisplayTrackEvent,
 }
 
 /// Recording summary returned by recording APIs.

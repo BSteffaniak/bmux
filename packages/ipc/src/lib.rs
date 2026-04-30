@@ -7,13 +7,13 @@
 
 //! Cross-platform IPC protocol models for bmux.
 
-use bmux_attach_image_protocol::AttachPaneImage;
 use bmux_attach_view_protocol::AttachViewComponent;
 pub use bmux_performance_state::{
     PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE, PerformanceRecordingLevel,
     PerformanceRuntimeSettings,
 };
 pub use bmux_recording_protocol::{
+    DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent,
     RECORDING_FORMAT_VERSION, RecordingCaptureTarget, RecordingEventKind, RecordingProfile,
     RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
     RecordingRollingUsage, RecordingStatus, RecordingSummary,
@@ -679,82 +679,6 @@ where
     bmux_codec::from_bytes(bytes)
 }
 
-// ── Shared display track types for recording files ───────────────────────────
-
-/// Display track event — shared type used by both the attach runtime's
-/// `DisplayCaptureWriter` and the playbook engine's `PlaybookDisplayTrackWriter`.
-///
-/// The `terminal_profile` field stores pre-serialized bytes (codec-encoded
-/// `DetectedTerminalProfile`) to avoid cross-crate type dependencies. Use `None`
-/// when no terminal profile is available (e.g., headless playbook execution).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DisplayTrackEvent {
-    StreamOpened {
-        client_id: Uuid,
-        recording_id: Uuid,
-        cell_width_px: Option<u16>,
-        cell_height_px: Option<u16>,
-        window_width_px: Option<u16>,
-        window_height_px: Option<u16>,
-        /// Pre-serialized terminal profile bytes (binary-encoded), or `None`.
-        #[serde(with = "bmux_codec::serde_bytes_vec::option")]
-        terminal_profile: Option<Vec<u8>>,
-    },
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
-    FrameBytes {
-        #[serde(with = "bmux_codec::serde_bytes_vec")]
-        data: Vec<u8>,
-    },
-    CursorSnapshot {
-        x: u16,
-        y: u16,
-        visible: bool,
-        shape: DisplayCursorShape,
-        blink_enabled: bool,
-    },
-    Activity {
-        kind: DisplayActivityKind,
-    },
-    StreamClosed,
-    /// Snapshot of all visible images for a set of panes at frame time.
-    /// Used by the GIF exporter to overlay decoded images onto the
-    /// rasterized text cell grid.
-    ///
-    /// Added in format version 5.  Placed after `StreamClosed` to preserve
-    /// the existing variant indices for backwards-compatible display track
-    /// deserialization.
-    ImageUpdate {
-        images: Vec<AttachPaneImage>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DisplayCursorShape {
-    Block,
-    Bar,
-    Underline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DisplayActivityKind {
-    Input,
-    Output,
-    Cursor,
-}
-
-/// Display track envelope — wraps an event with a monotonic timestamp.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DisplayTrackEnvelope {
-    pub mono_ns: u64,
-    pub event: DisplayTrackEvent,
-}
-
 // ── Binary frame utilities for recording files ───────────────────────────────
 
 /// Write a length-prefixed binary frame to a writer.
@@ -827,6 +751,7 @@ pub fn read_frames<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_attach_image_protocol::AttachPaneImage;
     use std::path::Path;
 
     #[test]

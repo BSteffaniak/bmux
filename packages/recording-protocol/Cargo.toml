@@ -11,10 +11,14 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_codec = { workspace = true }
-serde      = { workspace = true, features = ["derive", "std"] }
-uuid       = { workspace = true, features = ["serde", "std"] }
+bmux_attach_image_protocol = { workspace = true }
+bmux_codec                 = { workspace = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
+uuid                       = { workspace = true, features = ["serde", "std"] }
 
 [features]
-default          = []
-fail-on-warnings = []
+default = []
+fail-on-warnings = [
+    "bmux_attach_image_protocol/fail-on-warnings",
+    "bmux_codec/fail-on-warnings",
+]
