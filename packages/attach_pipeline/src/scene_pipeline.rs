@@ -11,14 +11,15 @@ use crate::render::{
 use crate::types::{AttachCursorState, PaneRenderBuffer};
 use crate::{mouse_protocol_encoding_to_ipc, mouse_protocol_mode_to_ipc};
 use anyhow::Result;
+use bmux_attach_layout_protocol::{
+    AttachInputModeState, AttachMouseProtocolState, AttachPaneChunk,
+};
 use bmux_attach_pipeline_models::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, AttachPipelineDiagnosticCode,
     AttachPipelineDiagnosticEvent, AttachViewport,
 };
 use bmux_client::{AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState};
-use bmux_ipc::{
-    AttachInputModeState, AttachMouseProtocolState, AttachPaneChunk, AttachViewComponent,
-};
+use bmux_ipc::AttachViewComponent;
 use crossterm::cursor::{Hide, SavePosition};
 use crossterm::queue;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};

@@ -4,8 +4,9 @@ use bmux_attach_layout_protocol::attach_layout_protocol::{
     AttachLayoutSnapshot, AttachSurfaceSummary, STATE_KIND as ATTACH_LAYOUT_STATE_KIND,
 };
 use bmux_attach_layout_protocol::{
-    AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-    PaneFocusDirection, PaneSplitDirection,
+    AttachInputModeState, AttachLayer as SurfaceLayer, AttachMouseProtocolEncoding,
+    AttachMouseProtocolMode, AttachMouseProtocolState, AttachRect, AttachScene, AttachSurface,
+    AttachSurfaceKind, PaneFocusDirection, PaneSplitDirection,
 };
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
@@ -490,14 +491,14 @@ fn apply_attach_output_bytes(
     let screen = buffer.parser.screen();
     view_state.pane_mouse_protocol_hints.insert(
         pane_id,
-        bmux_ipc::AttachMouseProtocolState {
+        AttachMouseProtocolState {
             mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
             encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
         },
     );
     view_state.pane_input_mode_hints.insert(
         pane_id,
-        bmux_ipc::AttachInputModeState {
+        AttachInputModeState {
             application_cursor: screen.application_cursor(),
             application_keypad: screen.application_keypad(),
         },
@@ -541,14 +542,14 @@ fn apply_attach_output_chunk(
             let screen = buffer.parser.screen();
             pane_mouse_protocol_hints.insert(
                 pane_id,
-                bmux_ipc::AttachMouseProtocolState {
+                AttachMouseProtocolState {
                     mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
                     encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
                 },
             );
             pane_input_mode_hints.insert(
                 pane_id,
-                bmux_ipc::AttachInputModeState {
+                AttachInputModeState {
                     application_cursor: screen.application_cursor(),
                     application_keypad: screen.application_keypad(),
                 },
@@ -7729,25 +7730,23 @@ pub struct AttachPaneInputMode {
     pub application_keypad: bool,
 }
 
-pub const fn mouse_protocol_mode_to_ipc(
-    mode: vt100::MouseProtocolMode,
-) -> bmux_ipc::AttachMouseProtocolMode {
+pub const fn mouse_protocol_mode_to_ipc(mode: vt100::MouseProtocolMode) -> AttachMouseProtocolMode {
     match mode {
-        vt100::MouseProtocolMode::None => bmux_ipc::AttachMouseProtocolMode::None,
-        vt100::MouseProtocolMode::Press => bmux_ipc::AttachMouseProtocolMode::Press,
-        vt100::MouseProtocolMode::PressRelease => bmux_ipc::AttachMouseProtocolMode::PressRelease,
-        vt100::MouseProtocolMode::ButtonMotion => bmux_ipc::AttachMouseProtocolMode::ButtonMotion,
-        vt100::MouseProtocolMode::AnyMotion => bmux_ipc::AttachMouseProtocolMode::AnyMotion,
+        vt100::MouseProtocolMode::None => AttachMouseProtocolMode::None,
+        vt100::MouseProtocolMode::Press => AttachMouseProtocolMode::Press,
+        vt100::MouseProtocolMode::PressRelease => AttachMouseProtocolMode::PressRelease,
+        vt100::MouseProtocolMode::ButtonMotion => AttachMouseProtocolMode::ButtonMotion,
+        vt100::MouseProtocolMode::AnyMotion => AttachMouseProtocolMode::AnyMotion,
     }
 }
 
 pub const fn mouse_protocol_encoding_to_ipc(
     encoding: vt100::MouseProtocolEncoding,
-) -> bmux_ipc::AttachMouseProtocolEncoding {
+) -> AttachMouseProtocolEncoding {
     match encoding {
-        vt100::MouseProtocolEncoding::Default => bmux_ipc::AttachMouseProtocolEncoding::Default,
-        vt100::MouseProtocolEncoding::Utf8 => bmux_ipc::AttachMouseProtocolEncoding::Utf8,
-        vt100::MouseProtocolEncoding::Sgr => bmux_ipc::AttachMouseProtocolEncoding::Sgr,
+        vt100::MouseProtocolEncoding::Default => AttachMouseProtocolEncoding::Default,
+        vt100::MouseProtocolEncoding::Utf8 => AttachMouseProtocolEncoding::Utf8,
+        vt100::MouseProtocolEncoding::Sgr => AttachMouseProtocolEncoding::Sgr,
     }
 }
 
@@ -9907,9 +9906,9 @@ mod tests {
 
         view_state.pane_mouse_protocol_hints.insert(
             pane_id,
-            bmux_ipc::AttachMouseProtocolState {
-                mode: bmux_ipc::AttachMouseProtocolMode::AnyMotion,
-                encoding: bmux_ipc::AttachMouseProtocolEncoding::Sgr,
+            AttachMouseProtocolState {
+                mode: AttachMouseProtocolMode::AnyMotion,
+                encoding: AttachMouseProtocolEncoding::Sgr,
             },
         );
 
@@ -9940,7 +9939,7 @@ mod tests {
 
         view_state.pane_input_mode_hints.insert(
             pane_id,
-            bmux_ipc::AttachInputModeState {
+            AttachInputModeState {
                 application_cursor: true,
                 application_keypad: true,
             },

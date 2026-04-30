@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_codec                = { workspace = true }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
 bmux_scene_protocol       = { workspace = true }
@@ -30,4 +31,4 @@ ignored = ["serde", "uuid", "bmux_plugin_sdk", "bmux_scene_protocol"]
 
 [features]
 default          = []
-fail-on-warnings = []
+fail-on-warnings = ["bmux_codec/fail-on-warnings"]

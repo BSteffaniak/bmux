@@ -1823,6 +1823,13 @@ fn pane_summary_dtos_are_absent_from_ipc() {
         "pub struct AttachSurface",
         "pub struct InteractiveRegion",
         "pub struct AttachScene",
+        "pub struct AttachPaneChunk",
+        "pub enum AttachMouseProtocolMode",
+        "pub enum AttachMouseProtocolEncoding",
+        "pub struct AttachMouseProtocolState",
+        "pub struct AttachPaneMouseProtocol",
+        "pub struct AttachInputModeState",
+        "pub struct AttachPaneInputMode",
         "pub struct PaneSummary",
         "pub enum PaneState",
     ];

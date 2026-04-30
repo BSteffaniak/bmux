@@ -100,6 +100,82 @@ pub struct AttachScene {
     pub surfaces: Vec<AttachSurface>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachPaneChunk {
+    pub pane_id: ::uuid::Uuid,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
+    pub data: Vec<u8>,
+    /// Inclusive start offset (in pane output stream bytes) for `data`.
+    ///
+    /// This is monotonic per pane/output stream and allows clients to verify
+    /// continuity when feeding persistent terminal parsers.
+    #[serde(default)]
+    pub stream_start: u64,
+    /// Exclusive end offset (in pane output stream bytes) for `data`.
+    #[serde(default)]
+    pub stream_end: u64,
+    /// True when bytes were dropped before `stream_start` for this client
+    /// (cursor fell behind ring-buffer retention and was clamped). Clients
+    /// must treat this as a continuity break and resync state.
+    #[serde(default)]
+    pub stream_gap: bool,
+    /// True when the inner application is inside a DEC mode 2026
+    /// synchronized update - the server's PTY reader has seen
+    /// `\x1b[?2026h` but not yet `\x1b[?2026l` for this pane.
+    #[serde(default)]
+    pub sync_update_active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachMouseProtocolMode {
+    #[default]
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachMouseProtocolEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct AttachMouseProtocolState {
+    #[serde(default)]
+    pub mode: AttachMouseProtocolMode,
+    #[serde(default)]
+    pub encoding: AttachMouseProtocolEncoding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachPaneMouseProtocol {
+    pub pane_id: ::uuid::Uuid,
+    #[serde(default)]
+    pub protocol: AttachMouseProtocolState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct AttachInputModeState {
+    #[serde(default)]
+    pub application_cursor: bool,
+    #[serde(default)]
+    pub application_keypad: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachPaneInputMode {
+    pub pane_id: ::uuid::Uuid,
+    #[serde(default)]
+    pub mode: AttachInputModeState,
+}
+
 /// Pane selector accepted by pane-runtime commands and protocol helpers.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PaneSelector {

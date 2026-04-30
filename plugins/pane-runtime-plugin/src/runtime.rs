@@ -2,16 +2,14 @@
 
 use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::{
-    AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+    AttachFocusTarget, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
+    AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneInputMode,
+    AttachPaneMouseProtocol, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
     PaneFocusDirection, PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
     PaneSplitDirection, PaneState, PaneSummary,
 };
 use bmux_context_state::ContextStateHandle;
-use bmux_ipc::{
-    AttachInputModeState, AttachMouseProtocolEncoding, AttachMouseProtocolMode,
-    AttachMouseProtocolState, AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol,
-    AttachViewComponent, Event, RecordingEventKind, RecordingPayload,
-};
+use bmux_ipc::{AttachViewComponent, Event, RecordingEventKind, RecordingPayload};
 use bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig;
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,

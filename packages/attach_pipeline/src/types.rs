@@ -1,3 +1,4 @@
+use bmux_attach_layout_protocol::{AttachInputModeState, AttachMouseProtocolState};
 use bmux_plugin::{ExtensionRect, RenderDamage};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -63,6 +64,6 @@ impl Default for PaneRenderBuffer {
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct AttachPaneMouseProtocolHints {
-    pub mode_hints: BTreeMap<Uuid, bmux_ipc::AttachMouseProtocolState>,
-    pub input_mode_hints: BTreeMap<Uuid, bmux_ipc::AttachInputModeState>,
+    pub mode_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
+    pub input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
 }

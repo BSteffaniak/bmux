@@ -6,7 +6,10 @@
 //! consumers can decode them without the plugin having to invent a
 //! parallel BPDL representation of every field.
 
-use bmux_attach_layout_protocol::{AttachScene, PaneLayoutNode, PaneSummary};
+use bmux_attach_layout_protocol::{
+    AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene, PaneLayoutNode,
+    PaneSummary,
+};
 use bmux_pane_runtime_plugin_api::attach_runtime_state::{
     AttachLayout as AttachLayoutRecord, AttachPaneImages, AttachPaneOutputBatch,
     AttachPaneSnapshot as AttachPaneSnapshotRecord, AttachSnapshot as AttachSnapshotRecord,
@@ -210,7 +213,7 @@ pub fn attach_pane_images(
     Ok(AttachPaneImages { encoded })
 }
 
-fn chunk_to_record(chunk: bmux_ipc::AttachPaneChunk) -> PaneChunk {
+fn chunk_to_record(chunk: AttachPaneChunk) -> PaneChunk {
     PaneChunk {
         pane_id: chunk.pane_id,
         data: chunk.data,
@@ -221,7 +224,7 @@ fn chunk_to_record(chunk: bmux_ipc::AttachPaneChunk) -> PaneChunk {
     }
 }
 
-fn mouse_to_record(mouse: bmux_ipc::AttachPaneMouseProtocol) -> PaneMouseProtocol {
+fn mouse_to_record(mouse: AttachPaneMouseProtocol) -> PaneMouseProtocol {
     let encoded = serde_json::to_vec(&mouse.protocol).unwrap_or_default();
     PaneMouseProtocol {
         pane_id: mouse.pane_id,
@@ -229,7 +232,7 @@ fn mouse_to_record(mouse: bmux_ipc::AttachPaneMouseProtocol) -> PaneMouseProtoco
     }
 }
 
-fn input_mode_to_record(mode: bmux_ipc::AttachPaneInputMode) -> PaneInputMode {
+fn input_mode_to_record(mode: AttachPaneInputMode) -> PaneInputMode {
     let encoded = serde_json::to_vec(&mode.mode).unwrap_or_default();
     PaneInputMode {
         pane_id: mode.pane_id,

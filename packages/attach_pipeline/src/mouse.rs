@@ -1,6 +1,8 @@
 use crate::types::PaneRenderBuffer;
-use bmux_attach_layout_protocol::{AttachLayer, AttachRect, AttachScene};
-use bmux_ipc::{AttachMouseProtocolEncoding, AttachMouseProtocolMode};
+use bmux_attach_layout_protocol::{
+    AttachLayer, AttachMouseProtocolEncoding, AttachMouseProtocolMode, AttachMouseProtocolState,
+    AttachRect, AttachScene,
+};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -139,7 +141,7 @@ pub const fn encoding_from_ipc(
 #[must_use]
 pub fn pane_protocol(
     pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
-    pane_mouse_protocol_hints: &BTreeMap<Uuid, bmux_ipc::AttachMouseProtocolState>,
+    pane_mouse_protocol_hints: &BTreeMap<Uuid, AttachMouseProtocolState>,
     pane_id: Uuid,
 ) -> Option<PaneProtocol> {
     let parser_protocol = pane_buffers.get(&pane_id).map(|buffer| {

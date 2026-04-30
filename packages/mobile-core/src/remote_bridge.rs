@@ -2,14 +2,14 @@ use crate::connection::{TerminalMouseButton, TerminalMouseEvent, TerminalMouseEv
 use crate::error::{MobileCoreError, Result};
 use crate::pane_runtime_client::PaneRuntimeClientExt;
 use crate::target::{TargetRecord, TargetTransport};
-use bmux_attach_layout_protocol::AttachRect;
+use bmux_attach_layout_protocol::{AttachPaneChunk, AttachRect};
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::render::visible_scene_pane_ids;
 use bmux_attach_pipeline::{AttachChunkApplyOutcome, AttachScenePipeline, AttachViewport};
 use bmux_client::{BmuxClient, ClientError, ServerEvent, StreamingBmuxClient};
 use bmux_ipc::compressed_stream::CompressedStream;
 use bmux_ipc::transport::{ErasedIpcStream, IpcTransportError};
-use bmux_ipc::{AttachPaneChunk, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ErrorCode};
+use bmux_ipc::{AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ErrorCode};
 use bmux_session_models::SessionSelector;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;

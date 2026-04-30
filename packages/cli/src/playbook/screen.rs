@@ -357,7 +357,7 @@ impl ScreenInspector {
 
         let mut needs_resync = false;
         for chunk in batch.chunks {
-            let bmux_ipc::AttachPaneChunk {
+            let bmux_attach_layout_protocol::AttachPaneChunk {
                 pane_id,
                 data,
                 stream_start,
