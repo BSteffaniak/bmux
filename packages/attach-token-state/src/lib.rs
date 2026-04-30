@@ -13,10 +13,19 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use bmux_ipc::AttachGrant;
 use bmux_session_models::SessionId;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Attach grant returned by attach-token issuance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachGrant {
+    #[serde(default)]
+    pub context_id: Option<Uuid>,
+    pub session_id: Uuid,
+    pub attach_token: Uuid,
+    pub expires_at_epoch_ms: u64,
+}
 
 /// Reasons an attach-token `consume` call can fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

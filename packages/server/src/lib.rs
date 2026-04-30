@@ -5,13 +5,14 @@
 //! Server component for bmux terminal multiplexer.
 
 use anyhow::{Context, Result};
+use bmux_attach_token_state::AttachGrant;
 use bmux_client_state::FollowStateHandle;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_context_state::{ContextSelector, ContextStateHandle};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, Envelope, EnvelopeKind,
-    ErrorCode, ErrorResponse, Event, IpcEndpoint, PerformanceRecordingLevel, ProtocolContract,
+    AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, Envelope, EnvelopeKind, ErrorCode,
+    ErrorResponse, Event, IpcEndpoint, PerformanceRecordingLevel, ProtocolContract,
     RecordingEventKind, RecordingPayload, RecordingRollingStartOptions, Request, Response,
     ResponsePayload, ServerSnapshotStatus, ServicePipelinePayload, ServicePipelineRequest,
     ServicePipelineStepResult, decode, default_supported_capabilities, encode, negotiate_protocol,

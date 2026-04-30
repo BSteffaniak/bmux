@@ -8,9 +8,9 @@
 //! selection sync, attach-token lifecycle, runtime begin/end attach,
 //! and wire-event emission.
 
-use bmux_attach_token_state::AttachTokenValidationError;
+use bmux_attach_token_state::{AttachGrant, AttachTokenValidationError};
 use bmux_context_state::ContextSelector as PrimitiveContextSelector;
-use bmux_ipc::{AttachGrant, Event};
+use bmux_ipc::Event;
 use bmux_pane_runtime_plugin_api::attach_runtime_commands::{
     AttachCommandError, AttachGrant as AttachGrantRecord, AttachOutput as AttachOutputRecord,
     AttachReady, AttachRetargetReady, AttachViewportSet, ContextSelector, SessionSelector,

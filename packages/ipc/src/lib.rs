@@ -406,16 +406,6 @@ pub enum ServicePipelinePayload {
     },
 }
 
-/// Attach grant returned by attach control-plane request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttachGrant {
-    #[serde(default)]
-    pub context_id: Option<Uuid>,
-    pub session_id: Uuid,
-    pub attach_token: Uuid,
-    pub expires_at_epoch_ms: u64,
-}
-
 /// Image protocol identifier for IPC transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

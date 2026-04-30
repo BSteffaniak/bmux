@@ -1811,6 +1811,7 @@ fn client_state_dtos_are_absent_from_ipc() {
 fn pane_summary_dtos_are_absent_from_ipc() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
     let denied = [
+        "pub struct AttachGrant",
         "pub enum PaneSelector",
         "pub enum PaneSplitDirection",
         "pub struct PaneLaunchCommand",
@@ -1836,7 +1837,7 @@ fn pane_summary_dtos_are_absent_from_ipc() {
     for marker in denied {
         assert!(
             !ipc_source.contains(marker),
-            "packages/ipc/src/lib.rs must not reintroduce {marker}; pane summary DTOs belong in bmux_attach_layout_protocol",
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; attach/pane DTOs belong in neutral primitive crates",
         );
     }
 }
