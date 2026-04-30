@@ -4751,6 +4751,10 @@ fn overlay_rect_damage(
     attach_scene_damage_for_absolute_rects(&layout_state.scene, &rects, policy)
 }
 
+fn frame_uses_synchronized_update(frame_damage: &bmux_attach_pipeline::FrameDamage) -> bool {
+    frame_damage.scene_damaged() || frame_damage.overlay_damaged()
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn render_attach_frame(
     client: &mut StreamingBmuxClient,
@@ -4816,12 +4820,20 @@ pub fn render_attach_frame(
         view_state.dirty.status_needs_redraw = false;
     }
 
+    let (status_top_inset, status_bottom_inset) =
+        status_insets_for_position(view_state.status_position);
+    let render_scene = frame_damage.scene_damaged();
+    let use_synchronized_update = frame_uses_synchronized_update(&frame_damage);
+
     let mut frame_bytes = Vec::new();
-    // Wrap the entire frame in a synchronized update so the terminal
-    // buffers all output and displays it atomically (Mode 2026).
-    // Terminals that don't support this silently ignore the sequences.
-    queue!(frame_bytes, BeginSynchronizedUpdate)
-        .context("failed queuing begin synchronized update")?;
+    // Wrap multi-region scene/overlay frames in a synchronized update so the
+    // terminal buffers output and displays it atomically (Mode 2026). Status-only
+    // frames are tiny and safe to write directly, avoiding two extra control
+    // sequences on the common low-damage path.
+    if use_synchronized_update {
+        queue!(frame_bytes, BeginSynchronizedUpdate)
+            .context("failed queuing begin synchronized update")?;
+    }
     queue!(frame_bytes, SavePosition).context("failed queuing cursor save for attach frame")?;
     // Hide the cursor during the frame render to prevent it from visibly
     // jumping to every MoveTo position as pane content is drawn.
@@ -4836,9 +4848,6 @@ pub fn render_attach_frame(
     {
         queue_attach_status_line(&mut frame_bytes, status_line, view_state.status_position)?;
     }
-    let (status_top_inset, status_bottom_inset) =
-        status_insets_for_position(view_state.status_position);
-    let render_scene = frame_damage.scene_damaged();
     let appearance_mode_id = if view_state.help_overlay_open {
         "help"
     } else if view_state.prompt.is_active() {
@@ -4985,7 +4994,10 @@ pub fn render_attach_frame(
         display_capture.record_images(&all_images);
     }
 
-    queue!(frame_bytes, EndSynchronizedUpdate).context("failed queuing end synchronized update")?;
+    if use_synchronized_update {
+        queue!(frame_bytes, EndSynchronizedUpdate)
+            .context("failed queuing end synchronized update")?;
+    }
 
     let terminal_write_started_at = Instant::now();
     let stdout = io::stdout();
@@ -10932,6 +10944,21 @@ mod tests {
         assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.overlay_needs_redraw);
         assert!(!view_state.dirty.full_pane_redraw);
+    }
+
+    #[test]
+    fn frame_uses_synchronized_update_only_for_scene_or_overlay_damage() {
+        let mut status_only = bmux_attach_pipeline::FrameDamage::default();
+        status_only.mark_status();
+        assert!(!frame_uses_synchronized_update(&status_only));
+
+        let mut overlay = bmux_attach_pipeline::FrameDamage::default();
+        overlay.mark_overlay();
+        assert!(frame_uses_synchronized_update(&overlay));
+
+        let mut content = bmux_attach_pipeline::FrameDamage::default();
+        content.mark_content_surface(Uuid::from_u128(1));
+        assert!(frame_uses_synchronized_update(&content));
     }
 
     #[test]
