@@ -1,10 +1,11 @@
+use bmux_attach_layout_protocol::PaneSummary;
 use bmux_client::{
     AttachLayoutState, AttachOpenInfo, AttachPaneSnapshotState, AttachSnapshotState, ClientError,
     PaneOutputBatchResult,
 };
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene,
-    ErrorCode, PaneLayoutNode, PaneSummary,
+    ErrorCode, PaneLayoutNode,
 };
 use bmux_pane_runtime_plugin_api::{
     attach_runtime_commands as attach_commands, attach_runtime_state as attach_state,

@@ -8337,13 +8337,14 @@ mod tests {
         AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRenderBuffer,
     };
 
+    use bmux_attach_layout_protocol::{PaneState, PaneSummary};
     use bmux_client::{AttachLayoutState, AttachOpenInfo};
     use bmux_config::{
         BmuxConfig, MouseClickPropagation, MouseSelectionReleaseBehavior, MouseWheelPropagation,
     };
     use bmux_ipc::{
         AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        AttachViewComponent, PaneLayoutNode, PaneState, PaneSummary,
+        AttachViewComponent, PaneLayoutNode,
     };
 
     use crossterm::event::{

@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+bmux_attach_layout_protocol = { workspace = true }
 bmux_attach_token_state = { workspace = true }
 bmux_client_state = { workspace = true }
 bmux_config = { workspace = true }
@@ -50,6 +51,7 @@ vt100 = { workspace = true }
 [features]
 default = []
 fail-on-warnings = [
+    "bmux_attach_layout_protocol/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",

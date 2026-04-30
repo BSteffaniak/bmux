@@ -1805,6 +1805,20 @@ fn client_state_dtos_are_absent_from_ipc() {
     }
 }
 
+/// Pane summary DTOs used by attach layout/snapshot payloads are owned
+/// by the neutral `bmux_attach_layout_protocol` crate, not core IPC.
+#[test]
+fn pane_summary_dtos_are_absent_from_ipc() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    let denied = ["pub struct PaneSummary", "pub enum PaneState"];
+    for marker in denied {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; pane summary DTOs belong in bmux_attach_layout_protocol",
+        );
+    }
+}
+
 /// The 8 pane-mutation IPC variants are absent. Every pane mutation
 /// is a typed `pane-runtime-commands` invocation whose handler lives
 /// in the pane-runtime-plugin.

@@ -11,16 +11,17 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-anyhow              = { workspace = true, features = ["std"] }
-bmux_ipc            = { workspace = true }
-bmux_session_models = { workspace = true, features = ["serde"] }
-serde               = { workspace = true, features = ["derive", "std"] }
-thiserror           = { workspace = true }
-uuid                = { workspace = true, features = ["serde", "std"] }
+anyhow                      = { workspace = true, features = ["std"] }
+bmux_attach_layout_protocol = { workspace = true }
+bmux_ipc                    = { workspace = true }
+bmux_session_models         = { workspace = true, features = ["serde"] }
+serde                       = { workspace = true, features = ["derive", "std"] }
+thiserror                   = { workspace = true }
+uuid                        = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 
 [features]
 default          = []
-fail-on-warnings = []
+fail-on-warnings = ["bmux_attach_layout_protocol/fail-on-warnings"]

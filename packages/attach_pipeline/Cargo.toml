@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_appearance             = { workspace = true }
+bmux_attach_layout_protocol = { workspace = true }
 bmux_attach_pipeline_models = { workspace = true }
 bmux_client                 = { workspace = true }
 bmux_ipc                    = { workspace = true }
@@ -30,6 +31,7 @@ vt100         = { workspace = true }
 default = []
 
 fail-on-warnings = [
+    "bmux_attach_layout_protocol/fail-on-warnings",
     "bmux_attach_pipeline_models/fail-on-warnings",
     "bmux_appearance/fail-on-warnings",
     "bmux_client/fail-on-warnings",

@@ -1,14 +1,15 @@
 //! Concrete pane runtime implementation owned by the pane-runtime plugin.
 
 use anyhow::{Context, Result};
+use bmux_attach_layout_protocol::{PaneState, PaneSummary};
 use bmux_context_state::ContextStateHandle;
 use bmux_ipc::{
     AttachFocusTarget, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
     AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneInputMode,
     AttachPaneMouseProtocol, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
     AttachViewComponent, Event, PaneFocusDirection, PaneLaunchCommand,
-    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
-    RecordingEventKind, RecordingPayload,
+    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, RecordingEventKind,
+    RecordingPayload,
 };
 use bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig;
 use bmux_pane_runtime_state::{

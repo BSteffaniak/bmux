@@ -7,7 +7,8 @@ use bmux_appearance::{
     RuntimeAppearance, RuntimeContentBlend, RuntimeContentEffect, RuntimeContentEffectBgPredicate,
     RuntimeContentEffectScope,
 };
-use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
+use bmux_attach_layout_protocol::PaneSummary;
+use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind};
 use bmux_plugin::{
     AttachRenderExtension, ExtensionRect, RenderColor, RenderDamage, RenderOp, RenderStyle,
 };
@@ -1705,9 +1706,10 @@ mod tests {
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
     };
     use bmux_appearance::{RuntimeAppearance, RuntimeContentBlend, RuntimeContentEffect};
+    use bmux_attach_layout_protocol::{PaneState, PaneSummary};
     use bmux_ipc::{
         AttachFocusTarget, AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface,
-        AttachSurfaceKind, PaneState, PaneSummary,
+        AttachSurfaceKind,
     };
     use bmux_plugin::{ExtensionRect, RenderColor, RenderDamage, RenderOp, RenderStyle};
     use crossterm::cursor::MoveTo;

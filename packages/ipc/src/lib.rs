@@ -547,27 +547,6 @@ pub struct AttachGrant {
     pub expires_at_epoch_ms: u64,
 }
 
-/// Summary returned when listing panes in the active session runtime.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSummary {
-    pub id: Uuid,
-    pub index: u32,
-    pub name: Option<String>,
-    pub focused: bool,
-    #[serde(default)]
-    pub state: PaneState,
-    #[serde(default)]
-    pub state_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PaneState {
-    #[default]
-    Running,
-    Exited,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachPaneChunk {
     pub pane_id: Uuid,
