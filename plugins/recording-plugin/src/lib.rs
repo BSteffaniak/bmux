@@ -20,20 +20,22 @@ pub use recording_runtime::{
     RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, prune_old_recordings,
 };
 
-use bmux_ipc::{
-    RecordingCaptureTarget, RecordingEventKind, RecordingPayload, RecordingProfile,
-    RecordingRollingStartOptions, RecordingRollingStatus, RecordingRollingUsage, RecordingStatus,
-    RecordingSummary,
-};
 use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_recording_plugin_api::{RecordingPluginConfig, recording_types};
+use bmux_recording_protocol::{
+    RecordingCaptureTarget, RecordingEventKind, RecordingPayload as ProtocolRecordingPayload,
+    RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
+    RecordingRollingStatus, RecordingRollingUsage, RecordingStatus, RecordingSummary,
+};
 use bmux_recording_runtime::{
     RecordMeta, RecordingSink, RecordingSinkHandle, RollingRecordingSettings,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
+
+type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
 /// Newtype wrapper for registering the manual recording runtime handle
 /// in [`bmux_plugin::PluginStateRegistry`]. Plugin-local domain type;
@@ -743,7 +745,7 @@ fn handle_cut(last_seconds: Option<u64>, name: Option<String>) -> Option<Recordi
     runtime.cut(&output_root, last_seconds, name).ok()
 }
 
-fn handle_rolling_clear(restart_if_active: bool) -> bmux_ipc::RecordingRollingClearReport {
+fn handle_rolling_clear(restart_if_active: bool) -> RecordingRollingClearReport {
     let Some(config) = config_handle() else {
         return empty_clear_report();
     };
@@ -953,9 +955,9 @@ fn clear_report_response(
     stopped_recording_id: Option<uuid::Uuid>,
     restarted_recording: Option<RecordingSummary>,
     usage_before: &RecordingRollingUsage,
-) -> bmux_ipc::RecordingRollingClearReport {
+) -> RecordingRollingClearReport {
     let usage_after = collect_rolling_usage(root).unwrap_or_default();
-    bmux_ipc::RecordingRollingClearReport {
+    RecordingRollingClearReport {
         root_path: root.display().to_string(),
         was_active,
         restarted,
@@ -966,15 +968,15 @@ fn clear_report_response(
     }
 }
 
-fn empty_clear_report() -> bmux_ipc::RecordingRollingClearReport {
-    bmux_ipc::RecordingRollingClearReport {
+fn empty_clear_report() -> RecordingRollingClearReport {
+    RecordingRollingClearReport {
         root_path: String::new(),
         was_active: false,
         restarted: false,
         stopped_recording_id: None,
         restarted_recording: None,
-        usage_before: bmux_ipc::RecordingRollingUsage::default(),
-        usage_after: bmux_ipc::RecordingRollingUsage::default(),
+        usage_before: RecordingRollingUsage::default(),
+        usage_after: RecordingRollingUsage::default(),
     }
 }
 

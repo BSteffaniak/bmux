@@ -5,9 +5,13 @@ use crate::ssh_access::{
 use anyhow::{Context, Result};
 use bmux_cli_schema::GatewayHostMode;
 use bmux_config::ConfigPaths;
+use bmux_ipc::IpcEndpoint;
 use bmux_ipc::transport::LocalIpcStream;
-use bmux_ipc::{IpcEndpoint, RecordingRollingStartOptions};
 use bmux_recording_plugin_api::{recording_commands, recording_state};
+use bmux_recording_protocol::{
+    RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
+    RecordingSummary,
+};
 use iroh::{Endpoint, endpoint::presets};
 use std::process::{Command as ProcessCommand, Stdio};
 use uuid::Uuid;
@@ -427,7 +431,7 @@ pub(super) async fn run_server_recording_start(
         connection_context,
     )
     .await?;
-    let recording: bmux_ipc::RecordingSummary =
+    let recording: RecordingSummary =
         recording_commands::client::rolling_start(&mut client, options.into())
             .await?
             .map(Into::into)
@@ -459,7 +463,7 @@ pub(super) async fn run_server_recording_stop(
 
 async fn fetch_server_recording_rolling_status(
     connection_context: ConnectionContext<'_>,
-) -> Result<bmux_ipc::RecordingRollingStatus> {
+) -> Result<RecordingRollingStatus> {
     cleanup_stale_pid_file().await?;
     let mut client = connect_with_context(
         ConnectionPolicyScope::Normal,
@@ -570,7 +574,7 @@ pub(super) async fn run_server_recording_clear(
         connection_context,
     )
     .await?;
-    let report: bmux_ipc::RecordingRollingClearReport =
+    let report: RecordingRollingClearReport =
         recording_commands::client::rolling_clear(&mut client, !no_restart)
             .await?
             .into();

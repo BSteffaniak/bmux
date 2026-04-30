@@ -7,7 +7,7 @@ use bmux_cli_schema::{
     SlotCommand, TerminalCommand,
 };
 use bmux_config::{BmuxConfig, SandboxCleanupSource};
-use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
+use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
 
 use super::{
     BuiltInHandlerId, BundleIncludeOptions, BundleSandboxOptions, ConnectionContext,

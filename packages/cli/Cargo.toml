@@ -44,6 +44,7 @@ bmux_permissions_plugin_api     = { workspace = true }
 bmux_plugin                     = { workspace = true }
 bmux_plugin_sdk                 = { workspace = true }
 bmux_recording_plugin_api       = { workspace = true }
+bmux_recording_protocol         = { workspace = true }
 bmux_scene_protocol             = { workspace = true }
 bmux_server                     = { workspace = true }
 bmux_session_models             = { workspace = true, features = ["serde"] }

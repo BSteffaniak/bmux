@@ -5,8 +5,8 @@ use bmux_clients_plugin_api::clients_state;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_contexts_plugin_api::contexts_commands::{self, ContextAck as ContextAckRecord};
 use bmux_diagnostic_log::{DiagnosticLogConfig, DiagnosticLogMode, DiagnosticLogWriter};
-use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
 use bmux_recording_plugin_api::{recording_commands, recording_state};
+use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions, RecordingSummary};
 use bmux_server::BmuxServer;
 use bmux_sessions_plugin_api::sessions_state::{self, SessionSummary};
 use std::collections::BTreeMap;
@@ -62,7 +62,7 @@ pub(super) async fn run_default_server_attach(
             connection_context,
         )
         .await?;
-        let started: bmux_ipc::RecordingSummary = recording_commands::client::start(
+        let started: RecordingSummary = recording_commands::client::start(
             &mut recording_client,
             None,
             options.capture_input,
@@ -126,7 +126,7 @@ pub(super) async fn run_default_server_attach(
         let recording = recording_state::client::list_recordings(&mut list_client)
             .await?
             .into_iter()
-            .map(bmux_ipc::RecordingSummary::from)
+            .map(RecordingSummary::from)
             .find(|summary| summary.id == stopped_id);
         if let Some(recording) = recording {
             let name_display = recording.name.as_deref().unwrap_or("-");

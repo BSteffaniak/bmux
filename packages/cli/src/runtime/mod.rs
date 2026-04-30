@@ -15,7 +15,7 @@ use bmux_cli_schema::{
 };
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths, push_process_config_overrides};
-use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingStatus, RecordingSummary};
+use bmux_recording_protocol::{RecordingEventKind, RecordingStatus, RecordingSummary};
 use bmux_snapshot_plugin_api::offline_snapshot::offline_kill_sessions;
 use crossterm::terminal;
 use gif::{Encoder as GifEncoder, Frame as GifFrame, Repeat};
@@ -24,6 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+type RecordingEventEnvelope =
+    bmux_recording_protocol::RecordingEventEnvelope<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
 mod access_cli;
 mod action_dispatch;

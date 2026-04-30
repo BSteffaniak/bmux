@@ -13,8 +13,7 @@ use bmux_context_state::{ContextSelector, ContextStateHandle};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     CORE_PROTOCOL_CAPABILITIES, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event,
-    IpcEndpoint, ProtocolContract, RecordingEventKind, RecordingPayload,
-    RecordingRollingStartOptions, Request, Response, ResponsePayload, ServerSnapshotStatus,
+    IpcEndpoint, ProtocolContract, Request, Response, ResponsePayload, ServerSnapshotStatus,
     ServicePipelinePayload, ServicePipelineRequest, ServicePipelineStepResult, decode,
     default_supported_capabilities, encode, negotiate_protocol,
 };
@@ -22,6 +21,9 @@ use bmux_perf_telemetry::{
     PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing, flush as flush_phase_timing,
 };
 use bmux_plugin_sdk::{WireEventSink, WireEventSinkError, WireEventSinkHandle};
+use bmux_recording_protocol::{
+    RecordingEventKind, RecordingPayload as ProtocolRecordingPayload, RecordingRollingStartOptions,
+};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::{SessionManagerHandle, SessionManagerSnapshot};
 use std::collections::BTreeMap;
@@ -32,6 +34,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
 
 use bmux_performance_state::{
     PERF_RECORDING_SOURCE, PerformanceEventRateLimiter, PerformanceRecordingLevel,

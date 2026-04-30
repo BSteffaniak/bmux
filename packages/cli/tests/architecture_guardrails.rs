@@ -1154,11 +1154,13 @@ fn recording_ipc_variants_are_absent() {
         "Request::RecordingCaptureTargets",
         "Request::RecordingPrune",
         // DTO ownership: recording protocol DTOs live in
-        // `bmux_recording_protocol`; IPC may only re-export or alias them
-        // for compatibility.
+        // `bmux_recording_protocol`; IPC must not re-export or alias them.
+        "pub use bmux_recording_protocol",
         "pub enum RecordingProfile",
         "pub enum RecordingEventKind",
+        "pub type RecordingPayload",
         "pub enum RecordingPayload",
+        "pub type RecordingEventEnvelope",
         "pub struct RecordingEventEnvelope",
         "pub enum DisplayTrackEvent",
         "pub enum DisplayCursorShape",
@@ -1187,7 +1189,7 @@ fn recording_ipc_variants_are_absent() {
     ];
     for marker in denied {
         assert!(
-            !ipc_source.contains(marker),
+            !production_section(ipc_source).contains(marker),
             "packages/ipc/src/lib.rs must not reintroduce {marker}; \
              recording lifecycle operations go through \
              BPDL-generated typed dispatch provided \

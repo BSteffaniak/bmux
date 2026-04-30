@@ -14,13 +14,17 @@ use super::{
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_cli_output::{Table, TableAlign, TableColumn, write_table};
 use bmux_fonts::FontPreset;
-use bmux_ipc::RecordingPayload;
 use bmux_performance_state::{
     PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE,
     PerformanceRecordingLevel as RuntimePerformanceRecordingLevel,
     PerformanceRuntimeSettings as RuntimePerformanceRuntimeSettings,
 };
 use bmux_recording_plugin_api::{recording_commands, recording_state, recording_types};
+use bmux_recording_protocol::{
+    DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent,
+    RECORDING_FORMAT_VERSION, RecordingPayload as ProtocolRecordingPayload, RecordingProfile,
+    read_frames, write_frame,
+};
 use font8x8::UnicodeFonts;
 use resvg::{tiny_skia, usvg};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -28,6 +32,8 @@ use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod terminal_profile;
+
+type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
 pub fn recording_plugin_error(error: recording_types::RecordingError) -> anyhow::Error {
     match error {
@@ -111,11 +117,11 @@ pub(super) async fn run_recording_start(
 
 pub(super) const fn recording_profile_arg_to_ipc(
     profile: Option<RecordingProfileArg>,
-) -> Option<bmux_ipc::RecordingProfile> {
+) -> Option<RecordingProfile> {
     match profile {
-        Some(RecordingProfileArg::Full) => Some(bmux_ipc::RecordingProfile::Full),
-        Some(RecordingProfileArg::Functional) => Some(bmux_ipc::RecordingProfile::Functional),
-        Some(RecordingProfileArg::Visual) => Some(bmux_ipc::RecordingProfile::Visual),
+        Some(RecordingProfileArg::Full) => Some(RecordingProfile::Full),
+        Some(RecordingProfileArg::Functional) => Some(RecordingProfile::Functional),
+        Some(RecordingProfileArg::Visual) => Some(RecordingProfile::Visual),
         None => None,
     }
 }
@@ -2048,11 +2054,11 @@ pub(super) async fn run_recording_export(
         anyhow::bail!("recording not found: {recording_id}")
     }
     let manifest_summary = read_recording_manifest(&recording_dir.join("manifest.json"))?;
-    if manifest_summary.format_version != bmux_ipc::RECORDING_FORMAT_VERSION {
+    if manifest_summary.format_version != RECORDING_FORMAT_VERSION {
         anyhow::bail!(
             "recording format version {} is unsupported; expected {}. re-record with current bmux",
             manifest_summary.format_version,
-            bmux_ipc::RECORDING_FORMAT_VERSION
+            RECORDING_FORMAT_VERSION
         )
     }
 
@@ -2189,7 +2195,7 @@ fn load_display_track_events(
     let path = display_track_path(recording_dir, client_id);
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed reading display track {}", path.display()))?;
-    let result = bmux_ipc::read_frames(&bytes)
+    let result = read_frames(&bytes)
         .map_err(|e| anyhow::anyhow!("failed parsing display track {}: {e}", path.display()))?;
     if result.bytes_remaining > 0 {
         tracing::warn!(
@@ -2475,7 +2481,7 @@ struct RecordedCursorSnapshot {
     x: u16,
     y: u16,
     visible: bool,
-    shape: bmux_ipc::DisplayCursorShape,
+    shape: DisplayCursorShape,
     blink_enabled: bool,
 }
 
@@ -2614,13 +2620,11 @@ fn update_cursor_replay_state(state: &mut CursorReplayState, data: &[u8]) {
     }
 }
 
-const fn display_cursor_shape_from_visual(
-    shape: CursorVisualShape,
-) -> bmux_ipc::DisplayCursorShape {
+const fn display_cursor_shape_from_visual(shape: CursorVisualShape) -> DisplayCursorShape {
     match shape {
-        CursorVisualShape::Block => bmux_ipc::DisplayCursorShape::Block,
-        CursorVisualShape::Bar => bmux_ipc::DisplayCursorShape::Bar,
-        CursorVisualShape::Underline => bmux_ipc::DisplayCursorShape::Underline,
+        CursorVisualShape::Block => DisplayCursorShape::Block,
+        CursorVisualShape::Bar => DisplayCursorShape::Bar,
+        CursorVisualShape::Underline => DisplayCursorShape::Underline,
     }
 }
 
@@ -2641,13 +2645,13 @@ fn cursor_snapshot_from_parser_fallback(
 const fn effective_cursor_shape(
     options: &CursorExportOptions,
     replay_state: CursorReplayState,
-    snapshot_shape: bmux_ipc::DisplayCursorShape,
+    snapshot_shape: DisplayCursorShape,
 ) -> CursorVisualShape {
     match options.shape {
         RecordingCursorShape::Auto => match snapshot_shape {
-            bmux_ipc::DisplayCursorShape::Block => replay_state.shape,
-            bmux_ipc::DisplayCursorShape::Bar => CursorVisualShape::Bar,
-            bmux_ipc::DisplayCursorShape::Underline => CursorVisualShape::Underline,
+            DisplayCursorShape::Block => replay_state.shape,
+            DisplayCursorShape::Bar => CursorVisualShape::Bar,
+            DisplayCursorShape::Underline => CursorVisualShape::Underline,
         },
         RecordingCursorShape::Block => CursorVisualShape::Block,
         RecordingCursorShape::Bar => CursorVisualShape::Bar,
@@ -3325,13 +3329,13 @@ fn export_recording_gif(
                     frame_had_display_change = true;
                 }
                 DisplayTrackEvent::Activity { kind } => match kind {
-                    bmux_ipc::DisplayActivityKind::Input => {
+                    DisplayActivityKind::Input => {
                         last_input_activity_ns = Some(scaled_ns);
                     }
-                    bmux_ipc::DisplayActivityKind::Output => {
+                    DisplayActivityKind::Output => {
                         last_output_activity_ns = Some(scaled_ns);
                     }
-                    bmux_ipc::DisplayActivityKind::Cursor => {
+                    DisplayActivityKind::Cursor => {
                         last_cursor_activity_ns = Some(scaled_ns);
                     }
                 },
@@ -5384,7 +5388,7 @@ pub(super) fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingE
                 segment_path.display()
             )
         })?;
-        let result = bmux_ipc::read_frames(&bytes).map_err(|e| {
+        let result = read_frames(&bytes).map_err(|e| {
             anyhow::anyhow!(
                 "failed parsing recording segment {}: {e}",
                 segment_path.display()
@@ -5618,7 +5622,6 @@ pub(super) const fn offline_recording_status() -> RecordingStatus {
 }
 
 // Display track types are defined in bmux_ipc for cross-module sharing.
-use bmux_ipc::{DisplayTrackEnvelope, DisplayTrackEvent};
 
 // ── Image overlay for GIF export ─────────────────────────────────────────────
 
@@ -5889,7 +5892,7 @@ impl DisplayCaptureWriter {
         })
     }
 
-    pub(super) fn record_activity(&mut self, kind: bmux_ipc::DisplayActivityKind) -> Result<()> {
+    pub(super) fn record_activity(&mut self, kind: DisplayActivityKind) -> Result<()> {
         self.record(DisplayTrackEvent::Activity { kind })
     }
 
@@ -5955,7 +5958,7 @@ impl DisplayCaptureWriter {
                 .min(u128::from(u64::MAX)) as u64,
             event,
         };
-        bmux_ipc::write_frame(&mut self.writer, &envelope)
+        write_frame(&mut self.writer, &envelope)
             .map_err(|e| anyhow::anyhow!("display track write_frame failed: {e}"))?;
         Ok(())
     }
@@ -6004,7 +6007,7 @@ mod tests {
                 x,
                 y,
                 visible: true,
-                shape: bmux_ipc::DisplayCursorShape::Block,
+                shape: DisplayCursorShape::Block,
                 blink_enabled: true,
             },
         }
@@ -6025,9 +6028,8 @@ mod tests {
             },
         };
         let mut buf = Vec::new();
-        bmux_ipc::write_frame(&mut buf, &envelope).expect("write should succeed");
-        let result =
-            bmux_ipc::read_frames::<DisplayTrackEnvelope>(&buf).expect("read should succeed");
+        write_frame(&mut buf, &envelope).expect("write should succeed");
+        let result = read_frames::<DisplayTrackEnvelope>(&buf).expect("read should succeed");
         assert_eq!(result.bytes_remaining, 0);
         assert_eq!(result.frames.len(), 1);
         assert_eq!(result.frames[0].mono_ns, 1);
@@ -6500,15 +6502,15 @@ mod tests {
     fn display_cursor_shape_from_visual_maps_shapes() {
         assert_eq!(
             display_cursor_shape_from_visual(CursorVisualShape::Block),
-            bmux_ipc::DisplayCursorShape::Block
+            DisplayCursorShape::Block
         );
         assert_eq!(
             display_cursor_shape_from_visual(CursorVisualShape::Bar),
-            bmux_ipc::DisplayCursorShape::Bar
+            DisplayCursorShape::Bar
         );
         assert_eq!(
             display_cursor_shape_from_visual(CursorVisualShape::Underline),
-            bmux_ipc::DisplayCursorShape::Underline
+            DisplayCursorShape::Underline
         );
     }
 
@@ -6526,7 +6528,7 @@ mod tests {
         assert_eq!(snapshot.x, 10);
         assert_eq!(snapshot.y, 5);
         assert!(snapshot.visible);
-        assert_eq!(snapshot.shape, bmux_ipc::DisplayCursorShape::Bar);
+        assert_eq!(snapshot.shape, DisplayCursorShape::Bar);
         assert!(!snapshot.blink_enabled);
     }
 
@@ -6563,11 +6565,11 @@ mod tests {
         RecordingSummary {
             id: Uuid::parse_str(id).expect("test id should parse"),
             name: name.map(str::to_string),
-            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            format_version: RECORDING_FORMAT_VERSION,
             session_id: None,
             capture_input: true,
-            profile: bmux_ipc::RecordingProfile::Functional,
-            event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+            profile: RecordingProfile::Functional,
+            event_kinds: vec![RecordingEventKind::PaneOutputRaw],
             started_epoch_ms,
             ended_epoch_ms,
             event_count,
@@ -6676,7 +6678,7 @@ mod tests {
     #[test]
     fn default_event_kinds_for_flags_falls_back_to_output() {
         let kinds = default_event_kinds_for_flags(false, false, false);
-        assert_eq!(kinds, vec![bmux_ipc::RecordingEventKind::PaneOutputRaw]);
+        assert_eq!(kinds, vec![RecordingEventKind::PaneOutputRaw]);
     }
 
     #[test]
@@ -6844,11 +6846,11 @@ mod tests {
             RecordingSummary {
                 id: other,
                 name: None,
-                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                format_version: RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
-                profile: bmux_ipc::RecordingProfile::Functional,
-                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                profile: RecordingProfile::Functional,
+                event_kinds: vec![RecordingEventKind::PaneOutputRaw],
                 started_epoch_ms: 1,
                 ended_epoch_ms: Some(2),
                 event_count: 0,
@@ -6860,11 +6862,11 @@ mod tests {
             RecordingSummary {
                 id: exact,
                 name: None,
-                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                format_version: RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
-                profile: bmux_ipc::RecordingProfile::Functional,
-                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                profile: RecordingProfile::Functional,
+                event_kinds: vec![RecordingEventKind::PaneOutputRaw],
                 started_epoch_ms: 3,
                 ended_epoch_ms: Some(4),
                 event_count: 0,
@@ -6891,11 +6893,11 @@ mod tests {
             RecordingSummary {
                 id: first,
                 name: None,
-                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                format_version: RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
-                profile: bmux_ipc::RecordingProfile::Functional,
-                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                profile: RecordingProfile::Functional,
+                event_kinds: vec![RecordingEventKind::PaneOutputRaw],
                 started_epoch_ms: 1,
                 ended_epoch_ms: None,
                 event_count: 0,
@@ -6907,11 +6909,11 @@ mod tests {
             RecordingSummary {
                 id: second,
                 name: None,
-                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                format_version: RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
-                profile: bmux_ipc::RecordingProfile::Functional,
-                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                profile: RecordingProfile::Functional,
+                event_kinds: vec![RecordingEventKind::PaneOutputRaw],
                 started_epoch_ms: 2,
                 ended_epoch_ms: None,
                 event_count: 0,
@@ -6934,11 +6936,11 @@ mod tests {
         let recordings = vec![RecordingSummary {
             id: named,
             name: Some("startup regression".to_string()),
-            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            format_version: RECORDING_FORMAT_VERSION,
             session_id: None,
             capture_input: true,
-            profile: bmux_ipc::RecordingProfile::Functional,
-            event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+            profile: RecordingProfile::Functional,
+            event_kinds: vec![RecordingEventKind::PaneOutputRaw],
             started_epoch_ms: 1,
             ended_epoch_ms: Some(2),
             event_count: 0,
@@ -6963,11 +6965,11 @@ mod tests {
             RecordingSummary {
                 id: first,
                 name: Some("bug repro startup".to_string()),
-                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                format_version: RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
-                profile: bmux_ipc::RecordingProfile::Functional,
-                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                profile: RecordingProfile::Functional,
+                event_kinds: vec![RecordingEventKind::PaneOutputRaw],
                 started_epoch_ms: 1,
                 ended_epoch_ms: None,
                 event_count: 0,
@@ -6979,11 +6981,11 @@ mod tests {
             RecordingSummary {
                 id: second,
                 name: Some("bug repro render".to_string()),
-                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                format_version: RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
-                profile: bmux_ipc::RecordingProfile::Functional,
-                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                profile: RecordingProfile::Functional,
+                event_kinds: vec![RecordingEventKind::PaneOutputRaw],
                 started_epoch_ms: 2,
                 ended_epoch_ms: None,
                 event_count: 0,

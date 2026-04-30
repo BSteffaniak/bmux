@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
-use bmux_ipc::{
-    DisplayTrackEnvelope, DisplayTrackEvent, RecordingEventEnvelope, RecordingEventKind,
-    RecordingPayload, RecordingProfile, RecordingStatus, RecordingSummary,
+use bmux_recording_protocol::{
+    DisplayTrackEnvelope, DisplayTrackEvent, RECORDING_FORMAT_VERSION,
+    RecordingEventEnvelope as ProtocolRecordingEventEnvelope, RecordingEventKind,
+    RecordingPayload as ProtocolRecordingPayload, RecordingProfile, RecordingStatus,
+    RecordingSummary, read_frames, write_frame,
 };
 use bmux_recording_runtime::RecordMeta;
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
+type RecordingEventEnvelope = ProtocolRecordingEventEnvelope<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const DEFAULT_ROLLING_SEGMENT_MAX_AGE_SECS: u64 = 2;
@@ -130,7 +135,7 @@ impl RecordingRuntime {
         let summary = RecordingSummary {
             id,
             name: name.clone(),
-            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            format_version: RECORDING_FORMAT_VERSION,
             session_id: session_filter,
             capture_input,
             profile,
@@ -222,7 +227,7 @@ impl RecordingRuntime {
         let active = self.active.as_ref().map(|active| RecordingSummary {
             id: active.id,
             name: active.name.clone(),
-            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            format_version: RECORDING_FORMAT_VERSION,
             session_id: active.session_filter,
             capture_input: active.capture_input,
             profile: active.profile,
@@ -501,7 +506,7 @@ impl RecordingRuntime {
         let summary = RecordingSummary {
             id,
             name,
-            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            format_version: RECORDING_FORMAT_VERSION,
             session_id: active.session_filter,
             capture_input: active.capture_input,
             profile: active.profile,
@@ -572,7 +577,7 @@ fn writer_loop(
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(event) => {
-                bmux_ipc::write_frame(&mut writer, &event)
+                write_frame(&mut writer, &event)
                     .map_err(|e| anyhow::anyhow!("recording write_frame failed: {e}"))?;
                 let payload_sz = payload_size(&event.payload);
                 event_count.fetch_add(1, Ordering::SeqCst);
@@ -743,7 +748,7 @@ fn list_segment_names(recording_dir: &Path) -> Result<Vec<String>> {
 fn read_recording_events(path: &Path) -> Result<Vec<RecordingEventEnvelope>> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed reading recording segment {}", path.display()))?;
-    let result = bmux_ipc::read_frames::<RecordingEventEnvelope>(&bytes).map_err(|error| {
+    let result = read_frames::<RecordingEventEnvelope>(&bytes).map_err(|error| {
         anyhow::anyhow!(
             "failed parsing recording segment {}: {error}",
             path.display()
@@ -778,7 +783,7 @@ fn write_recording_events_with_rotation(
     segment_names.push(segment_name.clone());
 
     for event in events {
-        bmux_ipc::write_frame(&mut writer, event)
+        write_frame(&mut writer, event)
             .map_err(|error| anyhow::anyhow!("recording cut write_frame failed: {error}"))?;
         segment_bytes = segment_bytes.saturating_add(payload_size(&event.payload));
         if segment_limit_bytes > 0 && segment_bytes >= segment_limit_bytes {
@@ -969,7 +974,7 @@ fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: 
         let path = entry.path();
         let bytes = std::fs::read(&path)
             .with_context(|| format!("failed reading display track {}", path.display()))?;
-        let result = bmux_ipc::read_frames::<DisplayTrackEnvelope>(&bytes).map_err(|error| {
+        let result = read_frames::<DisplayTrackEnvelope>(&bytes).map_err(|error| {
             anyhow::anyhow!("failed parsing display track {}: {error}", path.display())
         })?;
         let output = cut_display_track_frames(&result.frames, window_ns);
@@ -992,7 +997,7 @@ fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: 
                 })?,
         );
         for frame in &output {
-            bmux_ipc::write_frame(&mut writer, frame).map_err(|error| {
+            write_frame(&mut writer, frame).map_err(|error| {
                 anyhow::anyhow!("failed writing cut display track frame: {error}")
             })?;
         }
@@ -1109,10 +1114,10 @@ pub fn prune_old_recordings(root_dir: &Path, retention_days: u64) -> Result<usiz
 
 #[cfg(test)]
 mod tests {
-    use super::{Manifest, RecordMeta, RecordingRuntime};
-    use bmux_ipc::{
-        DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent, RecordingEventKind,
-        RecordingPayload, RecordingProfile, RecordingSummary,
+    use super::{Manifest, RecordMeta, RecordingPayload, RecordingRuntime};
+    use bmux_recording_protocol::{
+        DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent, RECORDING_FORMAT_VERSION,
+        RecordingEventKind, RecordingProfile, RecordingSummary, read_frames, write_frame,
     };
     use std::fs;
     use std::path::Path;
@@ -1133,14 +1138,14 @@ mod tests {
     fn write_display_track(path: &Path, frames: &[DisplayTrackEnvelope]) {
         let mut bytes = Vec::new();
         for frame in frames {
-            bmux_ipc::write_frame(&mut bytes, frame).expect("display frame should encode");
+            write_frame(&mut bytes, frame).expect("display frame should encode");
         }
         fs::write(path, bytes).expect("display track should write");
     }
 
     fn read_display_track(path: &Path) -> Vec<DisplayTrackEnvelope> {
         let bytes = fs::read(path).expect("display track should read");
-        bmux_ipc::read_frames::<DisplayTrackEnvelope>(&bytes)
+        read_frames::<DisplayTrackEnvelope>(&bytes)
             .expect("display track should decode")
             .frames
     }
@@ -1716,7 +1721,7 @@ mod tests {
         let summary = RecordingSummary {
             id: rec_id,
             name: None,
-            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            format_version: RECORDING_FORMAT_VERSION,
             session_id: None,
             capture_input: true,
             profile: RecordingProfile::Full,
@@ -1751,7 +1756,7 @@ mod tests {
         let summary = RecordingSummary {
             id: rec_id,
             name: None,
-            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            format_version: RECORDING_FORMAT_VERSION,
             session_id: None,
             capture_input: true,
             profile: RecordingProfile::Full,
@@ -1786,7 +1791,7 @@ mod tests {
         let summary = RecordingSummary {
             id: rec_id,
             name: None,
-            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            format_version: RECORDING_FORMAT_VERSION,
             session_id: None,
             capture_input: true,
             profile: RecordingProfile::Full,

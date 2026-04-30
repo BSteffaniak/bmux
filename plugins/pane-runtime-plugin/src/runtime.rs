@@ -10,7 +10,7 @@ use bmux_attach_layout_protocol::{
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_context_state::ContextStateHandle;
-use bmux_ipc::{Event, RecordingEventKind, RecordingPayload};
+use bmux_ipc::{ErrorCode, Event};
 use bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig;
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
@@ -18,6 +18,7 @@ use bmux_pane_runtime_state::{
     SessionRuntimeError,
 };
 use bmux_plugin_sdk::WireEventSinkHandle;
+use bmux_recording_protocol::{RecordingEventKind, RecordingPayload as ProtocolRecordingPayload};
 use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::SessionManagerHandle;
@@ -33,6 +34,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{trace, warn};
 use uuid::Uuid;
+
+type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
 
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
 const RESPONSE_METADATA_HEADROOM: usize = 65_536;

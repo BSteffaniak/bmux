@@ -12,12 +12,6 @@ pub use bmux_performance_state::{
     PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE, PerformanceRecordingLevel,
     PerformanceRuntimeSettings,
 };
-pub use bmux_recording_protocol::{
-    DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent,
-    RECORDING_FORMAT_VERSION, RecordingCaptureTarget, RecordingEventKind, RecordingProfile,
-    RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
-    RecordingRollingUsage, RecordingStatus, RecordingSummary,
-};
 pub use bmux_snapshot_protocol::SnapshotStatusReport as ServerSnapshotStatus;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
@@ -409,10 +403,6 @@ pub enum ServicePipelinePayload {
     },
 }
 
-pub type RecordingPayload = bmux_recording_protocol::RecordingPayload<Event, ErrorCode>;
-
-pub type RecordingEventEnvelope = bmux_recording_protocol::RecordingEventEnvelope<Event, ErrorCode>;
-
 /// Successful response payload variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -679,80 +669,20 @@ where
     bmux_codec::from_bytes(bytes)
 }
 
-// ── Binary frame utilities for recording files ───────────────────────────────
-
-/// Write a length-prefixed binary frame to a writer.
-///
-/// Format: `[u32 little-endian length][codec bytes]`
-///
-/// # Errors
-///
-/// Returns an error if codec serialization fails, the serialized payload
-/// exceeds `u32::MAX` bytes, or writing to the underlying writer fails.
-pub fn write_frame<W: std::io::Write, T: Serialize>(
-    writer: &mut W,
-    value: &T,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = bmux_codec::to_vec(value).map_err(|e| format!("codec serialize failed: {e}"))?;
-    let len = u32::try_from(bytes.len())
-        .map_err(|_| format!("frame too large: {} bytes exceeds u32::MAX", bytes.len()))?;
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(&bytes)?;
-    Ok(())
-}
-
-/// Result of reading binary frames from a buffer.
-pub struct ReadFramesResult<T> {
-    /// Successfully deserialized frames.
-    pub frames: Vec<T>,
-    /// Number of trailing bytes that could not be parsed as a complete frame.
-    /// Zero means a clean EOF with no leftover data.
-    pub bytes_remaining: usize,
-}
-
-/// Read all length-prefixed binary frames from a byte buffer.
-///
-/// Returns all successfully-parsed frames plus the count of any trailing bytes
-/// that could not form a complete frame (indicating a truncated recording).
-///
-/// # Panics
-///
-/// Panics if the internal 4-byte length-prefix slice conversion fails, which
-/// should not occur because the slice is bounds-checked before conversion.
-///
-/// # Errors
-///
-/// Returns an error if codec deserialization fails for any complete frame in
-/// the buffer.
-pub fn read_frames<T: DeserializeOwned>(
-    data: &[u8],
-) -> Result<ReadFramesResult<T>, Box<dyn std::error::Error>> {
-    let mut results = Vec::new();
-    let mut offset = 0;
-    while offset + 4 <= data.len() {
-        let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-        if offset + len > data.len() {
-            // Truncated frame — rewind to include the length prefix in remaining bytes.
-            offset -= 4;
-            break;
-        }
-        let value: T = bmux_codec::from_bytes(&data[offset..offset + len])
-            .map_err(|e| format!("codec deserialize failed at offset {offset}: {e}"))?;
-        results.push(value);
-        offset += len;
-    }
-    Ok(ReadFramesResult {
-        frames: results,
-        bytes_remaining: data.len() - offset,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use bmux_attach_image_protocol::AttachPaneImage;
+    use bmux_recording_protocol::{
+        DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent,
+        RECORDING_FORMAT_VERSION, RecordingEventEnvelope as ProtocolRecordingEventEnvelope,
+        RecordingEventKind, RecordingPayload as ProtocolRecordingPayload, RecordingProfile,
+        RecordingSummary, read_frames, write_frame,
+    };
     use std::path::Path;
+
+    type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
+    type RecordingEventEnvelope = ProtocolRecordingEventEnvelope<Event, ErrorCode>;
 
     #[test]
     fn serializes_request_roundtrip() {

@@ -27,11 +27,13 @@ pub mod offline_prune;
 pub use bmux_recording_runtime::RollingRecordingSettings;
 pub use offline_prune::prune_old_recordings;
 
+use bmux_recording_protocol as protocol;
+
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/recording-plugin.bpdl",
 }
 
-impl From<recording_types::RecordingProfile> for bmux_ipc::RecordingProfile {
+impl From<recording_types::RecordingProfile> for protocol::RecordingProfile {
     fn from(value: recording_types::RecordingProfile) -> Self {
         match value {
             recording_types::RecordingProfile::Full => Self::Full,
@@ -41,17 +43,17 @@ impl From<recording_types::RecordingProfile> for bmux_ipc::RecordingProfile {
     }
 }
 
-impl From<bmux_ipc::RecordingProfile> for recording_types::RecordingProfile {
-    fn from(value: bmux_ipc::RecordingProfile) -> Self {
+impl From<protocol::RecordingProfile> for recording_types::RecordingProfile {
+    fn from(value: protocol::RecordingProfile) -> Self {
         match value {
-            bmux_ipc::RecordingProfile::Full => Self::Full,
-            bmux_ipc::RecordingProfile::Functional => Self::Functional,
-            bmux_ipc::RecordingProfile::Visual => Self::Visual,
+            protocol::RecordingProfile::Full => Self::Full,
+            protocol::RecordingProfile::Functional => Self::Functional,
+            protocol::RecordingProfile::Visual => Self::Visual,
         }
     }
 }
 
-impl From<recording_types::RecordingEventKind> for bmux_ipc::RecordingEventKind {
+impl From<recording_types::RecordingEventKind> for protocol::RecordingEventKind {
     fn from(value: recording_types::RecordingEventKind) -> Self {
         match value {
             recording_types::RecordingEventKind::PaneInputRaw => Self::PaneInputRaw,
@@ -67,24 +69,24 @@ impl From<recording_types::RecordingEventKind> for bmux_ipc::RecordingEventKind 
     }
 }
 
-impl From<bmux_ipc::RecordingEventKind> for recording_types::RecordingEventKind {
-    fn from(value: bmux_ipc::RecordingEventKind) -> Self {
+impl From<protocol::RecordingEventKind> for recording_types::RecordingEventKind {
+    fn from(value: protocol::RecordingEventKind) -> Self {
         match value {
-            bmux_ipc::RecordingEventKind::PaneInputRaw => Self::PaneInputRaw,
-            bmux_ipc::RecordingEventKind::PaneOutputRaw => Self::PaneOutputRaw,
-            bmux_ipc::RecordingEventKind::ProtocolReplyRaw => Self::ProtocolReplyRaw,
-            bmux_ipc::RecordingEventKind::PaneImage => Self::PaneImage,
-            bmux_ipc::RecordingEventKind::ServerEvent => Self::ServerEvent,
-            bmux_ipc::RecordingEventKind::RequestStart => Self::RequestStart,
-            bmux_ipc::RecordingEventKind::RequestDone => Self::RequestDone,
-            bmux_ipc::RecordingEventKind::RequestError => Self::RequestError,
-            bmux_ipc::RecordingEventKind::Custom => Self::Custom,
+            protocol::RecordingEventKind::PaneInputRaw => Self::PaneInputRaw,
+            protocol::RecordingEventKind::PaneOutputRaw => Self::PaneOutputRaw,
+            protocol::RecordingEventKind::ProtocolReplyRaw => Self::ProtocolReplyRaw,
+            protocol::RecordingEventKind::PaneImage => Self::PaneImage,
+            protocol::RecordingEventKind::ServerEvent => Self::ServerEvent,
+            protocol::RecordingEventKind::RequestStart => Self::RequestStart,
+            protocol::RecordingEventKind::RequestDone => Self::RequestDone,
+            protocol::RecordingEventKind::RequestError => Self::RequestError,
+            protocol::RecordingEventKind::Custom => Self::Custom,
         }
     }
 }
 
-impl From<bmux_ipc::RecordingSummary> for recording_types::RecordingSummary {
-    fn from(value: bmux_ipc::RecordingSummary) -> Self {
+impl From<protocol::RecordingSummary> for recording_types::RecordingSummary {
+    fn from(value: protocol::RecordingSummary) -> Self {
         Self {
             id: value.id,
             name: value.name,
@@ -104,7 +106,7 @@ impl From<bmux_ipc::RecordingSummary> for recording_types::RecordingSummary {
     }
 }
 
-impl From<recording_types::RecordingSummary> for bmux_ipc::RecordingSummary {
+impl From<recording_types::RecordingSummary> for protocol::RecordingSummary {
     fn from(value: recording_types::RecordingSummary) -> Self {
         Self {
             id: value.id,
@@ -125,8 +127,8 @@ impl From<recording_types::RecordingSummary> for bmux_ipc::RecordingSummary {
     }
 }
 
-impl From<bmux_ipc::RecordingStatus> for recording_types::RecordingStatus {
-    fn from(value: bmux_ipc::RecordingStatus) -> Self {
+impl From<protocol::RecordingStatus> for recording_types::RecordingStatus {
+    fn from(value: protocol::RecordingStatus) -> Self {
         Self {
             active: value.active.map(Into::into),
             queue_len: u64::try_from(value.queue_len).unwrap_or(u64::MAX),
@@ -134,7 +136,7 @@ impl From<bmux_ipc::RecordingStatus> for recording_types::RecordingStatus {
     }
 }
 
-impl From<recording_types::RecordingStatus> for bmux_ipc::RecordingStatus {
+impl From<recording_types::RecordingStatus> for protocol::RecordingStatus {
     fn from(value: recording_types::RecordingStatus) -> Self {
         Self {
             active: value.active.map(Into::into),
@@ -143,8 +145,8 @@ impl From<recording_types::RecordingStatus> for bmux_ipc::RecordingStatus {
     }
 }
 
-impl From<bmux_ipc::RecordingCaptureTarget> for recording_types::RecordingCaptureTarget {
-    fn from(value: bmux_ipc::RecordingCaptureTarget) -> Self {
+impl From<protocol::RecordingCaptureTarget> for recording_types::RecordingCaptureTarget {
+    fn from(value: protocol::RecordingCaptureTarget) -> Self {
         Self {
             recording_id: value.recording_id,
             path: value.path,
@@ -153,7 +155,7 @@ impl From<bmux_ipc::RecordingCaptureTarget> for recording_types::RecordingCaptur
     }
 }
 
-impl From<recording_types::RecordingCaptureTarget> for bmux_ipc::RecordingCaptureTarget {
+impl From<recording_types::RecordingCaptureTarget> for protocol::RecordingCaptureTarget {
     fn from(value: recording_types::RecordingCaptureTarget) -> Self {
         Self {
             recording_id: value.recording_id,
@@ -164,7 +166,7 @@ impl From<recording_types::RecordingCaptureTarget> for bmux_ipc::RecordingCaptur
 }
 
 impl From<recording_types::RecordingRollingStartOptions>
-    for bmux_ipc::RecordingRollingStartOptions
+    for protocol::RecordingRollingStartOptions
 {
     fn from(value: recording_types::RecordingRollingStartOptions) -> Self {
         Self {
@@ -182,10 +184,10 @@ impl From<recording_types::RecordingRollingStartOptions>
     }
 }
 
-impl From<bmux_ipc::RecordingRollingStartOptions>
+impl From<protocol::RecordingRollingStartOptions>
     for recording_types::RecordingRollingStartOptions
 {
-    fn from(value: bmux_ipc::RecordingRollingStartOptions) -> Self {
+    fn from(value: protocol::RecordingRollingStartOptions) -> Self {
         Self {
             window_secs: value.window_secs,
             name: value.name,
@@ -201,8 +203,8 @@ impl From<bmux_ipc::RecordingRollingStartOptions>
     }
 }
 
-impl From<bmux_ipc::RecordingRollingUsage> for recording_types::RecordingRollingUsage {
-    fn from(value: bmux_ipc::RecordingRollingUsage) -> Self {
+impl From<protocol::RecordingRollingUsage> for recording_types::RecordingRollingUsage {
+    fn from(value: protocol::RecordingRollingUsage) -> Self {
         Self {
             bytes: value.bytes,
             files: value.files,
@@ -212,7 +214,7 @@ impl From<bmux_ipc::RecordingRollingUsage> for recording_types::RecordingRolling
     }
 }
 
-impl From<recording_types::RecordingRollingUsage> for bmux_ipc::RecordingRollingUsage {
+impl From<recording_types::RecordingRollingUsage> for protocol::RecordingRollingUsage {
     fn from(value: recording_types::RecordingRollingUsage) -> Self {
         Self {
             bytes: value.bytes,
@@ -223,8 +225,8 @@ impl From<recording_types::RecordingRollingUsage> for bmux_ipc::RecordingRolling
     }
 }
 
-impl From<bmux_ipc::RecordingRollingStatus> for recording_types::RecordingRollingStatus {
-    fn from(value: bmux_ipc::RecordingRollingStatus) -> Self {
+impl From<protocol::RecordingRollingStatus> for recording_types::RecordingRollingStatus {
+    fn from(value: protocol::RecordingRollingStatus) -> Self {
         Self {
             root_path: value.root_path,
             auto_start: value.auto_start,
@@ -237,7 +239,7 @@ impl From<bmux_ipc::RecordingRollingStatus> for recording_types::RecordingRollin
     }
 }
 
-impl From<recording_types::RecordingRollingStatus> for bmux_ipc::RecordingRollingStatus {
+impl From<recording_types::RecordingRollingStatus> for protocol::RecordingRollingStatus {
     fn from(value: recording_types::RecordingRollingStatus) -> Self {
         Self {
             root_path: value.root_path,
@@ -251,8 +253,8 @@ impl From<recording_types::RecordingRollingStatus> for bmux_ipc::RecordingRollin
     }
 }
 
-impl From<bmux_ipc::RecordingRollingClearReport> for recording_types::RecordingRollingClearReport {
-    fn from(value: bmux_ipc::RecordingRollingClearReport) -> Self {
+impl From<protocol::RecordingRollingClearReport> for recording_types::RecordingRollingClearReport {
+    fn from(value: protocol::RecordingRollingClearReport) -> Self {
         Self {
             root_path: value.root_path,
             was_active: value.was_active,
@@ -265,7 +267,7 @@ impl From<bmux_ipc::RecordingRollingClearReport> for recording_types::RecordingR
     }
 }
 
-impl From<recording_types::RecordingRollingClearReport> for bmux_ipc::RecordingRollingClearReport {
+impl From<recording_types::RecordingRollingClearReport> for protocol::RecordingRollingClearReport {
     fn from(value: recording_types::RecordingRollingClearReport) -> Self {
         Self {
             root_path: value.root_path,

@@ -24,8 +24,15 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingPayload, Request};
+use bmux_ipc::Request;
+use bmux_recording_protocol::{
+    RecordingEventEnvelope as ProtocolRecordingEventEnvelope, RecordingEventKind,
+    RecordingPayload as ProtocolRecordingPayload,
+};
 use uuid::Uuid;
+
+type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
+type RecordingEventEnvelope = ProtocolRecordingEventEnvelope<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
 // ---------------------------------------------------------------------------
 // Timing thresholds

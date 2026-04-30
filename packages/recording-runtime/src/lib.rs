@@ -9,11 +9,12 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use bmux_ipc::RecordingPayload;
-use bmux_recording_protocol::RecordingEventKind;
+use bmux_recording_protocol::{RecordingEventKind, RecordingPayload as ProtocolRecordingPayload};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
+
+type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
 /// Per-event metadata attached to each record written through the
 /// sink. Lives here (not in `bmux_ipc`) because it is shared between

@@ -11,7 +11,10 @@ use bmux_config::{
     RecordingExportCursorPaintMode, RecordingExportCursorProfile, RecordingExportCursorShape,
     RecordingExportCursorTextMode, RecordingExportPaletteSource,
 };
-use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingPayload};
+use bmux_recording_protocol::{
+    RecordingEventEnvelope as ProtocolRecordingEventEnvelope, RecordingEventKind,
+    RecordingPayload as ProtocolRecordingPayload,
+};
 use bmux_session_models::SessionSelector;
 use bmux_sessions_plugin_api::sessions_commands;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -22,6 +25,9 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use uuid::Uuid;
+
+type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
+type RecordingEventEnvelope = ProtocolRecordingEventEnvelope<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
 use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
 use crate::sandbox_meta::{

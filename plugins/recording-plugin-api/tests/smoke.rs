@@ -11,7 +11,7 @@ fn interface_ids_match_bpdl_source() {
 }
 
 #[test]
-fn recording_summary_converts_to_ipc() {
+fn recording_summary_converts_to_protocol() {
     let summary = recording_types::RecordingSummary {
         id: uuid::Uuid::nil(),
         name: Some("demo".to_string()),
@@ -29,10 +29,13 @@ fn recording_summary_converts_to_ipc() {
         total_segment_bytes: 4,
     };
 
-    let ipc: bmux_ipc::RecordingSummary = summary.into();
-    assert_eq!(ipc.profile, bmux_ipc::RecordingProfile::Functional);
+    let protocol: bmux_recording_protocol::RecordingSummary = summary.into();
     assert_eq!(
-        ipc.event_kinds,
-        vec![bmux_ipc::RecordingEventKind::PaneOutputRaw]
+        protocol.profile,
+        bmux_recording_protocol::RecordingProfile::Functional
+    );
+    assert_eq!(
+        protocol.event_kinds,
+        vec![bmux_recording_protocol::RecordingEventKind::PaneOutputRaw]
     );
 }

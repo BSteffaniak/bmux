@@ -16,6 +16,7 @@ use bmux_plugin_sdk::{
     perf_telemetry::{ALL_PHASE_CHANNELS, PhaseChannel, emit as emit_phase_timing},
 };
 use bmux_recording_plugin_api::recording_commands;
+use bmux_recording_protocol::{DisplayActivityKind, RecordingSummary};
 use bmux_session_models::SessionSelector;
 use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
 use bmux_windows_plugin_api::windows_commands;
@@ -2456,7 +2457,7 @@ pub(super) async fn start_recording(
     client: &mut BmuxClient,
     session_id: Option<Uuid>,
 ) -> Result<Uuid> {
-    let summary: bmux_ipc::RecordingSummary = recording_commands::client::start(
+    let summary: RecordingSummary = recording_commands::client::start(
         client, session_id, true, // capture_input
         None, // name
         None, // profile: server default (Functional)
@@ -2697,7 +2698,7 @@ pub(super) async fn execute_step(
                     .map_err(|e| anyhow::anyhow!("send-keys failed: {e}"))?;
             }
             if let Some(dt) = display_track.as_mut() {
-                let _ = dt.record_activity(bmux_ipc::DisplayActivityKind::Input);
+                let _ = dt.record_activity(DisplayActivityKind::Input);
             }
             Ok(None)
         }
@@ -2710,7 +2711,7 @@ pub(super) async fn execute_step(
                 .await
                 .map_err(|e| anyhow::anyhow!("send-bytes failed: {e}"))?;
             if let Some(dt) = display_track.as_mut() {
-                let _ = dt.record_activity(bmux_ipc::DisplayActivityKind::Input);
+                let _ = dt.record_activity(DisplayActivityKind::Input);
             }
             Ok(None)
         }

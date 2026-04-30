@@ -1,7 +1,7 @@
 //! Display track writer for playbook recordings.
 //!
-//! Uses the shared `DisplayTrackEvent` and `DisplayTrackEnvelope` types from
-//! `bmux_ipc` for binary compatibility with the attach runtime's display tracks.
+//! Uses shared recording protocol display-track types for binary compatibility
+//! with the attach runtime's display tracks.
 //!
 //! Format: length-prefixed binary codec frames.
 
@@ -10,7 +10,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use bmux_ipc::{DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent};
+use bmux_recording_protocol::{
+    DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent, write_frame,
+};
 use uuid::Uuid;
 
 /// Writer that produces the display track binary file alongside a recording.
@@ -141,7 +143,7 @@ impl PlaybookDisplayTrackWriter {
                 .min(u128::from(u64::MAX)) as u64, // safe: clamped to u64::MAX
             event,
         };
-        bmux_ipc::write_frame(&mut self.writer, &envelope)
+        write_frame(&mut self.writer, &envelope)
             .map_err(|e| anyhow::anyhow!("display track write_frame failed: {e}"))?;
         Ok(())
     }

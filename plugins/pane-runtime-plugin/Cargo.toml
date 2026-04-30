@@ -30,6 +30,7 @@ bmux_pane_runtime_state = { workspace = true }
 bmux_permissions_plugin_api = { workspace = true }
 bmux_plugin = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
+bmux_recording_protocol = { workspace = true }
 bmux_recording_runtime = { workspace = true }
 bmux_session_models = { workspace = true }
 bmux_session_state = { workspace = true }

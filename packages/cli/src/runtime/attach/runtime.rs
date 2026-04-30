@@ -31,6 +31,7 @@ use bmux_plugin_sdk::{
     perf_telemetry::{PhaseChannel, emit as emit_phase_timing},
 };
 use bmux_recording_plugin_api::recording_state;
+use bmux_recording_protocol::{DisplayActivityKind, RecordingCaptureTarget};
 use bmux_session_models::SessionSelector;
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
@@ -376,7 +377,7 @@ pub struct DisplayCaptureFanout {
 }
 
 impl DisplayCaptureFanout {
-    fn open_target(&mut self, target: &bmux_ipc::RecordingCaptureTarget, client_id: Uuid) {
+    fn open_target(&mut self, target: &RecordingCaptureTarget, client_id: Uuid) {
         if self.writers.contains_key(&target.recording_id) {
             return;
         }
@@ -435,7 +436,7 @@ impl DisplayCaptureFanout {
         }
     }
 
-    fn record_activity(&mut self, kind: bmux_ipc::DisplayActivityKind) {
+    fn record_activity(&mut self, kind: DisplayActivityKind) {
         let mut failed = Vec::new();
         for (id, writer) in &mut self.writers {
             if writer.record_activity(kind).is_err() {
@@ -2854,7 +2855,7 @@ async fn handle_attach_stream_server_event(
         ref path,
     } = server_event
     {
-        let target = bmux_ipc::RecordingCaptureTarget {
+        let target = RecordingCaptureTarget {
             recording_id,
             path: path.clone(),
             rolling_window_secs: None,
@@ -5514,10 +5515,10 @@ pub fn render_attach_frame(
     }
 
     display_capture.record_frame_bytes(&frame_bytes);
-    display_capture.record_activity(bmux_ipc::DisplayActivityKind::Output);
+    display_capture.record_activity(DisplayActivityKind::Output);
     display_capture.record_cursor_snapshot(view_state.last_cursor_state);
     if previous_cursor_state != view_state.last_cursor_state {
-        display_capture.record_activity(bmux_ipc::DisplayActivityKind::Cursor);
+        display_capture.record_activity(DisplayActivityKind::Cursor);
     }
     // Record structured image data for GIF export.
     #[cfg(any(
@@ -7016,7 +7017,7 @@ pub async fn handle_attach_terminal_event(
                     {
                         return Err(map_attach_client_error(error));
                     }
-                    display_capture.record_activity(bmux_ipc::DisplayActivityKind::Input);
+                    display_capture.record_activity(DisplayActivityKind::Input);
                 }
             }
             AttachEventAction::PluginCommand {
