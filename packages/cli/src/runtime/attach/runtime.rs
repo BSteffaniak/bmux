@@ -570,6 +570,10 @@ async fn recover_attach_output_desync_for_pane(
 pub struct AttachFrameRenderStats {
     pub frame_bytes: usize,
     pub terminal_write_ms: u64,
+    pub damage_rects: usize,
+    pub damage_area_cells: u64,
+    pub full_surface_fallbacks: usize,
+    pub full_frame_fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -644,6 +648,10 @@ struct AttachPerfWindow {
     render_ms_max: u64,
     frame_bytes_max: u64,
     terminal_write_ms_max: u64,
+    damage_rects_max: u64,
+    damage_area_cells_max: u64,
+    full_surface_fallbacks: u64,
+    full_frame_fallbacks: u64,
     wake_server_events: u64,
     wake_terminal_events: u64,
     wake_prompt_events: u64,
@@ -677,6 +685,10 @@ impl AttachPerfWindow {
             render_ms_max: 0,
             frame_bytes_max: 0,
             terminal_write_ms_max: 0,
+            damage_rects_max: 0,
+            damage_area_cells_max: 0,
+            full_surface_fallbacks: 0,
+            full_frame_fallbacks: 0,
             wake_server_events: 0,
             wake_terminal_events: 0,
             wake_prompt_events: 0,
@@ -728,6 +740,16 @@ impl AttachPerfWindow {
             .frame_bytes_max
             .max(u64::try_from(stats.frame_bytes).unwrap_or(u64::MAX));
         self.terminal_write_ms_max = self.terminal_write_ms_max.max(stats.terminal_write_ms);
+        self.damage_rects_max = self
+            .damage_rects_max
+            .max(u64::try_from(stats.damage_rects).unwrap_or(u64::MAX));
+        self.damage_area_cells_max = self.damage_area_cells_max.max(stats.damage_area_cells);
+        self.full_surface_fallbacks = self
+            .full_surface_fallbacks
+            .saturating_add(u64::try_from(stats.full_surface_fallbacks).unwrap_or(u64::MAX));
+        if stats.full_frame_fallback {
+            self.full_frame_fallbacks = self.full_frame_fallbacks.saturating_add(1);
+        }
     }
 
     const fn record_wake(&mut self, source: AttachWakeSource) {
@@ -891,6 +913,84 @@ async fn publish_attach_layout_snapshot(
     }
 }
 
+fn insert_attach_perf_detailed_payload(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    window: &AttachPerfWindow,
+) {
+    object.insert(
+        "drain_ipc_ms_sum".to_string(),
+        window.drain_ipc_ms_sum.into(),
+    );
+    object.insert(
+        "drain_ipc_ms_max".to_string(),
+        window.drain_ipc_ms_max.into(),
+    );
+    object.insert("render_ms_sum".to_string(), window.render_ms_sum.into());
+    object.insert("render_ms_max".to_string(), window.render_ms_max.into());
+    object.insert(
+        "wake_server_events".to_string(),
+        window.wake_server_events.into(),
+    );
+    object.insert(
+        "wake_terminal_events".to_string(),
+        window.wake_terminal_events.into(),
+    );
+    object.insert(
+        "wake_prompt_events".to_string(),
+        window.wake_prompt_events.into(),
+    );
+    object.insert(
+        "wake_action_dispatch_events".to_string(),
+        window.wake_action_dispatch_events.into(),
+    );
+    object.insert(
+        "wake_appearance_events".to_string(),
+        window.wake_appearance_events.into(),
+    );
+    object.insert(
+        "wake_scene_events".to_string(),
+        window.wake_scene_events.into(),
+    );
+    object.insert(
+        "wake_window_list_events".to_string(),
+        window.wake_window_list_events.into(),
+    );
+    object.insert(
+        "dirty_status_frames".to_string(),
+        window.dirty_status_frames.into(),
+    );
+    object.insert(
+        "dirty_full_pane_frames".to_string(),
+        window.dirty_full_pane_frames.into(),
+    );
+    object.insert(
+        "dirty_overlay_frames".to_string(),
+        window.dirty_overlay_frames.into(),
+    );
+    object.insert(
+        "dirty_pane_frames".to_string(),
+        window.dirty_pane_frames.into(),
+    );
+    object.insert(
+        "dirty_layout_frames".to_string(),
+        window.dirty_layout_frames.into(),
+    );
+    object.insert(
+        "dirty_scene_hydrated_frames".to_string(),
+        window.dirty_scene_hydrated_frames.into(),
+    );
+    object.insert(
+        "dirty_extension_frames".to_string(),
+        window.dirty_extension_frames.into(),
+    );
+    if let Some(avg) = window.drain_ipc_ms_sum.checked_div(window.drain_ipc_calls) {
+        object.insert("drain_ipc_ms_avg".to_string(), avg.into());
+    }
+    if let Some(avg) = window.render_ms_sum.checked_div(window.render_frames) {
+        object.insert("render_ms_avg".to_string(), avg.into());
+    }
+}
+
 fn attach_perf_window_payload(
     window: &AttachPerfWindow,
     elapsed: Duration,
@@ -905,80 +1005,13 @@ fn attach_perf_window_payload(
         "render_frames": window.render_frames,
         "frame_bytes_max": window.frame_bytes_max,
         "terminal_write_ms_max": window.terminal_write_ms_max,
+        "damage_rects_max": window.damage_rects_max,
+        "damage_area_cells_max": window.damage_area_cells_max,
+        "full_surface_fallbacks": window.full_surface_fallbacks,
+        "full_frame_fallbacks": window.full_frame_fallbacks,
     });
     if detailed && let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "drain_ipc_ms_sum".to_string(),
-            window.drain_ipc_ms_sum.into(),
-        );
-        object.insert(
-            "drain_ipc_ms_max".to_string(),
-            window.drain_ipc_ms_max.into(),
-        );
-        object.insert("render_ms_sum".to_string(), window.render_ms_sum.into());
-        object.insert("render_ms_max".to_string(), window.render_ms_max.into());
-        object.insert(
-            "wake_server_events".to_string(),
-            window.wake_server_events.into(),
-        );
-        object.insert(
-            "wake_terminal_events".to_string(),
-            window.wake_terminal_events.into(),
-        );
-        object.insert(
-            "wake_prompt_events".to_string(),
-            window.wake_prompt_events.into(),
-        );
-        object.insert(
-            "wake_action_dispatch_events".to_string(),
-            window.wake_action_dispatch_events.into(),
-        );
-        object.insert(
-            "wake_appearance_events".to_string(),
-            window.wake_appearance_events.into(),
-        );
-        object.insert(
-            "wake_scene_events".to_string(),
-            window.wake_scene_events.into(),
-        );
-        object.insert(
-            "wake_window_list_events".to_string(),
-            window.wake_window_list_events.into(),
-        );
-        object.insert(
-            "dirty_status_frames".to_string(),
-            window.dirty_status_frames.into(),
-        );
-        object.insert(
-            "dirty_full_pane_frames".to_string(),
-            window.dirty_full_pane_frames.into(),
-        );
-        object.insert(
-            "dirty_overlay_frames".to_string(),
-            window.dirty_overlay_frames.into(),
-        );
-        object.insert(
-            "dirty_pane_frames".to_string(),
-            window.dirty_pane_frames.into(),
-        );
-        object.insert(
-            "dirty_layout_frames".to_string(),
-            window.dirty_layout_frames.into(),
-        );
-        object.insert(
-            "dirty_scene_hydrated_frames".to_string(),
-            window.dirty_scene_hydrated_frames.into(),
-        );
-        object.insert(
-            "dirty_extension_frames".to_string(),
-            window.dirty_extension_frames.into(),
-        );
-        if let Some(avg) = window.drain_ipc_ms_sum.checked_div(window.drain_ipc_calls) {
-            object.insert("drain_ipc_ms_avg".to_string(), avg.into());
-        }
-        if let Some(avg) = window.render_ms_sum.checked_div(window.render_frames) {
-            object.insert("render_ms_avg".to_string(), avg.into());
-        }
+        insert_attach_perf_detailed_payload(object, window);
     }
     if trace && let Some(object) = payload.as_object_mut() {
         object.insert(
@@ -1019,6 +1052,10 @@ async fn maybe_emit_attach_perf_window(
         render_ms_max = window.render_ms_max,
         frame_bytes_max = window.frame_bytes_max,
         terminal_write_ms_max = window.terminal_write_ms_max,
+        damage_rects_max = window.damage_rects_max,
+        damage_area_cells_max = window.damage_area_cells_max,
+        full_surface_fallbacks = window.full_surface_fallbacks,
+        full_frame_fallbacks = window.full_frame_fallbacks,
         drain_budget_hits = window.drain_budget_hits,
         wake_server_events = window.wake_server_events,
         wake_terminal_events = window.wake_terminal_events,
@@ -4608,6 +4645,7 @@ pub fn render_attach_frame(
     display_capture: &mut DisplayCaptureFanout,
 ) -> Result<AttachFrameRenderStats> {
     let frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
+    let damage_stats = frame_damage.stats();
 
     if view_state.dirty.status_needs_redraw {
         let now = Instant::now();
@@ -4822,6 +4860,10 @@ pub fn render_attach_frame(
     let stats = AttachFrameRenderStats {
         frame_bytes: frame_bytes.len(),
         terminal_write_ms,
+        damage_rects: damage_stats.rect_count,
+        damage_area_cells: damage_stats.rect_area_cells,
+        full_surface_fallbacks: damage_stats.full_surface_count,
+        full_frame_fallback: damage_stats.full_frame,
     };
     view_state.dirty.clear_frame_damage();
     Ok(stats)

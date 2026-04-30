@@ -115,6 +115,14 @@ impl DamageRect {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameDamageStats {
+    pub rect_count: usize,
+    pub rect_area_cells: u64,
+    pub full_surface_count: usize,
+    pub full_frame: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameDamage {
     full_frame: bool,
@@ -270,6 +278,38 @@ impl FrameDamage {
         self.extension_surface_rects
             .get(&surface_id)
             .map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> FrameDamageStats {
+        let rect_count = self
+            .content_surface_rects
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+            .saturating_add(
+                self.extension_surface_rects
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+            );
+        let rect_area_cells = self
+            .content_surface_rects
+            .values()
+            .chain(self.extension_surface_rects.values())
+            .flat_map(|rects| rects.iter())
+            .fold(0_u64, |area, rect| {
+                area.saturating_add(u64::from(rect.area()))
+            });
+        FrameDamageStats {
+            rect_count,
+            rect_area_cells,
+            full_surface_count: self
+                .content_surfaces
+                .len()
+                .saturating_add(self.extension_surfaces.len()),
+            full_frame: self.full_frame,
+        }
     }
 }
 
@@ -993,6 +1033,26 @@ mod tests {
 
         assert!(damage.extension_surface_damaged(surface_id, Uuid::nil()));
         assert!(damage.extension_surface_rects(surface_id).is_empty());
+    }
+
+    #[test]
+    fn frame_damage_stats_reports_rect_area_and_fallbacks() {
+        let pane_id = Uuid::from_u128(4);
+        let surface_id = Uuid::from_u128(5);
+        let mut damage = FrameDamage::default();
+        damage.mark_content_surface_rect(
+            pane_id,
+            DamageRect::new(0, 0, 3, 2),
+            (20, 10),
+            DamageCoalescingPolicy::default(),
+        );
+        damage.mark_extension_surface(surface_id);
+
+        let stats = damage.stats();
+        assert_eq!(stats.rect_count, 1);
+        assert_eq!(stats.rect_area_cells, 6);
+        assert_eq!(stats.full_surface_count, 1);
+        assert!(!stats.full_frame);
     }
 
     fn screen_row(screen: &vt100::Screen, row: u16, width: u16) -> String {
