@@ -561,14 +561,6 @@ pub struct AttachGrant {
     pub expires_at_epoch_ms: u64,
 }
 
-/// Summary returned when listing sessions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionSummary {
-    pub id: Uuid,
-    pub name: Option<String>,
-    pub client_count: usize,
-}
-
 /// Summary returned when listing generic runtime contexts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextSummary {

@@ -1760,6 +1760,7 @@ fn session_lifecycle_ipc_variants_are_absent() {
         "ResponsePayload::SessionKilled {",
         "ResponsePayload::SessionList {",
         "ResponsePayload::PaneList {",
+        "pub struct SessionSummary",
         "Event::SessionCreated",
         "Event::SessionRemoved",
     ];
