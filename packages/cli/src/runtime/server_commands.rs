@@ -12,6 +12,7 @@ use bmux_recording_protocol::{
     RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
     RecordingSummary,
 };
+use bmux_snapshot_protocol::SnapshotStatusReport;
 use iroh::{Endpoint, endpoint::presets};
 use std::process::{Command as ProcessCommand, Stdio};
 use uuid::Uuid;
@@ -38,7 +39,7 @@ pub(super) struct ServerStatusJsonPayload {
     server_control_principal_id: Option<Uuid>,
     force_local_permitted: bool,
     latest_server_event: Option<String>,
-    snapshot: Option<bmux_ipc::ServerSnapshotStatus>,
+    snapshot: Option<SnapshotStatusReport>,
     server_metadata: Option<ServerRuntimeMetadata>,
     cli_build: Option<String>,
     stale_build: bool,

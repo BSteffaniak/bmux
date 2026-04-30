@@ -8,11 +8,7 @@
 //! Cross-platform IPC protocol models for bmux.
 
 use bmux_attach_view_protocol::AttachViewComponent;
-pub use bmux_performance_state::{
-    PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE, PerformanceRecordingLevel,
-    PerformanceRuntimeSettings,
-};
-pub use bmux_snapshot_protocol::SnapshotStatusReport as ServerSnapshotStatus;
+use bmux_snapshot_protocol::SnapshotStatusReport;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -415,7 +411,7 @@ pub enum ResponsePayload {
     },
     ServerStatus {
         running: bool,
-        snapshot: ServerSnapshotStatus,
+        snapshot: SnapshotStatusReport,
         principal_id: Uuid,
         server_control_principal_id: Uuid,
     },
@@ -673,12 +669,14 @@ where
 mod tests {
     use super::*;
     use bmux_attach_image_protocol::AttachPaneImage;
+    use bmux_performance_state::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
     use bmux_recording_protocol::{
         DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent,
         RECORDING_FORMAT_VERSION, RecordingEventEnvelope as ProtocolRecordingEventEnvelope,
         RecordingEventKind, RecordingPayload as ProtocolRecordingPayload, RecordingProfile,
         RecordingSummary, read_frames, write_frame,
     };
+    use bmux_snapshot_protocol::SnapshotStatusReport;
     use std::path::Path;
 
     type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
@@ -963,7 +961,7 @@ mod tests {
             },
             ResponsePayload::ServerStatus {
                 running: true,
-                snapshot: ServerSnapshotStatus {
+                snapshot: SnapshotStatusReport {
                     enabled: true,
                     path: Some("/tmp/snap".into()),
                     snapshot_exists: true,

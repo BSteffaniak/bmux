@@ -17,6 +17,7 @@ bmux_config                 = { workspace = true }
 bmux_ipc                    = { workspace = true }
 bmux_perf_telemetry         = { workspace = true }
 bmux_plugin_sdk             = { workspace = true }
+bmux_snapshot_protocol      = { workspace = true }
 
 # External dependencies
 bmux_codec = { workspace = true }
@@ -41,6 +42,7 @@ fail-on-warnings = [
     "bmux_codec/fail-on-warnings",
     "bmux_config/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
+    "bmux_snapshot_protocol/fail-on-warnings",
 ]
 
 # Serialization features

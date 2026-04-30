@@ -17,11 +17,12 @@ use bmux_ipc::transport::{
 use bmux_ipc::{
     CORE_PROTOCOL_CAPABILITIES, Envelope, EnvelopeKind, ErrorCode, IncompatibilityReason,
     InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, ProtocolContract, Request, Response,
-    ResponsePayload, ServerSnapshotStatus, ServicePipelineRequest, ServicePipelineStepResult,
-    decode, default_supported_capabilities, encode,
+    ResponsePayload, ServicePipelineRequest, ServicePipelineStepResult, decode,
+    default_supported_capabilities, encode,
 };
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing};
 use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult};
+use bmux_snapshot_protocol::SnapshotStatusReport;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -87,7 +88,7 @@ pub struct AttachPaneSnapshotState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerStatusInfo {
     pub running: bool,
-    pub snapshot: ServerSnapshotStatus,
+    pub snapshot: SnapshotStatusReport,
     pub principal_id: Uuid,
     pub server_control_principal_id: Uuid,
 }

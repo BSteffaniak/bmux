@@ -13,9 +13,9 @@ use bmux_context_state::{ContextSelector, ContextStateHandle};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     CORE_PROTOCOL_CAPABILITIES, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event,
-    IpcEndpoint, ProtocolContract, Request, Response, ResponsePayload, ServerSnapshotStatus,
-    ServicePipelinePayload, ServicePipelineRequest, ServicePipelineStepResult, decode,
-    default_supported_capabilities, encode, negotiate_protocol,
+    IpcEndpoint, ProtocolContract, Request, Response, ResponsePayload, ServicePipelinePayload,
+    ServicePipelineRequest, ServicePipelineStepResult, decode, default_supported_capabilities,
+    encode, negotiate_protocol,
 };
 use bmux_perf_telemetry::{
     PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing, flush as flush_phase_timing,
@@ -2226,7 +2226,7 @@ async fn handle_request(
             force_local_permitted: client_principal_id == state.server_control_principal_id,
         }),
         Request::ServerStatus => {
-            let snapshot: ServerSnapshotStatus = snapshot_orchestrator_handle().as_dyn().status();
+            let snapshot = snapshot_orchestrator_handle().as_dyn().status();
             Response::Ok(ResponsePayload::ServerStatus {
                 running: true,
                 snapshot,
