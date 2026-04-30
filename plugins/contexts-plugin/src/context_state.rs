@@ -14,8 +14,9 @@
 //! domain-agnostic `bmux_context_state::ContextStateHandle` trait
 //! object rather than naming this concrete type.
 
-use bmux_context_state::{CONTEXT_SESSION_ID_ATTRIBUTE, RuntimeContext};
-use bmux_ipc::{ContextSelector, ContextSummary};
+use bmux_context_state::{
+    CONTEXT_SESSION_ID_ATTRIBUTE, ContextSelector, ContextSummary, RuntimeContext,
+};
 use bmux_session_models::{ClientId, SessionId};
 use std::collections::{BTreeMap, VecDeque};
 use tracing::debug;

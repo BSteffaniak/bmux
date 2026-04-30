@@ -16,7 +16,8 @@ use bmux_clients_plugin_api::clients_state::{
     self as clients_state, ClientQueryError, ClientSummary,
 };
 use bmux_context_state::{
-    ContextStateHandle, ContextStateReader, ContextStateSnapshot, ContextStateWriter,
+    ContextSelector as PrimitiveContextSelector, ContextStateHandle, ContextStateReader,
+    ContextStateSnapshot, ContextStateWriter, ContextSummary as PrimitiveContextSummary,
     RuntimeContext,
 };
 use bmux_contexts_plugin_api::contexts_commands::{
@@ -73,11 +74,11 @@ impl ContextStateAdapter {
 }
 
 impl ContextStateReader for ContextStateAdapter {
-    fn list(&self) -> Vec<bmux_ipc::ContextSummary> {
-        self.with_read(ContextState::list, Vec::<bmux_ipc::ContextSummary>::new())
+    fn list(&self) -> Vec<PrimitiveContextSummary> {
+        self.with_read(ContextState::list, Vec::<PrimitiveContextSummary>::new())
     }
 
-    fn current_for_client(&self, client_id: ClientId) -> Option<bmux_ipc::ContextSummary> {
+    fn current_for_client(&self, client_id: ClientId) -> Option<PrimitiveContextSummary> {
         self.with_read(|state| state.current_for_client(client_id), None)
     }
 
@@ -91,7 +92,7 @@ impl ContextStateReader for ContextStateAdapter {
 
     fn resolve_id(
         &self,
-        selector: &bmux_ipc::ContextSelector,
+        selector: &PrimitiveContextSelector,
     ) -> std::result::Result<Uuid, &'static str> {
         self.with_read(
             |state| state.resolve_id(selector),
@@ -106,8 +107,8 @@ impl ContextStateWriter for ContextStateAdapter {
         client_id: ClientId,
         name: Option<String>,
         attributes: BTreeMap<String, String>,
-    ) -> bmux_ipc::ContextSummary {
-        let fallback = bmux_ipc::ContextSummary {
+    ) -> PrimitiveContextSummary {
+        let fallback = PrimitiveContextSummary {
             id: Uuid::nil(),
             name: name.clone(),
             attributes: attributes.clone(),
@@ -118,8 +119,8 @@ impl ContextStateWriter for ContextStateAdapter {
     fn select_for_client(
         &self,
         client_id: ClientId,
-        selector: &bmux_ipc::ContextSelector,
-    ) -> std::result::Result<bmux_ipc::ContextSummary, &'static str> {
+        selector: &PrimitiveContextSelector,
+    ) -> std::result::Result<PrimitiveContextSummary, &'static str> {
         self.with_write(
             |state| state.select_for_client(client_id, selector),
             Err("context-state lock poisoned"),
@@ -129,7 +130,7 @@ impl ContextStateWriter for ContextStateAdapter {
     fn close(
         &self,
         client_id: ClientId,
-        selector: &bmux_ipc::ContextSelector,
+        selector: &PrimitiveContextSelector,
         force: bool,
     ) -> std::result::Result<(Uuid, Option<SessionId>), &'static str> {
         self.with_write(
@@ -296,13 +297,13 @@ struct WireSelector {
 }
 
 impl WireSelector {
-    fn to_ipc(&self) -> Option<bmux_ipc::ContextSelector> {
+    fn to_primitive(&self) -> Option<PrimitiveContextSelector> {
         if let Some(id) = self.id {
-            return Some(bmux_ipc::ContextSelector::ById(id));
+            return Some(PrimitiveContextSelector::ById(id));
         }
         self.name
             .as_ref()
-            .map(|name| bmux_ipc::ContextSelector::ByName(name.clone()))
+            .map(|name| PrimitiveContextSelector::ByName(name.clone()))
     }
 }
 
@@ -501,7 +502,7 @@ fn get_context_local(
     _caller: &impl ServiceCaller,
     selector: &WireSelector,
 ) -> Result<Result<ContextSummary, ContextQueryError>, String> {
-    let Some(ipc_selector) = selector.to_ipc() else {
+    let Some(context_selector) = selector.to_primitive() else {
         return Ok(Err(ContextQueryError::InvalidSelector {
             reason: "selector must specify either id or name".to_string(),
         }));
@@ -510,7 +511,7 @@ fn get_context_local(
     let guard = state
         .read()
         .map_err(|_| "context state lock poisoned".to_string())?;
-    let resolved = guard.resolve_id(&ipc_selector);
+    let resolved = guard.resolve_id(&context_selector);
     Ok(resolved.map_or(Err(ContextQueryError::NotFound), |id| {
         guard
             .contexts
@@ -653,7 +654,7 @@ fn mutate_state_create(
     session_id: SessionId,
 ) -> Result<
     (
-        bmux_ipc::ContextSummary,
+        PrimitiveContextSummary,
         core::result::Result<(), &'static str>,
     ),
     CreateContextError,
@@ -682,7 +683,7 @@ fn select_context_local(
     caller_client_id: Option<::uuid::Uuid>,
     selector: &WireSelector,
 ) -> Result<ContextAck, SelectContextError> {
-    let Some(ipc_selector) = selector.to_ipc() else {
+    let Some(context_selector) = selector.to_primitive() else {
         return Err(SelectContextError::Denied {
             reason: "selector must specify either id or name".to_string(),
         });
@@ -690,7 +691,7 @@ fn select_context_local(
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| SelectContextError::Denied { reason })?;
 
-    let (context, session_after_select) = mutate_state_select(client_id, &ipc_selector)?;
+    let (context, session_after_select) = mutate_state_select(client_id, &context_selector)?;
 
     tracing::Span::current().record("context_id", tracing::field::display(context.id));
     if let Some(session_id) = session_after_select {
@@ -732,14 +733,14 @@ fn select_context_local(
 #[allow(clippy::significant_drop_tightening)]
 fn mutate_state_select(
     client_id: ClientId,
-    ipc_selector: &bmux_ipc::ContextSelector,
-) -> Result<(bmux_ipc::ContextSummary, Option<SessionId>), SelectContextError> {
+    context_selector: &PrimitiveContextSelector,
+) -> Result<(PrimitiveContextSummary, Option<SessionId>), SelectContextError> {
     let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
     let mut guard = state.write().map_err(|_| SelectContextError::Denied {
         reason: "context state lock poisoned".to_string(),
     })?;
     let context = guard
-        .select_for_client(client_id, ipc_selector)
+        .select_for_client(client_id, context_selector)
         .map_err(|reason| SelectContextError::Denied {
             reason: reason.to_string(),
         })?;
@@ -765,7 +766,7 @@ fn close_context_local(
     selector: &WireSelector,
     force: bool,
 ) -> Result<ContextAck, CloseContextError> {
-    let Some(ipc_selector) = selector.to_ipc() else {
+    let Some(context_selector) = selector.to_primitive() else {
         return Err(CloseContextError::Failed {
             reason: "selector must specify either id or name".to_string(),
         });
@@ -777,7 +778,7 @@ fn close_context_local(
         removed_id,
         bound_session_id,
         replacement,
-    } = mutate_state_close(client_id, &ipc_selector, force)?;
+    } = mutate_state_close(client_id, &context_selector, force)?;
 
     tracing::Span::current().record("removed_id", tracing::field::display(removed_id));
     if let Some((replacement_context_id, replacement_session_id)) = replacement {
@@ -861,7 +862,7 @@ struct CloseOutcome {
 #[allow(clippy::significant_drop_tightening)]
 fn mutate_state_close(
     client_id: ClientId,
-    ipc_selector: &bmux_ipc::ContextSelector,
+    context_selector: &PrimitiveContextSelector,
     force: bool,
 ) -> Result<CloseOutcome, CloseContextError> {
     let state = local_state().map_err(|reason| CloseContextError::Failed { reason })?;
@@ -869,7 +870,7 @@ fn mutate_state_close(
         reason: "context state lock poisoned".to_string(),
     })?;
     let (removed_id, bound_session_id) = guard
-        .close(client_id, ipc_selector, force)
+        .close(client_id, context_selector, force)
         .map_err(|_reason| CloseContextError::NotFound)?;
     // After `close`, the caller's `selected_by_client` now either
     // points at the replacement (if ContextState picked one) or is
@@ -1066,7 +1067,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn ipc_summary_to_typed(summary: bmux_ipc::ContextSummary) -> ContextSummary {
+fn ipc_summary_to_typed(summary: PrimitiveContextSummary) -> ContextSummary {
     ContextSummary {
         id: summary.id,
         name: summary.name,
@@ -1100,7 +1101,7 @@ mod tests {
             .expect("second context should bind to session");
 
         let _ = context_state
-            .select_for_client(client_id, &bmux_ipc::ContextSelector::ById(first.id))
+            .select_for_client(client_id, &PrimitiveContextSelector::ById(first.id))
             .expect("selecting first context should succeed");
 
         let removed = context_state.remove_contexts_for_session(first_session_id);
@@ -1140,11 +1141,11 @@ mod tests {
             .expect("second context should bind to session");
 
         let _ = context_state
-            .select_for_client(client_id, &bmux_ipc::ContextSelector::ById(first_id))
+            .select_for_client(client_id, &PrimitiveContextSelector::ById(first_id))
             .expect("selecting first context should succeed");
 
         let (closed_id, _closed_session) = context_state
-            .close(client_id, &bmux_ipc::ContextSelector::ById(first_id), true)
+            .close(client_id, &PrimitiveContextSelector::ById(first_id), true)
             .expect("closing first context should succeed");
         assert_eq!(closed_id, first_id);
 

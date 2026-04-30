@@ -7,7 +7,6 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use bmux_ipc::{ContextSelector, ContextSummary};
 use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -16,6 +15,23 @@ use uuid::Uuid;
 
 /// Attribute name used to stamp a bound session id onto a context.
 pub const CONTEXT_SESSION_ID_ATTRIBUTE: &str = "bmux.session_id";
+
+/// Selector accepted by context-state operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSelector {
+    ById(Uuid),
+    ByName(String),
+}
+
+/// Summary returned when listing generic runtime contexts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSummary {
+    pub id: Uuid,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+}
 
 /// A single context: id, optional display name, arbitrary attributes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

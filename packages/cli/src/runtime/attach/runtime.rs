@@ -16,9 +16,10 @@ use bmux_client::{
     StreamingBmuxClient,
 };
 use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
+use bmux_context_state::ContextSelector;
 use bmux_ipc::{
-    AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ContextSelector, InvokeServiceKind,
-    PaneFocusDirection, PaneSplitDirection, SessionSelector,
+    AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, InvokeServiceKind, PaneFocusDirection,
+    PaneSplitDirection, SessionSelector,
 };
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_permissions_plugin_api::session_policy_state;

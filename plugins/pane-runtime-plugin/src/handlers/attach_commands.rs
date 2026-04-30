@@ -9,7 +9,8 @@
 //! and wire-event emission.
 
 use bmux_attach_token_state::AttachTokenValidationError;
-use bmux_ipc::{AttachGrant, ContextSelector as IpcContextSelector, Event};
+use bmux_context_state::ContextSelector as PrimitiveContextSelector;
+use bmux_ipc::{AttachGrant, Event};
 use bmux_pane_runtime_plugin_api::attach_runtime_commands::{
     AttachCommandError, AttachGrant as AttachGrantRecord, AttachOutput as AttachOutputRecord,
     AttachReady, AttachRetargetReady, AttachViewportSet, ContextSelector, SessionSelector,
@@ -242,11 +243,11 @@ fn resolve_session_by_selector(
 
 fn context_selector_to_ipc(
     selector: &ContextSelector,
-) -> Result<IpcContextSelector, AttachCommandError> {
+) -> Result<PrimitiveContextSelector, AttachCommandError> {
     if let Some(id) = selector.id {
-        Ok(IpcContextSelector::ById(id))
+        Ok(PrimitiveContextSelector::ById(id))
     } else if let Some(name) = selector.name.clone() {
-        Ok(IpcContextSelector::ByName(name))
+        Ok(PrimitiveContextSelector::ByName(name))
     } else {
         Err(failed("attach-context requires a context selector"))
     }
@@ -545,7 +546,7 @@ pub fn attach_retarget_context(
         } else {
             let context = contexts
                 .0
-                .select_for_client(client_id, &IpcContextSelector::ById(req.context_id))
+                .select_for_client(client_id, &PrimitiveContextSelector::ById(req.context_id))
                 .map_err(|m| failed(m.to_string()))?;
             let Some(selected_session_id) = contexts.0.current_session_for_client(client_id) else {
                 return Err(failed("context has no attached runtime"));

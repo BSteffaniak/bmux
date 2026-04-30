@@ -307,13 +307,6 @@ pub enum SessionSelector {
     ByName(String),
 }
 
-/// Generic context selector accepted by context protocol requests.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ContextSelector {
-    ById(Uuid),
-    ByName(String),
-}
-
 /// Pane selector accepted by commands and protocol requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaneSelector {
@@ -559,15 +552,6 @@ pub struct AttachGrant {
     pub session_id: Uuid,
     pub attach_token: Uuid,
     pub expires_at_epoch_ms: u64,
-}
-
-/// Summary returned when listing generic runtime contexts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextSummary {
-    pub id: Uuid,
-    pub name: Option<String>,
-    #[serde(default)]
-    pub attributes: BTreeMap<String, String>,
 }
 
 /// Summary returned when listing panes in the active session runtime.
@@ -2196,17 +2180,6 @@ mod tests {
     #[test]
     fn pane_layout_node_split_roundtrip() {
         assert_roundtrip(&sample_layout_tree());
-    }
-
-    #[test]
-    fn context_selector_all_variants_roundtrip() {
-        let selectors = [
-            ContextSelector::ById(Uuid::from_u128(1)),
-            ContextSelector::ByName("ctx-name".into()),
-        ];
-        for sel in &selectors {
-            assert_roundtrip(sel);
-        }
     }
 
     #[test]

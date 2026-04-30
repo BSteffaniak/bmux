@@ -7,15 +7,14 @@
 use anyhow::{Context, Result};
 use bmux_client_state::FollowStateHandle;
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_context_state::ContextStateHandle;
+use bmux_context_state::{ContextSelector, ContextStateHandle};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ContextSelector, Envelope,
-    EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PerformanceRecordingLevel,
-    ProtocolContract, RecordingEventKind, RecordingPayload, RecordingRollingStartOptions, Request,
-    Response, ResponsePayload, ServerSnapshotStatus, ServicePipelinePayload,
-    ServicePipelineRequest, ServicePipelineStepResult, decode, default_supported_capabilities,
-    encode, negotiate_protocol,
+    AttachGrant, AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, Envelope, EnvelopeKind,
+    ErrorCode, ErrorResponse, Event, IpcEndpoint, PerformanceRecordingLevel, ProtocolContract,
+    RecordingEventKind, RecordingPayload, RecordingRollingStartOptions, Request, Response,
+    ResponsePayload, ServerSnapshotStatus, ServicePipelinePayload, ServicePipelineRequest,
+    ServicePipelineStepResult, decode, default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_perf_telemetry::{
     PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing, flush as flush_phase_timing,

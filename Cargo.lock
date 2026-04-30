@@ -1050,6 +1050,7 @@ dependencies = [
  "bmux_cluster_plugin",
  "bmux_codec",
  "bmux_config",
+ "bmux_context_state",
  "bmux_contexts_plugin",
  "bmux_contexts_plugin_api",
  "bmux_control_catalog_plugin",
@@ -1273,7 +1274,6 @@ dependencies = [
 name = "bmux_context_state"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_ipc",
  "bmux_session_models",
  "serde",
  "uuid",
@@ -1286,7 +1286,6 @@ dependencies = [
  "bmux_clients_plugin_api",
  "bmux_context_state",
  "bmux_contexts_plugin_api",
- "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_session_models",
