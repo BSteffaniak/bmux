@@ -114,6 +114,14 @@ fn frame_rects_to_render_damage(rects: &[DamageRect], surface_rect: ExtensionRec
     }))
 }
 
+fn render_damage_trace_shape(damage: &RenderDamage) -> (u16, bool) {
+    match damage {
+        RenderDamage::FullSurface => (0, true),
+        RenderDamage::Regions(regions) => (u16::try_from(regions.len()).unwrap_or(u16::MAX), false),
+        RenderDamage::None => (0, false),
+    }
+}
+
 fn queue_render_ops<W: io::Write>(
     stdout: &mut W,
     surface_rect: ExtensionRect,
@@ -527,6 +535,75 @@ pub struct AttachSceneRenderStats {
     pub extension_cache_hits: u64,
     pub extension_full_surface_calls: u64,
     pub extension_region_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachRenderTraceOp {
+    ClearRow {
+        row: u16,
+        cells: u16,
+    },
+    PaneRowFull {
+        surface_index: usize,
+        row: u16,
+        cells: u16,
+    },
+    PaneRowSegment {
+        surface_index: usize,
+        row: u16,
+        start_col: u16,
+        cells: u16,
+    },
+    PaneRowCacheSkip {
+        surface_index: usize,
+        row: u16,
+    },
+    PaneRowsSyncDeferred {
+        surface_index: usize,
+        rows: u16,
+    },
+    ExtensionOps {
+        surface_index: usize,
+        regions: u16,
+        full_surface: bool,
+    },
+    ExtensionCachedReplay {
+        surface_index: usize,
+    },
+    ExtensionImperative {
+        surface_index: usize,
+        regions: u16,
+        full_surface: bool,
+    },
+    Cursor {
+        surface_index: usize,
+        visible: bool,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttachRenderTrace {
+    ops: Vec<AttachRenderTraceOp>,
+}
+
+impl AttachRenderTrace {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { ops: Vec::new() }
+    }
+
+    pub fn push(&mut self, op: AttachRenderTraceOp) {
+        self.ops.push(op);
+    }
+
+    #[must_use]
+    pub fn ops(&self) -> &[AttachRenderTraceOp] {
+        &self.ops
+    }
+
+    pub fn clear(&mut self) {
+        self.ops.clear();
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1449,6 +1526,7 @@ pub fn render_attach_scene<W: io::Write>(
         damage_policy,
         render_extensions,
         None,
+        None,
     )
 }
 
@@ -1481,6 +1559,61 @@ pub fn render_attach_scene_with_stats<W: io::Write>(
     damage_policy: DamageCoalescingPolicy,
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
 ) -> Result<(Option<AttachCursorState>, AttachSceneRenderStats)> {
+    render_attach_scene_with_stats_and_trace(
+        stdout,
+        scene,
+        panes,
+        pane_buffers,
+        frame_damage,
+        status_top_inset,
+        status_bottom_inset,
+        scrollback_active,
+        scrollback_offset,
+        scrollback_cursor,
+        selection_anchor,
+        zoomed,
+        terminal_size,
+        runtime_appearance,
+        damage_policy,
+        render_extensions,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::fn_params_excessive_bools // explicit render-state flags keep hot-path call sites readable
+)]
+/// Render a composed attach scene frame and optionally collect semantic render trace ops.
+///
+/// Trace collection is observational: it records normalized operations after the
+/// corresponding write decision and does not affect emitted bytes, row caches,
+/// damage coalescing, or extension cache keys.
+///
+/// # Errors
+///
+/// Returns an error when queueing frame bytes fails.
+pub fn render_attach_scene_with_stats_and_trace<W: io::Write>(
+    stdout: &mut W,
+    scene: &AttachScene,
+    panes: &[PaneSummary],
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    frame_damage: &FrameDamage,
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+    scrollback_active: bool,
+    scrollback_offset: usize,
+    scrollback_cursor: Option<AttachScrollbackCursor>,
+    selection_anchor: Option<AttachScrollbackPosition>,
+    zoomed: bool,
+    terminal_size: (u16, u16),
+    runtime_appearance: &RuntimeAppearance,
+    damage_policy: DamageCoalescingPolicy,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
+    render_trace: Option<&mut AttachRenderTrace>,
+) -> Result<(Option<AttachCursorState>, AttachSceneRenderStats)> {
     let mut stats = AttachSceneRenderStats::default();
     let cursor_state = render_attach_scene_inner(
         stdout,
@@ -1500,6 +1633,7 @@ pub fn render_attach_scene_with_stats<W: io::Write>(
         damage_policy,
         render_extensions,
         Some(&mut stats),
+        render_trace,
     )?;
     Ok((cursor_state, stats))
 }
@@ -1528,6 +1662,7 @@ fn render_attach_scene_inner<W: io::Write>(
     damage_policy: DamageCoalescingPolicy,
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
     mut render_stats: Option<&mut AttachSceneRenderStats>,
+    mut render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal_size;
     if cols == 0 || rows <= status_top_inset.saturating_add(status_bottom_inset) {
@@ -1549,6 +1684,12 @@ fn render_attach_scene_inner<W: io::Write>(
                 stats.clear_rows = stats.clear_rows.saturating_add(1);
                 stats.clear_cells = stats.clear_cells.saturating_add(u64::from(cols));
             }
+            if let Some(trace) = render_trace.as_deref_mut() {
+                trace.push(AttachRenderTraceOp::ClearRow {
+                    row: y,
+                    cells: cols,
+                });
+            }
         }
         // Invalidate all row caches so every row is re-emitted.
         for buffer in pane_buffers.values_mut() {
@@ -1568,7 +1709,7 @@ fn render_attach_scene_inner<W: io::Write>(
     let mut ordered_surfaces = scene.surfaces.iter().enumerate().collect::<Vec<_>>();
     ordered_surfaces.sort_by_key(|(index, surface)| (surface.layer, surface.z, *index));
 
-    for (_index, surface) in ordered_surfaces {
+    for (surface_index, surface) in ordered_surfaces {
         if !surface.visible {
             continue;
         }
@@ -1690,6 +1831,9 @@ fn render_attach_scene_inner<W: io::Write>(
                     if let Some(stats) = render_stats.as_deref_mut() {
                         stats.extension_cache_hits = stats.extension_cache_hits.saturating_add(1);
                     }
+                    if let Some(trace) = render_trace.as_deref_mut() {
+                        trace.push(AttachRenderTraceOp::ExtensionCachedReplay { surface_index });
+                    }
                     continue;
                 }
 
@@ -1697,6 +1841,14 @@ fn render_attach_scene_inner<W: io::Write>(
                     if let Some(stats) = render_stats.as_deref_mut() {
                         stats.extension_render_op_calls =
                             stats.extension_render_op_calls.saturating_add(1);
+                    }
+                    if let Some(trace) = render_trace.as_deref_mut() {
+                        let (regions, full_surface) = render_damage_trace_shape(&damage);
+                        trace.push(AttachRenderTraceOp::ExtensionOps {
+                            surface_index,
+                            regions,
+                            full_surface,
+                        });
                     }
                     let mut bytes = Vec::new();
                     match queue_render_ops(&mut bytes, ext_rect, &damage, &ops) {
@@ -1735,6 +1887,14 @@ fn render_attach_scene_inner<W: io::Write>(
                     if let Some(stats) = render_stats.as_deref_mut() {
                         stats.extension_imperative_calls =
                             stats.extension_imperative_calls.saturating_add(1);
+                    }
+                    if let Some(trace) = render_trace.as_deref_mut() {
+                        let (regions, full_surface) = render_damage_trace_shape(&damage);
+                        trace.push(AttachRenderTraceOp::ExtensionImperative {
+                            surface_index,
+                            regions,
+                            full_surface,
+                        });
                     }
                     let dyn_writer: &mut dyn io::Write = stdout;
                     if let Err(err) = ext.render_surface(dyn_writer, surface.id, &ext_rect, &damage)
@@ -1792,17 +1952,30 @@ fn render_attach_scene_inner<W: io::Write>(
                         cursor_col.min(inner_width.saturating_sub(1)),
                     )
                 };
+                let cursor_visible = use_scrollback || !screen.hide_cursor();
                 cursor_state = Some(AttachCursorState {
                     x: content.x.saturating_add(cursor_col),
                     y: content.y.saturating_add(cursor_row),
-                    visible: use_scrollback || !screen.hide_cursor(),
+                    visible: cursor_visible,
                 });
+                if let Some(trace) = render_trace.as_deref_mut() {
+                    trace.push(AttachRenderTraceOp::Cursor {
+                        surface_index,
+                        visible: cursor_visible,
+                    });
+                }
             }
             if !should_draw_content || sync_deferred {
                 if sync_deferred && let Some(stats) = render_stats.as_deref_mut() {
                     stats.pane_rows_sync_deferred = stats
                         .pane_rows_sync_deferred
                         .saturating_add(u64::try_from(inner_h).unwrap_or(u64::MAX));
+                }
+                if sync_deferred && let Some(trace) = render_trace.as_deref_mut() {
+                    trace.push(AttachRenderTraceOp::PaneRowsSyncDeferred {
+                        surface_index,
+                        rows: u16::try_from(inner_h).unwrap_or(u16::MAX),
+                    });
                 }
                 continue;
             }
@@ -1836,6 +2009,13 @@ fn render_attach_scene_inner<W: io::Write>(
                             .pane_cells_emitted
                             .saturating_add(u64::from(inner_width));
                     }
+                    if let Some(trace) = render_trace.as_deref_mut() {
+                        trace.push(AttachRenderTraceOp::PaneRowFull {
+                            surface_index,
+                            row: row_u16,
+                            cells: inner_width,
+                        });
+                    }
                 } else if force_row_damage {
                     for (start_col, end_col) in damaged_ranges {
                         let segment =
@@ -1853,10 +2033,26 @@ fn render_attach_scene_inner<W: io::Write>(
                                 .pane_cells_emitted
                                 .saturating_add(u64::from(end_col.saturating_sub(start_col)));
                         }
+                        if let Some(trace) = render_trace.as_deref_mut() {
+                            trace.push(AttachRenderTraceOp::PaneRowSegment {
+                                surface_index,
+                                row: row_u16,
+                                start_col,
+                                cells: end_col.saturating_sub(start_col),
+                            });
+                        }
                     }
-                } else if let Some(stats) = render_stats.as_deref_mut() {
-                    stats.pane_rows_cached_skipped =
-                        stats.pane_rows_cached_skipped.saturating_add(1);
+                } else {
+                    if let Some(stats) = render_stats.as_deref_mut() {
+                        stats.pane_rows_cached_skipped =
+                            stats.pane_rows_cached_skipped.saturating_add(1);
+                    }
+                    if let Some(trace) = render_trace.as_deref_mut() {
+                        trace.push(AttachRenderTraceOp::PaneRowCacheSkip {
+                            surface_index,
+                            row: row_u16,
+                        });
+                    }
                 }
                 if row < entry.prev_rows.len() {
                     entry.prev_rows[row] = line;
@@ -1883,6 +2079,13 @@ fn render_attach_scene_inner<W: io::Write>(
                         .pane_cells_emitted
                         .saturating_add(u64::from(inner_width));
                 }
+                if let Some(trace) = render_trace.as_deref_mut() {
+                    trace.push(AttachRenderTraceOp::PaneRowFull {
+                        surface_index,
+                        row: u16::try_from(row).unwrap_or(u16::MAX),
+                        cells: inner_width,
+                    });
+                }
             }
         }
     }
@@ -1893,9 +2096,10 @@ fn render_attach_scene_inner<W: io::Write>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachLayer, AttachLayerSurface, DamageCoalescingPolicy, DamageRect, FrameDamage,
-        append_pane_output, coalesce_render_damage, opaque_row_text, queue_frame_damage_overlay,
-        queue_layer_fill, queue_render_ops, render_attach_scene, render_attach_scene_with_stats,
+        AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
+        DamageCoalescingPolicy, DamageRect, FrameDamage, append_pane_output,
+        coalesce_render_damage, opaque_row_text, queue_frame_damage_overlay, queue_layer_fill,
+        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -2334,6 +2538,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Fixture setup is clearer inline with the render assertions it feeds.
     fn render_attach_scene_reemits_rows_intersecting_rect_damage() {
         let pane_id = Uuid::from_u128(1);
         let scene = AttachScene {
@@ -2398,7 +2603,8 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
         let mut output = Vec::new();
-        let (_cursor, stats) = render_attach_scene_with_stats(
+        let mut trace = AttachRenderTrace::new();
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
             &mut output,
             &scene,
             &[],
@@ -2415,6 +2621,7 @@ mod tests {
             &RuntimeAppearance::default(),
             DamageCoalescingPolicy::default(),
             &[],
+            Some(&mut trace),
         )
         .expect("rect-damaged render should succeed");
 
@@ -2428,6 +2635,20 @@ mod tests {
         assert_eq!(stats.pane_row_segments_emitted, 1);
         assert_eq!(stats.pane_cells_emitted, 2);
         assert_eq!(stats.pane_rows_cached_skipped, 2);
+        assert!(trace.ops().contains(&AttachRenderTraceOp::PaneRowSegment {
+            surface_index: 0,
+            row: 1,
+            start_col: 2,
+            cells: 2,
+        }));
+        assert_eq!(
+            trace
+                .ops()
+                .iter()
+                .filter(|op| matches!(op, AttachRenderTraceOp::PaneRowCacheSkip { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]

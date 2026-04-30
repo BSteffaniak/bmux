@@ -95,6 +95,8 @@ const ATTACH_OVERRENDER_CACHED_SKIP_RATIO_PERCENT: u64 = 90;
 const ATTACH_OVERRENDER_MIN_ROWS_EXAMINED: u64 = 10;
 const ATTACH_OVERRENDER_NON_FULL_FRAME_CELL_RATIO_PERCENT: u64 = 50;
 const ATTACH_OVERRENDER_EXTENSION_FULL_SURFACE_RATIO_PERCENT: u64 = 80;
+const ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT: u64 = 80;
+const ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB: u64 = 8;
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
@@ -609,24 +611,28 @@ pub struct AttachFrameRenderStats {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AttachRenderInefficiencyFlags {
-    bits: u8,
+    bits: u16,
 }
 
 impl AttachRenderInefficiencyFlags {
-    const DIRTY_NO_VISIBLE_ROW_CHANGE: u8 = 1 << 0;
-    const HIGH_CACHED_SKIP_RATIO: u8 = 1 << 1;
-    const LARGE_PARTIAL_FRAME: u8 = 1 << 2;
-    const EXTENSION_FULL_SURFACE_EXCESSIVE: u8 = 1 << 3;
+    const DIRTY_NO_VISIBLE_ROW_CHANGE: u16 = 1 << 0;
+    const HIGH_CACHED_SKIP_RATIO: u16 = 1 << 1;
+    const LARGE_PARTIAL_FRAME: u16 = 1 << 2;
+    const EXTENSION_FULL_SURFACE_EXCESSIVE: u16 = 1 << 3;
+    const FULL_FRAME_FALLBACK: u16 = 1 << 4;
+    const EXTENSION_IMPERATIVE_OR_CACHE_MISS: u16 = 1 << 5;
+    const STATUS_OVERLAY_ONLY_EMITS_PANE_WORK: u16 = 1 << 6;
+    const SLOW_TERMINAL_WRITE_PER_KIB: u16 = 1 << 7;
 
     const fn is_empty(self) -> bool {
         self.bits == 0
     }
 
-    const fn contains(self, flag: u8) -> bool {
+    const fn contains(self, flag: u16) -> bool {
         self.bits & flag != 0
     }
 
-    const fn with(mut self, flag: u8, enabled: bool) -> Self {
+    const fn with(mut self, flag: u16, enabled: bool) -> Self {
         if enabled {
             self.bits |= flag;
         }
@@ -666,6 +672,28 @@ fn classify_attach_render_inefficiency(
         stats.scene_render.extension_render_calls,
         ATTACH_OVERRENDER_EXTENSION_FULL_SURFACE_RATIO_PERCENT,
     );
+    let extension_cache_misses = stats
+        .scene_render
+        .extension_render_calls
+        .saturating_sub(stats.scene_render.extension_cache_hits);
+    let extension_imperative_or_cache_miss = percent_at_least(
+        stats
+            .scene_render
+            .extension_imperative_calls
+            .saturating_add(extension_cache_misses),
+        stats.scene_render.extension_render_calls,
+        ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT,
+    );
+    let status_overlay_only_emits_pane_work = !stats.full_frame_fallback
+        && stats.damage_rects == 0
+        && stats.full_surface_fallbacks == 0
+        && (stats.status_rendered || stats.overlay_rendered)
+        && stats.scene_render.pane_cells_emitted > 0;
+    let slow_terminal_write_per_kib = stats.frame_bytes > 0
+        && stats.terminal_write_ms.saturating_mul(1024)
+            >= u64::try_from(stats.frame_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB);
 
     AttachRenderInefficiencyFlags::default()
         .with(
@@ -683,6 +711,22 @@ fn classify_attach_render_inefficiency(
         .with(
             AttachRenderInefficiencyFlags::EXTENSION_FULL_SURFACE_EXCESSIVE,
             extension_full_surface_excessive,
+        )
+        .with(
+            AttachRenderInefficiencyFlags::FULL_FRAME_FALLBACK,
+            stats.full_frame_fallback,
+        )
+        .with(
+            AttachRenderInefficiencyFlags::EXTENSION_IMPERATIVE_OR_CACHE_MISS,
+            extension_imperative_or_cache_miss,
+        )
+        .with(
+            AttachRenderInefficiencyFlags::STATUS_OVERLAY_ONLY_EMITS_PANE_WORK,
+            status_overlay_only_emits_pane_work,
+        )
+        .with(
+            AttachRenderInefficiencyFlags::SLOW_TERMINAL_WRITE_PER_KIB,
+            slow_terminal_write_per_kib,
         )
 }
 
@@ -782,6 +826,10 @@ struct AttachPerfWindow {
     high_cached_skip_ratio_frames: u64,
     large_partial_frame_frames: u64,
     extension_full_surface_excessive_frames: u64,
+    full_frame_fallback_flagged_frames: u64,
+    extension_imperative_or_cache_miss_frames: u64,
+    status_overlay_only_emits_pane_work_frames: u64,
+    slow_terminal_write_per_kib_frames: u64,
     event_burst_drained_events: u64,
     event_burst_max_events: u64,
     wake_server_events: u64,
@@ -841,6 +889,10 @@ impl AttachPerfWindow {
             high_cached_skip_ratio_frames: 0,
             large_partial_frame_frames: 0,
             extension_full_surface_excessive_frames: 0,
+            full_frame_fallback_flagged_frames: 0,
+            extension_imperative_or_cache_miss_frames: 0,
+            status_overlay_only_emits_pane_work_frames: 0,
+            slow_terminal_write_per_kib_frames: 0,
             event_burst_drained_events: 0,
             event_burst_max_events: 0,
             wake_server_events: 0,
@@ -950,6 +1002,13 @@ impl AttachPerfWindow {
         self.dirty_events = self
             .dirty_events
             .saturating_add(u64::try_from(stats.dirty_event_count).unwrap_or(u64::MAX));
+        self.record_render_inefficiency_flags(inefficiency_flags);
+    }
+
+    const fn record_render_inefficiency_flags(
+        &mut self,
+        inefficiency_flags: AttachRenderInefficiencyFlags,
+    ) {
         if !inefficiency_flags.is_empty() {
             self.overrender_flagged_frames = self.overrender_flagged_frames.saturating_add(1);
         }
@@ -970,6 +1029,28 @@ impl AttachPerfWindow {
             self.extension_full_surface_excessive_frames = self
                 .extension_full_surface_excessive_frames
                 .saturating_add(1);
+        }
+        if inefficiency_flags.contains(AttachRenderInefficiencyFlags::FULL_FRAME_FALLBACK) {
+            self.full_frame_fallback_flagged_frames =
+                self.full_frame_fallback_flagged_frames.saturating_add(1);
+        }
+        if inefficiency_flags
+            .contains(AttachRenderInefficiencyFlags::EXTENSION_IMPERATIVE_OR_CACHE_MISS)
+        {
+            self.extension_imperative_or_cache_miss_frames = self
+                .extension_imperative_or_cache_miss_frames
+                .saturating_add(1);
+        }
+        if inefficiency_flags
+            .contains(AttachRenderInefficiencyFlags::STATUS_OVERLAY_ONLY_EMITS_PANE_WORK)
+        {
+            self.status_overlay_only_emits_pane_work_frames = self
+                .status_overlay_only_emits_pane_work_frames
+                .saturating_add(1);
+        }
+        if inefficiency_flags.contains(AttachRenderInefficiencyFlags::SLOW_TERMINAL_WRITE_PER_KIB) {
+            self.slow_terminal_write_per_kib_frames =
+                self.slow_terminal_write_per_kib_frames.saturating_add(1);
         }
     }
 
@@ -1223,6 +1304,22 @@ fn insert_attach_render_work_payload(
         "extension_full_surface_excessive_frames".to_string(),
         window.extension_full_surface_excessive_frames.into(),
     );
+    object.insert(
+        "full_frame_fallback_flagged_frames".to_string(),
+        window.full_frame_fallback_flagged_frames.into(),
+    );
+    object.insert(
+        "extension_imperative_or_cache_miss_frames".to_string(),
+        window.extension_imperative_or_cache_miss_frames.into(),
+    );
+    object.insert(
+        "status_overlay_only_emits_pane_work_frames".to_string(),
+        window.status_overlay_only_emits_pane_work_frames.into(),
+    );
+    object.insert(
+        "slow_terminal_write_per_kib_frames".to_string(),
+        window.slow_terminal_write_per_kib_frames.into(),
+    );
 }
 
 fn insert_attach_perf_detailed_payload(
@@ -1379,6 +1476,10 @@ async fn maybe_emit_attach_perf_window(
             high_cached_skip_ratio_frames = window.high_cached_skip_ratio_frames,
             large_partial_frame_frames = window.large_partial_frame_frames,
             extension_full_surface_excessive_frames = window.extension_full_surface_excessive_frames,
+            full_frame_fallback_flagged_frames = window.full_frame_fallback_flagged_frames,
+            extension_imperative_or_cache_miss_frames = window.extension_imperative_or_cache_miss_frames,
+            status_overlay_only_emits_pane_work_frames = window.status_overlay_only_emits_pane_work_frames,
+            slow_terminal_write_per_kib_frames = window.slow_terminal_write_per_kib_frames,
             "attach.render.overrender.window"
         );
     }
@@ -8829,6 +8930,32 @@ mod tests {
         ));
 
         assert!(flags.contains(AttachRenderInefficiencyFlags::LARGE_PARTIAL_FRAME));
+    }
+
+    #[test]
+    fn render_inefficiency_classifier_flags_full_frame_and_slow_write() {
+        let mut stats = frame_stats_for_classifier(AttachSceneRenderStats::default());
+        stats.full_frame_fallback = true;
+        stats.frame_bytes = 1024;
+        stats.terminal_write_ms = ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB;
+        let flags = classify_attach_render_inefficiency(&stats);
+
+        assert!(flags.contains(AttachRenderInefficiencyFlags::FULL_FRAME_FALLBACK));
+        assert!(flags.contains(AttachRenderInefficiencyFlags::SLOW_TERMINAL_WRITE_PER_KIB));
+    }
+
+    #[test]
+    fn render_inefficiency_classifier_flags_extension_cache_miss_pressure() {
+        let flags = classify_attach_render_inefficiency(&frame_stats_for_classifier(
+            AttachSceneRenderStats {
+                extension_render_calls: 10,
+                extension_cache_hits: 1,
+                extension_imperative_calls: 1,
+                ..AttachSceneRenderStats::default()
+            },
+        ));
+
+        assert!(flags.contains(AttachRenderInefficiencyFlags::EXTENSION_IMPERATIVE_OR_CACHE_MISS));
     }
 
     #[test]
