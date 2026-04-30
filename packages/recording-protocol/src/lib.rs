@@ -29,6 +29,80 @@ pub enum RecordingEventKind {
     Custom,
 }
 
+/// Recording event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingPayload<ServerEvent, RequestErrorCode> {
+    Bytes {
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        data: Vec<u8>,
+    },
+    ServerEvent {
+        event: ServerEvent,
+    },
+    RequestStart {
+        request_id: u64,
+        request_kind: String,
+        exclusive: bool,
+        /// Full request, binary-encoded.
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        request_data: Vec<u8>,
+    },
+    RequestDone {
+        request_id: u64,
+        request_kind: String,
+        response_kind: String,
+        elapsed_ms: u64,
+        /// Full request, binary-encoded.
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        request_data: Vec<u8>,
+        /// Full response payload, binary-encoded.
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        response_data: Vec<u8>,
+    },
+    RequestError {
+        request_id: u64,
+        request_kind: String,
+        error_code: RequestErrorCode,
+        message: String,
+        elapsed_ms: u64,
+    },
+    Custom {
+        source: String,
+        name: String,
+        /// Pre-serialized JSON payload bytes.
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        payload: Vec<u8>,
+    },
+    /// A terminal image extracted from pane output.
+    Image {
+        /// Protocol identifier: 0=Sixel, 1=KittyGraphics, 2=ITerm2.
+        protocol: u8,
+        position_row: u16,
+        position_col: u16,
+        cell_rows: u16,
+        cell_cols: u16,
+        pixel_width: u32,
+        pixel_height: u32,
+        /// Raw protocol bytes (sixel body, kitty payload, iTerm2 data).
+        #[serde(with = "bmux_codec::serde_bytes_vec")]
+        data: Vec<u8>,
+    },
+}
+
+/// Timeline event envelope persisted in recordings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingEventEnvelope<ServerEvent, RequestErrorCode> {
+    pub seq: u64,
+    pub mono_ns: u64,
+    pub wall_epoch_ms: u64,
+    pub session_id: Option<Uuid>,
+    pub pane_id: Option<Uuid>,
+    pub client_id: Option<Uuid>,
+    pub kind: RecordingEventKind,
+    pub payload: RecordingPayload<ServerEvent, RequestErrorCode>,
+}
+
 /// Recording summary returned by recording APIs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingSummary {

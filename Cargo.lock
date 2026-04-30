@@ -1877,6 +1877,7 @@ dependencies = [
 name = "bmux_recording_protocol"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_codec",
  "serde",
  "uuid",
 ]
