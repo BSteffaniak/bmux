@@ -102,14 +102,6 @@ pub struct PrincipalIdentityInfo {
     pub force_local_permitted: bool,
 }
 
-/// Summary returned by apply-restore operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServerRestoreSummary {
-    pub sessions: usize,
-    pub follows: usize,
-    pub selected_sessions: usize,
-}
-
 /// Typed client errors.
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -590,56 +582,6 @@ impl BmuxClient {
             } => Ok(force_local_permitted),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected principal identity",
-            )),
-        }
-    }
-
-    /// Trigger immediate server snapshot save.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn server_save(&mut self) -> Result<Option<String>> {
-        match self.request(Request::ServerSave).await? {
-            ResponsePayload::ServerSnapshotSaved { path } => Ok(path),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected server snapshot saved",
-            )),
-        }
-    }
-
-    /// Validate snapshot readability and schema without mutating runtime state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn server_restore_dry_run(&mut self) -> Result<(bool, String)> {
-        match self.request(Request::ServerRestoreDryRun).await? {
-            ResponsePayload::ServerSnapshotRestoreDryRun { ok, message } => Ok((ok, message)),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected server snapshot restore dry-run",
-            )),
-        }
-    }
-
-    /// Apply snapshot restore, replacing current in-memory server state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if request or response validation fails.
-    pub async fn server_restore_apply(&mut self) -> Result<ServerRestoreSummary> {
-        match self.request(Request::ServerRestoreApply).await? {
-            ResponsePayload::ServerSnapshotRestored {
-                sessions,
-                follows,
-                selected_sessions,
-            } => Ok(ServerRestoreSummary {
-                sessions,
-                follows,
-                selected_sessions,
-            }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "expected server snapshot restored",
             )),
         }
     }
@@ -1385,9 +1327,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::Ping => "ping",
         Request::WhoAmIPrincipal => "whoami_principal",
         Request::ServerStatus => "server_status",
-        Request::ServerSave => "server_save",
-        Request::ServerRestoreDryRun => "server_restore_dry_run",
-        Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
         Request::InvokeServicePipeline { .. } => "invoke_service_pipeline",
@@ -1530,11 +1469,6 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::HelloNegotiated { .. } => "hello_negotiated",
             ResponsePayload::HelloIncompatible { .. } => "hello_incompatible",
             ResponsePayload::ServerStatus { .. } => "server_status",
-            ResponsePayload::ServerSnapshotSaved { .. } => "server_snapshot_saved",
-            ResponsePayload::ServerSnapshotRestoreDryRun { .. } => {
-                "server_snapshot_restore_dry_run"
-            }
-            ResponsePayload::ServerSnapshotRestored { .. } => "server_snapshot_restored",
             ResponsePayload::ServerStopping => "server_stopping",
             ResponsePayload::ServiceInvoked { .. } => "service_invoked",
             ResponsePayload::ServicePipelineInvoked { .. } => "service_pipeline_invoked",

@@ -973,6 +973,32 @@ fn control_catalog_snapshot_ipc_variant_is_absent() {
     );
 }
 
+#[test]
+fn snapshot_command_ipc_variants_are_absent() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    let denied = [
+        "Request::ServerSave",
+        "Request::ServerRestoreDryRun",
+        "Request::ServerRestoreApply",
+        "ResponsePayload::ServerSnapshotSaved",
+        "ResponsePayload::ServerSnapshotRestoreDryRun",
+        "ResponsePayload::ServerSnapshotRestored",
+        "    ServerSave,",
+        "    ServerRestoreDryRun,",
+        "    ServerRestoreApply,",
+        "    ServerSnapshotSaved {",
+        "    ServerSnapshotRestoreDryRun {",
+        "    ServerSnapshotRestored {",
+    ];
+    for marker in denied {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; \
+             snapshot lifecycle commands go through generated snapshot-plugin services",
+        );
+    }
+}
+
 /// Verify that the `bmux.control_catalog` plugin crate exists and
 /// owns the catalog revision counter. The counter used to live in
 /// `ServerState.control_catalog_revision`; after the migration the

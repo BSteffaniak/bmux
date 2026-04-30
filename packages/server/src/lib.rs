@@ -2120,66 +2120,6 @@ async fn handle_request(
                 server_control_principal_id: state.server_control_principal_id,
             })
         }
-        Request::ServerSave => {
-            let handle = snapshot_orchestrator_handle();
-            let path = match handle.as_dyn().save_now_boxed().await {
-                Ok(path) => path.map(|p| p.display().to_string()),
-                Err(error) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: format!("snapshot save failed: {error}"),
-                    }));
-                }
-            };
-            Response::Ok(ResponsePayload::ServerSnapshotSaved { path })
-        }
-        Request::ServerRestoreDryRun => {
-            let handle = snapshot_orchestrator_handle();
-            match handle.as_dyn().dry_run_boxed().await {
-                Ok(report) => Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
-                    ok: report.ok,
-                    message: report.message,
-                }),
-                Err(bmux_snapshot_runtime::SnapshotOrchestratorError::Disabled) => {
-                    Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
-                        ok: false,
-                        message: "snapshot persistence is disabled".to_string(),
-                    })
-                }
-                Err(error) => Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
-                    ok: false,
-                    message: format!("snapshot dry-run failed: {error}"),
-                }),
-            }
-        }
-        Request::ServerRestoreApply => {
-            let handle = snapshot_orchestrator_handle();
-            let summary = match handle.as_dyn().restore_apply_boxed().await {
-                Ok(summary) => summary,
-                Err(bmux_snapshot_runtime::SnapshotOrchestratorError::Disabled) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::InvalidRequest,
-                        message: "snapshot persistence is disabled".to_string(),
-                    }));
-                }
-                Err(error) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::InvalidRequest,
-                        message: format!("snapshot restore failed: {error}"),
-                    }));
-                }
-            };
-            // Wire response retains the legacy `sessions`/`follows`/
-            // `selected_sessions` triple. The new orchestrator only
-            // knows about participant counts, so we expose
-            // `restored_plugins` as `sessions` and zero out the rest.
-            // Callers treat these counts as human-readable diagnostics.
-            Response::Ok(ResponsePayload::ServerSnapshotRestored {
-                sessions: summary.restored_plugins,
-                follows: summary.failed_plugins,
-                selected_sessions: 0,
-            })
-        }
         Request::ServerStop => {
             let _ = shutdown_tx.send(true);
             flush_phase_timing();
@@ -2420,10 +2360,7 @@ async fn handle_request(
 }
 
 const fn request_requires_exclusive(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::ServerSave | Request::ServerStop | Request::ServerRestoreApply
-    )
+    matches!(request, Request::ServerStop)
 }
 
 const fn response_requires_snapshot(_response: &Response) -> bool {
@@ -2437,9 +2374,6 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::Ping => "ping",
         Request::WhoAmIPrincipal => "whoami_principal",
         Request::ServerStatus => "server_status",
-        Request::ServerSave => "server_save",
-        Request::ServerRestoreDryRun => "server_restore_dry_run",
-        Request::ServerRestoreApply => "server_restore_apply",
         Request::ServerStop => "server_stop",
         Request::InvokeService { .. } => "invoke_service",
         Request::InvokeServicePipeline { .. } => "invoke_service_pipeline",
@@ -2699,9 +2633,6 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::HelloNegotiated { .. } => "hello_negotiated",
         ResponsePayload::HelloIncompatible { .. } => "hello_incompatible",
         ResponsePayload::ServerStatus { .. } => "server_status",
-        ResponsePayload::ServerSnapshotSaved { .. } => "server_snapshot_saved",
-        ResponsePayload::ServerSnapshotRestoreDryRun { .. } => "server_snapshot_restore_dry_run",
-        ResponsePayload::ServerSnapshotRestored { .. } => "server_snapshot_restored",
         ResponsePayload::ServerStopping => "server_stopping",
         ResponsePayload::ServiceInvoked { .. } => "service_invoked",
         ResponsePayload::ServicePipelineInvoked { .. } => "service_pipeline_invoked",

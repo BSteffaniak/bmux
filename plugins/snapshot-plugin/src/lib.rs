@@ -5,11 +5,10 @@
 //! participant, debounces dirty marks, and persists the result to a
 //! CLI-configured file path.
 //!
-//! Consumed by the server via the `SnapshotOrchestratorHandle` trait
-//! object registered in the plugin state registry. `Request::ServerSave
-//! / ServerRestoreDryRun / ServerRestoreApply / ServerStatus` IPC
-//! handlers on the server side delegate to the orchestrator through
-//! the handle.
+//! Consumed through generated `snapshot-state` and `snapshot-commands`
+//! services. The plugin registers a `SnapshotOrchestratorHandle` trait
+//! object in the plugin state registry so server startup/shutdown code
+//! can still drive baseline restore and debounce flushing.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]

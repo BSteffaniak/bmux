@@ -321,9 +321,6 @@ pub enum Request {
     Ping,
     WhoAmIPrincipal,
     ServerStatus,
-    ServerSave,
-    ServerRestoreDryRun,
-    ServerRestoreApply,
     ServerStop,
     InvokeService {
         capability: String,
@@ -413,18 +410,6 @@ pub enum ResponsePayload {
         snapshot: SnapshotStatusReport,
         principal_id: Uuid,
         server_control_principal_id: Uuid,
-    },
-    ServerSnapshotSaved {
-        path: Option<String>,
-    },
-    ServerSnapshotRestoreDryRun {
-        ok: bool,
-        message: String,
-    },
-    ServerSnapshotRestored {
-        sessions: usize,
-        follows: usize,
-        selected_sessions: usize,
     },
     EventsSubscribed,
     EventBatch {
@@ -807,9 +792,6 @@ mod tests {
             Request::Ping,
             Request::WhoAmIPrincipal,
             Request::ServerStatus,
-            Request::ServerSave,
-            Request::ServerRestoreDryRun,
-            Request::ServerRestoreApply,
             Request::ServerStop,
             Request::InvokeService {
                 capability: "bmux.storage".into(),
@@ -890,19 +872,6 @@ mod tests {
                 },
                 principal_id: id,
                 server_control_principal_id: id2,
-            },
-            ResponsePayload::ServerSnapshotSaved {
-                path: Some("/tmp/snap".into()),
-            },
-            ResponsePayload::ServerSnapshotSaved { path: None },
-            ResponsePayload::ServerSnapshotRestoreDryRun {
-                ok: true,
-                message: "all good".into(),
-            },
-            ResponsePayload::ServerSnapshotRestored {
-                sessions: 3,
-                follows: 1,
-                selected_sessions: 2,
             },
             ResponsePayload::EventsSubscribed,
             ResponsePayload::EventBatch {

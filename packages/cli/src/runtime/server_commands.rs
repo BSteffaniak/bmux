@@ -12,6 +12,7 @@ use bmux_recording_protocol::{
     RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
     RecordingSummary,
 };
+use bmux_snapshot_plugin_api::{snapshot_commands, snapshot_state, snapshot_types};
 use bmux_snapshot_protocol::SnapshotStatusReport;
 use iroh::{Endpoint, endpoint::presets};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -237,9 +238,12 @@ pub(super) async fn run_server_save(connection_context: ConnectionContext<'_>) -
         connection_context,
     )
     .await?;
-    let path = client.server_save().await.map_err(map_cli_client_error)?;
+    let result = snapshot_commands::client::save_now(&mut client)
+        .await
+        .context("snapshot save dispatch failed")?
+        .map_err(snapshot_plugin_error)?;
 
-    match path {
+    match result.path {
         Some(path) => println!("snapshot saved: {path}"),
         None => println!("snapshot save requested"),
     }
@@ -263,16 +267,16 @@ pub(super) async fn run_server_restore(
             connection_context,
         )
         .await?;
-        let (ok, message) = client
-            .server_restore_dry_run()
+        let result = snapshot_state::client::restore_dry_run(&mut client)
             .await
-            .map_err(map_cli_client_error)?;
+            .context("snapshot restore dry-run dispatch failed")?
+            .map_err(snapshot_plugin_error)?;
 
-        if ok {
-            println!("restore dry-run: OK - {message}");
+        if result.ok {
+            println!("restore dry-run: OK - {}", result.message);
             return Ok(0);
         }
-        println!("restore dry-run: FAIL - {message}");
+        println!("restore dry-run: FAIL - {}", result.message);
         return Ok(1);
     }
 
@@ -282,16 +286,27 @@ pub(super) async fn run_server_restore(
         connection_context,
     )
     .await?;
-    let summary = client
-        .server_restore_apply()
+    let summary = snapshot_commands::client::restore_apply(&mut client)
         .await
-        .map_err(map_cli_client_error)?;
+        .context("snapshot restore apply dispatch failed")?
+        .map_err(snapshot_plugin_error)?;
 
     println!(
-        "restore applied: sessions={}, follows={}, selected_sessions={}",
-        summary.sessions, summary.follows, summary.selected_sessions
+        "restore applied: restored_plugins={}, failed_plugins={}",
+        summary.restored_plugins, summary.failed_plugins
     );
     Ok(0)
+}
+
+fn snapshot_plugin_error(error: snapshot_types::SnapshotError) -> anyhow::Error {
+    match error {
+        snapshot_types::SnapshotError::NotRegistered { message }
+        | snapshot_types::SnapshotError::LockPoisoned { message }
+        | snapshot_types::SnapshotError::NoRuntime { message } => anyhow::anyhow!(message),
+        snapshot_types::SnapshotError::Failed { code, message } => {
+            anyhow::anyhow!("snapshot {code}: {message}")
+        }
+    }
 }
 
 pub(super) async fn latest_server_event_name(

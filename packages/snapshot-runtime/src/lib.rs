@@ -341,8 +341,8 @@ pub trait SnapshotOrchestrator: Send + Sync {
     fn dry_run(&self) -> impl Future<Output = SnapshotOrchestratorResult<DryRunReport>> + Send;
 
     /// Apply the on-disk snapshot as a **replace** operation: clear
-    /// all participant state, then restore. Called by
-    /// `Request::ServerRestoreApply`.
+    /// all participant state, then restore. Called by the snapshot
+    /// plugin's generated `restore-apply` command.
     ///
     /// # Errors
     ///
