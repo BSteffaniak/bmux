@@ -1557,6 +1557,8 @@ pub struct DamageBehaviorConfig {
     /// Damaged cell-area percentage that triggers a full-surface repaint fallback.
     /// Must be 1 through 100.
     pub max_area_percent: u16,
+    /// Draw a colored debug overlay around regions repainted by attach damage tracking.
+    pub visualize: bool,
 }
 
 impl Default for DamageBehaviorConfig {
@@ -1564,6 +1566,7 @@ impl Default for DamageBehaviorConfig {
         Self {
             max_rects: 64,
             max_area_percent: 60,
+            visualize: false,
         }
     }
 }

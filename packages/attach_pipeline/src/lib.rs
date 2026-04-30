@@ -21,7 +21,9 @@ pub use mouse::{
     Button as AttachMouseButton, Event as AttachMouseEvent, EventKind as AttachMouseEventKind,
     Modifiers as AttachMouseModifiers, PaneProtocol as AttachPaneMouseProtocol,
 };
-pub use render::{DamageCoalescingPolicy, DamageRect, FrameDamage, FrameDamageStats};
+pub use render::{
+    DamageCoalescingPolicy, DamageRect, FrameDamage, FrameDamageStats, queue_frame_damage_overlay,
+};
 pub use scene_pipeline::AttachScenePipeline;
 pub use types::{
     AttachCursorState, AttachPaneMouseProtocolHints, AttachScrollbackCursor,

@@ -666,6 +666,184 @@ impl FrameDamage {
     }
 }
 
+/// Queue a debug overlay that outlines regions covered by frame damage.
+///
+/// This is intentionally visual-only and emits fixed marker glyphs; it never
+/// includes pane cell contents or raw input/output bytes.
+///
+/// # Errors
+///
+/// Returns an error if terminal control sequence generation fails.
+pub fn queue_frame_damage_overlay<W: io::Write>(
+    stdout: &mut W,
+    scene: &AttachScene,
+    frame_damage: &FrameDamage,
+    terminal_size: (u16, u16),
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+) -> Result<bool> {
+    let mut rects = frame_damage_overlay_rects(
+        scene,
+        frame_damage,
+        terminal_size,
+        status_top_inset,
+        status_bottom_inset,
+    );
+    if rects.is_empty() {
+        return Ok(false);
+    }
+    rects.sort_by_key(|rect| (rect.y, rect.x, rect.h, rect.w));
+
+    queue!(
+        stdout,
+        SetForegroundColor(Color::AnsiValue(201)),
+        SetAttribute(Attribute::Bold)
+    )
+    .context("failed setting damage overlay style")?;
+    for rect in rects {
+        queue_damage_overlay_rect(stdout, rect)?;
+    }
+    queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))
+        .context("failed resetting damage overlay style")?;
+    Ok(true)
+}
+
+fn frame_damage_overlay_rects(
+    scene: &AttachScene,
+    frame_damage: &FrameDamage,
+    terminal_size: (u16, u16),
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+) -> Vec<DamageRect> {
+    let (terminal_width, terminal_height) = terminal_size;
+    let mut rects = Vec::new();
+    if frame_damage.full_frame {
+        push_overlay_rect(
+            &mut rects,
+            DamageRect::new(0, 0, terminal_width, terminal_height),
+            terminal_size,
+        );
+        return rects;
+    }
+
+    if frame_damage.status {
+        if status_top_inset > 0 {
+            push_overlay_rect(
+                &mut rects,
+                DamageRect::new(0, 0, terminal_width, status_top_inset),
+                terminal_size,
+            );
+        }
+        if status_bottom_inset > 0 {
+            push_overlay_rect(
+                &mut rects,
+                DamageRect::new(
+                    0,
+                    terminal_height.saturating_sub(status_bottom_inset),
+                    terminal_width,
+                    status_bottom_inset,
+                ),
+                terminal_size,
+            );
+        }
+    }
+
+    for surface in scene
+        .surfaces
+        .iter()
+        .filter(|surface| surface.visible && surface.pane_id.is_some())
+    {
+        let outer = DamageRect::new(
+            surface.rect.x,
+            surface.rect.y,
+            surface.rect.w,
+            surface.rect.h,
+        );
+        let content = DamageRect::new(
+            surface.content_rect.x,
+            surface.content_rect.y,
+            surface.content_rect.w,
+            surface.content_rect.h,
+        );
+
+        if frame_damage.extension_surfaces.contains(&surface.id) {
+            push_overlay_rect(&mut rects, outer, terminal_size);
+        }
+        for rect in frame_damage.extension_surface_rects(surface.id) {
+            push_overlay_rect(
+                &mut rects,
+                translate_damage_rect(*rect, outer),
+                terminal_size,
+            );
+        }
+
+        let Some(pane_id) = surface.pane_id else {
+            continue;
+        };
+        if frame_damage.content_surfaces.contains(&pane_id) {
+            push_overlay_rect(&mut rects, content, terminal_size);
+        }
+        for rect in frame_damage.content_surface_rects(pane_id) {
+            push_overlay_rect(
+                &mut rects,
+                translate_damage_rect(*rect, content),
+                terminal_size,
+            );
+        }
+    }
+    rects
+}
+
+fn push_overlay_rect(rects: &mut Vec<DamageRect>, rect: DamageRect, terminal_size: (u16, u16)) {
+    let Some(mut merged) = rect.clipped_to(terminal_size.0, terminal_size.1) else {
+        return;
+    };
+    let mut index = 0;
+    while index < rects.len() {
+        if rects[index].touches_or_overlaps(merged) {
+            merged = rects.swap_remove(index).union(merged);
+            index = 0;
+        } else {
+            index += 1;
+        }
+    }
+    rects.push(merged);
+}
+
+const fn translate_damage_rect(rect: DamageRect, origin: DamageRect) -> DamageRect {
+    DamageRect::new(
+        origin.x.saturating_add(rect.x),
+        origin.y.saturating_add(rect.y),
+        rect.w,
+        rect.h,
+    )
+}
+
+fn queue_damage_overlay_rect<W: io::Write>(stdout: &mut W, rect: DamageRect) -> Result<()> {
+    if rect.is_empty() {
+        return Ok(());
+    }
+    let marker = "█";
+    let row = marker.repeat(usize::from(rect.w));
+    queue!(stdout, MoveTo(rect.x, rect.y), Print(&row))
+        .context("failed queueing damage overlay top edge")?;
+    if rect.h > 1 {
+        let bottom = rect.bottom().saturating_sub(1);
+        queue!(stdout, MoveTo(rect.x, bottom), Print(&row))
+            .context("failed queueing damage overlay bottom edge")?;
+    }
+    if rect.w > 1 && rect.h > 2 {
+        let right = rect.right().saturating_sub(1);
+        for y in rect.y.saturating_add(1)..rect.bottom().saturating_sub(1) {
+            queue!(stdout, MoveTo(rect.x, y), Print(marker))
+                .context("failed queueing damage overlay left edge")?;
+            queue!(stdout, MoveTo(right, y), Print(marker))
+                .context("failed queueing damage overlay right edge")?;
+        }
+    }
+    Ok(())
+}
+
 fn coalesce_surface_rect(
     rects: &mut Vec<DamageRect>,
     rect: DamageRect,
@@ -1373,8 +1551,8 @@ pub fn render_attach_scene<W: io::Write>(
 mod tests {
     use super::{
         AttachLayer, AttachLayerSurface, DamageCoalescingPolicy, DamageRect, FrameDamage,
-        append_pane_output, coalesce_render_damage, opaque_row_text, queue_layer_fill,
-        render_attach_scene,
+        append_pane_output, coalesce_render_damage, opaque_row_text, queue_frame_damage_overlay,
+        queue_layer_fill, render_attach_scene,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -1535,6 +1713,79 @@ mod tests {
         assert_eq!(stats.rect_area_cells, 6);
         assert_eq!(stats.full_surface_count, 1);
         assert!(!stats.full_frame);
+    }
+
+    #[test]
+    fn queue_frame_damage_overlay_draws_content_rect_at_absolute_position() {
+        let pane_id = Uuid::from_u128(6);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(7),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: Uuid::from_u128(8),
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 10,
+                    y: 5,
+                    w: 12,
+                    h: 6,
+                },
+                content_rect: AttachRect {
+                    x: 11,
+                    y: 6,
+                    w: 10,
+                    h: 4,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut damage = FrameDamage::default();
+        damage.mark_content_surface_rect(
+            pane_id,
+            DamageRect::new(2, 1, 3, 2),
+            (10, 4),
+            DamageCoalescingPolicy::default(),
+        );
+
+        let mut bytes = Vec::new();
+        assert!(
+            queue_frame_damage_overlay(&mut bytes, &scene, &damage, (80, 24), 0, 1)
+                .expect("damage overlay should queue")
+        );
+        let output = String::from_utf8(bytes).expect("overlay bytes should be utf8");
+
+        assert!(output.contains("\u{1b}[8;14H"));
+        assert!(output.contains('█'));
+    }
+
+    #[test]
+    fn queue_frame_damage_overlay_skips_empty_damage() {
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(9),
+            focus: AttachFocusTarget::None,
+            surfaces: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+
+        assert!(
+            !queue_frame_damage_overlay(
+                &mut bytes,
+                &scene,
+                &FrameDamage::default(),
+                (80, 24),
+                0,
+                1
+            )
+            .expect("empty damage overlay should queue")
+        );
+        assert!(bytes.is_empty());
     }
 
     fn screen_row(screen: &vt100::Screen, row: u16, width: u16) -> String {

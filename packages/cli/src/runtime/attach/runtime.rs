@@ -65,8 +65,8 @@ use super::prompt_ui::{
     prompt_accepts_key_kind,
 };
 use super::render::{
-    AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
-    render_attach_scene, visible_scene_pane_ids,
+    AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text,
+    queue_frame_damage_overlay, queue_layer_fill, render_attach_scene, visible_scene_pane_ids,
 };
 use super::state::{
     AttachEventAction, AttachExitReason, AttachMouseResizeAxisDrag, AttachMouseResizeDrag,
@@ -4823,7 +4823,8 @@ pub fn render_attach_frame(
     let (status_top_inset, status_bottom_inset) =
         status_insets_for_position(view_state.status_position);
     let render_scene = frame_damage.scene_damaged();
-    let use_synchronized_update = frame_uses_synchronized_update(&frame_damage);
+    let use_synchronized_update =
+        frame_uses_synchronized_update(&frame_damage) || damage_config.visualize;
 
     let mut frame_bytes = Vec::new();
     // Wrap multi-region scene/overlay frames in a synchronized update so the
@@ -4938,6 +4939,17 @@ pub fn render_attach_frame(
         overlay_cursor_state = view_state
             .prompt
             .queue_attach_prompt_overlay(&mut frame_bytes)?;
+    }
+
+    if damage_config.visualize {
+        queue_frame_damage_overlay(
+            &mut frame_bytes,
+            &layout_state.scene,
+            &frame_damage,
+            terminal::size().unwrap_or((0, 0)),
+            status_top_inset,
+            status_bottom_inset,
+        )?;
     }
 
     if view_state.help_overlay_open || view_state.prompt.is_active() {
