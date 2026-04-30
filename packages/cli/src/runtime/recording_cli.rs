@@ -11,7 +11,8 @@ use bmux_config::{
     RecordingExportCursorPaintMode, RecordingExportCursorProfile, RecordingExportCursorShape,
     RecordingExportCursorTextMode, RecordingExportPaletteSource,
 };
-use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingPayload, SessionSelector};
+use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingPayload};
+use bmux_session_models::SessionSelector;
 use bmux_sessions_plugin_api::sessions_commands;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};

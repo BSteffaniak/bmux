@@ -28,8 +28,8 @@ uuid                      = { workspace = true, features = ["serde", "std"] }
 
 [package.metadata.cargo-machete]
 # `bmux_plugin_schema_macros::schema!` generates references to SDK transport
-# types that cargo-machete cannot see in proc-macro-generated source.
-ignored = ["bmux_plugin_sdk"]
+# and IPC types that cargo-machete cannot see in proc-macro-generated source.
+ignored = ["bmux_ipc", "bmux_plugin_sdk"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

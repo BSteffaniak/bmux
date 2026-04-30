@@ -8,13 +8,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use bmux_client::BmuxClient;
 use bmux_contexts_plugin_api::contexts_state;
-use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector};
+use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection};
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
 use bmux_plugin_sdk::{
     PluginCliCommandRequest, PluginCliCommandResponse, TypedServiceEndpoint,
     perf_telemetry::{ALL_PHASE_CHANNELS, PhaseChannel, emit as emit_phase_timing},
 };
 use bmux_recording_plugin_api::recording_commands;
+use bmux_session_models::SessionSelector;
 use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
 use bmux_windows_plugin_api::windows_commands;
 use crossterm::cursor::{Hide, MoveTo, Show};

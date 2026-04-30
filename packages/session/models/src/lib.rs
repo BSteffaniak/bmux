@@ -57,6 +57,14 @@ impl std::fmt::Display for ClientId {
     }
 }
 
+/// Session selector accepted by session-domain commands and protocol helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum SessionSelector {
+    ById(Uuid),
+    ByName(String),
+}
+
 // ============================================================================
 // Session Models
 // ============================================================================

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bmux_clients_plugin_api::clients_commands;
-use bmux_ipc::SessionSelector;
+use bmux_session_models::SessionSelector;
 use uuid::Uuid;
 
 use super::{ConnectionContext, ConnectionPolicyScope, connect_with_context, map_cli_client_error};

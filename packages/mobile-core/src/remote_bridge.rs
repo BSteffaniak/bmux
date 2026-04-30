@@ -8,10 +8,8 @@ use bmux_attach_pipeline::{AttachChunkApplyOutcome, AttachScenePipeline, AttachV
 use bmux_client::{BmuxClient, ClientError, ServerEvent, StreamingBmuxClient};
 use bmux_ipc::compressed_stream::CompressedStream;
 use bmux_ipc::transport::{ErasedIpcStream, IpcTransportError};
-use bmux_ipc::{
-    AttachPaneChunk, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ErrorCode,
-    SessionSelector,
-};
+use bmux_ipc::{AttachPaneChunk, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ErrorCode};
+use bmux_session_models::SessionSelector;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;

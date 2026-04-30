@@ -300,13 +300,6 @@ impl Envelope {
     }
 }
 
-/// Session selector accepted by commands and protocol requests.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionSelector {
-    ById(Uuid),
-    ByName(String),
-}
-
 /// Pane selector accepted by commands and protocol requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaneSelector {
@@ -1428,14 +1421,6 @@ mod tests {
         let bytes = encode(&envelope).expect("envelope should encode");
         let decoded: Envelope = decode(&bytes).expect("envelope should decode");
         assert_eq!(decoded, envelope);
-    }
-
-    #[test]
-    fn serializes_session_selector_by_id_roundtrip() {
-        let selector = SessionSelector::ById(Uuid::new_v4());
-        let bytes = encode(&selector).expect("selector should encode");
-        let decoded: SessionSelector = decode(&bytes).expect("selector should decode");
-        assert_eq!(decoded, selector);
     }
 
     #[test]

@@ -4,11 +4,12 @@ use bmux_client::{
 };
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene,
-    ErrorCode, PaneLayoutNode, PaneSummary, SessionSelector,
+    ErrorCode, PaneLayoutNode, PaneSummary,
 };
 use bmux_pane_runtime_plugin_api::{
     attach_runtime_commands as attach_commands, attach_runtime_state as attach_state,
 };
+use bmux_session_models::SessionSelector;
 use std::future::Future;
 use uuid::Uuid;
 

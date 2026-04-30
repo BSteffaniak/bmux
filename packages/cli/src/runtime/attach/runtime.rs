@@ -19,7 +19,7 @@ use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, S
 use bmux_context_state::ContextSelector;
 use bmux_ipc::{
     AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, InvokeServiceKind, PaneFocusDirection,
-    PaneSplitDirection, SessionSelector,
+    PaneSplitDirection,
 };
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_permissions_plugin_api::session_policy_state;
@@ -28,6 +28,7 @@ use bmux_plugin_sdk::{
     perf_telemetry::{PhaseChannel, emit as emit_phase_timing},
 };
 use bmux_recording_plugin_api::recording_state;
+use bmux_session_models::SessionSelector;
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -148,14 +149,14 @@ fn typed_client_error(error: &TypedServiceClientError) -> ClientError {
 }
 
 #[must_use]
-fn ipc_to_windows_selector(selector: bmux_ipc::SessionSelector) -> windows_commands::Selector {
+fn ipc_to_windows_selector(selector: SessionSelector) -> windows_commands::Selector {
     match selector {
-        bmux_ipc::SessionSelector::ById(id) => windows_commands::Selector {
+        SessionSelector::ById(id) => windows_commands::Selector {
             id: Some(id),
             name: None,
             index: None,
         },
-        bmux_ipc::SessionSelector::ByName(name) => windows_commands::Selector {
+        SessionSelector::ByName(name) => windows_commands::Selector {
             id: None,
             name: Some(name),
             index: None,
@@ -193,13 +194,13 @@ const fn ipc_split_to_windows_direction(
 }
 
 #[must_use]
-fn ipc_to_session_selector(selector: bmux_ipc::SessionSelector) -> sessions_state::SessionSelector {
+fn ipc_to_session_selector(selector: SessionSelector) -> sessions_state::SessionSelector {
     match selector {
-        bmux_ipc::SessionSelector::ById(id) => sessions_state::SessionSelector {
+        SessionSelector::ById(id) => sessions_state::SessionSelector {
             id: Some(id),
             name: None,
         },
-        bmux_ipc::SessionSelector::ByName(name) => sessions_state::SessionSelector {
+        SessionSelector::ByName(name) => sessions_state::SessionSelector {
             id: None,
             name: Some(name),
         },
@@ -209,7 +210,7 @@ fn ipc_to_session_selector(selector: bmux_ipc::SessionSelector) -> sessions_stat
 /// Typed dispatch wrapper for `sessions-commands:kill-session`.
 async fn typed_kill_session_attach(
     client: &mut StreamingBmuxClient,
-    selector: bmux_ipc::SessionSelector,
+    selector: SessionSelector,
     force_local: bool,
 ) -> std::result::Result<
     std::result::Result<

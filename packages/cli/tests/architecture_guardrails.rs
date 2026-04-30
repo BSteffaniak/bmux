@@ -1761,6 +1761,7 @@ fn session_lifecycle_ipc_variants_are_absent() {
         "ResponsePayload::SessionList {",
         "ResponsePayload::PaneList {",
         "pub struct SessionSummary",
+        "pub enum SessionSelector",
         "Event::SessionCreated",
         "Event::SessionRemoved",
     ];

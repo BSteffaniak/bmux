@@ -29,7 +29,9 @@ use bmux_plugin_sdk::{
     StatefulPluginResult, StatefulPluginSnapshot, TypedServiceRegistrationContext,
     TypedServiceRegistry,
 };
-use bmux_session_models::{ClientId, Session, SessionId, SessionInfo};
+use bmux_session_models::{
+    ClientId, Session, SessionId, SessionInfo, SessionSelector as PrimitiveSessionSelector,
+};
 use bmux_session_state::{
     SessionManagerHandle, SessionManagerReader, SessionManagerSnapshot, SessionManagerWriter,
 };
@@ -251,13 +253,13 @@ struct WireSelector {
 }
 
 impl WireSelector {
-    fn to_ipc(&self) -> Option<bmux_ipc::SessionSelector> {
+    fn to_selector(&self) -> Option<PrimitiveSessionSelector> {
         if let Some(id) = self.id {
-            return Some(bmux_ipc::SessionSelector::ById(id));
+            return Some(PrimitiveSessionSelector::ById(id));
         }
         self.name
             .as_ref()
-            .map(|name| bmux_ipc::SessionSelector::ByName(name.clone()))
+            .map(|name| PrimitiveSessionSelector::ByName(name.clone()))
     }
 }
 
@@ -421,7 +423,7 @@ fn list_sessions_local() -> Result<Vec<SessionSummary>, String> {
 fn get_session_local(
     selector: &WireSelector,
 ) -> Result<Result<SessionSummary, SessionQueryError>, String> {
-    let Some(ipc_selector) = selector.to_ipc() else {
+    let Some(session_selector) = selector.to_selector() else {
         return Ok(Err(SessionQueryError::InvalidSelector {
             reason: "selector must specify either id or name".to_string(),
         }));
@@ -435,18 +437,18 @@ fn get_session_local(
     Ok(manager
         .list_sessions()
         .into_iter()
-        .find(|info| matches_session_info(info, &ipc_selector))
+        .find(|info| matches_session_info(info, &session_selector))
         .map(session_info_to_typed)
         .ok_or(SessionQueryError::NotFound))
 }
 
 fn matches_session_info(
     info: &bmux_session_models::SessionInfo,
-    selector: &bmux_ipc::SessionSelector,
+    selector: &PrimitiveSessionSelector,
 ) -> bool {
     match selector {
-        bmux_ipc::SessionSelector::ById(id) => info.id.0 == *id,
-        bmux_ipc::SessionSelector::ByName(name) => info.name.as_deref() == Some(name.as_str()),
+        PrimitiveSessionSelector::ById(id) => info.id.0 == *id,
+        PrimitiveSessionSelector::ByName(name) => info.name.as_deref() == Some(name.as_str()),
     }
 }
 
@@ -608,7 +610,7 @@ fn kill_session_via_ipc(
 
 #[derive(Serialize, Deserialize)]
 struct AttachSessionArgs {
-    selector: bmux_ipc::SessionSelector,
+    selector: PrimitiveSessionSelector,
     can_write: bool,
 }
 
@@ -616,7 +618,7 @@ fn select_session_via_ipc(
     caller: &impl ServiceCaller,
     selector: &WireSelector,
 ) -> Result<SessionAck, SelectSessionError> {
-    let Some(ipc_selector) = selector.to_ipc() else {
+    let Some(session_selector) = selector.to_selector() else {
         return Err(SelectSessionError::Denied {
             reason: "selector must specify either id or name".to_string(),
         });
@@ -630,7 +632,7 @@ fn select_session_via_ipc(
         bmux_pane_runtime_plugin_api::attach_runtime_commands::INTERFACE_ID.as_str(),
         "attach-session",
         &AttachSessionArgs {
-            selector: ipc_selector,
+            selector: session_selector,
             can_write: true,
         },
     );
