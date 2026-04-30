@@ -46,6 +46,49 @@ pub enum AttachExitReason {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachDirtySource {
+    PaneOutput,
+    LayoutChanged,
+    FocusChanged,
+    SceneChanged,
+    StatusChanged,
+    PromptOverlay,
+    HelpOverlay,
+    AppearanceChanged,
+    ManualRedraw,
+    SnapshotHydration,
+    AlternateScreenTransition,
+    PluginCommand,
+    UserAction,
+    ActionDispatch,
+    Mouse,
+    Scrollback,
+    Selection,
+    ProfileChanged,
+    ControlCatalogChanged,
+    PaneLifecycle,
+    FollowTargetChanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachDirtyKind {
+    Pane,
+    Status,
+    Overlay,
+    FullFrame,
+    Extension,
+    PreciseDamage,
+    LayoutRefresh,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachDirtyEvent {
+    pub source: AttachDirtySource,
+    pub kind: AttachDirtyKind,
+    pub pane_id: Option<Uuid>,
+}
+
 #[allow(clippy::struct_excessive_bools)] // Dirty flags are independent repaint/fetch toggles.
 #[derive(Debug, Clone)]
 pub struct AttachDirtyFlags {
@@ -60,6 +103,8 @@ pub struct AttachDirtyFlags {
     pub extension_needs_redraw: bool,
     /// Precise frame damage computed by scene/layout reconciliation.
     pub precise_frame_damage: FrameDamage,
+    /// Low-cardinality reasons that accumulated before the next rendered frame.
+    pub dirty_events: Vec<AttachDirtyEvent>,
 }
 
 impl Default for AttachDirtyFlags {
@@ -72,11 +117,78 @@ impl Default for AttachDirtyFlags {
             full_pane_redraw: true,
             extension_needs_redraw: true,
             precise_frame_damage: FrameDamage::default(),
+            dirty_events: Vec::new(),
         }
     }
 }
 
 impl AttachDirtyFlags {
+    fn push_event(
+        &mut self,
+        source: AttachDirtySource,
+        kind: AttachDirtyKind,
+        pane_id: Option<Uuid>,
+    ) {
+        self.dirty_events.push(AttachDirtyEvent {
+            source,
+            kind,
+            pane_id,
+        });
+    }
+
+    pub fn mark_pane_dirty(&mut self, pane_id: Uuid, source: AttachDirtySource) {
+        self.pane_dirty_ids.insert(pane_id);
+        self.push_event(source, AttachDirtyKind::Pane, Some(pane_id));
+    }
+
+    pub fn mark_status_dirty(&mut self, source: AttachDirtySource) {
+        self.status_needs_redraw = true;
+        self.push_event(source, AttachDirtyKind::Status, None);
+    }
+
+    pub fn mark_overlay_dirty(&mut self, source: AttachDirtySource) {
+        self.overlay_needs_redraw = true;
+        self.push_event(source, AttachDirtyKind::Overlay, None);
+    }
+
+    pub fn mark_full_frame(&mut self, source: AttachDirtySource) {
+        self.full_pane_redraw = true;
+        self.push_event(source, AttachDirtyKind::FullFrame, None);
+    }
+
+    pub fn mark_extension_dirty(&mut self, source: AttachDirtySource) {
+        self.extension_needs_redraw = true;
+        self.push_event(source, AttachDirtyKind::Extension, None);
+    }
+
+    pub fn mark_layout_refresh(&mut self, source: AttachDirtySource) {
+        self.layout_needs_refresh = true;
+        self.push_event(source, AttachDirtyKind::LayoutRefresh, None);
+    }
+
+    pub fn mark_layout_frame_dirty(&mut self, source: AttachDirtySource) {
+        self.mark_layout_refresh(source);
+        self.mark_full_frame(source);
+    }
+
+    pub fn mark_layout_frame_and_status_dirty(&mut self, source: AttachDirtySource) {
+        self.mark_layout_frame_dirty(source);
+        self.mark_status_dirty(source);
+    }
+
+    pub fn merge_precise_damage(&mut self, damage: &FrameDamage, source: AttachDirtySource) {
+        if damage.is_empty() {
+            return;
+        }
+        self.precise_frame_damage.merge_from(damage);
+        self.push_event(source, AttachDirtyKind::PreciseDamage, None);
+    }
+
+    #[must_use]
+    pub fn dirty_events(&self) -> &[AttachDirtyEvent] {
+        &self.dirty_events
+    }
+
     #[must_use]
     pub fn frame_damage(&self, scene: &AttachScene) -> FrameDamage {
         let mut damage = if self.full_pane_redraw {
@@ -118,6 +230,7 @@ impl AttachDirtyFlags {
         self.overlay_needs_redraw = false;
         self.precise_frame_damage = FrameDamage::default();
         self.pane_dirty_ids.clear();
+        self.dirty_events.clear();
     }
 }
 
@@ -316,7 +429,8 @@ impl AttachViewState {
     ) {
         self.transient_status = Some(message.into());
         self.transient_status_until = Some(now + ttl);
-        self.dirty.status_needs_redraw = true;
+        self.dirty
+            .mark_status_dirty(AttachDirtySource::StatusChanged);
     }
 
     pub fn clear_expired_transient_status(&mut self, now: Instant) -> bool {
@@ -328,7 +442,8 @@ impl AttachViewState {
         }
         self.transient_status = None;
         self.transient_status_until = None;
-        self.dirty.status_needs_redraw = true;
+        self.dirty
+            .mark_status_dirty(AttachDirtySource::StatusChanged);
         true
     }
 

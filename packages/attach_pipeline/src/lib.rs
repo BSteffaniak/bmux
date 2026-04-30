@@ -24,7 +24,8 @@ pub use mouse::{
     Modifiers as AttachMouseModifiers, PaneProtocol as AttachPaneMouseProtocol,
 };
 pub use render::{
-    DamageCoalescingPolicy, DamageRect, FrameDamage, FrameDamageStats, queue_frame_damage_overlay,
+    AttachSceneRenderStats, DamageCoalescingPolicy, DamageRect, FrameDamage, FrameDamageStats,
+    queue_frame_damage_overlay,
 };
 pub use scene_pipeline::AttachScenePipeline;
 pub use types::{

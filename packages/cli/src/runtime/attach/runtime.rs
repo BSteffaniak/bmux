@@ -67,13 +67,14 @@ use super::prompt_ui::{
     prompt_accepts_key_kind,
 };
 use super::render::{
-    AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text,
-    queue_frame_damage_overlay, queue_layer_fill, render_attach_scene, visible_scene_pane_ids,
+    AttachLayer, AttachLayerSurface, AttachSceneRenderStats, append_pane_output, opaque_row_text,
+    queue_frame_damage_overlay, queue_layer_fill, render_attach_scene_with_stats,
+    visible_scene_pane_ids,
 };
 use super::state::{
-    AttachEventAction, AttachExitReason, AttachMouseResizeAxisDrag, AttachMouseResizeDrag,
-    AttachMouseSelectionDrag, AttachScrollbackCursor, AttachScrollbackPosition, AttachUiMode,
-    AttachViewState, PaneRect, PaneRenderBuffer,
+    AttachDirtySource, AttachEventAction, AttachExitReason, AttachMouseResizeAxisDrag,
+    AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachScrollbackCursor,
+    AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRect, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{BmuxPaneRuntimeClientExt, StreamingAttachInputExt};
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
@@ -88,6 +89,12 @@ const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_co
 /// naturally yields CPU time to the PTY reader thread, so no explicit
 /// sleep/yield is needed between rounds.
 const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
+const ATTACH_OVERRENDER_MIN_FRAMES: u64 = 10;
+const ATTACH_OVERRENDER_WINDOW_RATIO_PERCENT: u64 = 20;
+const ATTACH_OVERRENDER_CACHED_SKIP_RATIO_PERCENT: u64 = 90;
+const ATTACH_OVERRENDER_MIN_ROWS_EXAMINED: u64 = 10;
+const ATTACH_OVERRENDER_NON_FULL_FRAME_CELL_RATIO_PERCENT: u64 = 50;
+const ATTACH_OVERRENDER_EXTENSION_FULL_SURFACE_RATIO_PERCENT: u64 = 80;
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
@@ -491,11 +498,15 @@ fn apply_attach_output_bytes(
             application_keypad: screen.application_keypad(),
         },
     );
-    view_state.dirty.pane_dirty_ids.insert(pane_id);
+    view_state
+        .dirty
+        .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
     *frame_needs_render = true;
 
     if toggled_alternate {
-        view_state.dirty.full_pane_redraw = true;
+        view_state
+            .dirty
+            .mark_full_frame(AttachDirtySource::AlternateScreenTransition);
         view_state.force_cursor_move_next_frame = true;
     }
 
@@ -543,12 +554,16 @@ fn apply_attach_output_chunk(
     );
 
     if outcome == (AttachChunkApplyOutcome::Applied { had_data: true }) {
-        view_state.dirty.pane_dirty_ids.insert(pane_id);
+        view_state
+            .dirty
+            .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
         *frame_needs_render = true;
     }
 
     if toggled_alternate {
-        view_state.dirty.full_pane_redraw = true;
+        view_state
+            .dirty
+            .mark_full_frame(AttachDirtySource::AlternateScreenTransition);
         view_state.force_cursor_move_next_frame = true;
     }
 
@@ -566,7 +581,9 @@ async fn recover_attach_output_desync_for_pane(
     {
         hydrate_attach_revealed_panes_from_snapshot(client, view_state, &layout_state, &[pane_id])
             .await?;
-        view_state.dirty.full_pane_redraw = true;
+        view_state
+            .dirty
+            .mark_full_frame(AttachDirtySource::SnapshotHydration);
         return Ok(());
     }
 
@@ -575,6 +592,7 @@ async fn recover_attach_output_desync_for_pane(
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // Independent frame facts keep telemetry aggregation explicit.
 pub struct AttachFrameRenderStats {
     pub frame_bytes: usize,
     pub terminal_write_ms: u64,
@@ -582,6 +600,90 @@ pub struct AttachFrameRenderStats {
     pub damage_area_cells: u64,
     pub full_surface_fallbacks: usize,
     pub full_frame_fallback: bool,
+    pub scene_render: AttachSceneRenderStats,
+    pub status_rendered: bool,
+    pub overlay_rendered: bool,
+    pub synchronized_update: bool,
+    pub dirty_event_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AttachRenderInefficiencyFlags {
+    bits: u8,
+}
+
+impl AttachRenderInefficiencyFlags {
+    const DIRTY_NO_VISIBLE_ROW_CHANGE: u8 = 1 << 0;
+    const HIGH_CACHED_SKIP_RATIO: u8 = 1 << 1;
+    const LARGE_PARTIAL_FRAME: u8 = 1 << 2;
+    const EXTENSION_FULL_SURFACE_EXCESSIVE: u8 = 1 << 3;
+
+    const fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+
+    const fn contains(self, flag: u8) -> bool {
+        self.bits & flag != 0
+    }
+
+    const fn with(mut self, flag: u8, enabled: bool) -> Self {
+        if enabled {
+            self.bits |= flag;
+        }
+        self
+    }
+}
+
+const fn percent_at_least(part: u64, total: u64, threshold_percent: u64) -> bool {
+    total > 0 && part.saturating_mul(100) >= total.saturating_mul(threshold_percent)
+}
+
+fn classify_attach_render_inefficiency(
+    stats: &AttachFrameRenderStats,
+) -> AttachRenderInefficiencyFlags {
+    let emitted_units = stats
+        .scene_render
+        .pane_rows_emitted
+        .saturating_add(stats.scene_render.pane_row_segments_emitted);
+    let dirty_no_visible_row_change = stats.dirty_event_count > 0
+        && stats.scene_render.pane_rows_examined > 0
+        && emitted_units == 0;
+    let high_cached_skip_ratio = stats.scene_render.pane_rows_examined
+        >= ATTACH_OVERRENDER_MIN_ROWS_EXAMINED
+        && percent_at_least(
+            stats.scene_render.pane_rows_cached_skipped,
+            stats.scene_render.pane_rows_examined,
+            ATTACH_OVERRENDER_CACHED_SKIP_RATIO_PERCENT,
+        );
+    let large_partial_frame = !stats.full_frame_fallback
+        && percent_at_least(
+            stats.scene_render.pane_cells_emitted,
+            stats.scene_render.viewport_cells,
+            ATTACH_OVERRENDER_NON_FULL_FRAME_CELL_RATIO_PERCENT,
+        );
+    let extension_full_surface_excessive = percent_at_least(
+        stats.scene_render.extension_full_surface_calls,
+        stats.scene_render.extension_render_calls,
+        ATTACH_OVERRENDER_EXTENSION_FULL_SURFACE_RATIO_PERCENT,
+    );
+
+    AttachRenderInefficiencyFlags::default()
+        .with(
+            AttachRenderInefficiencyFlags::DIRTY_NO_VISIBLE_ROW_CHANGE,
+            dirty_no_visible_row_change,
+        )
+        .with(
+            AttachRenderInefficiencyFlags::HIGH_CACHED_SKIP_RATIO,
+            high_cached_skip_ratio,
+        )
+        .with(
+            AttachRenderInefficiencyFlags::LARGE_PARTIAL_FRAME,
+            large_partial_frame,
+        )
+        .with(
+            AttachRenderInefficiencyFlags::EXTENSION_FULL_SURFACE_EXCESSIVE,
+            extension_full_surface_excessive,
+        )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -660,6 +762,26 @@ struct AttachPerfWindow {
     damage_area_cells_max: u64,
     full_surface_fallbacks: u64,
     full_frame_fallbacks: u64,
+    pane_rows_examined: u64,
+    pane_rows_emitted: u64,
+    pane_row_segments_emitted: u64,
+    pane_rows_cached_skipped: u64,
+    pane_rows_sync_deferred: u64,
+    pane_cells_emitted: u64,
+    extension_render_calls: u64,
+    extension_render_op_calls: u64,
+    extension_imperative_calls: u64,
+    extension_cache_hits: u64,
+    extension_full_surface_calls: u64,
+    status_rendered_frames: u64,
+    overlay_rendered_frames: u64,
+    synchronized_update_frames: u64,
+    dirty_events: u64,
+    overrender_flagged_frames: u64,
+    dirty_no_visible_row_change_frames: u64,
+    high_cached_skip_ratio_frames: u64,
+    large_partial_frame_frames: u64,
+    extension_full_surface_excessive_frames: u64,
     event_burst_drained_events: u64,
     event_burst_max_events: u64,
     wake_server_events: u64,
@@ -699,6 +821,26 @@ impl AttachPerfWindow {
             damage_area_cells_max: 0,
             full_surface_fallbacks: 0,
             full_frame_fallbacks: 0,
+            pane_rows_examined: 0,
+            pane_rows_emitted: 0,
+            pane_row_segments_emitted: 0,
+            pane_rows_cached_skipped: 0,
+            pane_rows_sync_deferred: 0,
+            pane_cells_emitted: 0,
+            extension_render_calls: 0,
+            extension_render_op_calls: 0,
+            extension_imperative_calls: 0,
+            extension_cache_hits: 0,
+            extension_full_surface_calls: 0,
+            status_rendered_frames: 0,
+            overlay_rendered_frames: 0,
+            synchronized_update_frames: 0,
+            dirty_events: 0,
+            overrender_flagged_frames: 0,
+            dirty_no_visible_row_change_frames: 0,
+            high_cached_skip_ratio_frames: 0,
+            large_partial_frame_frames: 0,
+            extension_full_surface_excessive_frames: 0,
             event_burst_drained_events: 0,
             event_burst_max_events: 0,
             wake_server_events: 0,
@@ -745,6 +887,7 @@ impl AttachPerfWindow {
     }
 
     fn record_render_frame(&mut self, elapsed_ms: u64, stats: AttachFrameRenderStats) {
+        let inefficiency_flags = classify_attach_render_inefficiency(&stats);
         self.render_frames = self.render_frames.saturating_add(1);
         self.render_ms_sum = self.render_ms_sum.saturating_add(elapsed_ms);
         self.render_ms_max = self.render_ms_max.max(elapsed_ms);
@@ -761,6 +904,72 @@ impl AttachPerfWindow {
             .saturating_add(u64::try_from(stats.full_surface_fallbacks).unwrap_or(u64::MAX));
         if stats.full_frame_fallback {
             self.full_frame_fallbacks = self.full_frame_fallbacks.saturating_add(1);
+        }
+        self.pane_rows_examined = self
+            .pane_rows_examined
+            .saturating_add(stats.scene_render.pane_rows_examined);
+        self.pane_rows_emitted = self
+            .pane_rows_emitted
+            .saturating_add(stats.scene_render.pane_rows_emitted);
+        self.pane_row_segments_emitted = self
+            .pane_row_segments_emitted
+            .saturating_add(stats.scene_render.pane_row_segments_emitted);
+        self.pane_rows_cached_skipped = self
+            .pane_rows_cached_skipped
+            .saturating_add(stats.scene_render.pane_rows_cached_skipped);
+        self.pane_rows_sync_deferred = self
+            .pane_rows_sync_deferred
+            .saturating_add(stats.scene_render.pane_rows_sync_deferred);
+        self.pane_cells_emitted = self
+            .pane_cells_emitted
+            .saturating_add(stats.scene_render.pane_cells_emitted);
+        self.extension_render_calls = self
+            .extension_render_calls
+            .saturating_add(stats.scene_render.extension_render_calls);
+        self.extension_render_op_calls = self
+            .extension_render_op_calls
+            .saturating_add(stats.scene_render.extension_render_op_calls);
+        self.extension_imperative_calls = self
+            .extension_imperative_calls
+            .saturating_add(stats.scene_render.extension_imperative_calls);
+        self.extension_cache_hits = self
+            .extension_cache_hits
+            .saturating_add(stats.scene_render.extension_cache_hits);
+        self.extension_full_surface_calls = self
+            .extension_full_surface_calls
+            .saturating_add(stats.scene_render.extension_full_surface_calls);
+        if stats.status_rendered {
+            self.status_rendered_frames = self.status_rendered_frames.saturating_add(1);
+        }
+        if stats.overlay_rendered {
+            self.overlay_rendered_frames = self.overlay_rendered_frames.saturating_add(1);
+        }
+        if stats.synchronized_update {
+            self.synchronized_update_frames = self.synchronized_update_frames.saturating_add(1);
+        }
+        self.dirty_events = self
+            .dirty_events
+            .saturating_add(u64::try_from(stats.dirty_event_count).unwrap_or(u64::MAX));
+        if !inefficiency_flags.is_empty() {
+            self.overrender_flagged_frames = self.overrender_flagged_frames.saturating_add(1);
+        }
+        if inefficiency_flags.contains(AttachRenderInefficiencyFlags::DIRTY_NO_VISIBLE_ROW_CHANGE) {
+            self.dirty_no_visible_row_change_frames =
+                self.dirty_no_visible_row_change_frames.saturating_add(1);
+        }
+        if inefficiency_flags.contains(AttachRenderInefficiencyFlags::HIGH_CACHED_SKIP_RATIO) {
+            self.high_cached_skip_ratio_frames =
+                self.high_cached_skip_ratio_frames.saturating_add(1);
+        }
+        if inefficiency_flags.contains(AttachRenderInefficiencyFlags::LARGE_PARTIAL_FRAME) {
+            self.large_partial_frame_frames = self.large_partial_frame_frames.saturating_add(1);
+        }
+        if inefficiency_flags
+            .contains(AttachRenderInefficiencyFlags::EXTENSION_FULL_SURFACE_EXCESSIVE)
+        {
+            self.extension_full_surface_excessive_frames = self
+                .extension_full_surface_excessive_frames
+                .saturating_add(1);
         }
     }
 
@@ -933,6 +1142,89 @@ async fn publish_attach_layout_snapshot(
     }
 }
 
+fn insert_attach_render_work_payload(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    window: &AttachPerfWindow,
+) {
+    object.insert(
+        "pane_rows_examined".to_string(),
+        window.pane_rows_examined.into(),
+    );
+    object.insert(
+        "pane_rows_emitted".to_string(),
+        window.pane_rows_emitted.into(),
+    );
+    object.insert(
+        "pane_row_segments_emitted".to_string(),
+        window.pane_row_segments_emitted.into(),
+    );
+    object.insert(
+        "pane_rows_cached_skipped".to_string(),
+        window.pane_rows_cached_skipped.into(),
+    );
+    object.insert(
+        "pane_rows_sync_deferred".to_string(),
+        window.pane_rows_sync_deferred.into(),
+    );
+    object.insert(
+        "pane_cells_emitted".to_string(),
+        window.pane_cells_emitted.into(),
+    );
+    object.insert(
+        "extension_render_calls".to_string(),
+        window.extension_render_calls.into(),
+    );
+    object.insert(
+        "extension_render_op_calls".to_string(),
+        window.extension_render_op_calls.into(),
+    );
+    object.insert(
+        "extension_imperative_calls".to_string(),
+        window.extension_imperative_calls.into(),
+    );
+    object.insert(
+        "extension_cache_hits".to_string(),
+        window.extension_cache_hits.into(),
+    );
+    object.insert(
+        "extension_full_surface_calls".to_string(),
+        window.extension_full_surface_calls.into(),
+    );
+    object.insert(
+        "status_rendered_frames".to_string(),
+        window.status_rendered_frames.into(),
+    );
+    object.insert(
+        "overlay_rendered_frames".to_string(),
+        window.overlay_rendered_frames.into(),
+    );
+    object.insert(
+        "synchronized_update_frames".to_string(),
+        window.synchronized_update_frames.into(),
+    );
+    object.insert("dirty_events".to_string(), window.dirty_events.into());
+    object.insert(
+        "overrender_flagged_frames".to_string(),
+        window.overrender_flagged_frames.into(),
+    );
+    object.insert(
+        "dirty_no_visible_row_change_frames".to_string(),
+        window.dirty_no_visible_row_change_frames.into(),
+    );
+    object.insert(
+        "high_cached_skip_ratio_frames".to_string(),
+        window.high_cached_skip_ratio_frames.into(),
+    );
+    object.insert(
+        "large_partial_frame_frames".to_string(),
+        window.large_partial_frame_frames.into(),
+    );
+    object.insert(
+        "extension_full_surface_excessive_frames".to_string(),
+        window.extension_full_surface_excessive_frames.into(),
+    );
+}
+
 fn insert_attach_perf_detailed_payload(
     object: &mut serde_json::Map<String, serde_json::Value>,
     window: &AttachPerfWindow,
@@ -1011,6 +1303,7 @@ fn insert_attach_perf_detailed_payload(
         "dirty_extension_frames".to_string(),
         window.dirty_extension_frames.into(),
     );
+    insert_attach_render_work_payload(object, window);
     if let Some(avg) = window.drain_ipc_ms_sum.checked_div(window.drain_ipc_calls) {
         object.insert("drain_ipc_ms_avg".to_string(), avg.into());
     }
@@ -1069,6 +1362,25 @@ async fn maybe_emit_attach_perf_window(
     let elapsed = window.started_at.elapsed();
     if elapsed < Duration::from_millis(perf_emitter.window_ms()) {
         return Ok(());
+    }
+
+    if window.render_frames >= ATTACH_OVERRENDER_MIN_FRAMES
+        && percent_at_least(
+            window.overrender_flagged_frames,
+            window.render_frames,
+            ATTACH_OVERRENDER_WINDOW_RATIO_PERCENT,
+        )
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            render_frames = window.render_frames,
+            overrender_flagged_frames = window.overrender_flagged_frames,
+            dirty_no_visible_row_change_frames = window.dirty_no_visible_row_change_frames,
+            high_cached_skip_ratio_frames = window.high_cached_skip_ratio_frames,
+            large_partial_frame_frames = window.large_partial_frame_frames,
+            extension_full_surface_excessive_frames = window.extension_full_surface_excessive_frames,
+            "attach.render.overrender.window"
+        );
     }
 
     tracing::info!(
@@ -1701,8 +2013,12 @@ pub async fn run_session_attach_with_client(
                 if let Some(prompt_request) = prompt_request {
                     perf_window.record_wake(AttachWakeSource::Prompt);
                     view_state.prompt.enqueue_external(prompt_request);
-                    view_state.dirty.status_needs_redraw = true;
-                    view_state.dirty.overlay_needs_redraw = true;
+                    view_state
+                        .dirty
+                        .mark_status_dirty(AttachDirtySource::PromptOverlay);
+                    view_state
+                        .dirty
+                        .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
                 }
             }
 
@@ -1743,9 +2059,15 @@ pub async fn run_session_attach_with_client(
                     if runtime_appearance != *appearance {
                         runtime_appearance = (*appearance).clone();
                         view_state.cached_status_line = None;
-                        view_state.dirty.status_needs_redraw = true;
-                        view_state.dirty.full_pane_redraw = true;
-                        view_state.dirty.overlay_needs_redraw = true;
+                        view_state
+                            .dirty
+                            .mark_status_dirty(AttachDirtySource::AppearanceChanged);
+                        view_state
+                            .dirty
+                            .mark_full_frame(AttachDirtySource::AppearanceChanged);
+                        view_state
+                            .dirty
+                            .mark_overlay_dirty(AttachDirtySource::AppearanceChanged);
                     }
                 } else {
                     appearance_rx = None;
@@ -1766,7 +2088,9 @@ pub async fn run_session_attach_with_client(
                     perf_window.record_wake(AttachWakeSource::Scene);
                     if scene.revision != last_scene_revision {
                         last_scene_revision = scene.revision;
-                        view_state.dirty.extension_needs_redraw = true;
+                        view_state
+                            .dirty
+                            .mark_extension_dirty(AttachDirtySource::SceneChanged);
                     }
                 } else {
                     // Broadcast lagged/closed — drop subscription.
@@ -1790,7 +2114,9 @@ pub async fn run_session_attach_with_client(
                     if snapshot.revision != last_window_list_revision {
                         last_window_list_revision = snapshot.revision;
                         view_state.cached_window_list = Some(snapshot);
-                        view_state.dirty.status_needs_redraw = true;
+                        view_state
+                            .dirty
+                            .mark_status_dirty(AttachDirtySource::StatusChanged);
                     }
                 } else {
                     // Channel closed — drop subscription; fallback
@@ -1884,7 +2210,9 @@ pub async fn run_session_attach_with_client(
                 frame_needs_render = true;
                 match previous_layout.as_ref() {
                     None => {
-                        view_state.dirty.full_pane_redraw = true;
+                        view_state
+                            .dirty
+                            .mark_full_frame(AttachDirtySource::LayoutChanged);
                     }
                     Some(previous) => {
                         if previous.scene != layout_state.scene {
@@ -1941,23 +2269,25 @@ pub async fn run_session_attach_with_client(
                                     damage_policy,
                                 );
                                 if scene_damage.is_empty() {
-                                    view_state.dirty.extension_needs_redraw = true;
-                                } else {
                                     view_state
                                         .dirty
-                                        .precise_frame_damage
-                                        .merge_from(&scene_damage);
+                                        .mark_extension_dirty(AttachDirtySource::LayoutChanged);
+                                } else {
+                                    view_state.dirty.merge_precise_damage(
+                                        &scene_damage,
+                                        AttachDirtySource::LayoutChanged,
+                                    );
                                 }
                             }
                         } else if previous.focused_pane_id != layout_state.focused_pane_id {
-                            view_state
-                                .dirty
-                                .pane_dirty_ids
-                                .insert(previous.focused_pane_id);
-                            view_state
-                                .dirty
-                                .pane_dirty_ids
-                                .insert(layout_state.focused_pane_id);
+                            view_state.dirty.mark_pane_dirty(
+                                previous.focused_pane_id,
+                                AttachDirtySource::FocusChanged,
+                            );
+                            view_state.dirty.mark_pane_dirty(
+                                layout_state.focused_pane_id,
+                                AttachDirtySource::FocusChanged,
+                            );
                         }
                     }
                 }
@@ -2525,7 +2855,9 @@ async fn handle_attach_stream_server_event(
                         .publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
                     if scene_revision != *last_scene_revision {
                         *last_scene_revision = scene_revision;
-                        view_state.dirty.extension_needs_redraw = true;
+                        view_state
+                            .dirty
+                            .mark_extension_dirty(AttachDirtySource::SceneChanged);
                     }
                 }
                 Err(error) => {
@@ -2581,7 +2913,9 @@ async fn handle_attach_stream_server_event(
                 Ok(appearance) => {
                     let _ = bmux_plugin::global_event_bus()
                         .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
-                    view_state.dirty.full_pane_redraw = true;
+                    view_state
+                        .dirty
+                        .mark_full_frame(AttachDirtySource::AppearanceChanged);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -2722,8 +3056,9 @@ async fn handle_context_event_forwarded(
                 "attach.context_event.retarget"
             );
             retarget_attach_to_context(client, view_state, *context_id).await?;
-            view_state.dirty.layout_needs_refresh = true;
-            view_state.dirty.full_pane_redraw = true;
+            view_state
+                .dirty
+                .mark_layout_frame_dirty(AttachDirtySource::SceneChanged);
         }
         ContextEvent::Selected { context_id } => {
             // Safety net: if the richer
@@ -2749,8 +3084,9 @@ async fn handle_context_event_forwarded(
                 "attach.context_event.selected_retarget"
             );
             retarget_attach_to_context(client, view_state, *context_id).await?;
-            view_state.dirty.layout_needs_refresh = true;
-            view_state.dirty.full_pane_redraw = true;
+            view_state
+                .dirty
+                .mark_layout_frame_dirty(AttachDirtySource::SceneChanged);
         }
         ContextEvent::Created { .. } | ContextEvent::Closed { .. } => {
             // Creation and closure are informational here. Retarget
@@ -3390,8 +3726,9 @@ pub async fn handle_attach_plugin_command_action(
                     Instant::now(),
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
-                view_state.dirty.layout_needs_refresh = true;
-                view_state.dirty.full_pane_redraw = true;
+                view_state
+                    .dirty
+                    .mark_layout_frame_dirty(AttachDirtySource::PluginCommand);
                 emit_attach_plugin_command_timing(
                     plugin_id,
                     command_name,
@@ -3468,8 +3805,9 @@ pub async fn handle_attach_plugin_command_action(
                     Instant::now(),
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
-                view_state.dirty.layout_needs_refresh = true;
-                view_state.dirty.full_pane_redraw = true;
+                view_state
+                    .dirty
+                    .mark_layout_frame_dirty(AttachDirtySource::PluginCommand);
                 emit_attach_plugin_command_timing(
                     plugin_id,
                     command_name,
@@ -3494,8 +3832,9 @@ pub async fn handle_attach_plugin_command_action(
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
-            view_state.dirty.layout_needs_refresh = true;
-            view_state.dirty.full_pane_redraw = true;
+            view_state
+                .dirty
+                .mark_layout_frame_dirty(AttachDirtySource::PluginCommand);
             emit_attach_plugin_command_timing(
                 plugin_id,
                 command_name,
@@ -4567,8 +4906,12 @@ pub fn handle_help_overlay_key_event(
         KeyCode::Esc | KeyCode::Enter => {
             view_state.help_overlay_open = false;
             view_state.help_overlay_scroll = 0;
-            view_state.dirty.status_needs_redraw = true;
-            view_state.dirty.overlay_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_status_dirty(AttachDirtySource::HelpOverlay);
+            view_state
+                .dirty
+                .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
             true
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -4578,7 +4921,9 @@ pub fn handle_help_overlay_key_event(
                 help_lines.len(),
                 help_overlay_visible_rows(help_lines),
             );
-            view_state.dirty.overlay_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
             true
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -4588,7 +4933,9 @@ pub fn handle_help_overlay_key_event(
                 help_lines.len(),
                 help_overlay_visible_rows(help_lines),
             );
-            view_state.dirty.overlay_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
             true
         }
         KeyCode::PageUp => {
@@ -4599,7 +4946,9 @@ pub fn handle_help_overlay_key_event(
                 help_lines.len(),
                 help_overlay_visible_rows(help_lines),
             );
-            view_state.dirty.overlay_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
             true
         }
         KeyCode::PageDown => {
@@ -4610,18 +4959,24 @@ pub fn handle_help_overlay_key_event(
                 help_lines.len(),
                 help_overlay_visible_rows(help_lines),
             );
-            view_state.dirty.overlay_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
             true
         }
         KeyCode::Home => {
             view_state.help_overlay_scroll = 0;
-            view_state.dirty.overlay_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
             true
         }
         KeyCode::End => {
             let visible = help_overlay_visible_rows(help_lines);
             view_state.help_overlay_scroll = help_lines.len().saturating_sub(visible);
-            view_state.dirty.overlay_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
             true
         }
         _ => false,
@@ -4893,9 +5248,8 @@ pub fn render_attach_frame(
     if let Some(ref mut cs) = view_state.last_cursor_state {
         cs.visible = false;
     }
-    if frame_damage.status_damaged()
-        && let Some(status_line) = view_state.cached_status_line.as_ref()
-    {
+    let status_rendered = frame_damage.status_damaged() && view_state.cached_status_line.is_some();
+    if status_rendered && let Some(status_line) = view_state.cached_status_line.as_ref() {
         queue_attach_status_line(&mut frame_bytes, status_line, view_state.status_position)?;
     }
     let appearance_mode_id = if view_state.help_overlay_open {
@@ -4910,13 +5264,14 @@ pub fn render_attach_frame(
         view_state.active_mode_id.as_str()
     };
     let active_runtime_appearance = runtime_appearance.for_mode(appearance_mode_id);
+    let mut scene_render_stats = AttachSceneRenderStats::default();
     let cursor_state = if render_scene {
         // Snapshot the current set of registered render extensions
         // once per frame. The snapshot is cheap (Arc-clones) and
         // keeps the per-surface loop inside `render_attach_scene`
         // free of registry-lock churn.
         let extensions = bmux_plugin::registered_render_extensions();
-        render_attach_scene(
+        let (cursor_state, stats) = render_attach_scene_with_stats(
             &mut frame_bytes,
             &layout_state.scene,
             &layout_state.panes,
@@ -4933,7 +5288,9 @@ pub fn render_attach_frame(
             &active_runtime_appearance,
             damage_policy,
             &extensions,
-        )?
+        )?;
+        scene_render_stats = stats;
+        cursor_state
     } else {
         view_state.last_cursor_state
     };
@@ -4975,11 +5332,13 @@ pub fn render_attach_frame(
     }
 
     let previous_cursor_state = view_state.last_cursor_state;
+    let mut overlay_rendered = false;
     let mut overlay_cursor_state = None;
     let help_overlay_needs_render =
         view_state.help_overlay_open && (frame_damage.overlay_damaged() || render_scene);
     if help_overlay_needs_render && let Some(help_surface) = current_help_overlay_surface.as_ref() {
         queue_attach_help_overlay(&mut frame_bytes, help_surface, help_lines, help_scroll)?;
+        overlay_rendered = true;
     }
     if view_state.prompt.is_active() {
         // The prompt renderer owns the prompt cursor state, so keep drawing it on
@@ -4988,10 +5347,11 @@ pub fn render_attach_frame(
         overlay_cursor_state = view_state
             .prompt
             .queue_attach_prompt_overlay(&mut frame_bytes)?;
+        overlay_rendered = true;
     }
 
     if damage_config.visualize {
-        queue_frame_damage_overlay(
+        overlay_rendered |= queue_frame_damage_overlay(
             &mut frame_bytes,
             &layout_state.scene,
             &frame_damage,
@@ -5083,6 +5443,11 @@ pub fn render_attach_frame(
         damage_area_cells: damage_stats.rect_area_cells,
         full_surface_fallbacks: damage_stats.full_surface_count,
         full_frame_fallback: damage_stats.full_frame,
+        scene_render: scene_render_stats,
+        status_rendered,
+        overlay_rendered,
+        synchronized_update: use_synchronized_update,
+        dirty_event_count: view_state.dirty.dirty_events().len(),
     };
     view_state.last_help_overlay_surface = current_help_overlay_surface;
     view_state.last_prompt_overlay_surface = current_prompt_overlay_surface;
@@ -5970,8 +6335,12 @@ async fn hydrate_attach_state_from_snapshot_mode(
         }
     }
     view_state.dirty.layout_needs_refresh = false;
-    view_state.dirty.full_pane_redraw = true;
-    view_state.dirty.status_needs_redraw = true;
+    view_state
+        .dirty
+        .mark_full_frame(AttachDirtySource::SnapshotHydration);
+    view_state
+        .dirty
+        .mark_status_dirty(AttachDirtySource::SnapshotHydration);
     Ok(())
 }
 
@@ -6039,7 +6408,9 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
     }
 
     for pane_id in pane_ids {
-        view_state.dirty.pane_dirty_ids.insert(*pane_id);
+        view_state
+            .dirty
+            .mark_pane_dirty(*pane_id, AttachDirtySource::SnapshotHydration);
     }
 
     Ok(())
@@ -6159,7 +6530,9 @@ pub fn handle_attach_server_event(
                 |reason| format!("pane {} exited: {reason}", short_uuid(pane_id)),
             );
             view_state.set_transient_status(message, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
-            view_state.dirty.status_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_status_dirty(AttachDirtySource::PaneLifecycle);
         }
         bmux_client::ServerEvent::PaneRestarted {
             session_id,
@@ -6170,7 +6543,9 @@ pub fn handle_attach_server_event(
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
-            view_state.dirty.status_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_status_dirty(AttachDirtySource::PaneLifecycle);
         }
         _ => {}
     }
@@ -6229,7 +6604,9 @@ async fn handle_control_catalog_changed(
             );
         }
     }
-    view_state.dirty.status_needs_redraw = true;
+    view_state
+        .dirty
+        .mark_status_dirty(AttachDirtySource::ControlCatalogChanged);
 }
 
 async fn handle_clients_plugin_event(
@@ -6288,6 +6665,9 @@ async fn handle_clients_plugin_event(
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
             }
+            view_state
+                .dirty
+                .mark_layout_frame_and_status_dirty(AttachDirtySource::FollowTargetChanged);
         }
         bmux_clients_plugin_api::clients_events::ClientEvent::FollowTargetGone {
             former_leader_client_id,
@@ -6300,6 +6680,9 @@ async fn handle_clients_plugin_event(
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
+            view_state
+                .dirty
+                .mark_status_dirty(AttachDirtySource::FollowTargetChanged);
         }
         _ => {}
     }
@@ -6316,16 +6699,19 @@ pub fn apply_attach_view_change_components(
     for component in components {
         match component {
             AttachViewComponent::Scene | AttachViewComponent::Layout => {
-                view_state.dirty.layout_needs_refresh = true;
-                view_state.dirty.full_pane_redraw = true;
-                view_state.dirty.status_needs_redraw = true;
+                view_state
+                    .dirty
+                    .mark_layout_frame_and_status_dirty(AttachDirtySource::SceneChanged);
             }
             AttachViewComponent::SurfaceContent => {
-                view_state.dirty.layout_needs_refresh = true;
-                view_state.dirty.full_pane_redraw = true;
+                view_state
+                    .dirty
+                    .mark_layout_frame_dirty(AttachDirtySource::SceneChanged);
             }
             AttachViewComponent::Status => {
-                view_state.dirty.status_needs_redraw = true;
+                view_state
+                    .dirty
+                    .mark_status_dirty(AttachDirtySource::StatusChanged);
             }
         }
     }
@@ -6423,7 +6809,9 @@ pub async fn handle_attach_terminal_event(
                         }
                     }
                     PromptKeyDisposition::Consumed => {
-                        view_state.dirty.overlay_needs_redraw = true;
+                        view_state
+                            .dirty
+                            .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
                     }
                     PromptKeyDisposition::NotActive => {}
                 }
@@ -6441,7 +6829,9 @@ pub async fn handle_attach_terminal_event(
                             }
                         }
                         PromptKeyDisposition::Consumed => {
-                            view_state.dirty.overlay_needs_redraw = true;
+                            view_state
+                                .dirty
+                                .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
                         }
                         PromptKeyDisposition::NotActive => {}
                     }
@@ -6545,9 +6935,9 @@ pub async fn handle_attach_terminal_event(
                         view_state,
                     ) {
                         Ok(()) => {
-                            view_state.dirty.layout_needs_refresh = true;
-                            view_state.dirty.full_pane_redraw = true;
-                            view_state.dirty.status_needs_redraw = true;
+                            view_state.dirty.mark_layout_frame_and_status_dirty(
+                                AttachDirtySource::ProfileChanged,
+                            );
                         }
                         Err(error) => {
                             view_state.set_transient_status(
@@ -6564,8 +6954,12 @@ pub async fn handle_attach_terminal_event(
                     if !view_state.help_overlay_open {
                         view_state.help_overlay_scroll = 0;
                     }
-                    view_state.dirty.overlay_needs_redraw = true;
-                    view_state.dirty.status_needs_redraw = true;
+                    view_state
+                        .dirty
+                        .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
+                    view_state
+                        .dirty
+                        .mark_status_dirty(AttachDirtySource::HelpOverlay);
                     continue;
                 }
                 if view_state.help_overlay_open {
@@ -6574,8 +6968,12 @@ pub async fn handle_attach_terminal_event(
                     {
                         view_state.help_overlay_open = false;
                         view_state.help_overlay_scroll = 0;
-                        view_state.dirty.status_needs_redraw = true;
-                        view_state.dirty.overlay_needs_redraw = true;
+                        view_state
+                            .dirty
+                            .mark_status_dirty(AttachDirtySource::HelpOverlay);
+                        view_state
+                            .dirty
+                            .mark_overlay_dirty(AttachDirtySource::HelpOverlay);
                     }
                     continue;
                 }
@@ -6592,18 +6990,29 @@ pub async fn handle_attach_terminal_event(
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 } else if prompt_only_action && view_state.prompt.is_active() {
-                    view_state.dirty.overlay_needs_redraw = true;
+                    view_state
+                        .dirty
+                        .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
                 } else {
-                    view_state.dirty.layout_needs_refresh = true;
-                    view_state.dirty.full_pane_redraw = true;
+                    view_state
+                        .dirty
+                        .mark_layout_frame_dirty(AttachDirtySource::UserAction);
                 }
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active);
-                view_state.dirty.status_needs_redraw = true;
+                view_state
+                    .dirty
+                    .mark_status_dirty(AttachDirtySource::UserAction);
             }
             AttachEventAction::Redraw => {
-                view_state.dirty.status_needs_redraw = true;
-                view_state.dirty.layout_needs_refresh = true;
-                view_state.dirty.full_pane_redraw = true;
+                view_state
+                    .dirty
+                    .mark_status_dirty(AttachDirtySource::ManualRedraw);
+                view_state
+                    .dirty
+                    .mark_layout_refresh(AttachDirtySource::ManualRedraw);
+                view_state
+                    .dirty
+                    .mark_full_frame(AttachDirtySource::ManualRedraw);
             }
             AttachEventAction::Ignore => {}
         }
@@ -6705,11 +7114,16 @@ pub async fn handle_attach_prompt_completion(
         },
     }
 
-    view_state.dirty.status_needs_redraw = true;
-    view_state.dirty.overlay_needs_redraw = true;
+    view_state
+        .dirty
+        .mark_status_dirty(AttachDirtySource::PromptOverlay);
+    view_state
+        .dirty
+        .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
     if requires_layout_refresh {
-        view_state.dirty.layout_needs_refresh = true;
-        view_state.dirty.full_pane_redraw = true;
+        view_state
+            .dirty
+            .mark_layout_frame_dirty(AttachDirtySource::PromptOverlay);
     }
     Ok(None)
 }
@@ -6788,15 +7202,18 @@ async fn handle_attach_action_dispatch(
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
             } else {
-                view_state.dirty.layout_needs_refresh = true;
-                view_state.dirty.full_pane_redraw = true;
+                view_state
+                    .dirty
+                    .mark_layout_frame_dirty(AttachDirtySource::ActionDispatch);
             }
-            view_state.dirty.status_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_status_dirty(AttachDirtySource::ActionDispatch);
         }
         AttachEventAction::Redraw => {
-            view_state.dirty.status_needs_redraw = true;
-            view_state.dirty.layout_needs_refresh = true;
-            view_state.dirty.full_pane_redraw = true;
+            view_state
+                .dirty
+                .mark_layout_frame_and_status_dirty(AttachDirtySource::ManualRedraw);
         }
         AttachEventAction::Mouse(_) | AttachEventAction::Ignore => {}
     }
@@ -7498,9 +7915,9 @@ pub async fn handle_attach_status_tab_click(
         kernel_client_factory,
     )
     .await?;
-    view_state.dirty.status_needs_redraw = true;
-    view_state.dirty.layout_needs_refresh = true;
-    view_state.dirty.full_pane_redraw = true;
+    view_state
+        .dirty
+        .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
     Ok(true)
 }
 
@@ -7549,9 +7966,9 @@ pub async fn handle_attach_mouse_gesture_action(
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
             } else {
-                view_state.dirty.status_needs_redraw = true;
-                view_state.dirty.layout_needs_refresh = true;
-                view_state.dirty.full_pane_redraw = true;
+                view_state
+                    .dirty
+                    .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
             }
             Ok(true)
         }
@@ -7744,8 +8161,12 @@ fn update_attach_mouse_selection_drag(
         active: true,
         ..drag
     });
-    view_state.dirty.full_pane_redraw = true;
-    view_state.dirty.status_needs_redraw = true;
+    view_state
+        .dirty
+        .mark_full_frame(AttachDirtySource::Selection);
+    view_state
+        .dirty
+        .mark_status_dirty(AttachDirtySource::Selection);
     true
 }
 
@@ -7763,8 +8184,12 @@ fn finish_attach_mouse_selection_drag(view_state: &mut AttachViewState) -> bool 
                 copy_attach_selection(view_state, true);
             }
         }
-        view_state.dirty.full_pane_redraw = true;
-        view_state.dirty.status_needs_redraw = true;
+        view_state
+            .dirty
+            .mark_full_frame(AttachDirtySource::Selection);
+        view_state
+            .dirty
+            .mark_status_dirty(AttachDirtySource::Selection);
     }
     true
 }
@@ -7838,8 +8263,12 @@ pub fn handle_attach_mouse_scrollback(
                 return false;
             }
             step_attach_scrollback(view_state, -lines);
-            view_state.dirty.full_pane_redraw = true;
-            view_state.dirty.status_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_full_frame(AttachDirtySource::Scrollback);
+            view_state
+                .dirty
+                .mark_status_dirty(AttachDirtySource::Scrollback);
             true
         }
         MouseEventKind::ScrollDown => {
@@ -7853,8 +8282,12 @@ pub fn handle_attach_mouse_scrollback(
             {
                 view_state.exit_scrollback();
             }
-            view_state.dirty.full_pane_redraw = true;
-            view_state.dirty.status_needs_redraw = true;
+            view_state
+                .dirty
+                .mark_full_frame(AttachDirtySource::Scrollback);
+            view_state
+                .dirty
+                .mark_status_dirty(AttachDirtySource::Scrollback);
             true
         }
         _ => false,
@@ -7882,9 +8315,9 @@ pub async fn focus_attach_pane(
     .await?;
 
     view_state.mouse.last_focused_pane_id = Some(pane_id);
-    view_state.dirty.layout_needs_refresh = true;
-    view_state.dirty.full_pane_redraw = true;
-    view_state.dirty.status_needs_redraw = true;
+    view_state
+        .dirty
+        .mark_layout_frame_and_status_dirty(AttachDirtySource::FocusChanged);
 
     Ok(())
 }
@@ -7909,9 +8342,9 @@ async fn resize_attach_pane(
     )
     .await?;
 
-    view_state.dirty.layout_needs_refresh = true;
-    view_state.dirty.full_pane_redraw = true;
-    view_state.dirty.status_needs_redraw = true;
+    view_state
+        .dirty
+        .mark_layout_frame_and_status_dirty(AttachDirtySource::LayoutChanged);
     Ok(())
 }
 
@@ -8354,6 +8787,49 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
+
+    fn frame_stats_for_classifier(scene_render: AttachSceneRenderStats) -> AttachFrameRenderStats {
+        AttachFrameRenderStats {
+            frame_bytes: 0,
+            terminal_write_ms: 0,
+            damage_rects: 0,
+            damage_area_cells: 0,
+            full_surface_fallbacks: 0,
+            full_frame_fallback: false,
+            scene_render,
+            status_rendered: false,
+            overlay_rendered: false,
+            synchronized_update: false,
+            dirty_event_count: 1,
+        }
+    }
+
+    #[test]
+    fn render_inefficiency_classifier_flags_no_visible_row_change() {
+        let flags = classify_attach_render_inefficiency(&frame_stats_for_classifier(
+            AttachSceneRenderStats {
+                pane_rows_examined: 3,
+                pane_rows_cached_skipped: 3,
+                ..AttachSceneRenderStats::default()
+            },
+        ));
+
+        assert!(flags.contains(AttachRenderInefficiencyFlags::DIRTY_NO_VISIBLE_ROW_CHANGE));
+    }
+
+    #[test]
+    fn render_inefficiency_classifier_flags_large_partial_frame() {
+        let flags = classify_attach_render_inefficiency(&frame_stats_for_classifier(
+            AttachSceneRenderStats {
+                viewport_cells: 100,
+                pane_cells_emitted: 60,
+                pane_rows_emitted: 3,
+                ..AttachSceneRenderStats::default()
+            },
+        ));
+
+        assert!(flags.contains(AttachRenderInefficiencyFlags::LARGE_PARTIAL_FRAME));
+    }
 
     #[test]
     fn caller_process_command_execution_routes_to_caller_process() {
