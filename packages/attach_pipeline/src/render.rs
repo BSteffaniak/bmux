@@ -16,11 +16,112 @@ use std::io;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DamageCoalescingPolicy {
+    pub max_rects: usize,
+    pub max_area_percent: u16,
+}
+
+impl Default for DamageCoalescingPolicy {
+    fn default() -> Self {
+        Self {
+            max_rects: 64,
+            max_area_percent: 60,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl DamageRect {
+    #[must_use]
+    pub const fn new(x: u16, y: u16, w: u16, h: u16) -> Self {
+        Self { x, y, w, h }
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    #[must_use]
+    pub fn area(self) -> u32 {
+        u32::from(self.w) * u32::from(self.h)
+    }
+
+    #[must_use]
+    pub const fn right(self) -> u16 {
+        self.x.saturating_add(self.w)
+    }
+
+    #[must_use]
+    pub const fn bottom(self) -> u16 {
+        self.y.saturating_add(self.h)
+    }
+
+    #[must_use]
+    pub const fn clipped_to(self, width: u16, height: u16) -> Option<Self> {
+        let x2 = if self.right() < width {
+            self.right()
+        } else {
+            width
+        };
+        let y2 = if self.bottom() < height {
+            self.bottom()
+        } else {
+            height
+        };
+        if self.x >= x2 || self.y >= y2 {
+            None
+        } else {
+            Some(Self::new(
+                self.x,
+                self.y,
+                x2.saturating_sub(self.x),
+                y2.saturating_sub(self.y),
+            ))
+        }
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        let x1 = if self.x < other.x { self.x } else { other.x };
+        let y1 = if self.y < other.y { self.y } else { other.y };
+        let x2 = if self.right() > other.right() {
+            self.right()
+        } else {
+            other.right()
+        };
+        let y2 = if self.bottom() > other.bottom() {
+            self.bottom()
+        } else {
+            other.bottom()
+        };
+        Self::new(x1, y1, x2.saturating_sub(x1), y2.saturating_sub(y1))
+    }
+
+    #[must_use]
+    pub const fn touches_or_overlaps(self, other: Self) -> bool {
+        self.x <= other.right()
+            && other.x <= self.right()
+            && self.y <= other.bottom()
+            && other.y <= self.bottom()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameDamage {
     full_frame: bool,
     content_surfaces: BTreeSet<Uuid>,
+    content_surface_rects: BTreeMap<Uuid, Vec<DamageRect>>,
     extension_surfaces: BTreeSet<Uuid>,
+    extension_surface_rects: BTreeMap<Uuid, Vec<DamageRect>>,
     status: bool,
     overlay: bool,
 }
@@ -31,7 +132,9 @@ impl FrameDamage {
         Self {
             full_frame: true,
             content_surfaces: BTreeSet::new(),
+            content_surface_rects: BTreeMap::new(),
             extension_surfaces: BTreeSet::new(),
+            extension_surface_rects: BTreeMap::new(),
             status: true,
             overlay: true,
         }
@@ -46,14 +149,20 @@ impl FrameDamage {
     pub fn is_empty(&self) -> bool {
         !self.full_frame
             && self.content_surfaces.is_empty()
+            && self.content_surface_rects.is_empty()
             && self.extension_surfaces.is_empty()
+            && self.extension_surface_rects.is_empty()
             && !self.status
             && !self.overlay
     }
 
     #[must_use]
     pub fn scene_damaged(&self) -> bool {
-        self.full_frame || !self.content_surfaces.is_empty() || !self.extension_surfaces.is_empty()
+        self.full_frame
+            || !self.content_surfaces.is_empty()
+            || !self.content_surface_rects.is_empty()
+            || !self.extension_surfaces.is_empty()
+            || !self.extension_surface_rects.is_empty()
     }
 
     pub fn mark_full_frame(&mut self) {
@@ -61,11 +170,53 @@ impl FrameDamage {
     }
 
     pub fn mark_content_surface(&mut self, pane_id: Uuid) {
+        self.content_surface_rects.remove(&pane_id);
         self.content_surfaces.insert(pane_id);
     }
 
+    pub fn mark_content_surface_rect(
+        &mut self,
+        pane_id: Uuid,
+        rect: DamageRect,
+        surface_size: (u16, u16),
+        policy: DamageCoalescingPolicy,
+    ) {
+        if self.full_frame || self.content_surfaces.contains(&pane_id) {
+            return;
+        }
+        if coalesce_surface_rect(
+            self.content_surface_rects.entry(pane_id).or_default(),
+            rect,
+            surface_size,
+            policy,
+        ) {
+            self.mark_content_surface(pane_id);
+        }
+    }
+
     pub fn mark_extension_surface(&mut self, surface_id: Uuid) {
+        self.extension_surface_rects.remove(&surface_id);
         self.extension_surfaces.insert(surface_id);
+    }
+
+    pub fn mark_extension_surface_rect(
+        &mut self,
+        surface_id: Uuid,
+        rect: DamageRect,
+        surface_size: (u16, u16),
+        policy: DamageCoalescingPolicy,
+    ) {
+        if self.full_frame || self.extension_surfaces.contains(&surface_id) {
+            return;
+        }
+        if coalesce_surface_rect(
+            self.extension_surface_rects.entry(surface_id).or_default(),
+            rect,
+            surface_size,
+            policy,
+        ) {
+            self.mark_extension_surface(surface_id);
+        }
     }
 
     pub const fn mark_status(&mut self) {
@@ -78,14 +229,18 @@ impl FrameDamage {
 
     #[must_use]
     pub fn content_surface_damaged(&self, pane_id: Uuid) -> bool {
-        self.full_frame || self.content_surfaces.contains(&pane_id)
+        self.full_frame
+            || self.content_surfaces.contains(&pane_id)
+            || self.content_surface_rects.contains_key(&pane_id)
     }
 
     #[must_use]
     pub fn extension_surface_damaged(&self, surface_id: Uuid, pane_id: Uuid) -> bool {
         self.full_frame
             || self.extension_surfaces.contains(&surface_id)
+            || self.extension_surface_rects.contains_key(&surface_id)
             || self.content_surfaces.contains(&pane_id)
+            || self.content_surface_rects.contains_key(&pane_id)
     }
 
     #[must_use]
@@ -102,6 +257,56 @@ impl FrameDamage {
     pub const fn content_surfaces(&self) -> &BTreeSet<Uuid> {
         &self.content_surfaces
     }
+
+    #[must_use]
+    pub fn content_surface_rects(&self, pane_id: Uuid) -> &[DamageRect] {
+        self.content_surface_rects
+            .get(&pane_id)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn extension_surface_rects(&self, surface_id: Uuid) -> &[DamageRect] {
+        self.extension_surface_rects
+            .get(&surface_id)
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
+fn coalesce_surface_rect(
+    rects: &mut Vec<DamageRect>,
+    rect: DamageRect,
+    surface_size: (u16, u16),
+    policy: DamageCoalescingPolicy,
+) -> bool {
+    let Some(mut merged) = rect.clipped_to(surface_size.0, surface_size.1) else {
+        return false;
+    };
+    let mut index = 0;
+    while index < rects.len() {
+        if rects[index].touches_or_overlaps(merged) {
+            merged = rects.swap_remove(index).union(merged);
+            index = 0;
+        } else {
+            index += 1;
+        }
+    }
+    rects.push(merged);
+
+    let surface_area = u32::from(surface_size.0) * u32::from(surface_size.1);
+    if surface_area == 0 {
+        rects.clear();
+        return false;
+    }
+    let damaged_area = rects
+        .iter()
+        .fold(0_u32, |area, rect| area.saturating_add(rect.area()));
+    let area_percent = damaged_area.saturating_mul(100) / surface_area;
+    if rects.len() > policy.max_rects || area_percent >= u32::from(policy.max_area_percent) {
+        rects.clear();
+        return true;
+    }
+    false
 }
 
 #[allow(dead_code)]
@@ -708,8 +913,8 @@ pub fn render_attach_scene<W: io::Write>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachLayer, AttachLayerSurface, FrameDamage, append_pane_output, opaque_row_text,
-        queue_layer_fill, render_attach_scene,
+        AttachLayer, AttachLayerSurface, DamageCoalescingPolicy, DamageRect, FrameDamage,
+        append_pane_output, opaque_row_text, queue_layer_fill, render_attach_scene,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -729,6 +934,65 @@ mod tests {
         let mut damage = FrameDamage::default();
         damage.mark_content_surface(pane_id);
         damage
+    }
+
+    #[test]
+    fn frame_damage_coalesces_adjacent_content_rects() {
+        let pane_id = Uuid::from_u128(1);
+        let mut damage = FrameDamage::default();
+        damage.mark_content_surface_rect(
+            pane_id,
+            DamageRect::new(0, 0, 2, 2),
+            (20, 10),
+            DamageCoalescingPolicy::default(),
+        );
+        damage.mark_content_surface_rect(
+            pane_id,
+            DamageRect::new(2, 0, 2, 2),
+            (20, 10),
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(
+            damage.content_surface_rects(pane_id),
+            &[DamageRect::new(0, 0, 4, 2)]
+        );
+        assert!(damage.content_surface_damaged(pane_id));
+        assert!(!damage.content_surfaces().contains(&pane_id));
+    }
+
+    #[test]
+    fn frame_damage_escalates_rect_count_to_full_surface() {
+        let pane_id = Uuid::from_u128(2);
+        let mut damage = FrameDamage::default();
+        let policy = DamageCoalescingPolicy {
+            max_rects: 1,
+            max_area_percent: 100,
+        };
+        damage.mark_content_surface_rect(pane_id, DamageRect::new(0, 0, 1, 1), (20, 10), policy);
+        damage.mark_content_surface_rect(pane_id, DamageRect::new(4, 0, 1, 1), (20, 10), policy);
+
+        assert!(damage.content_surfaces().contains(&pane_id));
+        assert!(damage.content_surface_rects(pane_id).is_empty());
+    }
+
+    #[test]
+    fn frame_damage_escalates_large_area_to_full_extension_surface() {
+        let surface_id = Uuid::from_u128(3);
+        let mut damage = FrameDamage::default();
+        let policy = DamageCoalescingPolicy {
+            max_rects: 64,
+            max_area_percent: 50,
+        };
+        damage.mark_extension_surface_rect(
+            surface_id,
+            DamageRect::new(0, 0, 10, 5),
+            (10, 10),
+            policy,
+        );
+
+        assert!(damage.extension_surface_damaged(surface_id, Uuid::nil()));
+        assert!(damage.extension_surface_rects(surface_id).is_empty());
     }
 
     fn screen_row(screen: &vt100::Screen, row: u16, width: u16) -> String {

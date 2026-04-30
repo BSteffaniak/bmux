@@ -4804,7 +4804,8 @@ pub fn render_attach_frame(
     queue!(frame_bytes, EndSynchronizedUpdate).context("failed queuing end synchronized update")?;
 
     let terminal_write_started_at = Instant::now();
-    let mut stdout = io::stdout();
+    let stdout = io::stdout();
+    let mut stdout = io::BufWriter::new(stdout.lock());
     stdout
         .write_all(&frame_bytes)
         .context("failed writing attach frame")?;
