@@ -18,7 +18,10 @@ bmux_plugin_schema_macros::schema! {
     source: "bpdl/performance-plugin.bpdl",
 }
 
-pub use bmux_performance_state::PerformanceEventRateLimiter;
+pub use bmux_performance_state::{
+    PerformanceEventRateLimiter, PerformanceRecordingLevel as PrimitivePerformanceRecordingLevel,
+    PerformanceRuntimeSettings as PrimitivePerformanceRuntimeSettings,
+};
 pub use capabilities::{PERFORMANCE_READ, PERFORMANCE_WRITE};
 pub use metric_events::MetricEvent;
 pub use performance_events::PerformanceEvent;
@@ -29,7 +32,7 @@ pub use performance_types::{
     ThemeHeaderSettings, ThemeHeaderStyle,
 };
 
-impl From<performance_types::PerformanceRecordingLevel> for bmux_ipc::PerformanceRecordingLevel {
+impl From<performance_types::PerformanceRecordingLevel> for PrimitivePerformanceRecordingLevel {
     fn from(value: performance_types::PerformanceRecordingLevel) -> Self {
         match value {
             performance_types::PerformanceRecordingLevel::Off => Self::Off,
@@ -40,18 +43,18 @@ impl From<performance_types::PerformanceRecordingLevel> for bmux_ipc::Performanc
     }
 }
 
-impl From<bmux_ipc::PerformanceRecordingLevel> for performance_types::PerformanceRecordingLevel {
-    fn from(value: bmux_ipc::PerformanceRecordingLevel) -> Self {
+impl From<PrimitivePerformanceRecordingLevel> for performance_types::PerformanceRecordingLevel {
+    fn from(value: PrimitivePerformanceRecordingLevel) -> Self {
         match value {
-            bmux_ipc::PerformanceRecordingLevel::Off => Self::Off,
-            bmux_ipc::PerformanceRecordingLevel::Basic => Self::Basic,
-            bmux_ipc::PerformanceRecordingLevel::Detailed => Self::Detailed,
-            bmux_ipc::PerformanceRecordingLevel::Trace => Self::Trace,
+            PrimitivePerformanceRecordingLevel::Off => Self::Off,
+            PrimitivePerformanceRecordingLevel::Basic => Self::Basic,
+            PrimitivePerformanceRecordingLevel::Detailed => Self::Detailed,
+            PrimitivePerformanceRecordingLevel::Trace => Self::Trace,
         }
     }
 }
 
-impl From<performance_types::PerformanceRuntimeSettings> for bmux_ipc::PerformanceRuntimeSettings {
+impl From<performance_types::PerformanceRuntimeSettings> for PrimitivePerformanceRuntimeSettings {
     fn from(value: performance_types::PerformanceRuntimeSettings) -> Self {
         Self {
             recording_level: value.recording_level.into(),
@@ -63,8 +66,8 @@ impl From<performance_types::PerformanceRuntimeSettings> for bmux_ipc::Performan
     }
 }
 
-impl From<bmux_ipc::PerformanceRuntimeSettings> for performance_types::PerformanceRuntimeSettings {
-    fn from(value: bmux_ipc::PerformanceRuntimeSettings) -> Self {
+impl From<PrimitivePerformanceRuntimeSettings> for performance_types::PerformanceRuntimeSettings {
+    fn from(value: PrimitivePerformanceRuntimeSettings) -> Self {
         Self {
             recording_level: value.recording_level.into(),
             window_ms: value.window_ms,

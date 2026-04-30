@@ -9,7 +9,7 @@ fn interface_ids_match_bpdl_source() {
 }
 
 #[test]
-fn runtime_settings_convert_to_ipc() {
+fn runtime_settings_convert_to_primitive() {
     let settings = bmux_performance_plugin_api::performance_types::PerformanceRuntimeSettings {
         recording_level:
             bmux_performance_plugin_api::performance_types::PerformanceRecordingLevel::Detailed,
@@ -18,10 +18,10 @@ fn runtime_settings_convert_to_ipc() {
         max_payload_bytes_per_sec: 2048,
     };
 
-    let ipc: bmux_ipc::PerformanceRuntimeSettings = settings.into();
+    let primitive: bmux_performance_state::PerformanceRuntimeSettings = settings.into();
     assert_eq!(
-        ipc.recording_level,
-        bmux_ipc::PerformanceRecordingLevel::Detailed
+        primitive.recording_level,
+        bmux_performance_state::PerformanceRecordingLevel::Detailed
     );
-    assert_eq!(ipc.max_payload_bytes_per_sec, 2048);
+    assert_eq!(primitive.max_payload_bytes_per_sec, 2048);
 }
