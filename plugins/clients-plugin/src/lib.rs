@@ -13,7 +13,7 @@ pub use follow_state::FollowState;
 
 use bmux_client_state::{
     FollowEntry, FollowStateHandle, FollowStateReader, FollowStateSnapshot, FollowStateWriter,
-    FollowTargetUpdate,
+    FollowTargetGoneUpdate, FollowTargetUpdate,
 };
 use bmux_clients_plugin_api::clients_commands::{
     self, ClientAck, ClientsCommandsService, SetCurrentSessionError, SetFollowingError,
@@ -24,7 +24,6 @@ use bmux_clients_plugin_api::clients_state::{
 };
 use bmux_contexts_plugin_api::contexts_commands;
 use bmux_contexts_plugin_api::contexts_state::ContextSelector;
-use bmux_ipc::Event;
 use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
 };
@@ -32,7 +31,7 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     HostScope, PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
     StatefulPluginResult, StatefulPluginSnapshot, TypedServiceRegistrationContext,
-    TypedServiceRegistry, WireEventSinkHandle,
+    TypedServiceRegistry,
 };
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::SessionManagerHandle;
@@ -122,8 +121,18 @@ impl FollowStateWriter for FollowStateAdapter {
         self.with_write(|state| state.connect_client(client_id), ());
     }
 
-    fn disconnect_client(&self, client_id: ClientId) -> Vec<Event> {
-        self.with_write(|state| state.disconnect_client(client_id), Vec::new())
+    fn disconnect_client(&self, client_id: ClientId) -> Vec<FollowTargetGoneUpdate> {
+        let updates = self.with_write(|state| state.disconnect_client(client_id), Vec::new());
+        for update in &updates {
+            let _ = global_event_bus().emit(
+                &clients_events::EVENT_KIND,
+                ClientEvent::FollowTargetGone {
+                    follower_client_id: update.follower_client_id.0,
+                    former_leader_client_id: update.former_leader_client_id.0,
+                },
+            );
+        }
+        updates
     }
 
     fn set_selected_target(
@@ -330,19 +339,6 @@ impl StatefulPlugin for ClientsStatefulPlugin {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SetCurrentSessionArgs {
     session_id: Uuid,
-}
-
-/// Look up the server-registered `WireEventSinkHandle` from the plugin
-/// state registry and publish the given wire event through it. Silent
-/// no-op when no server is attached (tests / headless tooling).
-fn publish_wire_event(event: bmux_ipc::Event) {
-    let Some(handle) = global_plugin_state_registry().get::<WireEventSinkHandle>() else {
-        return;
-    };
-    let Ok(guard) = handle.read() else {
-        return;
-    };
-    let _ = guard.0.publish(event);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -600,12 +596,6 @@ fn set_current_session_local(
                     session_id: update_session.0,
                 },
             );
-            publish_wire_event(bmux_ipc::Event::FollowTargetChanged {
-                follower_client_id: update.follower_client_id.0,
-                leader_client_id: update.leader_client_id.0,
-                context_id: update.context_id,
-                session_id: update_session.0,
-            });
         }
     }
 
@@ -699,9 +689,6 @@ fn set_following_via_ipc(
                     follower_client_id: self_id,
                 },
             );
-            publish_wire_event(bmux_ipc::Event::FollowStopped {
-                follower_client_id: self_id,
-            });
         }
         return Ok(ClientAck { client_id: self_id });
     }
@@ -781,10 +768,8 @@ fn set_following_via_ipc(
         }
     }
 
-    // Emit event-bus events: generic FollowChanged for plugin
-    // consumers, plus the wire-shape FollowStarted / FollowTargetChanged
-    // events that server's registered WireEventSinkHandle fans out to
-    // cross-process attach-UI subscribers.
+    // Emit event-bus events for plugin consumers and cross-process
+    // attach-UI subscribers via the generic plugin-bus forwarder.
     let _ = global_event_bus().emit(
         &clients_events::EVENT_KIND,
         ClientEvent::FollowChanged {
@@ -801,11 +786,6 @@ fn set_following_via_ipc(
             global: req.global,
         },
     );
-    publish_wire_event(bmux_ipc::Event::FollowStarted {
-        follower_client_id: self_id,
-        leader_client_id: target_client_id,
-        global: req.global,
-    });
     if let Some(session_id) = initial_target_session {
         let _ = global_event_bus().emit(
             &clients_events::EVENT_KIND,
@@ -816,12 +796,6 @@ fn set_following_via_ipc(
                 session_id: session_id.0,
             },
         );
-        publish_wire_event(bmux_ipc::Event::FollowTargetChanged {
-            follower_client_id: self_id,
-            leader_client_id: target_client_id,
-            context_id: initial_target_context,
-            session_id: session_id.0,
-        });
     }
 
     Ok(ClientAck { client_id: self_id })

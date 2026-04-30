@@ -1927,7 +1927,7 @@ async fn handle_connection(
         &mut selected_session,
         &mut attached_stream_session,
     )?;
-    disconnect_follow_state(&state, client_id)?;
+    disconnect_follow_state(client_id);
     {
         let mut principals = state
             .client_principals
@@ -1948,8 +1948,7 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         | Event::SessionRemoved { id }
         | Event::ClientAttached { id }
         | Event::ClientDetached { id } => Some(*id),
-        Event::FollowTargetChanged { session_id, .. }
-        | Event::AttachViewChanged { session_id, .. }
+        Event::AttachViewChanged { session_id, .. }
         | Event::PaneOutputAvailable { session_id, .. }
         | Event::PaneOutput { session_id, .. }
         | Event::PaneImageAvailable { session_id, .. }
@@ -1957,9 +1956,6 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         | Event::PaneRestarted { session_id, .. } => Some(*session_id),
         Event::ServerStarted
         | Event::ServerStopping
-        | Event::FollowStarted { .. }
-        | Event::FollowStopped { .. }
-        | Event::FollowTargetGone { .. }
         | Event::RecordingStarted { .. }
         | Event::RecordingStopped { .. }
         | Event::PluginBusEvent { .. } => None,
@@ -2155,14 +2151,8 @@ fn reconcile_selected_session_membership(
     Ok(())
 }
 
-fn disconnect_follow_state(state: &Arc<ServerState>, client_id: ClientId) -> Result<()> {
-    let events = follow_handle().0.disconnect_client(client_id);
-
-    for event in events {
-        emit_event(state, event)?;
-    }
-
-    Ok(())
+fn disconnect_follow_state(client_id: ClientId) {
+    let _ = follow_handle().0.disconnect_client(client_id);
 }
 
 fn mark_snapshot_dirty(state: &Arc<ServerState>) {

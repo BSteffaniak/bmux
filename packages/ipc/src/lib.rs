@@ -1172,25 +1172,6 @@ pub enum Event {
     ClientDetached {
         id: Uuid,
     },
-    FollowStarted {
-        follower_client_id: Uuid,
-        leader_client_id: Uuid,
-        global: bool,
-    },
-    FollowStopped {
-        follower_client_id: Uuid,
-    },
-    FollowTargetGone {
-        follower_client_id: Uuid,
-        former_leader_client_id: Uuid,
-    },
-    FollowTargetChanged {
-        follower_client_id: Uuid,
-        leader_client_id: Uuid,
-        #[serde(default)]
-        context_id: Option<Uuid>,
-        session_id: Uuid,
-    },
     AttachViewChanged {
         #[serde(default)]
         context_id: Option<Uuid>,
@@ -1845,30 +1826,6 @@ mod tests {
             Event::SessionRemoved { id },
             Event::ClientAttached { id },
             Event::ClientDetached { id },
-            Event::FollowStarted {
-                follower_client_id: id,
-                leader_client_id: id2,
-                global: false,
-            },
-            Event::FollowStopped {
-                follower_client_id: id,
-            },
-            Event::FollowTargetGone {
-                follower_client_id: id,
-                former_leader_client_id: id2,
-            },
-            Event::FollowTargetChanged {
-                follower_client_id: id,
-                leader_client_id: id2,
-                context_id: Some(Uuid::from_u128(3)),
-                session_id: Uuid::from_u128(4),
-            },
-            Event::FollowTargetChanged {
-                follower_client_id: id,
-                leader_client_id: id2,
-                context_id: None,
-                session_id: Uuid::from_u128(4),
-            },
             Event::AttachViewChanged {
                 context_id: Some(id),
                 session_id: id2,

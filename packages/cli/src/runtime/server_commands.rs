@@ -310,7 +310,7 @@ pub(super) async fn latest_server_event_name(
     Ok(events.last().map(server_event_name))
 }
 
-pub(super) const fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
+pub(super) fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
     match event {
         bmux_client::ServerEvent::ServerStarted => "server_started",
         bmux_client::ServerEvent::ServerStopping => "server_stopping",
@@ -318,10 +318,6 @@ pub(super) const fn server_event_name(event: &bmux_client::ServerEvent) -> &'sta
         bmux_client::ServerEvent::SessionRemoved { .. } => "session_removed",
         bmux_client::ServerEvent::ClientAttached { .. } => "client_attached",
         bmux_client::ServerEvent::ClientDetached { .. } => "client_detached",
-        bmux_client::ServerEvent::FollowStarted { .. } => "follow_started",
-        bmux_client::ServerEvent::FollowStopped { .. } => "follow_stopped",
-        bmux_client::ServerEvent::FollowTargetGone { .. } => "follow_target_gone",
-        bmux_client::ServerEvent::FollowTargetChanged { .. } => "follow_target_changed",
         bmux_client::ServerEvent::AttachViewChanged { .. } => "attach_view_changed",
         bmux_client::ServerEvent::PaneOutputAvailable { .. } => "pane_output_available",
         bmux_client::ServerEvent::PaneOutput { .. } => "pane_output",
@@ -330,8 +326,43 @@ pub(super) const fn server_event_name(event: &bmux_client::ServerEvent) -> &'sta
         bmux_client::ServerEvent::PaneRestarted { .. } => "pane_restarted",
         bmux_client::ServerEvent::RecordingStarted { .. } => "recording_started",
         bmux_client::ServerEvent::RecordingStopped { .. } => "recording_stopped",
-        bmux_client::ServerEvent::PluginBusEvent { .. } => "plugin_bus_event",
+        bmux_client::ServerEvent::PluginBusEvent { kind, payload } => {
+            plugin_bus_event_name(kind, payload)
+        }
     }
+}
+
+fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
+    if kind == bmux_clients_plugin_api::clients_events::EVENT_KIND.as_str() {
+        return serde_json::from_slice::<bmux_clients_plugin_api::clients_events::ClientEvent>(
+            payload,
+        )
+        .map_or("plugin_bus_event", |event| match event {
+            bmux_clients_plugin_api::clients_events::ClientEvent::Attached { .. } => {
+                "client_attached"
+            }
+            bmux_clients_plugin_api::clients_events::ClientEvent::Detached { .. } => {
+                "client_detached"
+            }
+            bmux_clients_plugin_api::clients_events::ClientEvent::FollowStarted { .. } => {
+                "follow_started"
+            }
+            bmux_clients_plugin_api::clients_events::ClientEvent::FollowStopped { .. } => {
+                "follow_stopped"
+            }
+            bmux_clients_plugin_api::clients_events::ClientEvent::FollowTargetGone { .. } => {
+                "follow_target_gone"
+            }
+            bmux_clients_plugin_api::clients_events::ClientEvent::FollowTargetChanged {
+                ..
+            } => "follow_target_changed",
+            bmux_clients_plugin_api::clients_events::ClientEvent::SessionSelected { .. }
+            | bmux_clients_plugin_api::clients_events::ClientEvent::FollowChanged { .. } => {
+                "plugin_bus_event"
+            }
+        });
+    }
+    "plugin_bus_event"
 }
 
 pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -> Result<u8> {

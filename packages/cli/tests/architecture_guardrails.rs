@@ -1019,12 +1019,11 @@ fn control_catalog_plugin_exists() {
 /// Verify that the follow-client IPC variants
 /// (`Request::FollowClient`, `Request::Unfollow`) and their response
 /// payloads (`ResponsePayload::FollowStarted`,
-/// `ResponsePayload::FollowStopped`) have been deleted. Follow
-/// orchestration lives in `clients-plugin`'s typed
-/// `clients-commands::set-following` handler; the server bridges the
-/// plugin's typed `ClientEvent::{FollowStarted, FollowStopped,
-/// FollowTargetChanged}` into the legacy wire
-/// `Event::{FollowStarted, FollowStopped, FollowTargetChanged}`.
+/// `ResponsePayload::FollowStopped`) and legacy follow `Event` variants
+/// have been deleted. Follow orchestration lives in `clients-plugin`'s
+/// typed `clients-commands::set-following` handler; streaming clients
+/// receive generated `clients-events` through the generic plugin-bus
+/// forwarder.
 #[test]
 fn follow_ipc_variants_are_absent() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
@@ -1033,6 +1032,10 @@ fn follow_ipc_variants_are_absent() {
         "    Unfollow,",
         "ResponsePayload::FollowStarted",
         "ResponsePayload::FollowStopped",
+        "Event::FollowStarted",
+        "Event::FollowStopped",
+        "Event::FollowTargetGone",
+        "Event::FollowTargetChanged",
     ];
     for marker in denied {
         assert!(
@@ -1048,10 +1051,9 @@ fn follow_ipc_variants_are_absent() {
     assert!(
         !server_source.contains("fn spawn_client_events_bridge"),
         "packages/server/src/lib.rs must not define \
-         `spawn_client_events_bridge`; the clients plugin now \
-         publishes `Event::{{FollowStarted, FollowStopped, \
-         FollowTargetChanged}}` directly through the registered \
-         `WireEventSinkHandle`",
+         `spawn_client_events_bridge`; the clients plugin emits \
+         generated `clients-events` forwarded through the generic \
+         plugin-bus bridge",
     );
 }
 

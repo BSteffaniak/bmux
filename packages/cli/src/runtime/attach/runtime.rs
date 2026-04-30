@@ -2443,6 +2443,28 @@ async fn handle_attach_stream_server_event(
                     );
                 }
             }
+        } else if kind.as_str() == bmux_clients_plugin_api::clients_events::EVENT_KIND.as_str() {
+            match serde_json::from_slice::<bmux_clients_plugin_api::clients_events::ClientEvent>(
+                payload,
+            ) {
+                Ok(event) => {
+                    handle_clients_plugin_event(
+                        client,
+                        follow_target_id,
+                        Some(self_client_id),
+                        view_state,
+                        event,
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded clients event payload",
+                    );
+                }
+            }
         } else if kind.as_str()
             == bmux_control_catalog_plugin_api::control_catalog_events::EVENT_KIND.as_str()
         {
@@ -6089,8 +6111,8 @@ pub async fn handle_attach_loop_event(
 pub async fn handle_attach_server_event(
     client: &mut StreamingBmuxClient,
     server_event: bmux_client::ServerEvent,
-    follow_target_id: Option<Uuid>,
-    self_client_id: Option<Uuid>,
+    _follow_target_id: Option<Uuid>,
+    _self_client_id: Option<Uuid>,
     _global: bool,
     view_state: &mut AttachViewState,
 ) -> Result<AttachLoopControl> {
@@ -6113,68 +6135,6 @@ pub async fn handle_attach_server_event(
     }
 
     match server_event {
-        bmux_client::ServerEvent::FollowTargetChanged {
-            follower_client_id,
-            leader_client_id,
-            context_id,
-            session_id,
-        } => {
-            if Some(leader_client_id) != follow_target_id
-                || Some(follower_client_id) != self_client_id
-            {
-                return Ok(AttachLoopControl::Continue);
-            }
-            let attach_info = if let Some(context_id) = context_id {
-                open_attach_for_context(client, context_id)
-                    .await
-                    .map_err(map_attach_client_error)?
-            } else if view_state.attached_context_id.is_none() {
-                open_attach_for_session(client, session_id)
-                    .await
-                    .map_err(map_attach_client_error)?
-            } else {
-                return Ok(AttachLoopControl::Continue);
-            };
-            view_state.attached_id = attach_info.session_id;
-            view_state.attached_context_id = attach_info.context_id.or(context_id);
-            view_state.can_write = attach_info.can_write;
-            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
-                .await?;
-            hydrate_attach_state_from_snapshot(client, view_state)
-                .await
-                .map_err(map_attach_client_error)?;
-            refresh_attach_status_catalog_best_effort(client, view_state).await;
-            view_state.ui_mode = AttachUiMode::Normal;
-            let status = attach_context_status_from_catalog(view_state);
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-            if !view_state.can_write {
-                // Route the read-only notice to the status line — raw
-                // mode is active here and `println!` would overwrite
-                // pane content.
-                view_state.set_transient_status(
-                    "read-only attach: input disabled".to_string(),
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            }
-        }
-        bmux_client::ServerEvent::FollowTargetGone {
-            former_leader_client_id,
-            ..
-        } if Some(former_leader_client_id) == follow_target_id => {
-            // Surface the detach notice through the status line; raw
-            // mode is active and `println!` would corrupt rendering.
-            view_state.set_transient_status(
-                "follow target disconnected; staying on current session".to_string(),
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-        }
         bmux_client::ServerEvent::AttachViewChanged {
             context_id,
             session_id,
@@ -6238,6 +6198,80 @@ async fn handle_control_catalog_changed(
         }
     }
     view_state.dirty.status_needs_redraw = true;
+}
+
+async fn handle_clients_plugin_event(
+    client: &mut StreamingBmuxClient,
+    follow_target_id: Option<Uuid>,
+    self_client_id: Option<Uuid>,
+    view_state: &mut AttachViewState,
+    event: bmux_clients_plugin_api::clients_events::ClientEvent,
+) -> Result<()> {
+    match event {
+        bmux_clients_plugin_api::clients_events::ClientEvent::FollowTargetChanged {
+            follower_client_id,
+            leader_client_id,
+            context_id,
+            session_id,
+        } => {
+            if Some(leader_client_id) != follow_target_id
+                || Some(follower_client_id) != self_client_id
+            {
+                return Ok(());
+            }
+            let attach_info = if let Some(context_id) = context_id {
+                open_attach_for_context(client, context_id)
+                    .await
+                    .map_err(map_attach_client_error)?
+            } else if view_state.attached_context_id.is_none() {
+                open_attach_for_session(client, session_id)
+                    .await
+                    .map_err(map_attach_client_error)?
+            } else {
+                return Ok(());
+            };
+            view_state.attached_id = attach_info.session_id;
+            view_state.attached_context_id = attach_info.context_id.or(context_id);
+            view_state.can_write = attach_info.can_write;
+            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
+                .await?;
+            hydrate_attach_state_from_snapshot(client, view_state)
+                .await
+                .map_err(map_attach_client_error)?;
+            refresh_attach_status_catalog_best_effort(client, view_state).await;
+            view_state.ui_mode = AttachUiMode::Normal;
+            let status = attach_context_status_from_catalog(view_state);
+            set_attach_context_status(
+                view_state,
+                status,
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            if !view_state.can_write {
+                // Route the read-only notice to the status line; raw
+                // mode is active and `println!` would overwrite pane content.
+                view_state.set_transient_status(
+                    "read-only attach: input disabled".to_string(),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
+        }
+        bmux_clients_plugin_api::clients_events::ClientEvent::FollowTargetGone {
+            former_leader_client_id,
+            ..
+        } if Some(former_leader_client_id) == follow_target_id => {
+            // Surface the detach notice through the status line; raw
+            // mode is active and `println!` would corrupt rendering.
+            view_state.set_transient_status(
+                "follow target disconnected; staying on current session".to_string(),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub fn apply_attach_view_change_components(

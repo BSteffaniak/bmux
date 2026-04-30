@@ -9,7 +9,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use bmux_ipc::{ClientSummary, Event};
+use bmux_ipc::ClientSummary;
 use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,6 +32,13 @@ pub struct FollowTargetUpdate {
     pub leader_client_id: ClientId,
     pub context_id: Option<Uuid>,
     pub session_id: Option<SessionId>,
+}
+
+/// A follower was tracking a leader that disconnected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FollowTargetGoneUpdate {
+    pub follower_client_id: ClientId,
+    pub former_leader_client_id: ClientId,
 }
 
 /// Snapshot of follow-state suitable for persistence round-trips.
@@ -113,9 +120,10 @@ pub trait FollowStateReader: Send + Sync {
 pub trait FollowStateWriter: FollowStateReader {
     /// Mark a client connected with empty selection.
     fn connect_client(&self, client_id: ClientId);
-    /// Mark a client disconnected; returns any `FollowTargetGone`
-    /// events for followers that were tracking this client.
-    fn disconnect_client(&self, client_id: ClientId) -> Vec<Event>;
+    /// Mark a client disconnected; returns any followers that were
+    /// tracking this client so the clients plugin can emit typed
+    /// lifecycle events.
+    fn disconnect_client(&self, client_id: ClientId) -> Vec<FollowTargetGoneUpdate>;
     /// Update the client's selected context + session target.
     fn set_selected_target(
         &self,
@@ -226,7 +234,7 @@ impl FollowStateReader for NoopFollowState {
 
 impl FollowStateWriter for NoopFollowState {
     fn connect_client(&self, _client_id: ClientId) {}
-    fn disconnect_client(&self, _client_id: ClientId) -> Vec<Event> {
+    fn disconnect_client(&self, _client_id: ClientId) -> Vec<FollowTargetGoneUpdate> {
         Vec::new()
     }
     fn set_selected_target(

@@ -96,6 +96,12 @@ interface clients-events {
         follow-stopped {
             follower-client-id: uuid,
         },
+        // The followed leader disconnected. The follower remains on
+        // its current target, but is no longer following that leader.
+        follow-target-gone {
+            follower-client-id: uuid,
+            former-leader-client-id: uuid,
+        },
         // The follow-target's current selection changed. Emitted when
         // the leader's selected session (and optionally selected
         // context) moves, so the follower's UI can retarget.

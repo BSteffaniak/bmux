@@ -15,8 +15,8 @@
 //! domain-agnostic `bmux_client_state::FollowStateHandle` trait
 //! object rather than naming this concrete type.
 
-use bmux_client_state::{FollowEntry, FollowTargetUpdate};
-use bmux_ipc::{ClientSummary, Event};
+use bmux_client_state::{FollowEntry, FollowTargetGoneUpdate, FollowTargetUpdate};
+use bmux_ipc::ClientSummary;
 use bmux_session_models::{ClientId, SessionId};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
@@ -50,9 +50,9 @@ impl FollowState {
         self.attach_detach_allowed.entry(client_id).or_insert(true);
     }
 
-    /// Remove a client's tracking and return follow-target-gone events
+    /// Remove a client's tracking and return follow-target-gone updates
     /// for any clients that were following it.
-    pub fn disconnect_client(&mut self, client_id: ClientId) -> Vec<Event> {
+    pub fn disconnect_client(&mut self, client_id: ClientId) -> Vec<FollowTargetGoneUpdate> {
         self.connected_clients.remove(&client_id);
         self.selected_contexts.remove(&client_id);
         self.selected_sessions.remove(&client_id);
@@ -74,9 +74,9 @@ impl FollowState {
             .filter_map(|follower_id| {
                 self.follows
                     .remove(&follower_id)
-                    .map(|entry| Event::FollowTargetGone {
-                        follower_client_id: follower_id.0,
-                        former_leader_client_id: entry.leader_client_id.0,
+                    .map(|entry| FollowTargetGoneUpdate {
+                        follower_client_id: follower_id,
+                        former_leader_client_id: entry.leader_client_id,
                     })
             })
             .collect()

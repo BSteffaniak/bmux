@@ -434,6 +434,13 @@ pub(super) async fn run_server_start(
                     >(kind)
                 }
                 (k, bmux_plugin_sdk::PluginEventDelivery::Broadcast)
+                    if k == bmux_clients_plugin_api::clients_events::EVENT_KIND.as_str() =>
+                {
+                    server.spawn_plugin_bus_forwarder::<
+                        bmux_clients_plugin_api::clients_events::ClientEvent,
+                    >(kind)
+                }
+                (k, bmux_plugin_sdk::PluginEventDelivery::Broadcast)
                     if k == bmux_control_catalog_plugin_api::control_catalog_events::EVENT_KIND.as_str() =>
                 {
                     server.spawn_plugin_bus_forwarder::<

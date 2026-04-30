@@ -3488,6 +3488,41 @@ fn event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
             )
             | (bmux_ipc::Event::PaneExited { .. }, "pane_exited")
             | (bmux_ipc::Event::PaneRestarted { .. }, "pane_restarted")
+    ) || plugin_bus_event_matches(event, name)
+}
+
+fn plugin_bus_event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
+    let bmux_ipc::Event::PluginBusEvent { kind, payload } = event else {
+        return false;
+    };
+    if kind != bmux_clients_plugin_api::clients_events::EVENT_KIND.as_str() {
+        return false;
+    }
+    serde_json::from_slice::<bmux_clients_plugin_api::clients_events::ClientEvent>(payload).is_ok_and(
+        |event| {
+            matches!(
+                (event, name),
+                (
+                    bmux_clients_plugin_api::clients_events::ClientEvent::Attached { .. },
+                    "client_attached"
+                ) | (
+                    bmux_clients_plugin_api::clients_events::ClientEvent::Detached { .. },
+                    "client_detached"
+                ) | (
+                    bmux_clients_plugin_api::clients_events::ClientEvent::FollowStarted { .. },
+                    "follow_started"
+                ) | (
+                    bmux_clients_plugin_api::clients_events::ClientEvent::FollowStopped { .. },
+                    "follow_stopped"
+                ) | (
+                    bmux_clients_plugin_api::clients_events::ClientEvent::FollowTargetGone { .. },
+                    "follow_target_gone"
+                ) | (
+                    bmux_clients_plugin_api::clients_events::ClientEvent::FollowTargetChanged { .. },
+                    "follow_target_changed"
+                )
+            )
+        },
     )
 }
 
