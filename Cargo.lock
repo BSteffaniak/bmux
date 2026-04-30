@@ -1010,7 +1010,6 @@ dependencies = [
  "bmux_scene_protocol_render",
  "crossterm",
  "tracing",
- "unicode-width",
  "uuid",
  "vt100",
 ]

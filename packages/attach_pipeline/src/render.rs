@@ -19,7 +19,6 @@ use crossterm::style::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1140,6 +1139,116 @@ const fn selected_style(mut style: CellStyle) -> CellStyle {
     style
 }
 
+#[derive(Clone, Copy)]
+struct ContentRowRenderContext<'a> {
+    screen: &'a vt100::Screen,
+    selection: Option<(AttachScrollbackPosition, AttachScrollbackPosition)>,
+    scrollback_offset: usize,
+    runtime_appearance: &'a RuntimeAppearance,
+}
+
+fn render_content_row_segment(
+    context: ContentRowRenderContext<'_>,
+    row: u16,
+    start_col: u16,
+    end_col: u16,
+) -> String {
+    let mut line = String::new();
+    let mut current = CellStyle::default();
+    let mut col = start_col;
+    while col < end_col {
+        if let Some(cell) = context.screen.cell(row, col) {
+            let absolute_row = context.scrollback_offset.saturating_add(usize::from(row));
+            let style = if cell_selected(context.selection, absolute_row, usize::from(col)) {
+                selected_style(cell_style(cell))
+            } else {
+                cell_style(cell)
+            };
+            let style = apply_content_effects(style, context.runtime_appearance);
+            if style != current {
+                line.push_str(&style_sgr(style));
+                current = style;
+            }
+            if cell.is_wide_continuation() {
+                line.push(' ');
+                col = col.saturating_add(1);
+                continue;
+            }
+            let text = if cell.has_contents() {
+                cell.contents()
+            } else {
+                " "
+            };
+            line.push_str(text);
+            if cell.is_wide() {
+                col = col.saturating_add(2);
+            } else {
+                col = col.saturating_add(1);
+            }
+        } else {
+            if current != CellStyle::default() {
+                line.push_str("\x1b[0m");
+                current = CellStyle::default();
+            }
+            line.push(' ');
+            col = col.saturating_add(1);
+        }
+    }
+
+    if current != CellStyle::default() {
+        line.push_str("\x1b[0m");
+    }
+    line
+}
+
+fn damaged_row_ranges(
+    screen: &vt100::Screen,
+    row: u16,
+    width: u16,
+    rects: &[DamageRect],
+) -> Vec<(u16, u16)> {
+    let mut ranges = Vec::new();
+    for rect in rects {
+        if row < rect.y || row >= rect.bottom() {
+            continue;
+        }
+        let mut start = rect.x.min(width);
+        let mut end = rect.right().min(width);
+        if start >= end {
+            continue;
+        }
+        if start > 0
+            && screen
+                .cell(row, start)
+                .is_some_and(vt100::Cell::is_wide_continuation)
+        {
+            start = start.saturating_sub(1);
+        }
+        if end < width
+            && screen
+                .cell(row, end)
+                .is_some_and(vt100::Cell::is_wide_continuation)
+        {
+            end = end.saturating_add(1).min(width);
+        }
+        let mut index = 0;
+        let mut merged = (start, end);
+        while index < ranges.len() {
+            let existing: (u16, u16) = ranges[index];
+            if existing.0 <= merged.1 && merged.0 <= existing.1 {
+                merged = (existing.0.min(merged.0), existing.1.max(merged.1));
+                ranges.swap_remove(index);
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+        ranges.push(merged);
+    }
+    ranges.sort_unstable();
+    ranges
+}
+
 fn selection_bounds(
     anchor: Option<AttachScrollbackPosition>,
     cursor: Option<AttachScrollbackCursor>,
@@ -1452,79 +1561,42 @@ pub fn render_attach_scene<W: io::Write>(
                 continue;
             }
             let damaged_content_rows = frame_damage.content_surface_rects(pane_id);
+            let render_context = ContentRowRenderContext {
+                screen,
+                selection,
+                scrollback_offset,
+                runtime_appearance,
+            };
             for row in 0..inner_h {
-                let force_row_damage = damaged_content_rows.iter().any(|rect| {
-                    let row = u16::try_from(row).unwrap_or(u16::MAX);
-                    row >= rect.y && row < rect.bottom()
-                });
-                let y = content.y.saturating_add(row as u16);
-                let mut line = String::new();
-                let mut current = CellStyle::default();
-                let mut used_cols = 0usize;
-                let mut col = 0u16;
-                while col < inner_width {
-                    if let Some(cell) = screen.cell(row as u16, col) {
-                        let absolute_row = scrollback_offset.saturating_add(row);
-                        let style = if cell_selected(selection, absolute_row, usize::from(col)) {
-                            selected_style(cell_style(cell))
-                        } else {
-                            cell_style(cell)
-                        };
-                        let style = apply_content_effects(style, runtime_appearance);
-                        if style != current {
-                            line.push_str(&style_sgr(style));
-                            current = style;
-                        }
-                        if cell.is_wide_continuation() {
-                            line.push(' ');
-                            used_cols = used_cols.saturating_add(1);
-                            col = col.saturating_add(1);
-                            continue;
-                        }
-                        let text = if cell.has_contents() {
-                            cell.contents()
-                        } else {
-                            " "
-                        };
-                        line.push_str(text);
-                        let width = UnicodeWidthStr::width(text).max(1);
-                        used_cols = used_cols.saturating_add(width);
-                        if cell.is_wide() {
-                            col = col.saturating_add(2);
-                        } else {
-                            col = col.saturating_add(1);
-                        }
-                    } else {
-                        if current != CellStyle::default() {
-                            line.push_str("\x1b[0m");
-                            current = CellStyle::default();
-                        }
-                        line.push(' ');
-                        used_cols = used_cols.saturating_add(1);
-                        col = col.saturating_add(1);
-                    }
-                }
-
-                if used_cols < inner_w {
-                    if current != CellStyle::default() {
-                        line.push_str("\x1b[0m");
-                    }
-                    line.push_str(&" ".repeat(inner_w - used_cols));
-                } else if current != CellStyle::default() {
-                    line.push_str("\x1b[0m");
-                }
+                let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
+                let damaged_ranges =
+                    damaged_row_ranges(screen, row_u16, inner_width, damaged_content_rows);
+                let force_row_damage = !damaged_ranges.is_empty();
+                let y = content.y.saturating_add(row_u16);
+                let line = render_content_row_segment(render_context, row_u16, 0, inner_width);
 
                 // Row-level diff: skip emitting if the rendered string
                 // matches the previous frame's cached version for this row.
                 let cached = entry.prev_rows.get(row);
-                if force_row_damage || cached.is_none_or(|c| *c != line) {
+                if cached.is_none_or(|c| *c != line) {
                     queue!(stdout, MoveTo(content.x, y), Print(&line))
                         .context("failed drawing pane content")?;
-                    if row < entry.prev_rows.len() {
-                        entry.prev_rows[row] = line;
-                    } else {
-                        entry.prev_rows.push(line);
+                } else if force_row_damage {
+                    for (start_col, end_col) in damaged_ranges {
+                        let segment =
+                            render_content_row_segment(render_context, row_u16, start_col, end_col);
+                        queue!(
+                            stdout,
+                            MoveTo(content.x.saturating_add(start_col), y),
+                            Print(segment)
+                        )
+                        .context("failed drawing damaged pane content segment")?;
                     }
+                }
+                if row < entry.prev_rows.len() {
+                    entry.prev_rows[row] = line;
+                } else {
+                    entry.prev_rows.push(line);
                 }
             }
             // Trim stale cache entries if the visible row count shrank.
@@ -2003,7 +2075,8 @@ mod tests {
         .expect("rect-damaged render should succeed");
 
         let output = String::from_utf8(output).expect("output should be utf8");
-        assert!(output.contains("ijklmnop"));
+        assert!(output.contains("\u{1b}[2;3Hkl"));
+        assert!(!output.contains("ijklmnop"));
         assert!(!output.contains("abcdefgh"));
         assert!(!output.contains("qrstuvwx"));
     }
