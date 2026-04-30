@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::types::{Action, Playbook, PlaybookConfig, ServiceKind, SplitDirection, Step};
+use super::types::{
+    Action, Playbook, PlaybookConfig, RenderAssertion, ServiceKind, SplitDirection, Step,
+};
 
 /// Parse a playbook from the line-oriented DSL format.
 ///
@@ -86,6 +88,9 @@ fn parse_config_directive(
         }
         "record" => {
             config.record = rest.trim().parse::<bool>().unwrap_or(true);
+        }
+        "render-trace" => {
+            config.render_trace = rest.trim().parse::<bool>().unwrap_or(true);
         }
         "name" => {
             config.name = Some(rest.trim().to_string());
@@ -349,8 +354,55 @@ pub fn parse_action_line(line: &str) -> Result<Action> {
         }
         "screen" => Ok(Action::Screen),
         "status" => Ok(Action::Status),
+        "render-mark" => {
+            let id = require_arg(&args, "id", "render-mark")?;
+            Ok(Action::RenderMark { id })
+        }
+        "assert-render" => {
+            let since = require_arg(&args, "since", "assert-render")?;
+            Ok(Action::AssertRender {
+                since,
+                assertion: parse_render_assertion(&args)?,
+            })
+        }
         _ => bail!("unknown action: {action_name}"),
     }
+}
+
+fn parse_render_assertion(args: &BTreeMap<String, String>) -> Result<RenderAssertion> {
+    let mut assertion = RenderAssertion::default();
+    macro_rules! parse_u64_opt {
+        ($field:ident) => {
+            assertion.$field = args
+                .get(stringify!($field))
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .with_context(|| format!("invalid {}", stringify!($field)))?;
+        };
+    }
+    macro_rules! parse_bool_opt {
+        ($field:ident) => {
+            assertion.$field = args
+                .get(stringify!($field))
+                .map(|value| value.parse::<bool>())
+                .transpose()
+                .with_context(|| format!("invalid {}", stringify!($field)))?;
+        };
+    }
+    parse_u64_opt!(min_frames);
+    parse_u64_opt!(max_frames);
+    parse_bool_opt!(full_frame);
+    parse_u64_opt!(max_full_frame_frames);
+    parse_u64_opt!(max_full_surface_fallbacks);
+    parse_u64_opt!(max_damage_rects);
+    parse_u64_opt!(max_damage_area_cells);
+    parse_u64_opt!(max_rows_emitted);
+    parse_u64_opt!(max_row_segments_emitted);
+    parse_u64_opt!(max_cells_emitted);
+    parse_u64_opt!(max_frame_bytes);
+    parse_bool_opt!(status_rendered);
+    parse_bool_opt!(overlay_rendered);
+    Ok(assertion)
 }
 
 fn require_arg(args: &BTreeMap<String, String>, key: &str, action: &str) -> Result<String> {

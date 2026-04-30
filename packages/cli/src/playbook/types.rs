@@ -45,6 +45,8 @@ pub struct PlaybookConfig {
     pub bundled_plugin_ids: Vec<String>,
     /// Print step-by-step progress to stderr during execution.
     pub verbose: bool,
+    /// Collect normalized render summaries for render-mark/assert-render steps.
+    pub render_trace: bool,
 }
 
 /// Controls how the sandbox server inherits environment variables.
@@ -103,6 +105,7 @@ impl Default for PlaybookConfig {
             binary: None,
             bundled_plugin_ids: Vec::new(),
             verbose: false,
+            render_trace: false,
         }
     }
 }
@@ -222,6 +225,45 @@ pub enum Action {
     /// Query the current session status (session ID, pane count, focused pane).
     /// In batch mode, the result is included in the step details.
     Status,
+    /// Mark the current render-trace position for later assertions.
+    RenderMark { id: String },
+    /// Assert bounded render activity since a marker.
+    AssertRender {
+        since: String,
+        assertion: RenderAssertion,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RenderAssertion {
+    pub min_frames: Option<u64>,
+    pub max_frames: Option<u64>,
+    pub full_frame: Option<bool>,
+    pub max_full_frame_frames: Option<u64>,
+    pub max_full_surface_fallbacks: Option<u64>,
+    pub max_damage_rects: Option<u64>,
+    pub max_damage_area_cells: Option<u64>,
+    pub max_rows_emitted: Option<u64>,
+    pub max_row_segments_emitted: Option<u64>,
+    pub max_cells_emitted: Option<u64>,
+    pub max_frame_bytes: Option<u64>,
+    pub status_rendered: Option<bool>,
+    pub overlay_rendered: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaybookRenderSummary {
+    pub frames: u64,
+    pub full_frame_frames: u64,
+    pub full_surface_fallbacks: u64,
+    pub damage_rects: u64,
+    pub damage_area_cells: u64,
+    pub rows_emitted: u64,
+    pub row_segments_emitted: u64,
+    pub cells_emitted: u64,
+    pub frame_bytes: u64,
+    pub status_rendered_frames: u64,
+    pub overlay_rendered_frames: u64,
 }
 
 /// Plugin service invocation kind.
@@ -276,6 +318,9 @@ pub struct StepResult {
     /// Only populated when `status == Fail` and the session was attached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_captures: Option<Vec<PaneCapture>>,
+    /// Render summary observed for this step when `@render-trace true` is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub render_summary: Option<PlaybookRenderSummary>,
     /// Whether this step had `continue_on_error` set. If true and the step
     /// failed, execution continued past this step.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -379,6 +424,8 @@ impl Action {
             Self::InvokeService { .. } => "invoke-service",
             Self::Screen => "screen",
             Self::Status => "status",
+            Self::RenderMark { .. } => "render-mark",
+            Self::AssertRender { .. } => "assert-render",
         }
     }
 
@@ -520,8 +567,39 @@ impl Action {
             }
             Self::Screen => "screen".to_string(),
             Self::Status => "status".to_string(),
+            Self::RenderMark { id } => {
+                format!("render-mark id='{}'", escape_single_quote(id))
+            }
+            Self::AssertRender { since, assertion } => {
+                let mut line = format!("assert-render since='{}'", escape_single_quote(since));
+                append_render_assertion_dsl(&mut line, assertion);
+                line
+            }
         }
     }
+}
+
+fn append_render_assertion_dsl(line: &mut String, assertion: &RenderAssertion) {
+    macro_rules! push_opt {
+        ($field:ident) => {
+            if let Some(value) = assertion.$field {
+                write!(line, " {}={value}", stringify!($field)).unwrap();
+            }
+        };
+    }
+    push_opt!(min_frames);
+    push_opt!(max_frames);
+    push_opt!(full_frame);
+    push_opt!(max_full_frame_frames);
+    push_opt!(max_full_surface_fallbacks);
+    push_opt!(max_damage_rects);
+    push_opt!(max_damage_area_cells);
+    push_opt!(max_rows_emitted);
+    push_opt!(max_row_segments_emitted);
+    push_opt!(max_cells_emitted);
+    push_opt!(max_frame_bytes);
+    push_opt!(status_rendered);
+    push_opt!(overlay_rendered);
 }
 
 #[cfg(test)]
@@ -916,6 +994,41 @@ mod tests {
                 assert_eq!(payload, r#"{"key":"val"}"#);
             }
             other => panic!("expected InvokeService, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_render_mark() {
+        let (_, parsed) = round_trip(&Action::RenderMark {
+            id: "baseline".to_string(),
+        });
+        match parsed {
+            Action::RenderMark { id } => assert_eq!(id, "baseline"),
+            other => panic!("expected RenderMark, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_assert_render() {
+        let (_, parsed) = round_trip(&Action::AssertRender {
+            since: "baseline".to_string(),
+            assertion: RenderAssertion {
+                min_frames: Some(1),
+                max_frames: Some(2),
+                full_frame: Some(false),
+                max_rows_emitted: Some(3),
+                ..RenderAssertion::default()
+            },
+        });
+        match parsed {
+            Action::AssertRender { since, assertion } => {
+                assert_eq!(since, "baseline");
+                assert_eq!(assertion.min_frames, Some(1));
+                assert_eq!(assertion.max_frames, Some(2));
+                assert_eq!(assertion.full_frame, Some(false));
+                assert_eq!(assertion.max_rows_emitted, Some(3));
+            }
+            other => panic!("expected AssertRender, got {other:?}"),
         }
     }
 

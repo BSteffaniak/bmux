@@ -121,6 +121,7 @@ pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
 
     // Track expected pane count for index validation
     let mut expected_pane_count: u32 = 0;
+    let mut render_marks = BTreeSet::new();
 
     for step in &playbook.steps {
         match &step.action {
@@ -132,6 +133,19 @@ pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
             }
             types::Action::ClosePane { .. } => {
                 expected_pane_count = expected_pane_count.saturating_sub(1);
+            }
+            types::Action::RenderMark { id } => {
+                render_marks.insert(id.clone());
+            }
+            types::Action::AssertRender { since, assertion } => {
+                validate_render_assertion_step(
+                    &mut errors,
+                    step.index,
+                    playbook.config.render_trace,
+                    &render_marks,
+                    since,
+                    assertion,
+                );
             }
 
             // Validate regex patterns
@@ -162,29 +176,7 @@ pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
 
             // Validate event names
             types::Action::WaitForEvent { event, timeout } => {
-                if timeout.is_zero() {
-                    errors.push(format!(
-                        "step {}: wait-for-event has zero timeout",
-                        step.index
-                    ));
-                }
-                let valid_events = [
-                    "server_started",
-                    "server_stopping",
-                    "session_created",
-                    "session_removed",
-                    "client_attached",
-                    "client_detached",
-                    "attach_view_changed",
-                ];
-                if !valid_events.contains(&event.as_str()) {
-                    errors.push(format!(
-                        "step {}: unknown event '{}'; valid events: {}",
-                        step.index,
-                        event,
-                        valid_events.join(", ")
-                    ));
-                }
+                validate_wait_for_event_step(&mut errors, step.index, event, *timeout);
             }
 
             // Warn if targeting a pane before any split
@@ -205,6 +197,61 @@ pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
     }
 
     errors
+}
+
+fn validate_wait_for_event_step(
+    errors: &mut Vec<String>,
+    step_index: usize,
+    event: &str,
+    timeout: std::time::Duration,
+) {
+    if timeout.is_zero() {
+        errors.push(format!(
+            "step {step_index}: wait-for-event has zero timeout"
+        ));
+    }
+    let valid_events = [
+        "server_started",
+        "server_stopping",
+        "session_created",
+        "session_removed",
+        "client_attached",
+        "client_detached",
+        "attach_view_changed",
+    ];
+    if !valid_events.contains(&event) {
+        errors.push(format!(
+            "step {step_index}: unknown event '{event}'; valid events: {}",
+            valid_events.join(", ")
+        ));
+    }
+}
+
+fn validate_render_assertion_step(
+    errors: &mut Vec<String>,
+    step_index: usize,
+    render_trace: bool,
+    render_marks: &BTreeSet<String>,
+    since: &str,
+    assertion: &types::RenderAssertion,
+) {
+    if !render_trace {
+        errors.push(format!(
+            "step {step_index}: assert-render requires @render-trace true"
+        ));
+    }
+    if !render_marks.contains(since) {
+        errors.push(format!(
+            "step {step_index}: assert-render references unknown mark '{since}'"
+        ));
+    }
+    if let (Some(min), Some(max)) = (assertion.min_frames, assertion.max_frames)
+        && min > max
+    {
+        errors.push(format!(
+            "step {step_index}: assert-render min_frames exceeds max_frames"
+        ));
+    }
 }
 
 /// Format a `PlaybookResult` as human-readable output.
@@ -350,7 +397,7 @@ fn resolve_includes(
 ///
 /// Fields that are **not** merged (they remain parent-only):
 /// `name`, `description`, `viewport`, `timeout`, `record`, `verbose`,
-/// `binary`, `bundled_plugin_ids`.
+/// `render_trace`, `binary`, `bundled_plugin_ids`.
 fn merge_included_config(parent: &mut types::PlaybookConfig, included: &types::PlaybookConfig) {
     // shell: fill if parent hasn't set one (first include wins).
     if parent.shell.is_none() && included.shell.is_some() {

@@ -650,6 +650,7 @@ mod tests {
             expected: None,
             actual: None,
             failure_captures: None,
+            render_summary: None,
             continue_on_error: false,
         }
     }

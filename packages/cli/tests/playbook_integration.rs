@@ -537,6 +537,7 @@ fn parse_and_validate_fixtures() {
         "continue_on_error.dsl",
         "shell_exit.dsl",
         "assert_matches_fail.dsl",
+        "render_assert_idle.dsl",
     ];
 
     for name in &fixtures {
@@ -550,6 +551,28 @@ fn parse_and_validate_fixtures() {
             "validation errors for {name}: {errors:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subprocess: render assertions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_render_assert_idle() {
+    let (json, pass) = run_playbook_fixture("render_assert_idle.dsl");
+    assert!(pass, "render assertion should pass: {json:#}");
+    let steps = json["steps"].as_array().unwrap();
+    let assert_step = steps
+        .iter()
+        .find(|step| step["action"] == "assert-render")
+        .expect("assert-render step should be present");
+    assert_eq!(assert_step["status"], "pass");
+    assert!(
+        assert_step["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("render assertion passed")),
+        "assert-render detail should summarize pass: {assert_step:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------

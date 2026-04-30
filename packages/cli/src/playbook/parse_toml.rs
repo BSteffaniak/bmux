@@ -6,7 +6,8 @@ use serde::Deserialize;
 
 use super::parse_dsl::decode_c_escapes;
 use super::types::{
-    Action, Playbook, PlaybookConfig, PluginConfig, ServiceKind, SplitDirection, Step, Viewport,
+    Action, Playbook, PlaybookConfig, PluginConfig, RenderAssertion, ServiceKind, SplitDirection,
+    Step, Viewport,
 };
 
 /// Parse a playbook from a TOML string.
@@ -93,6 +94,7 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         binary: None,
         bundled_plugin_ids: Vec::new(),
         verbose: false,
+        render_trace: raw.render_trace.unwrap_or(false),
     })
 }
 
@@ -229,6 +231,31 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
         }
         "screen" => Ok(Action::Screen),
         "status" => Ok(Action::Status),
+        "render-mark" => {
+            let id = step.id.context("render-mark requires 'id'")?;
+            Ok(Action::RenderMark { id })
+        }
+        "assert-render" => {
+            let since = step.since.context("assert-render requires 'since'")?;
+            Ok(Action::AssertRender {
+                since,
+                assertion: RenderAssertion {
+                    min_frames: step.min_frames,
+                    max_frames: step.max_frames,
+                    full_frame: step.full_frame,
+                    max_full_frame_frames: step.max_full_frame_frames,
+                    max_full_surface_fallbacks: step.max_full_surface_fallbacks,
+                    max_damage_rects: step.max_damage_rects,
+                    max_damage_area_cells: step.max_damage_area_cells,
+                    max_rows_emitted: step.max_rows_emitted,
+                    max_row_segments_emitted: step.max_row_segments_emitted,
+                    max_cells_emitted: step.max_cells_emitted,
+                    max_frame_bytes: step.max_frame_bytes,
+                    status_rendered: step.status_rendered,
+                    overlay_rendered: step.overlay_rendered,
+                },
+            })
+        }
         other => bail!("unknown action: {other}"),
     }
 }
@@ -263,6 +290,7 @@ struct RawPlaybookConfig {
     shell: Option<String>,
     timeout_ms: Option<u64>,
     record: Option<bool>,
+    render_trace: Option<bool>,
     plugins: Option<RawPluginConfig>,
     vars: Option<BTreeMap<String, String>>,
     env: Option<BTreeMap<String, String>>,
@@ -321,6 +349,21 @@ struct RawStep {
     interface: Option<String>,
     operation: Option<String>,
     payload: Option<String>,
+    // Render assertions
+    since: Option<String>,
+    min_frames: Option<u64>,
+    max_frames: Option<u64>,
+    full_frame: Option<bool>,
+    max_full_frame_frames: Option<u64>,
+    max_full_surface_fallbacks: Option<u64>,
+    max_damage_rects: Option<u64>,
+    max_damage_area_cells: Option<u64>,
+    max_rows_emitted: Option<u64>,
+    max_row_segments_emitted: Option<u64>,
+    max_cells_emitted: Option<u64>,
+    max_frame_bytes: Option<u64>,
+    status_rendered: Option<bool>,
+    overlay_rendered: Option<bool>,
 }
 
 #[cfg(test)]

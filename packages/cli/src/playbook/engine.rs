@@ -41,8 +41,8 @@ use super::sandbox::SandboxServer;
 use super::screen::ScreenInspector;
 use super::subst::RuntimeVars;
 use super::types::{
-    Action, Playbook, PlaybookResult, ServiceKind, SnapshotCapture, SplitDirection, Step,
-    StepFailure, StepResult, StepStatus,
+    Action, PaneCapture, Playbook, PlaybookRenderSummary, PlaybookResult, RenderAssertion,
+    ServiceKind, SnapshotCapture, SplitDirection, Step, StepFailure, StepResult, StepStatus,
 };
 
 /// Default timeout for waiting for the sandbox server to start.
@@ -628,6 +628,241 @@ pub(super) struct AttachInputState {
     window_context_ids: Vec<Uuid>,
     scrollback_active: bool,
     scrollback_offset: usize,
+}
+
+#[derive(Debug, Default)]
+struct PlaybookRenderTraceState {
+    enabled: bool,
+    marks: std::collections::BTreeMap<String, usize>,
+    summaries: Vec<PlaybookRenderSummary>,
+}
+
+impl PlaybookRenderTraceState {
+    const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            marks: std::collections::BTreeMap::new(),
+            summaries: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, id: String) {
+        self.marks.insert(id, self.summaries.len());
+    }
+
+    fn record_delta(
+        &mut self,
+        before: Option<&[PaneCapture]>,
+        after: Option<&[PaneCapture]>,
+    ) -> Option<PlaybookRenderSummary> {
+        if !self.enabled {
+            return None;
+        }
+        let summary = summarize_playbook_render_delta(before, after);
+        self.summaries.push(summary.clone());
+        Some(summary)
+    }
+
+    fn assert_since(
+        &self,
+        since: &str,
+        assertion: &RenderAssertion,
+    ) -> Result<PlaybookRenderSummary> {
+        let Some(start) = self.marks.get(since).copied() else {
+            bail!("assert-render: unknown render mark '{since}'");
+        };
+        let summary = aggregate_render_summaries(&self.summaries[start..]);
+        validate_render_assertion(since, &summary, assertion)?;
+        Ok(summary)
+    }
+}
+
+fn handle_render_trace_step(
+    step: &Step,
+    trace_state: &mut PlaybookRenderTraceState,
+    trace_enabled: bool,
+) -> Option<(StepStatus, Option<String>, Option<String>)> {
+    match &step.action {
+        Action::RenderMark { id } => {
+            trace_state.mark(id.clone());
+            Some((
+                StepStatus::Pass,
+                Some(format!("render mark '{id}' set")),
+                None,
+            ))
+        }
+        Action::AssertRender { since, assertion } => {
+            if !trace_enabled {
+                let message = "assert-render requires @render-trace true".to_string();
+                return Some((StepStatus::Fail, Some(message.clone()), Some(message)));
+            }
+            match trace_state.assert_since(since, assertion) {
+                Ok(summary) => Some((
+                    StepStatus::Pass,
+                    Some(format!(
+                        "render assertion passed since '{since}': frames={} rows={} cells={}",
+                        summary.frames, summary.rows_emitted, summary.cells_emitted
+                    )),
+                    None,
+                )),
+                Err(error) => {
+                    let message = error.to_string();
+                    Some((StepStatus::Fail, Some(message.clone()), Some(message)))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+fn summarize_playbook_render_delta(
+    before: Option<&[PaneCapture]>,
+    after: Option<&[PaneCapture]>,
+) -> PlaybookRenderSummary {
+    let mut summary = PlaybookRenderSummary::default();
+    let Some(after) = after else {
+        return summary;
+    };
+    let before_by_index = before
+        .unwrap_or_default()
+        .iter()
+        .map(|pane| (pane.index, pane))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut full_frame = before.is_none_or(|panes| panes.len() != after.len());
+    for pane in after {
+        let Some(previous) = before_by_index.get(&pane.index) else {
+            full_frame = true;
+            summary.rows_emitted = summary.rows_emitted.saturating_add(
+                u64::try_from(pane.screen_text.lines().count()).unwrap_or(u64::MAX),
+            );
+            summary.cells_emitted = summary
+                .cells_emitted
+                .saturating_add(u64::try_from(pane.screen_text.len()).unwrap_or(u64::MAX));
+            continue;
+        };
+        let (rows, cells) = changed_render_rows(&previous.screen_text, &pane.screen_text);
+        summary.rows_emitted = summary.rows_emitted.saturating_add(rows);
+        summary.cells_emitted = summary.cells_emitted.saturating_add(cells);
+    }
+    if summary.rows_emitted > 0 || full_frame {
+        summary.frames = 1;
+        summary.damage_rects = summary.rows_emitted.max(u64::from(full_frame));
+        summary.damage_area_cells = summary.cells_emitted;
+        summary.frame_bytes = summary.cells_emitted;
+    }
+    if full_frame && summary.frames > 0 {
+        summary.full_frame_frames = 1;
+    }
+    summary
+}
+
+fn changed_render_rows(before: &str, after: &str) -> (u64, u64) {
+    let before_lines = before.lines().collect::<Vec<_>>();
+    let after_lines = after.lines().collect::<Vec<_>>();
+    let max_len = before_lines.len().max(after_lines.len());
+    let mut rows = 0_u64;
+    let mut cells = 0_u64;
+    for index in 0..max_len {
+        let before_line = before_lines.get(index).copied().unwrap_or_default();
+        let after_line = after_lines.get(index).copied().unwrap_or_default();
+        if before_line != after_line {
+            rows = rows.saturating_add(1);
+            cells = cells.saturating_add(u64::try_from(after_line.len()).unwrap_or(u64::MAX));
+        }
+    }
+    (rows, cells)
+}
+
+fn aggregate_render_summaries(summaries: &[PlaybookRenderSummary]) -> PlaybookRenderSummary {
+    summaries
+        .iter()
+        .fold(PlaybookRenderSummary::default(), |mut acc, summary| {
+            acc.frames = acc.frames.saturating_add(summary.frames);
+            acc.full_frame_frames = acc
+                .full_frame_frames
+                .saturating_add(summary.full_frame_frames);
+            acc.full_surface_fallbacks = acc
+                .full_surface_fallbacks
+                .saturating_add(summary.full_surface_fallbacks);
+            acc.damage_rects = acc.damage_rects.saturating_add(summary.damage_rects);
+            acc.damage_area_cells = acc
+                .damage_area_cells
+                .saturating_add(summary.damage_area_cells);
+            acc.rows_emitted = acc.rows_emitted.saturating_add(summary.rows_emitted);
+            acc.row_segments_emitted = acc
+                .row_segments_emitted
+                .saturating_add(summary.row_segments_emitted);
+            acc.cells_emitted = acc.cells_emitted.saturating_add(summary.cells_emitted);
+            acc.frame_bytes = acc.frame_bytes.saturating_add(summary.frame_bytes);
+            acc.status_rendered_frames = acc
+                .status_rendered_frames
+                .saturating_add(summary.status_rendered_frames);
+            acc.overlay_rendered_frames = acc
+                .overlay_rendered_frames
+                .saturating_add(summary.overlay_rendered_frames);
+            acc
+        })
+}
+
+fn validate_render_assertion(
+    since: &str,
+    summary: &PlaybookRenderSummary,
+    assertion: &RenderAssertion,
+) -> Result<()> {
+    macro_rules! assert_max {
+        ($field:ident, $actual:expr) => {
+            if let Some(max) = assertion.$field
+                && $actual > max
+            {
+                bail!(
+                    "assert-render since='{since}': {} expected <= {}, got {}",
+                    stringify!($field),
+                    max,
+                    $actual
+                );
+            }
+        };
+    }
+    if let Some(min) = assertion.min_frames
+        && summary.frames < min
+    {
+        bail!(
+            "assert-render since='{since}': min_frames expected >= {min}, got {}",
+            summary.frames
+        );
+    }
+    assert_max!(max_frames, summary.frames);
+    assert_max!(max_full_frame_frames, summary.full_frame_frames);
+    assert_max!(max_full_surface_fallbacks, summary.full_surface_fallbacks);
+    assert_max!(max_damage_rects, summary.damage_rects);
+    assert_max!(max_damage_area_cells, summary.damage_area_cells);
+    assert_max!(max_rows_emitted, summary.rows_emitted);
+    assert_max!(max_row_segments_emitted, summary.row_segments_emitted);
+    assert_max!(max_cells_emitted, summary.cells_emitted);
+    assert_max!(max_frame_bytes, summary.frame_bytes);
+    if let Some(expected) = assertion.full_frame {
+        let actual = summary.full_frame_frames > 0;
+        if actual != expected {
+            bail!("assert-render since='{since}': full_frame expected {expected}, got {actual}");
+        }
+    }
+    if let Some(expected) = assertion.status_rendered {
+        let actual = summary.status_rendered_frames > 0;
+        if actual != expected {
+            bail!(
+                "assert-render since='{since}': status_rendered expected {expected}, got {actual}"
+            );
+        }
+    }
+    if let Some(expected) = assertion.overlay_rendered {
+        let actual = summary.overlay_rendered_frames > 0;
+        if actual != expected {
+            bail!(
+                "assert-render since='{since}': overlay_rendered expected {expected}, got {actual}"
+            );
+        }
+    }
+    Ok(())
 }
 
 impl AttachInputRuntime {
@@ -1232,6 +1467,7 @@ async fn run_playbook_inner(
     } else {
         None
     };
+    let mut render_trace_state = PlaybookRenderTraceState::new(playbook.config.render_trace);
     let mut interactive_abort_from_step: Option<usize> = None;
 
     if matches!(interactive_mode, PlaybookInteractiveMode::Prompt) && options.interactive {
@@ -1334,11 +1570,42 @@ async fn run_playbook_inner(
                 expected: None,
                 actual: None,
                 failure_captures: None,
+                render_summary: None,
                 continue_on_error: step.continue_on_error,
             });
         }
 
+        if let Some(render_result) =
+            handle_render_trace_step(step, &mut render_trace_state, playbook.config.render_trace)
+        {
+            let (status, detail, error) = render_result;
+            if status == StepStatus::Fail && !step.continue_on_error {
+                error_msg.clone_from(&detail);
+            }
+            step_results.push(StepResult {
+                index: step.index,
+                action: step.action.name().to_string(),
+                status,
+                elapsed_ms: 0,
+                detail,
+                expected: None,
+                actual: None,
+                failure_captures: None,
+                render_summary: None,
+                continue_on_error: step.continue_on_error,
+            });
+            if error.is_some() && !step.continue_on_error {
+                break;
+            }
+            continue;
+        }
+
         let step_start = Instant::now();
+        let render_before = if render_trace_state.enabled && attached {
+            inspector.capture_all_safe()
+        } else {
+            None
+        };
         if playbook.config.verbose {
             eprint!(
                 "[{}/{}] {}...",
@@ -1379,6 +1646,9 @@ async fn run_playbook_inner(
                     elapsed_ms
                 );
                 let detail_for_visual = detail.clone();
+                let render_after = inspector.capture_all_safe();
+                let render_summary = render_trace_state
+                    .record_delta(render_before.as_deref(), render_after.as_deref());
                 step_results.push(StepResult {
                     index: step.index,
                     action: step.action.name().to_string(),
@@ -1388,6 +1658,7 @@ async fn run_playbook_inner(
                     expected: None,
                     actual: None,
                     failure_captures: None,
+                    render_summary,
                     continue_on_error: step.continue_on_error,
                 });
                 if let Some(state) = visual_interactive.as_mut() {
@@ -1465,6 +1736,7 @@ async fn run_playbook_inner(
                     expected,
                     actual,
                     failure_captures,
+                    render_summary: None,
                     continue_on_error: step.continue_on_error,
                 });
                 if let Some(state) = visual_interactive.as_mut() {
@@ -1510,6 +1782,7 @@ async fn run_playbook_inner(
                 expected: None,
                 actual: None,
                 failure_captures: None,
+                render_summary: None,
                 continue_on_error: skipped_step.continue_on_error,
             });
         }
@@ -2788,6 +3061,10 @@ pub(super) async fn execute_step(
                 sid_detail, runtime_vars.pane_count, runtime_vars.focused_pane,
             );
             Ok(Some(detail))
+        }
+
+        Action::RenderMark { .. } | Action::AssertRender { .. } => {
+            bail!("render trace actions are handled by the playbook runner")
         }
     }
 }
