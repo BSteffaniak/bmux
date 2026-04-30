@@ -13,7 +13,7 @@ use bmux_context_state::{ContextSelector, ContextStateHandle};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     CORE_PROTOCOL_CAPABILITIES, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event,
-    IpcEndpoint, PerformanceRecordingLevel, ProtocolContract, RecordingEventKind, RecordingPayload,
+    IpcEndpoint, ProtocolContract, RecordingEventKind, RecordingPayload,
     RecordingRollingStartOptions, Request, Response, ResponsePayload, ServerSnapshotStatus,
     ServicePipelinePayload, ServicePipelineRequest, ServicePipelineStepResult, decode,
     default_supported_capabilities, encode, negotiate_protocol,
@@ -34,8 +34,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use bmux_performance_state::{
-    PerformanceEventRateLimiter, PerformanceSettingsHandle, PerformanceSettingsReader,
-    PerformanceSettingsStore,
+    PERF_RECORDING_SOURCE, PerformanceEventRateLimiter, PerformanceRecordingLevel,
+    PerformanceSettingsHandle, PerformanceSettingsReader, PerformanceSettingsStore,
 };
 use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle, RollingRecordingSettings};
 
@@ -1847,7 +1847,7 @@ async fn handle_connection(
                                         record_to_all_runtimes(
                                             RecordingEventKind::Custom,
                                             RecordingPayload::Custom {
-                                                source: bmux_ipc::PERF_RECORDING_SOURCE.to_string(),
+                                                source: PERF_RECORDING_SOURCE.to_string(),
                                                 name: "server.push.window".to_string(),
                                                 payload: encoded_payload,
                                             },

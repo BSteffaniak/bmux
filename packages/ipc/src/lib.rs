@@ -9,6 +9,10 @@
 
 use bmux_attach_image_protocol::AttachPaneImage;
 use bmux_attach_view_protocol::AttachViewComponent;
+pub use bmux_performance_state::{
+    PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE, PerformanceRecordingLevel,
+    PerformanceRuntimeSettings,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -442,32 +446,6 @@ pub struct RecordingSummary {
 
 /// Current recording format version.
 pub const RECORDING_FORMAT_VERSION: u32 = 6;
-
-/// Canonical source identifier for bmux performance custom recording events.
-pub const PERF_RECORDING_SOURCE: &str = "bmux.perf";
-
-/// Current schema version for bmux performance custom recording payloads.
-pub const PERF_RECORDING_SCHEMA_VERSION: u8 = 1;
-
-/// Runtime performance telemetry capture level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PerformanceRecordingLevel {
-    #[default]
-    Off,
-    Basic,
-    Detailed,
-    Trace,
-}
-
-/// Mutable runtime settings used for performance telemetry capture.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PerformanceRuntimeSettings {
-    pub recording_level: PerformanceRecordingLevel,
-    pub window_ms: u64,
-    pub max_events_per_sec: u32,
-    pub max_payload_bytes_per_sec: usize,
-}
 
 const fn recording_format_version_default() -> u32 {
     1 // pre-versioning recordings are treated as version 1

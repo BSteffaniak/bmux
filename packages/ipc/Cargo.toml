@@ -14,6 +14,7 @@ version     = { workspace = true }
 bmux_attach_image_protocol = { workspace = true }
 bmux_attach_view_protocol  = { workspace = true }
 bmux_codec                 = { workspace = true }
+bmux_performance_state     = { workspace = true }
 lz4_flex                   = { workspace = true, optional = true }
 serde                      = { workspace = true, features = ["derive", "std"] }
 serde_json                 = { workspace = true }
@@ -31,6 +32,7 @@ fail-on-warnings = [
     "bmux_attach_image_protocol/fail-on-warnings",
     "bmux_attach_view_protocol/fail-on-warnings",
     "bmux_codec/fail-on-warnings",
+    "bmux_performance_state/fail-on-warnings",
 ]
 
 # Compression support (optional, feature-gated)

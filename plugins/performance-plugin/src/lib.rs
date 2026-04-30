@@ -19,7 +19,9 @@ use bmux_performance_plugin_api::{
     PaneMetricsSnapshot, PerformanceEvent, ProcessMetricsSnapshot, SystemMetricsSnapshot,
     ThemeHeaderMetric, ThemeHeaderSettings, performance_types,
 };
-use bmux_performance_state::{PerformanceCaptureSettings, PerformanceSettingsHandle};
+use bmux_performance_state::{
+    PerformanceCaptureSettings, PerformanceRuntimeSettings, PerformanceSettingsHandle,
+};
 use bmux_plugin::{global_event_bus, global_plugin_state_registry};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
@@ -481,7 +483,7 @@ fn metric_from_form_value(value: &str) -> Option<ThemeHeaderMetric> {
     }
 }
 
-fn handle_get_settings() -> bmux_ipc::PerformanceRuntimeSettings {
+fn handle_get_settings() -> PerformanceRuntimeSettings {
     let Some(handle) = global_plugin_state_registry().get::<PerformanceSettingsHandle>() else {
         return PerformanceCaptureSettings::default().to_runtime_settings();
     };
@@ -491,9 +493,7 @@ fn handle_get_settings() -> bmux_ipc::PerformanceRuntimeSettings {
     guard.0.current().to_runtime_settings()
 }
 
-fn handle_set_settings(
-    requested: &bmux_ipc::PerformanceRuntimeSettings,
-) -> bmux_ipc::PerformanceRuntimeSettings {
+fn handle_set_settings(requested: &PerformanceRuntimeSettings) -> PerformanceRuntimeSettings {
     let normalized_capture = PerformanceCaptureSettings::from_runtime_settings(requested);
     let normalized = normalized_capture.to_runtime_settings();
 

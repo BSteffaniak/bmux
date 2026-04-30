@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bmux_cli_schema::PerfProfileArg;
-use bmux_ipc::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
 use bmux_performance_plugin_api::{performance_commands, performance_state};
+use bmux_performance_state::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
 
 use super::{
     ConnectionContext, ConnectionPolicyScope, cleanup_stale_pid_file, connect_with_context,

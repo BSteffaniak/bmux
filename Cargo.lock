@@ -1089,6 +1089,7 @@ dependencies = [
  "bmux_pane_runtime_plugin_api",
  "bmux_performance_plugin",
  "bmux_performance_plugin_api",
+ "bmux_performance_state",
  "bmux_permissions_plugin",
  "bmux_permissions_plugin_api",
  "bmux_plugin",
@@ -1511,6 +1512,7 @@ dependencies = [
  "bmux_attach_image_protocol",
  "bmux_attach_view_protocol",
  "bmux_codec",
+ "bmux_performance_state",
  "lz4_flex",
  "serde",
  "serde_json",
@@ -1663,7 +1665,6 @@ dependencies = [
 name = "bmux_performance_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_ipc",
  "bmux_pane_runtime_state",
  "bmux_performance_plugin_api",
  "bmux_performance_state",
@@ -1692,7 +1693,7 @@ name = "bmux_performance_state"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_config",
- "bmux_ipc",
+ "serde",
  "serde_json",
 ]
 

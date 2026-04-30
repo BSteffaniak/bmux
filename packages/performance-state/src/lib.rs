@@ -9,9 +9,34 @@
 #![allow(clippy::module_name_repetitions)]
 
 use bmux_config::{BmuxConfig, PerformanceRecordingLevel as ConfigPerformanceRecordingLevel};
-use bmux_ipc::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Runtime performance telemetry capture level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceRecordingLevel {
+    #[default]
+    Off,
+    Basic,
+    Detailed,
+    Trace,
+}
+
+/// Mutable runtime settings used for performance telemetry capture.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PerformanceRuntimeSettings {
+    pub recording_level: PerformanceRecordingLevel,
+    pub window_ms: u64,
+    pub max_events_per_sec: u32,
+    pub max_payload_bytes_per_sec: usize,
+}
+
+/// Canonical source identifier for bmux performance custom recording events.
+pub const PERF_RECORDING_SOURCE: &str = "bmux.perf";
+
+/// Current schema version for bmux performance custom recording payloads.
+pub const PERF_RECORDING_SCHEMA_VERSION: u8 = 1;
 
 /// Normalized performance capture settings.
 ///
@@ -279,7 +304,7 @@ impl PerformanceEventRateLimiter {
 
         object.insert(
             "schema_version".to_string(),
-            serde_json::Value::from(bmux_ipc::PERF_RECORDING_SCHEMA_VERSION),
+            serde_json::Value::from(PERF_RECORDING_SCHEMA_VERSION),
         );
         object.insert(
             "level".to_string(),

@@ -15,6 +15,11 @@ use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_cli_output::{Table, TableAlign, TableColumn, write_table};
 use bmux_fonts::FontPreset;
 use bmux_ipc::RecordingPayload;
+use bmux_performance_state::{
+    PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE,
+    PerformanceRecordingLevel as RuntimePerformanceRecordingLevel,
+    PerformanceRuntimeSettings as RuntimePerformanceRuntimeSettings,
+};
 use bmux_recording_plugin_api::{recording_commands, recording_state, recording_types};
 use font8x8::UnicodeFonts;
 use resvg::{tiny_skia, usvg};
@@ -279,9 +284,6 @@ struct RecordingAutoExportSettings {
     output_dir: Option<PathBuf>,
 }
 
-const PERF_RECORDING_SOURCE: &str = bmux_ipc::PERF_RECORDING_SOURCE;
-const PERF_RECORDING_SCHEMA_VERSION: u8 = bmux_ipc::PERF_RECORDING_SCHEMA_VERSION;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum PerfCaptureLevel {
     Off,
@@ -302,12 +304,12 @@ impl PerfCaptureLevel {
     }
 
     #[must_use]
-    pub(super) const fn from_runtime(level: bmux_ipc::PerformanceRecordingLevel) -> Self {
+    pub(super) const fn from_runtime(level: RuntimePerformanceRecordingLevel) -> Self {
         match level {
-            bmux_ipc::PerformanceRecordingLevel::Off => Self::Off,
-            bmux_ipc::PerformanceRecordingLevel::Basic => Self::Basic,
-            bmux_ipc::PerformanceRecordingLevel::Detailed => Self::Detailed,
-            bmux_ipc::PerformanceRecordingLevel::Trace => Self::Trace,
+            RuntimePerformanceRecordingLevel::Off => Self::Off,
+            RuntimePerformanceRecordingLevel::Basic => Self::Basic,
+            RuntimePerformanceRecordingLevel::Detailed => Self::Detailed,
+            RuntimePerformanceRecordingLevel::Trace => Self::Trace,
         }
     }
 
@@ -363,7 +365,7 @@ impl PerfCaptureSettings {
     }
 
     #[must_use]
-    pub(super) fn from_runtime_settings(settings: &bmux_ipc::PerformanceRuntimeSettings) -> Self {
+    pub(super) fn from_runtime_settings(settings: &RuntimePerformanceRuntimeSettings) -> Self {
         Self {
             level: PerfCaptureLevel::from_runtime(settings.recording_level),
             window_ms: settings.window_ms.max(1),
