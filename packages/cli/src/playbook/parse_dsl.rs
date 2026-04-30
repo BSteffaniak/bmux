@@ -9,7 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use super::types::{
-    Action, Playbook, PlaybookConfig, RenderAssertion, ServiceKind, SplitDirection, Step,
+    Action, Playbook, PlaybookConfig, PlaybookRenderRowRef, RenderAssertion, ServiceKind,
+    SplitDirection, Step,
 };
 
 /// Parse a playbook from the line-oriented DSL format.
@@ -402,7 +403,30 @@ fn parse_render_assertion(args: &BTreeMap<String, String>) -> Result<RenderAsser
     parse_u64_opt!(max_frame_bytes);
     parse_bool_opt!(status_rendered);
     parse_bool_opt!(overlay_rendered);
+    assertion.expected_emitted_rows = args
+        .get("expected_emitted_rows")
+        .map(|value| parse_render_row_refs(value))
+        .transpose()?;
     Ok(assertion)
+}
+
+fn parse_render_row_refs(value: &str) -> Result<Vec<PlaybookRenderRowRef>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    trimmed
+        .split(',')
+        .map(|entry| {
+            let (pane, row) = entry
+                .split_once(':')
+                .with_context(|| format!("invalid render row ref '{entry}', expected pane:row"))?;
+            Ok(PlaybookRenderRowRef {
+                pane: pane.parse().context("invalid render row pane")?,
+                row: row.parse().context("invalid render row index")?,
+            })
+        })
+        .collect()
 }
 
 fn require_arg(args: &BTreeMap<String, String>, key: &str, action: &str) -> Result<String> {

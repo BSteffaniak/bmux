@@ -6,8 +6,8 @@ use serde::Deserialize;
 
 use super::parse_dsl::decode_c_escapes;
 use super::types::{
-    Action, Playbook, PlaybookConfig, PluginConfig, RenderAssertion, ServiceKind, SplitDirection,
-    Step, Viewport,
+    Action, Playbook, PlaybookConfig, PlaybookRenderRowRef, PluginConfig, RenderAssertion,
+    ServiceKind, SplitDirection, Step, Viewport,
 };
 
 /// Parse a playbook from a TOML string.
@@ -253,11 +253,30 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
                     max_frame_bytes: step.max_frame_bytes,
                     status_rendered: step.status_rendered,
                     overlay_rendered: step.overlay_rendered,
+                    expected_emitted_rows: step
+                        .expected_emitted_rows
+                        .as_deref()
+                        .map(parse_render_row_refs_toml)
+                        .transpose()?,
                 },
             })
         }
         other => bail!("unknown action: {other}"),
     }
+}
+
+fn parse_render_row_refs_toml(rows: &[String]) -> Result<Vec<PlaybookRenderRowRef>> {
+    rows.iter()
+        .map(|entry| {
+            let (pane, row) = entry
+                .split_once(':')
+                .with_context(|| format!("invalid render row ref '{entry}', expected pane:row"))?;
+            Ok(PlaybookRenderRowRef {
+                pane: pane.parse().context("invalid render row pane")?,
+                row: row.parse().context("invalid render row index")?,
+            })
+        })
+        .collect()
 }
 
 fn decode_hex(hex: &str) -> Result<Vec<u8>> {
@@ -364,6 +383,7 @@ struct RawStep {
     max_frame_bytes: Option<u64>,
     status_rendered: Option<bool>,
     overlay_rendered: Option<bool>,
+    expected_emitted_rows: Option<Vec<String>>,
 }
 
 #[cfg(test)]

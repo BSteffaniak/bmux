@@ -41,8 +41,9 @@ use super::sandbox::SandboxServer;
 use super::screen::ScreenInspector;
 use super::subst::RuntimeVars;
 use super::types::{
-    Action, PaneCapture, Playbook, PlaybookRenderSummary, PlaybookResult, RenderAssertion,
-    ServiceKind, SnapshotCapture, SplitDirection, Step, StepFailure, StepResult, StepStatus,
+    Action, PaneCapture, Playbook, PlaybookRenderRowRef, PlaybookRenderSummary, PlaybookResult,
+    RenderAssertion, ServiceKind, SnapshotCapture, SplitDirection, Step, StepFailure, StepResult,
+    StepStatus,
 };
 
 /// Default timeout for waiting for the sandbox server to start.
@@ -732,17 +733,21 @@ fn summarize_playbook_render_delta(
     for pane in after {
         let Some(previous) = before_by_index.get(&pane.index) else {
             full_frame = true;
-            summary.rows_emitted = summary.rows_emitted.saturating_add(
-                u64::try_from(pane.screen_text.lines().count()).unwrap_or(u64::MAX),
-            );
+            let changed_rows = new_pane_render_rows(pane);
+            summary.rows_emitted = summary
+                .rows_emitted
+                .saturating_add(u64::try_from(changed_rows.len()).unwrap_or(u64::MAX));
             summary.cells_emitted = summary
                 .cells_emitted
                 .saturating_add(u64::try_from(pane.screen_text.len()).unwrap_or(u64::MAX));
+            summary.emitted_rows.extend(changed_rows);
             continue;
         };
-        let (rows, cells) = changed_render_rows(&previous.screen_text, &pane.screen_text);
+        let (rows, cells, emitted_rows) =
+            changed_render_rows(pane.index, &previous.screen_text, &pane.screen_text);
         summary.rows_emitted = summary.rows_emitted.saturating_add(rows);
         summary.cells_emitted = summary.cells_emitted.saturating_add(cells);
+        summary.emitted_rows.extend(emitted_rows);
     }
     if summary.rows_emitted > 0 || full_frame {
         summary.frames = 1;
@@ -756,21 +761,41 @@ fn summarize_playbook_render_delta(
     summary
 }
 
-fn changed_render_rows(before: &str, after: &str) -> (u64, u64) {
+fn new_pane_render_rows(pane: &PaneCapture) -> Vec<PlaybookRenderRowRef> {
+    pane.screen_text
+        .lines()
+        .enumerate()
+        .map(|(row, _line)| PlaybookRenderRowRef {
+            pane: pane.index,
+            row: u16::try_from(row).unwrap_or(u16::MAX),
+        })
+        .collect()
+}
+
+fn changed_render_rows(
+    pane_index: u32,
+    before: &str,
+    after: &str,
+) -> (u64, u64, Vec<PlaybookRenderRowRef>) {
     let before_lines = before.lines().collect::<Vec<_>>();
     let after_lines = after.lines().collect::<Vec<_>>();
     let max_len = before_lines.len().max(after_lines.len());
     let mut rows = 0_u64;
     let mut cells = 0_u64;
+    let mut emitted_rows = Vec::new();
     for index in 0..max_len {
         let before_line = before_lines.get(index).copied().unwrap_or_default();
         let after_line = after_lines.get(index).copied().unwrap_or_default();
         if before_line != after_line {
             rows = rows.saturating_add(1);
             cells = cells.saturating_add(u64::try_from(after_line.len()).unwrap_or(u64::MAX));
+            emitted_rows.push(PlaybookRenderRowRef {
+                pane: pane_index,
+                row: u16::try_from(index).unwrap_or(u16::MAX),
+            });
         }
     }
-    (rows, cells)
+    (rows, cells, emitted_rows)
 }
 
 fn aggregate_render_summaries(summaries: &[PlaybookRenderSummary]) -> PlaybookRenderSummary {
@@ -800,6 +825,8 @@ fn aggregate_render_summaries(summaries: &[PlaybookRenderSummary]) -> PlaybookRe
             acc.overlay_rendered_frames = acc
                 .overlay_rendered_frames
                 .saturating_add(summary.overlay_rendered_frames);
+            acc.emitted_rows
+                .extend(summary.emitted_rows.iter().copied());
             acc
         })
 }
@@ -861,6 +888,15 @@ fn validate_render_assertion(
                 "assert-render since='{since}': overlay_rendered expected {expected}, got {actual}"
             );
         }
+    }
+    if let Some(expected) = assertion.expected_emitted_rows.as_deref()
+        && summary.emitted_rows != expected
+    {
+        bail!(
+            "assert-render since='{since}': expected_emitted_rows expected {}, got {}",
+            super::types::render_row_refs_to_dsl(expected),
+            super::types::render_row_refs_to_dsl(&summary.emitted_rows)
+        );
     }
     Ok(())
 }

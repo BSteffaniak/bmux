@@ -609,6 +609,7 @@ assert-render since='baseline' max_frames=0 max_rows_emitted=0 max_cells_emitted
 | `max_frame_bytes`            | u64  | no       | -       | Maximum estimated frame bytes                     |
 | `status_rendered`            | bool | no       | -       | Whether status rendering was observed             |
 | `overlay_rendered`           | bool | no       | -       | Whether overlay rendering was observed            |
+| `expected_emitted_rows`      | str  | no       | -       | Exact normalized pane rows as `pane:row,pane:row` |
 
 ### Inspection
 

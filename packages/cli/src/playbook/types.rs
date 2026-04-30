@@ -249,6 +249,13 @@ pub struct RenderAssertion {
     pub max_frame_bytes: Option<u64>,
     pub status_rendered: Option<bool>,
     pub overlay_rendered: Option<bool>,
+    pub expected_emitted_rows: Option<Vec<PlaybookRenderRowRef>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaybookRenderRowRef {
+    pub pane: u32,
+    pub row: u16,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,6 +271,8 @@ pub struct PlaybookRenderSummary {
     pub frame_bytes: u64,
     pub status_rendered_frames: u64,
     pub overlay_rendered_frames: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emitted_rows: Vec<PlaybookRenderRowRef>,
 }
 
 /// Plugin service invocation kind.
@@ -600,6 +609,22 @@ fn append_render_assertion_dsl(line: &mut String, assertion: &RenderAssertion) {
     push_opt!(max_frame_bytes);
     push_opt!(status_rendered);
     push_opt!(overlay_rendered);
+    if let Some(rows) = &assertion.expected_emitted_rows {
+        write!(
+            line,
+            " expected_emitted_rows='{}'",
+            render_row_refs_to_dsl(rows)
+        )
+        .unwrap();
+    }
+}
+
+#[must_use]
+pub fn render_row_refs_to_dsl(rows: &[PlaybookRenderRowRef]) -> String {
+    rows.iter()
+        .map(|row| format!("{}:{}", row.pane, row.row))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -1017,6 +1042,10 @@ mod tests {
                 max_frames: Some(2),
                 full_frame: Some(false),
                 max_rows_emitted: Some(3),
+                expected_emitted_rows: Some(vec![
+                    PlaybookRenderRowRef { pane: 1, row: 0 },
+                    PlaybookRenderRowRef { pane: 1, row: 1 },
+                ]),
                 ..RenderAssertion::default()
             },
         });
@@ -1027,6 +1056,13 @@ mod tests {
                 assert_eq!(assertion.max_frames, Some(2));
                 assert_eq!(assertion.full_frame, Some(false));
                 assert_eq!(assertion.max_rows_emitted, Some(3));
+                assert_eq!(
+                    assertion.expected_emitted_rows,
+                    Some(vec![
+                        PlaybookRenderRowRef { pane: 1, row: 0 },
+                        PlaybookRenderRowRef { pane: 1, row: 1 },
+                    ])
+                );
             }
             other => panic!("expected AssertRender, got {other:?}"),
         }

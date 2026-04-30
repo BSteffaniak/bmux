@@ -540,6 +540,9 @@ fn parse_and_validate_fixtures() {
         "render_assert_idle.dsl",
         "render_assert_single_line_output.dsl",
         "render_assert_status_only.dsl",
+        "render_assert_focus_change.dsl",
+        "render_assert_split_pane.dsl",
+        "render_assert_resize_viewport.dsl",
     ];
 
     for name in &fixtures {
@@ -572,6 +575,21 @@ fn playbook_render_assert_single_line_output() {
 #[test]
 fn playbook_render_assert_status_only() {
     assert_render_fixture_passes("render_assert_status_only.dsl");
+}
+
+#[test]
+fn playbook_render_assert_focus_change() {
+    assert_render_fixture_passes("render_assert_focus_change.dsl");
+}
+
+#[test]
+fn playbook_render_assert_split_pane() {
+    assert_render_fixture_passes("render_assert_split_pane.dsl");
+}
+
+#[test]
+fn playbook_render_assert_resize_viewport() {
+    assert_render_fixture_passes("render_assert_resize_viewport.dsl");
 }
 
 fn assert_render_fixture_passes(fixture: &str) {
