@@ -8,7 +8,9 @@
 //! and decompressed during the reverse conversion.
 
 use crate::model::{ImagePayload, ImageProtocol, PaneImage};
-use bmux_attach_image_protocol::{AttachImageProtocol, AttachPaneImage, AttachPaneImageDelta};
+use bmux_attach_image_protocol::{
+    AttachImageProtocol, AttachPaneImage, AttachPaneImageDelta, CompressionId,
+};
 
 // ---------------------------------------------------------------------------
 // PaneImage -> AttachPaneImage (server sends to client)
@@ -134,8 +136,8 @@ fn compress_image_payload(
     data: &[u8],
     protocol: AttachImageProtocol,
     explicit_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
-) -> (Vec<u8>, bmux_ipc::compression::CompressionId) {
-    use bmux_ipc::compression::{CompressionHint, CompressionId};
+) -> (Vec<u8>, CompressionId) {
+    use bmux_ipc::compression::CompressionHint;
 
     // Skip compression for pre-compressed formats.
     if is_precompressed(data, protocol) {
@@ -159,7 +161,7 @@ fn compress_image_payload(
 }
 
 /// Decompress image `raw_data` received from IPC.
-fn decompress_image_payload(data: &[u8], id: bmux_ipc::compression::CompressionId) -> Vec<u8> {
+fn decompress_image_payload(data: &[u8], id: CompressionId) -> Vec<u8> {
     bmux_ipc::compression::decompress_by_id(data, id).unwrap_or_else(|_| data.to_vec())
 }
 
@@ -212,7 +214,7 @@ mod tests {
         #[cfg(feature = "compression-zstd")]
         assert_ne!(
             ipc.compression,
-            bmux_ipc::compression::CompressionId::None,
+            CompressionId::None,
             "large repetitive data should be compressed"
         );
 
@@ -241,7 +243,7 @@ mod tests {
         let ipc = AttachPaneImage::from(&img);
         assert_eq!(
             ipc.compression,
-            bmux_ipc::compression::CompressionId::None,
+            CompressionId::None,
             "small payload should not be compressed"
         );
         assert_eq!(ipc.raw_data, raw);
@@ -256,7 +258,7 @@ mod tests {
         let ipc = AttachPaneImage::from(&img);
         assert_eq!(
             ipc.compression,
-            bmux_ipc::compression::CompressionId::None,
+            CompressionId::None,
             "pre-compressed PNG should not be compressed again"
         );
         assert_eq!(ipc.raw_data, raw);
@@ -271,7 +273,7 @@ mod tests {
         let ipc = super::pane_image_to_ipc(&img, Some(&codec));
         assert_eq!(
             ipc.compression,
-            bmux_ipc::compression::CompressionId::Zstd,
+            CompressionId::Zstd,
             "explicit zstd codec should be used"
         );
         assert!(ipc.raw_data.len() < raw.len());
@@ -289,7 +291,7 @@ mod tests {
         let ipc = super::pane_image_to_ipc(&img, Some(&codec));
         assert_eq!(
             ipc.compression,
-            bmux_ipc::compression::CompressionId::Lz4,
+            CompressionId::Lz4,
             "explicit lz4 codec should be used"
         );
         let roundtripped = PaneImage::from(&ipc);

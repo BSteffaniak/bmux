@@ -11,7 +11,7 @@
 //!
 //! Each layer is independently configurable and feature-gated.
 
-pub use bmux_attach_image_protocol::CompressionId;
+use bmux_attach_image_protocol::CompressionId;
 
 // ---------------------------------------------------------------------------
 // Compression hint

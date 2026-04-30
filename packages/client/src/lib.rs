@@ -4,6 +4,7 @@
 
 //! Client component for bmux terminal multiplexer.
 
+use bmux_attach_image_protocol::CompressionId;
 use bmux_attach_layout_protocol::{
     AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene, PaneLayoutNode,
     PaneSummary,
@@ -1557,12 +1558,12 @@ fn resolve_frame_codec_from_capabilities(
         .iter()
         .any(|c| c == bmux_ipc::CAPABILITY_COMPRESSION_FRAME_LZ4)
     {
-        compression::resolve_codec(compression::CompressionId::Lz4).map(Arc::from)
+        compression::resolve_codec(CompressionId::Lz4).map(Arc::from)
     } else if capabilities
         .iter()
         .any(|c| c == bmux_ipc::CAPABILITY_COMPRESSION_FRAME_ZSTD)
     {
-        compression::resolve_codec(compression::CompressionId::Zstd).map(Arc::from)
+        compression::resolve_codec(CompressionId::Zstd).map(Arc::from)
     } else {
         None
     }

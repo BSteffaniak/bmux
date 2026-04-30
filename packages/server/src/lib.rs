@@ -5,6 +5,7 @@
 //! Server component for bmux terminal multiplexer.
 
 use anyhow::{Context, Result};
+use bmux_attach_image_protocol::CompressionId;
 use bmux_attach_token_state::AttachGrant;
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client_state::FollowStateHandle;
@@ -2984,12 +2985,12 @@ fn resolve_frame_codec_from_capabilities(
         .iter()
         .any(|c| c == bmux_ipc::CAPABILITY_COMPRESSION_FRAME_LZ4)
     {
-        compression::resolve_codec(compression::CompressionId::Lz4).map(std::sync::Arc::from)
+        compression::resolve_codec(CompressionId::Lz4).map(std::sync::Arc::from)
     } else if capabilities
         .iter()
         .any(|c| c == bmux_ipc::CAPABILITY_COMPRESSION_FRAME_ZSTD)
     {
-        compression::resolve_codec(compression::CompressionId::Zstd).map(std::sync::Arc::from)
+        compression::resolve_codec(CompressionId::Zstd).map(std::sync::Arc::from)
     } else {
         None
     }

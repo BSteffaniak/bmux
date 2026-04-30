@@ -1,5 +1,6 @@
 use crate::compression::{self, CompressionCodec, CompressionHint};
 use crate::{Envelope, ProtocolVersion, decode, encode};
+use bmux_attach_image_protocol::CompressionId;
 use thiserror::Error;
 
 const FRAME_LEN_BYTES: usize = 4;
@@ -253,8 +254,8 @@ pub fn decode_frame_compressed(frame: &[u8]) -> Result<Envelope, FrameDecodeErro
     let comp_byte = frame[FRAME_LEN_BYTES];
     let payload_bytes = &frame[FRAME_LEN_BYTES + 1..expected];
 
-    let decompressed = match compression::CompressionId::from_byte(comp_byte) {
-        Some(compression::CompressionId::None) => payload_bytes.to_vec(),
+    let decompressed = match CompressionId::from_byte(comp_byte) {
+        Some(CompressionId::None) => payload_bytes.to_vec(),
         Some(id) => {
             let data = compression::decompress_by_id(payload_bytes, id)?;
             if data.len() > MAX_FRAME_PAYLOAD_SIZE {
@@ -301,8 +302,8 @@ pub fn try_decode_frame_compressed(
     let payload_bytes = buffer[FRAME_LEN_BYTES + 1..expected].to_vec();
     buffer.drain(..expected);
 
-    let decompressed = match compression::CompressionId::from_byte(comp_byte) {
-        Some(compression::CompressionId::None) => payload_bytes,
+    let decompressed = match CompressionId::from_byte(comp_byte) {
+        Some(CompressionId::None) => payload_bytes,
         Some(id) => {
             let data = compression::decompress_by_id(&payload_bytes, id)?;
             if data.len() > MAX_FRAME_PAYLOAD_SIZE {

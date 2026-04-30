@@ -668,7 +668,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_attach_image_protocol::AttachPaneImage;
+    use bmux_attach_image_protocol::{AttachPaneImage, CompressionId};
     use bmux_performance_state::{PerformanceRecordingLevel, PerformanceRuntimeSettings};
     use bmux_recording_protocol::{
         DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent,
@@ -1315,7 +1315,7 @@ mod tests {
                     id: 42,
                     protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
                     raw_data: vec![0x1b, 0x50, 0x71],
-                    compression: compression::CompressionId::None,
+                    compression: CompressionId::None,
                     position_row: 3,
                     position_col: 5,
                     cell_rows: 10,

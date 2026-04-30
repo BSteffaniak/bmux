@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 # Internal bmux packages
+bmux_attach_image_protocol  = { workspace = true }
 bmux_attach_layout_protocol = { workspace = true }
 bmux_config                 = { workspace = true }
 bmux_ipc                    = { workspace = true }
@@ -38,6 +39,7 @@ default = ["serde"]
 
 # Development features
 fail-on-warnings = [
+    "bmux_attach_image_protocol/fail-on-warnings",
     "bmux_attach_layout_protocol/fail-on-warnings",
     "bmux_codec/fail-on-warnings",
     "bmux_config/fail-on-warnings",
