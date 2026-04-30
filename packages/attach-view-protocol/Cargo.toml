@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral attach view change protocol DTOs shared by bmux runtime crates"
+edition     = { workspace = true }
+keywords    = ["bmux", "attach", "view", "protocol"]
+license     = { workspace = true }
+name        = "bmux_attach_view_protocol"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

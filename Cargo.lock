@@ -1014,8 +1014,8 @@ dependencies = [
  "bmux_appearance",
  "bmux_attach_layout_protocol",
  "bmux_attach_pipeline_models",
+ "bmux_attach_view_protocol",
  "bmux_client",
- "bmux_ipc",
  "bmux_plugin",
  "bmux_scene_protocol",
  "bmux_scene_protocol_render",
@@ -1044,6 +1044,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_attach_view_protocol"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bmux_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1054,6 +1061,7 @@ dependencies = [
  "bmux_attach_layout_protocol",
  "bmux_attach_pipeline",
  "bmux_attach_token_state",
+ "bmux_attach_view_protocol",
  "bmux_cli_output",
  "bmux_cli_schema",
  "bmux_client",
@@ -1501,6 +1509,7 @@ name = "bmux_ipc"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_attach_image_protocol",
+ "bmux_attach_view_protocol",
  "bmux_codec",
  "lz4_flex",
  "serde",
@@ -1532,6 +1541,7 @@ dependencies = [
  "bmux_attach_layout_protocol",
  "bmux_attach_pipeline",
  "bmux_attach_token_state",
+ "bmux_attach_view_protocol",
  "bmux_client",
  "bmux_codec",
  "bmux_ipc",
@@ -1571,6 +1581,7 @@ dependencies = [
  "bmux_attach_image_protocol",
  "bmux_attach_layout_protocol",
  "bmux_attach_token_state",
+ "bmux_attach_view_protocol",
  "bmux_client_state",
  "bmux_config",
  "bmux_context_state",
@@ -1908,6 +1919,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
  "bmux_attach_token_state",
+ "bmux_attach_view_protocol",
  "bmux_client_state",
  "bmux_codec",
  "bmux_config",

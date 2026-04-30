@@ -260,7 +260,7 @@ fn emit_attach_view_changed_scene(session_id: SessionId) {
         context_id: None,
         session_id: session_id.0,
         revision,
-        components: vec![bmux_ipc::AttachViewComponent::Scene],
+        components: vec![bmux_attach_view_protocol::AttachViewComponent::Scene],
     });
     super::publish_focus_state_snapshot();
 }

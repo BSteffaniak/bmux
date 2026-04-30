@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_attach_image_protocol = { workspace = true }
+bmux_attach_view_protocol  = { workspace = true }
 bmux_codec                 = { workspace = true }
 lz4_flex                   = { workspace = true, optional = true }
 serde                      = { workspace = true, features = ["derive", "std"] }
@@ -28,6 +29,7 @@ default = []
 # Development features
 fail-on-warnings = [
     "bmux_attach_image_protocol/fail-on-warnings",
+    "bmux_attach_view_protocol/fail-on-warnings",
     "bmux_codec/fail-on-warnings",
 ]
 

@@ -8,6 +8,7 @@
 //! Cross-platform IPC protocol models for bmux.
 
 use bmux_attach_image_protocol::AttachPaneImage;
+use bmux_attach_view_protocol::AttachViewComponent;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -307,15 +308,6 @@ impl Envelope {
 pub enum InvokeServiceKind {
     Query,
     Command,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachViewComponent {
-    Scene,
-    SurfaceContent,
-    Layout,
-    Status,
 }
 
 /// Request payload variants for client/server IPC.

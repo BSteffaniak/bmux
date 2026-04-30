@@ -18,8 +18,8 @@ use bmux_attach_pipeline_models::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, AttachPipelineDiagnosticCode,
     AttachPipelineDiagnosticEvent, AttachViewport,
 };
+use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState};
-use bmux_ipc::AttachViewComponent;
 use crossterm::cursor::{Hide, SavePosition};
 use crossterm::queue;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};

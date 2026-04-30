@@ -8,6 +8,7 @@ members = [
     "packages/appearance",
     "packages/attach-token-state",
     "packages/attach-layout-protocol",
+    "packages/attach-view-protocol",
     "packages/attach_pipeline",
     "packages/attach_pipeline/models",
     "packages/bmux",
@@ -130,6 +131,7 @@ bmux_attach_layout_protocol = { version = "0.0.1-alpha.0", default-features = fa
 bmux_attach_pipeline        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/attach_pipeline" }
 bmux_attach_pipeline_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/attach_pipeline/models" }
 bmux_attach_token_state     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/attach-token-state" }
+bmux_attach_view_protocol   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/attach-view-protocol" }
 bmux_cli                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
 bmux_cli_output             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli_output" }
 bmux_cli_schema             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli-schema" }

@@ -1812,6 +1812,7 @@ fn pane_summary_dtos_are_absent_from_ipc() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
     let denied = [
         "pub struct AttachGrant",
+        "pub enum AttachViewComponent",
         "pub enum AttachImageProtocol",
         "pub struct AttachPaneImage",
         "pub struct AttachPaneImageDelta",

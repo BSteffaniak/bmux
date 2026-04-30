@@ -8,8 +8,9 @@ use bmux_attach_layout_protocol::{
     PaneFocusDirection, PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
     PaneSplitDirection, PaneState, PaneSummary,
 };
+use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_context_state::ContextStateHandle;
-use bmux_ipc::{AttachViewComponent, Event, RecordingEventKind, RecordingPayload};
+use bmux_ipc::{Event, RecordingEventKind, RecordingPayload};
 use bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig;
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,

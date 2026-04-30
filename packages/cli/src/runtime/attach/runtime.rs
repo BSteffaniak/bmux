@@ -16,13 +16,14 @@ use bmux_attach_pipeline::reconcile::{
 use bmux_attach_pipeline::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy, DamageRect,
 };
+use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{
     AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, ClientError,
     StreamingBmuxClient,
 };
 use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
 use bmux_context_state::ContextSelector;
-use bmux_ipc::{AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, InvokeServiceKind};
+use bmux_ipc::{CAPABILITY_ATTACH_PANE_SNAPSHOT, InvokeServiceKind};
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_permissions_plugin_api::session_policy_state;
 use bmux_plugin_sdk::{
@@ -8900,11 +8901,11 @@ mod tests {
         AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         PaneLayoutNode, PaneState, PaneSummary,
     };
+    use bmux_attach_view_protocol::AttachViewComponent;
     use bmux_client::{AttachLayoutState, AttachOpenInfo};
     use bmux_config::{
         BmuxConfig, MouseClickPropagation, MouseSelectionReleaseBehavior, MouseWheelPropagation,
     };
-    use bmux_ipc::AttachViewComponent;
 
     use crossterm::event::{
         Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
