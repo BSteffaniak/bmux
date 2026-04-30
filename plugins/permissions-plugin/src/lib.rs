@@ -4,7 +4,7 @@
 
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{ServiceKind, StorageGetRequest, StorageSetRequest};
+use bmux_plugin_sdk::{StorageGetRequest, StorageSetRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -52,73 +52,64 @@ struct CurrentClientSnapshot {
     selected_session_id: Option<Uuid>,
 }
 
-fn list_sessions(caller: &impl ServiceCaller) -> Result<Vec<SessionSummary>, String> {
-    // Dispatch through sessions-plugin's typed
-    // `sessions-state::list-sessions` service rather than the legacy
-    // `Request::ListSessions` IPC variant.
-    #[derive(serde::Deserialize)]
-    struct Entry {
-        id: Uuid,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        client_count: u32,
-    }
-    caller
-        .call_service::<(), Vec<Entry>>(
-            bmux_sessions_plugin_api::capabilities::SESSIONS_READ.as_str(),
-            ServiceKind::Query,
-            bmux_sessions_plugin_api::sessions_state::INTERFACE_ID.as_str(),
-            "list-sessions",
-            &(),
-        )
-        .map(|entries| {
-            entries
-                .into_iter()
-                .map(|e| SessionSummary {
-                    id: e.id,
-                    name: e.name,
-                    client_count: e.client_count as usize,
-                })
-                .collect()
-        })
-        .map_err(|err| err.to_string())
+const fn dispatch_client<C: ServiceCaller + Sync + ?Sized>(
+    caller: &C,
+) -> bmux_plugin::ServiceCallerDispatchClient<'_, C> {
+    bmux_plugin::ServiceCallerDispatchClient::new(caller)
 }
 
-fn list_contexts(caller: &impl ServiceCaller) -> Result<Vec<ContextSummary>, String> {
-    caller
-        .call_service::<(), Vec<ContextSummary>>(
-            "bmux.contexts.read",
-            ServiceKind::Query,
-            "contexts-state",
-            "list-contexts",
-            &(),
-        )
-        .map_err(|err| err.to_string())
+fn list_sessions(caller: &(impl ServiceCaller + Sync)) -> Result<Vec<SessionSummary>, String> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_sessions_plugin_api::sessions_state::client::list_sessions(&mut client),
+    )
+    .map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| SessionSummary {
+                id: entry.id,
+                name: entry.name,
+                client_count: entry.client_count as usize,
+            })
+            .collect()
+    })
+    .map_err(|err| err.to_string())
 }
 
-fn current_context_id(caller: &impl ServiceCaller) -> Result<Option<Uuid>, String> {
-    let response: Option<ContextSummary> = caller
-        .call_service(
-            "bmux.contexts.read",
-            ServiceKind::Query,
-            "contexts-state",
-            "current-context",
-            &(),
-        )
-        .map_err(|err| err.to_string())?;
-    Ok(response.map(|c| c.id))
+fn list_contexts(caller: &(impl ServiceCaller + Sync)) -> Result<Vec<ContextSummary>, String> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_contexts_plugin_api::contexts_state::client::list_contexts(&mut client),
+    )
+    .map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| ContextSummary {
+                id: entry.id,
+                name: entry.name,
+                attributes: entry.attributes,
+            })
+            .collect()
+    })
+    .map_err(|err| err.to_string())
 }
 
-fn current_client_snapshot(caller: &impl ServiceCaller) -> Result<CurrentClientSnapshot, String> {
-    use bmux_clients_plugin_api::clients_state::{self, ClientQueryError, ClientSummary};
-    match caller.call_service::<(), std::result::Result<ClientSummary, ClientQueryError>>(
-        bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str(),
-        ServiceKind::Query,
-        clients_state::INTERFACE_ID.as_str(),
-        "current-client",
-        &(),
-    ) {
+fn current_context_id(caller: &(impl ServiceCaller + Sync)) -> Result<Option<Uuid>, String> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_contexts_plugin_api::contexts_state::client::current_context(&mut client),
+    )
+    .map(|context| context.map(|entry| entry.id))
+    .map_err(|err| err.to_string())
+}
+
+fn current_client_snapshot(
+    caller: &(impl ServiceCaller + Sync),
+) -> Result<CurrentClientSnapshot, String> {
+    use bmux_clients_plugin_api::clients_state;
+
+    let mut client = dispatch_client(caller);
+    match bmux_plugin::block_on_typed_dispatch(clients_state::client::current_client(&mut client)) {
         Ok(Ok(summary)) => Ok(CurrentClientSnapshot {
             selected_session_id: summary.selected_session_id,
         }),
@@ -363,7 +354,7 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
     }
 }
 
-fn resolve_current_session(caller: &impl HostRuntimeApi) -> Result<String, String> {
+fn resolve_current_session(caller: &(impl HostRuntimeApi + Sync)) -> Result<String, String> {
     let current_client = current_client_snapshot(caller)?;
     let sessions = list_sessions(caller)?;
     let preferred = current_client.selected_session_id.and_then(|selected_id| {
@@ -396,7 +387,7 @@ impl StoredPermissions {
 const PERMISSIONS_STORAGE_KEY: &str = "permissions-v1";
 
 fn list_entries(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     session: &str,
 ) -> Result<Vec<PermissionEntry>, String> {
     let session_id = resolve_session_id(caller, session)?;
@@ -408,7 +399,7 @@ fn list_entries(
         .unwrap_or_default())
 }
 
-fn grant_entry(caller: &impl HostRuntimeApi, request: GrantRequest) -> Result<(), String> {
+fn grant_entry(caller: &(impl HostRuntimeApi + Sync), request: GrantRequest) -> Result<(), String> {
     validate_role(&request.role)?;
     let session_id = resolve_session_id(caller, &request.session)?;
     let mut state = load_state(caller)?;
@@ -427,7 +418,10 @@ fn grant_entry(caller: &impl HostRuntimeApi, request: GrantRequest) -> Result<()
     save_state(caller, &state)
 }
 
-fn revoke_entry(caller: &impl HostRuntimeApi, request: &RevokeRequest) -> Result<(), String> {
+fn revoke_entry(
+    caller: &(impl HostRuntimeApi + Sync),
+    request: &RevokeRequest,
+) -> Result<(), String> {
     let session_id = resolve_session_id(caller, &request.session)?;
     let mut state = load_state(caller)?;
     if let Some(entries) = state.by_session_id.get_mut(&session_id) {
@@ -437,7 +431,7 @@ fn revoke_entry(caller: &impl HostRuntimeApi, request: &RevokeRequest) -> Result
 }
 
 fn evaluate_policy(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     request: &SessionPolicyCheckRequest,
 ) -> Result<SessionPolicyCheckResponse, String> {
     if request.action == "hot_path_execution" {
@@ -466,7 +460,7 @@ fn evaluate_policy(
 }
 
 fn evaluate_hot_path_execution_policy(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     request: &SessionPolicyCheckRequest,
 ) -> Result<SessionPolicyCheckResponse, String> {
     let Some(execution_class) = request.execution_class.as_deref() else {
@@ -519,7 +513,7 @@ fn evaluate_hot_path_execution_policy(
 }
 
 fn list_hot_path_overrides(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     request: ListHotPathOverridesRequest,
 ) -> Result<ListHotPathOverridesResponse, String> {
     let session_id = match request.session {
@@ -542,7 +536,7 @@ fn list_hot_path_overrides(
 }
 
 fn grant_hot_path_override(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     request: GrantHotPathOverrideRequest,
 ) -> Result<(), String> {
     validate_hot_path_override_fields(
@@ -577,7 +571,7 @@ fn grant_hot_path_override(
 }
 
 fn revoke_hot_path_override(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     request: &RevokeHotPathOverrideRequest,
 ) -> Result<(), String> {
     validate_hot_path_override_fields(
@@ -657,7 +651,7 @@ fn validate_hot_path_override_fields(
 }
 
 fn resolve_override_scope(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     scope: &str,
     session: Option<&str>,
     context: Option<&str>,
@@ -689,7 +683,7 @@ fn resolve_override_scope(
 }
 
 fn inspect_hot_path_decision(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     request: &CheckHotPathDecisionRequest,
 ) -> Result<CheckHotPathDecisionResponse, String> {
     if request.plugin_id.trim().is_empty() {
@@ -760,7 +754,7 @@ fn inspect_hot_path_decision(
 }
 
 fn watch_hot_path_policy_decision(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     request: &CheckHotPathDecisionRequest,
     as_json: bool,
     compact: bool,
@@ -965,7 +959,10 @@ fn save_state(caller: &impl HostRuntimeApi, state: &StoredPermissions) -> Result
     Ok(())
 }
 
-fn resolve_session_id(caller: &impl HostRuntimeApi, session: &str) -> Result<Uuid, String> {
+fn resolve_session_id(
+    caller: &(impl HostRuntimeApi + Sync),
+    session: &str,
+) -> Result<Uuid, String> {
     // When the input parses as a UUID we treat it as an authoritative
     // session id: further existence verification happens at the site
     // of actual mutation (grant_entry / list_entries / etc.).
@@ -988,7 +985,10 @@ fn resolve_session_id(caller: &impl HostRuntimeApi, session: &str) -> Result<Uui
         .ok_or_else(|| format!("session '{session}' not found"))
 }
 
-fn resolve_context_id(caller: &impl HostRuntimeApi, context: &str) -> Result<Uuid, String> {
+fn resolve_context_id(
+    caller: &(impl HostRuntimeApi + Sync),
+    context: &str,
+) -> Result<Uuid, String> {
     let selector = if let Ok(id) = Uuid::parse_str(context) {
         ContextSelector::ById(id)
     } else if context.trim().is_empty() {

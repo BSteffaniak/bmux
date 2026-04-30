@@ -1360,6 +1360,39 @@ fn plugin_impl_crates_do_not_define_private_domain_ipc_modules() {
     }
 }
 
+/// Foundational plugin cross-calls that have generated BPDL clients
+/// should not regress to handwritten service strings or ad-hoc
+/// `call_service` payload shims.
+#[test]
+fn migrated_plugin_cross_calls_use_generated_clients() {
+    let clients = production_section(include_str!("../../../plugins/clients-plugin/src/lib.rs"));
+    for marker in [
+        "\"bmux.contexts.",
+        "\"bmux.sessions.",
+        "\"contexts-commands\"",
+        "\"sessions-commands\"",
+    ] {
+        assert!(
+            !clients.contains(marker),
+            "clients-plugin must use generated clients instead of handwritten cross-plugin marker `{marker}`",
+        );
+    }
+
+    let contexts = production_section(include_str!("../../../plugins/contexts-plugin/src/lib.rs"));
+    assert!(
+        !contexts.contains(".call_service_raw("),
+        "contexts-plugin must use generated clients for sessions-plugin orchestration",
+    );
+
+    let permissions = production_section(include_str!(
+        "../../../plugins/permissions-plugin/src/lib.rs"
+    ));
+    assert!(
+        !permissions.contains(".call_service("),
+        "permissions-plugin must use generated clients for existing typed plugin contracts",
+    );
+}
+
 /// The monolithic `SnapshotV4` schema plus the `SnapshotManager` +
 /// `SnapshotRuntime` machinery and the entire
 /// `packages/server/src/persistence.rs` file have been deleted.
