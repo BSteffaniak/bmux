@@ -104,6 +104,15 @@ const fn extension_rect_touches_or_overlaps(a: ExtensionRect, b: ExtensionRect) 
     a.x <= b.right() && b.x <= a.right() && a.y <= b.bottom() && b.y <= a.bottom()
 }
 
+fn frame_rects_to_render_damage(rects: &[DamageRect], surface_rect: ExtensionRect) -> RenderDamage {
+    RenderDamage::from_rects(rects.iter().map(|rect| ExtensionRect {
+        x: surface_rect.x.saturating_add(rect.x),
+        y: surface_rect.y.saturating_add(rect.y),
+        w: rect.w,
+        h: rect.h,
+    }))
+}
+
 fn queue_render_ops<W: io::Write>(
     stdout: &mut W,
     surface_rect: ExtensionRect,
@@ -589,6 +598,39 @@ impl FrameDamage {
         self.extension_surface_rects
             .get(&surface_id)
             .map_or(&[], Vec::as_slice)
+    }
+
+    pub fn merge_from(&mut self, other: &Self) {
+        if other.full_frame {
+            self.mark_full_frame();
+            return;
+        }
+        for pane_id in &other.content_surfaces {
+            self.mark_content_surface(*pane_id);
+        }
+        for (pane_id, rects) in &other.content_surface_rects {
+            if self.content_surfaces.contains(pane_id) {
+                continue;
+            }
+            self.content_surface_rects
+                .entry(*pane_id)
+                .or_default()
+                .extend(rects.iter().copied());
+        }
+        for surface_id in &other.extension_surfaces {
+            self.mark_extension_surface(*surface_id);
+        }
+        for (surface_id, rects) in &other.extension_surface_rects {
+            if self.extension_surfaces.contains(surface_id) {
+                continue;
+            }
+            self.extension_surface_rects
+                .entry(*surface_id)
+                .or_default()
+                .extend(rects.iter().copied());
+        }
+        self.status |= other.status;
+        self.overlay |= other.overlay;
     }
 
     #[must_use]
@@ -1095,11 +1137,18 @@ pub fn render_attach_scene<W: io::Write>(
                 h: rect.h,
             };
             for ext in render_extensions {
+                let extension_rect_damage = frame_damage.extension_surface_rects(surface.id);
                 let damage = if frame_damage.content_surface_damaged(pane_id) {
                     RenderDamage::FullSurface
-                } else {
+                } else if extension_rect_damage.is_empty() {
                     coalesce_render_damage(
                         ext.surface_damage(surface.id, &ext_rect),
+                        ext_rect,
+                        damage_policy,
+                    )
+                } else {
+                    coalesce_render_damage(
+                        frame_rects_to_render_damage(extension_rect_damage, ext_rect),
                         ext_rect,
                         damage_policy,
                     )
@@ -1224,7 +1273,12 @@ pub fn render_attach_scene<W: io::Write>(
             if !should_draw_content || sync_deferred {
                 continue;
             }
+            let damaged_content_rows = frame_damage.content_surface_rects(pane_id);
             for row in 0..inner_h {
+                let force_row_damage = damaged_content_rows.iter().any(|rect| {
+                    let row = u16::try_from(row).unwrap_or(u16::MAX);
+                    row >= rect.y && row < rect.bottom()
+                });
                 let y = content.y.saturating_add(row as u16);
                 let mut line = String::new();
                 let mut current = CellStyle::default();
@@ -1285,7 +1339,7 @@ pub fn render_attach_scene<W: io::Write>(
                 // Row-level diff: skip emitting if the rendered string
                 // matches the previous frame's cached version for this row.
                 let cached = entry.prev_rows.get(row);
-                if cached.is_none_or(|c| *c != line) {
+                if force_row_damage || cached.is_none_or(|c| *c != line) {
                     queue!(stdout, MoveTo(content.x, y), Print(&line))
                         .context("failed drawing pane content")?;
                     if row < entry.prev_rows.len() {
@@ -1610,6 +1664,97 @@ mod tests {
         let toggled = append_pane_output(&mut buffer, b"\x1b[?1049hhello\x1b[?1049l");
         assert!(toggled);
         assert!(!buffer.parser.screen().alternate_screen());
+    }
+
+    #[test]
+    fn render_attach_scene_reemits_rows_intersecting_rect_damage() {
+        let pane_id = Uuid::from_u128(1);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(2),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 3,
+                },
+                content_rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 3,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        buffer.parser.screen_mut().set_size(3, 8);
+        buffer.parser.process(b"abcdefgh\r\nijklmnop\r\nqrstuvwx");
+        pane_buffers.insert(pane_id, buffer);
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 3),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("initial render should populate row cache");
+
+        let mut damage = FrameDamage::default();
+        damage.mark_content_surface_rect(
+            pane_id,
+            DamageRect::new(2, 1, 2, 1),
+            (8, 3),
+            DamageCoalescingPolicy::default(),
+        );
+        let mut output = Vec::new();
+        render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &damage,
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 3),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("rect-damaged render should succeed");
+
+        let output = String::from_utf8(output).expect("output should be utf8");
+        assert!(output.contains("ijklmnop"));
+        assert!(!output.contains("abcdefgh"));
+        assert!(!output.contains("qrstuvwx"));
     }
 
     #[test]

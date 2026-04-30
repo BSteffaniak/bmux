@@ -4,7 +4,9 @@ use bmux_attach_layout_protocol::attach_layout_protocol::{
     AttachLayoutSnapshot, AttachSurfaceSummary, STATE_KIND as ATTACH_LAYOUT_STATE_KIND,
 };
 use bmux_attach_pipeline::mouse as attach_mouse;
-use bmux_attach_pipeline::reconcile::apply_attach_output_chunk_with;
+use bmux_attach_pipeline::reconcile::{
+    apply_attach_output_chunk_with, attach_scene_damage_between,
+};
 use bmux_attach_pipeline::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy,
 };
@@ -1877,10 +1879,6 @@ pub async fn run_session_attach_with_client(
             };
             if view_state.cached_layout_state.as_ref() != Some(&layout_state) {
                 frame_needs_render = true;
-                let pane_ids = visible_scene_pane_ids(&layout_state.scene);
-                for pane_id in pane_ids {
-                    view_state.dirty.pane_dirty_ids.insert(pane_id);
-                }
                 match previous_layout.as_ref() {
                     None => {
                         view_state.dirty.full_pane_redraw = true;
@@ -1927,7 +1925,26 @@ pub async fn run_session_attach_with_client(
                             }
 
                             if !scene_hydrated {
-                                view_state.dirty.full_pane_redraw = true;
+                                let damage_policy = DamageCoalescingPolicy {
+                                    max_rects: attach_config.behavior.damage.max_rects,
+                                    max_area_percent: attach_config
+                                        .behavior
+                                        .damage
+                                        .max_area_percent,
+                                };
+                                let scene_damage = attach_scene_damage_between(
+                                    &previous.scene,
+                                    &layout_state.scene,
+                                    damage_policy,
+                                );
+                                if scene_damage.is_empty() {
+                                    view_state.dirty.extension_needs_redraw = true;
+                                } else {
+                                    view_state
+                                        .dirty
+                                        .precise_frame_damage
+                                        .merge_from(&scene_damage);
+                                }
                             }
                         } else if previous.focused_pane_id != layout_state.focused_pane_id {
                             view_state

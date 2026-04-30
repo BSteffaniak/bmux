@@ -58,6 +58,8 @@ pub struct AttachDirtyFlags {
     /// extensions to repaint their damaged regions without invalidating
     /// pane content row caches.
     pub extension_needs_redraw: bool,
+    /// Precise frame damage computed by scene/layout reconciliation.
+    pub precise_frame_damage: FrameDamage,
 }
 
 impl Default for AttachDirtyFlags {
@@ -69,6 +71,7 @@ impl Default for AttachDirtyFlags {
             pane_dirty_ids: BTreeSet::new(),
             full_pane_redraw: true,
             extension_needs_redraw: true,
+            precise_frame_damage: FrameDamage::default(),
         }
     }
 }
@@ -81,6 +84,7 @@ impl AttachDirtyFlags {
         } else {
             FrameDamage::default()
         };
+        damage.merge_from(&self.precise_frame_damage);
         for pane_id in &self.pane_dirty_ids {
             damage.mark_content_surface(*pane_id);
         }
@@ -104,6 +108,7 @@ impl AttachDirtyFlags {
             || self.full_pane_redraw
             || self.extension_needs_redraw
             || self.overlay_needs_redraw
+            || !self.precise_frame_damage.is_empty()
             || !self.pane_dirty_ids.is_empty()
     }
 
@@ -111,6 +116,7 @@ impl AttachDirtyFlags {
         self.full_pane_redraw = false;
         self.extension_needs_redraw = false;
         self.overlay_needs_redraw = false;
+        self.precise_frame_damage = FrameDamage::default();
         self.pane_dirty_ids.clear();
     }
 }
