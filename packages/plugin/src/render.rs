@@ -15,15 +15,15 @@
 //!    [`register_render_extension`] with an `Arc<dyn AttachRenderExtension>`.
 //! 2. The attach runtime reads the current registry via
 //!    [`registered_render_extensions`] on every frame and calls each
-//!    extension's [`AttachRenderExtension::apply_surface`] for every
-//!    visible surface.
+//!    extension's [`AttachRenderExtension::render_surface`] for every
+//!    damaged visible surface.
 //! 3. When a surface disappears (pane closed, layout recomputed without
 //!    it), the attach runtime calls
 //!    [`AttachRenderExtension::surface_removed`] so the extension can
 //!    evict any cached state.
 //!
 //! Extensions are expected to be lightweight: the registry lookup is
-//! `O(n)` per render, and `apply_surface` is on the hot path. Caching
+//! `O(n)` per render, and `render_surface` is on the hot path. Caching
 //! paint output on the extension side is recommended when the source
 //! data (e.g. a scene-protocol snapshot) changes less often than
 //! layout refreshes.
@@ -48,6 +48,92 @@ pub struct ExtensionRect {
     pub h: u16,
 }
 
+impl ExtensionRect {
+    #[must_use]
+    pub const fn right(self) -> u16 {
+        self.x.saturating_add(self.w)
+    }
+
+    #[must_use]
+    pub const fn bottom(self) -> u16 {
+        self.y.saturating_add(self.h)
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        !self.is_empty()
+            && !other.is_empty()
+            && self.x < other.right()
+            && self.right() > other.x
+            && self.y < other.bottom()
+            && self.bottom() > other.y
+    }
+
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = self.right().max(other.right());
+        let bottom = self.bottom().max(other.bottom());
+        Self {
+            x,
+            y,
+            w: right.saturating_sub(x),
+            h: bottom.saturating_sub(y),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderDamage {
+    None,
+    FullSurface,
+    Regions(Vec<ExtensionRect>),
+}
+
+impl RenderDamage {
+    #[must_use]
+    pub const fn full_surface() -> Self {
+        Self::FullSurface
+    }
+
+    #[must_use]
+    pub fn from_rects(rects: impl IntoIterator<Item = ExtensionRect>) -> Self {
+        let mut merged: Vec<ExtensionRect> = Vec::new();
+        for rect in rects {
+            if rect.is_empty() {
+                continue;
+            }
+            if let Some(existing) = merged.iter_mut().find(|existing| existing.intersects(rect)) {
+                *existing = existing.union(rect);
+            } else {
+                merged.push(rect);
+            }
+        }
+        if merged.is_empty() {
+            Self::None
+        } else {
+            Self::Regions(merged)
+        }
+    }
+
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// Host-supplied trait objects that plugins implement to paint
 /// per-surface chrome on top of pane content.
 ///
@@ -60,20 +146,27 @@ pub trait AttachRenderExtension: Send + Sync {
     /// `"bmux.decoration.renderer"`).
     fn name(&self) -> &str;
 
-    /// Paint any per-surface chrome onto `stdout` for the surface at
-    /// `surface_rect`. Returns `Ok(true)` when any bytes were written
-    /// (so the caller can terminate a styled run with a reset), or
-    /// `Ok(false)` when the extension had nothing to paint for this
-    /// surface.
+    /// Return the currently-invalid region for a surface. The default
+    /// is conservative: if the caller asks an extension to repaint and
+    /// the extension cannot provide exact damage, the host treats the
+    /// whole surface as damaged.
+    fn surface_damage(&self, _surface_id: Uuid, _surface_rect: &ExtensionRect) -> RenderDamage {
+        RenderDamage::FullSurface
+    }
+
+    /// Paint per-surface output onto `stdout` for the damaged region
+    /// of `surface_rect`. Returns `Ok(true)` when any bytes were
+    /// written, or `Ok(false)` when the extension had nothing to paint.
     ///
     /// # Errors
     ///
     /// Returns any error from queueing bytes onto `stdout`.
-    fn apply_surface(
+    fn render_surface(
         &self,
         stdout: &mut dyn io::Write,
         surface_id: Uuid,
         surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
     ) -> io::Result<bool>;
 
     /// Override the surface's content-rect inset. Returning `Some`
@@ -188,11 +281,12 @@ mod tests {
             &self.name
         }
 
-        fn apply_surface(
+        fn render_surface(
             &self,
             _stdout: &mut dyn io::Write,
             surface_id: Uuid,
             _surface_rect: &ExtensionRect,
+            _damage: &RenderDamage,
         ) -> io::Result<bool> {
             self.applied.lock().unwrap().push(surface_id);
             Ok(false)
@@ -230,6 +324,27 @@ mod tests {
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
         assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn extension_default_damage_is_full_surface() {
+        let ext = RecordingExtension {
+            name: "x".to_string(),
+            applied: Mutex::new(Vec::new()),
+            removed: Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            ext.surface_damage(
+                Uuid::nil(),
+                &ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                },
+            ),
+            RenderDamage::FullSurface
+        );
     }
 
     #[test]

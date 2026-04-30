@@ -333,7 +333,8 @@ pub fn visible_scene_pane_ids(scene: &AttachScene) -> Vec<Uuid> {
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::fn_params_excessive_bools // explicit render-state flags keep hot-path call sites readable
 )]
 /// Render a composed attach scene frame.
 ///
@@ -347,6 +348,7 @@ pub fn render_attach_scene<W: io::Write>(
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     dirty_pane_ids: &BTreeSet<Uuid>,
     full_pane_redraw: bool,
+    extension_redraw: bool,
     status_top_inset: u16,
     status_bottom_inset: u16,
     scrollback_active: bool,
@@ -421,7 +423,8 @@ pub fn render_attach_scene<W: io::Write>(
         if rect.w < 2 || rect.h < 2 {
             continue;
         }
-        let should_draw = full_pane_redraw || dirty_pane_ids.contains(&pane_id);
+        let should_draw_content = full_pane_redraw || dirty_pane_ids.contains(&pane_id);
+        let should_draw_extensions = should_draw_content || extension_redraw;
 
         // Defer drawing pane content while the inner application is inside a
         // DEC mode 2026 synchronized update.  The server's byte-by-byte CSI
@@ -437,12 +440,11 @@ pub fn render_attach_scene<W: io::Write>(
         let focus = surface.cursor_owner
             || focused_surface_id == Some(surface.id)
             || focused_pane_id == Some(pane_id);
-        if should_draw {
+        if should_draw_extensions {
             // Consult every registered render extension for this
-            // surface. Extensions (decoration renderer, overlays,
-            // etc.) paint their own chrome. When no extension has
-            // anything to render for the surface, we draw nothing —
-            // chrome is exclusively plugin-owned.
+            // surface. Extensions report generic surface damage;
+            // unknown damage safely falls back to full-surface
+            // extension repaint without forcing pane content redraw.
             let ext_rect = bmux_plugin::ExtensionRect {
                 x: rect.x,
                 y: rect.y,
@@ -454,12 +456,22 @@ pub fn render_attach_scene<W: io::Write>(
             // regardless of the concrete `W` the caller passed.
             let mut dyn_writer: &mut dyn io::Write = stdout;
             for ext in render_extensions {
-                if let Err(err) = ext.apply_surface(&mut dyn_writer, surface.id, &ext_rect) {
+                let damage = if full_pane_redraw || dirty_pane_ids.contains(&pane_id) {
+                    bmux_plugin::RenderDamage::FullSurface
+                } else {
+                    ext.surface_damage(surface.id, &ext_rect)
+                };
+                if damage.is_none() {
+                    continue;
+                }
+                if let Err(err) =
+                    ext.render_surface(&mut dyn_writer, surface.id, &ext_rect, &damage)
+                {
                     tracing::warn!(
                         extension = ext.name(),
                         surface_id = %surface.id,
                         error = %err,
-                        "render extension apply_surface failed",
+                        "render extension render_surface failed",
                     );
                 }
             }
@@ -513,7 +525,7 @@ pub fn render_attach_scene<W: io::Write>(
                     visible: use_scrollback || !screen.hide_cursor(),
                 });
             }
-            if !should_draw || sync_deferred {
+            if !should_draw_content || sync_deferred {
                 continue;
             }
             for row in 0..inner_h {
@@ -595,7 +607,7 @@ pub fn render_attach_scene<W: io::Write>(
                     .screen_mut()
                     .set_scrollback(previous_scrollback);
             }
-        } else if should_draw {
+        } else if should_draw_content {
             for row in 0..inner_h {
                 let y = content.y.saturating_add(row as u16);
                 queue!(stdout, MoveTo(content.x, y), Print(" ".repeat(inner_w)))
@@ -803,6 +815,7 @@ mod tests {
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
             true,
+            true,
             1,
             0,
             true,
@@ -865,6 +878,7 @@ mod tests {
             &[],
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
+            true,
             true,
             1,
             0,
@@ -941,6 +955,7 @@ mod tests {
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
             true,
+            true,
             0,
             0,
             false,
@@ -961,7 +976,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Test fixture builds a full scene + extension + assertions inline.
     fn render_attach_scene_applies_render_extension_paint_commands() {
-        use bmux_plugin::{AttachRenderExtension, ExtensionRect};
+        use bmux_plugin::{AttachRenderExtension, ExtensionRect, RenderDamage};
         use bmux_scene_protocol::scene_protocol::{Color, NamedColor};
         use std::io;
         use std::sync::Arc;
@@ -979,11 +994,12 @@ mod tests {
                 "test.styled_run"
             }
 
-            fn apply_surface(
+            fn render_surface(
                 &self,
                 stdout: &mut dyn io::Write,
                 _surface_id: Uuid,
                 _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
             ) -> io::Result<bool> {
                 let style = bmux_scene_protocol::scene_protocol::Style {
                     fg: Some(Color::Named {
@@ -1079,6 +1095,7 @@ mod tests {
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
             true,
+            true,
             1,
             0,
             false,
@@ -1162,6 +1179,7 @@ mod tests {
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
             true, // full redraw
+            true,
             1,
             0,
             false,
@@ -1192,6 +1210,7 @@ mod tests {
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
             false, // incremental — sync deferral should kick in
+            false,
             1,
             0,
             false,
@@ -1225,6 +1244,7 @@ mod tests {
             &[],
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
+            false,
             false,
             1,
             0,
@@ -1292,6 +1312,7 @@ mod tests {
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
             true, // full_pane_redraw — must draw even if sync in progress
+            true,
             1,
             0,
             false,
@@ -1318,7 +1339,7 @@ mod tests {
     // paint-command variants end-to-end through the same render path
     // used in production.
 
-    use bmux_plugin::{AttachRenderExtension, ExtensionRect};
+    use bmux_plugin::{AttachRenderExtension, ExtensionRect, RenderDamage};
     use bmux_scene_protocol::scene_protocol::{
         BorderGlyphs, Cell, Color, GradientAxis, NamedColor, PaintCommand, Rect as SceneRect,
         Style, SurfaceDecoration,
@@ -1354,11 +1375,12 @@ mod tests {
             "test.single_surface"
         }
 
-        fn apply_surface(
+        fn render_surface(
             &self,
             stdout: &mut dyn io::Write,
             _surface_id: Uuid,
             _surface_rect: &ExtensionRect,
+            _damage: &RenderDamage,
         ) -> io::Result<bool> {
             let Ok(surface) = self.surface.lock() else {
                 return Ok(false);
@@ -1440,6 +1462,7 @@ mod tests {
             &panes,
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
+            true,
             true,
             0,
             0,

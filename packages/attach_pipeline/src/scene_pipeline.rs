@@ -320,6 +320,7 @@ impl AttachScenePipeline {
             &mut self.pane_buffers,
             &self.dirty_pane_ids,
             self.full_pane_redraw,
+            self.full_pane_redraw,
             self.viewport.status_top_inset,
             self.viewport.status_bottom_inset,
             false,

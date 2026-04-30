@@ -53,6 +53,10 @@ pub struct AttachDirtyFlags {
     pub overlay_needs_redraw: bool,
     pub pane_dirty_ids: BTreeSet<Uuid>,
     pub full_pane_redraw: bool,
+    /// Generic surface/plugin-render damage. This asks render
+    /// extensions to repaint their damaged regions without invalidating
+    /// pane content row caches.
+    pub extension_needs_redraw: bool,
 }
 
 impl Default for AttachDirtyFlags {
@@ -63,6 +67,7 @@ impl Default for AttachDirtyFlags {
             overlay_needs_redraw: false,
             pane_dirty_ids: BTreeSet::new(),
             full_pane_redraw: true,
+            extension_needs_redraw: true,
         }
     }
 }

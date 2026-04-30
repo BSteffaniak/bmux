@@ -595,6 +595,7 @@ impl AttachDirtyReasons {
     const PANE_DIRTY: u8 = 1 << 3;
     const LAYOUT: u8 = 1 << 4;
     const SCENE_HYDRATED: u8 = 1 << 5;
+    const EXTENSION: u8 = 1 << 6;
 
     fn from_view_state(view_state: &AttachViewState, layout: bool, scene_hydrated: bool) -> Self {
         let mut bits = 0;
@@ -615,6 +616,9 @@ impl AttachDirtyReasons {
         }
         if scene_hydrated {
             bits |= Self::SCENE_HYDRATED;
+        }
+        if view_state.dirty.extension_needs_redraw {
+            bits |= Self::EXTENSION;
         }
         Self { bits }
     }
@@ -653,6 +657,7 @@ struct AttachPerfWindow {
     dirty_pane_frames: u64,
     dirty_layout_frames: u64,
     dirty_scene_hydrated_frames: u64,
+    dirty_extension_frames: u64,
 }
 
 impl AttachPerfWindow {
@@ -685,6 +690,7 @@ impl AttachPerfWindow {
             dirty_pane_frames: 0,
             dirty_layout_frames: 0,
             dirty_scene_hydrated_frames: 0,
+            dirty_extension_frames: 0,
         }
     }
 
@@ -769,6 +775,9 @@ impl AttachPerfWindow {
         }
         if reasons.contains(AttachDirtyReasons::SCENE_HYDRATED) {
             self.dirty_scene_hydrated_frames = self.dirty_scene_hydrated_frames.saturating_add(1);
+        }
+        if reasons.contains(AttachDirtyReasons::EXTENSION) {
+            self.dirty_extension_frames = self.dirty_extension_frames.saturating_add(1);
         }
     }
 
@@ -960,6 +969,10 @@ fn attach_perf_window_payload(
             "dirty_scene_hydrated_frames".to_string(),
             window.dirty_scene_hydrated_frames.into(),
         );
+        object.insert(
+            "dirty_extension_frames".to_string(),
+            window.dirty_extension_frames.into(),
+        );
         if let Some(avg) = window.drain_ipc_ms_sum.checked_div(window.drain_ipc_calls) {
             object.insert("drain_ipc_ms_avg".to_string(), avg.into());
         }
@@ -1020,6 +1033,7 @@ async fn maybe_emit_attach_perf_window(
         dirty_pane_frames = window.dirty_pane_frames,
         dirty_layout_frames = window.dirty_layout_frames,
         dirty_scene_hydrated_frames = window.dirty_scene_hydrated_frames,
+        dirty_extension_frames = window.dirty_extension_frames,
         "attach.metrics.window"
     );
 
@@ -1644,6 +1658,7 @@ pub async fn run_session_attach_with_client(
                         >(payload)
                         {
                             Ok(scene) => {
+                                let scene_revision = scene.revision;
                                 // Re-publish retained scene state on the local event
                                 // bus so late-installed render extensions can hydrate
                                 // without waiting for a fresh scene mutation.
@@ -1651,10 +1666,12 @@ pub async fn run_session_attach_with_client(
                                     &bmux_scene_protocol::scene_protocol::STATE_KIND,
                                     scene,
                                 );
-                                // Any new scene makes the frame dirty
-                                // so render extensions get a chance
-                                // to repaint.
-                                view_state.dirty.full_pane_redraw = true;
+                                if scene_revision != last_scene_revision {
+                                    last_scene_revision = scene_revision;
+                                    // Any new scene makes extension output dirty
+                                    // without invalidating pane content row caches.
+                                    view_state.dirty.extension_needs_redraw = true;
+                                }
                             }
                             Err(error) => {
                                 tracing::warn!(
@@ -1876,7 +1893,7 @@ pub async fn run_session_attach_with_client(
                     perf_window.record_wake(AttachWakeSource::Scene);
                     if scene.revision != last_scene_revision {
                         last_scene_revision = scene.revision;
-                        view_state.dirty.full_pane_redraw = true;
+                        view_state.dirty.extension_needs_redraw = true;
                     }
                 } else {
                     // Broadcast lagged/closed — drop subscription.
@@ -1920,6 +1937,7 @@ pub async fn run_session_attach_with_client(
             view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none();
         let mut frame_needs_render = view_state.dirty.status_needs_redraw
             || view_state.dirty.full_pane_redraw
+            || view_state.dirty.extension_needs_redraw
             || view_state.dirty.overlay_needs_redraw
             || !view_state.dirty.pane_dirty_ids.is_empty();
 
@@ -4637,8 +4655,9 @@ pub fn render_attach_frame(
     }
     let (status_top_inset, status_bottom_inset) =
         status_insets_for_position(view_state.status_position);
-    let render_scene =
-        view_state.dirty.full_pane_redraw || !view_state.dirty.pane_dirty_ids.is_empty();
+    let render_scene = view_state.dirty.full_pane_redraw
+        || view_state.dirty.extension_needs_redraw
+        || !view_state.dirty.pane_dirty_ids.is_empty();
     let appearance_mode_id = if view_state.help_overlay_open {
         "help"
     } else if view_state.prompt.is_active() {
@@ -4664,6 +4683,7 @@ pub fn render_attach_frame(
             &mut view_state.pane_buffers,
             &view_state.dirty.pane_dirty_ids,
             view_state.dirty.full_pane_redraw,
+            view_state.dirty.extension_needs_redraw,
             status_top_inset,
             status_bottom_inset,
             view_state.scrollback_active,
@@ -4804,6 +4824,7 @@ pub fn render_attach_frame(
         terminal_write_ms,
     };
     view_state.dirty.full_pane_redraw = false;
+    view_state.dirty.extension_needs_redraw = false;
     view_state.dirty.overlay_needs_redraw = false;
     view_state.dirty.pane_dirty_ids.clear();
     Ok(stats)
@@ -9471,7 +9492,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn attach_mouse_forward_honors_render_extension_content_rect() {
-        use bmux_plugin::{AttachRenderExtension, ExtensionRect};
+        use bmux_plugin::{AttachRenderExtension, ExtensionRect, RenderDamage};
         use std::io;
         use std::sync::Arc;
 
@@ -9488,11 +9509,12 @@ mod tests {
                 "test.fixed_inset"
             }
 
-            fn apply_surface(
+            fn render_surface(
                 &self,
                 _stdout: &mut dyn io::Write,
                 _surface_id: Uuid,
                 _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
             ) -> io::Result<bool> {
                 Ok(false)
             }

@@ -17,9 +17,9 @@
 //! 2. The retained scene state seeds the extension's cache immediately, and
 //!    every subsequent scene replacement updates it (revision-guarded so stale
 //!    wire events can't downgrade).
-//! 3. On every attach-render pass, the extension's `apply_surface`
-//!    looks up the matching surface and hands its paint commands to
-//!    [`bmux_scene_protocol_render::paint::apply_paint_commands`].
+//! 3. On every attach-render pass, the extension reports generic
+//!    surface damage and `render_surface` hands matching paint
+//!    commands to [`bmux_scene_protocol_render::paint::apply_paint_commands`].
 //!
 //! The CLI's streaming loop is responsible for decoding the IPC
 //! `PluginBusEvent` payloads and re-emitting them onto the local
@@ -34,9 +34,10 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use bmux_plugin::{AttachRenderExtension, ExtensionRect};
+use bmux_plugin::{AttachRenderExtension, ExtensionRect, RenderDamage};
 use bmux_scene_protocol::scene_protocol::{
-    DecorationScene, Rect as SceneRect, STATE_KIND as SCENE_STATE_KIND, SurfaceDecoration,
+    DecorationScene, PaintCommand, Rect as SceneRect, STATE_KIND as SCENE_STATE_KIND,
+    SurfaceDecoration,
 };
 use bmux_scene_protocol_render::paint::apply_paint_commands;
 use uuid::Uuid;
@@ -49,6 +50,7 @@ use uuid::Uuid;
 struct DecorationRendererCache {
     revision: u64,
     surfaces: BTreeMap<Uuid, SurfaceDecoration>,
+    rendered_surfaces: BTreeMap<Uuid, SurfaceDecoration>,
 }
 
 impl DecorationRendererCache {
@@ -64,6 +66,23 @@ impl DecorationRendererCache {
     fn surface(&self, surface_id: &Uuid) -> Option<&SurfaceDecoration> {
         self.surfaces.get(surface_id)
     }
+
+    fn rendered_surface(&self, surface_id: &Uuid) -> Option<&SurfaceDecoration> {
+        self.rendered_surfaces.get(surface_id)
+    }
+
+    fn mark_rendered(&mut self, surface_id: Uuid) {
+        if let Some(surface) = self.surfaces.get(&surface_id) {
+            self.rendered_surfaces.insert(surface_id, surface.clone());
+        } else {
+            self.rendered_surfaces.remove(&surface_id);
+        }
+    }
+
+    fn forget_surface(&mut self, surface_id: &Uuid) {
+        self.rendered_surfaces.remove(surface_id);
+        self.surfaces.remove(surface_id);
+    }
 }
 
 /// Render extension that applies the decoration plugin's
@@ -78,19 +97,36 @@ impl AttachRenderExtension for DecorationRenderExtension {
         &self.name
     }
 
-    fn apply_surface(
+    fn surface_damage(&self, surface_id: Uuid, _surface_rect: &ExtensionRect) -> RenderDamage {
+        let Ok(cache) = self.cache.lock() else {
+            return RenderDamage::None;
+        };
+        let current = cache.surface(&surface_id);
+        let previous = cache.rendered_surface(&surface_id);
+        decoration_surface_damage(previous, current)
+    }
+
+    fn render_surface(
         &self,
         stdout: &mut dyn io::Write,
         surface_id: Uuid,
         _surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
     ) -> io::Result<bool> {
-        let Ok(cache) = self.cache.lock() else {
+        let Ok(mut cache) = self.cache.lock() else {
             return Ok(false);
         };
         let Some(surface) = cache.surface(&surface_id) else {
+            cache.mark_rendered(surface_id);
             return Ok(false);
         };
+        if surface.paint_commands.is_empty() || damage.is_none() {
+            cache.mark_rendered(surface_id);
+            return Ok(false);
+        }
+        let surface = filter_surface_for_damage(surface, damage);
         if surface.paint_commands.is_empty() {
+            cache.mark_rendered(surface_id);
             return Ok(false);
         }
         // `apply_paint_commands` is generic over `W: io::Write` and
@@ -100,15 +136,23 @@ impl AttachRenderExtension for DecorationRenderExtension {
         // a fresh `&mut dyn io::Write`, which is itself Sized) lets
         // the generic bound see a Sized writer.
         let mut writer: &mut dyn io::Write = &mut *stdout;
-        apply_paint_commands(&mut writer, surface)
+        let rendered = apply_paint_commands(&mut writer, &surface)
             .map(|()| true)
-            .map_err(|err| io::Error::other(err.to_string()))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        cache.mark_rendered(surface_id);
+        Ok(rendered)
     }
 
     fn content_rect_override(&self, surface_id: Uuid) -> Option<ExtensionRect> {
         let cache = self.cache.lock().ok()?;
         let surface = cache.surface(&surface_id)?;
         Some(extension_rect_from_scene(&surface.content_rect))
+    }
+
+    fn surface_removed(&self, surface_id: Uuid) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.forget_surface(&surface_id);
+        }
     }
 }
 
@@ -119,6 +163,119 @@ fn extension_rect_from_scene(rect: &SceneRect) -> ExtensionRect {
         w: rect.w,
         h: rect.h,
     }
+}
+
+fn decoration_surface_damage(
+    previous: Option<&SurfaceDecoration>,
+    current: Option<&SurfaceDecoration>,
+) -> RenderDamage {
+    match (previous, current) {
+        (None, None) => RenderDamage::None,
+        (Some(previous), Some(current)) if previous.content_rect != current.content_rect => {
+            RenderDamage::FullSurface
+        }
+        (previous, current) => RenderDamage::from_rects(
+            previous
+                .into_iter()
+                .chain(current)
+                .flat_map(|surface| surface.paint_commands.iter().flat_map(paint_command_damage)),
+        ),
+    }
+}
+
+fn filter_surface_for_damage(
+    surface: &SurfaceDecoration,
+    damage: &RenderDamage,
+) -> SurfaceDecoration {
+    if matches!(damage, RenderDamage::FullSurface) {
+        return surface.clone();
+    }
+    let RenderDamage::Regions(regions) = damage else {
+        let mut filtered = surface.clone();
+        filtered.paint_commands.clear();
+        return filtered;
+    };
+    let mut filtered = surface.clone();
+    filtered.paint_commands = surface
+        .paint_commands
+        .iter()
+        .filter(|command| {
+            paint_command_damage(command)
+                .any(|rect| regions.iter().any(|region| region.intersects(rect)))
+        })
+        .cloned()
+        .collect();
+    filtered
+}
+
+fn paint_command_damage(command: &PaintCommand) -> impl Iterator<Item = ExtensionRect> + '_ {
+    let rects: Vec<ExtensionRect> = match command {
+        PaintCommand::Text { col, row, text, .. }
+        | PaintCommand::GradientRun { col, row, text, .. } => vec![ExtensionRect {
+            x: *col,
+            y: *row,
+            w: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
+            h: 1,
+        }],
+        PaintCommand::FilledRect { rect, .. } => vec![extension_rect_from_scene(rect)],
+        PaintCommand::CellGrid {
+            origin_col,
+            origin_row,
+            cols,
+            cells,
+            ..
+        } => {
+            let rows = if *cols == 0 {
+                0
+            } else {
+                let len = u16::try_from(cells.len()).unwrap_or(u16::MAX);
+                len.saturating_add(cols.saturating_sub(1)) / *cols
+            };
+            vec![ExtensionRect {
+                x: *origin_col,
+                y: *origin_row,
+                w: *cols,
+                h: rows,
+            }]
+        }
+        PaintCommand::BoxBorder { rect, .. } => border_damage_rects(rect),
+    };
+    rects.into_iter()
+}
+
+fn border_damage_rects(rect: &SceneRect) -> Vec<ExtensionRect> {
+    if rect.w == 0 || rect.h == 0 {
+        return Vec::new();
+    }
+    if rect.w < 2 || rect.h < 2 {
+        return vec![extension_rect_from_scene(rect)];
+    }
+    vec![
+        ExtensionRect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: 1,
+        },
+        ExtensionRect {
+            x: rect.x,
+            y: rect.y.saturating_add(rect.h.saturating_sub(1)),
+            w: rect.w,
+            h: 1,
+        },
+        ExtensionRect {
+            x: rect.x,
+            y: rect.y.saturating_add(1),
+            w: 1,
+            h: rect.h.saturating_sub(2),
+        },
+        ExtensionRect {
+            x: rect.x.saturating_add(rect.w.saturating_sub(1)),
+            y: rect.y.saturating_add(1),
+            w: 1,
+            h: rect.h.saturating_sub(2),
+        },
+    ]
 }
 
 /// Process-wide handle to the installed extension's cache. `install` stores it
