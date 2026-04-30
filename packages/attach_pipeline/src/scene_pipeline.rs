@@ -4,7 +4,10 @@ use crate::reconcile::{
     attach_layout_requires_snapshot_hydration, attach_scene_revealed_pane_ids,
     resize_attach_parsers_for_scene_with_size,
 };
-use crate::render::{FrameDamage, append_pane_output, render_attach_scene, visible_scene_pane_ids};
+use crate::render::{
+    DamageCoalescingPolicy, FrameDamage, append_pane_output, render_attach_scene,
+    visible_scene_pane_ids,
+};
 use crate::types::{AttachCursorState, PaneRenderBuffer};
 use crate::{mouse_protocol_encoding_to_ipc, mouse_protocol_mode_to_ipc};
 use anyhow::Result;
@@ -338,6 +341,7 @@ impl AttachScenePipeline {
             layout_state.zoomed,
             (self.viewport.cols, self.viewport.rows),
             &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
             &[],
         )?;
         apply_attach_cursor_state(

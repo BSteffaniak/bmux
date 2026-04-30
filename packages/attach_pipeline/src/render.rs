@@ -7,6 +7,7 @@ use bmux_appearance::{
     RuntimeContentEffectScope,
 };
 use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
+use bmux_plugin::{AttachRenderExtension, ExtensionRect, RenderDamage};
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
@@ -29,6 +30,73 @@ impl Default for DamageCoalescingPolicy {
             max_area_percent: 60,
         }
     }
+}
+
+fn coalesce_render_damage(
+    damage: RenderDamage,
+    surface_rect: ExtensionRect,
+    policy: DamageCoalescingPolicy,
+) -> RenderDamage {
+    let RenderDamage::Regions(rects) = damage else {
+        return damage;
+    };
+
+    let mut merged = Vec::new();
+    for rect in rects {
+        let Some(rect) = clip_extension_rect(rect, surface_rect) else {
+            continue;
+        };
+        let mut index = 0;
+        let mut next = rect;
+        while index < merged.len() {
+            if extension_rect_touches_or_overlaps(merged[index], next) {
+                next = merged.swap_remove(index).union(next);
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+        merged.push(next);
+    }
+
+    if merged.is_empty() {
+        return RenderDamage::None;
+    }
+
+    let surface_area = u32::from(surface_rect.w) * u32::from(surface_rect.h);
+    if surface_area == 0 {
+        return RenderDamage::None;
+    }
+    let damaged_area = merged.iter().fold(0_u32, |area, rect| {
+        area.saturating_add(u32::from(rect.w) * u32::from(rect.h))
+    });
+    let area_percent = damaged_area.saturating_mul(100) / surface_area;
+    if merged.len() > policy.max_rects || area_percent >= u32::from(policy.max_area_percent) {
+        RenderDamage::FullSurface
+    } else {
+        RenderDamage::Regions(merged)
+    }
+}
+
+fn clip_extension_rect(rect: ExtensionRect, bounds: ExtensionRect) -> Option<ExtensionRect> {
+    let x1 = rect.x.max(bounds.x);
+    let y1 = rect.y.max(bounds.y);
+    let x2 = rect.right().min(bounds.right());
+    let y2 = rect.bottom().min(bounds.bottom());
+    if x1 >= x2 || y1 >= y2 {
+        None
+    } else {
+        Some(ExtensionRect {
+            x: x1,
+            y: y1,
+            w: x2.saturating_sub(x1),
+            h: y2.saturating_sub(y1),
+        })
+    }
+}
+
+const fn extension_rect_touches_or_overlaps(a: ExtensionRect, b: ExtensionRect) -> bool {
+    a.x <= b.right() && b.x <= a.right() && a.y <= b.bottom() && b.y <= a.bottom()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -689,7 +757,8 @@ pub fn render_attach_scene<W: io::Write>(
     _zoomed: bool,
     terminal_size: (u16, u16),
     runtime_appearance: &RuntimeAppearance,
-    render_extensions: &[std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>],
+    damage_policy: DamageCoalescingPolicy,
+    render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal_size;
     if cols == 0 || rows <= status_top_inset.saturating_add(status_bottom_inset) {
@@ -788,9 +857,13 @@ pub fn render_attach_scene<W: io::Write>(
             let mut dyn_writer: &mut dyn io::Write = stdout;
             for ext in render_extensions {
                 let damage = if frame_damage.content_surface_damaged(pane_id) {
-                    bmux_plugin::RenderDamage::FullSurface
+                    RenderDamage::FullSurface
                 } else {
-                    ext.surface_damage(surface.id, &ext_rect)
+                    coalesce_render_damage(
+                        ext.surface_damage(surface.id, &ext_rect),
+                        ext_rect,
+                        damage_policy,
+                    )
                 };
                 if damage.is_none() {
                     continue;
@@ -954,7 +1027,8 @@ pub fn render_attach_scene<W: io::Write>(
 mod tests {
     use super::{
         AttachLayer, AttachLayerSurface, DamageCoalescingPolicy, DamageRect, FrameDamage,
-        append_pane_output, opaque_row_text, queue_layer_fill, render_attach_scene,
+        append_pane_output, coalesce_render_damage, opaque_row_text, queue_layer_fill,
+        render_attach_scene,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -964,6 +1038,7 @@ mod tests {
         AttachFocusTarget, AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface,
         AttachSurfaceKind, PaneState, PaneSummary,
     };
+    use bmux_plugin::{ExtensionRect, RenderDamage};
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
     use crossterm::style::Print;
@@ -974,6 +1049,67 @@ mod tests {
         let mut damage = FrameDamage::default();
         damage.mark_content_surface(pane_id);
         damage
+    }
+
+    #[test]
+    fn render_damage_policy_escalates_many_regions_to_full_surface() {
+        let damage = coalesce_render_damage(
+            RenderDamage::Regions(vec![
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                },
+                ExtensionRect {
+                    x: 4,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                },
+            ]),
+            ExtensionRect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            DamageCoalescingPolicy {
+                max_rects: 1,
+                max_area_percent: 100,
+            },
+        );
+
+        assert_eq!(damage, RenderDamage::FullSurface);
+    }
+
+    #[test]
+    fn render_damage_policy_clips_regions_to_surface_bounds() {
+        let damage = coalesce_render_damage(
+            RenderDamage::Regions(vec![ExtensionRect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            }]),
+            ExtensionRect {
+                x: 2,
+                y: 2,
+                w: 4,
+                h: 4,
+            },
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(
+            damage,
+            RenderDamage::Regions(vec![ExtensionRect {
+                x: 2,
+                y: 2,
+                w: 2,
+                h: 2,
+            }])
+        );
     }
 
     #[test]
@@ -1239,6 +1375,7 @@ mod tests {
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
             &[],
         )
         .expect("render should succeed");
@@ -1301,6 +1438,7 @@ mod tests {
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
             &[],
         )
         .expect("render should succeed");
@@ -1375,6 +1513,7 @@ mod tests {
             false,
             (80, 24),
             &appearance,
+            DamageCoalescingPolicy::default(),
             &[],
         )
         .expect("render should succeed");
@@ -1386,7 +1525,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Test fixture builds a full scene + extension + assertions inline.
     fn render_attach_scene_applies_render_extension_paint_commands() {
-        use bmux_plugin::{AttachRenderExtension, ExtensionRect, RenderDamage};
+        use bmux_plugin::AttachRenderExtension;
         use bmux_scene_protocol::scene_protocol::{Color, NamedColor};
         use std::io;
         use std::sync::Arc;
@@ -1513,6 +1652,7 @@ mod tests {
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
             &extensions,
         )
         .expect("render should succeed");
@@ -1595,6 +1735,7 @@ mod tests {
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
             &[],
         )
         .expect("initial render should succeed");
@@ -1624,6 +1765,7 @@ mod tests {
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
             &[],
         )
         .expect("deferred render should succeed");
@@ -1657,6 +1799,7 @@ mod tests {
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
             &[],
         )
         .expect("completed render should succeed");
@@ -1722,6 +1865,7 @@ mod tests {
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
             &[],
         )
         .expect("full redraw should succeed despite sync flag");
@@ -1739,7 +1883,7 @@ mod tests {
     // paint-command variants end-to-end through the same render path
     // used in production.
 
-    use bmux_plugin::{AttachRenderExtension, ExtensionRect, RenderDamage};
+    use bmux_plugin::AttachRenderExtension;
     use bmux_scene_protocol::scene_protocol::{
         BorderGlyphs, Cell, Color, GradientAxis, NamedColor, PaintCommand, Rect as SceneRect,
         Style, SurfaceDecoration,
@@ -1871,6 +2015,7 @@ mod tests {
             false,
             (80, 24),
             &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
             &extensions,
         )
         .expect("render should succeed");

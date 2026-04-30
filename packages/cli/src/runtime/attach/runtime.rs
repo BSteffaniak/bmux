@@ -5,7 +5,9 @@ use bmux_attach_layout_protocol::attach_layout_protocol::{
 };
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::apply_attach_output_chunk_with;
-use bmux_attach_pipeline::{AttachChunkApplyOutcome, AttachOutputChunkMeta};
+use bmux_attach_pipeline::{
+    AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy,
+};
 use bmux_client::{
     AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, ClientError,
     StreamingBmuxClient,
@@ -2111,6 +2113,7 @@ pub async fn run_session_attach_with_client(
                 &attach_keymap,
                 &attach_help_lines,
                 help_scroll,
+                &attach_config.behavior.damage,
                 attach_config.logs.client.slow_terminal_write_ms,
                 &mut display_capture,
             )?;
@@ -2355,6 +2358,7 @@ pub async fn run_session_attach_with_client(
             &attach_keymap,
             &attach_help_lines,
             help_scroll,
+            &attach_config.behavior.damage,
             attach_config.logs.client.slow_terminal_write_ms,
             &mut display_capture,
         )?;
@@ -4641,9 +4645,14 @@ pub fn render_attach_frame(
     keymap: &crate::input::Keymap,
     help_lines: &[String],
     help_scroll: usize,
+    damage_config: &bmux_config::DamageBehaviorConfig,
     slow_terminal_write_ms: u64,
     display_capture: &mut DisplayCaptureFanout,
 ) -> Result<AttachFrameRenderStats> {
+    let damage_policy = DamageCoalescingPolicy {
+        max_rects: damage_config.max_rects,
+        max_area_percent: damage_config.max_area_percent,
+    };
     let frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
     let damage_stats = frame_damage.stats();
 
@@ -4727,6 +4736,7 @@ pub fn render_attach_frame(
             layout_state.zoomed,
             terminal::size().unwrap_or((0, 0)),
             &active_runtime_appearance,
+            damage_policy,
             &extensions,
         )?
     } else {
