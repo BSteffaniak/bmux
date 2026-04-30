@@ -566,6 +566,64 @@ async fn recover_attach_output_desync_for_pane(
         .await
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AttachFrameRenderStats {
+    pub frame_bytes: usize,
+    pub terminal_write_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AttachWakeSource {
+    Server,
+    Terminal,
+    Prompt,
+    ActionDispatch,
+    Appearance,
+    Scene,
+    WindowList,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachDirtyReasons {
+    bits: u8,
+}
+
+impl AttachDirtyReasons {
+    const STATUS: u8 = 1 << 0;
+    const FULL_PANE: u8 = 1 << 1;
+    const OVERLAY: u8 = 1 << 2;
+    const PANE_DIRTY: u8 = 1 << 3;
+    const LAYOUT: u8 = 1 << 4;
+    const SCENE_HYDRATED: u8 = 1 << 5;
+
+    fn from_view_state(view_state: &AttachViewState, layout: bool, scene_hydrated: bool) -> Self {
+        let mut bits = 0;
+        if view_state.dirty.status_needs_redraw {
+            bits |= Self::STATUS;
+        }
+        if view_state.dirty.full_pane_redraw {
+            bits |= Self::FULL_PANE;
+        }
+        if view_state.dirty.overlay_needs_redraw {
+            bits |= Self::OVERLAY;
+        }
+        if !view_state.dirty.pane_dirty_ids.is_empty() {
+            bits |= Self::PANE_DIRTY;
+        }
+        if layout {
+            bits |= Self::LAYOUT;
+        }
+        if scene_hydrated {
+            bits |= Self::SCENE_HYDRATED;
+        }
+        Self { bits }
+    }
+
+    const fn contains(self, flag: u8) -> bool {
+        self.bits & flag != 0
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AttachPerfWindow {
     started_at: Instant,
@@ -580,6 +638,21 @@ struct AttachPerfWindow {
     render_frames: u64,
     render_ms_sum: u64,
     render_ms_max: u64,
+    frame_bytes_max: u64,
+    terminal_write_ms_max: u64,
+    wake_server_events: u64,
+    wake_terminal_events: u64,
+    wake_prompt_events: u64,
+    wake_action_dispatch_events: u64,
+    wake_appearance_events: u64,
+    wake_scene_events: u64,
+    wake_window_list_events: u64,
+    dirty_status_frames: u64,
+    dirty_full_pane_frames: u64,
+    dirty_overlay_frames: u64,
+    dirty_pane_frames: u64,
+    dirty_layout_frames: u64,
+    dirty_scene_hydrated_frames: u64,
 }
 
 impl AttachPerfWindow {
@@ -597,6 +670,21 @@ impl AttachPerfWindow {
             render_frames: 0,
             render_ms_sum: 0,
             render_ms_max: 0,
+            frame_bytes_max: 0,
+            terminal_write_ms_max: 0,
+            wake_server_events: 0,
+            wake_terminal_events: 0,
+            wake_prompt_events: 0,
+            wake_action_dispatch_events: 0,
+            wake_appearance_events: 0,
+            wake_scene_events: 0,
+            wake_window_list_events: 0,
+            dirty_status_frames: 0,
+            dirty_full_pane_frames: 0,
+            dirty_overlay_frames: 0,
+            dirty_pane_frames: 0,
+            dirty_layout_frames: 0,
+            dirty_scene_hydrated_frames: 0,
         }
     }
 
@@ -626,10 +714,62 @@ impl AttachPerfWindow {
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
-    fn record_render_frame(&mut self, elapsed_ms: u64) {
+    fn record_render_frame(&mut self, elapsed_ms: u64, stats: AttachFrameRenderStats) {
         self.render_frames = self.render_frames.saturating_add(1);
         self.render_ms_sum = self.render_ms_sum.saturating_add(elapsed_ms);
         self.render_ms_max = self.render_ms_max.max(elapsed_ms);
+        self.frame_bytes_max = self
+            .frame_bytes_max
+            .max(u64::try_from(stats.frame_bytes).unwrap_or(u64::MAX));
+        self.terminal_write_ms_max = self.terminal_write_ms_max.max(stats.terminal_write_ms);
+    }
+
+    const fn record_wake(&mut self, source: AttachWakeSource) {
+        match source {
+            AttachWakeSource::Server => {
+                self.wake_server_events = self.wake_server_events.saturating_add(1);
+            }
+            AttachWakeSource::Terminal => {
+                self.wake_terminal_events = self.wake_terminal_events.saturating_add(1);
+            }
+            AttachWakeSource::Prompt => {
+                self.wake_prompt_events = self.wake_prompt_events.saturating_add(1);
+            }
+            AttachWakeSource::ActionDispatch => {
+                self.wake_action_dispatch_events =
+                    self.wake_action_dispatch_events.saturating_add(1);
+            }
+            AttachWakeSource::Appearance => {
+                self.wake_appearance_events = self.wake_appearance_events.saturating_add(1);
+            }
+            AttachWakeSource::Scene => {
+                self.wake_scene_events = self.wake_scene_events.saturating_add(1);
+            }
+            AttachWakeSource::WindowList => {
+                self.wake_window_list_events = self.wake_window_list_events.saturating_add(1);
+            }
+        }
+    }
+
+    const fn record_dirty_reasons(&mut self, reasons: AttachDirtyReasons) {
+        if reasons.contains(AttachDirtyReasons::STATUS) {
+            self.dirty_status_frames = self.dirty_status_frames.saturating_add(1);
+        }
+        if reasons.contains(AttachDirtyReasons::FULL_PANE) {
+            self.dirty_full_pane_frames = self.dirty_full_pane_frames.saturating_add(1);
+        }
+        if reasons.contains(AttachDirtyReasons::OVERLAY) {
+            self.dirty_overlay_frames = self.dirty_overlay_frames.saturating_add(1);
+        }
+        if reasons.contains(AttachDirtyReasons::PANE_DIRTY) {
+            self.dirty_pane_frames = self.dirty_pane_frames.saturating_add(1);
+        }
+        if reasons.contains(AttachDirtyReasons::LAYOUT) {
+            self.dirty_layout_frames = self.dirty_layout_frames.saturating_add(1);
+        }
+        if reasons.contains(AttachDirtyReasons::SCENE_HYDRATED) {
+            self.dirty_scene_hydrated_frames = self.dirty_scene_hydrated_frames.saturating_add(1);
+        }
     }
 
     fn reset(&mut self) {
@@ -742,6 +882,108 @@ async fn publish_attach_layout_snapshot(
     }
 }
 
+fn attach_perf_window_payload(
+    window: &AttachPerfWindow,
+    elapsed: Duration,
+    detailed: bool,
+    trace: bool,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "window_elapsed_ms": duration_millis_u64(elapsed),
+        "drain_rounds": window.drain_rounds,
+        "drain_ipc_calls": window.drain_ipc_calls,
+        "drain_bytes": window.drain_bytes,
+        "render_frames": window.render_frames,
+        "frame_bytes_max": window.frame_bytes_max,
+        "terminal_write_ms_max": window.terminal_write_ms_max,
+    });
+    if detailed && let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "drain_ipc_ms_sum".to_string(),
+            window.drain_ipc_ms_sum.into(),
+        );
+        object.insert(
+            "drain_ipc_ms_max".to_string(),
+            window.drain_ipc_ms_max.into(),
+        );
+        object.insert("render_ms_sum".to_string(), window.render_ms_sum.into());
+        object.insert("render_ms_max".to_string(), window.render_ms_max.into());
+        object.insert(
+            "wake_server_events".to_string(),
+            window.wake_server_events.into(),
+        );
+        object.insert(
+            "wake_terminal_events".to_string(),
+            window.wake_terminal_events.into(),
+        );
+        object.insert(
+            "wake_prompt_events".to_string(),
+            window.wake_prompt_events.into(),
+        );
+        object.insert(
+            "wake_action_dispatch_events".to_string(),
+            window.wake_action_dispatch_events.into(),
+        );
+        object.insert(
+            "wake_appearance_events".to_string(),
+            window.wake_appearance_events.into(),
+        );
+        object.insert(
+            "wake_scene_events".to_string(),
+            window.wake_scene_events.into(),
+        );
+        object.insert(
+            "wake_window_list_events".to_string(),
+            window.wake_window_list_events.into(),
+        );
+        object.insert(
+            "dirty_status_frames".to_string(),
+            window.dirty_status_frames.into(),
+        );
+        object.insert(
+            "dirty_full_pane_frames".to_string(),
+            window.dirty_full_pane_frames.into(),
+        );
+        object.insert(
+            "dirty_overlay_frames".to_string(),
+            window.dirty_overlay_frames.into(),
+        );
+        object.insert(
+            "dirty_pane_frames".to_string(),
+            window.dirty_pane_frames.into(),
+        );
+        object.insert(
+            "dirty_layout_frames".to_string(),
+            window.dirty_layout_frames.into(),
+        );
+        object.insert(
+            "dirty_scene_hydrated_frames".to_string(),
+            window.dirty_scene_hydrated_frames.into(),
+        );
+        if let Some(avg) = window.drain_ipc_ms_sum.checked_div(window.drain_ipc_calls) {
+            object.insert("drain_ipc_ms_avg".to_string(), avg.into());
+        }
+        if let Some(avg) = window.render_ms_sum.checked_div(window.render_frames) {
+            object.insert("render_ms_avg".to_string(), avg.into());
+        }
+    }
+    if trace && let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "drain_rounds_with_data".to_string(),
+            window.drain_rounds_with_data.into(),
+        );
+        object.insert(
+            "drain_sync_active_rounds".to_string(),
+            window.drain_sync_active_rounds.into(),
+        );
+        object.insert(
+            "drain_budget_hits".to_string(),
+            window.drain_budget_hits.into(),
+        );
+    }
+    payload
+}
+
 async fn maybe_emit_attach_perf_window(
     perf_emitter: &mut recording::PerfEventEmitter,
     client: &mut StreamingBmuxClient,
@@ -762,7 +1004,22 @@ async fn maybe_emit_attach_perf_window(
         drain_ipc_ms_max = window.drain_ipc_ms_max,
         render_frames = window.render_frames,
         render_ms_max = window.render_ms_max,
+        frame_bytes_max = window.frame_bytes_max,
+        terminal_write_ms_max = window.terminal_write_ms_max,
         drain_budget_hits = window.drain_budget_hits,
+        wake_server_events = window.wake_server_events,
+        wake_terminal_events = window.wake_terminal_events,
+        wake_prompt_events = window.wake_prompt_events,
+        wake_action_dispatch_events = window.wake_action_dispatch_events,
+        wake_appearance_events = window.wake_appearance_events,
+        wake_scene_events = window.wake_scene_events,
+        wake_window_list_events = window.wake_window_list_events,
+        dirty_status_frames = window.dirty_status_frames,
+        dirty_full_pane_frames = window.dirty_full_pane_frames,
+        dirty_overlay_frames = window.dirty_overlay_frames,
+        dirty_pane_frames = window.dirty_pane_frames,
+        dirty_layout_frames = window.dirty_layout_frames,
+        dirty_scene_hydrated_frames = window.dirty_scene_hydrated_frames,
         "attach.metrics.window"
     );
 
@@ -771,54 +1028,12 @@ async fn maybe_emit_attach_perf_window(
         return Ok(());
     }
 
-    let detailed = perf_emitter.level_at_least(recording::PerfCaptureLevel::Detailed);
-    let trace = perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace);
-    let mut payload = serde_json::json!({
-        "window_elapsed_ms": duration_millis_u64(elapsed),
-        "drain_rounds": window.drain_rounds,
-        "drain_ipc_calls": window.drain_ipc_calls,
-        "drain_bytes": window.drain_bytes,
-        "render_frames": window.render_frames,
-    });
-    if detailed && let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "drain_ipc_ms_sum".to_string(),
-            serde_json::Value::from(window.drain_ipc_ms_sum),
-        );
-        object.insert(
-            "drain_ipc_ms_max".to_string(),
-            serde_json::Value::from(window.drain_ipc_ms_max),
-        );
-        object.insert(
-            "render_ms_sum".to_string(),
-            serde_json::Value::from(window.render_ms_sum),
-        );
-        object.insert(
-            "render_ms_max".to_string(),
-            serde_json::Value::from(window.render_ms_max),
-        );
-        if let Some(avg) = window.drain_ipc_ms_sum.checked_div(window.drain_ipc_calls) {
-            object.insert("drain_ipc_ms_avg".to_string(), serde_json::Value::from(avg));
-        }
-        if let Some(avg) = window.render_ms_sum.checked_div(window.render_frames) {
-            object.insert("render_ms_avg".to_string(), serde_json::Value::from(avg));
-        }
-    }
-    if trace && let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "drain_rounds_with_data".to_string(),
-            serde_json::Value::from(window.drain_rounds_with_data),
-        );
-        object.insert(
-            "drain_sync_active_rounds".to_string(),
-            serde_json::Value::from(window.drain_sync_active_rounds),
-        );
-        object.insert(
-            "drain_budget_hits".to_string(),
-            serde_json::Value::from(window.drain_budget_hits),
-        );
-    }
-
+    let payload = attach_perf_window_payload(
+        window,
+        elapsed,
+        perf_emitter.level_at_least(recording::PerfCaptureLevel::Detailed),
+        perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace),
+    );
     perf_emitter
         .emit_with_streaming_client(client, Some(session_id), None, "attach.window", payload)
         .await?;
@@ -976,7 +1191,7 @@ pub async fn run_session_attach_with_client(
     let mut rendered_frame_count = 0_u64;
     let mut first_frame_emitted = false;
     let mut interactive_ready_emitted = false;
-    let (initial_appearance, mut appearance_rx) = bmux_plugin::global_event_bus()
+    let (initial_appearance, appearance_rx_raw) = bmux_plugin::global_event_bus()
         .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
         .unwrap_or_else(|_| {
             let _ = bmux_plugin::global_event_bus().register_state_channel::<RuntimeAppearance>(
@@ -987,6 +1202,7 @@ pub async fn run_session_attach_with_client(
                 .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
                 .expect("runtime appearance state channel was just registered")
         });
+    let mut appearance_rx = Some(appearance_rx_raw);
     let mut runtime_appearance = (*initial_appearance).clone();
 
     if let Some(leader_client_id) = follow_target_id {
@@ -1251,12 +1467,14 @@ pub async fn run_session_attach_with_client(
     // has registered the channel the subscription returns `Err` and we run
     // without scene updates — extensions that aren't loaded simply have
     // nothing to draw.
-    let mut scene_event_rx = bmux_plugin::global_event_bus()
-        .subscribe_state::<bmux_scene_protocol::scene_protocol::DecorationScene>(
-            &bmux_scene_protocol::scene_protocol::STATE_KIND,
-        )
-        .ok()
-        .map(|(_initial, rx)| rx);
+    let (mut last_scene_revision, mut scene_event_rx) =
+        match bmux_plugin::global_event_bus()
+            .subscribe_state::<bmux_scene_protocol::scene_protocol::DecorationScene>(
+                &bmux_scene_protocol::scene_protocol::STATE_KIND,
+            ) {
+            Ok((initial, rx)) => (initial.revision, Some(rx)),
+            Err(_) => (0, None),
+        };
 
     // Subscribe to the windows-plugin `windows-list` state channel so
     // the attach tab bar can render the authoritative plugin-owned
@@ -1266,16 +1484,18 @@ pub async fn run_session_attach_with_client(
     // has not registered the channel (plugin absent / not yet
     // activated), the tab bar falls back to `cached_contexts` in raw
     // server order — baseline behavior per AGENTS.md.
-    let mut window_list_rx = match bmux_plugin::global_event_bus()
-        .subscribe_state::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
-        &bmux_windows_plugin_api::windows_list::STATE_KIND,
-    ) {
-        Ok((initial, rx)) => {
-            view_state.cached_window_list = Some(initial);
-            Some(rx)
-        }
-        Err(_) => None,
-    };
+    let (mut last_window_list_revision, mut window_list_rx) =
+        match bmux_plugin::global_event_bus()
+            .subscribe_state::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
+            &bmux_windows_plugin_api::windows_list::STATE_KIND,
+        ) {
+            Ok((initial, rx)) => {
+                let revision = initial.revision;
+                view_state.cached_window_list = Some(initial);
+                (revision, Some(rx))
+            }
+            Err(_) => (0, None),
+        };
 
     // Pull the current window list from the windows-plugin via typed
     // dispatch. The server-side state-channel forwarder emits the
@@ -1305,6 +1525,7 @@ pub async fn run_session_attach_with_client(
             windows,
             revision: 0,
         };
+        last_window_list_revision = snapshot.revision;
         view_state.cached_window_list = Some(std::sync::Arc::new(snapshot.clone()));
         let _ = bmux_plugin::global_event_bus()
             .publish_state(&bmux_windows_plugin_api::windows_list::STATE_KIND, snapshot);
@@ -1320,6 +1541,7 @@ pub async fn run_session_attach_with_client(
                     exit_reason = AttachExitReason::StreamClosed;
                     break;
                 };
+                perf_window.record_wake(AttachWakeSource::Server);
 
                 // PaneOutputAvailable sets a flag; fall through to the
                 // post-event processing block which fetches output.
@@ -1557,6 +1779,7 @@ pub async fn run_session_attach_with_client(
                     break;
                 };
                 let terminal_event = result.context("failed reading terminal event")?;
+                perf_window.record_wake(AttachWakeSource::Terminal);
 
                 if let Event::Resize(cols, rows) = terminal_event {
                     display_capture.record_resize(cols, rows);
@@ -1586,6 +1809,7 @@ pub async fn run_session_attach_with_client(
 
             prompt_request = prompt_host_rx.recv() => {
                 if let Some(prompt_request) = prompt_request {
+                    perf_window.record_wake(AttachWakeSource::Prompt);
                     view_state.prompt.enqueue_external(prompt_request);
                     view_state.dirty.status_needs_redraw = true;
                     view_state.dirty.overlay_needs_redraw = true;
@@ -1594,6 +1818,7 @@ pub async fn run_session_attach_with_client(
 
             dispatch_request = action_dispatch_rx.recv() => {
                 if let Some(dispatch_request) = dispatch_request {
+                    perf_window.record_wake(AttachWakeSource::ActionDispatch);
                     match handle_attach_loop_event(
                         AttachLoopEvent::ActionDispatch(dispatch_request),
                         &mut client,
@@ -1617,14 +1842,24 @@ pub async fn run_session_attach_with_client(
                 }
             }
 
-            appearance_changed = appearance_rx.changed() => {
-                if appearance_changed.is_ok() {
-                    runtime_appearance = (**appearance_rx.borrow()).clone();
+            appearance_result = async {
+                match &mut appearance_rx {
+                    Some(rx) => rx.changed().await.ok().map(|()| rx.borrow().clone()),
+                    None => std::future::pending().await,
                 }
-                view_state.cached_status_line = None;
-                view_state.dirty.status_needs_redraw = true;
-                view_state.dirty.full_pane_redraw = true;
-                view_state.dirty.overlay_needs_redraw = true;
+            } => {
+                if let Some(appearance) = appearance_result {
+                    perf_window.record_wake(AttachWakeSource::Appearance);
+                    if runtime_appearance != *appearance {
+                        runtime_appearance = (*appearance).clone();
+                        view_state.cached_status_line = None;
+                        view_state.dirty.status_needs_redraw = true;
+                        view_state.dirty.full_pane_redraw = true;
+                        view_state.dirty.overlay_needs_redraw = true;
+                    }
+                } else {
+                    appearance_rx = None;
+                }
             },
 
             // Scene state pushed on the local event bus. The PluginBusEvent handler
@@ -1633,12 +1868,16 @@ pub async fn run_session_attach_with_client(
             // the frame dirty so the renderer consults extensions on the next pass.
             scene_result = async {
                 match &mut scene_event_rx {
-                    Some(rx) => rx.changed().await.ok(),
+                    Some(rx) => rx.changed().await.ok().map(|()| rx.borrow().clone()),
                     None => std::future::pending().await,
                 }
             } => {
-                if scene_result.is_some() {
-                    view_state.dirty.full_pane_redraw = true;
+                if let Some(scene) = scene_result {
+                    perf_window.record_wake(AttachWakeSource::Scene);
+                    if scene.revision != last_scene_revision {
+                        last_scene_revision = scene.revision;
+                        view_state.dirty.full_pane_redraw = true;
+                    }
                 } else {
                     // Broadcast lagged/closed — drop subscription.
                     scene_event_rx = None;
@@ -1657,8 +1896,12 @@ pub async fn run_session_attach_with_client(
                 }
             } => {
                 if let Some(snapshot) = window_list_result {
-                    view_state.cached_window_list = Some(snapshot);
-                    view_state.dirty.status_needs_redraw = true;
+                    perf_window.record_wake(AttachWakeSource::WindowList);
+                    if snapshot.revision != last_window_list_revision {
+                        last_window_list_revision = snapshot.revision;
+                        view_state.cached_window_list = Some(snapshot);
+                        view_state.dirty.status_needs_redraw = true;
+                    }
                 } else {
                     // Channel closed — drop subscription; fallback
                     // path in build_attach_tabs_from_catalog covers
@@ -1673,6 +1916,8 @@ pub async fn run_session_attach_with_client(
 
         let _ = view_state.clear_expired_transient_status(Instant::now());
 
+        let dirty_layout_frame =
+            view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none();
         let mut frame_needs_render = view_state.dirty.status_needs_redraw
             || view_state.dirty.full_pane_redraw
             || view_state.dirty.overlay_needs_redraw
@@ -1680,7 +1925,7 @@ pub async fn run_session_attach_with_client(
 
         let mut scene_hydrated = false;
 
-        if view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none() {
+        if dirty_layout_frame {
             let previous_layout = view_state.cached_layout_state.clone();
             let layout_state = match client.attach_layout(view_state.attached_id).await {
                 Ok(state) => state,
@@ -1797,9 +2042,14 @@ pub async fn run_session_attach_with_client(
         };
 
         if scene_hydrated {
+            perf_window.record_dirty_reasons(AttachDirtyReasons::from_view_state(
+                &view_state,
+                dirty_layout_frame,
+                true,
+            ));
             let help_scroll = view_state.help_overlay_scroll;
             let render_started_at = Instant::now();
-            render_attach_frame(
+            let frame_stats = render_attach_frame(
                 &mut client,
                 &mut view_state,
                 &layout_state,
@@ -1822,7 +2072,7 @@ pub async fn run_session_attach_with_client(
                     "attach.render.slow_frame"
                 );
             }
-            perf_window.record_render_frame(render_ms);
+            perf_window.record_render_frame(render_ms, frame_stats);
             rendered_frame_count = rendered_frame_count.saturating_add(1);
             maybe_emit_attach_frame_perf(
                 &mut perf_emitter,
@@ -2036,9 +2286,14 @@ pub async fn run_session_attach_with_client(
             continue;
         }
 
+        perf_window.record_dirty_reasons(AttachDirtyReasons::from_view_state(
+            &view_state,
+            dirty_layout_frame,
+            false,
+        ));
         let help_scroll = view_state.help_overlay_scroll;
         let render_started_at = Instant::now();
-        render_attach_frame(
+        let frame_stats = render_attach_frame(
             &mut client,
             &mut view_state,
             &layout_state,
@@ -2061,7 +2316,7 @@ pub async fn run_session_attach_with_client(
                 "attach.render.slow_frame"
             );
         }
-        perf_window.record_render_frame(render_ms);
+        perf_window.record_render_frame(render_ms, frame_stats);
         rendered_frame_count = rendered_frame_count.saturating_add(1);
         maybe_emit_attach_frame_perf(
             &mut perf_emitter,
@@ -4337,7 +4592,7 @@ pub fn render_attach_frame(
     help_scroll: usize,
     slow_terminal_write_ms: u64,
     display_capture: &mut DisplayCaptureFanout,
-) -> Result<()> {
+) -> Result<AttachFrameRenderStats> {
     if view_state.dirty.status_needs_redraw {
         let now = Instant::now();
         let transient_status = view_state.transient_status_text(now).map(str::to_owned);
@@ -4544,10 +4799,14 @@ pub fn render_attach_frame(
             "attach.terminal.slow_write"
         );
     }
+    let stats = AttachFrameRenderStats {
+        frame_bytes: frame_bytes.len(),
+        terminal_write_ms,
+    };
     view_state.dirty.full_pane_redraw = false;
     view_state.dirty.overlay_needs_redraw = false;
     view_state.dirty.pane_dirty_ids.clear();
-    Ok(())
+    Ok(stats)
 }
 
 pub fn build_attach_tabs_from_catalog(
