@@ -163,9 +163,10 @@ Plugins that want domain-level helpers own them locally. Foundational
 plugins (sessions, contexts, clients, windows) reach core IPC through
 `ServiceCaller::execute_kernel_request(bmux_ipc::Request::*)`.
 Non-foundational plugins speak to foundational plugins through typed
-BPDL services (`ServiceCaller::call_service`). Some plugins keep a
-private `domain_ipc` module that wraps common patterns; these modules
-are plugin-local, never a core dependency.
+BPDL services (`ServiceCaller::call_service`) or generated BPDL
+clients. Private `domain_ipc` compatibility modules are not used; small
+purpose-named local helpers are acceptable when they directly wrap
+generated clients for one plugin's own workflow.
 
 ## Host state registry
 

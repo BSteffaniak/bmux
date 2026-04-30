@@ -1292,6 +1292,38 @@ fn generated_transport_api_crates_do_not_define_public_envelopes() {
     }
 }
 
+/// Plugin impl crates should call typed BPDL clients directly or use
+/// small purpose-named local helpers. The old private `domain_ipc`
+/// compatibility modules duplicated typed contracts and hid generated
+/// clients behind another domain-shaped transport layer.
+#[test]
+fn plugin_impl_crates_do_not_define_private_domain_ipc_modules() {
+    for plugin_dir in iter_plugin_crate_dirs().into_iter().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| !name.to_string_lossy().ends_with("-plugin-api"))
+    }) {
+        let relative = plugin_dir
+            .strip_prefix(repo_root())
+            .unwrap_or(plugin_dir.as_path())
+            .display();
+        assert!(
+            !plugin_dir.join("src/domain_ipc.rs").exists(),
+            "{relative}/src/domain_ipc.rs must not exist; use generated BPDL clients directly",
+        );
+        for source in rust_source_files(&plugin_dir) {
+            let text = std::fs::read_to_string(&source).expect("source should be readable");
+            let source_relative = source
+                .strip_prefix(repo_root())
+                .unwrap_or(source.as_path())
+                .display();
+            assert!(
+                !text.contains("mod domain_ipc"),
+                "{source_relative} must not reintroduce private domain_ipc modules",
+            );
+        }
+    }
+}
+
 /// The monolithic `SnapshotV4` schema plus the `SnapshotManager` +
 /// `SnapshotRuntime` machinery and the entire
 /// `packages/server/src/persistence.rs` file have been deleted.

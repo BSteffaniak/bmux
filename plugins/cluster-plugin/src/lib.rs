@@ -2,19 +2,21 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-mod domain_ipc;
-
+use bmux_clients_plugin_api::clients_state as api_clients_state;
 use bmux_config::BmuxConfig;
+use bmux_pane_runtime_plugin_api::{
+    attach_runtime_commands as api_attach_runtime_commands,
+    pane_runtime_commands as api_pane_runtime_commands,
+    pane_runtime_state as api_pane_runtime_state,
+};
 use bmux_plugin::HostRuntimeApi;
+use bmux_plugin::ServiceCaller;
 use bmux_plugin::prompt;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, NativeCommandContext, StorageGetRequest, StorageSetRequest,
 };
-use domain_ipc::{
-    KernelOps, PaneCloseRequest, PaneLaunchCommand, PaneLaunchRequest, PaneListRequest,
-    PaneSelector, PaneSplitDirection, SessionCreateRequest, SessionSelectRequest, SessionSelector,
-};
+use bmux_sessions_plugin_api::sessions_state as api_sessions_state;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -24,29 +26,131 @@ const CLUSTER_PANE_BINDING_PREFIX: &str = "cluster.pane.";
 const CLUSTER_CONNECTION_EVENTS_KEY: &str = "cluster.connection.events";
 const CLUSTER_CONNECTION_EVENTS_MAX: usize = 256;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionSummary {
+    id: uuid::Uuid,
+    name: Option<String>,
+    client_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PaneSummary {
+    id: uuid::Uuid,
+    index: u32,
+    name: Option<String>,
+    focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum SessionSelector {
+    ById(uuid::Uuid),
+    ByName(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum PaneSelector {
+    ById(uuid::Uuid),
+    ByIndex(u32),
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum PaneSplitDirection {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionCreateRequest {
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionCreateResponse {
+    id: uuid::Uuid,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionListResponse {
+    sessions: Vec<SessionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionSelectRequest {
+    selector: SessionSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionSelectResponse {
+    session_id: uuid::Uuid,
+    attach_token: uuid::Uuid,
+    expires_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PaneListRequest {
+    session: Option<SessionSelector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PaneListResponse {
+    panes: Vec<PaneSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PaneLaunchCommand {
+    program: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PaneLaunchRequest {
+    session: Option<SessionSelector>,
+    target: Option<PaneSelector>,
+    direction: PaneSplitDirection,
+    name: Option<String>,
+    command: PaneLaunchCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PaneLaunchResponse {
+    id: uuid::Uuid,
+    session_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PaneCloseRequest {
+    session: Option<SessionSelector>,
+    target: Option<PaneSelector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PaneCloseResponse {
+    id: uuid::Uuid,
+    session_id: uuid::Uuid,
+    session_closed: bool,
+}
+
 trait ClusterRuntimeOps {
     fn core_cli_command_run_path(
         &self,
         request: &CoreCliCommandRequest,
     ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String>;
-    fn session_list(&self) -> Result<domain_ipc::SessionListResponse, String>;
+    fn session_list(&self) -> Result<SessionListResponse, String>;
     fn session_create(
         &self,
         request: &SessionCreateRequest,
-    ) -> Result<domain_ipc::SessionCreateResponse, String>;
+    ) -> Result<SessionCreateResponse, String>;
     fn session_select(
         &self,
         request: &SessionSelectRequest,
-    ) -> Result<domain_ipc::SessionSelectResponse, String>;
-    fn pane_list(&self, request: &PaneListRequest) -> Result<domain_ipc::PaneListResponse, String>;
-    fn pane_launch(
-        &self,
-        request: &PaneLaunchRequest,
-    ) -> Result<domain_ipc::PaneLaunchResponse, String>;
-    fn pane_close(
-        &self,
-        request: &PaneCloseRequest,
-    ) -> Result<domain_ipc::PaneCloseResponse, String>;
+    ) -> Result<SessionSelectResponse, String>;
+    fn pane_list(&self, request: &PaneListRequest) -> Result<PaneListResponse, String>;
+    fn pane_launch(&self, request: &PaneLaunchRequest) -> Result<PaneLaunchResponse, String>;
+    fn pane_close(&self, request: &PaneCloseRequest) -> Result<PaneCloseResponse, String>;
     fn storage_get(
         &self,
         request: &StorageGetRequest,
@@ -54,7 +158,7 @@ trait ClusterRuntimeOps {
     fn storage_set(&self, request: &StorageSetRequest) -> Result<(), String>;
 }
 
-impl<T: HostRuntimeApi + KernelOps + Sync + ?Sized> ClusterRuntimeOps for T {
+impl<T: HostRuntimeApi + Sync> ClusterRuntimeOps for T {
     fn core_cli_command_run_path(
         &self,
         request: &CoreCliCommandRequest,
@@ -62,40 +166,34 @@ impl<T: HostRuntimeApi + KernelOps + Sync + ?Sized> ClusterRuntimeOps for T {
         HostRuntimeApi::core_cli_command_run_path(self, request).map_err(|error| error.to_string())
     }
 
-    fn session_list(&self) -> Result<domain_ipc::SessionListResponse, String> {
-        KernelOps::session_list(self).map_err(|error| error.to_string())
+    fn session_list(&self) -> Result<SessionListResponse, String> {
+        session_list(self)
     }
 
     fn session_create(
         &self,
         request: &SessionCreateRequest,
-    ) -> Result<domain_ipc::SessionCreateResponse, String> {
-        KernelOps::session_create(self, request).map_err(|error| error.to_string())
+    ) -> Result<SessionCreateResponse, String> {
+        session_create(self, request)
     }
 
     fn session_select(
         &self,
         request: &SessionSelectRequest,
-    ) -> Result<domain_ipc::SessionSelectResponse, String> {
-        KernelOps::session_select(self, request).map_err(|error| error.to_string())
+    ) -> Result<SessionSelectResponse, String> {
+        session_select(self, request)
     }
 
-    fn pane_list(&self, request: &PaneListRequest) -> Result<domain_ipc::PaneListResponse, String> {
-        KernelOps::pane_list(self, request).map_err(|error| error.to_string())
+    fn pane_list(&self, request: &PaneListRequest) -> Result<PaneListResponse, String> {
+        pane_list(self, request)
     }
 
-    fn pane_launch(
-        &self,
-        request: &PaneLaunchRequest,
-    ) -> Result<domain_ipc::PaneLaunchResponse, String> {
-        KernelOps::pane_launch(self, request).map_err(|error| error.to_string())
+    fn pane_launch(&self, request: &PaneLaunchRequest) -> Result<PaneLaunchResponse, String> {
+        pane_launch(self, request)
     }
 
-    fn pane_close(
-        &self,
-        request: &PaneCloseRequest,
-    ) -> Result<domain_ipc::PaneCloseResponse, String> {
-        KernelOps::pane_close(self, request).map_err(|error| error.to_string())
+    fn pane_close(&self, request: &PaneCloseRequest) -> Result<PaneCloseResponse, String> {
+        pane_close(self, request)
     }
 
     fn storage_get(
@@ -108,6 +206,220 @@ impl<T: HostRuntimeApi + KernelOps + Sync + ?Sized> ClusterRuntimeOps for T {
     fn storage_set(&self, request: &StorageSetRequest) -> Result<(), String> {
         HostRuntimeApi::storage_set(self, request).map_err(|error| error.to_string())
     }
+}
+
+const fn dispatch_client<C: ServiceCaller + Sync + ?Sized>(
+    caller: &C,
+) -> bmux_plugin::ServiceCallerDispatchClient<'_, C> {
+    bmux_plugin::ServiceCallerDispatchClient::new(caller)
+}
+
+fn typed_service_error(operation: &'static str, err: impl std::fmt::Display) -> String {
+    format!("{operation} failed: {err}")
+}
+
+fn session_selector_to_api(selector: &SessionSelector) -> api_sessions_state::SessionSelector {
+    match selector {
+        SessionSelector::ById(id) => api_sessions_state::SessionSelector {
+            id: Some(*id),
+            name: None,
+        },
+        SessionSelector::ByName(name) => api_sessions_state::SessionSelector {
+            id: None,
+            name: Some(name.clone()),
+        },
+    }
+}
+
+fn session_selector_to_attach_api(
+    selector: &SessionSelector,
+) -> api_attach_runtime_commands::SessionSelector {
+    match selector {
+        SessionSelector::ById(id) => api_attach_runtime_commands::SessionSelector {
+            id: Some(*id),
+            name: None,
+        },
+        SessionSelector::ByName(name) => api_attach_runtime_commands::SessionSelector {
+            id: None,
+            name: Some(name.clone()),
+        },
+    }
+}
+
+fn session_list(caller: &(impl ServiceCaller + Sync)) -> Result<SessionListResponse, String> {
+    let mut client = dispatch_client(caller);
+    let sessions = bmux_plugin::block_on_typed_dispatch(api_sessions_state::client::list_sessions(
+        &mut client,
+    ))
+    .map_err(|err| typed_service_error("sessions-state/list-sessions", err))?
+    .into_iter()
+    .map(|session| SessionSummary {
+        id: session.id,
+        name: session.name,
+        client_count: session.client_count,
+    })
+    .collect();
+    Ok(SessionListResponse { sessions })
+}
+
+fn session_create(
+    caller: &(impl ServiceCaller + Sync),
+    request: &SessionCreateRequest,
+) -> Result<SessionCreateResponse, String> {
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        api_pane_runtime_commands::client::new_session_with_runtime(
+            &mut client,
+            request.name.clone(),
+        ),
+    )
+    .map_err(|err| typed_service_error("pane-runtime-commands/new-session-with-runtime", err))?;
+    let ack = result.map_err(|err| format!("new-session-with-runtime failed: {err:?}"))?;
+    Ok(SessionCreateResponse {
+        id: ack.session_id,
+        name: request.name.clone(),
+    })
+}
+
+fn session_select(
+    caller: &(impl ServiceCaller + Sync),
+    request: &SessionSelectRequest,
+) -> Result<SessionSelectResponse, String> {
+    let mut client = dispatch_client(caller);
+    let result =
+        bmux_plugin::block_on_typed_dispatch(api_attach_runtime_commands::client::attach_session(
+            &mut client,
+            session_selector_to_attach_api(&request.selector),
+            true,
+        ))
+        .map_err(|err| typed_service_error("attach-runtime-commands/attach-session", err))?;
+    let grant = result.map_err(|err| format!("attach-session failed: {err:?}"))?;
+    Ok(SessionSelectResponse {
+        session_id: grant.session_id,
+        attach_token: grant.token,
+        expires_at_epoch_ms: grant.expires_epoch_ms,
+    })
+}
+
+fn resolve_session_uuid(
+    caller: &(impl ServiceCaller + Sync),
+    selector: Option<&SessionSelector>,
+) -> Result<uuid::Uuid, String> {
+    match selector {
+        Some(SessionSelector::ById(id)) => Ok(*id),
+        Some(SessionSelector::ByName(_)) => {
+            let mut client = dispatch_client(caller);
+            let result =
+                bmux_plugin::block_on_typed_dispatch(api_sessions_state::client::get_session(
+                    &mut client,
+                    session_selector_to_api(selector.expect("selector present")),
+                ))
+                .map_err(|err| typed_service_error("sessions-state/get-session", err))?;
+            result
+                .map(|session| session.id)
+                .map_err(|err| format!("session selector did not resolve: {err:?}"))
+        }
+        None => {
+            let mut client = dispatch_client(caller);
+            let result = bmux_plugin::block_on_typed_dispatch(
+                api_clients_state::client::current_client(&mut client),
+            )
+            .map_err(|err| typed_service_error("clients-state/current-client", err))?;
+            result
+                .map_err(|err| format!("current client unavailable: {err:?}"))?
+                .selected_session_id
+                .ok_or_else(|| "current client has no selected session".to_string())
+        }
+    }
+}
+
+fn pane_list(
+    caller: &(impl ServiceCaller + Sync),
+    request: &PaneListRequest,
+) -> Result<PaneListResponse, String> {
+    let session_id = match request.session.as_ref() {
+        Some(selector) => Some(resolve_session_uuid(caller, Some(selector))?),
+        None => None,
+    };
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(api_pane_runtime_state::client::list_panes(
+        &mut client,
+        session_id,
+    ))
+    .map_err(|err| typed_service_error("pane-runtime-state/list-panes", err))?;
+    let panes = result
+        .map_err(|err| format!("list-panes failed: {err:?}"))?
+        .panes
+        .into_iter()
+        .enumerate()
+        .map(|(index, pane)| PaneSummary {
+            id: pane.id,
+            index: u32::try_from(index).unwrap_or(0),
+            name: pane.name,
+            focused: pane.focused,
+        })
+        .collect();
+    Ok(PaneListResponse { panes })
+}
+
+fn pane_target_uuid(selector: Option<&PaneSelector>) -> Option<uuid::Uuid> {
+    selector.and_then(|selector| match selector {
+        PaneSelector::ById(id) => Some(*id),
+        PaneSelector::ByIndex(_) | PaneSelector::Active => None,
+    })
+}
+
+const fn split_direction_name(direction: PaneSplitDirection) -> &'static str {
+    match direction {
+        PaneSplitDirection::Horizontal => "horizontal",
+        PaneSplitDirection::Vertical => "vertical",
+    }
+}
+
+fn pane_launch(
+    caller: &(impl ServiceCaller + Sync),
+    request: &PaneLaunchRequest,
+) -> Result<PaneLaunchResponse, String> {
+    let session_id = resolve_session_uuid(caller, request.session.as_ref())?;
+    let target = pane_target_uuid(request.target.as_ref());
+    let mut client = dispatch_client(caller);
+    let result =
+        bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::launch_pane(
+            &mut client,
+            session_id,
+            target,
+            split_direction_name(request.direction).to_string(),
+            50,
+            request.name.clone(),
+            request.command.program.clone(),
+            request.command.args.clone(),
+            request.command.cwd.clone(),
+        ))
+        .map_err(|err| typed_service_error("pane-runtime-commands/launch-pane", err))?;
+    let ack = result.map_err(|err| format!("launch-pane failed: {err:?}"))?;
+    Ok(PaneLaunchResponse {
+        id: ack.pane_id,
+        session_id: ack.session_id,
+    })
+}
+
+fn pane_close(
+    caller: &(impl ServiceCaller + Sync),
+    request: &PaneCloseRequest,
+) -> Result<PaneCloseResponse, String> {
+    let session_id = resolve_session_uuid(caller, request.session.as_ref())?;
+    let target = pane_target_uuid(request.target.as_ref());
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        api_pane_runtime_commands::client::close_pane(&mut client, session_id, target),
+    )
+    .map_err(|err| typed_service_error("pane-runtime-commands/close-pane", err))?;
+    let ack = result.map_err(|err| format!("close-pane failed: {err:?}"))?;
+    Ok(PaneCloseResponse {
+        id: ack.pane_id,
+        session_id: ack.session_id,
+        session_closed: false,
+    })
 }
 
 #[derive(Default)]
@@ -2150,9 +2462,9 @@ fn parse_pane_retry_ref(raw: String) -> PaneRetryRef {
 }
 
 fn resolve_retry_pane<'a>(
-    panes: &'a [domain_ipc::PaneSummary],
+    panes: &'a [PaneSummary],
     pane_ref: &PaneRetryRef,
-) -> Result<&'a domain_ipc::PaneSummary, String> {
+) -> Result<&'a PaneSummary, String> {
     match pane_ref {
         PaneRetryRef::Active => panes
             .iter()
@@ -2315,7 +2627,7 @@ fn append_cluster_connection_event(
 
 fn resolve_cluster_binding_for_pane(
     caller: &impl ClusterRuntimeOps,
-    pane: &domain_ipc::PaneSummary,
+    pane: &PaneSummary,
 ) -> Result<ClusterPaneBinding, String> {
     let pane_id = pane.id.to_string();
     match get_cluster_pane_binding(caller, &pane_id) {
@@ -2402,9 +2714,9 @@ mod tests {
     #[derive(Default)]
     struct FakeRuntimeState {
         next_id: u128,
-        sessions: Vec<domain_ipc::SessionSummary>,
+        sessions: Vec<SessionSummary>,
         selected_session: Option<Uuid>,
-        panes: Vec<domain_ipc::PaneSummary>,
+        panes: Vec<PaneSummary>,
         storage: BTreeMap<String, Vec<u8>>,
         health: BTreeMap<String, bool>,
         health_sequences: BTreeMap<String, Vec<bool>>,
@@ -2442,7 +2754,7 @@ mod tests {
                     pane.focused = false;
                 }
             }
-            guard.panes.push(domain_ipc::PaneSummary {
+            guard.panes.push(PaneSummary {
                 id: pane_id,
                 index,
                 name,
@@ -2478,9 +2790,9 @@ mod tests {
             })
         }
 
-        fn session_list(&self) -> Result<domain_ipc::SessionListResponse, String> {
+        fn session_list(&self) -> Result<SessionListResponse, String> {
             let guard = self.inner.lock().expect("runtime lock poisoned");
-            Ok(domain_ipc::SessionListResponse {
+            Ok(SessionListResponse {
                 sessions: guard.sessions.clone(),
             })
         }
@@ -2488,17 +2800,17 @@ mod tests {
         fn session_create(
             &self,
             request: &SessionCreateRequest,
-        ) -> Result<domain_ipc::SessionCreateResponse, String> {
+        ) -> Result<SessionCreateResponse, String> {
             let mut guard = self.inner.lock().expect("runtime lock poisoned");
             let id = next_test_uuid(&mut guard.next_id);
-            guard.sessions.push(domain_ipc::SessionSummary {
+            guard.sessions.push(SessionSummary {
                 id,
                 name: request.name.clone(),
                 client_count: 1,
             });
             guard.selected_session = Some(id);
             drop(guard);
-            Ok(domain_ipc::SessionCreateResponse {
+            Ok(SessionCreateResponse {
                 id,
                 name: request.name.clone(),
             })
@@ -2507,7 +2819,7 @@ mod tests {
         fn session_select(
             &self,
             request: &SessionSelectRequest,
-        ) -> Result<domain_ipc::SessionSelectResponse, String> {
+        ) -> Result<SessionSelectResponse, String> {
             let mut guard = self.inner.lock().expect("runtime lock poisoned");
             let session_id = match &request.selector {
                 SessionSelector::ById(id) => *id,
@@ -2519,27 +2831,21 @@ mod tests {
                     .ok_or_else(|| format!("unknown session '{name}'"))?,
             };
             guard.selected_session = Some(session_id);
-            Ok(domain_ipc::SessionSelectResponse {
+            Ok(SessionSelectResponse {
                 session_id,
                 attach_token: next_test_uuid(&mut guard.next_id),
                 expires_at_epoch_ms: 0,
             })
         }
 
-        fn pane_list(
-            &self,
-            _request: &PaneListRequest,
-        ) -> Result<domain_ipc::PaneListResponse, String> {
+        fn pane_list(&self, _request: &PaneListRequest) -> Result<PaneListResponse, String> {
             let guard = self.inner.lock().expect("runtime lock poisoned");
-            Ok(domain_ipc::PaneListResponse {
+            Ok(PaneListResponse {
                 panes: guard.panes.clone(),
             })
         }
 
-        fn pane_launch(
-            &self,
-            request: &PaneLaunchRequest,
-        ) -> Result<domain_ipc::PaneLaunchResponse, String> {
+        fn pane_launch(&self, request: &PaneLaunchRequest) -> Result<PaneLaunchResponse, String> {
             let mut guard = self.inner.lock().expect("runtime lock poisoned");
             let target = request
                 .command
@@ -2555,7 +2861,7 @@ mod tests {
                 pane.focused = false;
             }
             let index = u32::try_from(guard.panes.len() + 1).expect("pane index should fit u32");
-            guard.panes.push(domain_ipc::PaneSummary {
+            guard.panes.push(PaneSummary {
                 id,
                 index,
                 name: request.name.clone(),
@@ -2577,13 +2883,10 @@ mod tests {
             };
             drop(guard);
 
-            Ok(domain_ipc::PaneLaunchResponse { id, session_id })
+            Ok(PaneLaunchResponse { id, session_id })
         }
 
-        fn pane_close(
-            &self,
-            request: &PaneCloseRequest,
-        ) -> Result<domain_ipc::PaneCloseResponse, String> {
+        fn pane_close(&self, request: &PaneCloseRequest) -> Result<PaneCloseResponse, String> {
             let mut guard = self.inner.lock().expect("runtime lock poisoned");
             let target_id = match request.target.as_ref().unwrap_or(&PaneSelector::Active) {
                 PaneSelector::ById(id) => *id,
@@ -2609,7 +2912,7 @@ mod tests {
             {
                 first.focused = true;
             }
-            Ok(domain_ipc::PaneCloseResponse {
+            Ok(PaneCloseResponse {
                 id: target_id,
                 session_id: guard.selected_session.unwrap_or(target_id),
                 session_closed: false,

@@ -44,6 +44,7 @@ BMUX core must remain domain-agnostic. Windows, sessions, contexts, clients, and
 - Plugin API crates must not expose handwritten public transport-client modules such as `src/typed_client.rs`; use BPDL-generated clients or consuming-crate-private helpers.
 - Once a service is modeled in BPDL, plugin API crates must not reintroduce public handwritten request/response transport envelopes for that service.
 - Re-exporting neutral primitive types from a plugin API crate is acceptable for ergonomics, but ownership remains with the neutral crate and core should import the neutral crate directly.
+- Plugin implementation crates must not recreate broad private transport compatibility layers such as `src/domain_ipc.rs`; call generated BPDL clients directly or use small purpose-named local helpers for one workflow.
 
 ### Review Gate Before Finishing (REQUIRED)
 

@@ -2,9 +2,14 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-mod domain_ipc;
-
-use bmux_plugin::{HostRuntimeApi, TypedServiceCaller};
+use api_contexts_state::{ContextSelector, ContextSummary};
+use bmux_clients_plugin_api::clients_state as api_clients_state;
+use bmux_contexts_plugin_api::{contexts_commands, contexts_state as api_contexts_state};
+use bmux_pane_runtime_plugin_api::{
+    pane_runtime_commands as api_pane_runtime_commands,
+    pane_runtime_state as api_pane_runtime_state,
+};
+use bmux_plugin::{HostRuntimeApi, ServiceCaller, TypedServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     HostScope, StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext,
@@ -17,8 +22,6 @@ use bmux_windows_plugin_api::windows_commands::{
     PaneZoomAck, Selector, WindowAck, WindowError, WindowsCommandsService,
 };
 use bmux_windows_plugin_api::windows_state::{self, PaneState, WindowEntry, WindowsStateService};
-use domain_ipc::KernelOps;
-use domain_ipc::{ContextCloseRequest, ContextCreateRequest, ContextSelector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
@@ -32,12 +35,365 @@ const PREVIOUS_WINDOW_CONTEXT_KEY: &str = "windows.previous_context_id";
 const WINDOW_ORDER_KEY: &str = "windows.order";
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
 
+fn typed_service_error(operation: &'static str, err: impl std::fmt::Display) -> String {
+    format!("{operation} failed: {err}")
+}
+
+const fn dispatch_client<C: ServiceCaller + Sync + ?Sized>(
+    caller: &C,
+) -> bmux_plugin::ServiceCallerDispatchClient<'_, C> {
+    bmux_plugin::ServiceCallerDispatchClient::new(caller)
+}
+
+const fn context_selector_by_id(id: Uuid) -> ContextSelector {
+    ContextSelector {
+        id: Some(id),
+        name: None,
+    }
+}
+
+struct LaunchPaneRequest {
+    direction: PaneDirection,
+    name: Option<String>,
+    program: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+}
+
+fn selector_matches_context(selector: &ContextSelector, context: &ContextSummary) -> bool {
+    if let Some(id) = selector.id {
+        return context.id == id;
+    }
+    selector
+        .name
+        .as_deref()
+        .is_some_and(|name| context.name.as_deref() == Some(name))
+}
+
+fn windows_selector_to_session_selector(
+    selector: &Selector,
+) -> bmux_sessions_plugin_api::sessions_state::SessionSelector {
+    bmux_sessions_plugin_api::sessions_state::SessionSelector {
+        id: selector.id,
+        name: selector.name.clone(),
+    }
+}
+
+fn list_contexts(caller: &(impl ServiceCaller + Sync)) -> Result<Vec<ContextSummary>, String> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(api_contexts_state::client::list_contexts(&mut client))
+        .map_err(|err| typed_service_error("contexts-state/list-contexts", err))
+}
+
+fn current_context(caller: &(impl ServiceCaller + Sync)) -> Result<Option<ContextSummary>, String> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(api_contexts_state::client::current_context(&mut client))
+        .map_err(|err| typed_service_error("contexts-state/current-context", err))
+}
+
+fn create_context(
+    caller: &(impl ServiceCaller + Sync),
+    name: Option<String>,
+    attributes: BTreeMap<String, String>,
+) -> Result<ContextSummary, String> {
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(contexts_commands::client::create_context(
+        &mut client,
+        name.clone(),
+        attributes.clone(),
+    ))
+    .map_err(|err| typed_service_error("contexts-commands/create-context", err))?;
+    let ack = result.map_err(|err| format!("create-context failed: {err:?}"))?;
+    Ok(ContextSummary {
+        id: ack.id,
+        name,
+        attributes,
+    })
+}
+
+fn select_context(
+    caller: &(impl ServiceCaller + Sync),
+    selector: ContextSelector,
+) -> Result<Uuid, String> {
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(contexts_commands::client::select_context(
+        &mut client,
+        selector,
+    ))
+    .map_err(|err| typed_service_error("contexts-commands/select-context", err))?;
+    result
+        .map(|ack| ack.id)
+        .map_err(|err| format!("select-context failed: {err:?}"))
+}
+
+fn close_context(
+    caller: &(impl ServiceCaller + Sync),
+    selector: ContextSelector,
+    force: bool,
+) -> Result<Uuid, String> {
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(contexts_commands::client::close_context(
+        &mut client,
+        selector,
+        force,
+    ))
+    .map_err(|err| typed_service_error("contexts-commands/close-context", err))?;
+    result
+        .map(|ack| ack.id)
+        .map_err(|err| format!("close-context failed: {err:?}"))
+}
+
+fn resolve_session_id(
+    caller: &(impl ServiceCaller + Sync),
+    selector: Option<&Selector>,
+) -> Result<Uuid, String> {
+    if let Some(selector) = selector {
+        if let Some(id) = selector.id {
+            return Ok(id);
+        }
+        if selector.name.is_some() {
+            let mut client = dispatch_client(caller);
+            let result = bmux_plugin::block_on_typed_dispatch(
+                bmux_sessions_plugin_api::sessions_state::client::get_session(
+                    &mut client,
+                    windows_selector_to_session_selector(selector),
+                ),
+            )
+            .map_err(|err| typed_service_error("sessions-state/get-session", err))?;
+            return result
+                .map(|session| session.id)
+                .map_err(|err| format!("session selector did not resolve: {err:?}"));
+        }
+    }
+
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(api_clients_state::client::current_client(
+        &mut client,
+    ))
+    .map_err(|err| typed_service_error("clients-state/current-client", err))?;
+    result
+        .map_err(|err| format!("current client unavailable: {err:?}"))?
+        .selected_session_id
+        .ok_or_else(|| "current client has no selected session".to_string())
+}
+
+fn list_panes(
+    caller: &(impl ServiceCaller + Sync),
+    session_id: Option<Uuid>,
+) -> Result<api_pane_runtime_state::SessionPaneList, String> {
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(api_pane_runtime_state::client::list_panes(
+        &mut client,
+        session_id,
+    ))
+    .map_err(|err| typed_service_error("pane-runtime-state/list-panes", err))?;
+    result.map_err(|err| format!("list-panes failed: {err:?}"))
+}
+
+fn resolve_target_pane_id(
+    caller: &(impl ServiceCaller + Sync),
+    session_id: Uuid,
+    selector: Option<&Selector>,
+) -> Result<Option<Uuid>, String> {
+    let Some(selector) = selector else {
+        return Ok(None);
+    };
+    if let Some(id) = selector.id {
+        return Ok(Some(id));
+    }
+    let Some(index) = selector.index else {
+        return Ok(None);
+    };
+    let panes = list_panes(caller, Some(session_id))?.panes;
+    panes
+        .into_iter()
+        .enumerate()
+        .find(|(idx, _)| u32::try_from(*idx).ok() == Some(index))
+        .map(|(_, pane)| Some(pane.id))
+        .ok_or_else(|| format!("pane index '{index}' not found"))
+}
+
+fn focus_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: Option<&Selector>,
+    direction: &str,
+) -> Result<api_pane_runtime_commands::PaneAck, String> {
+    let session_id = resolve_session_id(caller, session)?;
+    let target = resolve_target_pane_id(caller, session_id, target)?;
+    let mut client = dispatch_client(caller);
+    let result =
+        bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::focus_pane(
+            &mut client,
+            session_id,
+            target,
+            direction.to_string(),
+        ))
+        .map_err(|err| typed_service_error("pane-runtime-commands/focus-pane", err))?;
+    let ack = result.map_err(|err| format!("focus-pane failed: {err:?}"))?;
+    emit_pane_event(
+        bmux_windows_plugin_api::windows_events::PaneEvent::Focused {
+            pane_id: ack.pane_id,
+        },
+    );
+    Ok(ack)
+}
+
+fn split_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: Option<&Selector>,
+    direction: PaneDirection,
+    ratio_pct: Option<u32>,
+) -> Result<api_pane_runtime_commands::PaneAck, String> {
+    let session_id = resolve_session_id(caller, session)?;
+    let target = resolve_target_pane_id(caller, session_id, target)?;
+    let ratio = ratio_pct.unwrap_or(50).clamp(10, 90) as u8;
+    let mut client = dispatch_client(caller);
+    let result =
+        bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::split_pane(
+            &mut client,
+            session_id,
+            target,
+            pane_direction_name(direction).to_string(),
+            ratio,
+        ))
+        .map_err(|err| typed_service_error("pane-runtime-commands/split-pane", err))?;
+    let ack = result.map_err(|err| format!("split-pane failed: {err:?}"))?;
+    emit_pane_event(bmux_windows_plugin_api::windows_events::PaneEvent::Opened {
+        pane_id: ack.pane_id,
+        session_id: ack.session_id,
+    });
+    Ok(ack)
+}
+
+fn launch_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: Option<&Selector>,
+    request: LaunchPaneRequest,
+) -> Result<api_pane_runtime_commands::PaneAck, String> {
+    let session_id = resolve_session_id(caller, session)?;
+    let target = resolve_target_pane_id(caller, session_id, target)?;
+    let mut client = dispatch_client(caller);
+    let result =
+        bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::launch_pane(
+            &mut client,
+            session_id,
+            target,
+            pane_direction_name(request.direction).to_string(),
+            50,
+            request.name,
+            request.program,
+            request.args,
+            request.cwd,
+        ))
+        .map_err(|err| typed_service_error("pane-runtime-commands/launch-pane", err))?;
+    let ack = result.map_err(|err| format!("launch-pane failed: {err:?}"))?;
+    emit_pane_event(bmux_windows_plugin_api::windows_events::PaneEvent::Opened {
+        pane_id: ack.pane_id,
+        session_id: ack.session_id,
+    });
+    Ok(ack)
+}
+
+fn resize_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: Option<&Selector>,
+    direction: PaneResizeDirection,
+    cells: u16,
+) -> Result<api_pane_runtime_commands::SessionAck, String> {
+    let session_id = resolve_session_id(caller, session)?;
+    let target = resolve_target_pane_id(caller, session_id, target)?;
+    let mut client = dispatch_client(caller);
+    let result =
+        bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::resize_pane(
+            &mut client,
+            session_id,
+            target,
+            resize_direction_name(direction).to_string(),
+            cells.max(1),
+        ))
+        .map_err(|err| typed_service_error("pane-runtime-commands/resize-pane", err))?;
+    result.map_err(|err| format!("resize-pane failed: {err:?}"))
+}
+
+fn close_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: Option<&Selector>,
+) -> Result<api_pane_runtime_commands::PaneAck, String> {
+    let session_id = resolve_session_id(caller, session)?;
+    let target = resolve_target_pane_id(caller, session_id, target)?;
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        api_pane_runtime_commands::client::close_pane(&mut client, session_id, target),
+    )
+    .map_err(|err| typed_service_error("pane-runtime-commands/close-pane", err))?;
+    let ack = result.map_err(|err| format!("close-pane failed: {err:?}"))?;
+    emit_pane_event(bmux_windows_plugin_api::windows_events::PaneEvent::Closed {
+        pane_id: ack.pane_id,
+    });
+    Ok(ack)
+}
+
+fn zoom_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+) -> Result<api_pane_runtime_commands::PaneAck, String> {
+    let session_id = resolve_session_id(caller, session)?;
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        api_pane_runtime_commands::client::zoom_pane(&mut client, session_id),
+    )
+    .map_err(|err| typed_service_error("pane-runtime-commands/zoom-pane", err))?;
+    let ack = result.map_err(|err| format!("zoom-pane failed: {err:?}"))?;
+    emit_pane_event(bmux_windows_plugin_api::windows_events::PaneEvent::Zoomed {
+        pane_id: ack.pane_id,
+    });
+    Ok(ack)
+}
+
+const fn pane_direction_name(direction: PaneDirection) -> &'static str {
+    match direction {
+        PaneDirection::Horizontal | PaneDirection::Left | PaneDirection::Right => "horizontal",
+        PaneDirection::Vertical | PaneDirection::Up | PaneDirection::Down => "vertical",
+    }
+}
+
+const fn focus_direction_name(direction: PaneDirection) -> Option<&'static str> {
+    match direction {
+        PaneDirection::Horizontal | PaneDirection::Vertical => None,
+        PaneDirection::Left => Some("left"),
+        PaneDirection::Right => Some("right"),
+        PaneDirection::Up => Some("up"),
+        PaneDirection::Down => Some("down"),
+    }
+}
+
+const fn resize_direction_name(direction: PaneResizeDirection) -> &'static str {
+    match direction {
+        PaneResizeDirection::Increase => "increase",
+        PaneResizeDirection::Decrease => "decrease",
+        PaneResizeDirection::Left => "left",
+        PaneResizeDirection::Right => "right",
+        PaneResizeDirection::Up => "up",
+        PaneResizeDirection::Down => "down",
+    }
+}
+
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
 }
 
 fn emit_windows_plugin_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Plugin, payload);
+}
+
+fn emit_pane_event(event: bmux_windows_plugin_api::windows_events::PaneEvent) {
+    let _ = bmux_plugin::global_event_bus()
+        .emit(&bmux_windows_plugin_api::windows_events::EVENT_KIND, event);
 }
 
 /// Shared "last selected pane per client" map. Mutated by the
@@ -137,116 +493,68 @@ impl RustPlugin for WindowsPlugin {
                     .map_err(|e| ServiceResponse::error("switch_failed", e))
             },
             "windows-commands", "focus-pane" => |req: FocusPaneArgs, ctx| {
-                let request = domain_ipc::PaneFocusRequest {
-                    session: None,
-                    target: Some(domain_ipc::PaneSelector::ById(req.id)),
-                    direction: None,
-                };
-                ctx.pane_focus(&request)
-                    .map(|_| PaneAck { ok: true, pane_id: Some(req.id) })
-                    .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
+                let target = Selector { id: Some(req.id), name: None, index: None };
+                focus_pane(ctx, None, Some(&target), "")
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|e| ServiceResponse::error("focus_failed", e))
             },
             "windows-commands", "close-pane" => |req: ClosePaneArgs, ctx| {
-                let request = domain_ipc::PaneCloseRequest {
-                    session: None,
-                    target: Some(domain_ipc::PaneSelector::ById(req.id)),
-                };
-                ctx.pane_close(&request)
-                    .map(|_| PaneAck { ok: true, pane_id: Some(req.id) })
-                    .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
+                let target = Selector { id: Some(req.id), name: None, index: None };
+                close_pane(ctx, None, Some(&target))
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|e| ServiceResponse::error("close_failed", e))
             },
             "windows-commands", "focus-pane-by-selector" => |req: FocusPaneBySelectorArgs, ctx| {
-                let request = domain_ipc::PaneFocusRequest {
-                    session: req.session.as_ref().and_then(selector_to_session),
-                    target: Some(selector_to_pane(&req.target)),
-                    direction: None,
-                };
-                ctx.pane_focus(&request)
-                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
-                    .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
+                focus_pane(ctx, req.session.as_ref(), Some(&req.target), "")
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|e| ServiceResponse::error("focus_failed", e))
             },
             "windows-commands", "close-pane-by-selector" => |req: ClosePaneBySelectorArgs, ctx| {
-                let request = domain_ipc::PaneCloseRequest {
-                    session: req.session.as_ref().and_then(selector_to_session),
-                    target: Some(selector_to_pane(&req.target)),
-                };
-                ctx.pane_close(&request)
-                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
-                    .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
+                close_pane(ctx, req.session.as_ref(), Some(&req.target))
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|e| ServiceResponse::error("close_failed", e))
             },
             "windows-commands", "close-active-pane" => |req: CloseActivePaneArgs, ctx| {
-                let request = domain_ipc::PaneCloseRequest {
-                    session: req.session.as_ref().and_then(selector_to_session),
-                    target: None,
-                };
-                ctx.pane_close(&request)
-                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
-                    .map_err(|e| ServiceResponse::error("close_failed", e.to_string()))
+                close_pane(ctx, req.session.as_ref(), None)
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|e| ServiceResponse::error("close_failed", e))
             },
             "windows-commands", "focus-pane-in-direction" => |req: FocusPaneInDirectionArgs, ctx| {
-                let Some(focus_dir) = pane_direction_to_focus(req.direction) else {
+                let Some(focus_dir) = focus_direction_name(req.direction) else {
                     return Err(ServiceResponse::error(
                         "invalid_request",
-                        "direction must be Next/Prev (Horizontal/Vertical aren't meaningful)",
+                        "direction must be left/right/up/down",
                     ));
                 };
-                let request = domain_ipc::PaneFocusRequest {
-                    session: req.session.as_ref().and_then(selector_to_session),
-                    target: None,
-                    direction: Some(focus_dir),
-                };
-                ctx.pane_focus(&request)
-                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
-                    .map_err(|e| ServiceResponse::error("focus_failed", e.to_string()))
+                focus_pane(ctx, req.session.as_ref(), None, focus_dir)
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|e| ServiceResponse::error("focus_failed", e))
             },
             "windows-commands", "split-pane" => |req: SplitPaneArgs, ctx| {
-                let request = domain_ipc::PaneSplitRequest {
-                    session: req.session.as_ref().and_then(selector_to_session),
-                    target: req.target.as_ref().map(selector_to_pane),
-                    direction: pane_direction_to_split(req.direction),
-                };
-                ctx.pane_split(&request)
-                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
-                    .map_err(|e| ServiceResponse::error("split_failed", e.to_string()))
+                split_pane(ctx, req.session.as_ref(), req.target.as_ref(), req.direction, req.ratio_pct)
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|e| ServiceResponse::error("split_failed", e))
             },
             "windows-commands", "launch-pane" => |req: LaunchPaneArgs, ctx| {
-                let request = domain_ipc::PaneLaunchRequest {
-                    session: req.session.as_ref().and_then(selector_to_session),
-                    target: req.target.as_ref().map(selector_to_pane),
-                    direction: pane_direction_to_split(req.direction),
+                launch_pane(ctx, req.session.as_ref(), req.target.as_ref(), LaunchPaneRequest {
+                    direction: req.direction,
                     name: req.name,
-                    command: domain_ipc::PaneLaunchCommand {
-                        program: req.program,
-                        args: req.args,
-                        cwd: None,
-                        env: BTreeMap::new(),
-                    },
-                };
-                ctx.pane_launch(&request)
-                    .map(|resp| PaneAck { ok: true, pane_id: Some(resp.id) })
-                    .map_err(|e| ServiceResponse::error("launch_failed", e.to_string()))
+                    program: req.program,
+                    args: req.args,
+                    cwd: None,
+                })
+                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                    .map_err(|e| ServiceResponse::error("launch_failed", e))
             },
             "windows-commands", "resize-pane" => |req: ResizePaneArgs, ctx| {
-                let request = domain_ipc::PaneResizeRequest {
-                    session: req.session.as_ref().and_then(selector_to_session),
-                    target: req.target.as_ref().map(selector_to_pane),
-                    direction: typed_resize_to_domain(req.direction),
-                    cells: req.cells.max(1),
-                };
-                ctx.pane_resize(&request)
+                resize_pane(ctx, req.session.as_ref(), req.target.as_ref(), req.direction, req.cells)
                     .map(|_| PaneAck { ok: true, pane_id: None })
-                    .map_err(|e| ServiceResponse::error("resize_failed", e.to_string()))
+                    .map_err(|e| ServiceResponse::error("resize_failed", e))
             },
             "windows-commands", "zoom-pane" => |req: ZoomPaneArgs, ctx| {
-                let request = domain_ipc::PaneZoomRequest {
-                    session: req.session.as_ref().and_then(selector_to_session),
-                };
-                ctx.pane_zoom(&request)
-                    .map(|resp| PaneZoomAck {
-                        pane_id: resp.pane_id,
-                        zoomed: resp.zoomed,
-                    })
-                    .map_err(|e| ServiceResponse::error("zoom_failed", e.to_string()))
+                zoom_pane(ctx, req.session.as_ref())
+                    .map(|ack| PaneZoomAck { pane_id: ack.pane_id, zoomed: true })
+                    .map_err(|e| ServiceResponse::error("zoom_failed", e))
             },
             "windows-commands", "restart-pane" => |_req: RestartPaneArgs, _ctx| {
                 Err::<PaneAck, _>(ServiceResponse::error(
@@ -720,23 +1028,15 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 .ok_or_else(|| "missing required TARGET argument".to_string())?;
             let selector = parse_selector(&target)?;
             let force_local = has_flag(&context.arguments, "force-local");
-            let response = context
-                .context_close(&ContextCloseRequest {
-                    selector,
-                    force: force_local,
-                })
-                .map_err(|error| error.to_string())?;
+            let closed_id = close_context(context, selector, force_local)?;
             if emit_to_stdout {
-                println!("killed window context: {}", response.id);
+                println!("killed window context: {closed_id}");
             }
             Ok(())
         }
         "kill-all-windows" => {
             let force_local = has_flag(&context.arguments, "force-local");
-            let contexts = context
-                .context_list()
-                .map_err(|error| error.to_string())?
-                .contexts;
+            let contexts = list_contexts(context)?;
             if contexts.is_empty() {
                 if emit_to_stdout {
                     println!("no windows");
@@ -744,14 +1044,13 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                 return Ok(());
             }
             for context_summary in contexts {
-                let response = context
-                    .context_close(&ContextCloseRequest {
-                        selector: ContextSelector::ById(context_summary.id),
-                        force: force_local,
-                    })
-                    .map_err(|error| error.to_string())?;
+                let closed_id = close_context(
+                    context,
+                    context_selector_by_id(context_summary.id),
+                    force_local,
+                )?;
                 if emit_to_stdout {
-                    println!("killed window context: {}", response.id);
+                    println!("killed window context: {closed_id}");
                 }
             }
             Ok(())
@@ -880,55 +1179,34 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             let direction = option_value(&context.arguments, "direction")
                 .ok_or_else(|| "--direction is required".to_string())?;
             let direction = parse_pane_direction_arg(&direction)?;
-            let focus_dir = pane_direction_to_focus(direction).ok_or_else(|| {
+            let focus_dir = focus_direction_name(direction).ok_or_else(|| {
                 "direction must be left/right/up/down/next/prev (horizontal/vertical are split-only)".to_string()
             })?;
-            let request = domain_ipc::PaneFocusRequest {
-                session: None,
-                target: None,
-                direction: Some(focus_dir),
-            };
-            context.pane_focus(&request).map_err(|e| e.to_string())?;
+            focus_pane(context, None, None, focus_dir)?;
             Ok(())
         }
         "split-pane" => {
             let direction = option_value(&context.arguments, "direction")
                 .ok_or_else(|| "--direction is required".to_string())?;
             let direction = parse_pane_direction_arg(&direction)?;
-            let request = domain_ipc::PaneSplitRequest {
-                session: None,
-                target: None,
-                direction: pane_direction_to_split(direction),
-            };
-            context.pane_split(&request).map_err(|e| e.to_string())?;
+            split_pane(context, None, None, direction, None)?;
             Ok(())
         }
         "resize-pane" => {
             let direction_arg = option_value(&context.arguments, "direction");
             let direction = direction_arg.as_deref().map_or(
-                Ok(domain_ipc::PaneResizeDirection::Increase),
+                Ok(PaneResizeDirection::Increase),
                 parse_pane_resize_direction_arg,
             )?;
-            let request = domain_ipc::PaneResizeRequest {
-                session: None,
-                target: None,
-                direction,
-                cells: 1,
-            };
-            context.pane_resize(&request).map_err(|e| e.to_string())?;
+            resize_pane(context, None, None, direction, 1)?;
             Ok(())
         }
         "zoom-pane" => {
-            let request = domain_ipc::PaneZoomRequest { session: None };
-            context.pane_zoom(&request).map_err(|e| e.to_string())?;
+            zoom_pane(context, None)?;
             Ok(())
         }
         "close-active-pane" => {
-            let request = domain_ipc::PaneCloseRequest {
-                session: None,
-                target: None,
-            };
-            context.pane_close(&request).map_err(|e| e.to_string())?;
+            close_pane(context, None, None)?;
             Ok(())
         }
         "restart-pane" => {
@@ -961,19 +1239,13 @@ fn list_windows(
     runtime_state: &WindowRuntimeStateHandle,
     session_filter: Option<&str>,
 ) -> Result<Vec<WindowEntry>, String> {
-    let contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
+    let contexts = list_contexts(caller)?;
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     let selected = if let Some(filter) = session_filter {
         let selector = parse_selector(filter)?;
         contexts
             .into_iter()
-            .filter(|context| match &selector {
-                ContextSelector::ById(id) => &context.id == id,
-                ContextSelector::ByName(name) => context.name.as_deref() == Some(name.as_str()),
-            })
+            .filter(|context| selector_matches_context(&selector, context))
             .collect::<Vec<_>>()
     } else {
         contexts
@@ -1026,7 +1298,7 @@ fn publish_window_list_snapshot(
 }
 
 fn publish_window_list_ordered_contexts(
-    contexts: Vec<domain_ipc::ContextSummary>,
+    contexts: Vec<ContextSummary>,
     active_context_id: Option<Uuid>,
 ) {
     let entries = contexts
@@ -1076,10 +1348,7 @@ fn reset_window_order(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
 ) -> Result<usize, String> {
-    let contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
+    let contexts = list_contexts(caller)?;
     let mut ids: Vec<Uuid> = contexts.iter().map(|context| context.id).collect();
     ids.sort_by_key(uuid::Uuid::as_u128);
     set_stored_window_order_ids(caller, &ids)?;
@@ -1096,30 +1365,18 @@ fn create_window(
     runtime_state: &WindowRuntimeStateHandle,
     name: Option<String>,
 ) -> Result<WindowAck, String> {
-    let mut contexts = cached_known_contexts(runtime_state).map_or_else(
-        || {
-            caller
-                .context_list()
-                .map(|response| response.contexts)
-                .map_err(|error| error.to_string())
-        },
-        Ok,
-    )?;
+    let mut contexts =
+        cached_known_contexts(runtime_state).map_or_else(|| list_contexts(caller), Ok)?;
     seed_known_contexts(runtime_state, &contexts);
     let resolved_name = name.or_else(|| Some(next_default_tab_name_for_contexts(&contexts)));
     let previous_context =
         resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)
             .ok()
             .flatten();
-    let response = caller
-        .context_create(&ContextCreateRequest {
-            name: resolved_name,
-            attributes: BTreeMap::new(),
-        })
-        .map_err(|error| error.to_string())?;
-    let context_id = response.context.id;
-    cache_known_context(runtime_state, context_id, response.context.name.clone());
-    contexts.push(response.context);
+    let context = create_context(caller, resolved_name, BTreeMap::new())?;
+    let context_id = context.id;
+    cache_known_context(runtime_state, context_id, context.name.clone());
+    contexts.push(context);
     let mut order_appends = Vec::with_capacity(2);
     if let Some(previous) = previous_context {
         order_appends.push(previous);
@@ -1133,7 +1390,7 @@ fn create_window(
     })
 }
 
-fn next_default_tab_name_for_contexts(contexts: &[domain_ipc::ContextSummary]) -> String {
+fn next_default_tab_name_for_contexts(contexts: &[ContextSummary]) -> String {
     let mut next = 1_u32;
     loop {
         let candidate = format!("tab-{next}");
@@ -1153,16 +1410,11 @@ fn kill_window(
     selector: ContextSelector,
     force_local: bool,
 ) -> Result<WindowAck, String> {
-    let response = caller
-        .context_close(&ContextCloseRequest {
-            selector,
-            force: force_local,
-        })
-        .map_err(|error| error.to_string())?;
+    let context_id = close_context(caller, selector, force_local)?;
     publish_window_list_snapshot(caller, runtime_state);
     Ok(WindowAck {
         ok: true,
-        id: Some(response.id.to_string()),
+        id: Some(context_id.to_string()),
     })
 }
 
@@ -1171,17 +1423,9 @@ fn kill_all_windows(
     runtime_state: &WindowRuntimeStateHandle,
     force_local: bool,
 ) -> Result<WindowAck, String> {
-    let contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
+    let contexts = list_contexts(caller)?;
     for context in contexts {
-        caller
-            .context_close(&ContextCloseRequest {
-                selector: ContextSelector::ById(context.id),
-                force: force_local,
-            })
-            .map_err(|error| error.to_string())?;
+        close_context(caller, context_selector_by_id(context.id), force_local)?;
     }
     publish_window_list_snapshot(caller, runtime_state);
     Ok(WindowAck { ok: true, id: None })
@@ -1197,10 +1441,7 @@ fn switch_window(
 ) -> Result<WindowAck, String> {
     let total_started = Instant::now();
     let list_started = Instant::now();
-    let contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
+    let contexts = list_contexts(caller)?;
     let context_list_us = list_started.elapsed().as_micros();
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     switch_window_with_contexts(
@@ -1223,7 +1464,7 @@ fn switch_window_with_contexts(
     selector: &ContextSelector,
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
-    contexts: &[domain_ipc::ContextSummary],
+    contexts: &[ContextSummary],
     timing: SwitchWindowTiming,
 ) -> Result<WindowAck, String> {
     let resolve_started = Instant::now();
@@ -1232,11 +1473,7 @@ fn switch_window_with_contexts(
     let context_id = resolve_context_id_from_contexts(contexts, selector)?;
     let resolve_us = resolve_started.elapsed().as_micros();
     let select_started = Instant::now();
-    caller
-        .context_select(&domain_ipc::ContextSelectRequest {
-            selector: ContextSelector::ById(context_id),
-        })
-        .map_err(|error| error.to_string())?;
+    select_context(caller, context_selector_by_id(context_id))?;
     let context_select_us = select_started.elapsed().as_micros();
     let remember_started = Instant::now();
     let remembered_for_client = if let Some(client_id) = caller_client_id
@@ -1304,10 +1541,7 @@ fn cycle_window(
 ) -> Result<WindowAck, String> {
     let total_started = Instant::now();
     let list_started = Instant::now();
-    let contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
+    let contexts = list_contexts(caller)?;
     let context_list_us = list_started.elapsed().as_micros();
     let order_started = Instant::now();
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
@@ -1366,7 +1600,7 @@ fn cycle_window(
     switch_window_with_contexts(
         caller,
         runtime_state,
-        &ContextSelector::ById(target_id),
+        &context_selector_by_id(target_id),
         last_selected_by_client,
         caller_client_id,
         &contexts,
@@ -1389,10 +1623,7 @@ fn goto_window_by_index(
         return Err("window index must be 1 or greater".to_string());
     }
     let list_started = Instant::now();
-    let contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
+    let contexts = list_contexts(caller)?;
     let context_list_us = list_started.elapsed().as_micros();
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     if contexts.is_empty() {
@@ -1410,7 +1641,7 @@ fn goto_window_by_index(
     switch_window_with_contexts(
         caller,
         runtime_state,
-        &ContextSelector::ById(target_id),
+        &context_selector_by_id(target_id),
         last_selected_by_client,
         caller_client_id,
         &contexts,
@@ -1427,10 +1658,7 @@ fn close_current_window(
     last_selected_by_client: &LastSelectedByClient,
     caller_client_id: Option<Uuid>,
 ) -> Result<WindowAck, String> {
-    let contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
+    let contexts = list_contexts(caller)?;
     let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
     let current_id =
         resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
@@ -1452,18 +1680,13 @@ fn close_current_window(
         let _ = switch_window(
             caller,
             runtime_state,
-            ContextSelector::ById(fallback_id),
+            context_selector_by_id(fallback_id),
             last_selected_by_client,
             caller_client_id,
         );
     }
 
-    caller
-        .context_close(&ContextCloseRequest {
-            selector: ContextSelector::ById(current_id),
-            force: false,
-        })
-        .map_err(|error| error.to_string())?;
+    close_context(caller, context_selector_by_id(current_id), false)?;
 
     publish_window_list_snapshot(caller, runtime_state);
     Ok(WindowAck {
@@ -1473,15 +1696,12 @@ fn close_current_window(
 }
 
 fn resolve_context_id_from_contexts(
-    contexts: &[domain_ipc::ContextSummary],
+    contexts: &[ContextSummary],
     selector: &ContextSelector,
 ) -> Result<Uuid, String> {
     contexts
         .iter()
-        .find(|context| match selector {
-            ContextSelector::ById(id) => context.id == *id,
-            ContextSelector::ByName(name) => context.name.as_deref() == Some(name.as_str()),
-        })
+        .find(|context| selector_matches_context(selector, context))
         .map(|context| context.id)
         .ok_or_else(|| "target context not found".to_string())
 }
@@ -1489,17 +1709,14 @@ fn resolve_context_id_from_contexts(
 fn resolve_effective_current_context_with_contexts(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
-    contexts: &[domain_ipc::ContextSummary],
+    contexts: &[ContextSummary],
 ) -> Result<Option<Uuid>, String> {
     let stored_active = in_memory_runtime_context_id(runtime_state, ACTIVE_WINDOW_CONTEXT_KEY)
         .filter(|id| contexts.iter().any(|context| context.id == *id));
     if stored_active.is_some() {
         return Ok(stored_active);
     }
-    let current = caller
-        .context_current()
-        .map_err(|error| error.to_string())?
-        .context
+    let current = current_context(caller)?
         .map(|context| context.id)
         .filter(|id| contexts.iter().any(|context| context.id == *id));
     if current.is_some() {
@@ -1664,8 +1881,8 @@ fn set_stored_context_id(
 fn order_contexts_for_navigation(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &WindowRuntimeStateHandle,
-    contexts: Vec<domain_ipc::ContextSummary>,
-) -> Result<Vec<domain_ipc::ContextSummary>, String> {
+    contexts: Vec<ContextSummary>,
+) -> Result<Vec<ContextSummary>, String> {
     let order_ids = resolve_window_order_ids(caller, runtime_state, &contexts)?;
     let mut by_id = contexts
         .into_iter()
@@ -1680,7 +1897,7 @@ fn order_contexts_for_navigation(
 fn resolve_window_order_ids(
     caller: &impl HostRuntimeApi,
     runtime_state: &WindowRuntimeStateHandle,
-    contexts: &[domain_ipc::ContextSummary],
+    contexts: &[ContextSummary],
 ) -> Result<Vec<Uuid>, String> {
     if let Some(order_ids) = cached_window_order_ids(runtime_state) {
         return Ok(project_window_order_ids(order_ids, contexts));
@@ -1740,9 +1957,7 @@ fn cached_window_order_ids(runtime_state: &WindowRuntimeStateHandle) -> Option<V
         .and_then(|state| state.window_order_ids.clone())
 }
 
-fn cached_known_contexts(
-    runtime_state: &WindowRuntimeStateHandle,
-) -> Option<Vec<domain_ipc::ContextSummary>> {
+fn cached_known_contexts(runtime_state: &WindowRuntimeStateHandle) -> Option<Vec<ContextSummary>> {
     let state = runtime_state.lock().ok()?;
     if state.known_contexts.is_empty() {
         return None;
@@ -1751,7 +1966,7 @@ fn cached_known_contexts(
         state
             .known_contexts
             .iter()
-            .map(|(id, name)| domain_ipc::ContextSummary {
+            .map(|(id, name)| ContextSummary {
                 id: *id,
                 name: name.clone(),
                 attributes: BTreeMap::new(),
@@ -1760,10 +1975,7 @@ fn cached_known_contexts(
     )
 }
 
-fn seed_known_contexts(
-    runtime_state: &WindowRuntimeStateHandle,
-    contexts: &[domain_ipc::ContextSummary],
-) {
+fn seed_known_contexts(runtime_state: &WindowRuntimeStateHandle, contexts: &[ContextSummary]) {
     if let Ok(mut state) = runtime_state.lock() {
         for context in contexts {
             state
@@ -1789,10 +2001,7 @@ fn remove_known_context(runtime_state: &WindowRuntimeStateHandle, context_id: Uu
     }
 }
 
-fn project_window_order_ids(
-    mut order_ids: Vec<Uuid>,
-    contexts: &[domain_ipc::ContextSummary],
-) -> Vec<Uuid> {
+fn project_window_order_ids(mut order_ids: Vec<Uuid>, contexts: &[ContextSummary]) -> Vec<Uuid> {
     let context_ids = contexts
         .iter()
         .map(|context| context.id)
@@ -1925,77 +2134,6 @@ impl WindowsStateHandle {
     }
 }
 
-/// Convert a typed [`Selector`] to the IPC [`domain_ipc::SessionSelector`]
-/// used by the byte-encoded host API. Prefers `id` when both are set.
-fn selector_to_session(selector: &Selector) -> Option<domain_ipc::SessionSelector> {
-    if let Some(id) = selector.id {
-        return Some(domain_ipc::SessionSelector::ById(id));
-    }
-    selector
-        .name
-        .as_ref()
-        .map(|name| domain_ipc::SessionSelector::ByName(name.clone()))
-}
-
-/// Convert a typed [`Selector`] to the IPC [`domain_ipc::PaneSelector`].
-/// The BPDL selector has `id` / `name`; panes don't currently accept
-/// a name selector on the host side, so a bare `name` falls back to
-/// the active pane. Consumers that need index-based selection can
-/// extend the BPDL `selector` record later.
-/// Convert a typed [`Selector`] to the IPC [`domain_ipc::PaneSelector`].
-/// Precedence: `id` → `index` → `name` → active. Name-based pane
-/// selection has no direct IPC equivalent today, so a bare `name`
-/// falls back to the active pane.
-#[allow(clippy::option_if_let_else)] // Chained `if let` is clearer than nested `map_or` here.
-const fn selector_to_pane(selector: &Selector) -> domain_ipc::PaneSelector {
-    if let Some(id) = selector.id {
-        domain_ipc::PaneSelector::ById(id)
-    } else if let Some(index) = selector.index {
-        domain_ipc::PaneSelector::ByIndex(index)
-    } else {
-        domain_ipc::PaneSelector::Active
-    }
-}
-
-const fn pane_direction_to_split(direction: PaneDirection) -> domain_ipc::PaneSplitDirection {
-    // The BPDL enum covers split *and* focus directions; only Horizontal
-    // and Vertical are meaningful for splitting. Anything else folds to
-    // Horizontal as the safest default — the trait's `split_pane` caller
-    // is expected to pick Horizontal/Vertical explicitly.
-    match direction {
-        PaneDirection::Vertical => domain_ipc::PaneSplitDirection::Vertical,
-        PaneDirection::Horizontal
-        | PaneDirection::Left
-        | PaneDirection::Right
-        | PaneDirection::Up
-        | PaneDirection::Down => domain_ipc::PaneSplitDirection::Horizontal,
-    }
-}
-
-const fn pane_direction_to_focus(
-    direction: PaneDirection,
-) -> Option<domain_ipc::PaneFocusDirection> {
-    match direction {
-        // Only Next/Prev make sense at the IPC level today. The rest
-        // map to "no direction hint" so the host focuses the targeted
-        // pane explicitly.
-        PaneDirection::Horizontal | PaneDirection::Vertical => None,
-        PaneDirection::Right | PaneDirection::Down => Some(domain_ipc::PaneFocusDirection::Next),
-        PaneDirection::Left | PaneDirection::Up => Some(domain_ipc::PaneFocusDirection::Prev),
-    }
-}
-
-const fn typed_resize_to_domain(direction: PaneResizeDirection) -> domain_ipc::PaneResizeDirection {
-    match direction {
-        PaneResizeDirection::Increase => domain_ipc::PaneResizeDirection::Increase,
-        PaneResizeDirection::Decrease => domain_ipc::PaneResizeDirection::Decrease,
-        PaneResizeDirection::Left => domain_ipc::PaneResizeDirection::Left,
-        PaneResizeDirection::Right => domain_ipc::PaneResizeDirection::Right,
-        PaneResizeDirection::Up => domain_ipc::PaneResizeDirection::Up,
-        PaneResizeDirection::Down => domain_ipc::PaneResizeDirection::Down,
-    }
-}
-
 #[allow(clippy::needless_pass_by_value)] // Used as a fn-pointer in `.map_err(...)`; ref-taking would require closures.
 fn map_host_error<E: ToString>(err: E) -> PaneMutationError {
     PaneMutationError::Failed {
@@ -2010,17 +2148,14 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<(), FocusError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = domain_ipc::PaneFocusRequest {
-                session: None,
-                target: Some(domain_ipc::PaneSelector::ById(id)),
-                direction: None,
+            let target = Selector {
+                id: Some(id),
+                name: None,
+                index: None,
             };
-            caller
-                .pane_focus(&request)
+            focus_pane(&*caller, None, Some(&target), "")
                 .map(|_| ())
-                .map_err(|error| FocusError::FocusDenied {
-                    reason: error.to_string(),
-                })
+                .map_err(|error| FocusError::FocusDenied { reason: error })
         })
     }
 
@@ -2030,16 +2165,14 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<(), CloseError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = domain_ipc::PaneCloseRequest {
-                session: None,
-                target: Some(domain_ipc::PaneSelector::ById(id)),
+            let target = Selector {
+                id: Some(id),
+                name: None,
+                index: None,
             };
-            caller
-                .pane_close(&request)
+            close_pane(&*caller, None, Some(&target))
                 .map(|_| ())
-                .map_err(|error| CloseError::CloseDenied {
-                    reason: error.to_string(),
-                })
+                .map_err(|error| CloseError::CloseDenied { reason: error })
         })
     }
 
@@ -2050,17 +2183,10 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let pane_selector = selector_to_pane(&target);
-            let request = domain_ipc::PaneFocusRequest {
-                session: session.as_ref().and_then(selector_to_session),
-                target: Some(pane_selector),
-                direction: None,
-            };
-            caller
-                .pane_focus(&request)
+            focus_pane(&*caller, session.as_ref(), Some(&target), "")
                 .map(|response| PaneAck {
                     ok: true,
-                    pane_id: Some(response.id),
+                    pane_id: Some(response.pane_id),
                 })
                 .map_err(map_host_error)
         })
@@ -2073,16 +2199,10 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let pane_selector = selector_to_pane(&target);
-            let request = domain_ipc::PaneCloseRequest {
-                session: session.as_ref().and_then(selector_to_session),
-                target: Some(pane_selector),
-            };
-            caller
-                .pane_close(&request)
+            close_pane(&*caller, session.as_ref(), Some(&target))
                 .map(|response| PaneAck {
                     ok: true,
-                    pane_id: Some(response.id),
+                    pane_id: Some(response.pane_id),
                 })
                 .map_err(map_host_error)
         })
@@ -2094,15 +2214,10 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = domain_ipc::PaneCloseRequest {
-                session: session.as_ref().and_then(selector_to_session),
-                target: None,
-            };
-            caller
-                .pane_close(&request)
+            close_pane(&*caller, session.as_ref(), None)
                 .map(|response| PaneAck {
                     ok: true,
-                    pane_id: Some(response.id),
+                    pane_id: Some(response.pane_id),
                 })
                 .map_err(map_host_error)
         })
@@ -2115,22 +2230,15 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let Some(focus_dir) = pane_direction_to_focus(direction) else {
+            let Some(focus_dir) = focus_direction_name(direction) else {
                 return Err(PaneMutationError::InvalidArgument {
-                    reason: "direction must be Next/Prev (Horizontal/Vertical aren't meaningful)"
-                        .into(),
+                    reason: "direction must be left/right/up/down".into(),
                 });
             };
-            let request = domain_ipc::PaneFocusRequest {
-                session: session.as_ref().and_then(selector_to_session),
-                target: None,
-                direction: Some(focus_dir),
-            };
-            caller
-                .pane_focus(&request)
+            focus_pane(&*caller, session.as_ref(), None, focus_dir)
                 .map(|response| PaneAck {
                     ok: true,
-                    pane_id: Some(response.id),
+                    pane_id: Some(response.pane_id),
                 })
                 .map_err(map_host_error)
         })
@@ -2141,22 +2249,22 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         session: Option<Selector>,
         target: Option<Selector>,
         direction: PaneDirection,
-        _ratio_pct: Option<u32>,
+        ratio_pct: Option<u32>,
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = domain_ipc::PaneSplitRequest {
-                session: session.as_ref().and_then(selector_to_session),
-                target: target.as_ref().map(selector_to_pane),
-                direction: pane_direction_to_split(direction),
-            };
-            caller
-                .pane_split(&request)
-                .map(|response| PaneAck {
-                    ok: true,
-                    pane_id: Some(response.id),
-                })
-                .map_err(map_host_error)
+            split_pane(
+                &*caller,
+                session.as_ref(),
+                target.as_ref(),
+                direction,
+                ratio_pct,
+            )
+            .map(|response| PaneAck {
+                ok: true,
+                pane_id: Some(response.pane_id),
+            })
+            .map_err(map_host_error)
         })
     }
 
@@ -2171,25 +2279,23 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = domain_ipc::PaneLaunchRequest {
-                session: session.as_ref().and_then(selector_to_session),
-                target: target.as_ref().map(selector_to_pane),
-                direction: pane_direction_to_split(direction),
-                name,
-                command: domain_ipc::PaneLaunchCommand {
+            launch_pane(
+                &*caller,
+                session.as_ref(),
+                target.as_ref(),
+                LaunchPaneRequest {
+                    direction,
+                    name,
                     program,
                     args,
                     cwd: None,
-                    env: BTreeMap::new(),
                 },
-            };
-            caller
-                .pane_launch(&request)
-                .map(|response| PaneAck {
-                    ok: true,
-                    pane_id: Some(response.id),
-                })
-                .map_err(map_host_error)
+            )
+            .map(|response| PaneAck {
+                ok: true,
+                pane_id: Some(response.pane_id),
+            })
+            .map_err(map_host_error)
         })
     }
 
@@ -2202,19 +2308,18 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = domain_ipc::PaneResizeRequest {
-                session: session.as_ref().and_then(selector_to_session),
-                target: target.as_ref().map(selector_to_pane),
-                direction: typed_resize_to_domain(direction),
-                cells: cells.max(1),
-            };
-            caller
-                .pane_resize(&request)
-                .map(|_| PaneAck {
-                    ok: true,
-                    pane_id: None,
-                })
-                .map_err(map_host_error)
+            resize_pane(
+                &*caller,
+                session.as_ref(),
+                target.as_ref(),
+                direction,
+                cells,
+            )
+            .map(|_| PaneAck {
+                ok: true,
+                pane_id: None,
+            })
+            .map_err(map_host_error)
         })
     }
 
@@ -2224,14 +2329,10 @@ impl WindowsCommandsService for WindowsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneZoomAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = domain_ipc::PaneZoomRequest {
-                session: session.as_ref().and_then(selector_to_session),
-            };
-            caller
-                .pane_zoom(&request)
+            zoom_pane(&*caller, session.as_ref())
                 .map(|response| PaneZoomAck {
                     pane_id: response.pane_id,
-                    zoomed: response.zoomed,
+                    zoomed: true,
                 })
                 .map_err(map_host_error)
         })
@@ -2338,10 +2439,7 @@ impl WindowsStateService for WindowsStateHandle {
     ) -> Pin<Box<dyn Future<Output = Vec<PaneState>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            let request = domain_ipc::PaneListRequest {
-                session: Some(domain_ipc::SessionSelector::ById(session)),
-            };
-            let Ok(response) = caller.pane_list(&request) else {
+            let Ok(response) = list_panes(&*caller, Some(session)) else {
                 return Vec::new();
             };
             response
@@ -2373,25 +2471,25 @@ impl WindowsStateService for WindowsStateHandle {
 
 #[cfg(test)]
 #[allow(clippy::needless_pass_by_value)] // Test helper; owned selector from deserialized request
-fn resolve_session_id(
+fn resolve_context_selector_id(
     caller: &(impl HostRuntimeApi + Sync),
     selector: ContextSelector,
 ) -> Result<Uuid, String> {
-    let contexts = caller
-        .context_list()
-        .map_err(|error| error.to_string())?
-        .contexts;
+    let contexts = list_contexts(caller)?;
     resolve_context_id_from_contexts(&contexts, &selector)
 }
 
 fn parse_selector(value: &str) -> Result<ContextSelector, String> {
     if let Ok(id) = Uuid::parse_str(value) {
-        return Ok(ContextSelector::ById(id));
+        return Ok(context_selector_by_id(id));
     }
     if value.trim().is_empty() {
         return Err("target must not be empty".to_string());
     }
-    Ok(ContextSelector::ByName(value.to_string()))
+    Ok(ContextSelector {
+        id: None,
+        name: Some(value.to_string()),
+    })
 }
 
 fn option_value(arguments: &[String], long_name: &str) -> Option<String> {
@@ -2432,14 +2530,14 @@ fn parse_pane_direction_arg(value: &str) -> Result<PaneDirection, String> {
     }
 }
 
-fn parse_pane_resize_direction_arg(value: &str) -> Result<domain_ipc::PaneResizeDirection, String> {
+fn parse_pane_resize_direction_arg(value: &str) -> Result<PaneResizeDirection, String> {
     match value.to_ascii_lowercase().as_str() {
-        "increase" => Ok(domain_ipc::PaneResizeDirection::Increase),
-        "decrease" => Ok(domain_ipc::PaneResizeDirection::Decrease),
-        "left" => Ok(domain_ipc::PaneResizeDirection::Left),
-        "right" => Ok(domain_ipc::PaneResizeDirection::Right),
-        "up" => Ok(domain_ipc::PaneResizeDirection::Up),
-        "down" => Ok(domain_ipc::PaneResizeDirection::Down),
+        "increase" => Ok(PaneResizeDirection::Increase),
+        "decrease" => Ok(PaneResizeDirection::Decrease),
+        "left" => Ok(PaneResizeDirection::Left),
+        "right" => Ok(PaneResizeDirection::Right),
+        "up" => Ok(PaneResizeDirection::Up),
+        "down" => Ok(PaneResizeDirection::Down),
         other => Err(format!(
             "unknown resize direction '{other}' (expected increase/decrease/left/right/up/down)"
         )),
@@ -2584,16 +2682,27 @@ fn interface_ids_match_bpdl_constants() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_contexts_plugin_api::contexts_state::ContextSummary as SessionSummary;
     use bmux_plugin::ServiceCaller;
     use bmux_plugin_sdk::{
         ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, HostScope,
         NativeServiceContext, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
         decode_service_message, encode_service_message,
     };
-    use domain_ipc::{
-        ContextCloseRequest, ContextSelector as SessionSelector, ContextSummary as SessionSummary,
-    };
     use std::sync::Mutex;
+
+    #[derive(Debug, Clone)]
+    struct ContextCloseRequest {
+        selector: ContextSelector,
+        force: bool,
+    }
+
+    fn selector_by_name(name: &str) -> ContextSelector {
+        ContextSelector {
+            id: None,
+            name: Some(name.to_string()),
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct BridgeRequest {
@@ -3009,16 +3118,7 @@ mod tests {
                     }
                     contexts.extend(by_id.into_values());
                     let typed: Vec<bmux_contexts_plugin_api::contexts_state::ContextSummary> =
-                        contexts
-                            .into_iter()
-                            .map(
-                                |c| bmux_contexts_plugin_api::contexts_state::ContextSummary {
-                                    id: c.id,
-                                    name: c.name,
-                                    attributes: c.attributes,
-                                },
-                            )
-                            .collect();
+                        contexts;
                     encode_service_message(&typed)
                 }
                 ("contexts-state", "current-context") => {
@@ -3027,17 +3127,9 @@ mod tests {
                         .lock()
                         .expect("selected context lock should succeed");
                     let typed: Option<bmux_contexts_plugin_api::contexts_state::ContextSummary> =
-                        current_context_id
-                            .and_then(|id| {
-                                self.sessions.iter().find(|entry| entry.id == id).cloned()
-                            })
-                            .map(
-                                |c| bmux_contexts_plugin_api::contexts_state::ContextSummary {
-                                    id: c.id,
-                                    name: c.name,
-                                    attributes: c.attributes,
-                                },
-                            );
+                        current_context_id.and_then(|id| {
+                            self.sessions.iter().find(|entry| entry.id == id).cloned()
+                        });
                     encode_service_message(&typed)
                 }
                 ("contexts-commands", "create-context") => {
@@ -3137,11 +3229,14 @@ mod tests {
                             selector: request
                                 .selector
                                 .id
-                                .map(ContextSelector::ById)
+                                .map(context_selector_by_id)
                                 .or_else(|| {
-                                    request.selector.name.clone().map(ContextSelector::ByName)
+                                    request.selector.name.clone().map(|name| ContextSelector {
+                                        id: None,
+                                        name: Some(name),
+                                    })
                                 })
-                                .unwrap_or(ContextSelector::ById(resolved_id)),
+                                .unwrap_or_else(|| context_selector_by_id(resolved_id)),
                             force: request.force,
                         });
                     let ok: Result<
@@ -3423,11 +3518,11 @@ mod tests {
         let alpha_id = sessions[0].id;
         let host = MockHost::with_sessions(sessions);
 
-        let resolved_name = resolve_session_id(&host, SessionSelector::ByName("alpha".to_string()))
+        let resolved_name = resolve_context_selector_id(&host, selector_by_name("alpha"))
             .expect("resolve by name should succeed");
         assert_eq!(resolved_name, alpha_id);
 
-        let resolved_id = resolve_session_id(&host, SessionSelector::ById(alpha_id))
+        let resolved_id = resolve_context_selector_id(&host, context_selector_by_id(alpha_id))
             .expect("resolve by id should succeed");
         assert_eq!(resolved_id, alpha_id);
     }
@@ -3539,7 +3634,7 @@ mod tests {
             .id;
 
         let runtime_state = runtime_state();
-        let ack = kill_window(&host, &runtime_state, SessionSelector::ById(target), true)
+        let ack = kill_window(&host, &runtime_state, context_selector_by_id(target), true)
             .expect("kill should succeed");
         assert!(ack.ok);
         let target_text = target.to_string();
@@ -3549,9 +3644,7 @@ mod tests {
             let kills = host.kills.lock().expect("kill log lock should succeed");
             (
                 kills.len(),
-                kills.first().is_some_and(
-                    |k| matches!(k.selector, SessionSelector::ById(id) if id == target),
-                ),
+                kills.first().is_some_and(|k| k.selector.id == Some(target)),
                 kills.first().is_some_and(|k| k.force),
             )
         };
@@ -3568,7 +3661,7 @@ mod tests {
         let error = switch_window(
             &host,
             &runtime_state,
-            SessionSelector::ById(Uuid::new_v4()),
+            context_selector_by_id(Uuid::new_v4()),
             &last_selected_by_client,
             None,
         )
@@ -3587,7 +3680,7 @@ mod tests {
         let ack = switch_window(
             &host,
             &runtime_state,
-            SessionSelector::ById(target_id),
+            context_selector_by_id(target_id),
             &last_selected_by_client,
             None,
         )
@@ -3618,7 +3711,7 @@ mod tests {
         let ack = switch_window(
             &host,
             &runtime_state,
-            SessionSelector::ById(target_id),
+            context_selector_by_id(target_id),
             &last_selected_by_client,
             None,
         )
@@ -3921,13 +4014,8 @@ mod tests {
     fn kill_window_propagates_host_error() {
         let host = MockHost::with_failures(false, true, false);
         let runtime_state = runtime_state();
-        let error = kill_window(
-            &host,
-            &runtime_state,
-            SessionSelector::ByName("alpha".to_string()),
-            false,
-        )
-        .expect_err("kill should surface host failure");
+        let error = kill_window(&host, &runtime_state, selector_by_name("alpha"), false)
+            .expect_err("kill should surface host failure");
         assert!(error.contains("mock kill failure"));
     }
 
@@ -3953,7 +4041,7 @@ mod tests {
         let error = switch_window(
             &host,
             &runtime_state,
-            SessionSelector::ById(target),
+            context_selector_by_id(target),
             &last_selected_by_client,
             None,
         )
@@ -4191,9 +4279,9 @@ mod tests {
             let kills = host.kills.lock().expect("kill log lock should succeed");
             (
                 kills.len(),
-                kills.first().is_some_and(
-                    |k| matches!(k.selector, SessionSelector::ById(id) if id == first_id),
-                ),
+                kills
+                    .first()
+                    .is_some_and(|k| k.selector.id == Some(first_id)),
             )
         };
         assert_eq!(kill_count, 1);
