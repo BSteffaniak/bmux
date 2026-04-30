@@ -68,9 +68,10 @@ use super::prompt_ui::{
     prompt_accepts_key_kind,
 };
 use super::render::{
-    AttachLayer, AttachLayerSurface, AttachSceneRenderStats, append_pane_output, opaque_row_text,
-    queue_frame_damage_overlay, queue_layer_fill, render_attach_scene_with_stats,
-    visible_scene_pane_ids,
+    AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
+    AttachSceneRenderStats, append_pane_output, opaque_row_text,
+    queue_frame_damage_overlay_with_trace, queue_layer_fill,
+    render_attach_scene_with_stats_and_trace, visible_scene_pane_ids,
 };
 use super::state::{
     AttachDirtySource, AttachEventAction, AttachExitReason, AttachMouseResizeAxisDrag,
@@ -2452,6 +2453,7 @@ pub async fn run_session_attach_with_client(
                 &attach_config.behavior.damage,
                 attach_config.logs.client.slow_terminal_write_ms,
                 &mut display_capture,
+                None,
             )?;
             let render_ms = duration_millis_u64(render_started_at.elapsed());
             if render_ms >= attach_config.logs.client.slow_frame_ms {
@@ -2697,6 +2699,7 @@ pub async fn run_session_attach_with_client(
             &attach_config.behavior.damage,
             attach_config.logs.client.slow_terminal_write_ms,
             &mut display_capture,
+            None,
         )?;
         let render_ms = duration_millis_u64(render_started_at.elapsed());
         if render_ms >= attach_config.logs.client.slow_frame_ms {
@@ -5276,6 +5279,7 @@ pub fn render_attach_frame(
     damage_config: &bmux_config::DamageBehaviorConfig,
     slow_terminal_write_ms: u64,
     display_capture: &mut DisplayCaptureFanout,
+    mut render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<AttachFrameRenderStats> {
     let damage_policy = DamageCoalescingPolicy {
         max_rects: damage_config.max_rects,
@@ -5328,6 +5332,7 @@ pub fn render_attach_frame(
 
     let (status_top_inset, status_bottom_inset) =
         status_insets_for_position(view_state.status_position);
+    let terminal_size = terminal::size().unwrap_or((0, 0));
     let render_scene = frame_damage.scene_damaged();
     let use_synchronized_update =
         frame_uses_synchronized_update(&frame_damage) || damage_config.visualize;
@@ -5353,6 +5358,14 @@ pub fn render_attach_frame(
     let status_rendered = frame_damage.status_damaged() && view_state.cached_status_line.is_some();
     if status_rendered && let Some(status_line) = view_state.cached_status_line.as_ref() {
         queue_attach_status_line(&mut frame_bytes, status_line, view_state.status_position)?;
+        if let Some(trace) = render_trace.as_deref_mut()
+            && let Some(row) = status_row_for_position(view_state.status_position, terminal_size.1)
+        {
+            trace.push(AttachRenderTraceOp::StatusLine {
+                row,
+                cells: terminal_size.0,
+            });
+        }
     }
     let appearance_mode_id = if view_state.help_overlay_open {
         "help"
@@ -5373,7 +5386,7 @@ pub fn render_attach_frame(
         // keeps the per-surface loop inside `render_attach_scene`
         // free of registry-lock churn.
         let extensions = bmux_plugin::registered_render_extensions();
-        let (cursor_state, stats) = render_attach_scene_with_stats(
+        let (cursor_state, stats) = render_attach_scene_with_stats_and_trace(
             &mut frame_bytes,
             &layout_state.scene,
             &layout_state.panes,
@@ -5386,10 +5399,11 @@ pub fn render_attach_frame(
             view_state.scrollback_cursor,
             view_state.selection_anchor,
             layout_state.zoomed,
-            terminal::size().unwrap_or((0, 0)),
+            terminal_size,
             &active_runtime_appearance,
             damage_policy,
             &extensions,
+            render_trace.as_deref_mut(),
         )?;
         scene_render_stats = stats;
         cursor_state
@@ -5440,6 +5454,13 @@ pub fn render_attach_frame(
         view_state.help_overlay_open && (frame_damage.overlay_damaged() || render_scene);
     if help_overlay_needs_render && let Some(help_surface) = current_help_overlay_surface.as_ref() {
         queue_attach_help_overlay(&mut frame_bytes, help_surface, help_lines, help_scroll)?;
+        if let Some(trace) = render_trace.as_deref_mut() {
+            trace.push(AttachRenderTraceOp::HelpOverlay {
+                rows: help_surface.rect.h,
+                cells: u64::from(help_surface.rect.w)
+                    .saturating_mul(u64::from(help_surface.rect.h)),
+            });
+        }
         overlay_rendered = true;
     }
     if view_state.prompt.is_active() {
@@ -5449,17 +5470,27 @@ pub fn render_attach_frame(
         overlay_cursor_state = view_state
             .prompt
             .queue_attach_prompt_overlay(&mut frame_bytes)?;
+        if let Some(trace) = render_trace.as_deref_mut()
+            && let Some(prompt_surface) = current_prompt_overlay_surface.as_ref()
+        {
+            trace.push(AttachRenderTraceOp::PromptOverlay {
+                rows: prompt_surface.rect.h,
+                cells: u64::from(prompt_surface.rect.w)
+                    .saturating_mul(u64::from(prompt_surface.rect.h)),
+            });
+        }
         overlay_rendered = true;
     }
 
     if damage_config.visualize {
-        overlay_rendered |= queue_frame_damage_overlay(
+        overlay_rendered |= queue_frame_damage_overlay_with_trace(
             &mut frame_bytes,
             &layout_state.scene,
             &frame_damage,
-            terminal::size().unwrap_or((0, 0)),
+            terminal_size,
             status_top_inset,
             status_bottom_inset,
+            render_trace,
         )?;
     }
 

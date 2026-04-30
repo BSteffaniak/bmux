@@ -574,6 +574,22 @@ pub enum AttachRenderTraceOp {
         regions: u16,
         full_surface: bool,
     },
+    StatusLine {
+        row: u16,
+        cells: u16,
+    },
+    HelpOverlay {
+        rows: u16,
+        cells: u64,
+    },
+    PromptOverlay {
+        rows: u16,
+        cells: u64,
+    },
+    DamageOverlay {
+        rects: u16,
+        cells: u64,
+    },
     Cursor {
         surface_index: usize,
         visible: bool,
@@ -844,6 +860,34 @@ pub fn queue_frame_damage_overlay<W: io::Write>(
     status_top_inset: u16,
     status_bottom_inset: u16,
 ) -> Result<bool> {
+    queue_frame_damage_overlay_with_trace(
+        stdout,
+        scene,
+        frame_damage,
+        terminal_size,
+        status_top_inset,
+        status_bottom_inset,
+        None,
+    )
+}
+
+/// Queue a damage visualization overlay and optionally record its semantic trace op.
+///
+/// Returns `Ok(true)` when an overlay was queued and `Ok(false)` when there
+/// was no visible damage to draw.
+///
+/// # Errors
+///
+/// Returns an error if terminal control sequence generation fails.
+pub fn queue_frame_damage_overlay_with_trace<W: io::Write>(
+    stdout: &mut W,
+    scene: &AttachScene,
+    frame_damage: &FrameDamage,
+    terminal_size: (u16, u16),
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+    render_trace: Option<&mut AttachRenderTrace>,
+) -> Result<bool> {
     let mut rects = frame_damage_overlay_rects(
         scene,
         frame_damage,
@@ -855,6 +899,12 @@ pub fn queue_frame_damage_overlay<W: io::Write>(
         return Ok(false);
     }
     rects.sort_by_key(|rect| (rect.y, rect.x, rect.h, rect.w));
+    if let Some(trace) = render_trace {
+        trace.push(AttachRenderTraceOp::DamageOverlay {
+            rects: u16::try_from(rects.len()).unwrap_or(u16::MAX),
+            cells: rects.iter().map(|rect| u64::from(rect.area())).sum(),
+        });
+    }
 
     queue!(
         stdout,
@@ -2097,8 +2147,9 @@ mod tests {
     use super::{
         AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
         DamageCoalescingPolicy, DamageRect, FrameDamage, append_pane_output,
-        coalesce_render_damage, opaque_row_text, queue_frame_damage_overlay, queue_layer_fill,
-        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
+        coalesce_render_damage, opaque_row_text, queue_frame_damage_overlay,
+        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
+        render_attach_scene, render_attach_scene_with_stats_and_trace,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -2309,6 +2360,40 @@ mod tests {
 
         assert!(output.contains("\u{1b}[8;14H"));
         assert!(output.contains('█'));
+    }
+
+    #[test]
+    fn queue_frame_damage_overlay_records_semantic_trace() {
+        let mut damage = FrameDamage::default();
+        damage.mark_status();
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(9),
+            focus: AttachFocusTarget::None,
+            surfaces: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        let mut trace = AttachRenderTrace::new();
+
+        assert!(
+            queue_frame_damage_overlay_with_trace(
+                &mut bytes,
+                &scene,
+                &damage,
+                (20, 5),
+                1,
+                0,
+                Some(&mut trace),
+            )
+            .expect("damage overlay should queue")
+        );
+
+        assert_eq!(
+            trace.ops(),
+            &[AttachRenderTraceOp::DamageOverlay {
+                rects: 1,
+                cells: 20,
+            }]
+        );
     }
 
     #[test]

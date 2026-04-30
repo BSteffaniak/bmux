@@ -26,6 +26,7 @@ pub use mouse::{
 pub use render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, DamageCoalescingPolicy,
     DamageRect, FrameDamage, FrameDamageStats, queue_frame_damage_overlay,
+    queue_frame_damage_overlay_with_trace,
 };
 pub use scene_pipeline::AttachScenePipeline;
 pub use types::{

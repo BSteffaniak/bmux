@@ -538,6 +538,8 @@ fn parse_and_validate_fixtures() {
         "shell_exit.dsl",
         "assert_matches_fail.dsl",
         "render_assert_idle.dsl",
+        "render_assert_single_line_output.dsl",
+        "render_assert_status_only.dsl",
     ];
 
     for name in &fixtures {
@@ -559,7 +561,21 @@ fn parse_and_validate_fixtures() {
 
 #[test]
 fn playbook_render_assert_idle() {
-    let (json, pass) = run_playbook_fixture("render_assert_idle.dsl");
+    assert_render_fixture_passes("render_assert_idle.dsl");
+}
+
+#[test]
+fn playbook_render_assert_single_line_output() {
+    assert_render_fixture_passes("render_assert_single_line_output.dsl");
+}
+
+#[test]
+fn playbook_render_assert_status_only() {
+    assert_render_fixture_passes("render_assert_status_only.dsl");
+}
+
+fn assert_render_fixture_passes(fixture: &str) {
+    let (json, pass) = run_playbook_fixture(fixture);
     assert!(pass, "render assertion should pass: {json:#}");
     let steps = json["steps"].as_array().unwrap();
     let assert_step = steps

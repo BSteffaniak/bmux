@@ -272,20 +272,20 @@ Directives set playbook-wide configuration. They must appear before any action
 lines (or be interspersed; order relative to actions does not matter since
 directives are processed in a first pass).
 
-| Directive      | Syntax                                          | Default        | Description                                             |
-| -------------- | ----------------------------------------------- | -------------- | ------------------------------------------------------- |
-| `@viewport`    | `@viewport cols=<u16> rows=<u16>`               | `80x24`        | Terminal viewport dimensions                            |
-| `@shell`       | `@shell <path>`                                 | system default | Shell binary for the sandbox                            |
-| `@timeout`     | `@timeout <ms>`                                 | `30000`        | Max playbook execution time in milliseconds             |
-| `@record`      | `@record true\|false`                           | `false`        | Enable recording of the execution                       |
-| `@render-trace` | `@render-trace true\|false`                    | `false`        | Enable per-step normalized render summaries             |
-| `@name`        | `@name <string>`                                | none           | Playbook name (included in JSON output)                 |
-| `@description` | `@description <string>`                         | none           | Playbook description                                    |
-| `@plugin`      | `@plugin enable=<id>` or `@plugin disable=<id>` | all enabled    | Enable/disable specific plugins                         |
-| `@var`         | `@var NAME=VALUE`                               | none           | Define a static variable for `${NAME}` substitution     |
-| `@env`         | `@env NAME=VALUE`                               | none           | Set an environment variable in the sandbox process      |
-| `@env-mode`    | `@env-mode inherit\|clean`                      | `inherit`      | Sandbox environment isolation mode                      |
-| `@include`     | `@include <path>`                               | none           | Include another playbook file (recursive, max depth 10) |
+| Directive       | Syntax                                          | Default        | Description                                             |
+| --------------- | ----------------------------------------------- | -------------- | ------------------------------------------------------- |
+| `@viewport`     | `@viewport cols=<u16> rows=<u16>`               | `80x24`        | Terminal viewport dimensions                            |
+| `@shell`        | `@shell <path>`                                 | system default | Shell binary for the sandbox                            |
+| `@timeout`      | `@timeout <ms>`                                 | `30000`        | Max playbook execution time in milliseconds             |
+| `@record`       | `@record true\|false`                           | `false`        | Enable recording of the execution                       |
+| `@render-trace` | `@render-trace true\|false`                     | `false`        | Enable per-step normalized render summaries             |
+| `@name`         | `@name <string>`                                | none           | Playbook name (included in JSON output)                 |
+| `@description`  | `@description <string>`                         | none           | Playbook description                                    |
+| `@plugin`       | `@plugin enable=<id>` or `@plugin disable=<id>` | all enabled    | Enable/disable specific plugins                         |
+| `@var`          | `@var NAME=VALUE`                               | none           | Define a static variable for `${NAME}` substitution     |
+| `@env`          | `@env NAME=VALUE`                               | none           | Set an environment variable in the sandbox process      |
+| `@env-mode`     | `@env-mode inherit\|clean`                      | `inherit`      | Sandbox environment isolation mode                      |
+| `@include`      | `@include <path>`                               | none           | Include another playbook file (recursive, max depth 10) |
 
 ### Environment Modes
 
@@ -593,22 +593,22 @@ sleep ms=10
 assert-render since='baseline' max_frames=0 max_rows_emitted=0 max_cells_emitted=0 full_frame=false
 ```
 
-| Arg                          | Type | Required | Default | Description                                      |
-| ---------------------------- | ---- | -------- | ------- | ------------------------------------------------ |
-| `since`                      | str  | yes      | -       | Existing `render-mark` ID                        |
-| `min_frames`                 | u64  | no       | -       | Minimum observed frames                          |
-| `max_frames`                 | u64  | no       | -       | Maximum observed frames                          |
+| Arg                          | Type | Required | Default | Description                                       |
+| ---------------------------- | ---- | -------- | ------- | ------------------------------------------------- |
+| `since`                      | str  | yes      | -       | Existing `render-mark` ID                         |
+| `min_frames`                 | u64  | no       | -       | Minimum observed frames                           |
+| `max_frames`                 | u64  | no       | -       | Maximum observed frames                           |
 | `full_frame`                 | bool | no       | -       | Whether any full-frame render is allowed/expected |
-| `max_full_frame_frames`      | u64  | no       | -       | Maximum full-frame render count                  |
-| `max_full_surface_fallbacks` | u64  | no       | -       | Maximum full-surface fallback count              |
-| `max_damage_rects`           | u64  | no       | -       | Maximum damage rect count                        |
-| `max_damage_area_cells`      | u64  | no       | -       | Maximum damaged cell area                        |
-| `max_rows_emitted`           | u64  | no       | -       | Maximum changed/emitted rows                     |
-| `max_row_segments_emitted`   | u64  | no       | -       | Maximum emitted row segment count                |
-| `max_cells_emitted`          | u64  | no       | -       | Maximum changed/emitted cells                    |
-| `max_frame_bytes`            | u64  | no       | -       | Maximum estimated frame bytes                    |
-| `status_rendered`            | bool | no       | -       | Whether status rendering was observed            |
-| `overlay_rendered`           | bool | no       | -       | Whether overlay rendering was observed           |
+| `max_full_frame_frames`      | u64  | no       | -       | Maximum full-frame render count                   |
+| `max_full_surface_fallbacks` | u64  | no       | -       | Maximum full-surface fallback count               |
+| `max_damage_rects`           | u64  | no       | -       | Maximum damage rect count                         |
+| `max_damage_area_cells`      | u64  | no       | -       | Maximum damaged cell area                         |
+| `max_rows_emitted`           | u64  | no       | -       | Maximum changed/emitted rows                      |
+| `max_row_segments_emitted`   | u64  | no       | -       | Maximum emitted row segment count                 |
+| `max_cells_emitted`          | u64  | no       | -       | Maximum changed/emitted cells                     |
+| `max_frame_bytes`            | u64  | no       | -       | Maximum estimated frame bytes                     |
+| `status_rendered`            | bool | no       | -       | Whether status rendering was observed             |
+| `overlay_rendered`           | bool | no       | -       | Whether overlay rendering was observed            |
 
 ### Inspection
 
