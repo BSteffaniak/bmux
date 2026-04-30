@@ -433,6 +433,11 @@ pub(super) async fn run_server_start(
                         bmux_contexts_plugin_api::contexts_events::ContextEvent,
                     >(kind)
                 }
+                (k, bmux_plugin_sdk::PluginEventDelivery::Broadcast)
+                    if k == bmux_performance_plugin_api::EVENT_KIND.as_str() =>
+                {
+                    server.spawn_plugin_bus_forwarder::<bmux_performance_plugin_api::PerformanceEvent>(kind)
+                }
                 (k, bmux_plugin_sdk::PluginEventDelivery::State)
                     if k == bmux_windows_plugin_api::windows_list::STATE_KIND.as_str() =>
                 {

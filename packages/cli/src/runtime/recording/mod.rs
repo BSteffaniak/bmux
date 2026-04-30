@@ -312,6 +312,26 @@ impl PerfCaptureLevel {
     }
 
     #[must_use]
+    pub(super) const fn from_plugin(
+        level: bmux_performance_plugin_api::performance_types::PerformanceRecordingLevel,
+    ) -> Self {
+        match level {
+            bmux_performance_plugin_api::performance_types::PerformanceRecordingLevel::Off => {
+                Self::Off
+            }
+            bmux_performance_plugin_api::performance_types::PerformanceRecordingLevel::Basic => {
+                Self::Basic
+            }
+            bmux_performance_plugin_api::performance_types::PerformanceRecordingLevel::Detailed => {
+                Self::Detailed
+            }
+            bmux_performance_plugin_api::performance_types::PerformanceRecordingLevel::Trace => {
+                Self::Trace
+            }
+        }
+    }
+
+    #[must_use]
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -349,6 +369,20 @@ impl PerfCaptureSettings {
             window_ms: settings.window_ms.max(1),
             max_events_per_sec: settings.max_events_per_sec.max(1),
             max_payload_bytes_per_sec: settings.max_payload_bytes_per_sec.max(1),
+        }
+    }
+
+    #[must_use]
+    pub(super) fn from_plugin_settings(
+        settings: &bmux_performance_plugin_api::performance_types::PerformanceRuntimeSettings,
+    ) -> Self {
+        Self {
+            level: PerfCaptureLevel::from_plugin(settings.recording_level),
+            window_ms: settings.window_ms.max(1),
+            max_events_per_sec: settings.max_events_per_sec.max(1),
+            max_payload_bytes_per_sec: usize::try_from(settings.max_payload_bytes_per_sec)
+                .unwrap_or(usize::MAX)
+                .max(1),
         }
     }
 }

@@ -1260,10 +1260,6 @@ pub enum Event {
     RecordingStopped {
         recording_id: Uuid,
     },
-    /// Runtime performance telemetry settings changed.
-    PerformanceSettingsUpdated {
-        settings: PerformanceRuntimeSettings,
-    },
     /// Control-plane catalog state changed (sessions/contexts/bindings).
     /// Clients should refresh through the control-catalog plugin and reconcile local caches.
     ControlCatalogChanged {
@@ -1926,9 +1922,6 @@ mod tests {
             Event::PaneRestarted {
                 session_id: id,
                 pane_id: id2,
-            },
-            Event::PerformanceSettingsUpdated {
-                settings: sample_performance_runtime_settings(),
             },
             Event::ControlCatalogChanged {
                 revision: 9,

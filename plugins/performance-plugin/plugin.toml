@@ -21,3 +21,8 @@ kind         = "query"
 capability   = "bmux.performance.write"
 interface_id = "performance-commands"
 kind         = "command"
+
+[[event_publications]]
+delivery                     = "broadcast"
+forward_to_streaming_clients = true
+kind                         = "bmux.performance/performance-events"

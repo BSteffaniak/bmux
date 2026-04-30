@@ -1962,7 +1962,6 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         | Event::FollowTargetGone { .. }
         | Event::RecordingStarted { .. }
         | Event::RecordingStopped { .. }
-        | Event::PerformanceSettingsUpdated { .. }
         | Event::ControlCatalogChanged { .. }
         | Event::PluginBusEvent { .. } => None,
     };

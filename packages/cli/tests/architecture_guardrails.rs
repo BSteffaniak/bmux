@@ -312,9 +312,9 @@ fn performance_plugin_exists() {
     assert!(
         !server_source.contains("fn spawn_performance_events_bridge"),
         "packages/server/src/lib.rs must not define \
-         `spawn_performance_events_bridge`; the performance plugin \
-         now publishes `Event::PerformanceSettingsUpdated` directly \
-         through the registered `WireEventSinkHandle`",
+         `spawn_performance_events_bridge`; performance settings updates \
+         flow through the generated performance BPDL event and generic \
+         plugin-bus forwarder",
     );
 }
 

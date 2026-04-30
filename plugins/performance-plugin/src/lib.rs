@@ -22,7 +22,7 @@ use bmux_performance_plugin_api::{
 use bmux_performance_state::{PerformanceCaptureSettings, PerformanceSettingsHandle};
 use bmux_plugin::{global_event_bus, global_plugin_state_registry};
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry, WireEventSinkHandle};
+use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -59,19 +59,6 @@ static METRICS_STATE: OnceLock<Mutex<MetricsState>> = OnceLock::new();
 
 fn metrics_state() -> &'static Mutex<MetricsState> {
     METRICS_STATE.get_or_init(|| Mutex::new(MetricsState::default()))
-}
-
-/// Look up the server-registered `WireEventSinkHandle` from the plugin
-/// state registry and publish the given wire event through it. Silent
-/// no-op when no server is attached (tests / headless tooling).
-fn publish_wire_event(event: bmux_ipc::Event) {
-    let Some(handle) = global_plugin_state_registry().get::<WireEventSinkHandle>() else {
-        return;
-    };
-    let Ok(guard) = handle.read() else {
-        return;
-    };
-    let _ = guard.0.publish(event);
 }
 
 #[derive(Default)]
@@ -518,18 +505,15 @@ fn handle_set_settings(
     };
     guard.0.set(normalized_capture);
 
-    // Emit the typed event for plugin-local consumers, then publish
-    // the wire-shape event directly through the registered
-    // `WireEventSinkHandle` for cross-process subscribers.
+    // Emit the typed event for plugin-local consumers. Server bootstrap
+    // forwards this generated BPDL event to streaming clients through
+    // the generic plugin-bus bridge.
     let _ = global_event_bus().emit(
         &EVENT_KIND,
         PerformanceEvent::SettingsUpdated {
             settings: normalized.clone().into(),
         },
     );
-    publish_wire_event(bmux_ipc::Event::PerformanceSettingsUpdated {
-        settings: normalized.clone(),
-    });
 
     normalized
 }

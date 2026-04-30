@@ -1259,8 +1259,7 @@ pub async fn run_session_attach_with_client(
         recording::PerfCaptureSettings::from_config(&attach_config),
     );
     if let Ok(settings) = performance_state::client::get_settings(&mut client).await {
-        let settings = settings.into();
-        perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
+        perf_emitter.update_settings(recording::PerfCaptureSettings::from_plugin_settings(
             &settings,
         ));
     }
@@ -2406,18 +2405,27 @@ async fn handle_attach_stream_server_event(
         display_capture.open_target(&target, self_client_id);
     } else if let bmux_client::ServerEvent::RecordingStopped { recording_id } = server_event {
         display_capture.close_recording(recording_id);
-    } else if let bmux_client::ServerEvent::PerformanceSettingsUpdated { ref settings } =
-        server_event
-    {
-        perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
-            settings,
-        ));
     } else if let bmux_client::ServerEvent::PluginBusEvent {
         ref kind,
         ref payload,
     } = server_event
     {
-        if kind.as_str() == bmux_scene_protocol::scene_protocol::STATE_KIND.as_str() {
+        if kind.as_str() == bmux_performance_plugin_api::EVENT_KIND.as_str() {
+            match serde_json::from_slice::<bmux_performance_plugin_api::PerformanceEvent>(payload) {
+                Ok(bmux_performance_plugin_api::PerformanceEvent::SettingsUpdated { settings }) => {
+                    perf_emitter.update_settings(
+                        recording::PerfCaptureSettings::from_plugin_settings(&settings),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded performance event payload",
+                    );
+                }
+            }
+        } else if kind.as_str() == bmux_scene_protocol::scene_protocol::STATE_KIND.as_str() {
             match serde_json::from_slice::<bmux_scene_protocol::scene_protocol::DecorationScene>(
                 payload,
             ) {
