@@ -12,8 +12,8 @@ pub mod follow_state;
 pub use follow_state::FollowState;
 
 use bmux_client_state::{
-    FollowEntry, FollowStateHandle, FollowStateReader, FollowStateSnapshot, FollowStateWriter,
-    FollowTargetGoneUpdate, FollowTargetUpdate,
+    ClientSummary as PrimitiveClientSummary, FollowEntry, FollowStateHandle, FollowStateReader,
+    FollowStateSnapshot, FollowStateWriter, FollowTargetGoneUpdate, FollowTargetUpdate,
 };
 use bmux_clients_plugin_api::clients_commands::{
     self, ClientAck, ClientsCommandsService, SetCurrentSessionError, SetFollowingError,
@@ -92,11 +92,8 @@ impl FollowStateReader for FollowStateAdapter {
         self.with_read(|state| state.follows.get(&client_id).copied(), None)
     }
 
-    fn list_clients(&self) -> Vec<bmux_ipc::ClientSummary> {
-        self.with_read(
-            FollowState::list_clients,
-            Vec::<bmux_ipc::ClientSummary>::new(),
-        )
+    fn list_clients(&self) -> Vec<PrimitiveClientSummary> {
+        self.with_read(FollowState::list_clients, Vec::new())
     }
 
     fn selected_target(&self, client_id: ClientId) -> Option<(Option<Uuid>, Option<SessionId>)> {
@@ -612,7 +609,7 @@ fn list_clients_local() -> Result<Vec<ClientSummary>, String> {
     Ok(follow_state
         .list_clients()
         .iter()
-        .map(ipc_summary_to_typed)
+        .map(primitive_summary_to_typed)
         .collect())
 }
 
@@ -630,7 +627,7 @@ fn current_client_local(caller_client_id: Option<Uuid>) -> Result<ClientSummary,
         .list_clients()
         .iter()
         .find(|entry| entry.id == self_id)
-        .map(ipc_summary_to_typed)
+        .map(primitive_summary_to_typed)
         .ok_or(ClientQueryError::NotFound)
 }
 
@@ -945,7 +942,7 @@ fn current_client_id_for_typed_handle(caller: &TypedServiceCaller) -> Option<Uui
     }
 }
 
-const fn ipc_summary_to_typed(summary: &bmux_ipc::ClientSummary) -> ClientSummary {
+const fn primitive_summary_to_typed(summary: &PrimitiveClientSummary) -> ClientSummary {
     ClientSummary {
         id: summary.id,
         selected_session_id: summary.selected_session_id,

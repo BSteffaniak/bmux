@@ -9,7 +9,6 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use bmux_ipc::ClientSummary;
 use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,6 +38,17 @@ pub struct FollowTargetUpdate {
 pub struct FollowTargetGoneUpdate {
     pub follower_client_id: ClientId,
     pub former_leader_client_id: ClientId,
+}
+
+/// Summary of a connected client used by neutral follow-state readers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientSummary {
+    pub id: Uuid,
+    #[serde(default)]
+    pub selected_context_id: Option<Uuid>,
+    pub selected_session_id: Option<Uuid>,
+    pub following_client_id: Option<Uuid>,
+    pub following_global: bool,
 }
 
 /// Snapshot of follow-state suitable for persistence round-trips.
@@ -96,7 +106,7 @@ pub trait FollowStateReader: Send + Sync {
     /// Follow relationship the client is currently participating in as
     /// a follower, if any.
     fn follow_target(&self, client_id: ClientId) -> Option<FollowEntry>;
-    /// All connected clients rendered as wire `ClientSummary` rows.
+    /// All connected clients rendered as `ClientSummary` rows.
     fn list_clients(&self) -> Vec<ClientSummary>;
     /// Joint `(selected_context, selected_session)` lookup — cheaper
     /// than two separate calls when the caller needs both.

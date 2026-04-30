@@ -689,17 +689,6 @@ pub struct AttachPaneInputMode {
     pub mode: AttachInputModeState,
 }
 
-/// Summary returned when listing connected clients.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientSummary {
-    pub id: Uuid,
-    #[serde(default)]
-    pub selected_context_id: Option<Uuid>,
-    pub selected_session_id: Option<Uuid>,
-    pub following_client_id: Option<Uuid>,
-    pub following_global: bool,
-}
-
 /// Snapshot persistence status returned by server-status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerSnapshotStatus {

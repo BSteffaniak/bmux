@@ -1789,6 +1789,21 @@ fn context_state_dtos_are_absent_from_ipc() {
     }
 }
 
+/// Client summary DTOs are owned by the neutral `bmux_client_state`
+/// primitive crate and exposed publicly through generated
+/// clients-plugin API types, not core IPC.
+#[test]
+fn client_state_dtos_are_absent_from_ipc() {
+    let ipc_source = include_str!("../../ipc/src/lib.rs");
+    let denied = ["pub struct ClientSummary"];
+    for marker in denied {
+        assert!(
+            !ipc_source.contains(marker),
+            "packages/ipc/src/lib.rs must not reintroduce {marker}; client DTOs belong in bmux_client_state / clients-plugin-api",
+        );
+    }
+}
+
 /// The 8 pane-mutation IPC variants are absent. Every pane mutation
 /// is a typed `pane-runtime-commands` invocation whose handler lives
 /// in the pane-runtime-plugin.

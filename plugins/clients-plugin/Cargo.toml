@@ -18,7 +18,6 @@ crate-type = ["cdylib", "rlib"]
 bmux_client_state        = { workspace = true }
 bmux_clients_plugin_api  = { workspace = true }
 bmux_contexts_plugin_api = { workspace = true }
-bmux_ipc                 = { workspace = true }
 bmux_plugin              = { workspace = true }
 bmux_plugin_sdk          = { workspace = true }
 bmux_session_models      = { workspace = true, features = ["serde"] }

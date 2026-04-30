@@ -15,8 +15,7 @@
 //! domain-agnostic `bmux_client_state::FollowStateHandle` trait
 //! object rather than naming this concrete type.
 
-use bmux_client_state::{FollowEntry, FollowTargetGoneUpdate, FollowTargetUpdate};
-use bmux_ipc::ClientSummary;
+use bmux_client_state::{ClientSummary, FollowEntry, FollowTargetGoneUpdate, FollowTargetUpdate};
 use bmux_session_models::{ClientId, SessionId};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
@@ -204,8 +203,7 @@ impl FollowState {
         updates
     }
 
-    /// Render the current client roster as a list of wire-level
-    /// `ClientSummary` rows.
+    /// Render the current client roster as `ClientSummary` rows.
     #[must_use]
     pub fn list_clients(&self) -> Vec<ClientSummary> {
         self.connected_clients
