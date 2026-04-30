@@ -1888,6 +1888,12 @@ fn pane_mutation_ipc_variants_are_absent() {
         "    RestartPane {",
         "    ZoomPane {",
         "    PaneDirectInput {",
+        "    AttachViewChanged {",
+        "    PaneOutputAvailable {",
+        "    PaneOutput {",
+        "    PaneImageAvailable {",
+        "    PaneExited {",
+        "    PaneRestarted {",
     ];
     for marker in denied {
         assert!(

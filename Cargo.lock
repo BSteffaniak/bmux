@@ -1514,7 +1514,6 @@ name = "bmux_ipc"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_attach_image_protocol",
- "bmux_attach_view_protocol",
  "bmux_codec",
  "bmux_performance_state",
  "bmux_recording_protocol",
@@ -1589,7 +1588,6 @@ dependencies = [
  "bmux_attach_image_protocol",
  "bmux_attach_layout_protocol",
  "bmux_attach_token_state",
- "bmux_attach_view_protocol",
  "bmux_client_state",
  "bmux_config",
  "bmux_context_state",
@@ -1941,7 +1939,6 @@ dependencies = [
  "anyhow",
  "bmux_attach_image_protocol",
  "bmux_attach_token_state",
- "bmux_attach_view_protocol",
  "bmux_client_state",
  "bmux_codec",
  "bmux_config",

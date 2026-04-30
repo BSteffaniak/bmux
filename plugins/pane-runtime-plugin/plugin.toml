@@ -47,3 +47,8 @@ kind         = "query"
 capability   = "bmux.pane_runtime.read"
 interface_id = "pane-runtime-events"
 kind         = "event"
+
+[[event_publications]]
+delivery                     = "broadcast"
+forward_to_streaming_clients = true
+kind                         = "bmux.pane_runtime/pane-runtime-events"

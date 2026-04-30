@@ -321,12 +321,6 @@ pub(super) fn server_event_name(event: &bmux_client::ServerEvent) -> &'static st
         bmux_client::ServerEvent::ServerStopping => "server_stopping",
         bmux_client::ServerEvent::ClientAttached { .. } => "client_attached",
         bmux_client::ServerEvent::ClientDetached { .. } => "client_detached",
-        bmux_client::ServerEvent::AttachViewChanged { .. } => "attach_view_changed",
-        bmux_client::ServerEvent::PaneOutputAvailable { .. } => "pane_output_available",
-        bmux_client::ServerEvent::PaneOutput { .. } => "pane_output",
-        bmux_client::ServerEvent::PaneImageAvailable { .. } => "pane_image_available",
-        bmux_client::ServerEvent::PaneExited { .. } => "pane_exited",
-        bmux_client::ServerEvent::PaneRestarted { .. } => "pane_restarted",
         bmux_client::ServerEvent::RecordingStarted { .. } => "recording_started",
         bmux_client::ServerEvent::RecordingStopped { .. } => "recording_stopped",
         bmux_client::ServerEvent::PluginBusEvent { kind, payload } => {
@@ -379,6 +373,28 @@ fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
             | bmux_clients_plugin_api::clients_events::ClientEvent::FollowChanged { .. } => {
                 "plugin_bus_event"
             }
+        });
+    }
+    if kind == bmux_pane_runtime_plugin_api::pane_runtime_events::EVENT_KIND.as_str() {
+        return serde_json::from_slice::<
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent,
+        >(payload)
+        .map_or("plugin_bus_event", |event| match event {
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::Exited { .. } => {
+                "pane_exited"
+            }
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::Restarted { .. } => {
+                "pane_restarted"
+            }
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::OutputAvailable {
+                ..
+            } => "pane_output_available",
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::ImageAvailable {
+                ..
+            } => "pane_image_available",
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::AttachViewChanged {
+                ..
+            } => "attach_view_changed",
         });
     }
     "plugin_bus_event"

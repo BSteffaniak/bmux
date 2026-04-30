@@ -11,6 +11,7 @@ use bmux_client::{BmuxClient, ClientError, ServerEvent, StreamingBmuxClient};
 use bmux_ipc::compressed_stream::CompressedStream;
 use bmux_ipc::transport::{ErasedIpcStream, IpcTransportError};
 use bmux_ipc::{CAPABILITY_ATTACH_PANE_SNAPSHOT, ErrorCode};
+use bmux_pane_runtime_plugin_api::pane_runtime_events;
 use bmux_session_models::SessionSelector;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
@@ -1453,28 +1454,25 @@ async fn handle_session_event(
     event: ServerEvent,
 ) {
     match event {
-        ServerEvent::PaneOutput {
-            session_id: event_session_id,
-            pane_id,
-            data,
-            stream_start,
-            stream_end,
-            stream_gap,
-            sync_update_active,
-        } if event_session_id == session_id => {
-            let outcome = state.apply_chunk(&AttachPaneChunk {
-                pane_id,
-                data,
-                stream_start,
-                stream_end,
-                stream_gap,
-                sync_update_active,
-            });
-            if matches!(outcome, AttachChunkApplyOutcome::Desync) {
-                let _ = recover_desynced_pane(client, state, session_id, pane_id).await;
+        ServerEvent::PluginBusEvent { kind, payload }
+            if kind == pane_runtime_events::EVENT_KIND.as_str() =>
+        {
+            if let Ok(event) = serde_json::from_slice::<pane_runtime_events::PaneEvent>(&payload) {
+                handle_pane_runtime_event(client, state, session_id, event).await;
             }
         }
-        ServerEvent::PaneOutputAvailable {
+        _ => {}
+    }
+}
+
+async fn handle_pane_runtime_event(
+    client: &mut StreamingBmuxClient,
+    state: &mut StreamOutputState,
+    session_id: Uuid,
+    event: pane_runtime_events::PaneEvent,
+) {
+    match event {
+        pane_runtime_events::PaneEvent::OutputAvailable {
             session_id: event_session_id,
             ..
         } if event_session_id == session_id => {
@@ -1493,11 +1491,16 @@ async fn handle_session_event(
                 }
             }
         }
-        ServerEvent::AttachViewChanged {
+        pane_runtime_events::PaneEvent::AttachViewChanged {
             session_id: event_session_id,
             components,
             ..
         } if event_session_id == session_id => {
+            let components = components
+                .iter()
+                .copied()
+                .map(plugin_attach_view_component)
+                .collect::<Vec<_>>();
             let component_hydration_requested = state.apply_view_change_components(&components);
             if let Ok(layout) = client.attach_layout(session_id).await {
                 let layout_hydration_requested = state.apply_layout_state(layout);
@@ -1509,6 +1512,19 @@ async fn handle_session_event(
             }
         }
         _ => {}
+    }
+}
+
+const fn plugin_attach_view_component(
+    component: pane_runtime_events::AttachViewComponent,
+) -> AttachViewComponent {
+    match component {
+        pane_runtime_events::AttachViewComponent::Scene => AttachViewComponent::Scene,
+        pane_runtime_events::AttachViewComponent::SurfaceContent => {
+            AttachViewComponent::SurfaceContent
+        }
+        pane_runtime_events::AttachViewComponent::Layout => AttachViewComponent::Layout,
+        pane_runtime_events::AttachViewComponent::Status => AttachViewComponent::Status,
     }
 }
 

@@ -3864,21 +3864,6 @@ fn event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
             | (bmux_ipc::Event::ServerStopping, "server_stopping")
             | (bmux_ipc::Event::ClientAttached { .. }, "client_attached")
             | (bmux_ipc::Event::ClientDetached { .. }, "client_detached")
-            | (
-                bmux_ipc::Event::AttachViewChanged { .. },
-                "attach_view_changed"
-            )
-            | (
-                bmux_ipc::Event::PaneOutputAvailable { .. },
-                "pane_output_available"
-            )
-            | (bmux_ipc::Event::PaneOutput { .. }, "pane_output")
-            | (
-                bmux_ipc::Event::PaneImageAvailable { .. },
-                "pane_image_available"
-            )
-            | (bmux_ipc::Event::PaneExited { .. }, "pane_exited")
-            | (bmux_ipc::Event::PaneRestarted { .. }, "pane_restarted")
     ) || plugin_bus_event_matches(event, name)
 }
 
@@ -3886,6 +3871,9 @@ fn plugin_bus_event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
     let bmux_ipc::Event::PluginBusEvent { kind, payload } = event else {
         return false;
     };
+    if kind == bmux_pane_runtime_plugin_api::pane_runtime_events::EVENT_KIND.as_str() {
+        return pane_runtime_plugin_bus_event_matches(payload, name);
+    }
     if kind != bmux_clients_plugin_api::clients_events::EVENT_KIND.as_str() {
         return session_plugin_bus_event_matches(kind, payload, name);
     }
@@ -3915,6 +3903,31 @@ fn plugin_bus_event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
             )
         },
     )
+}
+
+fn pane_runtime_plugin_bus_event_matches(payload: &[u8], name: &str) -> bool {
+    serde_json::from_slice::<bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent>(payload)
+        .is_ok_and(|event| {
+            matches!(
+                (event, name),
+                (
+                    bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::Exited { .. },
+                    "pane_exited"
+                ) | (
+                    bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::Restarted { .. },
+                    "pane_restarted"
+                ) | (
+                    bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::OutputAvailable { .. },
+                    "pane_output_available"
+                ) | (
+                    bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::ImageAvailable { .. },
+                    "pane_image_available"
+                ) | (
+                    bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::AttachViewChanged { .. },
+                    "attach_view_changed"
+                )
+            )
+        })
 }
 
 fn session_plugin_bus_event_matches(kind: &str, payload: &[u8], name: &str) -> bool {

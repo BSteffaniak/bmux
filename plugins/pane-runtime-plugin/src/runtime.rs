@@ -8,16 +8,17 @@ use bmux_attach_layout_protocol::{
     PaneFocusDirection, PaneLaunchCommand, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
     PaneSplitDirection, PaneState, PaneSummary,
 };
-use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_context_state::ContextStateHandle;
 use bmux_ipc::{ErrorCode, Event};
-use bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig;
+use bmux_pane_runtime_plugin_api::{
+    PaneRuntimePluginConfig,
+    pane_runtime_events::{self, AttachViewComponent, PaneEvent},
+};
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
     PaneLayoutNode, PaneResizeDirection, PaneResurrectionSnapshot, PaneRuntimeMeta,
     SessionRuntimeError,
 };
-use bmux_plugin_sdk::WireEventSinkHandle;
 use bmux_recording_protocol::{RecordingEventKind, RecordingPayload as ProtocolRecordingPayload};
 use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
@@ -67,13 +68,11 @@ fn mark_snapshot_dirty_flag() {
     snapshot_dirty_flag().mark_dirty();
 }
 
-fn publish_wire_event(event: Event) {
-    if let Some(handle) = bmux_plugin::global_plugin_state_registry()
-        .get::<WireEventSinkHandle>()
-        .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
-        && let Err(error) = handle.0.publish(event)
+pub(crate) fn publish_pane_event(event: PaneEvent) {
+    if let Err(error) =
+        bmux_plugin::global_event_bus().emit(&pane_runtime_events::EVENT_KIND, event)
     {
-        warn!(%error, "failed publishing pane-runtime wire event");
+        warn!(%error, "failed publishing pane-runtime event");
     }
 }
 
@@ -95,7 +94,7 @@ fn emit_attach_view_changed_for_layout(session_id: SessionId) {
     let revision = session_runtime_handle()
         .0
         .bump_attach_view_revision(session_id);
-    publish_wire_event(Event::AttachViewChanged {
+    publish_pane_event(PaneEvent::AttachViewChanged {
         context_id: current_context_id_for_session(session_id),
         session_id: session_id.0,
         revision: revision.unwrap_or(0),
@@ -2436,7 +2435,7 @@ impl SessionRuntimeManager {
                                             )
                                             .is_ok()
                                         {
-                                            publish_wire_event(Event::PaneImageAvailable {
+                                            publish_pane_event(PaneEvent::ImageAvailable {
                                                 session_id: session_id.0,
                                                 pane_id,
                                             });
@@ -2489,7 +2488,7 @@ impl SessionRuntimeManager {
                                         )
                                         .is_ok()
                                     {
-                                        publish_wire_event(Event::PaneImageAvailable {
+                                        publish_pane_event(PaneEvent::ImageAvailable {
                                             session_id: session_id.0,
                                             pane_id,
                                         });
@@ -2528,7 +2527,7 @@ impl SessionRuntimeManager {
                                     )
                                     .is_ok()
                                 {
-                                    publish_wire_event(Event::PaneOutputAvailable {
+                                    publish_pane_event(PaneEvent::OutputAvailable {
                                         session_id: session_id.0,
                                         pane_id,
                                     });
@@ -2567,7 +2566,7 @@ impl SessionRuntimeManager {
                                             )
                                             .is_ok()
                                         {
-                                            publish_wire_event(Event::PaneImageAvailable {
+                                            publish_pane_event(PaneEvent::ImageAvailable {
                                                 session_id: session_id.0,
                                                 pane_id,
                                             });
@@ -4331,7 +4330,7 @@ fn reap_exited_pane(session_id: SessionId, pane_id: Uuid) {
     let state_reason = session_runtime_handle()
         .0
         .pane_state_reason(session_id, pane_id);
-    publish_wire_event(Event::PaneExited {
+    publish_pane_event(PaneEvent::Exited {
         session_id: session_id.0,
         pane_id,
         reason: state_reason,

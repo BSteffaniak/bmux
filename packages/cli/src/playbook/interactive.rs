@@ -1686,11 +1686,7 @@ async fn process_output_available_event<W: tokio::io::AsyncWrite + Unpin>(
     pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
     event: &bmux_client::ServerEvent,
 ) -> Result<()> {
-    let bmux_client::ServerEvent::PaneOutputAvailable {
-        session_id: event_session_id,
-        ..
-    } = event
-    else {
+    let Some(event_session_id) = pane_output_available_session_id(event) else {
         return Ok(());
     };
 
@@ -1700,12 +1696,12 @@ async fn process_output_available_event<W: tokio::io::AsyncWrite + Unpin>(
     if !*attached {
         return Ok(());
     }
-    if Some(*event_session_id) != *session_id {
+    if Some(event_session_id) != *session_id {
         return Ok(());
     }
 
     let drain = match inspector
-        .drain_incremental_output(client, *event_session_id, INTERACTIVE_OUTPUT_MAX_BYTES)
+        .drain_incremental_output(client, event_session_id, INTERACTIVE_OUTPUT_MAX_BYTES)
         .await
     {
         Ok(result) => result,
@@ -1779,6 +1775,26 @@ async fn process_output_available_event<W: tokio::io::AsyncWrite + Unpin>(
         false,
     )
     .await
+}
+
+fn pane_output_available_session_id(event: &bmux_client::ServerEvent) -> Option<Uuid> {
+    let bmux_client::ServerEvent::PluginBusEvent { kind, payload } = event else {
+        return None;
+    };
+    if kind != bmux_pane_runtime_plugin_api::pane_runtime_events::EVENT_KIND.as_str() {
+        return None;
+    }
+    match serde_json::from_slice::<bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent>(
+        payload,
+    )
+    .ok()?
+    {
+        bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::OutputAvailable {
+            session_id,
+            ..
+        } => Some(session_id),
+        _ => None,
+    }
 }
 
 #[allow(clippy::useless_let_if_seq)]
@@ -2589,12 +2605,6 @@ fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
         bmux_client::ServerEvent::ServerStopping => "server_stopping",
         bmux_client::ServerEvent::ClientAttached { .. } => "client_attached",
         bmux_client::ServerEvent::ClientDetached { .. } => "client_detached",
-        bmux_client::ServerEvent::AttachViewChanged { .. } => "attach_view_changed",
-        bmux_client::ServerEvent::PaneOutputAvailable { .. } => "pane_output_available",
-        bmux_client::ServerEvent::PaneOutput { .. } => "pane_output",
-        bmux_client::ServerEvent::PaneImageAvailable { .. } => "pane_image_available",
-        bmux_client::ServerEvent::PaneExited { .. } => "pane_exited",
-        bmux_client::ServerEvent::PaneRestarted { .. } => "pane_restarted",
         bmux_client::ServerEvent::RecordingStarted { .. } => "recording_started",
         bmux_client::ServerEvent::RecordingStopped { .. } => "recording_stopped",
         bmux_client::ServerEvent::PluginBusEvent { kind, payload } => {
@@ -2647,6 +2657,28 @@ fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
             | bmux_clients_plugin_api::clients_events::ClientEvent::FollowChanged { .. } => {
                 "plugin_bus_event"
             }
+        });
+    }
+    if kind == bmux_pane_runtime_plugin_api::pane_runtime_events::EVENT_KIND.as_str() {
+        return serde_json::from_slice::<
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent,
+        >(payload)
+        .map_or("plugin_bus_event", |event| match event {
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::Exited { .. } => {
+                "pane_exited"
+            }
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::Restarted { .. } => {
+                "pane_restarted"
+            }
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::OutputAvailable {
+                ..
+            } => "pane_output_available",
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::ImageAvailable {
+                ..
+            } => "pane_image_available",
+            bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::AttachViewChanged {
+                ..
+            } => "attach_view_changed",
         });
     }
     "plugin_bus_event"

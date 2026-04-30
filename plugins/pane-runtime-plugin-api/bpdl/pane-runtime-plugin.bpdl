@@ -390,12 +390,24 @@ interface attach-runtime-state {
 }
 
 interface pane-runtime-events {
+    enum attach-view-component {
+        scene,
+        surface-content,
+        layout,
+        status,
+    }
+
     variant pane-event {
         exited { session_id: uuid, pane_id: uuid, reason: string? },
         restarted { session_id: uuid, pane_id: uuid },
         output-available { session_id: uuid, pane_id: uuid },
         image-available { session_id: uuid, pane_id: uuid },
-        attach-view-changed { session_id: uuid, revision: u64 },
+        attach-view-changed {
+            context_id: uuid?,
+            session_id: uuid,
+            revision: u64,
+            components: list<attach-view-component>,
+        },
     }
 
     events pane-event;

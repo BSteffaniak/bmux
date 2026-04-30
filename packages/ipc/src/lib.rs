@@ -7,7 +7,6 @@
 
 //! Cross-platform IPC protocol models for bmux.
 
-use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_snapshot_protocol::SnapshotStatusReport;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
@@ -566,56 +565,6 @@ pub enum Event {
     ClientDetached {
         id: Uuid,
     },
-    AttachViewChanged {
-        #[serde(default)]
-        context_id: Option<Uuid>,
-        session_id: Uuid,
-        revision: u64,
-        components: Vec<AttachViewComponent>,
-    },
-    /// Notification that new pane output is available for reading.
-    /// Emitted by the server when PTY output arrives; streaming clients use
-    /// this to fetch output on demand instead of polling.
-    PaneOutputAvailable {
-        session_id: Uuid,
-        pane_id: Uuid,
-    },
-    /// Inline pane output pushed by the server.  Carries full stream
-    /// continuity metadata so clients can treat it identically to
-    /// `AttachPaneOutputBatch` chunks.
-    PaneOutput {
-        session_id: Uuid,
-        pane_id: Uuid,
-        #[serde(with = "bmux_codec::serde_bytes_vec")]
-        data: Vec<u8>,
-        /// Inclusive start offset (in pane output stream bytes) for `data`.
-        stream_start: u64,
-        /// Exclusive end offset (in pane output stream bytes) for `data`.
-        stream_end: u64,
-        /// True when bytes were dropped before `stream_start` for this client
-        /// (cursor fell behind ring-buffer retention and was clamped).
-        stream_gap: bool,
-        /// True when the inner application is inside a DEC mode 2026
-        /// synchronized update.
-        sync_update_active: bool,
-    },
-    /// Notification that pane image state has changed (new images placed,
-    /// images removed, or positions shifted).  Streaming clients use this
-    /// to fetch image deltas on demand instead of polling every frame.
-    PaneImageAvailable {
-        session_id: Uuid,
-        pane_id: Uuid,
-    },
-    PaneExited {
-        session_id: Uuid,
-        pane_id: Uuid,
-        #[serde(default)]
-        reason: Option<String>,
-    },
-    PaneRestarted {
-        session_id: Uuid,
-        pane_id: Uuid,
-    },
     /// A server-side recording has started.  Attached clients use this to
     /// begin writing their own display tracks into the recording directory.
     RecordingStarted {
@@ -701,19 +650,6 @@ mod tests {
     #[test]
     fn serializes_event_roundtrip() {
         let event = Event::ServerStarted;
-        let bytes = encode(&event).expect("event should encode");
-        let decoded: Event = decode(&bytes).expect("event should decode");
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn serializes_attach_view_changed_roundtrip() {
-        let event = Event::AttachViewChanged {
-            context_id: None,
-            session_id: Uuid::new_v4(),
-            revision: 7,
-            components: vec![AttachViewComponent::Layout, AttachViewComponent::Status],
-        };
         let bytes = encode(&event).expect("event should encode");
         let decoded: Event = decode(&bytes).expect("event should decode");
         assert_eq!(decoded, event);
@@ -1037,51 +973,12 @@ mod tests {
     #[test]
     fn event_all_variants_roundtrip() {
         let id = Uuid::from_u128(1);
-        let id2 = Uuid::from_u128(2);
 
         let variants: Vec<Event> = vec![
             Event::ServerStarted,
             Event::ServerStopping,
             Event::ClientAttached { id },
             Event::ClientDetached { id },
-            Event::AttachViewChanged {
-                context_id: Some(id),
-                session_id: id2,
-                revision: 42,
-                components: vec![
-                    AttachViewComponent::Scene,
-                    AttachViewComponent::SurfaceContent,
-                    AttachViewComponent::Layout,
-                    AttachViewComponent::Status,
-                ],
-            },
-            Event::PaneOutputAvailable {
-                session_id: id,
-                pane_id: id2,
-            },
-            Event::PaneOutput {
-                session_id: id,
-                pane_id: id2,
-                data: vec![27, 91, 51, 49, 109], // ESC[31m
-                stream_start: 128,
-                stream_end: 133,
-                stream_gap: false,
-                sync_update_active: false,
-            },
-            Event::PaneExited {
-                session_id: id,
-                pane_id: id2,
-                reason: Some("process exited with status 130".to_string()),
-            },
-            Event::PaneExited {
-                session_id: id,
-                pane_id: id2,
-                reason: None,
-            },
-            Event::PaneRestarted {
-                session_id: id,
-                pane_id: id2,
-            },
         ];
 
         for (i, variant) in variants.iter().enumerate() {

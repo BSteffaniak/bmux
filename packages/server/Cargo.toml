@@ -14,7 +14,6 @@ version     = { workspace = true }
 # Internal bmux packages
 bmux_attach_image_protocol = { workspace = true }
 bmux_attach_token_state    = { workspace = true }
-bmux_attach_view_protocol  = { workspace = true }
 bmux_client_state          = { workspace = true }
 bmux_config                = { workspace = true }
 bmux_context_state         = { workspace = true }

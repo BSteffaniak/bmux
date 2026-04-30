@@ -12,6 +12,7 @@ use bmux_attach_layout_protocol::{
 use bmux_pane_runtime_plugin_api::pane_runtime_commands::{
     PaneAck, PaneCommandError, SessionAck, SessionRuntimeCommandError,
 };
+use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, AttachViewComponent, PaneEvent};
 use bmux_pane_runtime_state::PaneResizeDirection;
 use bmux_session_models::SessionId;
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
@@ -241,6 +242,10 @@ fn publish_session_removed_event(session_id: SessionId) {
     );
 }
 
+fn publish_pane_event(event: PaneEvent) {
+    let _ = bmux_plugin::global_event_bus().emit(&pane_runtime_events::EVENT_KIND, event);
+}
+
 /// Bump a session's attach-view revision and publish the scene
 /// component update. Mirrors the server's
 /// `emit_attach_view_changed_for_layout` helper so plugin-side
@@ -256,11 +261,11 @@ fn emit_attach_view_changed_scene(session_id: SessionId) {
     let Some(revision) = handle.0.bump_attach_view_revision(session_id) else {
         return;
     };
-    publish_wire_event(bmux_ipc::Event::AttachViewChanged {
+    publish_pane_event(PaneEvent::AttachViewChanged {
         context_id: None,
         session_id: session_id.0,
         revision,
-        components: vec![bmux_attach_view_protocol::AttachViewComponent::Scene],
+        components: vec![AttachViewComponent::Scene],
     });
     super::publish_focus_state_snapshot();
 }
@@ -449,7 +454,7 @@ pub fn restart_pane(
         .0
         .restart_pane(session_id, target_selector(req.target))
         .map_err(|e| failed_command(e.to_string()))?;
-    publish_wire_event(bmux_ipc::Event::PaneRestarted {
+    publish_pane_event(PaneEvent::Restarted {
         session_id: session_id.0,
         pane_id,
     });

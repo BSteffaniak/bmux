@@ -25,6 +25,7 @@ use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, S
 use bmux_context_state::ContextSelector;
 use bmux_ipc::{CAPABILITY_ATTACH_PANE_SNAPSHOT, InvokeServiceKind};
 use bmux_keybind::{action_to_config_name, parse_action};
+use bmux_pane_runtime_plugin_api::pane_runtime_events as pane_events;
 use bmux_permissions_plugin_api::session_policy_state;
 use bmux_plugin_sdk::{
     HostScope, PluginCommandOutcome, ServiceKind, ServiceRequest,
@@ -2811,46 +2812,7 @@ async fn handle_attach_stream_server_event(
 ) -> Result<AttachServerEventHandling> {
     let mut image_fetch_requested = false;
 
-    if matches!(
-        server_event,
-        bmux_client::ServerEvent::PaneOutputAvailable { .. }
-    ) {
-        *pane_output_pending = true;
-    } else if let bmux_client::ServerEvent::PaneOutput {
-        pane_id,
-        ref data,
-        stream_start,
-        stream_end,
-        stream_gap,
-        sync_update_active,
-        ..
-    } = server_event
-    {
-        let mut render = false;
-        match apply_attach_output_chunk(
-            view_state,
-            pane_id,
-            data,
-            AttachOutputChunkMeta {
-                stream_start,
-                stream_end,
-                stream_gap,
-                sync_update_active,
-            },
-            &mut render,
-        ) {
-            AttachChunkApplyOutcome::Applied { .. } | AttachChunkApplyOutcome::Stale => {}
-            AttachChunkApplyOutcome::Desync => {
-                recover_attach_output_desync_for_pane(client, view_state, pane_id).await?;
-                *pane_output_pending = false;
-            }
-        }
-    } else if matches!(
-        server_event,
-        bmux_client::ServerEvent::PaneImageAvailable { .. }
-    ) {
-        image_fetch_requested = true;
-    } else if let bmux_client::ServerEvent::RecordingStarted {
+    if let bmux_client::ServerEvent::RecordingStarted {
         recording_id,
         ref path,
     } = server_event
@@ -2880,6 +2842,21 @@ async fn handle_attach_stream_server_event(
                         kind = %kind,
                         error = %error,
                         "decoding forwarded performance event payload",
+                    );
+                }
+            }
+        } else if kind.as_str() == pane_events::EVENT_KIND.as_str() {
+            match serde_json::from_slice::<pane_events::PaneEvent>(payload) {
+                Ok(event) => {
+                    let outcome =
+                        handle_pane_runtime_plugin_event(event, view_state, pane_output_pending);
+                    image_fetch_requested |= outcome.image_fetch_requested;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded pane-runtime event payload",
                     );
                 }
             }
@@ -3035,10 +3012,6 @@ async fn handle_attach_stream_server_event(
             }
         }
     } else {
-        if let bmux_client::ServerEvent::AttachViewChanged { .. } = &server_event {
-            *pane_output_pending = true;
-        }
-
         let control = handle_attach_loop_event(
             AttachLoopEvent::Server(server_event),
             client,
@@ -3062,6 +3035,83 @@ async fn handle_attach_stream_server_event(
         control: AttachLoopControl::Continue,
         image_fetch_requested,
     })
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PaneRuntimePluginEventOutcome {
+    image_fetch_requested: bool,
+}
+
+fn handle_pane_runtime_plugin_event(
+    event: pane_events::PaneEvent,
+    view_state: &mut AttachViewState,
+    pane_output_pending: &mut bool,
+) -> PaneRuntimePluginEventOutcome {
+    match event {
+        pane_events::PaneEvent::OutputAvailable { .. } => {
+            *pane_output_pending = true;
+            PaneRuntimePluginEventOutcome::default()
+        }
+        pane_events::PaneEvent::ImageAvailable { .. } => PaneRuntimePluginEventOutcome {
+            image_fetch_requested: true,
+        },
+        pane_events::PaneEvent::AttachViewChanged {
+            context_id,
+            session_id,
+            components,
+            ..
+        } if attach_view_event_matches_target(view_state, context_id, session_id) => {
+            let components = components
+                .iter()
+                .copied()
+                .map(plugin_attach_view_component)
+                .collect::<Vec<_>>();
+            apply_attach_view_change_components(&components, view_state);
+            *pane_output_pending = true;
+            PaneRuntimePluginEventOutcome::default()
+        }
+        pane_events::PaneEvent::Exited {
+            session_id,
+            pane_id,
+            reason,
+        } if session_id == view_state.attached_id => {
+            let message = reason.map_or_else(
+                || format!("pane {} exited", short_uuid(pane_id)),
+                |reason| format!("pane {} exited: {reason}", short_uuid(pane_id)),
+            );
+            view_state.set_transient_status(message, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
+            view_state
+                .dirty
+                .mark_status_dirty(AttachDirtySource::PaneLifecycle);
+            PaneRuntimePluginEventOutcome::default()
+        }
+        pane_events::PaneEvent::Restarted {
+            session_id,
+            pane_id,
+        } if session_id == view_state.attached_id => {
+            view_state.set_transient_status(
+                format!("pane {} restarted", short_uuid(pane_id)),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            view_state
+                .dirty
+                .mark_status_dirty(AttachDirtySource::PaneLifecycle);
+            PaneRuntimePluginEventOutcome::default()
+        }
+        _ => PaneRuntimePluginEventOutcome::default(),
+    }
+}
+
+const fn plugin_attach_view_component(
+    component: pane_events::AttachViewComponent,
+) -> AttachViewComponent {
+    match component {
+        pane_events::AttachViewComponent::Scene => AttachViewComponent::Scene,
+        pane_events::AttachViewComponent::SurfaceContent => AttachViewComponent::SurfaceContent,
+        pane_events::AttachViewComponent::Layout => AttachViewComponent::Layout,
+        pane_events::AttachViewComponent::Status => AttachViewComponent::Status,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6597,23 +6647,16 @@ pub async fn handle_attach_loop_event(
     event: AttachLoopEvent,
     client: &mut StreamingBmuxClient,
     attach_input_processor: &mut InputProcessor,
-    follow_target_id: Option<Uuid>,
-    self_client_id: Option<Uuid>,
-    global: bool,
+    _follow_target_id: Option<Uuid>,
+    _self_client_id: Option<Uuid>,
+    _global: bool,
     help_lines: &[String],
     view_state: &mut AttachViewState,
     display_capture: &mut DisplayCaptureFanout,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
     match event {
-        AttachLoopEvent::Server(server_event) => Ok(handle_attach_server_event(
-            client,
-            server_event,
-            follow_target_id,
-            self_client_id,
-            global,
-            view_state,
-        )),
+        AttachLoopEvent::Server(_server_event) => Ok(AttachLoopControl::Continue),
         AttachLoopEvent::Terminal(terminal_event) => {
             handle_attach_terminal_event(
                 client,
@@ -6636,57 +6679,6 @@ pub async fn handle_attach_loop_event(
             .await
         }
     }
-}
-
-#[allow(clippy::too_many_lines)]
-pub fn handle_attach_server_event(
-    _client: &mut StreamingBmuxClient,
-    server_event: bmux_client::ServerEvent,
-    _follow_target_id: Option<Uuid>,
-    _self_client_id: Option<Uuid>,
-    _global: bool,
-    view_state: &mut AttachViewState,
-) -> AttachLoopControl {
-    match server_event {
-        bmux_client::ServerEvent::AttachViewChanged {
-            context_id,
-            session_id,
-            components,
-            ..
-        } if attach_view_event_matches_target(view_state, context_id, session_id) => {
-            apply_attach_view_change_components(&components, view_state);
-        }
-        bmux_client::ServerEvent::PaneExited {
-            session_id,
-            pane_id,
-            reason,
-        } if session_id == view_state.attached_id => {
-            let message = reason.map_or_else(
-                || format!("pane {} exited", short_uuid(pane_id)),
-                |reason| format!("pane {} exited: {reason}", short_uuid(pane_id)),
-            );
-            view_state.set_transient_status(message, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
-            view_state
-                .dirty
-                .mark_status_dirty(AttachDirtySource::PaneLifecycle);
-        }
-        bmux_client::ServerEvent::PaneRestarted {
-            session_id,
-            pane_id,
-        } if session_id == view_state.attached_id => {
-            view_state.set_transient_status(
-                format!("pane {} restarted", short_uuid(pane_id)),
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-            view_state
-                .dirty
-                .mark_status_dirty(AttachDirtySource::PaneLifecycle);
-        }
-        _ => {}
-    }
-
-    AttachLoopControl::Continue
 }
 
 async fn handle_attached_session_removed(

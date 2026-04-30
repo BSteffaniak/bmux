@@ -7,7 +7,6 @@
 use anyhow::{Context, Result};
 use bmux_attach_image_protocol::CompressionId;
 use bmux_attach_token_state::AttachGrant;
-use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client_state::FollowStateHandle;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_context_state::{ContextSelector, ContextStateHandle};
@@ -47,16 +46,6 @@ use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle, RollingRecordingSe
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 
-/// Headroom reserved for envelope framing, layout metadata, pane summaries, and
-/// scene data so that the combined output chunks + metadata never exceed the IPC
-/// frame limit.  64 KiB is generous for any realistic layout.
-const RESPONSE_METADATA_HEADROOM: usize = 65_536;
-/// Maximum total bytes of pane output data the server will pack into a single
-/// response (snapshot or output-batch).  Computed as `MAX_FRAME_PAYLOAD_SIZE`
-/// minus generous metadata headroom, ensuring the serialized response always
-/// fits within the frame limit regardless of what the client requests.
-const RESPONSE_OUTPUT_BUDGET: usize =
-    bmux_ipc::frame::MAX_FRAME_PAYLOAD_SIZE - RESPONSE_METADATA_HEADROOM;
 const EVENT_PUSH_CHANNEL_CAPACITY: usize = 256;
 
 /// Main server implementation.
@@ -722,27 +711,6 @@ fn shutdown_runtime_info(info: bmux_pane_runtime_state::RemovedRuntimeInfo) {
     session_runtime_handle().0.shutdown_removed_runtime(info);
 }
 
-fn pane_output_event_from_push_read(
-    session_id: Uuid,
-    pane_id: Uuid,
-    read: bmux_pane_runtime_state::OutputRead,
-    sync_update_active: bool,
-) -> Option<Event> {
-    if read.bytes.is_empty() && !read.stream_gap {
-        return None;
-    }
-
-    Some(Event::PaneOutput {
-        session_id,
-        pane_id,
-        data: read.bytes,
-        stream_start: read.stream_start,
-        stream_end: read.stream_end,
-        stream_gap: read.stream_gap,
-        sync_update_active,
-    })
-}
-
 /// Look up the snapshot orchestrator handle from the plugin state
 /// registry. Returns the noop orchestrator when the snapshot plugin
 /// isn't loaded or its handle isn't registered yet.
@@ -773,11 +741,6 @@ fn snapshot_dirty_flag() -> std::sync::Arc<bmux_snapshot_runtime::SnapshotDirtyF
 // accesses the shared handle through `ServerState::context_state`,
 // which is an `Arc<RwLock<ContextState>>` obtained from the plugin
 // state registry.
-
-fn current_context_id_for_session(state: &Arc<ServerState>, session_id: SessionId) -> Option<Uuid> {
-    let _ = state;
-    context_handle().0.context_for_session(session_id)
-}
 
 fn current_context_session_for_client(
     state: &Arc<ServerState>,
@@ -1720,11 +1683,6 @@ async fn handle_connection(
         // It receives events from the broadcast channel and forwards them
         // as serialized frames through the writer channel.
         //
-        // For `PaneOutputAvailable` events, the task asks the pane-runtime
-        // handle to drain the client's cursor and sends the data inline as a
-        // `PaneOutput` event. This eliminates the
-        // round-trip `AttachPaneOutputBatch` request the client would
-        // otherwise need, reducing output latency to a single one-way push.
         if is_enable_push && event_push_task.is_none() {
             replay_retained_plugin_state_to_client(
                 &state,
@@ -1763,36 +1721,6 @@ async fn handle_connection(
 
                     match event_rx.recv().await {
                         Ok(event) => {
-                            // For pane output notifications, read the actual
-                            // data from the buffer and send it inline.
-                            let event = match event {
-                                Event::PaneOutputAvailable {
-                                    session_id,
-                                    pane_id,
-                                } => {
-                                    let Some((read, sync_update_active)) =
-                                        session_runtime_handle().0.read_pane_output_for_push(
-                                            SessionId(session_id),
-                                            pane_id,
-                                            push_client_id,
-                                            RESPONSE_OUTPUT_BUDGET,
-                                        )
-                                    else {
-                                        continue;
-                                    };
-                                    let Some(pane_output_event) = pane_output_event_from_push_read(
-                                        session_id,
-                                        pane_id,
-                                        read,
-                                        sync_update_active,
-                                    ) else {
-                                        continue;
-                                    };
-                                    pane_output_event
-                                }
-                                other => other,
-                            };
-
                             let Some(frame) =
                                 encode_event_frame(&event, push_frame_codec.as_deref())
                             else {
@@ -1951,12 +1879,6 @@ async fn handle_connection(
 fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
     let session_id = match &event {
         Event::ClientAttached { id } | Event::ClientDetached { id } => Some(*id),
-        Event::AttachViewChanged { session_id, .. }
-        | Event::PaneOutputAvailable { session_id, .. }
-        | Event::PaneOutput { session_id, .. }
-        | Event::PaneImageAvailable { session_id, .. }
-        | Event::PaneExited { session_id, .. }
-        | Event::PaneRestarted { session_id, .. } => Some(*session_id),
         Event::ServerStarted
         | Event::ServerStopping
         | Event::RecordingStarted { .. }
@@ -2052,37 +1974,13 @@ fn lag_recovery_attach_view_events_for_client(
     state: &Arc<ServerState>,
     client_id: ClientId,
 ) -> Vec<Event> {
-    let _ = state;
-    let revisions = session_runtime_handle()
-        .0
-        .lag_recovery_bump_attach_view_for_client(client_id);
-
-    if revisions.is_empty() {
-        return Vec::new();
-    }
-
-    let mut events: Vec<Event> = revisions
-        .into_iter()
-        .map(|(session_id, revision)| Event::AttachViewChanged {
-            context_id: current_context_id_for_session(state, session_id),
-            session_id: session_id.0,
-            revision,
-            components: vec![
-                AttachViewComponent::Scene,
-                AttachViewComponent::SurfaceContent,
-                AttachViewComponent::Layout,
-                AttachViewComponent::Status,
-            ],
-        })
-        .collect();
+    let _ = (state, client_id);
 
     // Force attach clients to poll the plugin-owned catalog after a
     // dropped event window. The revision is intentionally neutral here:
     // clients treat `full_resync` as authoritative and fetch the typed
     // snapshot from the control-catalog plugin.
-    events.push(control_catalog_full_resync_event());
-
-    events
+    vec![control_catalog_full_resync_event()]
 }
 
 fn control_catalog_full_resync_event() -> Event {

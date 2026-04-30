@@ -1582,17 +1582,29 @@ pub(super) async fn plugin_event_bridge_loop(
                     return Ok(()); // server disconnected
                 };
                 // Skip high-frequency pane output notifications for plugins.
-                if matches!(
-                    event,
-                    bmux_client::ServerEvent::PaneOutputAvailable { .. }
-                        | bmux_client::ServerEvent::PaneOutput { .. }
-                ) {
+                if is_pane_output_plugin_event(&event) {
                     continue;
                 }
                 dispatch_loaded_plugin_event(loaded_plugins, &plugin_event_from_server_event(&event)?)?;
             }
         }
     }
+}
+
+fn is_pane_output_plugin_event(event: &bmux_client::ServerEvent) -> bool {
+    let bmux_client::ServerEvent::PluginBusEvent { kind, payload } = event else {
+        return false;
+    };
+    if kind != bmux_pane_runtime_plugin_api::pane_runtime_events::EVENT_KIND.as_str() {
+        return false;
+    }
+    serde_json::from_slice::<bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent>(payload)
+        .is_ok_and(|event| {
+            matches!(
+                event,
+                bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent::OutputAvailable { .. }
+            )
+        })
 }
 
 pub(super) fn plugin_event_from_server_event(
