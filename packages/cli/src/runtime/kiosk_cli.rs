@@ -4,6 +4,7 @@ use super::{
     reconnect_backoff_ms, run_session_attach_with_client,
 };
 use crate::connection::ConnectionPolicyScope;
+use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths, KioskProfileConfig, KioskRole, KioskSandboxMode};
 use sha2::{Digest, Sha256};

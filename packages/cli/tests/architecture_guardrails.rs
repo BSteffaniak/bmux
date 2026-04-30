@@ -1177,10 +1177,8 @@ fn recording_ipc_variants_are_absent() {
 }
 
 /// Verify `bmux_client` stays close to protocol primitives. Most plugin
-/// API dependencies are forbidden here; the pane-runtime API dependency
-/// is tracked as transitional architecture debt in
-/// `.architecture-followups.md` until attach/session helpers are moved
-/// out of `packages/client`.
+/// API dependencies are forbidden here; typed-domain workflows belong in
+/// generated clients or consuming-crate private helpers.
 #[test]
 fn bmux_client_is_pure_protocol() {
     let cargo_toml = include_str!("../../client/Cargo.toml");
@@ -1193,6 +1191,7 @@ fn bmux_client_is_pure_protocol() {
         "bmux_control_catalog_plugin_api",
         "bmux_windows_plugin_api",
         "bmux_decoration_plugin_api",
+        "bmux_pane_runtime_plugin_api",
     ];
     for pattern in denied_patterns {
         assert!(

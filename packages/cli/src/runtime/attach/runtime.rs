@@ -70,6 +70,7 @@ use super::state::{
     AttachMouseSelectionDrag, AttachScrollbackCursor, AttachScrollbackPosition, AttachUiMode,
     AttachViewState, PaneRect, PaneRenderBuffer,
 };
+use crate::pane_runtime_client::{BmuxPaneRuntimeClientExt, StreamingAttachInputExt};
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
@@ -7148,7 +7149,7 @@ pub async fn maybe_forward_attach_mouse_event(
         return Ok(false);
     };
 
-    let () = client.attach_input(view_state.attached_id, bytes).await?;
+    let _bytes = client.attach_input(view_state.attached_id, bytes).await?;
     Ok(true)
 }
 

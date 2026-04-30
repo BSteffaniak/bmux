@@ -7,6 +7,7 @@
 //! This package provides the command-line interface functionality for bmux.
 
 mod connection;
+mod pane_runtime_client;
 mod runtime;
 pub(crate) mod sandbox_meta;
 mod ssh_access;

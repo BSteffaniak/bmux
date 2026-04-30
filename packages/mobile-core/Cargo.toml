@@ -15,12 +15,15 @@ bmux_attach_pipeline = { workspace = true }
 bmux_client = { workspace = true }
 bmux_codec = { workspace = true }
 bmux_ipc = { workspace = true, features = ["compression-zstd"] }
+bmux_pane_runtime_plugin_api = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
 bmux_sessions_plugin_api = { workspace = true }
 bmux_windows_plugin_api = { workspace = true }
 iroh = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 ssh2 = { workspace = true, features = ["vendored-openssl"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [

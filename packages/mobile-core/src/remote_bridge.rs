@@ -1,5 +1,6 @@
 use crate::connection::{TerminalMouseButton, TerminalMouseEvent, TerminalMouseEventKind};
 use crate::error::{MobileCoreError, Result};
+use crate::pane_runtime_client::PaneRuntimeClientExt;
 use crate::target::{TargetRecord, TargetTransport};
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::render::visible_scene_pane_ids;
@@ -1270,6 +1271,7 @@ async fn handle_session_command(
             let result = client
                 .attach_input(session_id, bytes)
                 .await
+                .map(|_bytes| ())
                 .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()));
             if let Err(error) = &result {
                 set_session_terminated_reason(actor_state, error.to_string());
@@ -1400,6 +1402,7 @@ async fn handle_session_mouse_event(
     client
         .attach_input(session_id, bytes)
         .await
+        .map(|_bytes| ())
         .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))
 }
 

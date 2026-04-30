@@ -1125,6 +1125,7 @@ dependencies = [
  "unicode-width",
  "uuid",
  "vt100",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1145,18 +1146,15 @@ dependencies = [
  "bmux_codec",
  "bmux_config",
  "bmux_ipc",
- "bmux_pane_runtime_plugin_api",
  "bmux_perf_telemetry",
  "bmux_plugin_sdk",
  "bmux_server",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1520,12 +1518,15 @@ dependencies = [
  "bmux_client",
  "bmux_codec",
  "bmux_ipc",
+ "bmux_pane_runtime_plugin_api",
+ "bmux_plugin_sdk",
  "bmux_sessions_plugin_api",
  "bmux_windows_plugin_api",
  "iroh",
  "rustls",
  "rustls-native-certs",
  "serde",
+ "serde_json",
  "ssh2",
  "thiserror 2.0.18",
  "tokio",

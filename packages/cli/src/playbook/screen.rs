@@ -15,6 +15,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::types::PaneCapture;
+use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
 
 /// Maximum bytes to request per pane in a snapshot.
 const SNAPSHOT_MAX_BYTES_PER_PANE: usize = 256 * 1024;

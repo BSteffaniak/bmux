@@ -31,6 +31,8 @@ use crossterm::{execute, queue};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
+
 use super::RunOptions;
 use super::parse_dsl::parse_action_line;
 use super::sandbox::SandboxServer;

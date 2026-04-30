@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
 use crate::sandbox_meta::{
     SandboxManifest, SandboxManifestPaths, clear_lock as clear_sandbox_lock,
     read_manifest as read_sandbox_manifest, sandbox_id_from_root as sandbox_id_from_root_meta,

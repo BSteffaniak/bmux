@@ -6,6 +6,7 @@
 
 pub mod connection;
 pub mod error;
+mod pane_runtime_client;
 pub mod remote_bridge;
 pub mod ssh;
 pub mod target;
