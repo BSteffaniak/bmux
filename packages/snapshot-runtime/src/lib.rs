@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bmux_plugin_sdk::StatefulPluginHandle;
+pub use bmux_snapshot_protocol::SnapshotStatusReport;
 
 // ── Stateful-plugin registry ─────────────────────────────────────────
 
@@ -293,24 +294,6 @@ pub struct DryRunReport {
     pub ok: bool,
     /// Human-readable summary (section count, participant ids, etc.).
     pub message: String,
-}
-
-/// Status report produced by [`SnapshotOrchestrator::status`]. Maps to
-/// the wire `bmux_ipc::ServerSnapshotStatus` shape on the server side.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SnapshotStatusReport {
-    /// Whether a snapshot path is configured (vs disabled).
-    pub enabled: bool,
-    /// Path to the snapshot file when enabled.
-    pub path: Option<String>,
-    /// Whether the snapshot file currently exists on disk.
-    pub snapshot_exists: bool,
-    /// Epoch-ms timestamp of the last successful write.
-    pub last_write_epoch_ms: Option<u64>,
-    /// Epoch-ms timestamp of the last successful restore.
-    pub last_restore_epoch_ms: Option<u64>,
-    /// Last restore or write error, cleared on next success.
-    pub last_restore_error: Option<String>,
 }
 
 /// The snapshot orchestrator — implemented by the `bmux.snapshot`

@@ -13,6 +13,7 @@ pub use bmux_performance_state::{
     PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE, PerformanceRecordingLevel,
     PerformanceRuntimeSettings,
 };
+pub use bmux_snapshot_protocol::SnapshotStatusReport as ServerSnapshotStatus;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -401,17 +402,6 @@ pub enum ServicePipelinePayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         field_order: Option<Vec<String>>,
     },
-}
-
-/// Snapshot persistence status returned by server-status.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerSnapshotStatus {
-    pub enabled: bool,
-    pub path: Option<String>,
-    pub snapshot_exists: bool,
-    pub last_write_epoch_ms: Option<u64>,
-    pub last_restore_epoch_ms: Option<u64>,
-    pub last_restore_error: Option<String>,
 }
 
 /// Recording summary returned by recording APIs.

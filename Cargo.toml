@@ -40,6 +40,7 @@ members = [
     "packages/server",
     "packages/session-state",
     "packages/session/models",
+    "packages/snapshot-protocol",
     "packages/snapshot-runtime",
     "packages/sandbox-harness",
     "packages/scene-protocol",
@@ -168,6 +169,7 @@ bmux_server                 = { version = "0.0.1-alpha.0", default-features = fa
 bmux_session_models         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
 bmux_session_state          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-state" }
 bmux_slots                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/slots" }
+bmux_snapshot_protocol      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/snapshot-protocol" }
 bmux_snapshot_runtime       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/snapshot-runtime" }
 bmux_terminal_protocol      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }
 

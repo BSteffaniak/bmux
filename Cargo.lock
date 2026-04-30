@@ -1513,6 +1513,7 @@ dependencies = [
  "bmux_attach_view_protocol",
  "bmux_codec",
  "bmux_performance_state",
+ "bmux_snapshot_protocol",
  "lz4_flex",
  "serde",
  "serde_json",
@@ -2035,10 +2036,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_snapshot_protocol"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bmux_snapshot_runtime"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_plugin_sdk",
+ "bmux_snapshot_protocol",
  "thiserror 2.0.18",
  "tokio",
 ]

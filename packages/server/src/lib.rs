@@ -2222,15 +2222,7 @@ async fn handle_request(
             force_local_permitted: client_principal_id == state.server_control_principal_id,
         }),
         Request::ServerStatus => {
-            let report = snapshot_orchestrator_handle().as_dyn().status();
-            let snapshot = ServerSnapshotStatus {
-                enabled: report.enabled,
-                path: report.path,
-                snapshot_exists: report.snapshot_exists,
-                last_write_epoch_ms: report.last_write_epoch_ms,
-                last_restore_epoch_ms: report.last_restore_epoch_ms,
-                last_restore_error: report.last_restore_error,
-            };
+            let snapshot: ServerSnapshotStatus = snapshot_orchestrator_handle().as_dyn().status();
             Response::Ok(ResponsePayload::ServerStatus {
                 running: true,
                 snapshot,

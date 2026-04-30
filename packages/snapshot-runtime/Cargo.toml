@@ -11,8 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_plugin_sdk = { workspace = true }
-thiserror       = { workspace = true }
+bmux_plugin_sdk        = { workspace = true }
+bmux_snapshot_protocol = { workspace = true }
+thiserror              = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

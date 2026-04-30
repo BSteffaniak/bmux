@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral snapshot protocol DTOs for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "snapshot", "protocol"]
+license     = { workspace = true }
+name        = "bmux_snapshot_protocol"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

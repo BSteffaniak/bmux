@@ -1818,6 +1818,7 @@ fn pane_summary_dtos_are_absent_from_ipc() {
         "pub struct AttachPaneImageDelta",
         "pub enum PerformanceRecordingLevel",
         "pub struct PerformanceRuntimeSettings",
+        "pub struct ServerSnapshotStatus",
         "pub enum PaneSelector",
         "pub enum PaneSplitDirection",
         "pub struct PaneLaunchCommand",
