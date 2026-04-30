@@ -2,6 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+pub mod compositor;
 pub mod cursor;
 pub mod mouse;
 pub mod reconcile;
@@ -17,6 +18,7 @@ pub use bmux_attach_pipeline_models::{
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+pub use compositor::{RetainedCompositor, RetainedDamage, RetainedRepaintSurface, RetainedSurface};
 pub use mouse::{
     Button as AttachMouseButton, Event as AttachMouseEvent, EventKind as AttachMouseEventKind,
     Modifiers as AttachMouseModifiers, PaneProtocol as AttachPaneMouseProtocol,
