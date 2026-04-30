@@ -34,10 +34,9 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    HostScope, PluginEventKind, ServiceKind as SdkServiceKind, StatefulPlugin, StatefulPluginError,
-    StatefulPluginHandle, StatefulPluginResult, StatefulPluginSnapshot,
-    TypedServiceRegistrationContext, TypedServiceRegistry, decode_service_message,
-    encode_service_message,
+    HostScope, PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
+    StatefulPluginResult, StatefulPluginSnapshot, TypedServiceRegistrationContext,
+    TypedServiceRegistry,
 };
 use bmux_session_models::{ClientId, SessionId};
 use bmux_snapshot_runtime::StatefulPluginRegistry;
@@ -457,6 +456,12 @@ fn local_state() -> Result<Arc<RwLock<ContextState>>, String> {
         })
 }
 
+const fn dispatch_client<C: ServiceCaller + Sync + ?Sized>(
+    caller: &C,
+) -> bmux_plugin::ServiceCallerDispatchClient<'_, C> {
+    bmux_plugin::ServiceCallerDispatchClient::new(caller)
+}
+
 /// Resolve the caller's `ClientId` from the `NativeServiceContext`.
 /// Falls back to a typed `clients-state::current-client` query when
 /// the context did not carry a client id (e.g. legacy IPC paths that
@@ -544,7 +549,7 @@ fn current_context_local(
     ),
 )]
 fn create_context_local(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<::uuid::Uuid>,
     name: Option<String>,
     attributes: BTreeMap<String, String>,
@@ -673,7 +678,7 @@ fn mutate_state_create(
     ),
 )]
 fn select_context_local(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<::uuid::Uuid>,
     selector: &WireSelector,
 ) -> Result<ContextAck, SelectContextError> {
@@ -755,7 +760,7 @@ fn mutate_state_select(
     ),
 )]
 fn close_context_local(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<::uuid::Uuid>,
     selector: &WireSelector,
     force: bool,
@@ -888,35 +893,19 @@ fn mutate_state_close(
 // ── Cross-plugin helpers: sessions-commands typed dispatch ───────────
 
 fn create_session_via_sessions_plugin(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     name: Option<String>,
 ) -> Result<SessionId, CreateContextError> {
-    #[derive(Serialize)]
-    struct NewSessionArgs {
-        name: Option<String>,
-    }
-    use bmux_sessions_plugin_api::sessions_commands::{self, NewSessionError, SessionAck};
+    use bmux_sessions_plugin_api::sessions_commands::{self, NewSessionError};
 
-    let payload = encode_service_message(&NewSessionArgs { name }).map_err(|err| {
-        CreateContextError::Failed {
-            reason: format!("encode new-session payload: {err}"),
-        }
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(sessions_commands::client::new_session(
+        &mut client,
+        name,
+    ))
+    .map_err(|err| CreateContextError::Failed {
+        reason: format!("sessions-commands:new-session failed: {err}"),
     })?;
-    let resp_bytes = caller
-        .call_service_raw(
-            bmux_sessions_plugin_api::capabilities::SESSIONS_WRITE.as_str(),
-            SdkServiceKind::Command,
-            sessions_commands::INTERFACE_ID.as_str(),
-            "new-session",
-            payload,
-        )
-        .map_err(|err| CreateContextError::Failed {
-            reason: format!("sessions-commands:new-session failed: {err}"),
-        })?;
-    let result: Result<SessionAck, NewSessionError> =
-        decode_service_message(&resp_bytes).map_err(|err| CreateContextError::Failed {
-            reason: format!("decode new-session response: {err}"),
-        })?;
     match result {
         Ok(ack) => Ok(SessionId(ack.id)),
         Err(NewSessionError::InvalidName { reason }) => {
@@ -927,37 +916,22 @@ fn create_session_via_sessions_plugin(
 }
 
 fn kill_session_via_sessions_plugin(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     session_id: SessionId,
 ) -> Result<(), String> {
-    use bmux_sessions_plugin_api::sessions_commands::{self, KillSessionError, SessionAck};
+    use bmux_sessions_plugin_api::sessions_commands::{self, KillSessionError};
     use bmux_sessions_plugin_api::sessions_state::SessionSelector;
 
-    #[derive(Serialize)]
-    struct KillSessionArgs {
-        selector: SessionSelector,
-        force_local: bool,
-    }
-
-    let payload = encode_service_message(&KillSessionArgs {
-        selector: SessionSelector {
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(sessions_commands::client::kill_session(
+        &mut client,
+        SessionSelector {
             id: Some(session_id.0),
             name: None,
         },
-        force_local: false,
-    })
-    .map_err(|err| format!("encode kill-session payload: {err}"))?;
-    let resp_bytes = caller
-        .call_service_raw(
-            bmux_sessions_plugin_api::capabilities::SESSIONS_WRITE.as_str(),
-            SdkServiceKind::Command,
-            sessions_commands::INTERFACE_ID.as_str(),
-            "kill-session",
-            payload,
-        )
-        .map_err(|err| format!("sessions-commands:kill-session failed: {err}"))?;
-    let result: Result<SessionAck, KillSessionError> = decode_service_message(&resp_bytes)
-        .map_err(|err| format!("decode kill-session response: {err}"))?;
+        false,
+    ))
+    .map_err(|err| format!("sessions-commands:kill-session failed: {err}"))?;
     match result {
         Ok(_) | Err(KillSessionError::NotFound) => Ok(()),
         Err(KillSessionError::Failed { reason }) => Err(reason),
@@ -965,35 +939,21 @@ fn kill_session_via_sessions_plugin(
 }
 
 fn select_session_via_sessions_plugin(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     session_id: SessionId,
 ) -> Result<(), String> {
-    use bmux_sessions_plugin_api::sessions_commands::{self, SelectSessionError, SessionAck};
+    use bmux_sessions_plugin_api::sessions_commands::{self, SelectSessionError};
     use bmux_sessions_plugin_api::sessions_state::SessionSelector;
 
-    #[derive(Serialize)]
-    struct SelectSessionArgs {
-        selector: SessionSelector,
-    }
-
-    let payload = encode_service_message(&SelectSessionArgs {
-        selector: SessionSelector {
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(sessions_commands::client::select_session(
+        &mut client,
+        SessionSelector {
             id: Some(session_id.0),
             name: None,
         },
-    })
-    .map_err(|err| format!("encode select-session payload: {err}"))?;
-    let resp_bytes = caller
-        .call_service_raw(
-            bmux_sessions_plugin_api::capabilities::SESSIONS_WRITE.as_str(),
-            SdkServiceKind::Command,
-            sessions_commands::INTERFACE_ID.as_str(),
-            "select-session",
-            payload,
-        )
-        .map_err(|err| format!("sessions-commands:select-session failed: {err}"))?;
-    let result: Result<SessionAck, SelectSessionError> = decode_service_message(&resp_bytes)
-        .map_err(|err| format!("decode select-session response: {err}"))?;
+    ))
+    .map_err(|err| format!("sessions-commands:select-session failed: {err}"))?;
     match result {
         Ok(_) | Err(SelectSessionError::NotFound) => Ok(()),
         Err(SelectSessionError::Denied { reason }) => Err(reason),
@@ -1119,6 +1079,7 @@ bmux_plugin_sdk::export_plugin!(ContextsPlugin, include_str!("../plugin.toml"));
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_plugin_sdk::{ServiceKind as SdkServiceKind, encode_service_message};
     use std::collections::BTreeMap;
 
     #[test]

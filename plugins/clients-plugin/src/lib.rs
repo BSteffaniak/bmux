@@ -22,6 +22,8 @@ use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
 use bmux_clients_plugin_api::clients_state::{
     self, ClientQueryError, ClientSummary, ClientsStateService,
 };
+use bmux_contexts_plugin_api::contexts_commands;
+use bmux_contexts_plugin_api::contexts_state::ContextSelector;
 use bmux_ipc::Event;
 use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
@@ -34,6 +36,7 @@ use bmux_plugin_sdk::{
 };
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::SessionManagerHandle;
+use bmux_sessions_plugin_api::sessions_commands;
 use bmux_snapshot_runtime::StatefulPluginRegistry;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -51,6 +54,12 @@ use uuid::Uuid;
 /// concrete plugin-owned type.
 struct FollowStateAdapter {
     inner: Arc<RwLock<FollowState>>,
+}
+
+const fn dispatch_client<C: ServiceCaller + Sync + ?Sized>(
+    caller: &C,
+) -> bmux_plugin::ServiceCallerDispatchClient<'_, C> {
+    bmux_plugin::ServiceCallerDispatchClient::new(caller)
 }
 
 impl FollowStateAdapter {
@@ -467,7 +476,7 @@ impl RustPlugin for ClientsPlugin {
 
 #[allow(clippy::too_many_lines)]
 fn set_current_session_local(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<Uuid>,
     session_id: Uuid,
 ) -> Result<ClientAck, SetCurrentSessionError> {
@@ -637,7 +646,7 @@ fn current_client_local(caller_client_id: Option<Uuid>) -> Result<ClientSummary,
 
 #[allow(clippy::too_many_lines)]
 fn set_following_via_ipc(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<Uuid>,
     req: &SetFollowingArgs,
 ) -> Result<ClientAck, SetFollowingError> {
@@ -819,61 +828,38 @@ fn set_following_via_ipc(
 }
 
 fn select_context_via_typed_dispatch(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     context_id: Uuid,
 ) -> Result<(), String> {
-    #[derive(serde::Serialize)]
-    struct Selector {
-        id: Option<Uuid>,
-        name: Option<String>,
-    }
-    #[derive(serde::Serialize)]
-    struct Args {
-        selector: Selector,
-    }
-    let _: serde_json::Value = caller
-        .call_service(
-            "bmux.contexts.write",
-            ServiceKind::Command,
-            "contexts-commands",
-            "select-context",
-            &Args {
-                selector: Selector {
-                    id: Some(context_id),
-                    name: None,
-                },
-            },
-        )
-        .map_err(|err| err.to_string())?;
-    Ok(())
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(contexts_commands::client::select_context(
+        &mut client,
+        ContextSelector {
+            id: Some(context_id),
+            name: None,
+        },
+    ))
+    .map_err(|err| err.to_string())?;
+    result.map(|_| ()).map_err(|err| format!("{err:?}"))
 }
 
 fn reconcile_client_membership_via_typed_dispatch(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     client_id: Uuid,
     previous: Option<Uuid>,
     next: Option<Uuid>,
 ) -> Result<(), String> {
-    #[derive(serde::Serialize)]
-    struct Args {
-        client_id: Uuid,
-        previous: Option<Uuid>,
-        next: Option<Uuid>,
-    }
-    let _: serde_json::Value = caller
-        .call_service(
-            "bmux.sessions.write",
-            ServiceKind::Command,
-            "sessions-commands",
-            "reconcile-client-membership",
-            &Args {
-                client_id,
-                previous,
-                next,
-            },
-        )
-        .map_err(|err| err.to_string())?;
-    Ok(())
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        sessions_commands::client::reconcile_client_membership(
+            &mut client,
+            client_id,
+            previous,
+            next,
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    result.map(|_| ()).map_err(|err| format!("{err:?}"))
 }
 
 // ── Typed handles ────────────────────────────────────────────────────
