@@ -1,7 +1,6 @@
 use crate::types::PaneRenderBuffer;
-use bmux_ipc::{
-    AttachLayer, AttachMouseProtocolEncoding, AttachMouseProtocolMode, AttachRect, AttachScene,
-};
+use bmux_attach_layout_protocol::{AttachLayer, AttachRect, AttachScene};
+use bmux_ipc::{AttachMouseProtocolEncoding, AttachMouseProtocolMode};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -337,7 +336,7 @@ pub const fn encode_sgr_cb(kind: EventKind, modifiers: Modifiers) -> Option<(u16
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_ipc::{AttachFocusTarget, AttachSurface, AttachSurfaceKind};
+    use bmux_attach_layout_protocol::{AttachFocusTarget, AttachSurface, AttachSurfaceKind};
 
     fn surface(
         pane_id: Uuid,

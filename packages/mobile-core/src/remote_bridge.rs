@@ -2,6 +2,7 @@ use crate::connection::{TerminalMouseButton, TerminalMouseEvent, TerminalMouseEv
 use crate::error::{MobileCoreError, Result};
 use crate::pane_runtime_client::PaneRuntimeClientExt;
 use crate::target::{TargetRecord, TargetTransport};
+use bmux_attach_layout_protocol::AttachRect;
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::render::visible_scene_pane_ids;
 use bmux_attach_pipeline::{AttachChunkApplyOutcome, AttachScenePipeline, AttachViewport};
@@ -1598,11 +1599,7 @@ impl StreamOutputState {
             .map(|layout_state| layout_state.focused_pane_id)
     }
 
-    fn target_pane_and_rect_at(
-        &self,
-        column: u16,
-        row: u16,
-    ) -> Option<(Uuid, bmux_ipc::AttachRect)> {
+    fn target_pane_and_rect_at(&self, column: u16, row: u16) -> Option<(Uuid, AttachRect)> {
         let layout_state = self.pipeline.layout_state.as_ref()?;
         attach_mouse::pane_and_rect_at(&layout_state.scene, column, row)
     }

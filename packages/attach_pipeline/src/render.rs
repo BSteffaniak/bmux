@@ -7,8 +7,7 @@ use bmux_appearance::{
     RuntimeAppearance, RuntimeContentBlend, RuntimeContentEffect, RuntimeContentEffectBgPredicate,
     RuntimeContentEffectScope,
 };
-use bmux_attach_layout_protocol::PaneSummary;
-use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind};
+use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
 use bmux_plugin::{
     AttachRenderExtension, ExtensionRect, RenderColor, RenderDamage, RenderOp, RenderStyle,
 };
@@ -1060,7 +1059,7 @@ pub struct AttachLayerSurface {
     /// pass `rect` inset by 1 on each side; decoration-free layers pass `rect` unchanged.
     /// The fill helper never infers decoration thickness from `rect` — it just fills
     /// what it is told to fill. This mirrors the scene-level contract on
-    /// [`bmux_ipc::AttachSurface`] where `content_rect` is the authoritative interior.
+    /// [`bmux_attach_layout_protocol::AttachSurface`] where `content_rect` is the authoritative interior.
     pub content_rect: PaneRect,
     pub layer: AttachLayer,
     pub opaque: bool,
@@ -2105,10 +2104,9 @@ mod tests {
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
     };
     use bmux_appearance::{RuntimeAppearance, RuntimeContentBlend, RuntimeContentEffect};
-    use bmux_attach_layout_protocol::{PaneState, PaneSummary};
-    use bmux_ipc::{
+    use bmux_attach_layout_protocol::{
         AttachFocusTarget, AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface,
-        AttachSurfaceKind,
+        AttachSurfaceKind, PaneState, PaneSummary,
     };
     use bmux_plugin::{ExtensionRect, RenderColor, RenderDamage, RenderOp, RenderStyle};
     use crossterm::cursor::MoveTo;

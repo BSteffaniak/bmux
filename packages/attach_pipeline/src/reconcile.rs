@@ -1,8 +1,8 @@
 use crate::render::{DamageCoalescingPolicy, DamageRect, FrameDamage, visible_scene_pane_ids};
 use crate::types::{PaneRect, PaneRenderBuffer};
+use bmux_attach_layout_protocol::{AttachScene, AttachSurface, AttachSurfaceKind};
 use bmux_attach_pipeline_models::{AttachChunkApplyOutcome, AttachOutputChunkMeta};
 use bmux_client::AttachLayoutState;
-use bmux_ipc::{AttachScene, AttachSurface, AttachSurfaceKind};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
@@ -257,7 +257,7 @@ pub fn resize_attach_parsers_for_scene_with_size(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_ipc::{AttachFocusTarget, AttachLayer, AttachRect};
+    use bmux_attach_layout_protocol::{AttachFocusTarget, AttachLayer, AttachRect};
 
     fn pane_surface(
         id: Uuid,

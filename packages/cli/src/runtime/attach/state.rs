@@ -1,5 +1,6 @@
 use crate::input::RuntimeAction;
 use crate::status::AttachStatusLine;
+use bmux_attach_layout_protocol::{AttachScene, AttachSurface};
 use bmux_attach_pipeline::FrameDamage;
 pub use bmux_attach_pipeline::{
     AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -9,7 +10,7 @@ use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use bmux_control_catalog_plugin_api::control_catalog_state::{
     ContextRow, ContextSessionBinding, SessionRow,
 };
-use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState, AttachScene, AttachSurface};
+use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState};
 use bmux_windows_plugin_api::windows_commands::PaneResizeDirection;
 use bmux_windows_plugin_api::windows_list::WindowListSnapshot;
 use crossterm::event::MouseEvent;

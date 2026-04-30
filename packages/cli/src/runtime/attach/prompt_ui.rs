@@ -5,7 +5,9 @@ use crate::runtime::prompt::{
     PromptPolicy, PromptRequest, PromptResponse, PromptValue,
 };
 use anyhow::{Context, Result};
-use bmux_ipc::{AttachLayer as SurfaceLayer, AttachRect, AttachSurface, AttachSurfaceKind};
+use bmux_attach_layout_protocol::{
+    AttachLayer as SurfaceLayer, AttachRect, AttachSurface, AttachSurfaceKind,
+};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,

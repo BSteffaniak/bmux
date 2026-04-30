@@ -3,7 +3,10 @@ use bmux_appearance::{RUNTIME_APPEARANCE_STATE_KIND, RuntimeAppearance};
 use bmux_attach_layout_protocol::attach_layout_protocol::{
     AttachLayoutSnapshot, AttachSurfaceSummary, STATE_KIND as ATTACH_LAYOUT_STATE_KIND,
 };
-use bmux_attach_layout_protocol::{PaneFocusDirection, PaneSplitDirection};
+use bmux_attach_layout_protocol::{
+    AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+    PaneFocusDirection, PaneSplitDirection,
+};
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
     apply_attach_output_chunk_with, attach_scene_damage_between,
@@ -4609,7 +4612,7 @@ pub fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(u
         .map(|surface| {
             // Read the authoritative content_rect from the scene rather than recomputing
             // a border inset from `surface.rect`. See AGENTS.md "core architecture boundary"
-            // and the content_rect contract on `bmux_ipc::AttachSurface`.
+            // and the content_rect contract on `AttachSurface`.
             (
                 usize::from(surface.content_rect.w.max(1)),
                 usize::from(surface.content_rect.h.max(1)),
@@ -5083,7 +5086,7 @@ pub fn handle_help_overlay_key_event(
 }
 
 #[allow(clippy::cast_possible_truncation)] // Terminal dimensions bounded by u16
-pub fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachSurface> {
+pub fn help_overlay_surface(lines: &[String]) -> Option<AttachSurface> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols < 20 || rows < 6 {
         return None;
@@ -5104,18 +5107,18 @@ pub fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachSurface>
     let x = ((cols as usize).saturating_sub(width)) / 2;
     let y = ((rows as usize).saturating_sub(height)) / 2;
 
-    Some(bmux_ipc::AttachSurface {
+    Some(AttachSurface {
         id: HELP_OVERLAY_SURFACE_ID,
-        kind: bmux_ipc::AttachSurfaceKind::Overlay,
-        layer: bmux_ipc::AttachLayer::Overlay,
+        kind: AttachSurfaceKind::Overlay,
+        layer: SurfaceLayer::Overlay,
         z: i32::MAX,
-        rect: bmux_ipc::AttachRect {
+        rect: AttachRect {
             x: x as u16,
             y: y as u16,
             w: width as u16,
             h: height as u16,
         },
-        content_rect: bmux_ipc::AttachRect {
+        content_rect: AttachRect {
             x: x as u16,
             y: y as u16,
             w: width as u16,
@@ -5133,7 +5136,7 @@ pub fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachSurface>
 #[allow(clippy::cast_possible_truncation)] // Terminal dimensions bounded by u16
 pub fn queue_attach_help_overlay(
     stdout: &mut impl Write,
-    surface_meta: &bmux_ipc::AttachSurface,
+    surface_meta: &AttachSurface,
     lines: &[String],
     scroll: usize,
 ) -> Result<()> {
@@ -5226,7 +5229,7 @@ pub fn queue_attach_help_overlay(
     Ok(())
 }
 
-const fn attach_surface_damage_rect(surface: &bmux_ipc::AttachSurface) -> DamageRect {
+const fn attach_surface_damage_rect(surface: &AttachSurface) -> DamageRect {
     DamageRect::new(
         surface.rect.x,
         surface.rect.y,
@@ -5237,8 +5240,8 @@ const fn attach_surface_damage_rect(surface: &bmux_ipc::AttachSurface) -> Damage
 
 fn overlay_rect_damage(
     layout_state: &AttachLayoutState,
-    previous: Option<&bmux_ipc::AttachSurface>,
-    current: Option<&bmux_ipc::AttachSurface>,
+    previous: Option<&AttachSurface>,
+    current: Option<&AttachSurface>,
     policy: DamageCoalescingPolicy,
 ) -> bmux_attach_pipeline::FrameDamage {
     if previous == current {
@@ -6516,8 +6519,8 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
 }
 
 pub fn attach_scene_revealed_pane_ids(
-    previous: &bmux_ipc::AttachScene,
-    next: &bmux_ipc::AttachScene,
+    previous: &AttachScene,
+    next: &AttachScene,
 ) -> BTreeSet<Uuid> {
     bmux_attach_pipeline::reconcile::attach_scene_revealed_pane_ids(previous, next)
 }
@@ -6535,7 +6538,7 @@ pub fn attach_layout_requires_snapshot_hydration(
 
 pub fn resize_attach_parsers_for_scene(
     pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
-    scene: &bmux_ipc::AttachScene,
+    scene: &AttachScene,
 ) {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     resize_attach_parsers_for_scene_with_size(pane_buffers, scene, cols, rows);
@@ -6543,7 +6546,7 @@ pub fn resize_attach_parsers_for_scene(
 
 pub fn resize_attach_parsers_for_scene_with_size(
     pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
-    scene: &bmux_ipc::AttachScene,
+    scene: &AttachScene,
     cols: u16,
     rows: u16,
 ) {
@@ -7857,15 +7860,9 @@ pub fn attach_mouse_forward_bytes_for_target(
 fn attach_scene_pane_content_rect(
     view_state: &AttachViewState,
     pane_id: Uuid,
-) -> Option<bmux_ipc::AttachRect> {
+) -> Option<AttachRect> {
     let layout_state = view_state.cached_layout_state.as_ref()?;
-    let mut best: Option<(
-        bmux_ipc::AttachLayer,
-        i32,
-        usize,
-        uuid::Uuid,
-        bmux_ipc::AttachRect,
-    )> = None;
+    let mut best: Option<(SurfaceLayer, i32, usize, uuid::Uuid, AttachRect)> = None;
     for (index, surface) in layout_state.scene.surfaces.iter().enumerate() {
         if surface.pane_id != Some(pane_id) {
             continue;
@@ -7898,7 +7895,7 @@ fn attach_scene_pane_content_rect(
             && override_rect.w > 0
             && override_rect.h > 0
         {
-            return Some(bmux_ipc::AttachRect {
+            return Some(AttachRect {
                 x: override_rect.x,
                 y: override_rect.y,
                 w: override_rect.w,
@@ -8465,7 +8462,7 @@ pub fn attach_scene_resize_separator_at(
         .filter(|surface| {
             surface.visible
                 && surface.accepts_input
-                && matches!(surface.kind, bmux_ipc::AttachSurfaceKind::Pane)
+                && matches!(surface.kind, AttachSurfaceKind::Pane)
         })
         .filter_map(|surface| surface.pane_id.map(|pane_id| (pane_id, surface.rect)))
         .collect::<Vec<_>>();
@@ -8521,9 +8518,9 @@ pub fn attach_scene_resize_separator_at(
 
 fn vertical_resize_axis_drag(
     left_pane: Uuid,
-    left_rect: bmux_ipc::AttachRect,
+    left_rect: AttachRect,
     right_pane: Uuid,
-    right_rect: bmux_ipc::AttachRect,
+    right_rect: AttachRect,
     column: u16,
     row: u16,
 ) -> Option<AttachMouseResizeAxisDrag> {
@@ -8553,9 +8550,9 @@ fn vertical_resize_axis_drag(
 
 fn horizontal_resize_axis_drag(
     top_pane: Uuid,
-    top_rect: bmux_ipc::AttachRect,
+    top_rect: AttachRect,
     bottom_pane: Uuid,
-    bottom_rect: bmux_ipc::AttachRect,
+    bottom_rect: AttachRect,
     column: u16,
     row: u16,
 ) -> Option<AttachMouseResizeAxisDrag> {
@@ -8589,11 +8586,11 @@ fn ranges_overlap_at(a_start: u16, a_end: u16, b_start: u16, b_end: u16, value: 
     value >= start && value <= end
 }
 
-fn rect_max_x(rect: bmux_ipc::AttachRect) -> Option<u16> {
+fn rect_max_x(rect: AttachRect) -> Option<u16> {
     (rect.w > 0).then(|| rect.x.saturating_add(rect.w.saturating_sub(1)))
 }
 
-fn rect_max_y(rect: bmux_ipc::AttachRect) -> Option<u16> {
+fn rect_max_y(rect: AttachRect) -> Option<u16> {
     (rect.h > 0).then(|| rect.y.saturating_add(rect.h.saturating_sub(1)))
 }
 
@@ -8869,15 +8866,15 @@ mod tests {
         AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRenderBuffer,
     };
 
-    use bmux_attach_layout_protocol::{PaneLayoutNode, PaneState, PaneSummary};
+    use bmux_attach_layout_protocol::{
+        AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+        PaneLayoutNode, PaneState, PaneSummary,
+    };
     use bmux_client::{AttachLayoutState, AttachOpenInfo};
     use bmux_config::{
         BmuxConfig, MouseClickPropagation, MouseSelectionReleaseBehavior, MouseWheelPropagation,
     };
-    use bmux_ipc::{
-        AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        AttachViewComponent,
-    };
+    use bmux_ipc::AttachViewComponent;
 
     use crossterm::event::{
         Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
@@ -8984,7 +8981,7 @@ mod tests {
         AttachSurface {
             id: Uuid::new_v4(),
             kind: AttachSurfaceKind::Pane,
-            layer: bmux_ipc::AttachLayer::Pane,
+            layer: SurfaceLayer::Pane,
             z: 0,
             rect,
             content_rect: rect,
@@ -9024,7 +9021,7 @@ mod tests {
                 surfaces: vec![AttachSurface {
                     id: Uuid::new_v4(),
                     kind: AttachSurfaceKind::Pane,
-                    layer: bmux_ipc::AttachLayer::Pane,
+                    layer: SurfaceLayer::Pane,
                     z: 0,
                     pane_id: Some(pane_id),
                     rect: AttachRect {
@@ -10183,7 +10180,7 @@ mod tests {
                 surfaces: vec![AttachSurface {
                     id: Uuid::new_v4(),
                     kind: AttachSurfaceKind::Pane,
-                    layer: bmux_ipc::AttachLayer::Pane,
+                    layer: SurfaceLayer::Pane,
                     z: 0,
                     pane_id: Some(pane_id),
                     rect,
@@ -10304,7 +10301,7 @@ mod tests {
                 surfaces: vec![AttachSurface {
                     id: Uuid::new_v4(),
                     kind: AttachSurfaceKind::Pane,
-                    layer: bmux_ipc::AttachLayer::Pane,
+                    layer: SurfaceLayer::Pane,
                     z: 0,
                     pane_id: Some(pane_id),
                     rect: outer,
@@ -10455,7 +10452,7 @@ mod tests {
                 surfaces: vec![AttachSurface {
                     id: surface_id,
                     kind: AttachSurfaceKind::Pane,
-                    layer: bmux_ipc::AttachLayer::Pane,
+                    layer: SurfaceLayer::Pane,
                     z: 0,
                     pane_id: Some(pane_id),
                     rect: outer,
@@ -10582,7 +10579,7 @@ mod tests {
                     AttachSurface {
                         id: Uuid::new_v4(),
                         kind: AttachSurfaceKind::Pane,
-                        layer: bmux_ipc::AttachLayer::Pane,
+                        layer: SurfaceLayer::Pane,
                         z: 1,
                         rect: AttachRect {
                             x: 0,
@@ -10606,7 +10603,7 @@ mod tests {
                     AttachSurface {
                         id: Uuid::new_v4(),
                         kind: AttachSurfaceKind::FloatingPane,
-                        layer: bmux_ipc::AttachLayer::FloatingPane,
+                        layer: SurfaceLayer::FloatingPane,
                         z: 10,
                         rect: AttachRect {
                             x: 2,
@@ -11408,7 +11405,7 @@ mod tests {
                 surfaces: vec![AttachSurface {
                     id: Uuid::new_v4(),
                     kind: AttachSurfaceKind::Pane,
-                    layer: bmux_ipc::AttachLayer::Pane,
+                    layer: SurfaceLayer::Pane,
                     z: 0,
                     pane_id: Some(pane_id),
                     rect: AttachRect {
@@ -11646,18 +11643,18 @@ mod tests {
         let view_state = attach_view_state_with_scrollback_fixture();
         let layout_state = view_state.cached_layout_state.expect("layout state");
         let pane_id = layout_state.focused_pane_id;
-        let previous_overlay = bmux_ipc::AttachSurface {
+        let previous_overlay = AttachSurface {
             id: HELP_OVERLAY_SURFACE_ID,
-            kind: bmux_ipc::AttachSurfaceKind::Overlay,
-            layer: bmux_ipc::AttachLayer::Overlay,
+            kind: AttachSurfaceKind::Overlay,
+            layer: SurfaceLayer::Overlay,
             z: i32::MAX,
-            rect: bmux_ipc::AttachRect {
+            rect: AttachRect {
                 x: 0,
                 y: 0,
                 w: 4,
                 h: 3,
             },
-            content_rect: bmux_ipc::AttachRect {
+            content_rect: AttachRect {
                 x: 0,
                 y: 0,
                 w: 4,
@@ -11718,22 +11715,22 @@ mod tests {
     #[test]
     fn resize_attach_parsers_applies_layout_size_before_snapshot_bytes() {
         let pane_id = uuid::Uuid::new_v4();
-        let scene = bmux_ipc::AttachScene {
+        let scene = AttachScene {
             session_id: uuid::Uuid::new_v4(),
-            focus: bmux_ipc::AttachFocusTarget::Pane { pane_id },
-            surfaces: vec![bmux_ipc::AttachSurface {
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
                 id: pane_id,
-                kind: bmux_ipc::AttachSurfaceKind::Pane,
-                layer: bmux_ipc::AttachLayer::Pane,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
                 z: 0,
-                rect: bmux_ipc::AttachRect {
+                rect: AttachRect {
                     x: 0,
                     y: 1,
                     w: 120,
                     h: 49,
                 },
                 // Content rect reflects the server's 1-cell border inset.
-                content_rect: bmux_ipc::AttachRect {
+                content_rect: AttachRect {
                     x: 1,
                     y: 2,
                     w: 118,

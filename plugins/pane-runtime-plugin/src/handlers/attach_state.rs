@@ -6,7 +6,7 @@
 //! consumers can decode them without the plugin having to invent a
 //! parallel BPDL representation of every field.
 
-use bmux_attach_layout_protocol::{PaneLayoutNode, PaneSummary};
+use bmux_attach_layout_protocol::{AttachScene, PaneLayoutNode, PaneSummary};
 use bmux_pane_runtime_plugin_api::attach_runtime_state::{
     AttachLayout as AttachLayoutRecord, AttachPaneImages, AttachPaneOutputBatch,
     AttachPaneSnapshot as AttachPaneSnapshotRecord, AttachSnapshot as AttachSnapshotRecord,
@@ -64,7 +64,7 @@ fn caller_client_id(ctx: &NativeServiceContext) -> ClientId {
 struct LayoutPayload {
     panes: Vec<PaneSummary>,
     layout_root: PaneLayoutNode,
-    scene: bmux_ipc::AttachScene,
+    scene: AttachScene,
     zoomed: bool,
 }
 
@@ -98,7 +98,7 @@ pub fn attach_layout_state(
 struct SnapshotLayoutPayload {
     panes: Vec<PaneSummary>,
     layout_root: PaneLayoutNode,
-    scene: bmux_ipc::AttachScene,
+    scene: AttachScene,
 }
 
 pub fn attach_snapshot_state(

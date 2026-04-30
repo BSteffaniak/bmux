@@ -709,7 +709,9 @@ fn text_hash(text: &str) -> String {
 }
 
 /// Extract per-pane (cols, rows) from scene surface rects.
-fn build_pane_dimensions_from_scene(scene: &bmux_ipc::AttachScene) -> BTreeMap<Uuid, (u16, u16)> {
+fn build_pane_dimensions_from_scene(
+    scene: &bmux_attach_layout_protocol::AttachScene,
+) -> BTreeMap<Uuid, (u16, u16)> {
     scene
         .surfaces
         .iter()

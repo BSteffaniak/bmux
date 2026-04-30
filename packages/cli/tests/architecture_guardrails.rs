@@ -1816,6 +1816,13 @@ fn pane_summary_dtos_are_absent_from_ipc() {
         "pub struct PaneLaunchCommand",
         "pub enum PaneFocusDirection",
         "pub enum PaneLayoutNode",
+        "pub struct AttachRect",
+        "pub enum AttachLayer",
+        "pub enum AttachFocusTarget",
+        "pub enum AttachSurfaceKind",
+        "pub struct AttachSurface",
+        "pub struct InteractiveRegion",
+        "pub struct AttachScene",
         "pub struct PaneSummary",
         "pub enum PaneState",
     ];
