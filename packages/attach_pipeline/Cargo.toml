@@ -19,11 +19,12 @@ bmux_plugin                 = { workspace = true }
 bmux_scene_protocol         = { workspace = true }
 bmux_scene_protocol_render  = { workspace = true }
 
-anyhow    = { workspace = true, features = ["std"] }
-crossterm = { workspace = true }
-tracing   = { workspace = true, features = ["std"] }
-uuid      = { workspace = true, features = ["std"] }
-vt100     = { workspace = true }
+anyhow        = { workspace = true, features = ["std"] }
+crossterm     = { workspace = true }
+tracing       = { workspace = true, features = ["std"] }
+unicode-width = { workspace = true }
+uuid          = { workspace = true, features = ["std"] }
+vt100         = { workspace = true }
 
 [features]
 default = []

@@ -19,6 +19,7 @@ use crossterm::style::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1155,6 +1156,8 @@ fn render_content_row_segment(
 ) -> String {
     let mut line = String::new();
     let mut current = CellStyle::default();
+    let mut emitted_cols = 0_usize;
+    let target_cols = usize::from(end_col.saturating_sub(start_col));
     let mut col = start_col;
     while col < end_col {
         if let Some(cell) = context.screen.cell(row, col) {
@@ -1171,6 +1174,7 @@ fn render_content_row_segment(
             }
             if cell.is_wide_continuation() {
                 line.push(' ');
+                emitted_cols = emitted_cols.saturating_add(1);
                 col = col.saturating_add(1);
                 continue;
             }
@@ -1180,6 +1184,7 @@ fn render_content_row_segment(
                 " "
             };
             line.push_str(text);
+            emitted_cols = emitted_cols.saturating_add(UnicodeWidthStr::width(text).max(1));
             if cell.is_wide() {
                 col = col.saturating_add(2);
             } else {
@@ -1191,10 +1196,18 @@ fn render_content_row_segment(
                 current = CellStyle::default();
             }
             line.push(' ');
+            emitted_cols = emitted_cols.saturating_add(1);
             col = col.saturating_add(1);
         }
     }
 
+    if emitted_cols < target_cols {
+        if current != CellStyle::default() {
+            line.push_str("\x1b[0m");
+            current = CellStyle::default();
+        }
+        line.push_str(&" ".repeat(target_cols - emitted_cols));
+    }
     if current != CellStyle::default() {
         line.push_str("\x1b[0m");
     }
@@ -2079,6 +2092,96 @@ mod tests {
         assert!(!output.contains("ijklmnop"));
         assert!(!output.contains("abcdefgh"));
         assert!(!output.contains("qrstuvwx"));
+    }
+
+    #[test]
+    fn render_attach_scene_expands_rect_damage_across_wide_glyphs() {
+        let pane_id = Uuid::from_u128(10);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(11),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 2,
+                },
+                content_rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 1,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        buffer.parser.screen_mut().set_size(1, 8);
+        buffer.parser.process("ab界ef".as_bytes());
+        pane_buffers.insert(pane_id, buffer);
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("initial render should populate row cache");
+
+        let mut damage = FrameDamage::default();
+        damage.mark_content_surface_rect(
+            pane_id,
+            DamageRect::new(3, 0, 1, 1),
+            (8, 1),
+            DamageCoalescingPolicy::default(),
+        );
+        let mut output = Vec::new();
+        render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &damage,
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 2),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("wide-damaged render should succeed");
+
+        let output = String::from_utf8(output).expect("output should be utf8");
+        assert!(output.contains("\u{1b}[1;3H界"), "{output:?}");
+        assert!(!output.contains("ab界ef"), "{output:?}");
     }
 
     #[test]
