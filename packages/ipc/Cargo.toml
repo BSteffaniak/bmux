@@ -11,21 +11,25 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_codec = { workspace = true }
-lz4_flex   = { workspace = true, optional = true }
-serde      = { workspace = true, features = ["derive", "std"] }
-serde_json = { workspace = true }
-thiserror  = { workspace = true }
-tokio      = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
-uuid       = { workspace = true, features = ["serde", "std", "v4"] }
-zstd       = { workspace = true, optional = true }
+bmux_attach_image_protocol = { workspace = true }
+bmux_codec                 = { workspace = true }
+lz4_flex                   = { workspace = true, optional = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json                 = { workspace = true }
+thiserror                  = { workspace = true }
+tokio                      = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
+uuid                       = { workspace = true, features = ["serde", "std", "v4"] }
+zstd                       = { workspace = true, optional = true }
 
 [features]
 # Default features
 default = []
 
 # Development features
-fail-on-warnings = ["bmux_codec/fail-on-warnings"]
+fail-on-warnings = [
+    "bmux_attach_image_protocol/fail-on-warnings",
+    "bmux_codec/fail-on-warnings",
+]
 
 # Compression support (optional, feature-gated)
 compression      = ["compression-zstd", "compression-lz4"]

@@ -3280,7 +3280,7 @@ fn export_recording_gif(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    let mut active_images: Vec<bmux_ipc::AttachPaneImage> = Vec::new();
+    let mut active_images: Vec<bmux_attach_image_protocol::AttachPaneImage> = Vec::new();
     for frame_idx in 0..target_frames {
         profiler.record_frame_considered();
         let frame_time_ns = u64::from(frame_idx).saturating_mul(frame_interval_ns);
@@ -5629,14 +5629,16 @@ use bmux_ipc::{DisplayTrackEnvelope, DisplayTrackEvent};
     feature = "image-kitty",
     feature = "image-iterm2"
 ))]
-fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32, u32, Vec<u8>)> {
+fn decode_attach_image_to_rgba(
+    image: &bmux_attach_image_protocol::AttachPaneImage,
+) -> Option<(u32, u32, Vec<u8>)> {
     // Decompress raw_data if it was compressed during IPC transport.
     let raw_data =
         bmux_ipc::compression::decompress_by_id(&image.raw_data, image.compression).ok()?;
 
     match image.protocol {
         #[cfg(feature = "image-sixel")]
-        bmux_ipc::AttachImageProtocol::Sixel => {
+        bmux_attach_image_protocol::AttachImageProtocol::Sixel => {
             let pb = bmux_image::codec::sixel::decode(&raw_data)?;
             debug_assert!(
                 matches!(pb.format, bmux_image::PixelFormat::Rgba8),
@@ -5646,7 +5648,7 @@ fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32
         }
 
         #[cfg(feature = "image-kitty")]
-        bmux_ipc::AttachImageProtocol::KittyGraphics => {
+        bmux_attach_image_protocol::AttachImageProtocol::KittyGraphics => {
             let w = image.pixel_width;
             let h = image.pixel_height;
             if w == 0 || h == 0 {
@@ -5672,7 +5674,7 @@ fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32
         }
 
         #[cfg(feature = "image-iterm2")]
-        bmux_ipc::AttachImageProtocol::ITerm2 => {
+        bmux_attach_image_protocol::AttachImageProtocol::ITerm2 => {
             // iTerm2 raw_data is the OSC body (params + base64-encoded file).
             // Parse the body to extract decoded image file bytes, then decode
             // the image format (PNG, JPEG, GIF, etc.) to RGBA pixels.
@@ -5713,7 +5715,7 @@ fn overlay_display_track_images(
     frame_height: u32,
     cell_w: u32,
     cell_h: u32,
-    images: &[bmux_ipc::AttachPaneImage],
+    images: &[bmux_attach_image_protocol::AttachPaneImage],
 ) {
     for image in images {
         let Some((img_w, img_h, rgba)) = decode_attach_image_to_rgba(image) else {
@@ -5921,7 +5923,10 @@ impl DisplayCaptureWriter {
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pub(super) fn record_images(&mut self, images: &[bmux_ipc::AttachPaneImage]) -> Result<()> {
+    pub(super) fn record_images(
+        &mut self,
+        images: &[bmux_attach_image_protocol::AttachPaneImage],
+    ) -> Result<()> {
         let count = images.len();
         if count == 0 && self.last_image_count == 0 {
             return Ok(());

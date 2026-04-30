@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 anyhow                      = { workspace = true, features = ["std"] }
+bmux_attach_image_protocol  = { workspace = true }
 bmux_attach_layout_protocol = { workspace = true }
 bmux_ipc                    = { workspace = true }
 bmux_session_models         = { workspace = true, features = ["serde"] }
@@ -23,5 +24,8 @@ uuid                        = { workspace = true, features = ["serde", "std"] }
 serde_json = { workspace = true }
 
 [features]
-default          = []
-fail-on-warnings = ["bmux_attach_layout_protocol/fail-on-warnings"]
+default = []
+fail-on-warnings = [
+    "bmux_attach_image_protocol/fail-on-warnings",
+    "bmux_attach_layout_protocol/fail-on-warnings",
+]

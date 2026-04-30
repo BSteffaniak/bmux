@@ -11,38 +11,7 @@
 //!
 //! Each layer is independently configurable and feature-gated.
 
-use serde::{Deserialize, Serialize};
-
-// ---------------------------------------------------------------------------
-// Compression identifier (wire format)
-// ---------------------------------------------------------------------------
-
-/// Identifies which compression algorithm was used on a payload.
-///
-/// Serialized as a single `u8` on the wire.  New variants must be appended
-/// at the end to preserve backward compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[repr(u8)]
-pub enum CompressionId {
-    #[default]
-    None = 0,
-    Zstd = 1,
-    Lz4 = 2,
-}
-
-impl CompressionId {
-    /// Decode a raw byte into a `CompressionId`, returning `None` for
-    /// unrecognised values.
-    #[must_use]
-    pub const fn from_byte(b: u8) -> Option<Self> {
-        match b {
-            0 => Some(Self::None),
-            1 => Some(Self::Zstd),
-            2 => Some(Self::Lz4),
-            _ => None,
-        }
-    }
-}
+pub use bmux_attach_image_protocol::CompressionId;
 
 // ---------------------------------------------------------------------------
 // Compression hint

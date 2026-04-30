@@ -233,7 +233,7 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         pane_ids: &[Uuid],
         since_sequences: &[u64],
         payload_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
-    ) -> Vec<bmux_ipc::AttachPaneImageDelta>;
+    ) -> Vec<bmux_attach_image_protocol::AttachPaneImageDelta>;
 
     // ── Attach lifecycle ───────────────────────────────────────────
 
@@ -569,7 +569,7 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _pane_ids: &[Uuid],
         _since_sequences: &[u64],
         _payload_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
-    ) -> Vec<bmux_ipc::AttachPaneImageDelta> {
+    ) -> Vec<bmux_attach_image_protocol::AttachPaneImageDelta> {
         Vec::new()
     }
     fn begin_attach(

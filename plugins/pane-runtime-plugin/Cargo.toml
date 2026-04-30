@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+bmux_attach_image_protocol = { workspace = true }
 bmux_attach_layout_protocol = { workspace = true }
 bmux_attach_token_state = { workspace = true }
 bmux_client_state = { workspace = true }

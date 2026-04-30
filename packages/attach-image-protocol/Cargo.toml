@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral attach image transport DTOs shared by bmux runtime crates"
+edition     = { workspace = true }
+keywords    = ["bmux", "attach", "image", "protocol"]
+license     = { workspace = true }
+name        = "bmux_attach_image_protocol"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_codec = { workspace = true }
+serde      = { workspace = true, features = ["derive", "std"] }
+uuid       = { workspace = true, features = ["serde", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = ["bmux_codec/fail-on-warnings"]

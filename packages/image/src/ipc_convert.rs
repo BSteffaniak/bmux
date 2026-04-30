@@ -8,7 +8,7 @@
 //! and decompressed during the reverse conversion.
 
 use crate::model::{ImagePayload, ImageProtocol, PaneImage};
-use bmux_ipc::{AttachImageProtocol, AttachPaneImage, AttachPaneImageDelta};
+use bmux_attach_image_protocol::{AttachImageProtocol, AttachPaneImage, AttachPaneImageDelta};
 
 // ---------------------------------------------------------------------------
 // PaneImage -> AttachPaneImage (server sends to client)

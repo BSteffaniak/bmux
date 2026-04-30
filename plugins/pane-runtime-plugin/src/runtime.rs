@@ -3836,7 +3836,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         pane_ids: &[Uuid],
         since_sequences: &[u64],
         payload_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
-    ) -> Vec<bmux_ipc::AttachPaneImageDelta> {
+    ) -> Vec<bmux_attach_image_protocol::AttachPaneImageDelta> {
         self.with_lock_read(|m| {
             let mut result = Vec::new();
             let Some(runtime) = m.runtimes.get(&session_id) else {
@@ -3861,7 +3861,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                     #[cfg(not(feature = "image-registry"))]
                     {
                         let _ = (pane, since, payload_codec);
-                        result.push(bmux_ipc::AttachPaneImageDelta {
+                        result.push(bmux_attach_image_protocol::AttachPaneImageDelta {
                             pane_id: *pane_id,
                             added: Vec::new(),
                             removed: Vec::new(),

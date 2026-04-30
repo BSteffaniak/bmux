@@ -7,6 +7,7 @@
 
 //! Cross-platform IPC protocol models for bmux.
 
+use bmux_attach_image_protocol::AttachPaneImage;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -404,44 +405,6 @@ pub enum ServicePipelinePayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         field_order: Option<Vec<String>>,
     },
-}
-
-/// Image protocol identifier for IPC transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachImageProtocol {
-    Sixel,
-    KittyGraphics,
-    ITerm2,
-}
-
-/// A single image placed within a pane, for IPC transport.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttachPaneImage {
-    pub id: u64,
-    pub protocol: AttachImageProtocol,
-    /// Raw protocol bytes (sixel body, kitty payload, iTerm2 data),
-    /// potentially compressed according to `compression`.
-    #[serde(with = "bmux_codec::serde_bytes_vec")]
-    pub raw_data: Vec<u8>,
-    /// Compression algorithm applied to `raw_data`.  `None` means the data
-    /// is uncompressed.  The receiver must decompress before use.
-    pub compression: compression::CompressionId,
-    pub position_row: u16,
-    pub position_col: u16,
-    pub cell_rows: u16,
-    pub cell_cols: u16,
-    pub pixel_width: u32,
-    pub pixel_height: u32,
-}
-
-/// Incremental image update for a single pane.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttachPaneImageDelta {
-    pub pane_id: Uuid,
-    pub added: Vec<AttachPaneImage>,
-    pub removed: Vec<u64>,
-    pub sequence: u64,
 }
 
 /// Snapshot persistence status returned by server-status.
@@ -1765,7 +1728,7 @@ mod tests {
             DisplayTrackEvent::ImageUpdate {
                 images: vec![AttachPaneImage {
                     id: 42,
-                    protocol: AttachImageProtocol::Sixel,
+                    protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
                     raw_data: vec![0x1b, 0x50, 0x71],
                     compression: compression::CompressionId::None,
                     position_row: 3,

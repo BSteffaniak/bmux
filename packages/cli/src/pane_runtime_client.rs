@@ -1,3 +1,4 @@
+use bmux_attach_image_protocol::AttachPaneImageDelta;
 use bmux_attach_layout_protocol::{
     AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene, PaneLayoutNode,
     PaneSummary,
@@ -8,7 +9,7 @@ use bmux_client::{
     PaneOutputBatchResult,
 };
 use bmux_context_state::ContextSelector;
-use bmux_ipc::{AttachPaneImageDelta, ErrorCode};
+use bmux_ipc::ErrorCode;
 use bmux_pane_runtime_plugin_api::{
     attach_runtime_commands as AttachCommands, attach_runtime_state as AttachState,
     pane_runtime_commands as PaneCommands,

@@ -285,7 +285,7 @@ pub struct AttachViewState {
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pub pane_images: BTreeMap<Uuid, Vec<bmux_ipc::AttachPaneImage>>,
+    pub pane_images: BTreeMap<Uuid, Vec<bmux_attach_image_protocol::AttachPaneImage>>,
     /// Per-pane last-seen image sequence numbers for delta queries.
     #[cfg(any(
         feature = "image-sixel",

@@ -451,7 +451,7 @@ impl DisplayCaptureFanout {
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    fn record_images(&mut self, images: &[bmux_ipc::AttachPaneImage]) {
+    fn record_images(&mut self, images: &[bmux_attach_image_protocol::AttachPaneImage]) {
         let mut failed = Vec::new();
         for (id, writer) in &mut self.writers {
             if writer.record_images(images).is_err() {
@@ -5525,7 +5525,7 @@ pub fn render_attach_frame(
         feature = "image-iterm2"
     ))]
     {
-        let mut all_images: Vec<bmux_ipc::AttachPaneImage> = Vec::new();
+        let mut all_images: Vec<bmux_attach_image_protocol::AttachPaneImage> = Vec::new();
         for surface in &layout_state.scene.surfaces {
             let Some(pane_id) = surface.pane_id else {
                 continue;
