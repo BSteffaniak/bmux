@@ -51,6 +51,11 @@ impl FrameDamage {
             && !self.overlay
     }
 
+    #[must_use]
+    pub fn scene_damaged(&self) -> bool {
+        self.full_frame || !self.content_surfaces.is_empty() || !self.extension_surfaces.is_empty()
+    }
+
     pub fn mark_full_frame(&mut self) {
         *self = Self::full_frame();
     }

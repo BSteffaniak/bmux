@@ -1,5 +1,6 @@
 use crate::input::RuntimeAction;
 use crate::status::AttachStatusLine;
+use bmux_attach_pipeline::FrameDamage;
 pub use bmux_attach_pipeline::{
     AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
 };
@@ -8,7 +9,7 @@ use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use bmux_control_catalog_plugin_api::control_catalog_state::{
     ContextRow, ContextSessionBinding, SessionRow,
 };
-use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState};
+use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState, AttachScene};
 use bmux_windows_plugin_api::windows_commands::PaneResizeDirection;
 use bmux_windows_plugin_api::windows_list::WindowListSnapshot;
 use crossterm::event::MouseEvent;
@@ -69,6 +70,48 @@ impl Default for AttachDirtyFlags {
             full_pane_redraw: true,
             extension_needs_redraw: true,
         }
+    }
+}
+
+impl AttachDirtyFlags {
+    #[must_use]
+    pub fn frame_damage(&self, scene: &AttachScene) -> FrameDamage {
+        let mut damage = if self.full_pane_redraw {
+            FrameDamage::full_frame()
+        } else {
+            FrameDamage::default()
+        };
+        for pane_id in &self.pane_dirty_ids {
+            damage.mark_content_surface(*pane_id);
+        }
+        if self.extension_needs_redraw {
+            for surface in &scene.surfaces {
+                damage.mark_extension_surface(surface.id);
+            }
+        }
+        if self.status_needs_redraw {
+            damage.mark_status();
+        }
+        if self.overlay_needs_redraw {
+            damage.mark_overlay();
+        }
+        damage
+    }
+
+    #[must_use]
+    pub fn needs_render(&self) -> bool {
+        self.status_needs_redraw
+            || self.full_pane_redraw
+            || self.extension_needs_redraw
+            || self.overlay_needs_redraw
+            || !self.pane_dirty_ids.is_empty()
+    }
+
+    pub fn clear_frame_damage(&mut self) {
+        self.full_pane_redraw = false;
+        self.extension_needs_redraw = false;
+        self.overlay_needs_redraw = false;
+        self.pane_dirty_ids.clear();
     }
 }
 

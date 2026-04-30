@@ -60,8 +60,8 @@ use super::prompt_ui::{
     prompt_accepts_key_kind,
 };
 use super::render::{
-    AttachLayer, AttachLayerSurface, FrameDamage, append_pane_output, opaque_row_text,
-    queue_layer_fill, render_attach_scene, visible_scene_pane_ids,
+    AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
+    render_attach_scene, visible_scene_pane_ids,
 };
 use super::state::{
     AttachEventAction, AttachExitReason, AttachMouseResizeAxisDrag, AttachMouseResizeDrag,
@@ -1935,11 +1935,7 @@ pub async fn run_session_attach_with_client(
 
         let dirty_layout_frame =
             view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none();
-        let mut frame_needs_render = view_state.dirty.status_needs_redraw
-            || view_state.dirty.full_pane_redraw
-            || view_state.dirty.extension_needs_redraw
-            || view_state.dirty.overlay_needs_redraw
-            || !view_state.dirty.pane_dirty_ids.is_empty();
+        let mut frame_needs_render = view_state.dirty.needs_render();
 
         let mut scene_hydrated = false;
 
@@ -4611,6 +4607,8 @@ pub fn render_attach_frame(
     slow_terminal_write_ms: u64,
     display_capture: &mut DisplayCaptureFanout,
 ) -> Result<AttachFrameRenderStats> {
+    let frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
+
     if view_state.dirty.status_needs_redraw {
         let now = Instant::now();
         let transient_status = view_state.transient_status_text(now).map(str::to_owned);
@@ -4650,31 +4648,14 @@ pub fn render_attach_frame(
     if let Some(ref mut cs) = view_state.last_cursor_state {
         cs.visible = false;
     }
-    if let Some(status_line) = view_state.cached_status_line.as_ref() {
+    if frame_damage.status_damaged()
+        && let Some(status_line) = view_state.cached_status_line.as_ref()
+    {
         queue_attach_status_line(&mut frame_bytes, status_line, view_state.status_position)?;
     }
     let (status_top_inset, status_bottom_inset) =
         status_insets_for_position(view_state.status_position);
-    let mut frame_damage = if view_state.dirty.full_pane_redraw {
-        FrameDamage::full_frame()
-    } else {
-        FrameDamage::default()
-    };
-    for pane_id in &view_state.dirty.pane_dirty_ids {
-        frame_damage.mark_content_surface(*pane_id);
-    }
-    if view_state.dirty.extension_needs_redraw {
-        for surface in &layout_state.scene.surfaces {
-            frame_damage.mark_extension_surface(surface.id);
-        }
-    }
-    if view_state.dirty.status_needs_redraw {
-        frame_damage.mark_status();
-    }
-    if view_state.dirty.overlay_needs_redraw {
-        frame_damage.mark_overlay();
-    }
-    let render_scene = !frame_damage.is_empty();
+    let render_scene = frame_damage.scene_damaged();
     let appearance_mode_id = if view_state.help_overlay_open {
         "help"
     } else if view_state.prompt.is_active() {
@@ -4721,7 +4702,7 @@ pub fn render_attach_frame(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    if view_state.host_image_caps.any_supported() {
+    if render_scene && view_state.host_image_caps.any_supported() {
         for surface in &layout_state.scene.surfaces {
             let Some(pane_id) = surface.pane_id else {
                 continue;
@@ -4752,12 +4733,15 @@ pub fn render_attach_frame(
 
     let previous_cursor_state = view_state.last_cursor_state;
     let mut overlay_cursor_state = None;
-    if view_state.help_overlay_open
-        && let Some(help_surface) = help_overlay_surface(help_lines)
-    {
+    let help_overlay_needs_render =
+        view_state.help_overlay_open && (frame_damage.overlay_damaged() || render_scene);
+    if help_overlay_needs_render && let Some(help_surface) = help_overlay_surface(help_lines) {
         queue_attach_help_overlay(&mut frame_bytes, &help_surface, help_lines, help_scroll)?;
     }
     if view_state.prompt.is_active() {
+        // The prompt renderer owns the prompt cursor state, so keep drawing it on
+        // every attach frame until that cursor state can be reported separately
+        // from prompt bytes.
         overlay_cursor_state = view_state
             .prompt
             .queue_attach_prompt_overlay(&mut frame_bytes)?;
@@ -4838,10 +4822,7 @@ pub fn render_attach_frame(
         frame_bytes: frame_bytes.len(),
         terminal_write_ms,
     };
-    view_state.dirty.full_pane_redraw = false;
-    view_state.dirty.extension_needs_redraw = false;
-    view_state.dirty.overlay_needs_redraw = false;
-    view_state.dirty.pane_dirty_ids.clear();
+    view_state.dirty.clear_frame_damage();
     Ok(stats)
 }
 

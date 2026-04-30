@@ -365,10 +365,12 @@ const fn pane_direction_name(direction: PaneDirection) -> &'static str {
 const fn focus_direction_name(direction: PaneDirection) -> Option<&'static str> {
     match direction {
         PaneDirection::Horizontal | PaneDirection::Vertical => None,
-        PaneDirection::Left => Some("left"),
-        PaneDirection::Right => Some("right"),
-        PaneDirection::Up => Some("up"),
-        PaneDirection::Down => Some("down"),
+        // The pane-runtime focus primitive is currently ordered-cycle based
+        // (`next`/`prev`). Preserve directional keybindings by folding
+        // spatial directions onto that stable primitive until pane geometry
+        // selection moves behind the typed windows facade.
+        PaneDirection::Left | PaneDirection::Up => Some("prev"),
+        PaneDirection::Right | PaneDirection::Down => Some("next"),
     }
 }
 
@@ -2516,8 +2518,8 @@ fn positional_value(arguments: &[String]) -> Option<String> {
 /// pane-runtime service requests.
 ///
 /// `next` folds to `Right` and `prev`/`previous` fold to `Left` so
-/// that `pane_direction_to_focus` emits the correct `Next`/`Prev`
-/// mapping at the IPC boundary.
+/// that `focus_direction_name` emits the correct `next`/`prev`
+/// mapping at the pane-runtime boundary.
 fn parse_pane_direction_arg(value: &str) -> Result<PaneDirection, String> {
     match value.to_ascii_lowercase().as_str() {
         "horizontal" => Ok(PaneDirection::Horizontal),
@@ -2702,6 +2704,16 @@ mod tests {
             id: None,
             name: Some(name.to_string()),
         }
+    }
+
+    #[test]
+    fn focus_direction_name_maps_spatial_directions_to_runtime_cycle() {
+        assert_eq!(focus_direction_name(PaneDirection::Left), Some("prev"));
+        assert_eq!(focus_direction_name(PaneDirection::Up), Some("prev"));
+        assert_eq!(focus_direction_name(PaneDirection::Right), Some("next"));
+        assert_eq!(focus_direction_name(PaneDirection::Down), Some("next"));
+        assert_eq!(focus_direction_name(PaneDirection::Horizontal), None);
+        assert_eq!(focus_direction_name(PaneDirection::Vertical), None);
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

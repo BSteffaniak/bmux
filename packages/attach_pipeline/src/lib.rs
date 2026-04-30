@@ -21,6 +21,7 @@ pub use mouse::{
     Button as AttachMouseButton, Event as AttachMouseEvent, EventKind as AttachMouseEventKind,
     Modifiers as AttachMouseModifiers, PaneProtocol as AttachPaneMouseProtocol,
 };
+pub use render::FrameDamage;
 pub use scene_pipeline::AttachScenePipeline;
 pub use types::{
     AttachCursorState, AttachPaneMouseProtocolHints, AttachScrollbackCursor,
