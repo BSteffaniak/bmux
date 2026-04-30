@@ -654,6 +654,8 @@ struct AttachPerfWindow {
     damage_area_cells_max: u64,
     full_surface_fallbacks: u64,
     full_frame_fallbacks: u64,
+    event_burst_drained_events: u64,
+    event_burst_max_events: u64,
     wake_server_events: u64,
     wake_terminal_events: u64,
     wake_prompt_events: u64,
@@ -691,6 +693,8 @@ impl AttachPerfWindow {
             damage_area_cells_max: 0,
             full_surface_fallbacks: 0,
             full_frame_fallbacks: 0,
+            event_burst_drained_events: 0,
+            event_burst_max_events: 0,
             wake_server_events: 0,
             wake_terminal_events: 0,
             wake_prompt_events: 0,
@@ -752,6 +756,14 @@ impl AttachPerfWindow {
         if stats.full_frame_fallback {
             self.full_frame_fallbacks = self.full_frame_fallbacks.saturating_add(1);
         }
+    }
+
+    fn record_event_burst(&mut self, drained_events: usize) {
+        let drained_events = u64::try_from(drained_events).unwrap_or(u64::MAX);
+        self.event_burst_drained_events = self
+            .event_burst_drained_events
+            .saturating_add(drained_events);
+        self.event_burst_max_events = self.event_burst_max_events.max(drained_events);
     }
 
     const fn record_wake(&mut self, source: AttachWakeSource) {
@@ -930,6 +942,14 @@ fn insert_attach_perf_detailed_payload(
     object.insert("render_ms_sum".to_string(), window.render_ms_sum.into());
     object.insert("render_ms_max".to_string(), window.render_ms_max.into());
     object.insert(
+        "event_burst_drained_events".to_string(),
+        window.event_burst_drained_events.into(),
+    );
+    object.insert(
+        "event_burst_max_events".to_string(),
+        window.event_burst_max_events.into(),
+    );
+    object.insert(
         "wake_server_events".to_string(),
         window.wake_server_events.into(),
     );
@@ -1011,6 +1031,8 @@ fn attach_perf_window_payload(
         "damage_area_cells_max": window.damage_area_cells_max,
         "full_surface_fallbacks": window.full_surface_fallbacks,
         "full_frame_fallbacks": window.full_frame_fallbacks,
+        "event_burst_drained_events": window.event_burst_drained_events,
+        "event_burst_max_events": window.event_burst_max_events,
     });
     if detailed && let Some(object) = payload.as_object_mut() {
         insert_attach_perf_detailed_payload(object, window);
@@ -1059,6 +1081,8 @@ async fn maybe_emit_attach_perf_window(
         full_surface_fallbacks = window.full_surface_fallbacks,
         full_frame_fallbacks = window.full_frame_fallbacks,
         drain_budget_hits = window.drain_budget_hits,
+        event_burst_drained_events = window.event_burst_drained_events,
+        event_burst_max_events = window.event_burst_max_events,
         wake_server_events = window.wake_server_events,
         wake_terminal_events = window.wake_terminal_events,
         wake_prompt_events = window.wake_prompt_events,
@@ -1596,58 +1620,24 @@ pub async fn run_session_attach_with_client(
                 };
                 perf_window.record_wake(AttachWakeSource::Server);
 
-                // PaneOutputAvailable sets a flag; fall through to the
-                // post-event processing block which fetches output.
-                if matches!(
+                let handling = handle_attach_stream_server_event(
                     server_event,
-                    bmux_client::ServerEvent::PaneOutputAvailable { .. }
-                ) {
-                    pane_output_pending = true;
-                    // Fall through to post-event processing (no event dispatch needed).
-                } else if let bmux_client::ServerEvent::PaneOutput {
-                    pane_id,
-                    ref data,
-                    stream_start,
-                    stream_end,
-                    stream_gap,
-                    sync_update_active,
-                    ..
-                } = server_event
-                {
-                    // Inline output push — apply using the same continuity
-                    // checks as batch chunks so parser state remains
-                    // deterministic even under cursor gaps or out-of-order
-                    // delivery.
-                    let mut render = false;
-                    match apply_attach_output_chunk(
-                        &mut view_state,
-                        pane_id,
-                        data,
-                        AttachOutputChunkMeta {
-                            stream_start,
-                            stream_end,
-                            stream_gap,
-                            sync_update_active,
-                        },
-                        &mut render,
-                    ) {
-                        AttachChunkApplyOutcome::Applied { .. } | AttachChunkApplyOutcome::Stale => {}
-                        AttachChunkApplyOutcome::Desync => {
-                            recover_attach_output_desync_for_pane(
-                                &mut client,
-                                &mut view_state,
-                                pane_id,
-                            )
-                            .await?;
-                            pane_output_pending = false;
-                        }
-                    }
-                } else if matches!(
-                    server_event,
-                    bmux_client::ServerEvent::PaneImageAvailable { .. }
-                ) {
-                    // Image state changed on the server — fetch deltas on the
-                    // next render cycle instead of polling every frame.
+                    &mut client,
+                    &mut attach_input_processor,
+                    follow_target_id,
+                    self_client_id,
+                    global,
+                    &attach_help_lines,
+                    &mut view_state,
+                    &mut display_capture,
+                    kernel_client_factory.as_ref(),
+                    &attach_config,
+                    &mut perf_emitter,
+                    &mut pane_output_pending,
+                    &mut last_scene_revision,
+                )
+                .await?;
+                if handling.image_fetch_requested {
                     #[cfg(any(
                         feature = "image-sixel",
                         feature = "image-kitty",
@@ -1656,173 +1646,12 @@ pub async fn run_session_attach_with_client(
                     {
                         image_fetch_pending = true;
                     }
-                } else if let bmux_client::ServerEvent::RecordingStarted {
-                    recording_id,
-                    ref path,
-                } = server_event
-                {
-                    let target = bmux_ipc::RecordingCaptureTarget {
-                        recording_id,
-                        path: path.clone(),
-                        rolling_window_secs: None,
-                    };
-                    display_capture.open_target(&target, self_client_id);
-                } else if let bmux_client::ServerEvent::RecordingStopped {
-                    recording_id,
-                } = server_event
-                {
-                    display_capture.close_recording(recording_id);
-                } else if let bmux_client::ServerEvent::PerformanceSettingsUpdated {
-                    ref settings,
-                } = server_event
-                {
-                    perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
-                        settings,
-                    ));
-                } else if let bmux_client::ServerEvent::PluginBusEvent {
-                    ref kind,
-                    ref payload,
-                } = server_event
-                {
-                    // Server-forwarded plugin event/state payload. Decode by kind
-                    // and re-emit onto the local event bus so any render extension
-                    // (decoration, future overlays, etc.) sees the payload through
-                    // the appropriate delivery mode. Core code does NOT interpret
-                    // the payload itself — extensions own that.
-                    if kind.as_str()
-                        == bmux_scene_protocol::scene_protocol::STATE_KIND.as_str()
-                    {
-                        match serde_json::from_slice::<
-                            bmux_scene_protocol::scene_protocol::DecorationScene,
-                        >(payload)
-                        {
-                            Ok(scene) => {
-                                let scene_revision = scene.revision;
-                                // Re-publish retained scene state on the local event
-                                // bus so late-installed render extensions can hydrate
-                                // without waiting for a fresh scene mutation.
-                                let _ = bmux_plugin::global_event_bus().publish_state(
-                                    &bmux_scene_protocol::scene_protocol::STATE_KIND,
-                                    scene,
-                                );
-                                if scene_revision != last_scene_revision {
-                                    last_scene_revision = scene_revision;
-                                    // Any new scene makes extension output dirty
-                                    // without invalidating pane content row caches.
-                                    view_state.dirty.extension_needs_redraw = true;
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    kind = %kind,
-                                    error = %error,
-                                    "decoding forwarded scene-protocol payload",
-                                );
-                            }
-                        }
-                    } else if kind.as_str()
-                        == bmux_contexts_plugin_api::contexts_events::EVENT_KIND.as_str()
-                    {
-                        // Attach-retarget on context lifecycle events.
-                        // `create-context` and `select-context` each emit
-                        // two events of interest here: `Selected` (for
-                        // the initiating client) and
-                        // `SessionActiveContextChanged` (multi-client
-                        // broadcast). We act on whichever arrives first
-                        // per (session, context) pair and dedup via
-                        // `attached_context_id` — retargeting to the
-                        // already-attached context is a no-op but wastes
-                        // round-trips.
-                        match serde_json::from_slice::<
-                            bmux_contexts_plugin_api::contexts_events::ContextEvent,
-                        >(payload)
-                        {
-                            Ok(event) => {
-                                handle_context_event_forwarded(
-                                    &mut client,
-                                    &mut view_state,
-                                    &event,
-                                    self_client_id,
-                                    &attach_config,
-                                )
-                                .await?;
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    kind = %kind,
-                                    error = %error,
-                                    "decoding forwarded contexts-events payload",
-                                );
-                            }
-                        }
-                    } else if kind.as_str()
-                        == bmux_windows_plugin_api::windows_list::STATE_KIND.as_str()
-                    {
-                        // Server-forwarded windows-list snapshot.
-                        // Decode and republish on the local state
-                        // channel. The attach loop's
-                        // `subscribe_state::<WindowListSnapshot>`
-                        // arm wakes and refreshes
-                        // `cached_window_list`, which the tab-bar
-                        // renderer reads on the next draw.
-                        match serde_json::from_slice::<
-                            bmux_windows_plugin_api::windows_list::WindowListSnapshot,
-                        >(payload)
-                        {
-                            Ok(snapshot) => {
-                                let _ = bmux_plugin::global_event_bus().publish_state(
-                                    &bmux_windows_plugin_api::windows_list::STATE_KIND,
-                                    snapshot,
-                                );
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    kind = %kind,
-                                    error = %error,
-                                    "decoding forwarded windows-list payload",
-                                );
-                            }
-                        }
-                    } else if kind.as_str() == RUNTIME_APPEARANCE_STATE_KIND.as_str() {
-                        match serde_json::from_slice::<RuntimeAppearance>(payload) {
-                            Ok(appearance) => {
-                                let _ = bmux_plugin::global_event_bus()
-                                    .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
-                                view_state.dirty.full_pane_redraw = true;
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    kind = %kind,
-                                    error = %error,
-                                    "decoding forwarded runtime appearance payload",
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    if let bmux_client::ServerEvent::AttachViewChanged { .. } = &server_event {
-                        pane_output_pending = true;
-                    }
-
-                    match handle_attach_loop_event(
-                        AttachLoopEvent::Server(server_event),
-                        &mut client,
-                        &mut attach_input_processor,
-                        follow_target_id,
-                        Some(self_client_id),
-                        global,
-                        &attach_help_lines,
-                        &mut view_state,
-                        &mut display_capture,
-                        kernel_client_factory.as_ref(),
-                    )
-                    .await?
-                    {
-                        AttachLoopControl::Continue => {}
-                        AttachLoopControl::Break(reason) => {
-                            exit_reason = reason;
-                            break;
-                        }
+                }
+                match handling.control {
+                    AttachLoopControl::Continue => {}
+                    AttachLoopControl::Break(reason) => {
+                        exit_reason = reason;
+                        break;
                     }
                 }
             }
@@ -1966,6 +1795,61 @@ pub async fn run_session_attach_with_client(
                 }
             }
 
+        }
+
+        let mut burst_requested_exit = false;
+        let mut burst_drained_events = 0_usize;
+        for _ in 0..attach_config.behavior.event_coalescing.max_events_per_frame {
+            let server_event = match client.event_receiver().try_recv() {
+                Ok(server_event) => server_event,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    exit_reason = AttachExitReason::StreamClosed;
+                    burst_requested_exit = true;
+                    break;
+                }
+            };
+            burst_drained_events = burst_drained_events.saturating_add(1);
+            perf_window.record_wake(AttachWakeSource::Server);
+            let handling = handle_attach_stream_server_event(
+                server_event,
+                &mut client,
+                &mut attach_input_processor,
+                follow_target_id,
+                self_client_id,
+                global,
+                &attach_help_lines,
+                &mut view_state,
+                &mut display_capture,
+                kernel_client_factory.as_ref(),
+                &attach_config,
+                &mut perf_emitter,
+                &mut pane_output_pending,
+                &mut last_scene_revision,
+            )
+            .await?;
+            if handling.image_fetch_requested {
+                #[cfg(any(
+                    feature = "image-sixel",
+                    feature = "image-kitty",
+                    feature = "image-iterm2"
+                ))]
+                {
+                    image_fetch_pending = true;
+                }
+            }
+            match handling.control {
+                AttachLoopControl::Continue => {}
+                AttachLoopControl::Break(reason) => {
+                    exit_reason = reason;
+                    burst_requested_exit = true;
+                    break;
+                }
+            }
+        }
+        perf_window.record_event_burst(burst_drained_events);
+        if burst_requested_exit {
+            break;
         }
 
         // ── Post-event processing: layout, output fetch, render ──────
@@ -2442,6 +2326,200 @@ pub async fn run_session_attach_with_client(
     Ok(AttachRunOutcome {
         status_code: 0,
         exit_reason,
+    })
+}
+
+struct AttachServerEventHandling {
+    control: AttachLoopControl,
+    image_fetch_requested: bool,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn handle_attach_stream_server_event(
+    server_event: bmux_client::ServerEvent,
+    client: &mut StreamingBmuxClient,
+    attach_input_processor: &mut InputProcessor,
+    follow_target_id: Option<Uuid>,
+    self_client_id: Uuid,
+    global: bool,
+    attach_help_lines: &[String],
+    view_state: &mut AttachViewState,
+    display_capture: &mut DisplayCaptureFanout,
+    kernel_client_factory: Option<&KernelClientFactory>,
+    attach_config: &BmuxConfig,
+    perf_emitter: &mut recording::PerfEventEmitter,
+    pane_output_pending: &mut bool,
+    last_scene_revision: &mut u64,
+) -> Result<AttachServerEventHandling> {
+    let mut image_fetch_requested = false;
+
+    if matches!(
+        server_event,
+        bmux_client::ServerEvent::PaneOutputAvailable { .. }
+    ) {
+        *pane_output_pending = true;
+    } else if let bmux_client::ServerEvent::PaneOutput {
+        pane_id,
+        ref data,
+        stream_start,
+        stream_end,
+        stream_gap,
+        sync_update_active,
+        ..
+    } = server_event
+    {
+        let mut render = false;
+        match apply_attach_output_chunk(
+            view_state,
+            pane_id,
+            data,
+            AttachOutputChunkMeta {
+                stream_start,
+                stream_end,
+                stream_gap,
+                sync_update_active,
+            },
+            &mut render,
+        ) {
+            AttachChunkApplyOutcome::Applied { .. } | AttachChunkApplyOutcome::Stale => {}
+            AttachChunkApplyOutcome::Desync => {
+                recover_attach_output_desync_for_pane(client, view_state, pane_id).await?;
+                *pane_output_pending = false;
+            }
+        }
+    } else if matches!(
+        server_event,
+        bmux_client::ServerEvent::PaneImageAvailable { .. }
+    ) {
+        image_fetch_requested = true;
+    } else if let bmux_client::ServerEvent::RecordingStarted {
+        recording_id,
+        ref path,
+    } = server_event
+    {
+        let target = bmux_ipc::RecordingCaptureTarget {
+            recording_id,
+            path: path.clone(),
+            rolling_window_secs: None,
+        };
+        display_capture.open_target(&target, self_client_id);
+    } else if let bmux_client::ServerEvent::RecordingStopped { recording_id } = server_event {
+        display_capture.close_recording(recording_id);
+    } else if let bmux_client::ServerEvent::PerformanceSettingsUpdated { ref settings } =
+        server_event
+    {
+        perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
+            settings,
+        ));
+    } else if let bmux_client::ServerEvent::PluginBusEvent {
+        ref kind,
+        ref payload,
+    } = server_event
+    {
+        if kind.as_str() == bmux_scene_protocol::scene_protocol::STATE_KIND.as_str() {
+            match serde_json::from_slice::<bmux_scene_protocol::scene_protocol::DecorationScene>(
+                payload,
+            ) {
+                Ok(scene) => {
+                    let scene_revision = scene.revision;
+                    let _ = bmux_plugin::global_event_bus()
+                        .publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
+                    if scene_revision != *last_scene_revision {
+                        *last_scene_revision = scene_revision;
+                        view_state.dirty.extension_needs_redraw = true;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded scene-protocol payload",
+                    );
+                }
+            }
+        } else if kind.as_str() == bmux_contexts_plugin_api::contexts_events::EVENT_KIND.as_str() {
+            match serde_json::from_slice::<bmux_contexts_plugin_api::contexts_events::ContextEvent>(
+                payload,
+            ) {
+                Ok(event) => {
+                    handle_context_event_forwarded(
+                        client,
+                        view_state,
+                        &event,
+                        self_client_id,
+                        attach_config,
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded contexts-events payload",
+                    );
+                }
+            }
+        } else if kind.as_str() == bmux_windows_plugin_api::windows_list::STATE_KIND.as_str() {
+            match serde_json::from_slice::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
+                payload,
+            ) {
+                Ok(snapshot) => {
+                    let _ = bmux_plugin::global_event_bus().publish_state(
+                        &bmux_windows_plugin_api::windows_list::STATE_KIND,
+                        snapshot,
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded windows-list payload",
+                    );
+                }
+            }
+        } else if kind.as_str() == RUNTIME_APPEARANCE_STATE_KIND.as_str() {
+            match serde_json::from_slice::<RuntimeAppearance>(payload) {
+                Ok(appearance) => {
+                    let _ = bmux_plugin::global_event_bus()
+                        .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
+                    view_state.dirty.full_pane_redraw = true;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded runtime appearance payload",
+                    );
+                }
+            }
+        }
+    } else {
+        if let bmux_client::ServerEvent::AttachViewChanged { .. } = &server_event {
+            *pane_output_pending = true;
+        }
+
+        let control = handle_attach_loop_event(
+            AttachLoopEvent::Server(server_event),
+            client,
+            attach_input_processor,
+            follow_target_id,
+            Some(self_client_id),
+            global,
+            attach_help_lines,
+            view_state,
+            display_capture,
+            kernel_client_factory,
+        )
+        .await?;
+        return Ok(AttachServerEventHandling {
+            control,
+            image_fetch_requested,
+        });
+    }
+
+    Ok(AttachServerEventHandling {
+        control: AttachLoopControl::Continue,
+        image_fetch_requested,
     })
 }
 

@@ -1508,6 +1508,9 @@ pub struct BehaviorConfig {
     /// Attach renderer damage coalescing and fallback thresholds.
     #[config_doc(nested)]
     pub damage: DamageBehaviorConfig,
+    /// Event burst coalescing controls for attach rendering.
+    #[config_doc(nested)]
+    pub event_coalescing: EventCoalescingBehaviorConfig,
     /// Terminal image protocol settings (Sixel, Kitty graphics, iTerm2).
     #[config_doc(nested)]
     pub images: ImageBehaviorConfig,
@@ -1537,6 +1540,7 @@ impl Default for BehaviorConfig {
             pane_restore_method: PaneRestoreMethod::Snapshot,
             mouse: MouseBehaviorConfig::default(),
             damage: DamageBehaviorConfig::default(),
+            event_coalescing: EventCoalescingBehaviorConfig::default(),
             images: ImageBehaviorConfig::default(),
             compression: CompressionConfig::default(),
         }
@@ -1560,6 +1564,23 @@ impl Default for DamageBehaviorConfig {
         Self {
             max_rects: 64,
             max_area_percent: 60,
+        }
+    }
+}
+
+/// Attach event burst coalescing behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "behavior.event_coalescing")]
+#[serde(default)]
+pub struct EventCoalescingBehaviorConfig {
+    /// Maximum ready server events to drain before rendering one attach frame.
+    pub max_events_per_frame: usize,
+}
+
+impl Default for EventCoalescingBehaviorConfig {
+    fn default() -> Self {
+        Self {
+            max_events_per_frame: 64,
         }
     }
 }
@@ -2867,6 +2888,13 @@ impl BmuxConfig {
 
         validate_damage_behavior_config(&self.behavior.damage)?;
 
+        if self.behavior.event_coalescing.max_events_per_frame == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "behavior.event_coalescing.max_events_per_frame".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
         if self.status_bar.max_tabs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "status_bar.max_tabs".to_string(),
@@ -2967,6 +2995,15 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "behavior.damage.max_area_percent -> {}",
                 self.behavior.damage.max_area_percent
+            ));
+        }
+
+        if self.behavior.event_coalescing.max_events_per_frame == 0 {
+            self.behavior.event_coalescing.max_events_per_frame =
+                behavior_defaults.event_coalescing.max_events_per_frame;
+            repaired_fields.push(format!(
+                "behavior.event_coalescing.max_events_per_frame=0 -> {}",
+                self.behavior.event_coalescing.max_events_per_frame
             ));
         }
 
@@ -3704,6 +3741,9 @@ protocol_trace_capacity = 0
 max_rects = 0
 max_area_percent = 101
 
+[behavior.event_coalescing]
+max_events_per_frame = 0
+
 [keybindings]
 prefix = ""
 timeout_profile = "warp"
@@ -3730,6 +3770,7 @@ fast = 10
         assert_eq!(config.behavior.protocol_trace_capacity, 200);
         assert_eq!(config.behavior.damage.max_rects, 64);
         assert_eq!(config.behavior.damage.max_area_percent, 60);
+        assert_eq!(config.behavior.event_coalescing.max_events_per_frame, 64);
 
         let persisted = std::fs::read_to_string(&path).expect("failed reading config file");
         assert!(persisted.contains("scrollback_limit = 0"));
@@ -3739,6 +3780,7 @@ fast = 10
         assert!(persisted.contains("protocol_trace_capacity = 0"));
         assert!(persisted.contains("max_rects = 0"));
         assert!(persisted.contains("max_area_percent = 101"));
+        assert!(persisted.contains("max_events_per_frame = 0"));
         assert!(persisted.contains("pane_term = \"xterm-256color\""));
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
