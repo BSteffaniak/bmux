@@ -17,7 +17,37 @@ use bmux_plugin_sdk::{
     PluginCliCommandResponse, RecordingWriteEventRequest, RecordingWriteEventResponse, Result,
     ServiceKind, StorageGetRequest, StorageGetResponse, StorageSetRequest,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+const RECORDING_WRITE_CAPABILITY: &str = "bmux.recording.write";
+const RECORDING_COMMANDS_INTERFACE: &str = "recording-commands";
+const RECORDING_WRITE_CUSTOM_EVENT_OPERATION: &str = "write-custom-event";
+
+#[derive(Serialize)]
+struct RecordingWriteCustomEventWireRequest {
+    session_id: Option<uuid::Uuid>,
+    pane_id: Option<uuid::Uuid>,
+    source: String,
+    name: String,
+    #[serde(with = "bmux_codec::serde_bytes_vec")]
+    payload: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+enum RecordingWriteCustomEventWireError {
+    NoActive,
+    Unavailable,
+    Failed { reason: String },
+}
+
+impl RecordingWriteCustomEventWireError {
+    fn into_reason(self) -> Option<String> {
+        match self {
+            Self::NoActive | Self::Unavailable => None,
+            Self::Failed { reason } => Some(reason),
+        }
+    }
+}
 
 /// Trait for types that can dispatch cross-plugin service calls.
 ///
@@ -185,32 +215,30 @@ pub trait HostRuntimeApi: ServiceCaller {
         &self,
         request: &RecordingWriteEventRequest,
     ) -> Result<RecordingWriteEventResponse> {
-        let recording_request =
-            bmux_recording_plugin_api::recording_commands::client::WriteCustomEventRequest {
-                session_id: recording_attribute_uuid(request, "bmux.session_id"),
-                pane_id: recording_attribute_uuid(request, "bmux.pane_id"),
-                // `HostRuntimeApi` doesn't know which plugin is calling,
-                // so we pass an empty source. The caller-side code that
-                // needs source identity should dispatch directly via
-                // `recording-commands::write-custom-event` instead.
-                source: String::new(),
-                name: request.name.clone(),
-                payload: serde_json::to_vec(&request.payload).unwrap_or_default(),
-            };
-        let response: std::result::Result<
-            (),
-            bmux_recording_plugin_api::recording_types::RecordingError,
-        > = self.call_service(
-            bmux_recording_plugin_api::capabilities::RECORDING_WRITE.as_str(),
-            ServiceKind::Command,
-            bmux_recording_plugin_api::recording_commands::INTERFACE_ID.as_str(),
-            bmux_recording_plugin_api::recording_commands::OP_WRITE_CUSTOM_EVENT.as_str(),
-            &recording_request,
-        )?;
-        if response.is_ok() {
-            Ok(RecordingWriteEventResponse { accepted: true })
-        } else {
-            Ok(RecordingWriteEventResponse { accepted: false })
+        let recording_request = RecordingWriteCustomEventWireRequest {
+            session_id: recording_attribute_uuid(request, "bmux.session_id"),
+            pane_id: recording_attribute_uuid(request, "bmux.pane_id"),
+            // `HostRuntimeApi` doesn't know which plugin is calling, so
+            // callers that need source identity should dispatch directly
+            // via the recording plugin's generated command client.
+            source: String::new(),
+            name: request.name.clone(),
+            payload: serde_json::to_vec(&request.payload).unwrap_or_default(),
+        };
+        let response: std::result::Result<(), RecordingWriteCustomEventWireError> = self
+            .call_service(
+                RECORDING_WRITE_CAPABILITY,
+                ServiceKind::Command,
+                RECORDING_COMMANDS_INTERFACE,
+                RECORDING_WRITE_CUSTOM_EVENT_OPERATION,
+                &recording_request,
+            )?;
+        match response {
+            Ok(()) => Ok(RecordingWriteEventResponse { accepted: true }),
+            Err(err) => {
+                let _ = err.into_reason();
+                Ok(RecordingWriteEventResponse { accepted: false })
+            }
         }
     }
 }

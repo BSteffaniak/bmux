@@ -344,6 +344,34 @@ fn server_does_not_import_plugin_api_crates() {
     );
 }
 
+/// The host-side plugin runtime is core architecture. It may expose
+/// generic recording primitives, but it must not construct generated
+/// request/response types from the recording plugin API crate.
+#[test]
+fn plugin_host_crate_does_not_import_plugin_api_crates() {
+    let plugin_source = production_section(include_str!("../../plugin/src/host_runtime.rs"));
+    let plugin_cargo = include_str!("../../plugin/Cargo.toml");
+    for marker in [
+        "bmux_recording_plugin_api",
+        "bmux_performance_plugin_api",
+        "bmux_sessions_plugin_api",
+        "bmux_contexts_plugin_api",
+        "bmux_clients_plugin_api",
+        "bmux_windows_plugin_api",
+        "bmux_permissions_plugin_api",
+        "bmux_pane_runtime_plugin_api",
+    ] {
+        assert!(
+            !plugin_source.contains(marker),
+            "packages/plugin/src/host_runtime.rs must not import `{marker}`; core host runtime stays domain-agnostic",
+        );
+        assert!(
+            !plugin_cargo.contains(marker),
+            "packages/plugin/Cargo.toml must not depend on `{marker}`; core host runtime stays domain-agnostic",
+        );
+    }
+}
+
 /// Verify that `Request::{PerformanceStatus, PerformanceSet}` and
 /// `ResponsePayload::{PerformanceStatus, PerformanceUpdated}` have
 /// been deleted from `bmux_ipc`. Performance settings queries and
