@@ -120,15 +120,26 @@ fn queue_render_ops<W: io::Write>(
     ops: &[RenderOp],
 ) -> Result<bool> {
     let mut wrote = false;
+    let mut pending_text_run = None;
     for op in ops {
         if !render_op_intersects_damage(op, damage) {
+            wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
             continue;
         }
         match op {
             RenderOp::TextRun { x, y, text, style } => {
-                wrote |= queue_render_text_run(stdout, surface_rect, *x, *y, text, *style)?;
+                if !merge_pending_text_run(&mut pending_text_run, *x, *y, text, *style) {
+                    wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
+                    pending_text_run = Some(PendingTextRun {
+                        x: *x,
+                        y: *y,
+                        text: text.clone(),
+                        style: *style,
+                    });
+                }
             }
             RenderOp::FillRect { rect, ch, style } => {
+                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
                 wrote |= queue_render_fill_rect(stdout, surface_rect, *rect, *ch, *style)?;
             }
             RenderOp::Border {
@@ -136,18 +147,69 @@ fn queue_render_ops<W: io::Write>(
                 glyphs,
                 style,
             } => {
+                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
                 wrote |= queue_render_border(stdout, surface_rect, *rect, *glyphs, *style)?;
             }
             RenderOp::CellGrid { x, y, rows } => {
+                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
                 wrote |= queue_render_cell_grid(stdout, surface_rect, *x, *y, rows)?;
             }
         }
     }
+    wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
     if wrote {
         queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))
             .context("failed resetting declarative render op style")?;
     }
     Ok(wrote)
+}
+
+#[derive(Clone, Debug)]
+struct PendingTextRun {
+    x: u16,
+    y: u16,
+    text: String,
+    style: RenderStyle,
+}
+
+fn merge_pending_text_run(
+    pending: &mut Option<PendingTextRun>,
+    x: u16,
+    y: u16,
+    text: &str,
+    style: RenderStyle,
+) -> bool {
+    let Some(pending) = pending.as_mut() else {
+        return false;
+    };
+    if pending.y != y || pending.style != style {
+        return false;
+    }
+    let pending_width =
+        u16::try_from(UnicodeWidthStr::width(pending.text.as_str())).unwrap_or(u16::MAX);
+    if pending.x.saturating_add(pending_width) != x {
+        return false;
+    }
+    pending.text.push_str(text);
+    true
+}
+
+fn flush_pending_text_run<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    pending: &mut Option<PendingTextRun>,
+) -> Result<bool> {
+    let Some(pending) = pending.take() else {
+        return Ok(false);
+    };
+    queue_render_text_run(
+        stdout,
+        surface_rect,
+        pending.x,
+        pending.y,
+        &pending.text,
+        pending.style,
+    )
 }
 
 fn queue_render_style<W: io::Write>(stdout: &mut W, style: RenderStyle) -> Result<()> {
@@ -333,7 +395,7 @@ fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
         RenderOp::TextRun { x, y, text, .. } => ExtensionRect {
             x: *x,
             y: *y,
-            w: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
+            w: u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(u16::MAX),
             h: 1,
         },
         RenderOp::FillRect { rect, .. } | RenderOp::Border { rect, .. } => *rect,
@@ -1637,7 +1699,7 @@ mod tests {
     use super::{
         AttachLayer, AttachLayerSurface, DamageCoalescingPolicy, DamageRect, FrameDamage,
         append_pane_output, coalesce_render_damage, opaque_row_text, queue_frame_damage_overlay,
-        queue_layer_fill, render_attach_scene,
+        queue_layer_fill, queue_render_ops, render_attach_scene,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -1890,6 +1952,78 @@ mod tests {
     fn opaque_row_text_truncates_and_pads() {
         assert_eq!(opaque_row_text("help", 8), "help    ");
         assert_eq!(opaque_row_text("123456789", 5), "12345");
+    }
+
+    #[test]
+    fn queue_render_ops_batches_adjacent_text_runs() {
+        let ops = [
+            RenderOp::TextRun {
+                x: 0,
+                y: 0,
+                text: "ab".to_string(),
+                style: RenderStyle::default(),
+            },
+            RenderOp::TextRun {
+                x: 2,
+                y: 0,
+                text: "cd".to_string(),
+                style: RenderStyle::default(),
+            },
+        ];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 1,
+                },
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+            .expect("render ops should queue")
+        );
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+
+        assert!(output.contains("\u{1b}[1;1Habcd"), "{output:?}");
+        assert!(!output.contains("\u{1b}[1;3H"), "{output:?}");
+    }
+
+    #[test]
+    fn queue_render_ops_uses_unicode_width_for_text_damage_bounds() {
+        let ops = [RenderOp::TextRun {
+            x: 0,
+            y: 0,
+            text: "界".to_string(),
+            style: RenderStyle::default(),
+        }];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 1,
+                },
+                &RenderDamage::Regions(vec![ExtensionRect {
+                    x: 1,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                }]),
+                &ops,
+            )
+            .expect("wide text run should intersect damage")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        assert!(output.contains('界'), "{output:?}");
     }
 
     #[test]
