@@ -95,6 +95,74 @@ impl ExtensionRect {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderColor {
+    Default,
+    Indexed(u8),
+    Rgb { r: u8, g: u8, b: u8 },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderStyle {
+    pub fg: Option<RenderColor>,
+    pub bg: Option<RenderColor>,
+    pub bold: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderCell {
+    pub ch: char,
+    pub style: RenderStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorderGlyphs {
+    pub top_left: char,
+    pub top_right: char,
+    pub bottom_left: char,
+    pub bottom_right: char,
+    pub horizontal: char,
+    pub vertical: char,
+}
+
+impl Default for BorderGlyphs {
+    fn default() -> Self {
+        Self {
+            top_left: '+',
+            top_right: '+',
+            bottom_left: '+',
+            bottom_right: '+',
+            horizontal: '-',
+            vertical: '|',
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderOp {
+    TextRun {
+        x: u16,
+        y: u16,
+        text: String,
+        style: RenderStyle,
+    },
+    FillRect {
+        rect: ExtensionRect,
+        ch: char,
+        style: RenderStyle,
+    },
+    Border {
+        rect: ExtensionRect,
+        glyphs: BorderGlyphs,
+        style: RenderStyle,
+    },
+    CellGrid {
+        x: u16,
+        y: u16,
+        rows: Vec<Vec<RenderCell>>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderDamage {
     None,
@@ -168,6 +236,20 @@ pub trait AttachRenderExtension: Send + Sync {
         surface_rect: &ExtensionRect,
         damage: &RenderDamage,
     ) -> io::Result<bool>;
+
+    /// Return declarative render operations for the damaged region of
+    /// `surface_rect`. Returning `None` asks the host to call
+    /// [`Self::render_surface`] as an imperative escape hatch. Returning
+    /// `Some(Vec::new())` means the extension is declarative but has no
+    /// operations for this damage.
+    fn render_ops(
+        &self,
+        _surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        _damage: &RenderDamage,
+    ) -> Option<Vec<RenderOp>> {
+        None
+    }
 
     /// Override the surface's content-rect inset. Returning `Some`
     /// tells the attach runtime "the PTY should render inside this

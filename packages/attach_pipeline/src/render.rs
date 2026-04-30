@@ -7,11 +7,15 @@ use bmux_appearance::{
     RuntimeContentEffectScope,
 };
 use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
-use bmux_plugin::{AttachRenderExtension, ExtensionRect, RenderDamage};
+use bmux_plugin::{
+    AttachRenderExtension, ExtensionRect, RenderColor, RenderDamage, RenderOp, RenderStyle,
+};
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
-use crossterm::style::Print;
+use crossterm::style::{
+    Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use unicode_width::UnicodeWidthStr;
@@ -97,6 +101,244 @@ fn clip_extension_rect(rect: ExtensionRect, bounds: ExtensionRect) -> Option<Ext
 
 const fn extension_rect_touches_or_overlaps(a: ExtensionRect, b: ExtensionRect) -> bool {
     a.x <= b.right() && b.x <= a.right() && a.y <= b.bottom() && b.y <= a.bottom()
+}
+
+fn queue_render_ops<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    ops: &[RenderOp],
+) -> Result<bool> {
+    let mut wrote = false;
+    for op in ops {
+        if !render_op_intersects_damage(op, damage) {
+            continue;
+        }
+        match op {
+            RenderOp::TextRun { x, y, text, style } => {
+                wrote |= queue_render_text_run(stdout, surface_rect, *x, *y, text, *style)?;
+            }
+            RenderOp::FillRect { rect, ch, style } => {
+                wrote |= queue_render_fill_rect(stdout, surface_rect, *rect, *ch, *style)?;
+            }
+            RenderOp::Border {
+                rect,
+                glyphs,
+                style,
+            } => {
+                wrote |= queue_render_border(stdout, surface_rect, *rect, *glyphs, *style)?;
+            }
+            RenderOp::CellGrid { x, y, rows } => {
+                wrote |= queue_render_cell_grid(stdout, surface_rect, *x, *y, rows)?;
+            }
+        }
+    }
+    if wrote {
+        queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))
+            .context("failed resetting declarative render op style")?;
+    }
+    Ok(wrote)
+}
+
+fn queue_render_style<W: io::Write>(stdout: &mut W, style: RenderStyle) -> Result<()> {
+    if let Some(fg) = style.fg {
+        queue!(stdout, SetForegroundColor(render_color_to_crossterm(fg)))
+            .context("failed setting render op foreground color")?;
+    }
+    if let Some(bg) = style.bg {
+        queue!(stdout, SetBackgroundColor(render_color_to_crossterm(bg)))
+            .context("failed setting render op background color")?;
+    }
+    if style.bold {
+        queue!(stdout, SetAttribute(Attribute::Bold))
+            .context("failed setting render op bold attribute")?;
+    }
+    Ok(())
+}
+
+const fn render_color_to_crossterm(color: RenderColor) -> Color {
+    match color {
+        RenderColor::Default => Color::Reset,
+        RenderColor::Indexed(index) => Color::AnsiValue(index),
+        RenderColor::Rgb { r, g, b } => Color::Rgb { r, g, b },
+    }
+}
+
+fn queue_render_text_run<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    x: u16,
+    y: u16,
+    text: &str,
+    style: RenderStyle,
+) -> Result<bool> {
+    if y < surface_rect.y || y >= surface_rect.bottom() || x >= surface_rect.right() {
+        return Ok(false);
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let start = usize::from(surface_rect.x.saturating_sub(x));
+    if start >= chars.len() {
+        return Ok(false);
+    }
+    let max_len = usize::from(surface_rect.right().saturating_sub(x.max(surface_rect.x)));
+    let clipped = chars[start..].iter().take(max_len).collect::<String>();
+    if clipped.is_empty() {
+        return Ok(false);
+    }
+    queue_render_style(stdout, style)?;
+    queue!(stdout, MoveTo(x.max(surface_rect.x), y), Print(clipped))
+        .context("failed queueing declarative text render op")?;
+    Ok(true)
+}
+
+fn queue_render_fill_rect<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    rect: ExtensionRect,
+    ch: char,
+    style: RenderStyle,
+) -> Result<bool> {
+    let Some(rect) = clip_extension_rect(rect, surface_rect) else {
+        return Ok(false);
+    };
+    if rect.is_empty() {
+        return Ok(false);
+    }
+    queue_render_style(stdout, style)?;
+    let row = ch.to_string().repeat(usize::from(rect.w));
+    for y in rect.y..rect.bottom() {
+        queue!(stdout, MoveTo(rect.x, y), Print(&row))
+            .context("failed queueing declarative fill render op")?;
+    }
+    Ok(true)
+}
+
+fn queue_render_border<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    rect: ExtensionRect,
+    glyphs: bmux_plugin::BorderGlyphs,
+    style: RenderStyle,
+) -> Result<bool> {
+    let Some(rect) = clip_extension_rect(rect, surface_rect) else {
+        return Ok(false);
+    };
+    if rect.w == 0 || rect.h == 0 {
+        return Ok(false);
+    }
+    queue_render_style(stdout, style)?;
+    if rect.h == 1 {
+        let row = glyphs.horizontal.to_string().repeat(usize::from(rect.w));
+        queue!(stdout, MoveTo(rect.x, rect.y), Print(row))
+            .context("failed queueing declarative single-row border render op")?;
+        return Ok(true);
+    }
+    if rect.w == 1 {
+        for y in rect.y..rect.bottom() {
+            queue!(stdout, MoveTo(rect.x, y), Print(glyphs.vertical))
+                .context("failed queueing declarative single-column border render op")?;
+        }
+        return Ok(true);
+    }
+    let inner_width = usize::from(rect.w.saturating_sub(2));
+    let top = format!(
+        "{}{}{}",
+        glyphs.top_left,
+        glyphs.horizontal.to_string().repeat(inner_width),
+        glyphs.top_right
+    );
+    let bottom = format!(
+        "{}{}{}",
+        glyphs.bottom_left,
+        glyphs.horizontal.to_string().repeat(inner_width),
+        glyphs.bottom_right
+    );
+    queue!(stdout, MoveTo(rect.x, rect.y), Print(top))
+        .context("failed queueing declarative top border render op")?;
+    for y in rect.y.saturating_add(1)..rect.bottom().saturating_sub(1) {
+        queue!(stdout, MoveTo(rect.x, y), Print(glyphs.vertical))
+            .context("failed queueing declarative left border render op")?;
+        queue!(
+            stdout,
+            MoveTo(rect.right().saturating_sub(1), y),
+            Print(glyphs.vertical)
+        )
+        .context("failed queueing declarative right border render op")?;
+    }
+    queue!(
+        stdout,
+        MoveTo(rect.x, rect.bottom().saturating_sub(1)),
+        Print(bottom)
+    )
+    .context("failed queueing declarative bottom border render op")?;
+    Ok(true)
+}
+
+fn queue_render_cell_grid<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    x: u16,
+    y: u16,
+    rows: &[Vec<bmux_plugin::RenderCell>],
+) -> Result<bool> {
+    let mut wrote = false;
+    for (row_offset, row) in rows.iter().enumerate() {
+        let Ok(row_offset) = u16::try_from(row_offset) else {
+            break;
+        };
+        let cell_y = y.saturating_add(row_offset);
+        if cell_y < surface_rect.y || cell_y >= surface_rect.bottom() {
+            continue;
+        }
+        for (col_offset, cell) in row.iter().enumerate() {
+            let Ok(col_offset) = u16::try_from(col_offset) else {
+                break;
+            };
+            let cell_x = x.saturating_add(col_offset);
+            if cell_x < surface_rect.x || cell_x >= surface_rect.right() {
+                continue;
+            }
+            queue_render_style(stdout, cell.style)?;
+            queue!(stdout, MoveTo(cell_x, cell_y), Print(cell.ch))
+                .context("failed queueing declarative cell-grid render op")?;
+            wrote = true;
+        }
+    }
+    Ok(wrote)
+}
+
+fn render_op_intersects_damage(op: &RenderOp, damage: &RenderDamage) -> bool {
+    match damage {
+        RenderDamage::None => false,
+        RenderDamage::FullSurface => true,
+        RenderDamage::Regions(regions) => regions
+            .iter()
+            .copied()
+            .any(|region| render_op_bounds(op).intersects(region)),
+    }
+}
+
+fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
+    match op {
+        RenderOp::TextRun { x, y, text, .. } => ExtensionRect {
+            x: *x,
+            y: *y,
+            w: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
+            h: 1,
+        },
+        RenderOp::FillRect { rect, .. } | RenderOp::Border { rect, .. } => *rect,
+        RenderOp::CellGrid { x, y, rows } => ExtensionRect {
+            x: *x,
+            y: *y,
+            w: rows
+                .iter()
+                .map(Vec::len)
+                .max()
+                .and_then(|width| u16::try_from(width).ok())
+                .unwrap_or(u16::MAX),
+            h: u16::try_from(rows.len()).unwrap_or(u16::MAX),
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -851,10 +1093,6 @@ pub fn render_attach_scene<W: io::Write>(
                 w: rect.w,
                 h: rect.h,
             };
-            // Re-bind through `&mut dyn io::Write` so the extension
-            // trait's object-safe signature sees a dyn writer
-            // regardless of the concrete `W` the caller passed.
-            let mut dyn_writer: &mut dyn io::Write = stdout;
             for ext in render_extensions {
                 let damage = if frame_damage.content_surface_damaged(pane_id) {
                     RenderDamage::FullSurface
@@ -868,15 +1106,29 @@ pub fn render_attach_scene<W: io::Write>(
                 if damage.is_none() {
                     continue;
                 }
-                if let Err(err) =
-                    ext.render_surface(&mut dyn_writer, surface.id, &ext_rect, &damage)
-                {
-                    tracing::warn!(
-                        extension = ext.name(),
-                        surface_id = %surface.id,
-                        error = %err,
-                        "render extension render_surface failed",
-                    );
+                if let Some(ops) = ext.render_ops(surface.id, &ext_rect, &damage) {
+                    if let Err(err) = queue_render_ops(stdout, ext_rect, &damage, &ops) {
+                        tracing::warn!(
+                            extension = ext.name(),
+                            surface_id = %surface.id,
+                            error = %err,
+                            "render extension render_ops failed",
+                        );
+                    }
+                } else {
+                    // Re-bind through `&mut dyn io::Write` so the extension
+                    // trait's object-safe signature sees a dyn writer
+                    // regardless of the concrete `W` the caller passed.
+                    let dyn_writer: &mut dyn io::Write = stdout;
+                    if let Err(err) = ext.render_surface(dyn_writer, surface.id, &ext_rect, &damage)
+                    {
+                        tracing::warn!(
+                            extension = ext.name(),
+                            surface_id = %surface.id,
+                            error = %err,
+                            "render extension render_surface failed",
+                        );
+                    }
                 }
             }
         }
@@ -1038,7 +1290,7 @@ mod tests {
         AttachFocusTarget, AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface,
         AttachSurfaceKind, PaneState, PaneSummary,
     };
-    use bmux_plugin::{ExtensionRect, RenderDamage};
+    use bmux_plugin::{ExtensionRect, RenderColor, RenderDamage, RenderOp, RenderStyle};
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
     use crossterm::style::Print;
@@ -1520,6 +1772,110 @@ mod tests {
 
         let rendered = String::from_utf8(output).expect("render output should be utf8");
         assert!(rendered.contains("\x1b[0;39;48;2;25;0;0m"));
+    }
+
+    #[test]
+    fn render_attach_scene_prefers_declarative_render_extension_ops() {
+        use bmux_plugin::AttachRenderExtension;
+        use std::io;
+        use std::sync::Arc;
+
+        struct DeclarativeExtension;
+
+        impl AttachRenderExtension for DeclarativeExtension {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "test.declarative"
+            }
+
+            fn render_surface(
+                &self,
+                _stdout: &mut dyn io::Write,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> io::Result<bool> {
+                panic!("imperative render_surface should not be called when render_ops is Some")
+            }
+
+            fn render_ops(
+                &self,
+                _surface_id: Uuid,
+                _surface_rect: &ExtensionRect,
+                _damage: &RenderDamage,
+            ) -> Option<Vec<RenderOp>> {
+                Some(vec![RenderOp::TextRun {
+                    x: 2,
+                    y: 1,
+                    text: "OPS".to_string(),
+                    style: RenderStyle {
+                        fg: Some(RenderColor::Rgb { r: 1, g: 2, b: 3 }),
+                        bg: None,
+                        bold: true,
+                    },
+                }])
+            }
+        }
+
+        let pane_id = Uuid::from_u128(170);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(171),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 20,
+                    h: 5,
+                },
+                content_rect: AttachRect {
+                    x: 1,
+                    y: 2,
+                    w: 18,
+                    h: 3,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        pane_buffers.insert(pane_id, PaneRenderBuffer::default());
+        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
+            vec![Arc::new(DeclarativeExtension) as Arc<dyn AttachRenderExtension>];
+
+        let mut output = Vec::new();
+        let _ = render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (80, 24),
+            &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &extensions,
+        )
+        .expect("render should succeed");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        assert!(rendered.contains("OPS"));
+        assert!(rendered.contains("\x1b[38;2;1;2;3m"));
+        assert!(rendered.contains("\x1b[1m"));
     }
 
     #[test]

@@ -60,8 +60,9 @@ pub use registry::{
     ServiceProvider,
 };
 pub use render::{
-    AttachRenderExtension, ExtensionRect, RenderDamage, RenderExtensionRegistry,
-    global_render_extension_registry, register_render_extension, registered_render_extensions,
+    AttachRenderExtension, BorderGlyphs, ExtensionRect, RenderCell, RenderColor, RenderDamage,
+    RenderExtensionRegistry, RenderOp, RenderStyle, global_render_extension_registry,
+    register_render_extension, registered_render_extensions,
 };
 pub use service_location::{ServiceLocation, ServiceLocationMap, global_service_locations};
 pub use startup_gate::{
