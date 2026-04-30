@@ -34,10 +34,15 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use bmux_plugin::{AttachRenderExtension, ExtensionRect, RenderDamage};
+use bmux_plugin::{
+    AttachRenderExtension, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
+    RenderColor, RenderDamage, RenderOp, RenderStyle,
+};
+use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
-    DecorationScene, PaintCommand, Rect as SceneRect, STATE_KIND as SCENE_STATE_KIND,
-    SurfaceDecoration,
+    BorderGlyphs as SceneBorderGlyphs, Cell as SceneCell, Color as SceneColor, DecorationScene,
+    GradientAxis, NamedColor, PaintCommand, Rect as SceneRect, STATE_KIND as SCENE_STATE_KIND,
+    Style as SceneStyle, SurfaceDecoration,
 };
 use bmux_scene_protocol_render::paint::apply_paint_commands;
 use uuid::Uuid;
@@ -106,6 +111,11 @@ impl AttachRenderExtension for DecorationRenderExtension {
         decoration_surface_damage(previous, current)
     }
 
+    fn render_revision(&self, _surface_id: Uuid) -> Option<u64> {
+        let cache = self.cache.lock().ok()?;
+        Some(cache.revision)
+    }
+
     fn render_surface(
         &self,
         stdout: &mut dyn io::Write,
@@ -141,6 +151,33 @@ impl AttachRenderExtension for DecorationRenderExtension {
             .map_err(|err| io::Error::other(err.to_string()))?;
         cache.mark_rendered(surface_id);
         Ok(rendered)
+    }
+
+    fn render_ops(
+        &self,
+        surface_id: Uuid,
+        _surface_rect: &ExtensionRect,
+        damage: &RenderDamage,
+    ) -> Option<Vec<RenderOp>> {
+        let Ok(mut cache) = self.cache.lock() else {
+            return Some(Vec::new());
+        };
+        let Some(surface) = cache.surface(&surface_id) else {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        };
+        if surface.paint_commands.is_empty() || damage.is_none() {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        }
+        let surface = filter_surface_for_damage(surface, damage);
+        if surface.paint_commands.is_empty() {
+            cache.mark_rendered(surface_id);
+            return Some(Vec::new());
+        }
+        let ops = render_ops_for_surface(&surface)?;
+        cache.mark_rendered(surface_id);
+        Some(ops)
     }
 
     fn content_rect_override(&self, surface_id: Uuid) -> Option<ExtensionRect> {
@@ -206,6 +243,207 @@ fn filter_surface_for_damage(
         .cloned()
         .collect();
     filtered
+}
+
+fn render_ops_for_surface(surface: &SurfaceDecoration) -> Option<Vec<RenderOp>> {
+    let mut ordered: Vec<(usize, &PaintCommand)> =
+        surface.paint_commands.iter().enumerate().collect();
+    ordered.sort_by_key(|(index, command)| (paint_command_z(command), *index));
+
+    let mut ops = Vec::new();
+    for (_, command) in ordered {
+        push_render_ops_for_command(&mut ops, command)?;
+    }
+    Some(ops)
+}
+
+fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) -> Option<()> {
+    match command {
+        PaintCommand::Text {
+            col,
+            row,
+            text,
+            style,
+            ..
+        } => {
+            if text.is_empty() {
+                return Some(());
+            }
+            ops.push(RenderOp::TextRun {
+                x: *col,
+                y: *row,
+                text: text.clone(),
+                style: render_style_from_scene(style)?,
+            });
+        }
+        PaintCommand::FilledRect {
+            rect, glyph, style, ..
+        } => {
+            if rect.w == 0 || rect.h == 0 || glyph.is_empty() {
+                return Some(());
+            }
+            ops.push(RenderOp::FillRect {
+                rect: extension_rect_from_scene(rect),
+                ch: single_char(glyph)?,
+                style: render_style_from_scene(style)?,
+            });
+        }
+        PaintCommand::GradientRun {
+            col,
+            row,
+            text,
+            axis,
+            from_style,
+            to_style,
+            ..
+        } => {
+            if text.is_empty() {
+                return Some(());
+            }
+            if axis != &GradientAxis::Horizontal || from_style != to_style {
+                return None;
+            }
+            ops.push(RenderOp::TextRun {
+                x: *col,
+                y: *row,
+                text: text.clone(),
+                style: render_style_from_scene(from_style)?,
+            });
+        }
+        PaintCommand::CellGrid {
+            origin_col,
+            origin_row,
+            cols,
+            cells,
+            ..
+        } => {
+            if *cols == 0 || cells.is_empty() {
+                return Some(());
+            }
+            ops.push(RenderOp::CellGrid {
+                x: *origin_col,
+                y: *origin_row,
+                rows: render_cell_grid_rows(*cols, cells)?,
+            });
+        }
+        PaintCommand::BoxBorder {
+            rect,
+            glyphs,
+            style,
+            ..
+        } => {
+            if rect.w < 2 || rect.h < 2 || matches!(glyphs, SceneBorderGlyphs::None) {
+                return Some(());
+            }
+            ops.push(RenderOp::Border {
+                rect: extension_rect_from_scene(rect),
+                glyphs: render_border_glyphs(glyphs)?,
+                style: render_style_from_scene(style)?,
+            });
+        }
+    }
+    Some(())
+}
+
+const fn paint_command_z(command: &PaintCommand) -> i16 {
+    match command {
+        PaintCommand::Text { z, .. }
+        | PaintCommand::FilledRect { z, .. }
+        | PaintCommand::GradientRun { z, .. }
+        | PaintCommand::CellGrid { z, .. }
+        | PaintCommand::BoxBorder { z, .. } => *z,
+    }
+}
+
+fn render_style_from_scene(style: &SceneStyle) -> Option<RenderStyle> {
+    if style.underline
+        || style.italic
+        || style.reverse
+        || style.dim
+        || style.blink
+        || style.strikethrough
+    {
+        return None;
+    }
+    Some(RenderStyle {
+        fg: style.fg.as_ref().map(render_color_from_scene),
+        bg: style.bg.as_ref().map(render_color_from_scene),
+        bold: style.bold,
+    })
+}
+
+fn render_color_from_scene(color: &SceneColor) -> RenderColor {
+    match color {
+        SceneColor::Default | SceneColor::Reset => RenderColor::Default,
+        SceneColor::Indexed { index } => RenderColor::Indexed(*index),
+        SceneColor::Rgb { r, g, b } => RenderColor::Rgb {
+            r: *r,
+            g: *g,
+            b: *b,
+        },
+        SceneColor::Named { name } => RenderColor::Indexed(named_color_index(*name)),
+    }
+}
+
+const fn named_color_index(color: NamedColor) -> u8 {
+    match color {
+        NamedColor::Black => 0,
+        NamedColor::Red => 1,
+        NamedColor::Green => 2,
+        NamedColor::Yellow => 3,
+        NamedColor::Blue => 4,
+        NamedColor::Magenta => 5,
+        NamedColor::Cyan => 6,
+        NamedColor::White => 7,
+        NamedColor::BrightBlack => 8,
+        NamedColor::BrightRed => 9,
+        NamedColor::BrightGreen => 10,
+        NamedColor::BrightYellow => 11,
+        NamedColor::BrightBlue => 12,
+        NamedColor::BrightMagenta => 13,
+        NamedColor::BrightCyan => 14,
+        NamedColor::BrightWhite => 15,
+    }
+}
+
+fn render_cell_grid_rows(cols: u16, cells: &[SceneCell]) -> Option<Vec<Vec<RenderCell>>> {
+    let mut rows = Vec::new();
+    for row_cells in cells.chunks(usize::from(cols)) {
+        let mut row = Vec::with_capacity(row_cells.len());
+        for cell in row_cells {
+            if cell.glyph.is_empty() {
+                return None;
+            }
+            row.push(RenderCell {
+                ch: single_char(&cell.glyph)?,
+                style: render_style_from_scene(&cell.style)?,
+            });
+        }
+        rows.push(row);
+    }
+    Some(rows)
+}
+
+fn render_border_glyphs(glyphs: &SceneBorderGlyphs) -> Option<RenderBorderGlyphs> {
+    let glyphs = border_glyphs_corners_or_custom(glyphs)?;
+    Some(RenderBorderGlyphs {
+        top_left: single_char(glyphs.top_left)?,
+        top_right: single_char(glyphs.top_right)?,
+        bottom_left: single_char(glyphs.bottom_left)?,
+        bottom_right: single_char(glyphs.bottom_right)?,
+        horizontal: single_char(glyphs.horizontal)?,
+        vertical: single_char(glyphs.vertical)?,
+    })
+}
+
+fn single_char(value: &str) -> Option<char> {
+    let mut chars = value.chars();
+    let ch = chars.next()?;
+    if chars.next().is_none() {
+        Some(ch)
+    } else {
+        None
+    }
 }
 
 fn paint_command_damage(command: &PaintCommand) -> impl Iterator<Item = ExtensionRect> + '_ {
@@ -378,4 +616,190 @@ fn spawn_scene_subscriber(cache: Arc<Mutex<DecorationRendererCache>>) {
             tracing::debug!("decoration render extension subscriber loop exited");
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scene_style() -> SceneStyle {
+        SceneStyle {
+            fg: None,
+            bg: None,
+            bold: false,
+            underline: false,
+            italic: false,
+            reverse: false,
+            dim: false,
+            blink: false,
+            strikethrough: false,
+        }
+    }
+
+    fn surface(surface_id: Uuid, paint_commands: Vec<PaintCommand>) -> SurfaceDecoration {
+        SurfaceDecoration {
+            surface_id,
+            rect: SceneRect {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 10,
+            },
+            content_rect: SceneRect {
+                x: 1,
+                y: 1,
+                w: 18,
+                h: 8,
+            },
+            paint_commands,
+            interactive_regions: Vec::new(),
+        }
+    }
+
+    fn extension_with_surface(
+        surface_id: Uuid,
+        paint_commands: Vec<PaintCommand>,
+    ) -> (
+        DecorationRenderExtension,
+        Arc<Mutex<DecorationRendererCache>>,
+    ) {
+        let cache = Arc::new(Mutex::new(DecorationRendererCache {
+            revision: 7,
+            surfaces: BTreeMap::from([(surface_id, surface(surface_id, paint_commands))]),
+            rendered_surfaces: BTreeMap::new(),
+        }));
+        let extension = DecorationRenderExtension {
+            name: "test.decoration.renderer".to_string(),
+            cache: cache.clone(),
+        };
+        (extension, cache)
+    }
+
+    #[test]
+    fn render_ops_converts_supported_text_and_marks_rendered() {
+        let surface_id = Uuid::from_u128(1);
+        let (extension, cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::Text {
+                col: 2,
+                row: 3,
+                z: 0,
+                text: "hello".to_string(),
+                style: scene_style(),
+            }],
+        );
+
+        assert_eq!(extension.render_revision(surface_id), Some(7));
+        let ops = extension
+            .render_ops(
+                surface_id,
+                &ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+                &RenderDamage::FullSurface,
+            )
+            .expect("supported decoration should use declarative ops");
+
+        assert_eq!(
+            ops,
+            vec![RenderOp::TextRun {
+                x: 2,
+                y: 3,
+                text: "hello".to_string(),
+                style: RenderStyle::default(),
+            }]
+        );
+        assert!(
+            cache
+                .lock()
+                .expect("cache should lock")
+                .rendered_surface(&surface_id)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn render_ops_sorts_by_z_before_returning_ops() {
+        let surface_id = Uuid::from_u128(2);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![
+                PaintCommand::Text {
+                    col: 0,
+                    row: 0,
+                    z: 10,
+                    text: "high".to_string(),
+                    style: scene_style(),
+                },
+                PaintCommand::Text {
+                    col: 0,
+                    row: 1,
+                    z: 0,
+                    text: "low".to_string(),
+                    style: scene_style(),
+                },
+            ],
+        );
+
+        let ops = extension
+            .render_ops(
+                surface_id,
+                &ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+                &RenderDamage::FullSurface,
+            )
+            .expect("supported decoration should use declarative ops");
+
+        assert!(matches!(
+            &ops[..],
+            [RenderOp::TextRun { text: low, .. }, RenderOp::TextRun { text: high, .. }]
+                if low == "low" && high == "high"
+        ));
+    }
+
+    #[test]
+    fn render_ops_falls_back_for_lossy_style_without_marking_rendered() {
+        let surface_id = Uuid::from_u128(3);
+        let mut style = scene_style();
+        style.underline = true;
+        let (extension, cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::Text {
+                col: 2,
+                row: 3,
+                z: 0,
+                text: "hello".to_string(),
+                style,
+            }],
+        );
+
+        assert!(
+            extension
+                .render_ops(
+                    surface_id,
+                    &ExtensionRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 10,
+                    },
+                    &RenderDamage::FullSurface,
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .lock()
+                .expect("cache should lock")
+                .rendered_surface(&surface_id)
+                .is_none()
+        );
+    }
 }
