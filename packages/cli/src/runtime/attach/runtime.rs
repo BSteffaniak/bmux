@@ -60,8 +60,8 @@ use super::prompt_ui::{
     prompt_accepts_key_kind,
 };
 use super::render::{
-    AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
-    render_attach_scene, visible_scene_pane_ids,
+    AttachLayer, AttachLayerSurface, FrameDamage, append_pane_output, opaque_row_text,
+    queue_layer_fill, render_attach_scene, visible_scene_pane_ids,
 };
 use super::state::{
     AttachEventAction, AttachExitReason, AttachMouseResizeAxisDrag, AttachMouseResizeDrag,
@@ -4655,9 +4655,26 @@ pub fn render_attach_frame(
     }
     let (status_top_inset, status_bottom_inset) =
         status_insets_for_position(view_state.status_position);
-    let render_scene = view_state.dirty.full_pane_redraw
-        || view_state.dirty.extension_needs_redraw
-        || !view_state.dirty.pane_dirty_ids.is_empty();
+    let mut frame_damage = if view_state.dirty.full_pane_redraw {
+        FrameDamage::full_frame()
+    } else {
+        FrameDamage::default()
+    };
+    for pane_id in &view_state.dirty.pane_dirty_ids {
+        frame_damage.mark_content_surface(*pane_id);
+    }
+    if view_state.dirty.extension_needs_redraw {
+        for surface in &layout_state.scene.surfaces {
+            frame_damage.mark_extension_surface(surface.id);
+        }
+    }
+    if view_state.dirty.status_needs_redraw {
+        frame_damage.mark_status();
+    }
+    if view_state.dirty.overlay_needs_redraw {
+        frame_damage.mark_overlay();
+    }
+    let render_scene = !frame_damage.is_empty();
     let appearance_mode_id = if view_state.help_overlay_open {
         "help"
     } else if view_state.prompt.is_active() {
@@ -4681,9 +4698,7 @@ pub fn render_attach_frame(
             &layout_state.scene,
             &layout_state.panes,
             &mut view_state.pane_buffers,
-            &view_state.dirty.pane_dirty_ids,
-            view_state.dirty.full_pane_redraw,
-            view_state.dirty.extension_needs_redraw,
+            &frame_damage,
             status_top_inset,
             status_bottom_inset,
             view_state.scrollback_active,

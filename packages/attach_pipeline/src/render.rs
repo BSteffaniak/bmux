@@ -16,6 +16,89 @@ use std::io;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameDamage {
+    full_frame: bool,
+    content_surfaces: BTreeSet<Uuid>,
+    extension_surfaces: BTreeSet<Uuid>,
+    status: bool,
+    overlay: bool,
+}
+
+impl FrameDamage {
+    #[must_use]
+    pub const fn full_frame() -> Self {
+        Self {
+            full_frame: true,
+            content_surfaces: BTreeSet::new(),
+            extension_surfaces: BTreeSet::new(),
+            status: true,
+            overlay: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_full_frame(&self) -> bool {
+        self.full_frame
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.full_frame
+            && self.content_surfaces.is_empty()
+            && self.extension_surfaces.is_empty()
+            && !self.status
+            && !self.overlay
+    }
+
+    pub fn mark_full_frame(&mut self) {
+        *self = Self::full_frame();
+    }
+
+    pub fn mark_content_surface(&mut self, pane_id: Uuid) {
+        self.content_surfaces.insert(pane_id);
+    }
+
+    pub fn mark_extension_surface(&mut self, surface_id: Uuid) {
+        self.extension_surfaces.insert(surface_id);
+    }
+
+    pub const fn mark_status(&mut self) {
+        self.status = true;
+    }
+
+    pub const fn mark_overlay(&mut self) {
+        self.overlay = true;
+    }
+
+    #[must_use]
+    pub fn content_surface_damaged(&self, pane_id: Uuid) -> bool {
+        self.full_frame || self.content_surfaces.contains(&pane_id)
+    }
+
+    #[must_use]
+    pub fn extension_surface_damaged(&self, surface_id: Uuid, pane_id: Uuid) -> bool {
+        self.full_frame
+            || self.extension_surfaces.contains(&surface_id)
+            || self.content_surfaces.contains(&pane_id)
+    }
+
+    #[must_use]
+    pub const fn status_damaged(&self) -> bool {
+        self.full_frame || self.status
+    }
+
+    #[must_use]
+    pub const fn overlay_damaged(&self) -> bool {
+        self.full_frame || self.overlay
+    }
+
+    #[must_use]
+    pub const fn content_surfaces(&self) -> &BTreeSet<Uuid> {
+        &self.content_surfaces
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AttachLayer {
@@ -346,9 +429,7 @@ pub fn render_attach_scene<W: io::Write>(
     scene: &AttachScene,
     _panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
-    dirty_pane_ids: &BTreeSet<Uuid>,
-    full_pane_redraw: bool,
-    extension_redraw: bool,
+    frame_damage: &FrameDamage,
     status_top_inset: u16,
     status_bottom_inset: u16,
     scrollback_active: bool,
@@ -366,7 +447,7 @@ pub fn render_attach_scene<W: io::Write>(
     }
 
     let mut cursor_state = None;
-    if full_pane_redraw {
+    if frame_damage.is_full_frame() {
         let clear_start = status_top_inset.min(rows);
         let clear_end = rows.saturating_sub(status_bottom_inset).max(clear_start);
         for y in clear_start..clear_end {
@@ -423,8 +504,8 @@ pub fn render_attach_scene<W: io::Write>(
         if rect.w < 2 || rect.h < 2 {
             continue;
         }
-        let should_draw_content = full_pane_redraw || dirty_pane_ids.contains(&pane_id);
-        let should_draw_extensions = should_draw_content || extension_redraw;
+        let should_draw_content = frame_damage.content_surface_damaged(pane_id);
+        let should_draw_extensions = frame_damage.extension_surface_damaged(surface.id, pane_id);
 
         // Defer drawing pane content while the inner application is inside a
         // DEC mode 2026 synchronized update.  The server's byte-by-byte CSI
@@ -435,7 +516,7 @@ pub fn render_attach_scene<W: io::Write>(
         // screen area has already been cleared and must be repopulated.
         let sync_deferred = pane_buffers
             .get(&pane_id)
-            .is_some_and(|b| b.sync_update_in_progress && !full_pane_redraw);
+            .is_some_and(|b| b.sync_update_in_progress && !frame_damage.is_full_frame());
 
         let focus = surface.cursor_owner
             || focused_surface_id == Some(surface.id)
@@ -456,7 +537,7 @@ pub fn render_attach_scene<W: io::Write>(
             // regardless of the concrete `W` the caller passed.
             let mut dyn_writer: &mut dyn io::Write = stdout;
             for ext in render_extensions {
-                let damage = if full_pane_redraw || dirty_pane_ids.contains(&pane_id) {
+                let damage = if frame_damage.content_surface_damaged(pane_id) {
                     bmux_plugin::RenderDamage::FullSurface
                 } else {
                     ext.surface_damage(surface.id, &ext_rect)
@@ -622,8 +703,8 @@ pub fn render_attach_scene<W: io::Write>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
-        render_attach_scene,
+        AttachLayer, AttachLayerSurface, FrameDamage, append_pane_output, opaque_row_text,
+        queue_layer_fill, render_attach_scene,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -636,8 +717,14 @@ mod tests {
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
     use crossterm::style::Print;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use uuid::Uuid;
+
+    fn content_damage(pane_id: Uuid) -> FrameDamage {
+        let mut damage = FrameDamage::default();
+        damage.mark_content_surface(pane_id);
+        damage
+    }
 
     fn screen_row(screen: &vt100::Screen, row: u16, width: u16) -> String {
         let mut line = String::new();
@@ -813,9 +900,7 @@ mod tests {
             &scene,
             &[],
             &mut pane_buffers,
-            &BTreeSet::from([pane_id]),
-            true,
-            true,
+            &FrameDamage::full_frame(),
             1,
             0,
             true,
@@ -877,9 +962,7 @@ mod tests {
             &scene,
             &[],
             &mut pane_buffers,
-            &BTreeSet::from([pane_id]),
-            true,
-            true,
+            &FrameDamage::full_frame(),
             1,
             0,
             true,
@@ -953,9 +1036,7 @@ mod tests {
             &scene,
             &[],
             &mut pane_buffers,
-            &BTreeSet::from([pane_id]),
-            true,
-            true,
+            &FrameDamage::full_frame(),
             0,
             0,
             false,
@@ -1093,9 +1174,7 @@ mod tests {
             &scene,
             &panes,
             &mut pane_buffers,
-            &BTreeSet::from([pane_id]),
-            true,
-            true,
+            &FrameDamage::full_frame(),
             1,
             0,
             false,
@@ -1177,9 +1256,7 @@ mod tests {
             &scene,
             &[],
             &mut pane_buffers,
-            &BTreeSet::from([pane_id]),
-            true, // full redraw
-            true,
+            &FrameDamage::full_frame(),
             1,
             0,
             false,
@@ -1208,9 +1285,7 @@ mod tests {
             &scene,
             &[],
             &mut pane_buffers,
-            &BTreeSet::from([pane_id]),
-            false, // incremental — sync deferral should kick in
-            false,
+            &content_damage(pane_id),
             1,
             0,
             false,
@@ -1243,9 +1318,7 @@ mod tests {
             &scene,
             &[],
             &mut pane_buffers,
-            &BTreeSet::from([pane_id]),
-            false,
-            false,
+            &content_damage(pane_id),
             1,
             0,
             false,
@@ -1310,9 +1383,7 @@ mod tests {
             &scene,
             &[],
             &mut pane_buffers,
-            &BTreeSet::from([pane_id]),
-            true, // full_pane_redraw — must draw even if sync in progress
-            true,
+            &FrameDamage::full_frame(),
             1,
             0,
             false,
@@ -1461,9 +1532,7 @@ mod tests {
             &scene,
             &panes,
             &mut pane_buffers,
-            &BTreeSet::from([pane_id]),
-            true,
-            true,
+            &FrameDamage::full_frame(),
             0,
             0,
             false,

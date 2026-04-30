@@ -4,7 +4,7 @@ use crate::reconcile::{
     attach_layout_requires_snapshot_hydration, attach_scene_revealed_pane_ids,
     resize_attach_parsers_for_scene_with_size,
 };
-use crate::render::{append_pane_output, render_attach_scene, visible_scene_pane_ids};
+use crate::render::{FrameDamage, append_pane_output, render_attach_scene, visible_scene_pane_ids};
 use crate::types::{AttachCursorState, PaneRenderBuffer};
 use crate::{mouse_protocol_encoding_to_ipc, mouse_protocol_mode_to_ipc};
 use anyhow::Result;
@@ -311,6 +311,16 @@ impl AttachScenePipeline {
             return Ok(None);
         };
 
+        let frame_damage = if self.full_pane_redraw {
+            FrameDamage::full_frame()
+        } else {
+            let mut damage = FrameDamage::default();
+            for pane_id in &self.dirty_pane_ids {
+                damage.mark_content_surface(*pane_id);
+            }
+            damage
+        };
+
         let mut frame_bytes = Vec::new();
         queue!(frame_bytes, BeginSynchronizedUpdate, SavePosition, Hide)?;
         let cursor_state = render_attach_scene(
@@ -318,9 +328,7 @@ impl AttachScenePipeline {
             &layout_state.scene,
             &layout_state.panes,
             &mut self.pane_buffers,
-            &self.dirty_pane_ids,
-            self.full_pane_redraw,
-            self.full_pane_redraw,
+            &frame_damage,
             self.viewport.status_top_inset,
             self.viewport.status_bottom_inset,
             false,
