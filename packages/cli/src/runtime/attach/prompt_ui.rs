@@ -591,6 +591,12 @@ impl AttachPromptState {
         PromptKeyDisposition::Consumed
     }
 
+    #[must_use]
+    pub fn overlay_surface(&self) -> Option<AttachSurface> {
+        prompt_overlay_layout(self.active.as_ref().map(|active| &active.envelope.request))
+            .map(|layout| layout.surface)
+    }
+
     #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are bounded by terminal::size() u16 dimensions.
     pub fn queue_attach_prompt_overlay(
         &mut self,

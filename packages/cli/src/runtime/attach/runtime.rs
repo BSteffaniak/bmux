@@ -6,9 +6,10 @@ use bmux_attach_layout_protocol::attach_layout_protocol::{
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
     apply_attach_output_chunk_with, attach_scene_damage_between,
+    attach_scene_damage_for_absolute_rects,
 };
 use bmux_attach_pipeline::{
-    AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy,
+    AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy, DamageRect,
 };
 use bmux_client::{
     AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, ClientError,
@@ -4518,7 +4519,7 @@ pub fn handle_help_overlay_key_event(
             view_state.help_overlay_open = false;
             view_state.help_overlay_scroll = 0;
             view_state.dirty.status_needs_redraw = true;
-            view_state.dirty.full_pane_redraw = true;
+            view_state.dirty.overlay_needs_redraw = true;
             true
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -4722,6 +4723,34 @@ pub fn queue_attach_help_overlay(
     Ok(())
 }
 
+const fn attach_surface_damage_rect(surface: &bmux_ipc::AttachSurface) -> DamageRect {
+    DamageRect::new(
+        surface.rect.x,
+        surface.rect.y,
+        surface.rect.w,
+        surface.rect.h,
+    )
+}
+
+fn overlay_rect_damage(
+    layout_state: &AttachLayoutState,
+    previous: Option<&bmux_ipc::AttachSurface>,
+    current: Option<&bmux_ipc::AttachSurface>,
+    policy: DamageCoalescingPolicy,
+) -> bmux_attach_pipeline::FrameDamage {
+    if previous == current {
+        return bmux_attach_pipeline::FrameDamage::default();
+    }
+    let mut rects = Vec::new();
+    if let Some(surface) = previous {
+        rects.push(attach_surface_damage_rect(surface));
+    }
+    if let Some(surface) = current {
+        rects.push(attach_surface_damage_rect(surface));
+    }
+    attach_scene_damage_for_absolute_rects(&layout_state.scene, &rects, policy)
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn render_attach_frame(
     client: &mut StreamingBmuxClient,
@@ -4742,7 +4771,25 @@ pub fn render_attach_frame(
         max_rects: damage_config.max_rects,
         max_area_percent: damage_config.max_area_percent,
     };
-    let frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
+    let current_help_overlay_surface = if view_state.help_overlay_open {
+        help_overlay_surface(help_lines)
+    } else {
+        None
+    };
+    let current_prompt_overlay_surface = view_state.prompt.overlay_surface();
+    let mut frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
+    frame_damage.merge_from(&overlay_rect_damage(
+        layout_state,
+        view_state.last_help_overlay_surface.as_ref(),
+        current_help_overlay_surface.as_ref(),
+        damage_policy,
+    ));
+    frame_damage.merge_from(&overlay_rect_damage(
+        layout_state,
+        view_state.last_prompt_overlay_surface.as_ref(),
+        current_prompt_overlay_surface.as_ref(),
+        damage_policy,
+    ));
     let damage_stats = frame_damage.stats();
 
     if view_state.dirty.status_needs_redraw {
@@ -4872,8 +4919,8 @@ pub fn render_attach_frame(
     let mut overlay_cursor_state = None;
     let help_overlay_needs_render =
         view_state.help_overlay_open && (frame_damage.overlay_damaged() || render_scene);
-    if help_overlay_needs_render && let Some(help_surface) = help_overlay_surface(help_lines) {
-        queue_attach_help_overlay(&mut frame_bytes, &help_surface, help_lines, help_scroll)?;
+    if help_overlay_needs_render && let Some(help_surface) = current_help_overlay_surface.as_ref() {
+        queue_attach_help_overlay(&mut frame_bytes, help_surface, help_lines, help_scroll)?;
     }
     if view_state.prompt.is_active() {
         // The prompt renderer owns the prompt cursor state, so keep drawing it on
@@ -4964,6 +5011,8 @@ pub fn render_attach_frame(
         full_surface_fallbacks: damage_stats.full_surface_count,
         full_frame_fallback: damage_stats.full_frame,
     };
+    view_state.last_help_overlay_surface = current_help_overlay_surface;
+    view_state.last_prompt_overlay_surface = current_prompt_overlay_surface;
     view_state.dirty.clear_frame_damage();
     Ok(stats)
 }
@@ -6422,12 +6471,10 @@ pub async fn handle_attach_terminal_event(
                 }
                 if matches!(action, RuntimeAction::ShowHelp) {
                     view_state.help_overlay_open = !view_state.help_overlay_open;
-                    if view_state.help_overlay_open {
-                        view_state.dirty.overlay_needs_redraw = true;
-                    } else {
+                    if !view_state.help_overlay_open {
                         view_state.help_overlay_scroll = 0;
-                        view_state.dirty.full_pane_redraw = true;
                     }
+                    view_state.dirty.overlay_needs_redraw = true;
                     view_state.dirty.status_needs_redraw = true;
                     continue;
                 }
@@ -6438,7 +6485,7 @@ pub async fn handle_attach_terminal_event(
                         view_state.help_overlay_open = false;
                         view_state.help_overlay_scroll = 0;
                         view_state.dirty.status_needs_redraw = true;
-                        view_state.dirty.full_pane_redraw = true;
+                        view_state.dirty.overlay_needs_redraw = true;
                     }
                     continue;
                 }
@@ -6493,6 +6540,7 @@ pub async fn handle_attach_prompt_completion(
     view_state: &mut AttachViewState,
     completion: AttachPromptCompletion,
 ) -> std::result::Result<Option<AttachLoopControl>, ClientError> {
+    let mut requires_layout_refresh = false;
     match completion.origin {
         AttachPromptOrigin::External { response_tx, .. } => {
             let _ = response_tx.send(completion.response);
@@ -6555,6 +6603,7 @@ pub async fn handle_attach_prompt_completion(
                         Instant::now(),
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
+                    requires_layout_refresh = true;
                 } else {
                     view_state.set_transient_status(
                         "close pane canceled",
@@ -6567,7 +6616,11 @@ pub async fn handle_attach_prompt_completion(
     }
 
     view_state.dirty.status_needs_redraw = true;
-    view_state.dirty.full_pane_redraw = true;
+    view_state.dirty.overlay_needs_redraw = true;
+    if requires_layout_refresh {
+        view_state.dirty.layout_needs_refresh = true;
+        view_state.dirty.full_pane_redraw = true;
+    }
     Ok(None)
 }
 
@@ -10851,7 +10904,7 @@ mod tests {
     }
 
     #[test]
-    fn help_overlay_close_marks_full_redraw() {
+    fn help_overlay_close_marks_overlay_redraw_without_full_pane_redraw() {
         let mut view_state = AttachViewState::new(bmux_client::AttachOpenInfo {
             context_id: None,
             session_id: uuid::Uuid::new_v4(),
@@ -10877,7 +10930,52 @@ mod tests {
         assert!(!view_state.help_overlay_open);
         assert_eq!(view_state.help_overlay_scroll, 0);
         assert!(view_state.dirty.status_needs_redraw);
-        assert!(view_state.dirty.full_pane_redraw);
+        assert!(view_state.dirty.overlay_needs_redraw);
+        assert!(!view_state.dirty.full_pane_redraw);
+    }
+
+    #[test]
+    fn overlay_rect_damage_repaints_underlying_pane_rows() {
+        let view_state = attach_view_state_with_scrollback_fixture();
+        let layout_state = view_state.cached_layout_state.expect("layout state");
+        let pane_id = layout_state.focused_pane_id;
+        let previous_overlay = bmux_ipc::AttachSurface {
+            id: HELP_OVERLAY_SURFACE_ID,
+            kind: bmux_ipc::AttachSurfaceKind::Overlay,
+            layer: bmux_ipc::AttachLayer::Overlay,
+            z: i32::MAX,
+            rect: bmux_ipc::AttachRect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 3,
+            },
+            content_rect: bmux_ipc::AttachRect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 3,
+            },
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner: true,
+            pane_id: None,
+        };
+
+        let damage = overlay_rect_damage(
+            &layout_state,
+            Some(&previous_overlay),
+            None,
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(
+            damage.content_surface_rects(pane_id),
+            &[DamageRect::new(0, 0, 3, 2)]
+        );
+        assert!(!damage.is_full_frame());
     }
 
     #[test]

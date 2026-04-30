@@ -117,8 +117,17 @@ pub fn attach_scene_damage_between(
         }
     }
 
+    attach_scene_damage_for_absolute_rects(next, &absolute_damage, policy)
+}
+
+#[must_use]
+pub fn attach_scene_damage_for_absolute_rects(
+    scene: &AttachScene,
+    absolute_damage: &[DamageRect],
+    policy: DamageCoalescingPolicy,
+) -> FrameDamage {
     let mut damage = FrameDamage::default();
-    for surface in next
+    for surface in scene
         .surfaces
         .iter()
         .filter(|surface| surface_is_pane(surface))
@@ -128,7 +137,7 @@ pub fn attach_scene_damage_between(
         let Some(pane_id) = surface.pane_id else {
             continue;
         };
-        for rect in &absolute_damage {
+        for rect in absolute_damage {
             if let Some(intersection) = intersect_damage_rect(*rect, outer) {
                 damage.mark_extension_surface_rect(
                     surface.id,

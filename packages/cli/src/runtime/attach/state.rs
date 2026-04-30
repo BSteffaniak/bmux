@@ -9,7 +9,7 @@ use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use bmux_control_catalog_plugin_api::control_catalog_state::{
     ContextRow, ContextSessionBinding, SessionRow,
 };
-use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState, AttachScene};
+use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState, AttachScene, AttachSurface};
 use bmux_windows_plugin_api::windows_commands::PaneResizeDirection;
 use bmux_windows_plugin_api::windows_list::WindowListSnapshot;
 use crossterm::event::MouseEvent;
@@ -156,6 +156,8 @@ pub struct AttachViewState {
     pub status_position: StatusPosition,
     pub cached_status_line: Option<AttachStatusLine>,
     pub cached_layout_state: Option<AttachLayoutState>,
+    pub last_help_overlay_surface: Option<AttachSurface>,
+    pub last_prompt_overlay_surface: Option<AttachSurface>,
     pub last_cursor_state: Option<AttachCursorState>,
     pub force_cursor_move_next_frame: bool,
     pub mouse: AttachMouseState,
@@ -264,6 +266,8 @@ impl AttachViewState {
             status_position: StatusPosition::Bottom,
             cached_status_line: None,
             cached_layout_state: None,
+            last_help_overlay_surface: None,
+            last_prompt_overlay_surface: None,
             last_cursor_state: None,
             force_cursor_move_next_frame: false,
             mouse: AttachMouseState {
