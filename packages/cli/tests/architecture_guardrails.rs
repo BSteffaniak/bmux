@@ -1746,7 +1746,8 @@ fn core_service_descriptors_have_no_legacy_domain_host_interfaces() {
 /// `Request::ListSessions` / `Request::ListPanes` are absent from
 /// `bmux_ipc`. Session lifecycle and listing flow through
 /// typed-dispatch services owned by the sessions-plugin and the
-/// pane-runtime-plugin.
+/// pane-runtime-plugin; streaming lifecycle updates flow through
+/// generated `sessions-events` and the generic plugin-bus forwarder.
 #[test]
 fn session_lifecycle_ipc_variants_are_absent() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
@@ -1759,6 +1760,8 @@ fn session_lifecycle_ipc_variants_are_absent() {
         "ResponsePayload::SessionKilled {",
         "ResponsePayload::SessionList {",
         "ResponsePayload::PaneList {",
+        "Event::SessionCreated",
+        "Event::SessionRemoved",
     ];
     for marker in denied {
         assert!(

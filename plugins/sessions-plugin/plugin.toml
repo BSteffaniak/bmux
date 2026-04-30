@@ -22,6 +22,11 @@ capability   = "bmux.sessions.read"
 interface_id = "sessions-events"
 kind         = "event"
 
+[[event_publications]]
+delivery                     = "broadcast"
+forward_to_streaming_clients = true
+kind                         = "bmux.sessions/sessions-events"
+
 # CLI / keybinding surface. Each of these maps to the corresponding
 # typed service handler (`new-session`, etc.) so attach keybindings
 # and shell CLIs can invoke sessions-plugin behavior via

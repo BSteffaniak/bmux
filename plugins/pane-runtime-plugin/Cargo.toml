@@ -30,6 +30,7 @@ bmux_plugin_sdk = { workspace = true }
 bmux_recording_runtime = { workspace = true }
 bmux_session_models = { workspace = true }
 bmux_session_state = { workspace = true }
+bmux_sessions_plugin_api = { workspace = true }
 bmux_snapshot_runtime = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
 portable-pty = { workspace = true }
@@ -53,6 +54,7 @@ fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_permissions_plugin_api/fail-on-warnings",
+    "bmux_sessions_plugin_api/fail-on-warnings",
 ]
 image-registry = [
     "dep:bmux_image",

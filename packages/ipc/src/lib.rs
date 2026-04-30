@@ -1159,13 +1159,6 @@ pub enum Response {
 pub enum Event {
     ServerStarted,
     ServerStopping,
-    SessionCreated {
-        id: Uuid,
-        name: Option<String>,
-    },
-    SessionRemoved {
-        id: Uuid,
-    },
     ClientAttached {
         id: Uuid,
     },
@@ -1439,10 +1432,7 @@ mod tests {
 
     #[test]
     fn serializes_event_roundtrip() {
-        let event = Event::SessionCreated {
-            id: Uuid::new_v4(),
-            name: Some("ops".to_string()),
-        };
+        let event = Event::ServerStarted;
         let bytes = encode(&event).expect("event should encode");
         let decoded: Event = decode(&bytes).expect("event should decode");
         assert_eq!(decoded, event);
@@ -1757,13 +1747,7 @@ mod tests {
             },
             ResponsePayload::EventsSubscribed,
             ResponsePayload::EventBatch {
-                events: vec![
-                    Event::ServerStarted,
-                    Event::SessionCreated {
-                        id,
-                        name: Some("test".into()),
-                    },
-                ],
+                events: vec![Event::ServerStarted],
             },
             ResponsePayload::ServerStopping,
             ResponsePayload::ServiceInvoked {
@@ -1818,12 +1802,6 @@ mod tests {
         let variants: Vec<Event> = vec![
             Event::ServerStarted,
             Event::ServerStopping,
-            Event::SessionCreated {
-                id,
-                name: Some("test".into()),
-            },
-            Event::SessionCreated { id, name: None },
-            Event::SessionRemoved { id },
             Event::ClientAttached { id },
             Event::ClientDetached { id },
             Event::AttachViewChanged {
@@ -1929,17 +1907,13 @@ mod tests {
 
     #[test]
     fn recording_payload_all_variants_roundtrip() {
-        let id = Uuid::from_u128(1);
         let payloads: Vec<RecordingPayload> = vec![
             RecordingPayload::Bytes {
                 data: vec![1, 2, 3, 4, 5],
             },
             RecordingPayload::Bytes { data: vec![] },
             RecordingPayload::ServerEvent {
-                event: Event::SessionCreated {
-                    id,
-                    name: Some("test".into()),
-                },
+                event: Event::ServerStarted,
             },
             RecordingPayload::RequestStart {
                 request_id: 42,

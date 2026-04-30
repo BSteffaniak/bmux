@@ -314,8 +314,6 @@ pub(super) fn server_event_name(event: &bmux_client::ServerEvent) -> &'static st
     match event {
         bmux_client::ServerEvent::ServerStarted => "server_started",
         bmux_client::ServerEvent::ServerStopping => "server_stopping",
-        bmux_client::ServerEvent::SessionCreated { .. } => "session_created",
-        bmux_client::ServerEvent::SessionRemoved { .. } => "session_removed",
         bmux_client::ServerEvent::ClientAttached { .. } => "client_attached",
         bmux_client::ServerEvent::ClientDetached { .. } => "client_detached",
         bmux_client::ServerEvent::AttachViewChanged { .. } => "attach_view_changed",
@@ -333,6 +331,22 @@ pub(super) fn server_event_name(event: &bmux_client::ServerEvent) -> &'static st
 }
 
 fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
+    if kind == bmux_sessions_plugin_api::sessions_events::EVENT_KIND.as_str() {
+        return serde_json::from_slice::<bmux_sessions_plugin_api::sessions_events::SessionEvent>(
+            payload,
+        )
+        .map_or("plugin_bus_event", |event| match event {
+            bmux_sessions_plugin_api::sessions_events::SessionEvent::Created { .. } => {
+                "session_created"
+            }
+            bmux_sessions_plugin_api::sessions_events::SessionEvent::Removed { .. } => {
+                "session_removed"
+            }
+            bmux_sessions_plugin_api::sessions_events::SessionEvent::Selected { .. } => {
+                "plugin_bus_event"
+            }
+        });
+    }
     if kind == bmux_clients_plugin_api::clients_events::EVENT_KIND.as_str() {
         return serde_json::from_slice::<bmux_clients_plugin_api::clients_events::ClientEvent>(
             payload,

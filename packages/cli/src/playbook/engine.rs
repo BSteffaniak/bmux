@@ -3469,8 +3469,6 @@ fn event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
         (event, name),
         (bmux_ipc::Event::ServerStarted, "server_started")
             | (bmux_ipc::Event::ServerStopping, "server_stopping")
-            | (bmux_ipc::Event::SessionCreated { .. }, "session_created")
-            | (bmux_ipc::Event::SessionRemoved { .. }, "session_removed")
             | (bmux_ipc::Event::ClientAttached { .. }, "client_attached")
             | (bmux_ipc::Event::ClientDetached { .. }, "client_detached")
             | (
@@ -3496,7 +3494,7 @@ fn plugin_bus_event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
         return false;
     };
     if kind != bmux_clients_plugin_api::clients_events::EVENT_KIND.as_str() {
-        return false;
+        return session_plugin_bus_event_matches(kind, payload, name);
     }
     serde_json::from_slice::<bmux_clients_plugin_api::clients_events::ClientEvent>(payload).is_ok_and(
         |event| {
@@ -3524,6 +3522,25 @@ fn plugin_bus_event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
             )
         },
     )
+}
+
+fn session_plugin_bus_event_matches(kind: &str, payload: &[u8], name: &str) -> bool {
+    if kind != bmux_sessions_plugin_api::sessions_events::EVENT_KIND.as_str() {
+        return false;
+    }
+    serde_json::from_slice::<bmux_sessions_plugin_api::sessions_events::SessionEvent>(payload)
+        .is_ok_and(|event| {
+            matches!(
+                (event, name),
+                (
+                    bmux_sessions_plugin_api::sessions_events::SessionEvent::Created { .. },
+                    "session_created"
+                ) | (
+                    bmux_sessions_plugin_api::sessions_events::SessionEvent::Removed { .. },
+                    "session_removed"
+                )
+            )
+        })
 }
 
 #[cfg(test)]

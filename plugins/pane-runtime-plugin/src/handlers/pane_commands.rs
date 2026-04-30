@@ -12,6 +12,7 @@ use bmux_pane_runtime_plugin_api::pane_runtime_commands::{
 };
 use bmux_pane_runtime_state::PaneResizeDirection;
 use bmux_session_models::SessionId;
+use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -229,6 +230,15 @@ fn publish_wire_event(event: bmux_ipc::Event) {
     }
 }
 
+fn publish_session_removed_event(session_id: SessionId) {
+    let _ = bmux_plugin::global_event_bus().emit(
+        &sessions_events::EVENT_KIND,
+        SessionEvent::Removed {
+            session_id: session_id.0,
+        },
+    );
+}
+
 /// Bump a session's attach-view revision and publish the scene
 /// component update. Mirrors the server's
 /// `emit_attach_view_changed_for_layout` helper so plugin-side
@@ -412,7 +422,7 @@ pub fn close_pane(
         if had_attached_clients {
             publish_wire_event(bmux_ipc::Event::ClientDetached { id: session_id.0 });
         }
-        publish_wire_event(bmux_ipc::Event::SessionRemoved { id: session_id.0 });
+        publish_session_removed_event(session_id);
     }
 
     if !session_closed {
@@ -579,16 +589,15 @@ pub fn kill_session_runtime(
     runtime_handle.0.shutdown_removed_runtime(removed_runtime);
     attach_token_handle.0.remove_for_session(session_id);
 
-    if let Some(sink) = wire_sink {
-        if had_attached_clients {
-            let _ = sink
-                .0
-                .publish(bmux_ipc::Event::ClientDetached { id: session_id.0 });
-        }
+    if let Some(sink) = wire_sink
+        && had_attached_clients
+    {
         let _ = sink
             .0
-            .publish(bmux_ipc::Event::SessionRemoved { id: session_id.0 });
+            .publish(bmux_ipc::Event::ClientDetached { id: session_id.0 });
     }
+
+    publish_session_removed_event(session_id);
 
     Ok(SessionAck {
         session_id: req.session_id,

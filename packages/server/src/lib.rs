@@ -1944,10 +1944,7 @@ async fn handle_connection(
 
 fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
     let session_id = match &event {
-        Event::SessionCreated { id, .. }
-        | Event::SessionRemoved { id }
-        | Event::ClientAttached { id }
-        | Event::ClientDetached { id } => Some(*id),
+        Event::ClientAttached { id } | Event::ClientDetached { id } => Some(*id),
         Event::AttachViewChanged { session_id, .. }
         | Event::PaneOutputAvailable { session_id, .. }
         | Event::PaneOutput { session_id, .. }

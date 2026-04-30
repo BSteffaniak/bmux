@@ -2843,15 +2843,14 @@ mod tests {
 
     #[test]
     fn plugin_event_from_server_event_maps_kind_and_payload() {
-        let session_id = Uuid::from_u128(1);
-        let event = plugin_event_from_server_event(&bmux_client::ServerEvent::SessionCreated {
-            id: session_id,
-            name: Some("editor".to_string()),
-        })
-        .expect("plugin event should build");
-        let session_id_text = session_id.to_string();
-        assert_eq!(event.kind.as_str(), "bmux.core/session_created");
-        assert!(event.payload.to_string().contains(&session_id_text));
+        let server_event = bmux_client::ServerEvent::ServerStarted;
+        let event =
+            plugin_event_from_server_event(&server_event).expect("plugin event should build");
+        assert_eq!(event.kind.as_str(), "bmux.core/server_started");
+        assert_eq!(
+            event.payload,
+            serde_json::to_value(server_event).expect("server event should encode")
+        );
     }
 
     #[test]

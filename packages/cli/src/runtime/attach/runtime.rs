@@ -2443,6 +2443,31 @@ async fn handle_attach_stream_server_event(
                     );
                 }
             }
+        } else if kind.as_str() == bmux_sessions_plugin_api::sessions_events::EVENT_KIND.as_str() {
+            match serde_json::from_slice::<bmux_sessions_plugin_api::sessions_events::SessionEvent>(
+                payload,
+            ) {
+                Ok(bmux_sessions_plugin_api::sessions_events::SessionEvent::Removed {
+                    session_id,
+                }) => {
+                    if let Some(control) =
+                        handle_attached_session_removed(client, view_state, session_id).await?
+                    {
+                        return Ok(AttachServerEventHandling {
+                            control,
+                            image_fetch_requested,
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        kind = %kind,
+                        error = %error,
+                        "decoding forwarded sessions event payload",
+                    );
+                }
+            }
         } else if kind.as_str() == bmux_clients_plugin_api::clients_events::EVENT_KIND.as_str() {
             match serde_json::from_slice::<bmux_clients_plugin_api::clients_events::ClientEvent>(
                 payload,
@@ -6072,17 +6097,14 @@ pub async fn handle_attach_loop_event(
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
     match event {
-        AttachLoopEvent::Server(server_event) => {
-            handle_attach_server_event(
-                client,
-                server_event,
-                follow_target_id,
-                self_client_id,
-                global,
-                view_state,
-            )
-            .await
-        }
+        AttachLoopEvent::Server(server_event) => Ok(handle_attach_server_event(
+            client,
+            server_event,
+            follow_target_id,
+            self_client_id,
+            global,
+            view_state,
+        )),
         AttachLoopEvent::Terminal(terminal_event) => {
             handle_attach_terminal_event(
                 client,
@@ -6108,32 +6130,14 @@ pub async fn handle_attach_loop_event(
 }
 
 #[allow(clippy::too_many_lines)]
-pub async fn handle_attach_server_event(
-    client: &mut StreamingBmuxClient,
+pub fn handle_attach_server_event(
+    _client: &mut StreamingBmuxClient,
     server_event: bmux_client::ServerEvent,
     _follow_target_id: Option<Uuid>,
     _self_client_id: Option<Uuid>,
     _global: bool,
     view_state: &mut AttachViewState,
-) -> Result<AttachLoopControl> {
-    if let bmux_client::ServerEvent::SessionRemoved { id } = &server_event
-        && *id == view_state.attached_id
-    {
-        let removed_session_id = view_state.attached_id;
-        if recover_attach_after_session_removed(client, view_state).await? {
-            view_state.set_transient_status(
-                format!(
-                    "session {} closed; switched to active session",
-                    short_uuid(removed_session_id)
-                ),
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-            return Ok(AttachLoopControl::Continue);
-        }
-        return Ok(AttachLoopControl::Break(AttachExitReason::StreamClosed));
-    }
-
+) -> AttachLoopControl {
     match server_event {
         bmux_client::ServerEvent::AttachViewChanged {
             context_id,
@@ -6169,7 +6173,33 @@ pub async fn handle_attach_server_event(
         _ => {}
     }
 
-    Ok(AttachLoopControl::Continue)
+    AttachLoopControl::Continue
+}
+
+async fn handle_attached_session_removed(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    session_id: Uuid,
+) -> Result<Option<AttachLoopControl>> {
+    if session_id != view_state.attached_id {
+        return Ok(None);
+    }
+
+    let removed_session_id = view_state.attached_id;
+    if recover_attach_after_session_removed(client, view_state).await? {
+        view_state.set_transient_status(
+            format!(
+                "session {} closed; switched to active session",
+                short_uuid(removed_session_id)
+            ),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        return Ok(Some(AttachLoopControl::Continue));
+    }
+    Ok(Some(AttachLoopControl::Break(
+        AttachExitReason::StreamClosed,
+    )))
 }
 
 async fn handle_control_catalog_changed(
