@@ -9,7 +9,8 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use bmux_ipc::{RecordingEventKind, RecordingPayload};
+use bmux_ipc::RecordingPayload;
+use bmux_recording_protocol::RecordingEventKind;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;

@@ -13,6 +13,7 @@ pub use bmux_performance_state::{
     PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE, PerformanceRecordingLevel,
     PerformanceRuntimeSettings,
 };
+pub use bmux_recording_protocol::{RecordingEventKind, RecordingProfile};
 pub use bmux_snapshot_protocol::SnapshotStatusReport as ServerSnapshotStatus;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
@@ -462,15 +463,6 @@ fn recording_event_kinds_default() -> Vec<RecordingEventKind> {
     ]
 }
 
-/// Recording profile used to choose event verbosity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordingProfile {
-    Full,
-    Functional,
-    Visual,
-}
-
 /// Recording runtime status details.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingStatus {
@@ -550,21 +542,6 @@ pub struct RecordingRollingClearReport {
     pub usage_before: RecordingRollingUsage,
     #[serde(default)]
     pub usage_after: RecordingRollingUsage,
-}
-
-/// Event kind emitted into a recording timeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordingEventKind {
-    PaneInputRaw,
-    PaneOutputRaw,
-    ProtocolReplyRaw,
-    PaneImage,
-    ServerEvent,
-    RequestStart,
-    RequestDone,
-    RequestError,
-    Custom,
 }
 
 /// Recording event payload.

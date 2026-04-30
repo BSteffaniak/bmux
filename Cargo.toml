@@ -36,6 +36,7 @@ members = [
     "packages/plugin-sdk",
     "packages/perf-tools",
     "packages/pane-runtime-state",
+    "packages/recording-protocol",
     "packages/recording-runtime",
     "packages/server",
     "packages/session-state",
@@ -161,6 +162,7 @@ bmux_plugin                 = { version = "0.0.1-alpha.0", default-features = fa
 bmux_plugin_schema          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-schema" }
 bmux_plugin_schema_macros   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-schema-macros" }
 bmux_plugin_sdk             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
+bmux_recording_protocol     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/recording-protocol" }
 bmux_recording_runtime      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/recording-runtime" }
 bmux_sandbox_harness        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/sandbox-harness" }
 bmux_scene_protocol         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/scene-protocol" }

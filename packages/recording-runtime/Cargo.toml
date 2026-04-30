@@ -11,9 +11,10 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_ipc = { workspace = true }
-serde    = { workspace = true, features = ["derive", "std"] }
-uuid     = { workspace = true, features = ["serde", "std"] }
+bmux_ipc                = { workspace = true }
+bmux_recording_protocol = { workspace = true }
+serde                   = { workspace = true, features = ["derive", "std"] }
+uuid                    = { workspace = true, features = ["serde", "std"] }
 
 [features]
 default          = []

@@ -1153,6 +1153,11 @@ fn recording_ipc_variants_are_absent() {
         "Request::RecordingRollingClear",
         "Request::RecordingCaptureTargets",
         "Request::RecordingPrune",
+        // DTO ownership: pure recording protocol enums live in
+        // `bmux_recording_protocol`; IPC may only re-export them for
+        // compatibility.
+        "pub enum RecordingProfile",
+        "pub enum RecordingEventKind",
         // ResponsePayload variants.
         "ResponsePayload::RecordingStarted",
         "ResponsePayload::RecordingStopped",
