@@ -3,7 +3,16 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_permissions_plugin_api::permissions_commands::CommandAck;
+use bmux_permissions_plugin_api::permissions_commands::client::{GrantRequest, RevokeRequest};
 use bmux_permissions_plugin_api::permissions_state::PermissionEntry;
+use bmux_permissions_plugin_api::permissions_state::client::ListPermissionsRequest;
+use bmux_permissions_plugin_api::session_policy_commands::client::{
+    GrantHotPathOverrideRequest, RevokeHotPathOverrideRequest,
+};
+use bmux_permissions_plugin_api::session_policy_state::client::{
+    CheckRequest as SessionPolicyCheckRequest, ListHotPathOverridesRequest,
+    ResolveHotPathDecisionRequest as CheckHotPathDecisionRequest,
+};
 use bmux_permissions_plugin_api::session_policy_state::{
     HotPathDecisionResponse, HotPathOverrideEntry, SessionPolicyCheckResponse,
 };
@@ -1039,85 +1048,6 @@ fn option_value(arguments: &[String], long_name: &str) -> Option<String> {
 fn has_flag(arguments: &[String], long_name: &str) -> bool {
     let long_flag = format!("--{long_name}");
     arguments.iter().any(|argument| argument == &long_flag)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListPermissionsRequest {
-    session: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantRequest {
-    session: String,
-    #[serde(alias = "client")]
-    client_id: String,
-    role: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RevokeRequest {
-    session: String,
-    #[serde(alias = "client")]
-    client_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SessionPolicyCheckRequest {
-    session_id: Uuid,
-    #[serde(default)]
-    context_id: Option<Uuid>,
-    client_id: Uuid,
-    principal_id: Uuid,
-    action: String,
-    #[serde(default)]
-    plugin_id: Option<String>,
-    #[serde(default)]
-    capability: Option<String>,
-    #[serde(default)]
-    execution_class: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantHotPathOverrideRequest {
-    plugin_id: String,
-    capability: String,
-    execution_class: String,
-    scope: String,
-    #[serde(default)]
-    session: Option<String>,
-    #[serde(default)]
-    context: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RevokeHotPathOverrideRequest {
-    plugin_id: String,
-    capability: String,
-    execution_class: String,
-    scope: String,
-    #[serde(default)]
-    session: Option<String>,
-    #[serde(default)]
-    context: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListHotPathOverridesRequest {
-    #[serde(default)]
-    session: Option<String>,
-    #[serde(default)]
-    context: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CheckHotPathDecisionRequest {
-    plugin_id: String,
-    capability: String,
-    execution_class: String,
-    #[serde(default)]
-    session: Option<String>,
-    #[serde(default)]
-    context: Option<String>,
 }
 
 bmux_plugin_sdk::export_plugin!(PermissionsPlugin, include_str!("../plugin.toml"));

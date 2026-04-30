@@ -521,7 +521,7 @@ fn emit_transport_endpoint(
     let returns = rust_type(&op.returns, imports, own_types);
     if !op.params.is_empty() {
         let request_name = request_ty.clone();
-        out.push_str("        #[derive(Debug, Clone, Serialize)]\n");
+        out.push_str("        #[derive(Debug, Clone, Serialize, Deserialize)]\n");
         let _ = writeln!(out, "        pub struct {request_name} {{");
         for param in &op.params {
             let field_name = snake_case(&param.name);

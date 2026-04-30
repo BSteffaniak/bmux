@@ -8,6 +8,13 @@ use bmux_cli::attach::{
     PromptValue,
 };
 use bmux_cli_output::{Table, TableColumn, write_table};
+use bmux_permissions_plugin_api::permissions_commands::CommandAck as PermissionCommandAck;
+use bmux_permissions_plugin_api::permissions_commands::client::{
+    GrantRequest as GrantPermissionRequest, RevokeRequest as RevokePermissionRequest,
+};
+use bmux_permissions_plugin_api::permissions_state::client::ListPermissionsRequest;
+use bmux_permissions_plugin_api::permissions_state::{self, PermissionEntry as PermissionSummary};
+use bmux_permissions_plugin_api::{capabilities, permissions_commands};
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::EXIT_USAGE;
 use bmux_plugin_sdk::prelude::*;
@@ -74,10 +81,10 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
     };
 
     let response = match context.call_service::<ListPermissionsRequest, ListPermissionsResponse>(
-        "bmux.permissions.read",
+        capabilities::PERMISSIONS_READ.as_str(),
         ServiceKind::Query,
-        "permissions-state",
-        "list-permissions",
+        permissions_state::INTERFACE_ID.as_str(),
+        permissions_state::OP_LIST_PERMISSIONS.as_str(),
         &ListPermissionsRequest {
             session: session.clone(),
         },
@@ -147,10 +154,10 @@ fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
     };
 
     let _response = match context.call_service::<GrantPermissionRequest, PermissionCommandAck>(
-        "bmux.permissions.write",
+        capabilities::PERMISSIONS_WRITE.as_str(),
         ServiceKind::Command,
-        "permissions-commands",
-        "grant",
+        permissions_commands::INTERFACE_ID.as_str(),
+        permissions_commands::OP_GRANT.as_str(),
         &GrantPermissionRequest {
             session: session.clone(),
             client_id: client_id.to_string(),
@@ -200,10 +207,10 @@ fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
     };
 
     let _response = match context.call_service::<RevokePermissionRequest, PermissionCommandAck>(
-        "bmux.permissions.write",
+        capabilities::PERMISSIONS_WRITE.as_str(),
         ServiceKind::Command,
-        "permissions-commands",
-        "revoke",
+        permissions_commands::INTERFACE_ID.as_str(),
+        permissions_commands::OP_REVOKE.as_str(),
         &RevokePermissionRequest {
             session: session.clone(),
             client_id: client_id.to_string(),
@@ -584,18 +591,7 @@ fn write_stdout_table(table: &Table) -> std::io::Result<()> {
     write_table(&mut stdout, table)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListPermissionsRequest {
-    session: String,
-}
-
 type ListPermissionsResponse = Vec<PermissionSummary>;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PermissionSummary {
-    client_id: String,
-    role: String,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -603,24 +599,6 @@ enum SessionRole {
     Owner,
     Writer,
     Observer,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantPermissionRequest {
-    session: String,
-    client_id: String,
-    role: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PermissionCommandAck {
-    ok: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RevokePermissionRequest {
-    session: String,
-    client_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
