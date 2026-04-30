@@ -2,14 +2,10 @@
 
 Typed public API of the `bmux.snapshot` plugin.
 
-Hand-written (no BPDL). Hosts:
+BPDL-backed contract plus non-transport utilities:
 
 - `SnapshotPluginConfig` — CLI-registered configuration (snapshot file path + debounce window).
-- Capability + interface id constants.
-- `SnapshotRequest` / `SnapshotResponse` wire enums for the plugin's
-  typed service surface.
-- `typed_client` module — async helpers over any
-  `bmux_plugin_sdk::TypedDispatchClient` (`save_now`, `status`,
-  `restore_dry_run`, `restore_apply`).
+- Generated `snapshot-types`, `snapshot-state`, and `snapshot-commands`
+  modules from `bpdl/snapshot-plugin.bpdl`.
 - `offline_snapshot` module — the `offline_kill_sessions` utility
   CLI subcommands call when the server is down.

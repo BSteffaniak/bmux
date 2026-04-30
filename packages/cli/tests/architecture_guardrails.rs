@@ -751,8 +751,8 @@ fn client_core_crate_has_no_domain_convenience_methods() {
 }
 
 // Verify that the `bmux_plugin_domain_compat` crate has been fully
-// eliminated. Domain helpers now live inside each plugin's private
-// `domain_ipc` module, or are reached through typed BPDL services.
+// eliminated. Domain workflows should use BPDL-generated clients and
+// small purpose-named local helpers, not broad compatibility crates.
 #[test]
 fn domain_compat_crate_is_absent() {
     let compat_dir =
@@ -760,8 +760,8 @@ fn domain_compat_crate_is_absent() {
     assert!(
         !compat_dir.exists(),
         "packages/plugin-domain-compat/ must be absent; domain \
-         helpers live in each plugin's private `domain_ipc` module \
-         or are reached through typed BPDL services",
+         workflows should use BPDL-generated clients and small \
+         purpose-named local helpers",
     );
 
     let workspace_toml = include_str!("../../../Cargo.toml");
@@ -868,8 +868,8 @@ fn core_architecture_does_not_depend_on_plugins() {
             // Heuristic: any dep name starting with `bmux_` and ending
             // with `_plugin` (the canonical plugin-crate suffix) is a
             // violation when declared as a dependency of a core crate.
-            // Plugin-api crates (`bmux_*_plugin_api`) are acceptable —
-            // they are neutral typed-dispatch surfaces.
+            // Plugin-api crates are checked by stricter boundary tests
+            // because current transitional deps need explicit tracking.
             //
             // Exceptions: `bmux_plugin` (core plugin infrastructure),
             // `bmux_plugin_sdk` (core plugin SDK), and
@@ -1028,11 +1028,9 @@ fn follow_ipc_variants_are_absent() {
 }
 
 /// Verify that the recording-plugin crates exist and that core does
-/// not define the `RecordingRuntime` type. The type was relocated from
-/// `packages/server/src/recording.rs` to
-/// `plugins/recording-plugin-api/src/recording_runtime.rs`;
-/// server imports it via `use bmux_recording_plugin_api::RecordingRuntime`
-/// without depending on the plugin impl crate.
+/// not define the `RecordingRuntime` type. The concrete runtime lives
+/// in the recording plugin implementation crate; core reaches recording
+/// through neutral runtime handles and generic host primitives.
 #[test]
 fn recording_plugin_exists() {
     let api_dir =
@@ -1150,11 +1148,11 @@ fn recording_ipc_variants_are_absent() {
     }
 }
 
-/// Verify `bmux_client` is pure protocol primitives — it depends only
-/// on protocol/transport primitives (`bmux_ipc`, `bmux_config`,
-/// `bmux_codec`, `bmux_plugin_sdk`) and carries zero plugin-api or
-/// plugin-impl deps. Typed domain helpers live in `_plugin_api`
-/// crates as free functions accepting `C: TypedDispatchClient`.
+/// Verify `bmux_client` stays close to protocol primitives. Most plugin
+/// API dependencies are forbidden here; the pane-runtime API dependency
+/// is tracked as transitional architecture debt in
+/// `.architecture-followups.md` until attach/session helpers are moved
+/// out of `packages/client`.
 #[test]
 fn bmux_client_is_pure_protocol() {
     let cargo_toml = include_str!("../../client/Cargo.toml");
@@ -1172,10 +1170,48 @@ fn bmux_client_is_pure_protocol() {
         assert!(
             !cargo_toml.contains(pattern),
             "packages/client/Cargo.toml must not depend on `{pattern}`; \
-             typed-domain helpers live in `*_plugin_api::typed_client` \
-             modules, not in `bmux_client`",
+             typed-domain workflows belong in generated clients or \
+             consuming-crate private helpers, not in `bmux_client`",
         );
     }
+}
+
+/// Source-like backup files under active package/plugin trees preserve
+/// stale architecture in grep results and can confuse boundary audits.
+#[test]
+fn source_tree_has_no_backup_rust_files() {
+    fn visit(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if name == "target" || name.starts_with('.') {
+                    continue;
+                }
+                visit(&path, offenders);
+            } else if name.ends_with(".rs.bak") || name.ends_with(".bak.rs") {
+                offenders.push(
+                    path.strip_prefix(repo_root())
+                        .unwrap_or(path.as_path())
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let mut offenders = Vec::new();
+    for root in [repo_root().join("packages"), repo_root().join("plugins")] {
+        visit(&root, &mut offenders);
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "source backup files must not live under packages/ or plugins/: {offenders:#?}",
+    );
 }
 
 /// Verify that `ServerState` doesn't hold concrete plugin-owned state
