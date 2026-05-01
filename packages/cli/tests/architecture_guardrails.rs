@@ -977,9 +977,11 @@ fn control_catalog_snapshot_ipc_variant_is_absent() {
 fn snapshot_command_ipc_variants_are_absent() {
     let ipc_source = include_str!("../../ipc/src/lib.rs");
     let denied = [
+        "use bmux_snapshot_protocol::SnapshotStatusReport",
         "Request::ServerSave",
         "Request::ServerRestoreDryRun",
         "Request::ServerRestoreApply",
+        "snapshot: SnapshotStatusReport",
         "ResponsePayload::ServerSnapshotSaved",
         "ResponsePayload::ServerSnapshotRestoreDryRun",
         "ResponsePayload::ServerSnapshotRestored",

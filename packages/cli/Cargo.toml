@@ -51,7 +51,6 @@ bmux_session_models             = { workspace = true, features = ["serde"] }
 bmux_sessions_plugin_api        = { workspace = true }
 bmux_slots                      = { workspace = true }
 bmux_snapshot_plugin_api        = { workspace = true }
-bmux_snapshot_protocol          = { workspace = true }
 bmux_terminal_protocol          = { workspace = true }
 bmux_windows_plugin_api         = { workspace = true }
 
@@ -216,7 +215,6 @@ fail-on-warnings = [
     "bmux_server/fail-on-warnings",
     "bmux_sessions_plugin?/fail-on-warnings",
     "bmux_snapshot_plugin?/fail-on-warnings",
-    "bmux_snapshot_protocol/fail-on-warnings",
     "bmux_theme_plugin?/fail-on-warnings",
     "bmux_terminal_protocol/fail-on-warnings",
     "bmux_windows_plugin?/fail-on-warnings",

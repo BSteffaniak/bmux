@@ -2111,15 +2111,11 @@ async fn handle_request(
             server_control_principal_id: state.server_control_principal_id,
             force_local_permitted: client_principal_id == state.server_control_principal_id,
         }),
-        Request::ServerStatus => {
-            let snapshot = snapshot_orchestrator_handle().as_dyn().status();
-            Response::Ok(ResponsePayload::ServerStatus {
-                running: true,
-                snapshot,
-                principal_id: client_principal_id,
-                server_control_principal_id: state.server_control_principal_id,
-            })
-        }
+        Request::ServerStatus => Response::Ok(ResponsePayload::ServerStatus {
+            running: true,
+            principal_id: client_principal_id,
+            server_control_principal_id: state.server_control_principal_id,
+        }),
         Request::ServerStop => {
             let _ = shutdown_tx.send(true);
             flush_phase_timing();

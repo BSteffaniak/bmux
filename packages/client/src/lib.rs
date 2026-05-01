@@ -23,7 +23,6 @@ use bmux_ipc::{
 };
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing};
 use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult};
-use bmux_snapshot_protocol::SnapshotStatusReport;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -89,7 +88,6 @@ pub struct AttachPaneSnapshotState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerStatusInfo {
     pub running: bool,
-    pub snapshot: SnapshotStatusReport,
     pub principal_id: Uuid,
     pub server_control_principal_id: Uuid,
 }
@@ -357,12 +355,10 @@ impl BmuxClient {
         match self.request(Request::ServerStatus).await? {
             ResponsePayload::ServerStatus {
                 running,
-                snapshot,
                 principal_id,
                 server_control_principal_id,
             } => Ok(ServerStatusInfo {
                 running,
-                snapshot,
                 principal_id,
                 server_control_principal_id,
             }),

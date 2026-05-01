@@ -7,7 +7,6 @@
 
 //! Cross-platform IPC protocol models for bmux.
 
-use bmux_snapshot_protocol::SnapshotStatusReport;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -407,7 +406,6 @@ pub enum ResponsePayload {
     },
     ServerStatus {
         running: bool,
-        snapshot: SnapshotStatusReport,
         principal_id: Uuid,
         server_control_principal_id: Uuid,
     },
@@ -593,7 +591,6 @@ mod tests {
         RecordingEventKind, RecordingPayload as ProtocolRecordingPayload, RecordingProfile,
         RecordingSummary, read_frames, write_frame,
     };
-    use bmux_snapshot_protocol::SnapshotStatusReport;
     use std::path::Path;
 
     type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
@@ -862,14 +859,6 @@ mod tests {
             },
             ResponsePayload::ServerStatus {
                 running: true,
-                snapshot: SnapshotStatusReport {
-                    enabled: true,
-                    path: Some("/tmp/snap".into()),
-                    snapshot_exists: true,
-                    last_write_epoch_ms: Some(1_700_000_000_000),
-                    last_restore_epoch_ms: None,
-                    last_restore_error: None,
-                },
                 principal_id: id,
                 server_control_principal_id: id2,
             },

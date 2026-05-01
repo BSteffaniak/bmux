@@ -13,7 +13,6 @@ use bmux_recording_protocol::{
     RecordingSummary,
 };
 use bmux_snapshot_plugin_api::{snapshot_commands, snapshot_state, snapshot_types};
-use bmux_snapshot_protocol::SnapshotStatusReport;
 use iroh::{Endpoint, endpoint::presets};
 use std::process::{Command as ProcessCommand, Stdio};
 use uuid::Uuid;
@@ -40,7 +39,7 @@ pub(super) struct ServerStatusJsonPayload {
     server_control_principal_id: Option<Uuid>,
     force_local_permitted: bool,
     latest_server_event: Option<String>,
-    snapshot: Option<SnapshotStatusReport>,
+    snapshot: Option<snapshot_types::SnapshotStatusPayload>,
     server_metadata: Option<ServerRuntimeMetadata>,
     cli_build: Option<String>,
     stale_build: bool,
@@ -54,6 +53,11 @@ pub(super) async fn run_server_status(
 ) -> Result<u8> {
     cleanup_stale_pid_file().await?;
     let status = fetch_server_status(connection_context).await?;
+    let snapshot_status = if matches!(status, Some(ref s) if s.running) {
+        fetch_snapshot_status(connection_context).await?
+    } else {
+        None
+    };
     let metadata = read_server_runtime_metadata()?;
     let current_build_id = current_cli_build_id().ok();
     let stale_warning = metadata.as_ref().and_then(|entry| {
@@ -87,7 +91,7 @@ pub(super) async fn run_server_status(
                 .as_ref()
                 .is_some_and(|entry| entry.principal_id == entry.server_control_principal_id),
             latest_server_event: latest_event,
-            snapshot: status.as_ref().map(|entry| entry.snapshot.clone()),
+            snapshot: snapshot_status.clone(),
             server_metadata: metadata,
             cli_build: current_build_id,
             stale_build,
@@ -139,44 +143,68 @@ pub(super) async fn run_server_status(
             println!("server socket: {}", paths.server_socket().display());
             #[cfg(windows)]
             println!("server pipe: {}", paths.server_named_pipe());
-            println!(
-                "snapshot: {}{}",
-                if status.snapshot.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                status
-                    .snapshot
-                    .path
-                    .as_ref()
-                    .map_or(String::new(), |path| format!(" ({path})"))
-            );
-            if status.snapshot.enabled {
-                println!(
-                    "snapshot file: {}",
-                    if status.snapshot.snapshot_exists {
-                        "present"
-                    } else {
-                        "missing"
-                    }
-                );
-                if let Some(last_write) = status.snapshot.last_write_epoch_ms {
-                    println!("snapshot last write (ms): {last_write}");
-                }
-                if let Some(last_restore) = status.snapshot.last_restore_epoch_ms {
-                    println!("snapshot last restore (ms): {last_restore}");
-                }
-                if let Some(error) = status.snapshot.last_restore_error.as_ref() {
-                    println!("snapshot last error: {error}");
-                }
-            }
+            print_snapshot_status(snapshot_status.as_ref());
             println!("bmux server is running");
             Ok(0)
         }
         _ => {
             println!("bmux server is not running");
             Ok(1)
+        }
+    }
+}
+
+async fn fetch_snapshot_status(
+    connection_context: ConnectionContext<'_>,
+) -> Result<Option<snapshot_types::SnapshotStatusPayload>> {
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-server-status-snapshot",
+        connection_context,
+    )
+    .await?;
+
+    let status = snapshot_state::client::status(&mut client)
+        .await
+        .context("snapshot status dispatch failed")?;
+    Ok(status.ok())
+}
+
+fn print_snapshot_status(status: Option<&snapshot_types::SnapshotStatusPayload>) {
+    let Some(status) = status else {
+        println!("snapshot: unavailable");
+        return;
+    };
+
+    println!(
+        "snapshot: {}{}",
+        if status.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        status
+            .path
+            .as_ref()
+            .map_or(String::new(), |path| format!(" ({path})"))
+    );
+    if status.enabled {
+        println!(
+            "snapshot file: {}",
+            if status.snapshot_exists {
+                "present"
+            } else {
+                "missing"
+            }
+        );
+        if let Some(last_write) = status.last_write_epoch_ms {
+            println!("snapshot last write (ms): {last_write}");
+        }
+        if let Some(last_restore) = status.last_restore_epoch_ms {
+            println!("snapshot last restore (ms): {last_restore}");
+        }
+        if let Some(error) = status.last_restore_error.as_ref() {
+            println!("snapshot last error: {error}");
         }
     }
 }
