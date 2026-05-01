@@ -2524,8 +2524,8 @@ mod capability_guardrail_helpers {
 //
 // AGENTS.md forbids domain leaks in core architecture crates.
 // `packages/keybind/src/lib.rs::RuntimeAction` historically grew
-// domain-named variants (NewWindow, FocusLeft, ZoomPane, etc.) that
-// belong to plugins, not core. The
+// domain-named variants (NewWindow, ZoomPane, etc.) that belong to
+// plugins, not core. The
 // migration in `docs/runtime-action-migration.md` tracks removing
 // them in favor of `RuntimeAction::PluginCommand { plugin_id, command_name, args }`.
 //
@@ -2569,12 +2569,6 @@ const RUNTIME_ACTION_ALLOWLIST: &[&str] = &[
     // DOMAIN-leaking variants pending migration. Each should move to
     // a `plugin:bmux.<plugin>:<cmd>` invocation before deletion.
     // See `docs/runtime-action-migration.md` for the plan.
-    "FocusNext",
-    "FocusPrev",
-    "FocusLeft",
-    "FocusRight",
-    "FocusUp",
-    "FocusDown",
     "ToggleSplitDirection",
     "SplitFocusedVertical",
     "SplitFocusedHorizontal",

@@ -94,6 +94,10 @@ struct PendingChord {
     decoded: Vec<DecodedStroke>,
 }
 
+fn windows_focus_command(direction: &str) -> String {
+    format!("plugin:bmux.windows:focus-pane-in-direction --direction {direction}")
+}
+
 // ============================================================================
 // Keymap
 // ============================================================================
@@ -101,15 +105,6 @@ struct PendingChord {
 impl Keymap {
     pub(crate) fn default_runtime() -> Self {
         let runtime: BTreeMap<String, String> = [
-            ("o", RuntimeAction::FocusNext),
-            ("h", RuntimeAction::FocusLeft),
-            ("l", RuntimeAction::FocusRight),
-            ("k", RuntimeAction::FocusUp),
-            ("j", RuntimeAction::FocusDown),
-            ("arrow_left", RuntimeAction::FocusLeft),
-            ("arrow_right", RuntimeAction::FocusRight),
-            ("arrow_up", RuntimeAction::FocusUp),
-            ("arrow_down", RuntimeAction::FocusDown),
             ("t", RuntimeAction::ToggleSplitDirection),
             ("%", RuntimeAction::SplitFocusedVertical),
             ("\"", RuntimeAction::SplitFocusedHorizontal),
@@ -141,6 +136,17 @@ impl Keymap {
         ]
         .into_iter()
         .map(|(key, action)| (key.to_string(), action_to_name(&action).to_string()))
+        .chain([
+            ("o".to_string(), windows_focus_command("next")),
+            ("h".to_string(), windows_focus_command("left")),
+            ("l".to_string(), windows_focus_command("right")),
+            ("k".to_string(), windows_focus_command("up")),
+            ("j".to_string(), windows_focus_command("down")),
+            ("arrow_left".to_string(), windows_focus_command("left")),
+            ("arrow_right".to_string(), windows_focus_command("right")),
+            ("arrow_up".to_string(), windows_focus_command("up")),
+            ("arrow_down".to_string(), windows_focus_command("down")),
+        ])
         .chain(std::iter::once((
             "shift+c".to_string(),
             "plugin:bmux.sessions:new-session".to_string(),
@@ -1096,6 +1102,14 @@ mod tests {
             .collect()
     }
 
+    fn focus_action(direction: &str) -> RuntimeAction {
+        RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "focus-pane-in-direction".to_string(),
+            args: vec!["--direction".to_string(), direction.to_string()],
+        }
+    }
+
     fn modal_mode(
         label: &str,
         passthrough: bool,
@@ -1286,35 +1300,35 @@ mod tests {
         let mut processor = new_processor(Keymap::default_runtime());
         assert_eq!(
             processor.process_chunk(&[0x01, b'h']),
-            vec![RuntimeAction::FocusLeft]
+            vec![focus_action("left")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, b'j']),
-            vec![RuntimeAction::FocusDown]
+            vec![focus_action("down")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, b'k']),
-            vec![RuntimeAction::FocusUp]
+            vec![focus_action("up")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, b'l']),
-            vec![RuntimeAction::FocusRight]
+            vec![focus_action("right")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, 0x1b, b'[', b'D']),
-            vec![RuntimeAction::FocusLeft]
+            vec![focus_action("left")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, 0x1b, b'[', b'C']),
-            vec![RuntimeAction::FocusRight]
+            vec![focus_action("right")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, 0x1b, b'[', b'A']),
-            vec![RuntimeAction::FocusUp]
+            vec![focus_action("up")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, 0x1b, b'[', b'B']),
-            vec![RuntimeAction::FocusDown]
+            vec![focus_action("down")]
         );
 
         assert_eq!(
@@ -1373,14 +1387,14 @@ mod tests {
 
     #[test]
     fn supports_configurable_prefix() {
-        let runtime = runtime_bindings(&[("o", RuntimeAction::FocusNext)]);
+        let runtime = runtime_bindings(&[("o", focus_action("next"))]);
         let keymap = Keymap::from_parts("ctrl+b", Some(400), &runtime, &BTreeMap::new())
             .expect("valid keymap");
         let mut processor = new_processor(keymap);
 
         assert_eq!(
             processor.process_chunk(&[0x02, b'o']),
-            vec![RuntimeAction::FocusNext]
+            vec![focus_action("next")]
         );
     }
 
@@ -1388,24 +1402,21 @@ mod tests {
     fn longest_match_wins_with_timeout() {
         let runtime = runtime_bindings(&[
             ("w", RuntimeAction::ShowHelp),
-            ("w o", RuntimeAction::FocusNext),
+            ("w o", focus_action("next")),
         ]);
         let keymap = Keymap::from_parts("ctrl+a", Some(80), &runtime, &BTreeMap::new())
             .expect("valid keymap");
         let mut processor = new_processor(keymap);
 
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
-        assert_eq!(
-            processor.process_chunk(b"o"),
-            vec![RuntimeAction::FocusNext]
-        );
+        assert_eq!(processor.process_chunk(b"o"), vec![focus_action("next")]);
     }
 
     #[test]
     fn timeout_falls_back_to_shorter_match() {
         let runtime = runtime_bindings(&[
             ("w", RuntimeAction::ShowHelp),
-            ("w o", RuntimeAction::FocusNext),
+            ("w o", focus_action("next")),
         ]);
         let keymap = Keymap::from_parts("ctrl+a", Some(50), &runtime, &BTreeMap::new())
             .expect("valid keymap");
@@ -1420,7 +1431,7 @@ mod tests {
     fn indefinite_timeout_keeps_waiting_for_longer_match() {
         let runtime = runtime_bindings(&[
             ("w", RuntimeAction::ShowHelp),
-            ("w o", RuntimeAction::FocusNext),
+            ("w o", focus_action("next")),
         ]);
         let keymap =
             Keymap::from_parts("ctrl+a", None, &runtime, &BTreeMap::new()).expect("valid keymap");
@@ -1429,17 +1440,14 @@ mod tests {
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
         thread::sleep(Duration::from_millis(70));
         assert!(processor.process_chunk(&[]).is_empty());
-        assert_eq!(
-            processor.process_chunk(b"o"),
-            vec![RuntimeAction::FocusNext]
-        );
+        assert_eq!(processor.process_chunk(b"o"), vec![focus_action("next")]);
     }
 
     #[test]
     fn indefinite_timeout_falls_back_when_next_key_breaks_longer_match() {
         let runtime = runtime_bindings(&[
             ("w", RuntimeAction::ShowHelp),
-            ("w o", RuntimeAction::FocusNext),
+            ("w o", focus_action("next")),
         ]);
         let keymap =
             Keymap::from_parts("ctrl+a", None, &runtime, &BTreeMap::new()).expect("valid keymap");
@@ -1459,7 +1467,7 @@ mod tests {
     fn terminal_event_timeout_falls_back_to_shorter_match() {
         let runtime = runtime_bindings(&[
             ("w", RuntimeAction::ShowHelp),
-            ("w o", RuntimeAction::FocusNext),
+            ("w o", focus_action("next")),
         ]);
         let keymap = Keymap::from_parts("ctrl+a", Some(50), &runtime, &BTreeMap::new())
             .expect("valid keymap");
@@ -1493,7 +1501,7 @@ mod tests {
     #[test]
     fn global_precedence_over_runtime() {
         let global = global_bindings(&[("ctrl+a o", RuntimeAction::Quit)]);
-        let runtime = runtime_bindings(&[("o", RuntimeAction::FocusNext)]);
+        let runtime = runtime_bindings(&[("o", focus_action("next"))]);
 
         let keymap =
             Keymap::from_parts("ctrl+a", Some(400), &runtime, &global).expect("valid keymap");
@@ -1618,7 +1626,7 @@ mod tests {
         );
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('o'), KeyModifiers::NONE)),
-            vec![RuntimeAction::FocusNext]
+            vec![focus_action("next")]
         );
 
         assert_eq!(

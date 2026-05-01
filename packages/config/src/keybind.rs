@@ -108,18 +108,6 @@ impl ResolvedTimeout {
 
 fn default_global_runtime_bindings() -> BTreeMap<String, String> {
     let mut map = action_bindings(&[
-        // Pane focus navigation
-        ("alt+h", RuntimeAction::FocusLeft),
-        ("alt+left", RuntimeAction::FocusLeft),
-        ("alt+j", RuntimeAction::FocusDown),
-        ("alt+down", RuntimeAction::FocusDown),
-        ("alt+k", RuntimeAction::FocusUp),
-        ("alt+up", RuntimeAction::FocusUp),
-        ("alt+right", RuntimeAction::FocusRight),
-        // Pane cycling
-        ("ctrl+k", RuntimeAction::FocusPrev),
-        ("ctrl+t", RuntimeAction::FocusPrev),
-        ("alt+t", RuntimeAction::FocusNext),
         // Resize
         ("alt+plus", RuntimeAction::IncreaseSplit),
         ("alt+=", RuntimeAction::IncreaseSplit),
@@ -131,6 +119,17 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
         "ctrl+alt+t".to_string(),
         "plugin:bmux.theme:pick-theme".to_string(),
     );
+    // Pane focus navigation and cycling are owned by the windows plugin.
+    map.insert("alt+h".to_string(), windows_focus_command("left"));
+    map.insert("alt+left".to_string(), windows_focus_command("left"));
+    map.insert("alt+j".to_string(), windows_focus_command("down"));
+    map.insert("alt+down".to_string(), windows_focus_command("down"));
+    map.insert("alt+k".to_string(), windows_focus_command("up"));
+    map.insert("alt+up".to_string(), windows_focus_command("up"));
+    map.insert("alt+right".to_string(), windows_focus_command("right"));
+    map.insert("ctrl+k".to_string(), windows_focus_command("prev"));
+    map.insert("ctrl+t".to_string(), windows_focus_command("prev"));
+    map.insert("alt+t".to_string(), windows_focus_command("next"));
     // Last-window toggle (ctrl+o). The windows plugin owns all tab
     // navigation; this key binds to `last-window` (tmux's convention
     // for "jump back to the previous window").
@@ -178,15 +177,6 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
 
 fn default_runtime_bindings() -> BTreeMap<String, String> {
     let mut map = action_bindings(&[
-        ("o", RuntimeAction::FocusNext),
-        ("h", RuntimeAction::FocusLeft),
-        ("l", RuntimeAction::FocusRight),
-        ("k", RuntimeAction::FocusUp),
-        ("j", RuntimeAction::FocusDown),
-        ("arrow_left", RuntimeAction::FocusLeft),
-        ("arrow_right", RuntimeAction::FocusRight),
-        ("arrow_up", RuntimeAction::FocusUp),
-        ("arrow_down", RuntimeAction::FocusDown),
         ("t", RuntimeAction::ToggleSplitDirection),
         ("%", RuntimeAction::SplitFocusedVertical),
         ("\"", RuntimeAction::SplitFocusedHorizontal),
@@ -216,6 +206,15 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
         ("d", RuntimeAction::Detach),
         ("q", RuntimeAction::Quit),
     ]);
+    map.insert("o".to_string(), windows_focus_command("next"));
+    map.insert("h".to_string(), windows_focus_command("left"));
+    map.insert("l".to_string(), windows_focus_command("right"));
+    map.insert("k".to_string(), windows_focus_command("up"));
+    map.insert("j".to_string(), windows_focus_command("down"));
+    map.insert("arrow_left".to_string(), windows_focus_command("left"));
+    map.insert("arrow_right".to_string(), windows_focus_command("right"));
+    map.insert("arrow_up".to_string(), windows_focus_command("up"));
+    map.insert("arrow_down".to_string(), windows_focus_command("down"));
     // Window prev/next: (, ) bind via the windows plugin so the tab
     // bar and navigation stay in lockstep on whatever ordering the
     // plugin owns.
@@ -274,6 +273,10 @@ fn action_bindings(pairs: &[(&str, RuntimeAction)]) -> BTreeMap<String, String> 
         .iter()
         .map(|(key, action)| ((*key).to_string(), action_to_name(action).to_string()))
         .collect()
+}
+
+fn windows_focus_command(direction: &str) -> String {
+    format!("plugin:bmux.windows:focus-pane-in-direction --direction {direction}")
 }
 
 impl KeyBindingConfig {

@@ -6,7 +6,7 @@ use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use bmux_attach_layout_protocol::{PaneFocusDirection, PaneSelector, PaneSplitDirection};
+use bmux_attach_layout_protocol::{PaneSelector, PaneSplitDirection};
 use bmux_client::BmuxClient;
 use bmux_contexts_plugin_api::contexts_state;
 use bmux_ipc::InvokeServiceKind;
@@ -117,16 +117,6 @@ const fn ipc_split_to_windows_direction(
     match direction {
         PaneSplitDirection::Vertical => windows_commands::PaneDirection::Vertical,
         PaneSplitDirection::Horizontal => windows_commands::PaneDirection::Horizontal,
-    }
-}
-
-#[must_use]
-const fn ipc_focus_to_windows_direction(
-    direction: PaneFocusDirection,
-) -> windows_commands::PaneDirection {
-    match direction {
-        PaneFocusDirection::Next => windows_commands::PaneDirection::Right,
-        PaneFocusDirection::Prev => windows_commands::PaneDirection::Left,
     }
 }
 
@@ -3282,102 +3272,6 @@ async fn apply_attach_runtime_actions(
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("split focused horizontal failed: {e}"))?;
-            }
-            crate::input::RuntimeAction::FocusNext => {
-                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
-                    client,
-                    "focus-pane-in-direction",
-                    &windows_commands::client::FocusPaneInDirectionRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                        direction: ipc_focus_to_windows_direction(
-                            PaneFocusDirection::Next,
-                        ),
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("focus next failed: {e}"))?;
-            }
-            crate::input::RuntimeAction::FocusPrev => {
-                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
-                    client,
-                    "focus-pane-in-direction",
-                    &windows_commands::client::FocusPaneInDirectionRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                        direction: ipc_focus_to_windows_direction(
-                            PaneFocusDirection::Prev,
-                        ),
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("focus prev failed: {e}"))?;
-            }
-            crate::input::RuntimeAction::FocusLeft => {
-                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
-                    client,
-                    "focus-pane-in-direction",
-                    &windows_commands::client::FocusPaneInDirectionRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                        direction: ipc_focus_to_windows_direction(
-                            PaneFocusDirection::Prev,
-                        ),
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("focus left failed: {e}"))?;
-            }
-            crate::input::RuntimeAction::FocusRight => {
-                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
-                    client,
-                    "focus-pane-in-direction",
-                    &windows_commands::client::FocusPaneInDirectionRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                        direction: ipc_focus_to_windows_direction(
-                            PaneFocusDirection::Next,
-                        ),
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("focus right failed: {e}"))?;
-            }
-            crate::input::RuntimeAction::FocusUp => {
-                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
-                    client,
-                    "focus-pane-in-direction",
-                    &windows_commands::client::FocusPaneInDirectionRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                        direction: ipc_focus_to_windows_direction(
-                            PaneFocusDirection::Prev,
-                        ),
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("focus up failed: {e}"))?;
-            }
-            crate::input::RuntimeAction::FocusDown => {
-                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
-                    client,
-                    "focus-pane-in-direction",
-                    &windows_commands::client::FocusPaneInDirectionRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                        direction: ipc_focus_to_windows_direction(
-                            PaneFocusDirection::Next,
-                        ),
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("focus down failed: {e}"))?;
             }
             crate::input::RuntimeAction::CloseFocusedPane => {
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(

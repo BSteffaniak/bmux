@@ -6,7 +6,7 @@ use bmux_attach_layout_protocol::attach_layout_protocol::{
 use bmux_attach_layout_protocol::{
     AttachInputModeState, AttachLayer as SurfaceLayer, AttachMouseProtocolEncoding,
     AttachMouseProtocolMode, AttachMouseProtocolState, AttachRect, AttachScene, AttachSurface,
-    AttachSurfaceKind, PaneFocusDirection, PaneSplitDirection,
+    AttachSurfaceKind, PaneSplitDirection,
 };
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
@@ -185,16 +185,6 @@ const fn pane_id_windows_selector(id: Uuid) -> windows_commands::Selector {
         id: Some(id),
         name: None,
         index: None,
-    }
-}
-
-#[must_use]
-const fn ipc_focus_to_windows_direction(
-    direction: PaneFocusDirection,
-) -> windows_commands::PaneDirection {
-    match direction {
-        PaneFocusDirection::Next => windows_commands::PaneDirection::Right,
-        PaneFocusDirection::Prev => windows_commands::PaneDirection::Left,
     }
 }
 
@@ -4165,31 +4155,6 @@ pub async fn handle_attach_ui_action(
             )
             .await?;
         }
-        RuntimeAction::FocusNext
-        | RuntimeAction::FocusPrev
-        | RuntimeAction::FocusLeft
-        | RuntimeAction::FocusRight
-        | RuntimeAction::FocusUp
-        | RuntimeAction::FocusDown => {
-            let direction = if matches!(
-                action,
-                RuntimeAction::FocusLeft | RuntimeAction::FocusUp | RuntimeAction::FocusPrev
-            ) {
-                PaneFocusDirection::Prev
-            } else {
-                PaneFocusDirection::Next
-            };
-            let selector = attached_session_selector(view_state);
-            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
-                client,
-                "focus-pane-in-direction",
-                &windows_commands::client::FocusPaneInDirectionRequest {
-                    session: Some(ipc_to_windows_selector(selector)),
-                    direction: ipc_focus_to_windows_direction(direction),
-                },
-            )
-            .await?;
-        }
         RuntimeAction::IncreaseSplit
         | RuntimeAction::DecreaseSplit
         | RuntimeAction::ResizeLeft
@@ -6123,16 +6088,10 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     ];
 
     for entry in effective_attach_keybindings(config) {
-        let category = match entry.action {
+        let category = match &entry.action {
             RuntimeAction::Detach | RuntimeAction::Quit => "Session",
             RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
-            | RuntimeAction::FocusNext
-            | RuntimeAction::FocusPrev
-            | RuntimeAction::FocusLeft
-            | RuntimeAction::FocusRight
-            | RuntimeAction::FocusUp
-            | RuntimeAction::FocusDown
             | RuntimeAction::IncreaseSplit
             | RuntimeAction::DecreaseSplit
             | RuntimeAction::ResizeLeft
@@ -6141,6 +6100,11 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
             | RuntimeAction::ResizeDown
             | RuntimeAction::CloseFocusedPane
             | RuntimeAction::RestartFocusedPane => "Pane",
+            RuntimeAction::PluginCommand {
+                plugin_id,
+                command_name,
+                ..
+            } if plugin_id == "bmux.windows" && command_name == "focus-pane-in-direction" => "Pane",
             RuntimeAction::EnterWindowMode
             | RuntimeAction::ExitMode
             | RuntimeAction::EnterScrollMode
@@ -6252,12 +6216,6 @@ pub const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::PluginCommand { .. }
             | RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
-            | RuntimeAction::FocusNext
-            | RuntimeAction::FocusPrev
-            | RuntimeAction::FocusLeft
-            | RuntimeAction::FocusRight
-            | RuntimeAction::FocusUp
-            | RuntimeAction::FocusDown
             | RuntimeAction::IncreaseSplit
             | RuntimeAction::DecreaseSplit
             | RuntimeAction::ResizeLeft
@@ -8722,13 +8680,7 @@ pub fn attach_key_event_actions(
 pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
     match action {
         // Navigation — safe to repeat.
-        RuntimeAction::FocusNext
-        | RuntimeAction::FocusPrev
-        | RuntimeAction::FocusLeft
-        | RuntimeAction::FocusRight
-        | RuntimeAction::FocusUp
-        | RuntimeAction::FocusDown
-        | RuntimeAction::ScrollUpLine
+        RuntimeAction::ScrollUpLine
         | RuntimeAction::ScrollDownLine
         | RuntimeAction::ScrollUpPage
         | RuntimeAction::ScrollDownPage
@@ -8789,12 +8741,6 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
         RuntimeAction::EnterWindowMode
         | RuntimeAction::SplitFocusedVertical
         | RuntimeAction::SplitFocusedHorizontal
-        | RuntimeAction::FocusNext
-        | RuntimeAction::FocusPrev
-        | RuntimeAction::FocusLeft
-        | RuntimeAction::FocusRight
-        | RuntimeAction::FocusUp
-        | RuntimeAction::FocusDown
         | RuntimeAction::IncreaseSplit
         | RuntimeAction::DecreaseSplit
         | RuntimeAction::ResizeLeft
@@ -8871,6 +8817,14 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
+
+    fn focus_action(direction: &str) -> RuntimeAction {
+        RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "focus-pane-in-direction".to_string(),
+            args: vec!["--direction".to_string(), direction.to_string()],
+        }
+    }
 
     fn frame_stats_for_classifier(scene_render: AttachSceneRenderStats) -> AttachFrameRenderStats {
         AttachFrameRenderStats {
@@ -9458,7 +9412,7 @@ mod tests {
 
     #[test]
     fn action_supports_repeat_allows_navigation() {
-        assert!(super::action_supports_repeat(&RuntimeAction::FocusNext));
+        assert!(super::action_supports_repeat(&focus_action("next")));
         assert!(super::action_supports_repeat(&RuntimeAction::ResizeLeft));
         assert!(super::action_supports_repeat(&RuntimeAction::ScrollUpLine));
         assert!(super::action_supports_repeat(
@@ -9541,12 +9495,19 @@ mod tests {
             AttachUiMode::Normal,
         )
         .expect("repeat should parse");
-        for action in &repeat {
-            assert!(
-                !matches!(action, AttachEventAction::PluginCommand { .. }),
-                "Repeat must never emit a PluginCommand",
-            );
-        }
+        assert!(repeat.iter().all(|action| match action {
+            AttachEventAction::PluginCommand {
+                plugin_id,
+                command_name,
+                ..
+            } => command_accepts_repeat(plugin_id, command_name),
+            AttachEventAction::Ui(action) => super::action_supports_repeat(action),
+            AttachEventAction::Send(_) => true,
+            AttachEventAction::Detach
+            | AttachEventAction::Redraw
+            | AttachEventAction::Ignore
+            | AttachEventAction::Mouse(_) => false,
+        }));
     }
 
     #[test]
@@ -10992,9 +10953,10 @@ mod tests {
 
         assert!(matches!(
             actions.first(),
-            Some(AttachEventAction::Ui(
-                crate::input::RuntimeAction::FocusPrev
-            ))
+            Some(AttachEventAction::PluginCommand { plugin_id, command_name, args })
+                if plugin_id == "bmux.windows"
+                    && command_name == "focus-pane-in-direction"
+                    && args == &["--direction".to_string(), "prev".to_string()]
         ));
     }
 
@@ -11015,9 +10977,10 @@ mod tests {
         .expect("attach key action should parse");
         assert!(matches!(
             normal_actions.first(),
-            Some(AttachEventAction::Ui(
-                crate::input::RuntimeAction::FocusLeft
-            ))
+            Some(AttachEventAction::PluginCommand { plugin_id, command_name, args })
+                if plugin_id == "bmux.windows"
+                    && command_name == "focus-pane-in-direction"
+                    && args == &["--direction".to_string(), "left".to_string()]
         ));
 
         let _ = processor;
@@ -11108,9 +11071,10 @@ mod tests {
         .expect("attach key action should parse");
         assert!(matches!(
             actions.first(),
-            Some(AttachEventAction::Ui(
-                crate::input::RuntimeAction::FocusLeft
-            ))
+            Some(AttachEventAction::PluginCommand { plugin_id, command_name, args })
+                if plugin_id == "bmux.windows"
+                    && command_name == "focus-pane-in-direction"
+                    && args == &["--direction".to_string(), "left".to_string()]
         ));
     }
 
@@ -11440,7 +11404,10 @@ mod tests {
     #[test]
     fn attach_keybindings_keep_focus_next_pane_binding() {
         let (runtime, _global, _scroll) = filtered_attach_keybindings(&BmuxConfig::default());
-        assert_eq!(runtime.get("o"), Some(&"focus_next_pane".to_string()));
+        assert_eq!(
+            runtime.get("o"),
+            Some(&"plugin:bmux.windows:focus-pane-in-direction --direction next".to_string())
+        );
     }
 
     #[test]
@@ -11505,14 +11472,16 @@ mod tests {
         assert!(entries.iter().any(|entry| {
             entry.scope == AttachKeybindingScope::Runtime
                 && entry.chord == "o"
-                && entry.action_name == "focus_next_pane"
-                && entry.action == crate::input::RuntimeAction::FocusNext
+                && entry.action_name
+                    == "plugin:bmux.windows:focus-pane-in-direction --direction next"
+                && entry.action == focus_action("next")
         }));
         assert!(entries.iter().any(|entry| {
             entry.scope == AttachKeybindingScope::Global
                 && entry.chord == "alt+h"
-                && entry.action_name == "focus_left_pane"
-                && entry.action == crate::input::RuntimeAction::FocusLeft
+                && entry.action_name
+                    == "plugin:bmux.windows:focus-pane-in-direction --direction left"
+                && entry.action == focus_action("left")
         }));
     }
 

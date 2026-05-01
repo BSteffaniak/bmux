@@ -8,12 +8,6 @@ use anyhow::{Result, bail};
 pub enum RuntimeAction {
     Quit,
     Detach,
-    FocusNext,
-    FocusPrev,
-    FocusLeft,
-    FocusRight,
-    FocusUp,
-    FocusDown,
     ToggleSplitDirection,
     SplitFocusedVertical,
     SplitFocusedHorizontal,
@@ -59,12 +53,6 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
     match action {
         RuntimeAction::Quit => "quit",
         RuntimeAction::Detach => "detach",
-        RuntimeAction::FocusNext => "focus_next_pane",
-        RuntimeAction::FocusPrev => "focus_previous_pane",
-        RuntimeAction::FocusLeft => "focus_left_pane",
-        RuntimeAction::FocusRight => "focus_right_pane",
-        RuntimeAction::FocusUp => "focus_up_pane",
-        RuntimeAction::FocusDown => "focus_down_pane",
         RuntimeAction::ToggleSplitDirection => "toggle_split_direction",
         RuntimeAction::SplitFocusedVertical => "split_focused_vertical",
         RuntimeAction::SplitFocusedHorizontal => "split_focused_horizontal",
@@ -150,12 +138,12 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
     match normalized.as_str() {
         "quit" | "quit_destroy" => Ok(RuntimeAction::Quit),
         "detach" => Ok(RuntimeAction::Detach),
-        "focus_next_pane" => Ok(RuntimeAction::FocusNext),
-        "focus_previous_pane" | "focus_prev_pane" => Ok(RuntimeAction::FocusPrev),
-        "focus_left_pane" => Ok(RuntimeAction::FocusLeft),
-        "focus_right_pane" => Ok(RuntimeAction::FocusRight),
-        "focus_up_pane" => Ok(RuntimeAction::FocusUp),
-        "focus_down_pane" => Ok(RuntimeAction::FocusDown),
+        "focus_next_pane" => Ok(windows_focus_command("next")),
+        "focus_previous_pane" | "focus_prev_pane" => Ok(windows_focus_command("prev")),
+        "focus_left_pane" => Ok(windows_focus_command("left")),
+        "focus_right_pane" => Ok(windows_focus_command("right")),
+        "focus_up_pane" => Ok(windows_focus_command("up")),
+        "focus_down_pane" => Ok(windows_focus_command("down")),
         "toggle_split_direction" => Ok(RuntimeAction::ToggleSplitDirection),
         "split_focused_vertical" => Ok(RuntimeAction::SplitFocusedVertical),
         "split_focused_horizontal" => Ok(RuntimeAction::SplitFocusedHorizontal),
@@ -212,6 +200,14 @@ fn plugin_command<const N: usize>(
         command_name: command_name.to_string(),
         args: args.into_iter().map(ToString::to_string).collect(),
     }
+}
+
+fn windows_focus_command(direction: &str) -> RuntimeAction {
+    plugin_command(
+        "bmux.windows",
+        "focus-pane-in-direction",
+        ["--direction", direction],
+    )
 }
 
 fn parse_enter_mode_action(value: &str) -> Option<Result<RuntimeAction>> {
@@ -356,6 +352,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_action_maps_legacy_focus_actions_to_plugin_commands() {
+        assert_eq!(
+            parse_action("focus_prev_pane").expect("legacy focus previous action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "focus-pane-in-direction".to_string(),
+                args: vec!["--direction".to_string(), "prev".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_action("focus_left_pane").expect("legacy focus left action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "focus-pane-in-direction".to_string(),
+                args: vec!["--direction".to_string(), "left".to_string()],
+            }
+        );
+    }
+
+    #[test]
     fn parse_action_accepts_plugin_command_with_multiple_args() {
         let action = parse_action("plugin:bmux.windows:switch-window --session dev")
             .expect("plugin action with multiple args should parse");
@@ -435,7 +451,11 @@ mod tests {
         );
         assert_eq!(
             parse_action("Focus_Next_Pane").expect("mixed case built-in should parse"),
-            RuntimeAction::FocusNext
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "focus-pane-in-direction".to_string(),
+                args: vec!["--direction".to_string(), "next".to_string()],
+            }
         );
     }
 
