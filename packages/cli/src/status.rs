@@ -23,6 +23,7 @@ pub struct AttachStatusTabHitbox {
 pub struct AttachStatusLine {
     pub rendered: String,
     pub tab_hitboxes: Vec<AttachStatusTabHitbox>,
+    pub drag_marker_col: Option<u16>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
@@ -44,6 +45,7 @@ pub fn build_attach_status_line(
         return AttachStatusLine {
             rendered: String::new(),
             tab_hitboxes: Vec::new(),
+            drag_marker_col: None,
         };
     }
 
@@ -136,6 +138,7 @@ pub fn build_attach_status_line(
     AttachStatusLine {
         rendered,
         tab_hitboxes,
+        drag_marker_col: None,
     }
 }
 

@@ -9,6 +9,7 @@ owns_namespaces = [
     "kill-window",
     "kill-all-windows",
     "switch-window",
+    "move-window",
     "next-window",
     "prev-window",
     "last-window",
@@ -184,6 +185,35 @@ long       = "session"
 name       = "session"
 short      = "s"
 value_name = "SESSION"
+
+[[commands]]
+aliases       = [["window", "move"]]
+expose_in_cli = true
+name          = "move-window"
+path          = ["move-window"]
+summary       = "Move a workspace window before or after another window"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "source"
+position   = 0
+required   = true
+value_name = "SOURCE_CONTEXT_ID"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 1
+required   = true
+value_name = "TARGET_CONTEXT_ID"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "placement"
+name       = "placement"
+required   = true
+value_name = "PLACEMENT"
+values     = ["before", "after"]
 
 [[commands]]
 accepts_repeat = true

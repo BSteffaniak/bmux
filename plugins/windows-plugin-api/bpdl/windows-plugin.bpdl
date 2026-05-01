@@ -127,6 +127,12 @@ interface windows-commands {
         down,
     }
 
+    // Placement for moving a window relative to another window.
+    enum window-move-placement {
+        @default before,
+        after,
+    }
+
     // Selector identifying a session or pane. Exactly one of `id`,
     // `name`, or `index` should be populated. `id` wins when multiple
     // are set. `index` is only meaningful for pane selectors scoped
@@ -202,6 +208,8 @@ interface windows-commands {
     command kill-window(target: string, force-local: bool) -> result<window-ack, window-error>;
     command kill-all-windows(force-local: bool) -> result<window-ack, window-error>;
     command switch-window(target: string) -> result<window-ack, window-error>;
+    command move-window(source: uuid, target: uuid, placement: window-move-placement)
+        -> result<window-ack, window-error>;
 }
 
 interface windows-events {
@@ -231,8 +239,8 @@ interface windows-events {
 // windows plugin owns the authoritative window order (persisted in its
 // plugin-local storage under `windows.order`) and publishes a fresh
 // snapshot on every mutation: new-window, rename-window,
-// switch-window, kill-window, kill-all-windows, goto-window,
-// close-current-window, next/prev/last window.
+// switch-window, move-window, kill-window, kill-all-windows,
+// goto-window, close-current-window, next/prev/last window.
 //
 // Subscribers (notably the attach tab bar) consume this via
 // `EventBus::subscribe_state::<WindowListSnapshot>` to observe the

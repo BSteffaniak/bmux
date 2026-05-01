@@ -315,10 +315,11 @@ pub struct AttachViewState {
     pub image_decode_mode: bmux_image::config::ImageDecodeMode,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct AttachMouseState {
     pub config: MouseBehaviorConfig,
+    pub tab_drag_enabled: bool,
     pub last_position: Option<(u16, u16)>,
     pub last_event_at: Option<Instant>,
     pub hover_started_at: Option<Instant>,
@@ -326,6 +327,45 @@ pub struct AttachMouseState {
     pub last_focused_pane_id: Option<Uuid>,
     pub resize_drag: Option<AttachMouseResizeDrag>,
     pub selection_drag: Option<AttachMouseSelectionDrag>,
+    pub tab_drag: Option<AttachMouseTabDrag>,
+}
+
+impl Default for AttachMouseState {
+    fn default() -> Self {
+        Self {
+            config: MouseBehaviorConfig::default(),
+            tab_drag_enabled: true,
+            last_position: None,
+            last_event_at: None,
+            hover_started_at: None,
+            hovered_pane_id: None,
+            last_focused_pane_id: None,
+            resize_drag: None,
+            selection_drag: None,
+            tab_drag: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachMouseTabDrag {
+    pub source_context_id: Uuid,
+    pub started_col: u16,
+    pub started_row: u16,
+    pub active: bool,
+    pub drop_target: Option<AttachTabDropTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachTabDropTarget {
+    pub context_id: Uuid,
+    pub placement: AttachTabDropPlacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachTabDropPlacement {
+    Before,
+    After,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

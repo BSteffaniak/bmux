@@ -79,8 +79,9 @@ use super::render::{
 };
 use super::state::{
     AttachDirtySource, AttachEventAction, AttachExitReason, AttachMouseResizeAxisDrag,
-    AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachScrollbackCursor,
-    AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRect, PaneRenderBuffer,
+    AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag, AttachScrollbackCursor,
+    AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget, AttachUiMode,
+    AttachViewState, PaneRect, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{BmuxPaneRuntimeClientExt, StreamingAttachInputExt};
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
@@ -1809,6 +1810,7 @@ pub async fn run_session_attach_with_client(
     let mut view_state = AttachViewState::new(attach_info);
     view_state.self_client_id = Some(self_client_id);
     view_state.mouse.config = attach_config.attach_mouse_config();
+    view_state.mouse.tab_drag_enabled = status_tab_drag_enabled(&attach_config.status_bar);
     view_state.status_position = if attach_config.status_bar.enabled {
         attach_config.appearance.status_position
     } else {
@@ -4678,6 +4680,7 @@ pub fn build_attach_status_line_for_draw(
         return AttachStatusLine {
             rendered: String::new(),
             tab_hitboxes: Vec::new(),
+            drag_marker_col: None,
         };
     }
 
@@ -4752,7 +4755,7 @@ pub fn build_attach_status_line_for_draw(
         attach_mode_hint(&view_state.active_mode_id, ui_mode, keymap)
     };
 
-    build_attach_status_line(
+    let mut status_line = build_attach_status_line(
         cols,
         status_config,
         &runtime_appearance,
@@ -4765,7 +4768,14 @@ pub fn build_attach_status_line_for_draw(
         role_label,
         follow_label.as_deref(),
         &hint,
-    )
+    );
+    status_line.drag_marker_col = view_state
+        .mouse
+        .tab_drag
+        .as_ref()
+        .and_then(|drag| drag.drop_target)
+        .and_then(|target| attach_tab_drop_marker_col(&status_line, target, cols));
+    status_line
 }
 
 pub fn attach_mode_hint(mode_id: &str, _ui_mode: AttachUiMode, keymap: &Keymap) -> String {
@@ -4928,6 +4938,7 @@ fn apply_attach_profile_switch_with_path(
 
     let previous_keymap = attach_input_processor.keymap().clone();
     let previous_mouse_config = view_state.mouse.config.clone();
+    let previous_tab_drag_enabled = view_state.mouse.tab_drag_enabled;
     let previous_status_position = view_state.status_position;
 
     if let Err(error) =
@@ -4949,6 +4960,7 @@ fn apply_attach_profile_switch_with_path(
             StatusPosition::Off
         };
         view_state.mouse.config = resolved_config.attach_mouse_config();
+        view_state.mouse.tab_drag_enabled = status_tab_drag_enabled(&resolved_config.status_bar);
         sync_attach_active_mode_from_processor(
             view_state,
             attach_input_processor.keymap(),
@@ -4979,6 +4991,7 @@ fn apply_attach_profile_switch_with_path(
         attach_input_processor.replace_keymap(previous_keymap);
         attach_input_processor.set_scroll_mode(view_state.scrollback_active);
         view_state.mouse.config = previous_mouse_config;
+        view_state.mouse.tab_drag_enabled = previous_tab_drag_enabled;
         view_state.status_position = previous_status_position;
         sync_attach_active_mode_from_processor(
             view_state,
@@ -5023,7 +5036,16 @@ pub fn queue_attach_status_line(
         return Ok(());
     };
     queue!(stdout, MoveTo(0, status_row), Print(&status_line.rendered))
-        .context("failed queuing attach status line")
+        .context("failed queuing attach status line")?;
+    if let Some(marker_col) = status_line.drag_marker_col {
+        queue!(
+            stdout,
+            MoveTo(marker_col.min(cols.saturating_sub(1)), status_row),
+            Print("│")
+        )
+        .context("failed queuing attach status tab drag marker")?;
+    }
+    Ok(())
 }
 
 pub fn help_overlay_visible_rows(lines: &[String]) -> usize {
@@ -5644,6 +5666,11 @@ pub fn render_attach_frame(
     view_state.last_prompt_overlay_surface = current_prompt_overlay_surface;
     view_state.dirty.clear_frame_damage();
     Ok(stats)
+}
+
+pub const fn status_tab_drag_enabled(status_config: &bmux_config::StatusBarConfig) -> bool {
+    !matches!(status_config.tab_scope, bmux_config::StatusTabScope::Mru)
+        && !matches!(status_config.tab_order, bmux_config::StatusTabOrder::Mru)
 }
 
 pub fn build_attach_tabs_from_catalog(
@@ -7567,22 +7594,24 @@ pub async fn handle_attach_mouse_event(
 
     if !view_state.mouse.config.enabled {
         view_state.mouse.resize_drag = None;
+        view_state.mouse.tab_drag = None;
         return Ok(());
     }
     if view_state.help_overlay_open || view_state.prompt.is_active() {
         view_state.mouse.resize_drag = None;
+        view_state.mouse.tab_drag = None;
         return Ok(());
     }
 
-    if matches!(mouse_event.kind, MouseEventKind::Down(MouseButton::Left))
-        && handle_attach_status_tab_click(client, view_state, mouse_event, kernel_client_factory)
-            .await?
+    if handle_attach_status_tab_mouse_event(client, view_state, mouse_event, kernel_client_factory)
+        .await?
     {
         return Ok(());
     }
 
     if !view_state.can_write {
         view_state.mouse.resize_drag = None;
+        view_state.mouse.tab_drag = None;
         return Ok(());
     }
 
@@ -8228,6 +8257,241 @@ const fn mouse_event_to_shared(mouse_event: MouseEvent) -> attach_mouse::Event {
         row: mouse_event.row,
         modifiers: key_modifiers_to_shared(mouse_event.modifiers),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn handle_attach_status_tab_mouse_event(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+    kernel_client_factory: Option<&KernelClientFactory>,
+) -> std::result::Result<bool, ClientError> {
+    match mouse_event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(source_context_id) = attach_status_tab_context_at(view_state, mouse_event)
+            else {
+                view_state.mouse.tab_drag = None;
+                return Ok(false);
+            };
+
+            if !view_state.mouse.tab_drag_enabled {
+                trace!("attach.status_tab_drag.disabled.mru_order");
+                return handle_attach_status_tab_click(
+                    client,
+                    view_state,
+                    mouse_event,
+                    kernel_client_factory,
+                )
+                .await;
+            }
+
+            let drop_target = view_state
+                .cached_status_line
+                .as_ref()
+                .and_then(|status_line| {
+                    resolve_attach_tab_drop_target(status_line, mouse_event.column)
+                });
+            view_state.mouse.tab_drag = Some(AttachMouseTabDrag {
+                source_context_id,
+                started_col: mouse_event.column,
+                started_row: mouse_event.row,
+                active: false,
+                drop_target,
+            });
+            view_state.dirty.mark_status_dirty(AttachDirtySource::Mouse);
+            Ok(true)
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if view_state.mouse.tab_drag.is_none() {
+                return Ok(false);
+            }
+            let drop_target = if attach_status_mouse_row_matches(view_state, mouse_event) {
+                view_state
+                    .cached_status_line
+                    .as_ref()
+                    .and_then(|status_line| {
+                        resolve_attach_tab_drop_target(status_line, mouse_event.column)
+                    })
+            } else {
+                None
+            };
+            if let Some(drag) = view_state.mouse.tab_drag.as_mut() {
+                drag.active = true;
+                drag.drop_target = drop_target;
+            }
+            view_state.dirty.mark_status_dirty(AttachDirtySource::Mouse);
+            Ok(true)
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(mut drag) = view_state.mouse.tab_drag.take() else {
+                return Ok(false);
+            };
+            let drop_target = if attach_status_mouse_row_matches(view_state, mouse_event) {
+                view_state
+                    .cached_status_line
+                    .as_ref()
+                    .and_then(|status_line| {
+                        resolve_attach_tab_drop_target(status_line, mouse_event.column)
+                    })
+            } else {
+                None
+            }
+            .or_else(|| drag.drop_target.take());
+
+            if let (true, Some(target)) = (drag.active, drop_target) {
+                if !view_state.can_write {
+                    view_state.set_transient_status(
+                        "tab reorder unavailable in read-only attach".to_string(),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                } else if target.context_id != drag.source_context_id {
+                    let placement = attach_tab_drop_placement_arg(target.placement);
+                    let args = vec![
+                        drag.source_context_id.to_string(),
+                        target.context_id.to_string(),
+                        "--placement".to_string(),
+                        placement.to_string(),
+                    ];
+                    handle_attach_plugin_command_action(
+                        client,
+                        "bmux.windows",
+                        "move-window",
+                        &args,
+                        view_state,
+                        kernel_client_factory,
+                    )
+                    .await?;
+                }
+            } else if !drag.active {
+                switch_attach_status_tab(
+                    client,
+                    view_state,
+                    drag.source_context_id,
+                    kernel_client_factory,
+                )
+                .await?;
+            }
+            view_state
+                .dirty
+                .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn attach_status_mouse_row_matches(view_state: &AttachViewState, mouse_event: MouseEvent) -> bool {
+    let (_cols, rows) = terminal::size().unwrap_or((0, 0));
+    let Some(status_row) = status_row_for_position(view_state.status_position, rows) else {
+        return false;
+    };
+    status_row_matches_mouse(status_row, mouse_event.row, rows)
+}
+
+fn attach_status_tab_context_at(
+    view_state: &AttachViewState,
+    mouse_event: MouseEvent,
+) -> Option<Uuid> {
+    if !attach_status_mouse_row_matches(view_state, mouse_event) {
+        return None;
+    }
+    view_state
+        .cached_status_line
+        .as_ref()
+        .and_then(|status_line| {
+            status_line
+                .tab_hitboxes
+                .iter()
+                .find(|hitbox| {
+                    mouse_event.column >= hitbox.start_col && mouse_event.column <= hitbox.end_col
+                })
+                .map(|hitbox| hitbox.context_id)
+        })
+}
+
+pub fn resolve_attach_tab_drop_target(
+    status_line: &AttachStatusLine,
+    column: u16,
+) -> Option<AttachTabDropTarget> {
+    let mut hitboxes = status_line.tab_hitboxes.iter().collect::<Vec<_>>();
+    hitboxes.sort_by_key(|hitbox| hitbox.start_col);
+    let first = hitboxes.first()?;
+    if column < first.start_col {
+        return Some(AttachTabDropTarget {
+            context_id: first.context_id,
+            placement: AttachTabDropPlacement::Before,
+        });
+    }
+    for hitbox in &hitboxes {
+        if column < hitbox.start_col {
+            return Some(AttachTabDropTarget {
+                context_id: hitbox.context_id,
+                placement: AttachTabDropPlacement::Before,
+            });
+        }
+        if column <= hitbox.end_col {
+            let width = hitbox
+                .end_col
+                .saturating_sub(hitbox.start_col)
+                .saturating_add(1);
+            let offset = column.saturating_sub(hitbox.start_col);
+            let placement = if u32::from(offset).saturating_mul(2) < u32::from(width) {
+                AttachTabDropPlacement::Before
+            } else {
+                AttachTabDropPlacement::After
+            };
+            return Some(AttachTabDropTarget {
+                context_id: hitbox.context_id,
+                placement,
+            });
+        }
+    }
+    hitboxes.last().map(|hitbox| AttachTabDropTarget {
+        context_id: hitbox.context_id,
+        placement: AttachTabDropPlacement::After,
+    })
+}
+
+fn attach_tab_drop_marker_col(
+    status_line: &AttachStatusLine,
+    target: AttachTabDropTarget,
+    cols: u16,
+) -> Option<u16> {
+    let hitbox = status_line
+        .tab_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.context_id == target.context_id)?;
+    let col = match target.placement {
+        AttachTabDropPlacement::Before => hitbox.start_col,
+        AttachTabDropPlacement::After => hitbox.end_col.saturating_add(1),
+    };
+    Some(col.min(cols.saturating_sub(1)))
+}
+
+const fn attach_tab_drop_placement_arg(placement: AttachTabDropPlacement) -> &'static str {
+    match placement {
+        AttachTabDropPlacement::Before => "before",
+        AttachTabDropPlacement::After => "after",
+    }
+}
+
+async fn switch_attach_status_tab(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    target_context_id: Uuid,
+    kernel_client_factory: Option<&KernelClientFactory>,
+) -> std::result::Result<(), ClientError> {
+    debug!(target_context_id = %target_context_id, "attach.status_click.retarget");
+    handle_attach_plugin_command_action(
+        client,
+        "bmux.windows",
+        "switch-window",
+        &[target_context_id.to_string()],
+        view_state,
+        kernel_client_factory,
+    )
+    .await
 }
 
 pub async fn handle_attach_status_tab_click(
@@ -9094,6 +9358,7 @@ mod tests {
         AttachEventAction, AttachMouseSelectionDrag, AttachScrollbackCursor,
         AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRenderBuffer,
     };
+    use crate::status::AttachStatusTabHitbox;
 
     use bmux_attach_layout_protocol::{
         AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
@@ -9131,6 +9396,119 @@ mod tests {
             command_name: "focus-pane-in-direction".to_string(),
             args: vec!["--direction".to_string(), direction.to_string()],
         }
+    }
+
+    fn tab_status_line(hitboxes: Vec<AttachStatusTabHitbox>) -> AttachStatusLine {
+        AttachStatusLine {
+            rendered: String::new(),
+            tab_hitboxes: hitboxes,
+            drag_marker_col: None,
+        }
+    }
+
+    #[test]
+    fn attach_output_batch_unexpected_response_after_detach_is_stream_closed() {
+        let error = ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: "attach-pane-output-batch typed dispatch failed: unexpected response invoking attach-runtime-state/attach-pane-output-batch: expected service invoked".to_string(),
+        };
+
+        assert!(is_attach_not_attached_runtime_error(&error));
+    }
+
+    #[test]
+    fn tab_drop_target_uses_tab_halves_and_gaps() {
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let third = Uuid::from_u128(3);
+        let status = tab_status_line(vec![
+            AttachStatusTabHitbox {
+                start_col: 2,
+                end_col: 5,
+                context_id: first,
+            },
+            AttachStatusTabHitbox {
+                start_col: 8,
+                end_col: 11,
+                context_id: second,
+            },
+            AttachStatusTabHitbox {
+                start_col: 14,
+                end_col: 17,
+                context_id: third,
+            },
+        ]);
+
+        assert_eq!(
+            resolve_attach_tab_drop_target(&status, 1),
+            Some(AttachTabDropTarget {
+                context_id: first,
+                placement: AttachTabDropPlacement::Before,
+            })
+        );
+        assert_eq!(
+            resolve_attach_tab_drop_target(&status, 3),
+            Some(AttachTabDropTarget {
+                context_id: first,
+                placement: AttachTabDropPlacement::Before,
+            })
+        );
+        assert_eq!(
+            resolve_attach_tab_drop_target(&status, 4),
+            Some(AttachTabDropTarget {
+                context_id: first,
+                placement: AttachTabDropPlacement::After,
+            })
+        );
+        assert_eq!(
+            resolve_attach_tab_drop_target(&status, 7),
+            Some(AttachTabDropTarget {
+                context_id: second,
+                placement: AttachTabDropPlacement::Before,
+            })
+        );
+        assert_eq!(
+            resolve_attach_tab_drop_target(&status, 99),
+            Some(AttachTabDropTarget {
+                context_id: third,
+                placement: AttachTabDropPlacement::After,
+            })
+        );
+        assert_eq!(
+            attach_tab_drop_marker_col(
+                &status,
+                AttachTabDropTarget {
+                    context_id: second,
+                    placement: AttachTabDropPlacement::Before,
+                },
+                80,
+            ),
+            Some(8)
+        );
+        assert_eq!(
+            attach_tab_drop_marker_col(
+                &status,
+                AttachTabDropTarget {
+                    context_id: second,
+                    placement: AttachTabDropPlacement::After,
+                },
+                80,
+            ),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn tab_drag_is_disabled_for_mru_status_config() {
+        let mut config = BmuxConfig::default().status_bar;
+        assert!(status_tab_drag_enabled(&config));
+
+        config.tab_order = bmux_config::StatusTabOrder::Mru;
+        assert!(!status_tab_drag_enabled(&config));
+
+        config.tab_order = bmux_config::StatusTabOrder::Stable;
+        config.tab_scope = bmux_config::StatusTabScope::Mru;
+        assert!(!status_tab_drag_enabled(&config));
     }
 
     fn frame_stats_for_classifier(scene_render: AttachSceneRenderStats) -> AttachFrameRenderStats {

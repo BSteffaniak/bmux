@@ -20,7 +20,7 @@ use bmux_plugin_sdk::{
 };
 use bmux_windows_plugin_api::windows_commands::{
     self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, PaneResizeDirection,
-    PaneZoomAck, Selector, WindowAck, WindowError, WindowsCommandsService,
+    PaneZoomAck, Selector, WindowAck, WindowError, WindowMovePlacement, WindowsCommandsService,
 };
 use bmux_windows_plugin_api::windows_state::{self, PaneState, WindowEntry, WindowsStateService};
 use serde::{Deserialize, Serialize};
@@ -515,6 +515,10 @@ impl RustPlugin for WindowsPlugin {
                     ctx.caller_client_id,
                 )
                     .map_err(|e| ServiceResponse::error("switch_failed", e))
+            },
+            "windows-commands", "move-window" => |req: MoveWindowArgs, ctx| {
+                move_window(ctx, &self.runtime_state, req.source, req.target, req.placement)
+                    .map_err(|e| ServiceResponse::error("move_failed", e))
             },
             "windows-commands", "focus-pane" => |req: FocusPaneArgs, ctx| {
                 let target = Selector { id: Some(req.id), name: None, index: None };
@@ -1125,6 +1129,30 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             }
             Ok(())
         }
+        "move-window" => {
+            let source = positional_value_at(&context.arguments, 0)
+                .ok_or_else(|| "missing required SOURCE_CONTEXT_ID argument".to_string())?;
+            let target = positional_value_at(&context.arguments, 1)
+                .ok_or_else(|| "missing required TARGET_CONTEXT_ID argument".to_string())?;
+            let placement = option_value(&context.arguments, "placement")
+                .ok_or_else(|| "--placement is required".to_string())?;
+            let source_id = Uuid::parse_str(&source)
+                .map_err(|error| format!("invalid source context id '{source}': {error}"))?;
+            let target_id = Uuid::parse_str(&target)
+                .map_err(|error| format!("invalid target context id '{target}': {error}"))?;
+            let placement = parse_window_move_placement_arg(&placement)?;
+            let ack = move_window(
+                context,
+                &plugin.runtime_state,
+                source_id,
+                target_id,
+                placement,
+            )?;
+            if emit_to_stdout && let Some(id) = ack.id {
+                println!("moved window context: {id}");
+            }
+            Ok(())
+        }
         "next-window" => {
             let ack = cycle_window(
                 context,
@@ -1657,6 +1685,58 @@ fn switch_window_with_contexts(
     Ok(WindowAck {
         ok: true,
         id: Some(context_id.to_string()),
+    })
+}
+
+fn move_window(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &WindowRuntimeStateHandle,
+    source: Uuid,
+    target: Uuid,
+    placement: WindowMovePlacement,
+) -> Result<WindowAck, String> {
+    if source == target {
+        return Ok(WindowAck {
+            ok: true,
+            id: Some(source.to_string()),
+        });
+    }
+
+    let contexts = list_contexts(caller)?;
+    let live_ids = contexts
+        .iter()
+        .map(|context| context.id)
+        .collect::<HashSet<_>>();
+    if !live_ids.contains(&source) {
+        return Err(format!("source window context not found: {source}"));
+    }
+    if !live_ids.contains(&target) {
+        return Err(format!("target window context not found: {target}"));
+    }
+
+    let mut order_ids = resolve_window_order_ids(caller, runtime_state, &contexts)?;
+    let Some(source_index) = order_ids.iter().position(|id| *id == source) else {
+        return Err(format!("source window context not in order: {source}"));
+    };
+    let source_id = order_ids.remove(source_index);
+    let Some(target_index) = order_ids.iter().position(|id| *id == target) else {
+        return Err(format!("target window context not in order: {target}"));
+    };
+    let insert_index = match placement {
+        WindowMovePlacement::Before => target_index,
+        WindowMovePlacement::After => target_index.saturating_add(1),
+    };
+    order_ids.insert(insert_index.min(order_ids.len()), source_id);
+
+    set_stored_window_order_ids(caller, &order_ids)?;
+    if let Ok(mut state) = runtime_state.lock() {
+        state.window_order_ids = Some(order_ids);
+        state.window_order_dirty = false;
+    }
+    publish_window_list_snapshot(caller, runtime_state);
+    Ok(WindowAck {
+        ok: true,
+        id: Some(source.to_string()),
     })
 }
 
@@ -2551,6 +2631,25 @@ impl WindowsCommandsService for WindowsCommandsHandle {
             .map_err(|reason| WindowError::Failed { reason })
         })
     }
+
+    fn move_window<'a>(
+        &'a self,
+        source: Uuid,
+        target: Uuid,
+        placement: WindowMovePlacement,
+    ) -> Pin<Box<dyn Future<Output = Result<WindowAck, WindowError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            move_window(
+                &*caller,
+                &self.shared.runtime_state,
+                source,
+                target,
+                placement,
+            )
+            .map_err(|reason| WindowError::Failed { reason })
+        })
+    }
 }
 
 impl WindowsStateService for WindowsStateHandle {
@@ -2651,10 +2750,25 @@ fn has_flag(arguments: &[String], long_name: &str) -> bool {
 }
 
 fn positional_value(arguments: &[String]) -> Option<String> {
+    positional_value_at(arguments, 0)
+}
+
+fn positional_value_at(arguments: &[String], position: usize) -> Option<String> {
     arguments
         .iter()
-        .find(|argument| !argument.starts_with('-'))
+        .filter(|argument| !argument.starts_with('-'))
+        .nth(position)
         .cloned()
+}
+
+fn parse_window_move_placement_arg(value: &str) -> Result<WindowMovePlacement, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "before" => Ok(WindowMovePlacement::Before),
+        "after" => Ok(WindowMovePlacement::After),
+        other => Err(format!(
+            "unknown move placement '{other}' (expected before/after)"
+        )),
+    }
 }
 
 /// Parse a `--direction` argument value from a keybinding-dispatched
@@ -2719,6 +2833,13 @@ struct KillAllWindowsArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SwitchWindowArgs {
     target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MoveWindowArgs {
+    source: Uuid,
+    target: Uuid,
+    placement: WindowMovePlacement,
 }
 
 /// Byte-wire envelope for `windows-commands/focus-pane`. The BPDL
@@ -4453,6 +4574,117 @@ mod tests {
         };
         assert_eq!(kill_count, 1);
         assert!(first_kill_matches);
+    }
+
+    #[test]
+    fn move_window_moves_source_before_target_and_persists_order() {
+        let sessions = sample_sessions_three();
+        let first = sessions[0].id;
+        let second = sessions[1].id;
+        let third = sessions[2].id;
+        let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
+        seed_window_order(&host, &sessions);
+
+        let ack = move_window(
+            &host,
+            &runtime_state,
+            third,
+            first,
+            WindowMovePlacement::Before,
+        )
+        .expect("move should succeed");
+
+        assert!(ack.ok);
+        assert_eq!(ack.id, Some(third.to_string()));
+        let order = get_stored_window_order_ids(&host).expect("order readable");
+        assert_eq!(order, vec![third, first, second]);
+        assert_eq!(cached_window_order_ids(&runtime_state), Some(order));
+    }
+
+    #[test]
+    fn move_window_moves_source_after_target_and_keeps_active_unchanged() {
+        let sessions = sample_sessions_three();
+        let first = sessions[0].id;
+        let second = sessions[1].id;
+        let third = sessions[2].id;
+        let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
+        seed_window_order(&host, &sessions);
+        set_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY, Some(second)).expect("seed active");
+
+        move_window(
+            &host,
+            &runtime_state,
+            first,
+            third,
+            WindowMovePlacement::After,
+        )
+        .expect("move should succeed");
+
+        let order = get_stored_window_order_ids(&host).expect("order readable");
+        assert_eq!(order, vec![second, third, first]);
+        assert_eq!(
+            get_stored_context_id(&host, ACTIVE_WINDOW_CONTEXT_KEY).expect("active readable"),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn move_window_same_source_and_target_is_noop() {
+        let sessions = sample_sessions_three();
+        let first = sessions[0].id;
+        let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
+        seed_window_order(&host, &sessions);
+
+        move_window(
+            &host,
+            &runtime_state,
+            first,
+            first,
+            WindowMovePlacement::After,
+        )
+        .expect("same source and target should succeed");
+
+        let order = get_stored_window_order_ids(&host).expect("order readable");
+        assert_eq!(
+            order,
+            sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn move_window_rejects_unknown_source_or_target() {
+        let sessions = sample_sessions();
+        let first = sessions[0].id;
+        let host = MockHost::with_sessions(sessions.clone());
+        let runtime_state = runtime_state();
+        seed_window_order(&host, &sessions);
+        let unknown = Uuid::new_v4();
+
+        let source_error = move_window(
+            &host,
+            &runtime_state,
+            unknown,
+            first,
+            WindowMovePlacement::Before,
+        )
+        .expect_err("unknown source should fail");
+        assert!(source_error.contains("source window context not found"));
+
+        let target_error = move_window(
+            &host,
+            &runtime_state,
+            first,
+            unknown,
+            WindowMovePlacement::Before,
+        )
+        .expect_err("unknown target should fail");
+        assert!(target_error.contains("target window context not found"));
     }
 
     /// Verify that `register_typed_services` installs both typed
