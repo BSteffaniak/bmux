@@ -6,9 +6,9 @@ use anyhow::{Result, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAction {
+    NoOp,
     Quit,
     Detach,
-    ToggleSplitDirection,
     CloseFocusedPane,
     ShowHelp,
     EnterScrollMode,
@@ -26,7 +26,6 @@ pub enum RuntimeAction {
     MoveCursorDown,
     CopyScrollback,
     ConfirmScrollback,
-    EnterWindowMode,
     ExitMode,
     EnterMode(String),
     SwitchProfile(String),
@@ -41,9 +40,9 @@ pub enum RuntimeAction {
 #[must_use]
 pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
     match action {
+        RuntimeAction::NoOp => "no_op",
         RuntimeAction::Quit => "quit",
         RuntimeAction::Detach => "detach",
-        RuntimeAction::ToggleSplitDirection => "toggle_split_direction",
         RuntimeAction::CloseFocusedPane => "close_focused_pane",
         RuntimeAction::ShowHelp => "show_help",
         RuntimeAction::EnterScrollMode => "enter_scroll_mode",
@@ -61,7 +60,6 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::MoveCursorDown => "move_cursor_down",
         RuntimeAction::CopyScrollback => "copy_scrollback",
         RuntimeAction::ConfirmScrollback => "confirm_scrollback",
-        RuntimeAction::EnterWindowMode => "enter_window_mode",
         RuntimeAction::ExitMode => "exit_mode",
         RuntimeAction::EnterMode(_) => "enter_mode",
         RuntimeAction::SwitchProfile(_) => "switch_profile",
@@ -124,7 +122,7 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
         "focus_right_pane" => Ok(windows_focus_command("right")),
         "focus_up_pane" => Ok(windows_focus_command("up")),
         "focus_down_pane" => Ok(windows_focus_command("down")),
-        "toggle_split_direction" => Ok(RuntimeAction::ToggleSplitDirection),
+        "no_op" | "toggle_split_direction" | "enter_window_mode" => Ok(RuntimeAction::NoOp),
         "split_focused_vertical" => Ok(windows_split_command("vertical")),
         "split_focused_horizontal" => Ok(windows_split_command("horizontal")),
         "increase_split" => Ok(windows_resize_command("increase")),
@@ -152,7 +150,6 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
         "move_cursor_down" => Ok(RuntimeAction::MoveCursorDown),
         "copy_scrollback" => Ok(RuntimeAction::CopyScrollback),
         "confirm_scrollback" => Ok(RuntimeAction::ConfirmScrollback),
-        "enter_window_mode" => Ok(RuntimeAction::EnterWindowMode),
         "exit_mode" => Ok(RuntimeAction::ExitMode),
         "window_prev" => Ok(plugin_command("bmux.windows", "prev-window", [])),
         "window_next" => Ok(plugin_command("bmux.windows", "next-window", [])),

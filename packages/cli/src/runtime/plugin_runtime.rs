@@ -2228,6 +2228,22 @@ mod tests {
     }
 
     #[test]
+    fn windows_manifest_marks_navigation_commands_repeat_safe() {
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_bundled_manifest(include_str!(
+                "../../../../plugins/windows-plugin/plugin.toml"
+            ))
+            .expect("windows manifest should register");
+
+        assert!(registry.command_accepts_repeat("bmux.windows", "focus-pane-in-direction"));
+        assert!(registry.command_accepts_repeat("bmux.windows", "resize-pane"));
+        assert!(registry.command_accepts_repeat("bmux.windows", "next-window"));
+        assert!(registry.command_accepts_repeat("bmux.windows", "prev-window"));
+        assert!(!registry.command_accepts_repeat("bmux.windows", "close-active-pane"));
+    }
+
+    #[test]
     fn static_bundled_load_uses_registered_vtable() {
         let config = BmuxConfig::default();
         let paths = ConfigPaths::new(

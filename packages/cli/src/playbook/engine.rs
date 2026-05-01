@@ -3460,8 +3460,8 @@ async fn apply_attach_runtime_actions(
                     "total_us": total_started.elapsed().as_micros(),
                 }));
             }
-            crate::input::RuntimeAction::Quit
-            | crate::input::RuntimeAction::ToggleSplitDirection
+            crate::input::RuntimeAction::NoOp
+            | crate::input::RuntimeAction::Quit
             | crate::input::RuntimeAction::ShowHelp
             | crate::input::RuntimeAction::BeginSelection
             | crate::input::RuntimeAction::MoveCursorLeft
@@ -3469,7 +3469,6 @@ async fn apply_attach_runtime_actions(
             | crate::input::RuntimeAction::MoveCursorUp
             | crate::input::RuntimeAction::MoveCursorDown
             | crate::input::RuntimeAction::CopyScrollback
-            | crate::input::RuntimeAction::EnterWindowMode
             | crate::input::RuntimeAction::ExitMode
             | crate::input::RuntimeAction::EnterMode(_)
             | crate::input::RuntimeAction::SwitchProfile(_) => {}

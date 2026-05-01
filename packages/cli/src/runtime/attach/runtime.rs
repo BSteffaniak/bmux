@@ -4012,13 +4012,6 @@ pub async fn handle_attach_plugin_command_action(
 #[allow(clippy::too_many_lines)]
 pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachViewState) {
     match action {
-        RuntimeAction::EnterWindowMode => {
-            view_state.set_transient_status(
-                "workspace mode unavailable in core baseline",
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-        }
         RuntimeAction::EnterScrollMode => {
             if enter_attach_scrollback(view_state) {
             } else {
@@ -5999,8 +5992,7 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
             {
                 "Pane"
             }
-            RuntimeAction::EnterWindowMode
-            | RuntimeAction::ExitMode
+            RuntimeAction::ExitMode
             | RuntimeAction::EnterScrollMode
             | RuntimeAction::ExitScrollMode
             | RuntimeAction::ScrollUpLine
@@ -6092,9 +6084,9 @@ pub const fn inject_attach_global_defaults(
 pub const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
     matches!(
         action,
-        RuntimeAction::Detach
+        RuntimeAction::NoOp
+            | RuntimeAction::Detach
             | RuntimeAction::Quit
-            | RuntimeAction::EnterWindowMode
             | RuntimeAction::ExitMode
             | RuntimeAction::EnterScrollMode
             | RuntimeAction::ExitScrollMode
@@ -8558,8 +8550,8 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         } => command_accepts_repeat(plugin_id, command_name),
         // Mutating and mode-switching — never repeat.
         RuntimeAction::Quit
+        | RuntimeAction::NoOp
         | RuntimeAction::Detach
-        | RuntimeAction::ToggleSplitDirection
         | RuntimeAction::CloseFocusedPane
         | RuntimeAction::ShowHelp
         | RuntimeAction::EnterScrollMode
@@ -8569,7 +8561,6 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         | RuntimeAction::BeginSelection
         | RuntimeAction::CopyScrollback
         | RuntimeAction::ConfirmScrollback
-        | RuntimeAction::EnterWindowMode
         | RuntimeAction::ExitMode
         | RuntimeAction::EnterMode(_)
         | RuntimeAction::SwitchProfile(_) => false,
@@ -8589,12 +8580,11 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
             command_name,
             args,
         },
-        RuntimeAction::EnterWindowMode
-        | RuntimeAction::CloseFocusedPane
+        RuntimeAction::CloseFocusedPane
+        | RuntimeAction::NoOp
         | RuntimeAction::ExitMode
         | RuntimeAction::Quit
         | RuntimeAction::ShowHelp
-        | RuntimeAction::ToggleSplitDirection
         | RuntimeAction::EnterMode(_)
         | RuntimeAction::SwitchProfile(_)
         | RuntimeAction::EnterScrollMode
@@ -8663,14 +8653,6 @@ mod tests {
         RuntimeAction::PluginCommand {
             plugin_id: "bmux.windows".to_string(),
             command_name: "focus-pane-in-direction".to_string(),
-            args: vec!["--direction".to_string(), direction.to_string()],
-        }
-    }
-
-    fn resize_action(direction: &str) -> RuntimeAction {
-        RuntimeAction::PluginCommand {
-            plugin_id: "bmux.windows".to_string(),
-            command_name: "resize-pane".to_string(),
             args: vec!["--direction".to_string(), direction.to_string()],
         }
     }
@@ -9261,8 +9243,6 @@ mod tests {
 
     #[test]
     fn action_supports_repeat_allows_navigation() {
-        assert!(super::action_supports_repeat(&focus_action("next")));
-        assert!(super::action_supports_repeat(&resize_action("left")));
         assert!(super::action_supports_repeat(&RuntimeAction::ScrollUpLine));
         assert!(super::action_supports_repeat(
             &RuntimeAction::ForwardToPane(b"x".to_vec())

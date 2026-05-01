@@ -113,7 +113,6 @@ fn windows_split_command(direction: &str) -> String {
 impl Keymap {
     pub(crate) fn default_runtime() -> Self {
         let runtime: BTreeMap<String, String> = [
-            ("t", RuntimeAction::ToggleSplitDirection),
             ("x", RuntimeAction::CloseFocusedPane),
             ("?", RuntimeAction::ShowHelp),
             ("[", RuntimeAction::EnterScrollMode),

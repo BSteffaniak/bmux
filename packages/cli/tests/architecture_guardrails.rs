@@ -2543,6 +2543,7 @@ mod capability_guardrail_helpers {
 /// entry here.
 const RUNTIME_ACTION_ALLOWLIST: &[&str] = &[
     // Core (not domain-scoped)
+    "NoOp",
     "Quit",
     "Detach",
     "ShowHelp",
@@ -2569,9 +2570,7 @@ const RUNTIME_ACTION_ALLOWLIST: &[&str] = &[
     // DOMAIN-leaking variants pending migration. Each should move to
     // a `plugin:bmux.<plugin>:<cmd>` invocation before deletion.
     // See `docs/runtime-action-migration.md` for the plan.
-    "ToggleSplitDirection",
     "CloseFocusedPane",
-    "EnterWindowMode",
 ];
 
 #[test]

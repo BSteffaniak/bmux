@@ -175,7 +175,6 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
 
 fn default_runtime_bindings() -> BTreeMap<String, String> {
     let mut map = action_bindings(&[
-        ("t", RuntimeAction::ToggleSplitDirection),
         ("x", RuntimeAction::CloseFocusedPane),
         ("?", RuntimeAction::ShowHelp),
         ("[", RuntimeAction::EnterScrollMode),
