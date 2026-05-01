@@ -85,7 +85,7 @@ pub(super) async fn run_playbook_run(
                 gif_path,
                 None,                        // view_client: auto-detect
                 1.0,                         // speed
-                12,                          // fps
+                None,                        // fps: recording.export.fps
                 None,                        // max_duration
                 None,                        // max_frames
                 RecordingRenderMode::Bitmap, // Use bitmap for headless (no real terminal fonts)

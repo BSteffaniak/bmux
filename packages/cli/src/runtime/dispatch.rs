@@ -1190,9 +1190,22 @@ pub(super) async fn dispatch_built_in_command(
         (
             BuiltInHandlerId::RecordingCut,
             Command::Recording {
-                command: RecordingCommand::Cut { last_seconds, name },
+                command:
+                    RecordingCommand::Cut {
+                        last_seconds,
+                        export_fps,
+                        name,
+                    },
             },
-        ) => run_recording_cut(*last_seconds, name.as_deref(), connection_context).await,
+        ) => {
+            run_recording_cut(
+                *last_seconds,
+                export_fps.as_ref().map(|fps| fps.get()),
+                name.as_deref(),
+                connection_context,
+            )
+            .await
+        }
         (
             BuiltInHandlerId::RecordingInspect,
             Command::Recording {
@@ -1322,7 +1335,7 @@ pub(super) async fn dispatch_built_in_command(
                 output,
                 view_client.as_deref(),
                 *speed,
-                *fps,
+                fps.as_ref().map(|fps| fps.get()),
                 *max_duration,
                 *max_frames,
                 *renderer,

@@ -104,10 +104,11 @@ pub(super) async fn run_recording_delete_all(
 
 pub(super) async fn run_recording_cut(
     last_seconds: Option<u64>,
+    export_fps: Option<u32>,
     name: Option<&str>,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
-    recording::run_recording_cut(last_seconds, name, connection_context).await
+    recording::run_recording_cut(last_seconds, export_fps, name, connection_context).await
 }
 
 pub(super) fn run_recording_inspect(
@@ -183,7 +184,7 @@ pub(super) async fn run_recording_export(
     output: &str,
     view_client: Option<&str>,
     speed: f64,
-    fps: u32,
+    fps: Option<u32>,
     max_duration: Option<u64>,
     max_frames: Option<u32>,
     renderer: RecordingRenderMode,
@@ -219,6 +220,7 @@ pub(super) async fn run_recording_export(
     let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
     let export_defaults = &config.recording.export;
 
+    let resolved_fps = fps.unwrap_or_else(|| export_defaults.fps.max(1));
     let resolved_cursor = cursor.unwrap_or(match export_defaults.cursor {
         RecordingExportCursorMode::Auto => RecordingCursorMode::Auto,
         RecordingExportCursorMode::On => RecordingCursorMode::On,
@@ -298,7 +300,7 @@ pub(super) async fn run_recording_export(
         output,
         view_client,
         speed,
-        fps,
+        resolved_fps,
         max_duration,
         max_frames,
         renderer,
@@ -333,14 +335,18 @@ pub(super) async fn run_recording_export(
     .await
 }
 
-pub(super) async fn run_recording_auto_export_gif(recording_id: &str, output: &str) -> Result<u8> {
+pub(super) async fn run_recording_auto_export_gif(
+    recording_id: &str,
+    output: &str,
+    fps: Option<u32>,
+) -> Result<u8> {
     run_recording_export(
         recording_id,
         RecordingExportFormat::Gif,
         output,
         None,
         1.0,
-        12,
+        fps,
         None,
         None,
         RecordingRenderMode::Font,

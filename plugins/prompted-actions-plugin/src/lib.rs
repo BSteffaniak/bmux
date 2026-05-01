@@ -18,13 +18,21 @@
 //!
 //! [[plugins.settings."bmux.prompted_actions".actions]]
 //! name = "recording-cut"
-//! command = "plugin:bmux.plugin_cli:recording-cut --last-seconds {seconds}"
+//! command = "plugin:bmux.plugin_cli:recording-cut --last-seconds {seconds} --export-fps {fps}"
 //!
 //! [[plugins.settings."bmux.prompted_actions".actions.prompts]]
 //! key = "seconds"
 //! type = "text"
 //! title = "Cut Recording"
 //! placeholder = "last N seconds"
+//! validation = "positive_integer"
+//!
+//! [[plugins.settings."bmux.prompted_actions".actions.prompts]]
+//! key = "fps"
+//! type = "text"
+//! title = "GIF Frame Rate"
+//! placeholder = "24"
+//! default = "24"
 //! validation = "positive_integer"
 //! ```
 //!

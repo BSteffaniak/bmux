@@ -1246,11 +1246,15 @@ impl Default for RecordingConfig {
     }
 }
 
-/// Defaults for `recording export` cursor rendering behavior.
+pub const DEFAULT_RECORDING_EXPORT_FPS: u32 = 24;
+
+/// Defaults for `recording export` rendering behavior.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
 #[config_doc(section = "recording.export")]
 #[serde(default)]
 pub struct RecordingExportConfig {
+    /// Target frames per second default for GIF exports.
+    pub fps: u32,
     /// Cursor rendering default for `recording export`.
     pub cursor: RecordingExportCursorMode,
     /// Cursor shape default for `recording export`.
@@ -1299,6 +1303,7 @@ pub struct RecordingExportConfig {
 impl Default for RecordingExportConfig {
     fn default() -> Self {
         Self {
+            fps: DEFAULT_RECORDING_EXPORT_FPS,
             cursor: RecordingExportCursorMode::Auto,
             cursor_shape: RecordingExportCursorShape::Auto,
             cursor_blink: RecordingExportCursorBlinkMode::Auto,
@@ -2908,6 +2913,13 @@ impl BmuxConfig {
             });
         }
 
+        if self.recording.export.fps == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "recording.export.fps".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
         if self.recording.export.cursor_blink_period_ms == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "recording.export.cursor_blink_period_ms".to_string(),
@@ -3093,6 +3105,14 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "recording.segment_mb=0 -> {}",
                 recording_defaults.segment_mb
+            ));
+        }
+
+        if self.recording.export.fps == 0 {
+            self.recording.export.fps = recording_defaults.export.fps;
+            repaired_fields.push(format!(
+                "recording.export.fps=0 -> {}",
+                self.recording.export.fps
             ));
         }
 
@@ -4298,6 +4318,10 @@ timeout_profile = "missing"
     fn recording_export_defaults_include_cursor_settings() {
         let config = BmuxConfig::default();
         assert_eq!(
+            config.recording.export.fps,
+            crate::DEFAULT_RECORDING_EXPORT_FPS
+        );
+        assert_eq!(
             config.recording.export.cursor,
             crate::RecordingExportCursorMode::Auto
         );
@@ -4344,11 +4368,12 @@ timeout_profile = "missing"
         let dir = path.parent().expect("temp dir").to_path_buf();
         std::fs::write(
             &path,
-            "[recording.export]\ncursor = 'on'\ncursor_shape = 'underline'\ncursor_blink = 'off'\ncursor_blink_period_ms = 650\ncursor_color = '#44aaee'\ncursor_profile = 'ghostty'\ncursor_solid_after_activity_ms = 900\ncursor_solid_after_input_ms = 910\ncursor_solid_after_output_ms = 920\ncursor_solid_after_cursor_ms = 930\ncursor_paint_mode = 'fill'\ncursor_text_mode = 'swap_fg_bg'\ncursor_bar_width_pct = 14\ncursor_underline_height_pct = 11\npalette_source = 'recording'\npalette_foreground = '#d0d0d0'\npalette_background = '#101010'\npalette_colors = ['5=#bb78d9', '9=#ff6655']\n",
+            "[recording.export]\nfps = 30\ncursor = 'on'\ncursor_shape = 'underline'\ncursor_blink = 'off'\ncursor_blink_period_ms = 650\ncursor_color = '#44aaee'\ncursor_profile = 'ghostty'\ncursor_solid_after_activity_ms = 900\ncursor_solid_after_input_ms = 910\ncursor_solid_after_output_ms = 920\ncursor_solid_after_cursor_ms = 930\ncursor_paint_mode = 'fill'\ncursor_text_mode = 'swap_fg_bg'\ncursor_bar_width_pct = 14\ncursor_underline_height_pct = 11\npalette_source = 'recording'\npalette_foreground = '#d0d0d0'\npalette_background = '#101010'\npalette_colors = ['5=#bb78d9', '9=#ff6655']\n",
         )
         .expect("failed writing config fixture");
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.recording.export.fps, 30);
         assert_eq!(
             config.recording.export.cursor,
             crate::RecordingExportCursorMode::On

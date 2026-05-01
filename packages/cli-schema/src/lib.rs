@@ -7,6 +7,7 @@
 //! The docs site uses this to auto-generate the CLI reference page.
 
 use clap::{Parser, Subcommand, ValueEnum};
+use std::num::NonZeroU32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum DebugRenderLogFormat {
@@ -954,6 +955,9 @@ pub enum RecordingCommand {
         /// Window to snapshot, in seconds (default: full rolling window)
         #[arg(long)]
         last_seconds: Option<u64>,
+        /// Override GIF auto-export frames per second for this cut
+        #[arg(long, value_name = "FPS")]
+        export_fps: Option<NonZeroU32>,
         /// Optional human-readable recording name
         #[arg(long, value_parser = parse_recording_name)]
         name: Option<String>,
@@ -1051,9 +1055,9 @@ pub enum RecordingCommand {
         /// Playback speed multiplier
         #[arg(long, default_value_t = 1.0)]
         speed: f64,
-        /// Target frames per second
-        #[arg(long, default_value_t = 12)]
-        fps: u32,
+        /// Target frames per second (defaults to recording.export.fps)
+        #[arg(long)]
+        fps: Option<NonZeroU32>,
         /// Maximum export duration in seconds
         #[arg(long)]
         max_duration: Option<u64>,
@@ -4915,6 +4919,7 @@ mod tests {
             command,
             RecordingCommand::Cut {
                 last_seconds: None,
+                export_fps: None,
                 name: None,
             }
         ));
@@ -4931,8 +4936,25 @@ mod tests {
             command,
             RecordingCommand::Cut {
                 last_seconds: Some(90),
+                export_fps: None,
                 name: None,
             }
+        ));
+    }
+
+    #[test]
+    fn parses_recording_cut_export_fps() {
+        let cli = Cli::try_parse_from(["bmux", "recording", "cut", "--export-fps", "30"])
+            .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Cut {
+                export_fps: Some(fps),
+                ..
+            } if fps.get() == 30
         ));
     }
 
@@ -5094,7 +5116,7 @@ mod tests {
             command,
             RecordingCommand::Export {
                 format: RecordingExportFormat::Gif,
-                fps: 15,
+                fps: Some(fps),
                 max_duration: Some(30),
                 max_frames: Some(250),
                 renderer: RecordingRenderMode::Font,
@@ -5123,7 +5145,8 @@ mod tests {
                 export_metadata: Some(_),
                 no_progress: true,
                 ..
-            } if (size - 15.0).abs() < f32::EPSILON
+            } if fps.get() == 15
+                && (size - 15.0).abs() < f32::EPSILON
                 && (line_height - 1.1).abs() < f32::EPSILON
                 && font_path.len() == 2
                 && palette_color.len() == 2

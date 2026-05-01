@@ -329,6 +329,7 @@ struct RecordingStatusView {
 struct RecordingAutoExportSettings {
     enabled: bool,
     output_dir: Option<PathBuf>,
+    fps: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -678,6 +679,7 @@ fn recording_auto_export_settings() -> RecordingAutoExportSettings {
     RecordingAutoExportSettings {
         enabled,
         output_dir,
+        fps: config.recording.export.fps.max(1),
     }
 }
 
@@ -735,6 +737,7 @@ fn auto_export_output_path(recording_dir: &Path, explicit_output_dir: Option<&Pa
 pub(super) async fn maybe_auto_export_recording(
     recording_id: Uuid,
     recording_path: Option<&Path>,
+    fps_override: Option<u32>,
 ) -> RecordingAutoExportOutcome {
     let settings = recording_auto_export_settings();
     if !settings.enabled {
@@ -749,7 +752,14 @@ pub(super) async fn maybe_auto_export_recording(
     let output = output_path.to_string_lossy().into_owned();
     publish_recording_export_started(recording_id, output.clone());
     let recording_id_string = recording_id.to_string();
-    match super::recording_cli::run_recording_auto_export_gif(&recording_id_string, &output).await {
+    let fps = fps_override.unwrap_or(settings.fps).max(1);
+    match super::recording_cli::run_recording_auto_export_gif(
+        &recording_id_string,
+        &output,
+        Some(fps),
+    )
+    .await
+    {
         Ok(_) => {
             publish_recording_export_completed(recording_id, output);
             RecordingAutoExportOutcome::Exported { output_path }
@@ -1108,7 +1118,7 @@ pub(super) async fn run_recording_stop(
         .await?
         .map_err(recording_plugin_error)?;
     println!("recording stopped: {stopped_id}");
-    let auto_export = maybe_auto_export_recording(stopped_id, None).await;
+    let auto_export = maybe_auto_export_recording(stopped_id, None, None).await;
     print_auto_export_outcome(stopped_id, &auto_export);
     let mut status = format!("recording stopped: {stopped_id}");
     if let Some(suffix) = auto_export_status_suffix(&auto_export) {
@@ -1423,6 +1433,7 @@ pub(super) async fn run_recording_delete_all(
 
 pub(super) async fn run_recording_cut(
     last_seconds: Option<u64>,
+    export_fps: Option<u32>,
     name: Option<&str>,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
@@ -1460,7 +1471,8 @@ pub(super) async fn run_recording_cut(
         recording.id, name_display, recording.event_count, recording.payload_bytes, recording.path
     );
     let recording_path = PathBuf::from(&recording.path);
-    let auto_export = maybe_auto_export_recording(recording.id, Some(&recording_path)).await;
+    let auto_export =
+        maybe_auto_export_recording(recording.id, Some(&recording_path), export_fps).await;
     print_auto_export_outcome(recording.id, &auto_export);
     let mut status = format!("recording cut created: {}", recording.path);
     if let Some(suffix) = auto_export_status_suffix(&auto_export) {

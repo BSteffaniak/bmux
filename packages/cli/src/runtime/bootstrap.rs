@@ -139,10 +139,10 @@ pub(super) async fn run_default_server_attach(
                 recording.path
             );
             let recording_path = std::path::PathBuf::from(&recording.path);
-            recording::maybe_auto_export_recording(stopped_id, Some(&recording_path)).await;
+            recording::maybe_auto_export_recording(stopped_id, Some(&recording_path), None).await;
         } else {
             println!("recording stopped: {stopped_id}");
-            recording::maybe_auto_export_recording(stopped_id, None).await;
+            recording::maybe_auto_export_recording(stopped_id, None, None).await;
         }
     }
 
