@@ -398,7 +398,7 @@ fn recording_cut_generated(
 ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
     handle_cut(req.last_seconds, req.name)
         .map(Into::into)
-        .ok_or_else(|| generated_failed("recording cut failed"))
+        .map_err(|error| generated_failed(error.to_string()))
 }
 
 fn recording_rolling_start_generated(
@@ -760,24 +760,29 @@ fn handle_rolling_start(options: RecordingRollingStartOptions) -> Option<Recordi
     Some(recording)
 }
 
-fn handle_cut(last_seconds: Option<u64>, name: Option<String>) -> Option<RecordingSummary> {
-    let config = config_handle()?;
-    let Ok(cfg) = config.read() else {
-        return None;
-    };
+fn handle_cut(last_seconds: Option<u64>, name: Option<String>) -> anyhow::Result<RecordingSummary> {
+    let config =
+        config_handle().ok_or_else(|| anyhow::anyhow!("recording plugin config is unavailable"))?;
+    let cfg = config
+        .read()
+        .map_err(|_| anyhow::anyhow!("recording plugin config lock is poisoned"))?;
     let output_root = cfg.recordings_dir.clone();
     drop(cfg);
 
-    let handle = rolling_handle()?;
-    let Ok(guard) = handle.read() else {
-        return None;
-    };
-    let Ok(mut rolling) = guard.0.lock() else {
-        return None;
-    };
-    let runtime = rolling.as_mut()?;
+    let handle = rolling_handle()
+        .ok_or_else(|| anyhow::anyhow!("recording rolling runtime handle is unavailable"))?;
+    let guard = handle
+        .read()
+        .map_err(|_| anyhow::anyhow!("recording rolling runtime handle lock is poisoned"))?;
+    let mut rolling = guard
+        .0
+        .lock()
+        .map_err(|_| anyhow::anyhow!("recording rolling runtime lock is poisoned"))?;
+    let runtime = rolling.as_mut().ok_or_else(|| {
+        anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
+    })?;
 
-    runtime.cut(&output_root, last_seconds, name).ok()
+    runtime.cut(&output_root, last_seconds, name)
 }
 
 fn handle_rolling_clear(restart_if_active: bool) -> RecordingRollingClearReport {

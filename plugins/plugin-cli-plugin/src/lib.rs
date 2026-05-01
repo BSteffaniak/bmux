@@ -73,6 +73,9 @@ fn run_core_proxy_command(
                     "failed running core command path via host bridge: {error}"
                 ))
             })?;
+    if let Some(error) = response.error {
+        return Err(PluginCommandError::new(response.exit_code.max(1), error));
+    }
     Ok(response.exit_code)
 }
 

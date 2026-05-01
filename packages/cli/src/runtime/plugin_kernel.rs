@@ -291,7 +291,7 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
     {
         let response = match run_core_built_in_command(&command_request) {
             Ok(exit_code) => bmux_plugin_sdk::CoreCliCommandResponse::new(exit_code),
-            Err(_) => return 5,
+            Err(error) => bmux_plugin_sdk::CoreCliCommandResponse::failed(1, error.to_string()),
         };
         let Ok(payload) = bmux_plugin_sdk::encode_service_message(&response) else {
             return 5;

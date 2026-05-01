@@ -2784,10 +2784,9 @@ mod tests {
                     guard.health.get(target).copied().unwrap_or(false)
                 }
             };
-            Ok(bmux_plugin_sdk::CoreCliCommandResponse {
-                protocol_version: request.protocol_version,
-                exit_code: i32::from(!healthy),
-            })
+            let mut response = bmux_plugin_sdk::CoreCliCommandResponse::new(i32::from(!healthy));
+            response.protocol_version = request.protocol_version;
+            Ok(response)
         }
 
         fn session_list(&self) -> Result<SessionListResponse, String> {

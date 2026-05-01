@@ -384,6 +384,8 @@ impl CoreCliCommandRequest {
 pub struct CoreCliCommandResponse {
     pub protocol_version: u16,
     pub exit_code: i32,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,6 +441,16 @@ impl CoreCliCommandResponse {
         Self {
             protocol_version: CORE_CLI_BRIDGE_PROTOCOL_V1,
             exit_code,
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn failed(exit_code: i32, error: String) -> Self {
+        Self {
+            protocol_version: CORE_CLI_BRIDGE_PROTOCOL_V1,
+            exit_code,
+            error: Some(error),
         }
     }
 }
@@ -569,6 +581,17 @@ mod tests {
                 .to_string()
                 .contains("unsupported core CLI bridge request protocol version")
         );
+    }
+
+    #[test]
+    fn core_cli_response_failed_carries_error() {
+        let response = super::CoreCliCommandResponse::failed(7, "boom".to_string());
+        let encoded = super::encode_service_message(&response).expect("response should encode");
+        let decoded: super::CoreCliCommandResponse =
+            super::decode_service_message(&encoded).expect("response should decode");
+
+        assert_eq!(decoded.exit_code, 7);
+        assert_eq!(decoded.error.as_deref(), Some("boom"));
     }
 
     #[test]

@@ -3,6 +3,10 @@ use std::{cell::RefCell, collections::BTreeMap};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Generic plugin command outcome metadata key for a concise user-facing
+/// status message.
+pub const COMMAND_OUTCOME_STATUS_MESSAGE_KEY: &str = "bmux.status_message";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageGetRequest {
     pub key: String,

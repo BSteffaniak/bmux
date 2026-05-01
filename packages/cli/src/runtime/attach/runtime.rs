@@ -28,7 +28,8 @@ use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_pane_runtime_plugin_api::pane_runtime_events as pane_events;
 use bmux_permissions_plugin_api::session_policy_state;
 use bmux_plugin_sdk::{
-    HostScope, PluginCommandOutcome, ServiceKind, ServiceRequest,
+    COMMAND_OUTCOME_STATUS_MESSAGE_KEY, HostScope, PluginCommandOutcome, ServiceKind,
+    ServiceRequest,
     perf_telemetry::{PhaseChannel, emit as emit_phase_timing},
 };
 use bmux_recording_plugin_api::recording_state;
@@ -89,6 +90,7 @@ use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
+const ATTACH_PLUGIN_STATUS_MESSAGE_MAX_CHARS: usize = 180;
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
 /// progress output burst to complete (e.g. when the server indicates
 /// `output_still_pending` or the inner application is mid-synchronized-
@@ -3173,6 +3175,31 @@ fn selected_context_id_from_command_outcome(outcome: &PluginCommandOutcome) -> O
     context_id
 }
 
+fn status_message_from_command_outcome(outcome: &PluginCommandOutcome) -> Option<String> {
+    let value = outcome.metadata.get(COMMAND_OUTCOME_STATUS_MESSAGE_KEY)?;
+    let Some(message) = value.as_str() else {
+        warn!(
+            value = ?value,
+            "attach.plugin_command.invalid_status_message_outcome"
+        );
+        return None;
+    };
+    Some(truncate_attach_status_message(message))
+}
+
+fn truncate_attach_status_message(message: &str) -> String {
+    let mut chars = message.chars();
+    let truncated = chars
+        .by_ref()
+        .take(ATTACH_PLUGIN_STATUS_MESSAGE_MAX_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 /// React to a `contexts-events` payload forwarded from the server
 /// via `ServerEvent::PluginBusEvent`.
 ///
@@ -3720,6 +3747,7 @@ pub async fn handle_attach_plugin_command_action(
         Ok(execution) => {
             let run_us = run_started.elapsed().as_micros();
             let status = execution.status;
+            let outcome_status_message = status_message_from_command_outcome(&execution.outcome);
             if status != 0 {
                 // Route the plugin's error text (captured by the SDK
                 // into `PluginCommandOutcome.error_message` instead of
@@ -3750,11 +3778,16 @@ pub async fn handle_attach_plugin_command_action(
                         "attach.plugin_command.nonzero_status"
                     );
                 }
-                let status_text = if error_detail.is_some() {
-                    format!("plugin action failed ({plugin_id}:{command_name}) — see logs")
-                } else {
-                    format!("plugin action failed ({plugin_id}:{command_name}) exit {status}")
-                };
+                let status_text = outcome_status_message.unwrap_or_else(|| {
+                    error_detail.map_or_else(
+                        || {
+                            format!(
+                                "plugin action failed ({plugin_id}:{command_name}) exit {status}"
+                            )
+                        },
+                        truncate_attach_status_message,
+                    )
+                });
                 view_state.set_transient_status(
                     status_text,
                     Instant::now(),
@@ -4006,7 +4039,8 @@ pub async fn handle_attach_plugin_command_action(
             }
 
             view_state.set_transient_status(
-                format!("plugin action: {plugin_id}:{command_name}"),
+                outcome_status_message
+                    .unwrap_or_else(|| format!("plugin action: {plugin_id}:{command_name}")),
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
@@ -9795,6 +9829,24 @@ mod tests {
         );
 
         assert_eq!(selected_context_id_from_command_outcome(&outcome), None);
+    }
+
+    #[test]
+    fn command_outcome_status_message_metadata_is_truncated() {
+        let mut outcome = PluginCommandOutcome::default();
+        let long_message = "x".repeat(ATTACH_PLUGIN_STATUS_MESSAGE_MAX_CHARS + 1);
+        outcome.metadata.insert(
+            COMMAND_OUTCOME_STATUS_MESSAGE_KEY.to_string(),
+            serde_json::json!(long_message),
+        );
+
+        let message = status_message_from_command_outcome(&outcome)
+            .expect("status message should be present");
+        assert!(message.ends_with('…'));
+        assert_eq!(
+            message.chars().count(),
+            ATTACH_PLUGIN_STATUS_MESSAGE_MAX_CHARS + 1
+        );
     }
 
     #[test]

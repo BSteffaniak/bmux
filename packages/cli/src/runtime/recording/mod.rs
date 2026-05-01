@@ -9,7 +9,8 @@ use super::{
     RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
     RecordingPaletteSource, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
     RecordingStatus, RecordingSummary, Repeat, Result, Uuid, Write, active_runtime_name,
-    cleanup_stale_pid_file, connect_if_running_with_context, io, parse_uuid_value, terminal,
+    cleanup_stale_pid_file, connect_if_running_with_context, current_cli_build_id, io,
+    parse_uuid_value, read_server_runtime_metadata, terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_cli_output::{Table, TableAlign, TableColumn, write_table};
@@ -19,6 +20,7 @@ use bmux_performance_state::{
     PerformanceRecordingLevel as RuntimePerformanceRecordingLevel,
     PerformanceRuntimeSettings as RuntimePerformanceRuntimeSettings,
 };
+use bmux_plugin_sdk::{TypedDispatchClientError, TypedServiceClientError};
 use bmux_recording_plugin_api::{recording_commands, recording_state, recording_types};
 use bmux_recording_protocol::{
     DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent,
@@ -43,6 +45,41 @@ pub fn recording_plugin_error(error: recording_types::RecordingError) -> anyhow:
         }
         recording_types::RecordingError::Failed { reason } => anyhow::anyhow!(reason),
     }
+}
+
+fn recording_service_client_error(error: TypedServiceClientError) -> anyhow::Error {
+    if let Some(details) = missing_recording_provider_details(&error) {
+        let mut message = format!(
+            "recording service is unavailable on the running bmux server ({details}). Restart the server with `bmux server stop` and retry; verify `bmux.recording` is enabled with `bmux plugin list`."
+        );
+        if let Some(hint) = stale_server_build_hint() {
+            message.push(' ');
+            message.push_str(&hint);
+        }
+        emit_recording_command_status(&message);
+        return anyhow::anyhow!(message);
+    }
+    anyhow::Error::new(error)
+}
+
+fn missing_recording_provider_details(error: &TypedServiceClientError) -> Option<String> {
+    let TypedServiceClientError::Dispatch(TypedDispatchClientError::Server { details, .. }) = error
+    else {
+        return None;
+    };
+    (details.contains("no provider for service capability='bmux.recording."))
+        .then(|| details.clone())
+}
+
+fn stale_server_build_hint() -> Option<String> {
+    let metadata = read_server_runtime_metadata().ok().flatten()?;
+    let cli_build = current_cli_build_id().ok()?;
+    (metadata.build_id != cli_build).then(|| {
+        format!(
+            "Running server build differs from current CLI build (server: {} at {}; cli: {}).",
+            metadata.build_id, metadata.executable_path, cli_build
+        )
+    })
 }
 
 pub(super) async fn run_recording_start(
@@ -288,6 +325,13 @@ struct RecordingStatusView {
 struct RecordingAutoExportSettings {
     enabled: bool,
     output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RecordingAutoExportOutcome {
+    Disabled,
+    Exported { output_path: PathBuf },
+    Failed { output_path: PathBuf, error: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -684,10 +728,13 @@ fn auto_export_output_path(recording_dir: &Path, explicit_output_dir: Option<&Pa
     )
 }
 
-pub(super) async fn maybe_auto_export_recording(recording_id: Uuid, recording_path: Option<&Path>) {
+pub(super) async fn maybe_auto_export_recording(
+    recording_id: Uuid,
+    recording_path: Option<&Path>,
+) -> RecordingAutoExportOutcome {
     let settings = recording_auto_export_settings();
     if !settings.enabled {
-        return;
+        return RecordingAutoExportOutcome::Disabled;
     }
 
     let recording_dir = recording_path.map_or_else(
@@ -697,15 +744,49 @@ pub(super) async fn maybe_auto_export_recording(recording_id: Uuid, recording_pa
     let output_path = auto_export_output_path(&recording_dir, settings.output_dir.as_deref());
     let output = output_path.to_string_lossy().into_owned();
     let recording_id_string = recording_id.to_string();
-    if let Err(error) =
-        super::recording_cli::run_recording_auto_export_gif(&recording_id_string, &output).await
-    {
-        eprintln!(
-            "bmux warning: recording auto-export failed for {} (output={}): {}",
-            recording_id,
-            output_path.display(),
-            error
-        );
+    match super::recording_cli::run_recording_auto_export_gif(&recording_id_string, &output).await {
+        Ok(_) => RecordingAutoExportOutcome::Exported { output_path },
+        Err(error) => RecordingAutoExportOutcome::Failed {
+            output_path,
+            error: error.to_string(),
+        },
+    }
+}
+
+fn emit_recording_command_status(message: impl Into<String>) {
+    bmux_plugin_sdk::record_command_outcome_metadata(
+        bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
+        serde_json::json!(message.into()),
+    );
+}
+
+fn print_auto_export_outcome(recording_id: Uuid, outcome: &RecordingAutoExportOutcome) {
+    match outcome {
+        RecordingAutoExportOutcome::Disabled => {}
+        RecordingAutoExportOutcome::Exported { output_path } => {
+            println!("recording auto-exported: {}", output_path.display());
+        }
+        RecordingAutoExportOutcome::Failed { output_path, error } => {
+            eprintln!(
+                "bmux warning: recording auto-export failed for {} (output={}): {}",
+                recording_id,
+                output_path.display(),
+                error
+            );
+        }
+    }
+}
+
+fn auto_export_status_suffix(outcome: &RecordingAutoExportOutcome) -> Option<String> {
+    match outcome {
+        RecordingAutoExportOutcome::Disabled => None,
+        RecordingAutoExportOutcome::Exported { output_path } => {
+            Some(format!("; GIF exported to {}", output_path.display()))
+        }
+        RecordingAutoExportOutcome::Failed { output_path, error } => Some(format!(
+            "; GIF export failed for {}: {error}",
+            output_path.display()
+        )),
     }
 }
 
@@ -987,7 +1068,13 @@ pub(super) async fn run_recording_stop(
         .await?
         .map_err(recording_plugin_error)?;
     println!("recording stopped: {stopped_id}");
-    maybe_auto_export_recording(stopped_id, None).await;
+    let auto_export = maybe_auto_export_recording(stopped_id, None).await;
+    print_auto_export_outcome(stopped_id, &auto_export);
+    let mut status = format!("recording stopped: {stopped_id}");
+    if let Some(suffix) = auto_export_status_suffix(&auto_export) {
+        status.push_str(&suffix);
+    }
+    emit_recording_command_status(status);
     Ok(0)
 }
 
@@ -1315,7 +1402,8 @@ pub(super) async fn run_recording_cut(
 
     let recording: RecordingSummary =
         recording_commands::client::cut(&mut client, last_seconds, name)
-            .await?
+            .await
+            .map_err(recording_service_client_error)?
             .map(Into::into)
             .map_err(recording_plugin_error)?;
     let name_display = recording.name.as_deref().unwrap_or("-");
@@ -1332,7 +1420,13 @@ pub(super) async fn run_recording_cut(
         recording.id, name_display, recording.event_count, recording.payload_bytes, recording.path
     );
     let recording_path = PathBuf::from(&recording.path);
-    maybe_auto_export_recording(recording.id, Some(&recording_path)).await;
+    let auto_export = maybe_auto_export_recording(recording.id, Some(&recording_path)).await;
+    print_auto_export_outcome(recording.id, &auto_export);
+    let mut status = format!("recording cut created: {}", recording.path);
+    if let Some(suffix) = auto_export_status_suffix(&auto_export) {
+        status.push_str(&suffix);
+    }
+    emit_recording_command_status(status);
     Ok(0)
 }
 

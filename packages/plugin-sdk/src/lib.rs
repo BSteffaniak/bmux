@@ -79,11 +79,11 @@ pub use event::{
 };
 pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost, ResolvedService};
 pub use host_services::{
-    LogWriteLevel, LogWriteRequest, PluginCommandOutcome, RecordingWriteEventRequest,
-    RecordingWriteEventResponse, StorageGetRequest, StorageGetResponse, StorageSetRequest,
-    VolatileStateClearRequest, VolatileStateGetRequest, VolatileStateGetResponse,
-    VolatileStateSetRequest, begin_command_outcome_capture, finish_command_outcome_capture,
-    record_command_outcome_metadata,
+    COMMAND_OUTCOME_STATUS_MESSAGE_KEY, LogWriteLevel, LogWriteRequest, PluginCommandOutcome,
+    RecordingWriteEventRequest, RecordingWriteEventResponse, StorageGetRequest, StorageGetResponse,
+    StorageSetRequest, VolatileStateClearRequest, VolatileStateGetRequest,
+    VolatileStateGetResponse, VolatileStateSetRequest, begin_command_outcome_capture,
+    finish_command_outcome_capture, record_command_outcome_metadata,
 };
 pub use ident::{CapabilityId, InterfaceId, OperationId, PluginEventKind};
 pub use native_exports::{
