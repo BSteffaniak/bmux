@@ -73,7 +73,6 @@ pub const CORE_CAPABILITY_SESSION: &str = "core.session";
 pub const CORE_CAPABILITY_ATTACH: &str = "core.attach";
 pub const CORE_CAPABILITY_PANE_IO: &str = "core.pane_io";
 pub const CORE_CAPABILITY_DETACH: &str = "core.detach";
-pub const CAPABILITY_ATTACH_PANE_SNAPSHOT: &str = "feature.attach_pane_snapshot";
 
 /// Core protocol capabilities required for baseline bmux operation.
 pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
@@ -162,7 +161,6 @@ pub fn default_supported_capabilities() -> Vec<String> {
         CORE_CAPABILITY_ATTACH.to_string(),
         CORE_CAPABILITY_PANE_IO.to_string(),
         CORE_CAPABILITY_DETACH.to_string(),
-        CAPABILITY_ATTACH_PANE_SNAPSHOT.to_string(),
     ];
     // Advertise compression capabilities when compiled in.
     // Note: Frame compression capabilities are NOT advertised by default
@@ -651,7 +649,6 @@ mod tests {
                 CORE_CAPABILITY_ATTACH.to_string(),
                 CORE_CAPABILITY_PANE_IO.to_string(),
                 CORE_CAPABILITY_DETACH.to_string(),
-                CAPABILITY_ATTACH_PANE_SNAPSHOT.to_string(),
             ],
         };
         let server = ProtocolContract {
@@ -663,10 +660,9 @@ mod tests {
         let negotiated = negotiate_protocol(&client, &server, CORE_PROTOCOL_CAPABILITIES)
             .expect("negotiation should succeed");
         assert_eq!(negotiated.revision, 3);
-        assert!(
-            negotiated
-                .capabilities
-                .contains(&CAPABILITY_ATTACH_PANE_SNAPSHOT.to_string())
+        assert_eq!(
+            negotiated.capabilities.len(),
+            CORE_PROTOCOL_CAPABILITIES.len()
         );
     }
 

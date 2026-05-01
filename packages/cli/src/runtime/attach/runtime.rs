@@ -23,7 +23,7 @@ use bmux_client::{
 };
 use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
 use bmux_context_state::ContextSelector;
-use bmux_ipc::{CAPABILITY_ATTACH_PANE_SNAPSHOT, InvokeServiceKind};
+use bmux_ipc::InvokeServiceKind;
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_pane_runtime_plugin_api::pane_runtime_events as pane_events;
 use bmux_permissions_plugin_api::session_policy_state;
@@ -563,12 +563,17 @@ async fn recover_attach_output_desync_for_pane(
     view_state: &mut AttachViewState,
     pane_id: Uuid,
 ) -> std::result::Result<(), ClientError> {
-    if client.supports_capability(CAPABILITY_ATTACH_PANE_SNAPSHOT)
-        && let Some(layout_state) = view_state.cached_layout_state.clone()
+    if let Some(layout_state) = view_state.cached_layout_state.clone()
         && attach_layout_pane_id_set(&layout_state).contains(&pane_id)
+        && hydrate_attach_revealed_panes_from_snapshot(
+            client,
+            view_state,
+            &layout_state,
+            &[pane_id],
+        )
+        .await
+        .is_ok()
     {
-        hydrate_attach_revealed_panes_from_snapshot(client, view_state, &layout_state, &[pane_id])
-            .await?;
         view_state
             .dirty
             .mark_full_frame(AttachDirtySource::SnapshotHydration);
@@ -2321,17 +2326,17 @@ pub async fn run_session_attach_with_client(
                                     .await?;
                                     scene_hydrated = true;
                                 } else if !revealed_pane_ids.is_empty() {
-                                    if client.supports_capability(CAPABILITY_ATTACH_PANE_SNAPSHOT) {
-                                        let revealed =
-                                            revealed_pane_ids.into_iter().collect::<Vec<_>>();
-                                        hydrate_attach_revealed_panes_from_snapshot(
-                                            &mut client,
-                                            &mut view_state,
-                                            &layout_state,
-                                            &revealed,
-                                        )
-                                        .await?;
-                                    } else {
+                                    let revealed =
+                                        revealed_pane_ids.into_iter().collect::<Vec<_>>();
+                                    if hydrate_attach_revealed_panes_from_snapshot(
+                                        &mut client,
+                                        &mut view_state,
+                                        &layout_state,
+                                        &revealed,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
                                         hydrate_attach_state_from_snapshot(
                                             &mut client,
                                             &mut view_state,

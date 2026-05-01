@@ -16,10 +16,10 @@ use bmux_ipc::transport::{
     IpcStreamWriter, IpcTransportError, IpcWriteTiming, LocalIpcStream,
 };
 use bmux_ipc::{
-    CORE_PROTOCOL_CAPABILITIES, Envelope, EnvelopeKind, ErrorCode, IncompatibilityReason,
-    InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, ProtocolContract, Request, Response,
-    ResponsePayload, ServicePipelineRequest, ServicePipelineStepResult, decode,
-    default_supported_capabilities, encode,
+    Envelope, EnvelopeKind, ErrorCode, IncompatibilityReason, InvokeServiceKind, IpcEndpoint,
+    NegotiatedProtocol, ProtocolContract, Request, Response, ResponsePayload,
+    ServicePipelineRequest, ServicePipelineStepResult, decode, default_supported_capabilities,
+    encode,
 };
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, PhaseTimer, emit as emit_phase_timing};
 use bmux_plugin_sdk::{TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult};
@@ -177,16 +177,6 @@ impl BmuxClient {
     #[must_use]
     pub const fn negotiated_protocol(&self) -> Option<&NegotiatedProtocol> {
         self.negotiated_protocol.as_ref()
-    }
-
-    #[must_use]
-    pub fn supports_capability(&self, capability: &str) -> bool {
-        self.negotiated_protocol.as_ref().is_some_and(|negotiated| {
-            negotiated
-                .capabilities
-                .iter()
-                .any(|supported| supported == capability)
-        }) || CORE_PROTOCOL_CAPABILITIES.contains(&capability)
     }
 
     /// Connect to a server endpoint and complete protocol handshake.
@@ -871,16 +861,6 @@ impl StreamingBmuxClient {
     #[must_use]
     pub const fn negotiated_protocol(&self) -> Option<&NegotiatedProtocol> {
         self.negotiated_protocol.as_ref()
-    }
-
-    #[must_use]
-    pub fn supports_capability(&self, capability: &str) -> bool {
-        self.negotiated_protocol.as_ref().is_some_and(|negotiated| {
-            negotiated
-                .capabilities
-                .iter()
-                .any(|supported| supported == capability)
-        }) || CORE_PROTOCOL_CAPABILITIES.contains(&capability)
     }
 
     /// Background reader loop that demuxes incoming envelopes.

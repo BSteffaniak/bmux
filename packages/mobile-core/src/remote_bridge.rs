@@ -8,9 +8,9 @@ use bmux_attach_pipeline::render::visible_scene_pane_ids;
 use bmux_attach_pipeline::{AttachChunkApplyOutcome, AttachScenePipeline, AttachViewport};
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{BmuxClient, ClientError, ServerEvent, StreamingBmuxClient};
+use bmux_ipc::ErrorCode;
 use bmux_ipc::compressed_stream::CompressedStream;
 use bmux_ipc::transport::{ErasedIpcStream, IpcTransportError};
-use bmux_ipc::{CAPABILITY_ATTACH_PANE_SNAPSHOT, ErrorCode};
 use bmux_pane_runtime_plugin_api::pane_runtime_events;
 use bmux_session_models::SessionSelector;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
@@ -1547,10 +1547,9 @@ async fn recover_desynced_pane(
     session_id: Uuid,
     pane_id: Uuid,
 ) -> Result<()> {
-    if client.supports_capability(CAPABILITY_ATTACH_PANE_SNAPSHOT)
-        && let Ok(snapshot) = client
-            .attach_pane_snapshot(session_id, vec![pane_id], EVENT_TRIGGER_FETCH_MAX_BYTES)
-            .await
+    if let Ok(snapshot) = client
+        .attach_pane_snapshot(session_id, vec![pane_id], EVENT_TRIGGER_FETCH_MAX_BYTES)
+        .await
     {
         state.hydrate_pane_snapshot(&[pane_id], snapshot);
         return Ok(());

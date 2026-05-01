@@ -207,6 +207,29 @@ fn plugin_production_code_uses_generic_host_api_only() {
     }
 }
 
+#[test]
+fn core_ipc_does_not_advertise_domain_feature_capabilities() {
+    let source = std::fs::read_to_string(
+        repo_root()
+            .join("packages")
+            .join("ipc")
+            .join("src")
+            .join("lib.rs"),
+    )
+    .expect("packages/ipc/src/lib.rs should be readable");
+    for marker in [
+        "feature.attach_pane_snapshot",
+        "feature.attach_snapshot",
+        "feature.contexts",
+        "feature.recording.v4",
+    ] {
+        assert!(
+            !source.contains(marker),
+            "core IPC must not advertise stale domain feature capability {marker}",
+        );
+    }
+}
+
 /// Verify that `packages/event/models` is fully domain-agnostic. The
 /// former `Session/Pane/Client/Input` event enums and constructors
 /// must not silently reappear.
