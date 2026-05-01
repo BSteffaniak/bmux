@@ -56,10 +56,80 @@ type NativeInvokeServiceFn =
 
 const NATIVE_SERVICE_STATUS_OK: i32 = 0;
 const NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
+const NATIVE_SERVICE_INITIAL_RESPONSE_BYTES: usize = 4096;
+const NATIVE_SERVICE_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const NATIVE_SERVICE_BUFFER_RESIZE_ATTEMPTS: usize = 8;
 const KERNEL_STATUS_OK: i32 = 0;
 const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 const PROCESS_PLUGIN_TIMEOUT_ENV_VAR: &str = "BMUX_PROCESS_PLUGIN_TIMEOUT_MS";
 const PROCESS_PLUGIN_TIMEOUT_DEFAULT_MS: u64 = 30_000;
+
+fn invoke_native_service_resizing_output<F>(
+    plugin_id: &str,
+    mut call_service: F,
+) -> Result<(Vec<u8>, usize)>
+where
+    F: FnMut(&mut [u8], &mut usize) -> i32,
+{
+    let mut output = vec![0_u8; NATIVE_SERVICE_INITIAL_RESPONSE_BYTES];
+    let mut buffer_resize_attempts = 0_usize;
+    let output_len = loop {
+        let mut output_len = 0_usize;
+        let status = call_service(&mut output, &mut output_len);
+        if status == NATIVE_SERVICE_STATUS_OK {
+            break output_len;
+        }
+        if status != NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL {
+            return Err(PluginError::NativeServiceInvocation {
+                plugin_id: plugin_id.to_string(),
+                status,
+            });
+        }
+
+        buffer_resize_attempts += 1;
+        if buffer_resize_attempts > NATIVE_SERVICE_BUFFER_RESIZE_ATTEMPTS {
+            return Err(PluginError::InvalidNativeServiceOutput {
+                plugin_id: plugin_id.to_string(),
+                details: format!(
+                    "service response kept outgrowing buffers after {buffer_resize_attempts} attempts; last required {output_len} bytes for {} byte buffer",
+                    output.len(),
+                ),
+            });
+        }
+
+        let doubled = output.len().saturating_mul(2);
+        let next_len = output_len.max(doubled);
+        if next_len > NATIVE_SERVICE_MAX_RESPONSE_BYTES {
+            return Err(PluginError::InvalidNativeServiceOutput {
+                plugin_id: plugin_id.to_string(),
+                details: format!(
+                    "service response requires {next_len} bytes, exceeding max native service response size of {NATIVE_SERVICE_MAX_RESPONSE_BYTES} bytes",
+                ),
+            });
+        }
+        if next_len <= output.len() {
+            return Err(PluginError::InvalidNativeServiceOutput {
+                plugin_id: plugin_id.to_string(),
+                details: format!(
+                    "service reported buffer too small but requested non-growing buffer size {next_len} bytes",
+                ),
+            });
+        }
+        output.resize(next_len, 0);
+    };
+
+    if output_len > output.len() {
+        return Err(PluginError::InvalidNativeServiceOutput {
+            plugin_id: plugin_id.to_string(),
+            details: format!(
+                "service returned {output_len} bytes into {} byte buffer",
+                output.len(),
+            ),
+        });
+    }
+    output.truncate(output_len);
+    Ok((output, buffer_resize_attempts))
+}
 
 static LOCAL_STATIC_SERVICE_PROVIDER_CACHE: OnceLock<Mutex<BTreeMap<String, Arc<LoadedPlugin>>>> =
     OnceLock::new();
@@ -2075,33 +2145,13 @@ impl LoadedPlugin {
             }
         };
 
-        let mut output = vec![0_u8; 4096];
-        let mut output_len = 0_usize;
         let call_started = Instant::now();
-        let mut status = call_service(&payload, &mut output, &mut output_len);
-        if status == NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL {
-            output.resize(output_len.max(output.len() * 2), 0);
-            status = call_service(&payload, &mut output, &mut output_len);
-        }
+        let (output, buffer_resize_attempts) = invoke_native_service_resizing_output(
+            self.declaration.id.as_str(),
+            |output, output_len| call_service(&payload, output, output_len),
+        )?;
         let call_us = call_started.elapsed().as_micros();
-
-        if status != NATIVE_SERVICE_STATUS_OK {
-            return Err(PluginError::NativeServiceInvocation {
-                plugin_id: self.declaration.id.as_str().to_string(),
-                status,
-            });
-        }
-
-        if output_len > output.len() {
-            return Err(PluginError::InvalidNativeServiceOutput {
-                plugin_id: self.declaration.id.as_str().to_string(),
-                details: format!(
-                    "service returned {output_len} bytes into {} byte buffer",
-                    output.len(),
-                ),
-            });
-        }
-        output.truncate(output_len);
+        let output_len = output.len();
 
         let decode_started = Instant::now();
         let (_, response) =
@@ -2121,6 +2171,7 @@ impl LoadedPlugin {
                 .field("request_payload_len", context.request.payload.len())
                 .field("encoded_request_len", payload.len())
                 .field("encoded_response_len", output_len)
+                .field("response_buffer_resize_attempts", buffer_resize_attempts)
                 .field("encode_us", encode_us)
                 .field("call_us", call_us)
                 .field("decode_us", decode_us)
@@ -2676,6 +2727,8 @@ mod tests {
     thread_local! {
         static KERNEL_REQUESTS: RefCell<Vec<bmux_ipc::Request>> = const { RefCell::new(Vec::new()) };
         static OMIT_CURRENT_CLIENT_FROM_LIST: Cell<bool> = const { Cell::new(false) };
+        static GROW_NATIVE_SERVICE_RESPONSE_ON_RETRY: Cell<bool> = const { Cell::new(false) };
+        static NATIVE_SERVICE_INVOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
     }
 
     const TEST_MANIFEST_TEXT: &str = concat!(
@@ -2728,7 +2781,18 @@ sleep 60
         let (request_id, context) =
             decode_service_envelope::<NativeServiceContext>(input, ServiceEnvelopeKind::Request)
                 .expect("service request should decode");
-        let response = ServiceResponse::ok(context.request.payload);
+        let mut response_payload = context.request.payload;
+        if GROW_NATIVE_SERVICE_RESPONSE_ON_RETRY.with(Cell::get) {
+            let invocation = NATIVE_SERVICE_INVOCATION_COUNT.with(|count| {
+                let invocation = count.get().saturating_add(1);
+                count.set(invocation);
+                invocation
+            });
+            if invocation >= 2 {
+                response_payload.resize(response_payload.len().saturating_add(12_000), 0);
+            }
+        }
+        let response = ServiceResponse::ok(response_payload);
         let encoded = encode_service_envelope(request_id, ServiceEnvelopeKind::Response, &response)
             .expect("service response should encode");
         unsafe {
@@ -2900,6 +2964,151 @@ minimum = "1.0"
         assert_eq!(loaded.commands().len(), 1);
         assert!(loaded.supports_command("hello"));
         assert!(loaded.run_command("missing", &[]).is_err());
+    }
+
+    fn test_static_plugin_entry() -> *const c_char {
+        TEST_MANIFEST_TEXT.as_ptr().cast()
+    }
+
+    fn test_static_plugin_command_with_context(_input_ptr: *const u8, _input_len: usize) -> i32 {
+        0
+    }
+
+    fn test_static_plugin_lifecycle(_input_ptr: *const u8, _input_len: usize) -> i32 {
+        0
+    }
+
+    fn test_static_plugin_event(_input_ptr: *const u8, _input_len: usize) -> i32 {
+        0
+    }
+
+    fn test_static_plugin_service(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+    ) -> i32 {
+        bmux_plugin_invoke_service_v1(
+            input_ptr,
+            input_len,
+            output_ptr,
+            output_capacity,
+            output_len,
+        )
+    }
+
+    fn test_static_plugin_typed_services(
+        _context: bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
+    ) -> bmux_plugin_sdk::TypedServiceRegistry {
+        bmux_plugin_sdk::TypedServiceRegistry::new()
+    }
+
+    fn loaded_static_test_plugin() -> LoadedPlugin {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.plugin"
+name = "Test Plugin"
+version = "0.1.0"
+entry = "unused.dylib"
+required_capabilities = ["bmux.commands"]
+
+[[commands]]
+name = "hello"
+summary = "hello"
+execution = "provider_exec"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
+            .expect("manifest should register");
+        let vtable = bmux_plugin_sdk::StaticPluginVtable {
+            entry: test_static_plugin_entry,
+            run_command_with_context: test_static_plugin_command_with_context,
+            activate: test_static_plugin_lifecycle,
+            deactivate: test_static_plugin_lifecycle,
+            handle_event: test_static_plugin_event,
+            invoke_service: test_static_plugin_service,
+            register_typed_services: test_static_plugin_typed_services,
+        };
+
+        LoadedPlugin {
+            registered: registry
+                .get("test.plugin")
+                .expect("plugin should exist")
+                .clone(),
+            declaration: PluginManifest::from_toml_str(TEST_MANIFEST_TEXT.trim_end_matches('\0'))
+                .expect("manifest should parse")
+                .to_declaration()
+                .expect("declaration should build"),
+            backend: PluginBackend::Static(vtable),
+        }
+    }
+
+    fn native_test_service_context(payload: Vec<u8>) -> NativeServiceContext {
+        NativeServiceContext {
+            plugin_id: "test.plugin".to_string(),
+            request: bmux_plugin_sdk::ServiceRequest {
+                caller_plugin_id: "test.caller".to_string(),
+                service: bmux_plugin_sdk::RegisteredService {
+                    capability: bmux_plugin_sdk::HostScope::new("test.service")
+                        .expect("capability should parse"),
+                    kind: bmux_plugin_sdk::ServiceKind::Query,
+                    interface_id: "test-service".to_string(),
+                    provider: bmux_plugin_sdk::ProviderId::Plugin("test.plugin".to_string()),
+                },
+                operation: "echo".to_string(),
+                payload,
+            },
+            required_capabilities: vec!["test.service".to_string()],
+            provided_capabilities: vec!["test.service".to_string()],
+            services: Vec::new(),
+            available_capabilities: vec!["test.service".to_string()],
+            enabled_plugins: vec!["test.plugin".to_string()],
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: bmux_plugin_sdk::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                config_dir_candidates: vec!["/config".to_string()],
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+                state_dir: "/state".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
+            host_kernel_bridge: None,
+        }
+    }
+
+    #[test]
+    fn native_service_invocation_retries_when_response_outgrows_retry_buffer() {
+        GROW_NATIVE_SERVICE_RESPONSE_ON_RETRY.with(|enabled| enabled.set(true));
+        NATIVE_SERVICE_INVOCATION_COUNT.with(|count| count.set(0));
+
+        let loaded = loaded_static_test_plugin();
+        let response = loaded
+            .invoke_service(&native_test_service_context(vec![b'x'; 5_000]))
+            .expect("service should retry until the grown response fits");
+
+        GROW_NATIVE_SERVICE_RESPONSE_ON_RETRY.with(|enabled| enabled.set(false));
+        NATIVE_SERVICE_INVOCATION_COUNT.with(|count| count.set(0));
+
+        assert!(response.error.is_none());
+        assert_eq!(response.payload.len(), 17_000);
     }
 
     #[cfg(unix)]

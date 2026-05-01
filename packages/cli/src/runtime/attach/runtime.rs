@@ -103,6 +103,7 @@ const ATTACH_OVERRENDER_NON_FULL_FRAME_CELL_RATIO_PERCENT: u64 = 50;
 const ATTACH_OVERRENDER_EXTENSION_FULL_SURFACE_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB: u64 = 8;
+const ATTACH_MOUSE_RESIZE_DRAG_MIN_APPLY_INTERVAL: Duration = Duration::from_millis(32);
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
@@ -2748,6 +2749,13 @@ pub async fn run_session_attach_with_client(
             )
             .await?;
     }
+
+    tracing::info!(
+        exit_reason = attach_exit_reason_label(exit_reason),
+        attach_runtime_ms = duration_millis_u64(attach_started_at.elapsed()),
+        rendered_frames = rendered_frame_count,
+        "attach.runtime.end"
+    );
 
     drop(raw_mode_guard);
     restore_terminal_after_attach_ui()?;
@@ -7495,24 +7503,67 @@ async fn handle_attach_mouse_resize_drag(
             if horizontal.is_none() && vertical.is_none() {
                 return Ok(true);
             }
-            if let Some((target, direction, cells)) = horizontal {
-                resize_attach_pane(client, view_state, target, direction, cells).await?;
-                drag.last_column = mouse_event.column;
+            let now = Instant::now();
+            if now.duration_since(drag.last_applied_at)
+                < ATTACH_MOUSE_RESIZE_DRAG_MIN_APPLY_INTERVAL
+            {
+                return Ok(true);
             }
-            if let Some((target, direction, cells)) = vertical {
-                resize_attach_pane(client, view_state, target, direction, cells).await?;
-                drag.last_row = mouse_event.row;
-            }
+            apply_attach_mouse_resize_delta(client, view_state, &mut drag, mouse_event).await;
+            drag.last_applied_at = now;
             view_state.mouse.resize_drag = Some(drag);
             Ok(true)
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            if view_state.mouse.resize_drag.take().is_some() {
+            if let Some(mut drag) = view_state.mouse.resize_drag.take() {
+                apply_attach_mouse_resize_delta(client, view_state, &mut drag, mouse_event).await;
                 return Ok(true);
             }
             Ok(false)
         }
         _ => Ok(view_state.mouse.resize_drag.is_some()),
+    }
+}
+
+async fn apply_attach_mouse_resize_delta(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    drag: &mut AttachMouseResizeDrag,
+    mouse_event: MouseEvent,
+) {
+    let horizontal = resize_drag_axis_delta(
+        drag.horizontal,
+        i32::from(mouse_event.column) - i32::from(drag.last_column),
+    );
+    let vertical = resize_drag_axis_delta(
+        drag.vertical,
+        i32::from(mouse_event.row) - i32::from(drag.last_row),
+    );
+    if let Some((target, direction, cells)) = horizontal {
+        apply_attach_pane_resize_or_log(client, view_state, target, direction, cells).await;
+        drag.last_column = mouse_event.column;
+    }
+    if let Some((target, direction, cells)) = vertical {
+        apply_attach_pane_resize_or_log(client, view_state, target, direction, cells).await;
+        drag.last_row = mouse_event.row;
+    }
+}
+
+async fn apply_attach_pane_resize_or_log(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    pane_id: Uuid,
+    direction: bmux_windows_plugin_api::windows_commands::PaneResizeDirection,
+    cells: u16,
+) {
+    if let Err(error) = resize_attach_pane(client, view_state, pane_id, direction, cells).await {
+        tracing::warn!(
+            %error,
+            %pane_id,
+            ?direction,
+            cells,
+            "attach.mouse_resize.apply_failed"
+        );
     }
 }
 
@@ -8369,6 +8420,7 @@ pub fn attach_scene_resize_separator_at(
         vertical,
         last_column: column,
         last_row: row,
+        last_applied_at: Instant::now(),
     })
 }
 
