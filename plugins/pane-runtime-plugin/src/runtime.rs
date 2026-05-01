@@ -1770,6 +1770,75 @@ fn collect_layout_rects(
     }
 }
 
+fn layout_order_fallback_after_close(order: &[Uuid], target: Uuid) -> Option<Uuid> {
+    let target_index = order.iter().position(|id| *id == target)?;
+    order
+        .iter()
+        .copied()
+        .filter(|id| *id != target)
+        .nth(target_index)
+        .or_else(|| {
+            order
+                .iter()
+                .copied()
+                .take(target_index)
+                .rfind(|id| *id != target)
+        })
+}
+
+fn rect_center(rect: LayoutRect) -> (u32, u32) {
+    (
+        u32::from(rect.x).saturating_mul(2) + u32::from(rect.w),
+        u32::from(rect.y).saturating_mul(2) + u32::from(rect.h),
+    )
+}
+
+fn rect_center_distance(a: LayoutRect, b: LayoutRect) -> u32 {
+    let (ax, ay) = rect_center(a);
+    let (bx, by) = rect_center(b);
+    ax.abs_diff(bx).saturating_add(ay.abs_diff(by))
+}
+
+fn next_focus_after_close(
+    layout_root: &PaneLayoutNode,
+    focused_pane_id: Uuid,
+    target: Uuid,
+    viewport: Option<AttachViewport>,
+) -> Option<Uuid> {
+    let mut order = Vec::new();
+    layout_root.pane_order(&mut order);
+    if !order.contains(&target) {
+        return None;
+    }
+    if focused_pane_id != target && order.contains(&focused_pane_id) {
+        return Some(focused_pane_id);
+    }
+
+    let fallback = layout_order_fallback_after_close(&order, target);
+    let root = scene_root_from_viewport(viewport);
+    let mut rects = BTreeMap::new();
+    collect_layout_rects(layout_root, root, &mut rects);
+    let target_rect = rects.get(&target).copied()?;
+    let target_index = order.iter().position(|id| *id == target).unwrap_or(0);
+
+    rects
+        .iter()
+        .filter(|(pane_id, _)| **pane_id != target)
+        .min_by_key(|(pane_id, rect)| {
+            let order_index = order
+                .iter()
+                .position(|id| id == *pane_id)
+                .unwrap_or(usize::MAX);
+            (
+                rect_center_distance(target_rect, **rect),
+                order_index.abs_diff(target_index),
+                order_index,
+            )
+        })
+        .map(|(pane_id, _)| *pane_id)
+        .or(fallback)
+}
+
 const fn attach_rect_from_layout_rect(rect: LayoutRect) -> AttachRect {
     AttachRect {
         x: rect.x,
@@ -2832,24 +2901,27 @@ impl SessionRuntimeManager {
         };
 
         if remove_runtime {
-            let removed = self.remove_runtime(session_id)?;
-            return Ok((pane_id, Some(removed)));
+            anyhow::bail!("cannot close the final pane without an explicit session action");
         }
 
         let session = self
             .runtimes
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let next_focus = next_focus_after_close(
+            &session.layout_root,
+            session.focused_pane_id,
+            pane_id,
+            session.attach_viewport,
+        );
         let pane = session
             .panes
             .remove(&pane_id)
             .ok_or_else(|| anyhow::anyhow!("focused pane not found"))?;
         let _ = session.layout_root.remove_leaf(pane_id);
-        let mut remaining = Vec::new();
-        session.layout_root.pane_order(&mut remaining);
         if (session.focused_pane_id == pane_id
             || !session.panes.contains_key(&session.focused_pane_id))
-            && let Some(next_id) = remaining.first().copied()
+            && let Some(next_id) = next_focus
         {
             session.focused_pane_id = next_id;
         }
@@ -4628,6 +4700,54 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leaf(id: Uuid) -> PaneLayoutNode {
+        PaneLayoutNode::Leaf { pane_id: id }
+    }
+
+    #[test]
+    fn close_focus_fallback_uses_nearest_layout_neighbor() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let root = PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(a)),
+            second: Box::new(PaneLayoutNode::Split {
+                direction: PaneSplitDirection::Horizontal,
+                ratio: 0.5,
+                first: Box::new(leaf(b)),
+                second: Box::new(leaf(c)),
+            }),
+        };
+        let viewport = Some(AttachViewport {
+            cols: 100,
+            rows: 40,
+            status_top_inset: 0,
+            status_bottom_inset: 0,
+        });
+
+        assert_eq!(next_focus_after_close(&root, b, b, viewport), Some(c));
+        assert_eq!(next_focus_after_close(&root, c, c, viewport), Some(b));
+    }
+
+    #[test]
+    fn close_focus_keeps_existing_focus_when_closing_unfocused_pane() {
+        let focused = Uuid::new_v4();
+        let closed = Uuid::new_v4();
+        let root = PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(leaf(focused)),
+            second: Box::new(leaf(closed)),
+        };
+
+        assert_eq!(
+            next_focus_after_close(&root, focused, closed, None),
+            Some(focused)
+        );
+    }
 
     #[test]
     fn pane_mouse_protocol_tracker_tracks_dec_private_modes() {

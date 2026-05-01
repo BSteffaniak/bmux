@@ -374,6 +374,18 @@ pub fn close_pane(
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.close")?;
+    if handle
+        .0
+        .list_panes(session_id)
+        .map_err(|e| failed_command(e.to_string()))?
+        .len()
+        <= 1
+    {
+        return Err(PaneCommandError::Denied {
+            reason: "cannot close the final pane without choosing a new target or quitting"
+                .to_string(),
+        });
+    }
     let (pane_id, removed_runtime) = handle
         .0
         .close_pane(session_id, target_selector(req.target))

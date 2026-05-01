@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
-use super::super::prompt::{self, PromptRequest, PromptResponse, PromptValue};
+use super::super::prompt::{self, PromptOption, PromptRequest, PromptResponse, PromptValue};
 use super::super::{
     ATTACH_SCROLLBACK_UNAVAILABLE_STATUS, ATTACH_SELECTION_CLEARED_STATUS,
     ATTACH_SELECTION_COPIED_STATUS, ATTACH_SELECTION_EMPTY_STATUS, ATTACH_SELECTION_STARTED_STATUS,
@@ -68,8 +68,8 @@ use super::super::{
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent};
 use super::prompt_ui::{
-    AttachInternalPromptAction, AttachPromptCompletion, AttachPromptOrigin, PromptKeyDisposition,
-    prompt_accepts_key_kind,
+    AttachCloseFallbackTarget, AttachInternalPromptAction, AttachPromptCompletion,
+    AttachPromptOrigin, PromptKeyDisposition, prompt_accepts_key_kind,
 };
 use super::render::{
     AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
@@ -4033,6 +4033,97 @@ pub async fn handle_attach_plugin_command_action(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AttachCloseFallback {
+    target: AttachCloseFallbackTarget,
+    label: &'static str,
+}
+
+const FINAL_PANE_CHOICE_NEW_PANE: &str = "new-pane";
+const FINAL_PANE_CHOICE_NEW_SESSION: &str = "new-session";
+const FINAL_PANE_CHOICE_QUIT: &str = "quit";
+const FINAL_PANE_CHOICE_CANCEL: &str = "cancel";
+
+fn next_context_fallback(view_state: &AttachViewState) -> Option<AttachCloseFallback> {
+    let current_context = view_state.attached_context_id;
+    let windows = view_state.cached_window_list.as_ref()?;
+    let candidates = windows
+        .windows
+        .iter()
+        .filter(|entry| Some(entry.id) != current_context)
+        .filter(|entry| {
+            context_session_id(&view_state.cached_context_session_bindings, entry.id)
+                != Some(view_state.attached_id)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    let current_index =
+        current_context.and_then(|id| windows.windows.iter().position(|w| w.id == id));
+    let selected = current_index
+        .and_then(|index| {
+            windows.windows[index.saturating_add(1)..]
+                .iter()
+                .find(|entry| candidates.iter().any(|candidate| candidate.id == entry.id))
+                .or_else(|| {
+                    windows.windows[..index]
+                        .iter()
+                        .rev()
+                        .find(|entry| candidates.iter().any(|candidate| candidate.id == entry.id))
+                })
+        })
+        .or_else(|| candidates.first().copied())?;
+
+    Some(AttachCloseFallback {
+        target: AttachCloseFallbackTarget::Context {
+            context_id: selected.id,
+        },
+        label: "another tab",
+    })
+}
+
+fn next_session_fallback(view_state: &AttachViewState) -> Option<AttachCloseFallback> {
+    view_state
+        .cached_sessions
+        .iter()
+        .find(|session| session.id != view_state.attached_id)
+        .map(|session| AttachCloseFallback {
+            target: AttachCloseFallbackTarget::Session {
+                session_id: session.id,
+            },
+            label: "another session",
+        })
+}
+
+fn next_close_fallback(view_state: &AttachViewState) -> Option<AttachCloseFallback> {
+    next_context_fallback(view_state).or_else(|| next_session_fallback(view_state))
+}
+
+fn enqueue_final_pane_action_prompt(
+    view_state: &mut AttachViewState,
+    pane_id: Uuid,
+    session_id: Uuid,
+) {
+    view_state.prompt.enqueue_internal(
+        PromptRequest::single_select(
+            "Final pane action",
+            vec![
+                PromptOption::new(FINAL_PANE_CHOICE_NEW_PANE, "New pane in this session"),
+                PromptOption::new(FINAL_PANE_CHOICE_NEW_SESSION, "New session"),
+                PromptOption::new(FINAL_PANE_CHOICE_QUIT, "Quit bmux"),
+                PromptOption::new(FINAL_PANE_CHOICE_CANCEL, "Cancel"),
+            ],
+        )
+        .message("This is the final available pane. Choose what bmux should do next.")
+        .policy(prompt::PromptPolicy::RejectIfBusy),
+        AttachInternalPromptAction::FinalPaneAction {
+            pane_id,
+            session_id,
+        },
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachViewState) {
     match action {
@@ -4151,15 +4242,41 @@ pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachVi
                 );
                 return;
             }
-            view_state.prompt.enqueue_internal(
-                PromptRequest::confirm("Close focused pane?")
-                    .message("This will stop the pane process.")
-                    .submit_label("Close")
+            let pane_count = view_state
+                .cached_layout_state
+                .as_ref()
+                .map_or(0, |layout| layout.panes.len());
+            if pane_count > 1 {
+                view_state.prompt.enqueue_internal(
+                    PromptRequest::confirm("Close focused pane?")
+                        .message("This will stop the pane process.")
+                        .submit_label("Close")
+                        .cancel_label("Cancel")
+                        .confirm_default(false)
+                        .policy(prompt::PromptPolicy::RejectIfBusy),
+                    AttachInternalPromptAction::ClosePane { pane_id },
+                );
+            } else if let Some(fallback) = next_close_fallback(view_state) {
+                view_state.prompt.enqueue_internal(
+                    PromptRequest::confirm(format!(
+                        "Close this pane and switch to {}?",
+                        fallback.label
+                    ))
+                    .message(
+                        "This is the last pane in the current session. bmux will switch before closing it.",
+                    )
+                    .submit_label("Close and switch")
                     .cancel_label("Cancel")
                     .confirm_default(false)
                     .policy(prompt::PromptPolicy::RejectIfBusy),
-                AttachInternalPromptAction::ClosePane { pane_id },
-            );
+                    AttachInternalPromptAction::CloseLastPaneAndSwitch {
+                        old_session_id: view_state.attached_id,
+                        target: fallback.target,
+                    },
+                );
+            } else {
+                enqueue_final_pane_action_prompt(view_state, pane_id, view_state.attached_id);
+            }
         }
         _ => {}
     }
@@ -7030,6 +7147,134 @@ pub const fn prompt_response_is_confirmed(response: &PromptResponse) -> bool {
     )
 }
 
+const fn prompt_response_single_value(response: &PromptResponse) -> Option<&str> {
+    match response {
+        PromptResponse::Submitted(PromptValue::Single(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+async fn retarget_attach_to_session(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    session_id: Uuid,
+) -> std::result::Result<(), ClientError> {
+    let attach_info = open_attach_for_session(client, session_id).await?;
+    view_state.attached_id = attach_info.session_id;
+    view_state.attached_context_id = attach_info.context_id;
+    view_state.can_write = attach_info.can_write;
+    update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
+    hydrate_attach_state_from_snapshot(client, view_state).await?;
+    refresh_attach_status_catalog_best_effort(client, view_state).await;
+    view_state.ui_mode = AttachUiMode::Normal;
+    let status = attach_context_status_from_catalog(view_state);
+    set_attach_context_status(
+        view_state,
+        status,
+        Instant::now(),
+        ATTACH_TRANSIENT_STATUS_TTL,
+    );
+    Ok(())
+}
+
+async fn kill_session_for_safe_close(
+    client: &mut StreamingBmuxClient,
+    session_id: Uuid,
+) -> std::result::Result<(), ClientError> {
+    match typed_kill_session_attach(client, SessionSelector::ById(session_id), false).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("kill-session failed: {err:?}"),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+async fn close_pane_by_id_for_prompt(
+    client: &mut StreamingBmuxClient,
+    pane_id: Uuid,
+) -> std::result::Result<(), ClientError> {
+    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+        client,
+        "focus-pane",
+        &windows_commands::client::FocusPaneRequest { id: pane_id },
+    )
+    .await?;
+    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+        client,
+        "close-pane",
+        &windows_commands::client::ClosePaneRequest { id: pane_id },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn close_last_pane_after_retarget(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    old_session_id: Uuid,
+    target: AttachCloseFallbackTarget,
+) -> std::result::Result<(), ClientError> {
+    match target {
+        AttachCloseFallbackTarget::Context { context_id } => {
+            retarget_attach_to_context(client, view_state, context_id).await?;
+        }
+        AttachCloseFallbackTarget::Session { session_id } => {
+            retarget_attach_to_session(client, view_state, session_id).await?;
+        }
+    }
+    kill_session_for_safe_close(client, old_session_id).await
+}
+
+async fn create_new_window_and_retarget(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+) -> std::result::Result<(), ClientError> {
+    let ack: bmux_windows_plugin_api::windows_commands::WindowAck = invoke_windows_command(
+        client,
+        "new-window",
+        &windows_commands::client::NewWindowRequest { name: None },
+    )
+    .await?;
+    let context_id = ack
+        .id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or_else(|| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: "new-window did not return a context id".to_string(),
+        })?;
+    retarget_attach_to_context(client, view_state, context_id).await
+}
+
+async fn split_new_pane_then_close_old(
+    client: &mut StreamingBmuxClient,
+    pane_id: Uuid,
+    session_id: Uuid,
+) -> std::result::Result<(), ClientError> {
+    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+        client,
+        "split-pane",
+        &windows_commands::client::SplitPaneRequest {
+            session: Some(ipc_to_windows_selector(SessionSelector::ById(session_id))),
+            target: Some(pane_id_windows_selector(pane_id)),
+            direction: windows_commands::PaneDirection::Horizontal,
+            ratio_pct: None,
+        },
+    )
+    .await?;
+    close_pane_by_id_for_prompt(client, pane_id).await
+}
+
+fn set_close_prompt_error(view_state: &mut AttachViewState, error: ClientError) {
+    view_state.set_transient_status(
+        format!("close pane failed: {}", map_attach_client_error(error)),
+        Instant::now(),
+        ATTACH_TRANSIENT_STATUS_TTL,
+    );
+}
+
 #[allow(clippy::too_many_lines)] // Internal prompt completions are a compact action state machine.
 pub async fn handle_attach_prompt_completion(
     client: &mut StreamingBmuxClient,
@@ -7080,26 +7325,17 @@ pub async fn handle_attach_prompt_completion(
             }
             AttachInternalPromptAction::ClosePane { pane_id } => {
                 if prompt_response_is_confirmed(&completion.response) {
-                    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
-                        invoke_windows_command(
-                            client,
-                            "focus-pane",
-                            &windows_commands::client::FocusPaneRequest { id: pane_id },
-                        )
-                        .await?;
-                    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
-                        invoke_windows_command(
-                            client,
-                            "close-pane",
-                            &windows_commands::client::ClosePaneRequest { id: pane_id },
-                        )
-                        .await?;
-                    view_state.set_transient_status(
-                        "pane closed",
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                    requires_layout_refresh = true;
+                    match close_pane_by_id_for_prompt(client, pane_id).await {
+                        Ok(()) => {
+                            view_state.set_transient_status(
+                                "pane closed",
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                            requires_layout_refresh = true;
+                        }
+                        Err(error) => set_close_prompt_error(view_state, error),
+                    }
                 } else {
                     view_state.set_transient_status(
                         "close pane canceled",
@@ -7108,6 +7344,95 @@ pub async fn handle_attach_prompt_completion(
                     );
                 }
             }
+            AttachInternalPromptAction::CloseLastPaneAndSwitch {
+                old_session_id,
+                target,
+            } => {
+                if prompt_response_is_confirmed(&completion.response) {
+                    match close_last_pane_after_retarget(client, view_state, old_session_id, target)
+                        .await
+                    {
+                        Ok(()) => {
+                            view_state.set_transient_status(
+                                "pane closed; switched target",
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                            requires_layout_refresh = true;
+                        }
+                        Err(error) => set_close_prompt_error(view_state, error),
+                    }
+                } else {
+                    view_state.set_transient_status(
+                        "close pane canceled",
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
+            }
+            AttachInternalPromptAction::FinalPaneAction {
+                pane_id,
+                session_id,
+            } => match prompt_response_single_value(&completion.response) {
+                Some(FINAL_PANE_CHOICE_NEW_PANE) => {
+                    match split_new_pane_then_close_old(client, pane_id, session_id).await {
+                        Ok(()) => {
+                            view_state.set_transient_status(
+                                "new pane opened; old pane closed",
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                            requires_layout_refresh = true;
+                        }
+                        Err(error) => set_close_prompt_error(view_state, error),
+                    }
+                }
+                Some(FINAL_PANE_CHOICE_NEW_SESSION) => {
+                    let result = match create_new_window_and_retarget(client, view_state).await {
+                        Ok(()) => kill_session_for_safe_close(client, session_id).await,
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(()) => {
+                            view_state.set_transient_status(
+                                "new session opened; old pane closed",
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                            requires_layout_refresh = true;
+                        }
+                        Err(error) => set_close_prompt_error(view_state, error),
+                    }
+                }
+                Some(FINAL_PANE_CHOICE_QUIT) => {
+                    match typed_kill_session_attach(
+                        client,
+                        SessionSelector::ById(session_id),
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            return Ok(Some(AttachLoopControl::Break(AttachExitReason::Quit)));
+                        }
+                        Ok(Err(err)) => set_close_prompt_error(
+                            view_state,
+                            ClientError::ServerError {
+                                code: bmux_ipc::ErrorCode::Internal,
+                                message: format!("kill-session failed: {err:?}"),
+                            },
+                        ),
+                        Err(error) => set_close_prompt_error(view_state, error),
+                    }
+                }
+                _ => {
+                    view_state.set_transient_status(
+                        "close pane canceled",
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
+            },
         },
     }
 
@@ -8755,6 +9080,8 @@ pub fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool {
         error,
         ClientError::ServerError { message, .. }
             if message.contains("not attached to session runtime")
+                || (message.contains("attach-pane-output-batch typed dispatch failed")
+                    && message.contains("expected service invoked"))
     )
 }
 #[cfg(test)]

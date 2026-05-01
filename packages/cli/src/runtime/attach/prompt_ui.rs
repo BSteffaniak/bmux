@@ -22,10 +22,26 @@ use uuid::Uuid;
 
 const PROMPT_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(2);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachCloseFallbackTarget {
+    Context { context_id: Uuid },
+    Session { session_id: Uuid },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachInternalPromptAction {
     QuitSession,
-    ClosePane { pane_id: Uuid },
+    ClosePane {
+        pane_id: Uuid,
+    },
+    CloseLastPaneAndSwitch {
+        old_session_id: Uuid,
+        target: AttachCloseFallbackTarget,
+    },
+    FinalPaneAction {
+        pane_id: Uuid,
+        session_id: Uuid,
+    },
 }
 
 #[derive(Debug)]
