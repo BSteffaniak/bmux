@@ -74,7 +74,6 @@ pub const CORE_CAPABILITY_ATTACH: &str = "core.attach";
 pub const CORE_CAPABILITY_PANE_IO: &str = "core.pane_io";
 pub const CORE_CAPABILITY_DETACH: &str = "core.detach";
 pub const CAPABILITY_ATTACH_PANE_SNAPSHOT: &str = "feature.attach_pane_snapshot";
-pub const CAPABILITY_CONTROL_CATALOG_SYNC: &str = "feature.control_catalog_sync";
 
 /// Core protocol capabilities required for baseline bmux operation.
 pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
@@ -82,7 +81,6 @@ pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
     CORE_CAPABILITY_ATTACH,
     CORE_CAPABILITY_PANE_IO,
     CORE_CAPABILITY_DETACH,
-    CAPABILITY_CONTROL_CATALOG_SYNC,
 ];
 
 // Compression capability strings (non-core, optional).
@@ -165,7 +163,6 @@ pub fn default_supported_capabilities() -> Vec<String> {
         CORE_CAPABILITY_PANE_IO.to_string(),
         CORE_CAPABILITY_DETACH.to_string(),
         CAPABILITY_ATTACH_PANE_SNAPSHOT.to_string(),
-        CAPABILITY_CONTROL_CATALOG_SYNC.to_string(),
     ];
     // Advertise compression capabilities when compiled in.
     // Note: Frame compression capabilities are NOT advertised by default
@@ -654,7 +651,6 @@ mod tests {
                 CORE_CAPABILITY_ATTACH.to_string(),
                 CORE_CAPABILITY_PANE_IO.to_string(),
                 CORE_CAPABILITY_DETACH.to_string(),
-                CAPABILITY_CONTROL_CATALOG_SYNC.to_string(),
                 CAPABILITY_ATTACH_PANE_SNAPSHOT.to_string(),
             ],
         };
