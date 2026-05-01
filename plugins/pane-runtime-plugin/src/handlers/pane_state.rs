@@ -115,6 +115,9 @@ pub fn list_floating_panes(
         .map(|surface| FloatingPaneSummary {
             id: surface.id,
             pane_id: surface.pane_id,
+            anchor_pane_id: surface.anchor_pane_id,
+            context_id: surface.context_id,
+            client_id: surface.client_id.map(|client_id| client_id.0),
             x: surface.rect.x,
             y: surface.rect.y,
             w: surface.rect.w,

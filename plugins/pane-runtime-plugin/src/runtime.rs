@@ -1738,6 +1738,8 @@ fn floating_summary(surface: FloatingSurfaceRuntime) -> FloatingPaneRuntimeSumma
         id: surface.id,
         pane_id: surface.pane_id,
         anchor_pane_id: surface.anchor_pane_id,
+        context_id: surface.context_id,
+        client_id: surface.client_id,
         rect: surface.rect,
         scope: surface.scope,
         layer: surface.layer,
@@ -1949,6 +1951,24 @@ fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
     }
 }
 
+fn floating_surface_visible_for_attach(
+    runtime: &SessionRuntimeHandle,
+    surface: &FloatingSurfaceRuntime,
+    client_id: ClientId,
+    context_id: Option<Uuid>,
+) -> bool {
+    match surface.scope {
+        FloatingPaneScope::PerPane => surface
+            .anchor_pane_id
+            .is_some_and(|anchor| runtime.panes.contains_key(&anchor)),
+        FloatingPaneScope::PerWindow => {
+            surface.context_id.is_none() || surface.context_id == context_id
+        }
+        FloatingPaneScope::PerSession | FloatingPaneScope::ServerGlobal => true,
+        FloatingPaneScope::ClientGlobal => surface.client_id.is_none_or(|owner| owner == client_id),
+    }
+}
+
 // Building the attach scene requires constructing every surface's
 // `rect` + `content_rect` + `interactive_regions` literally; splitting
 // this further would hurt readability more than it helps.
@@ -1957,6 +1977,8 @@ fn build_attach_scene(
     session_id: SessionId,
     runtime: &SessionRuntimeHandle,
     viewport: Option<AttachViewport>,
+    client_id: ClientId,
+    context_id: Option<Uuid>,
 ) -> AttachScene {
     let scene_root = scene_root_from_viewport(viewport);
 
@@ -1987,7 +2009,12 @@ fn build_attach_scene(
             runtime
                 .floating_surfaces
                 .iter()
-                .filter(|surface| runtime.panes.contains_key(&surface.pane_id))
+                .filter(|surface| {
+                    runtime.panes.contains_key(&surface.pane_id)
+                        && floating_surface_visible_for_attach(
+                            runtime, surface, client_id, context_id,
+                        )
+                })
                 .map(|surface| {
                     let rect = attach_rect_from_layout_rect(surface.rect);
                     AttachSurface {
@@ -2051,7 +2078,10 @@ fn build_attach_scene(
         runtime
             .floating_surfaces
             .iter()
-            .filter(|surface| runtime.panes.contains_key(&surface.pane_id))
+            .filter(|surface| {
+                runtime.panes.contains_key(&surface.pane_id)
+                    && floating_surface_visible_for_attach(runtime, surface, client_id, context_id)
+            })
             .map(|surface| {
                 let rect = attach_rect_from_layout_rect(surface.rect);
                 AttachSurface {
@@ -3178,6 +3208,9 @@ impl SessionRuntimeManager {
         z: i32,
         name: Option<String>,
         command: Option<PaneLaunchCommand>,
+        anchor_pane_id: Option<Uuid>,
+        context_id: Option<Uuid>,
+        client_id: Option<ClientId>,
     ) -> Result<FloatingPaneRuntimeSummary> {
         let (target_pane_id, next_pane_name, shell, client_ids) = {
             let session = self
@@ -3217,7 +3250,14 @@ impl SessionRuntimeManager {
         let surface = FloatingSurfaceRuntime {
             id: Uuid::new_v4(),
             pane_id,
-            anchor_pane_id: matches!(scope, FloatingPaneScope::PerPane).then_some(target_pane_id),
+            anchor_pane_id: matches!(scope, FloatingPaneScope::PerPane)
+                .then_some(anchor_pane_id.unwrap_or(target_pane_id)),
+            context_id: matches!(scope, FloatingPaneScope::PerWindow)
+                .then(|| context_id.or_else(|| current_context_id_for_session(session_id)))
+                .flatten(),
+            client_id: matches!(scope, FloatingPaneScope::ClientGlobal)
+                .then_some(client_id)
+                .flatten(),
             rect,
             scope,
             layer,
@@ -3428,7 +3468,13 @@ impl SessionRuntimeManager {
         if !session.attached_clients.contains(&client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
-        let scene = build_attach_scene(session_id, session, session.attach_viewport);
+        let scene = build_attach_scene(
+            session_id,
+            session,
+            session.attach_viewport,
+            client_id,
+            current_context_id_for_session(session_id),
+        );
         let pane_ids = ordered_pane_ids(session);
         let panes = pane_ids
             .iter()
@@ -3467,7 +3513,13 @@ impl SessionRuntimeManager {
         if !session.attached_clients.contains(&client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
-        let scene = build_attach_scene(session_id, session, session.attach_viewport);
+        let scene = build_attach_scene(
+            session_id,
+            session,
+            session.attach_viewport,
+            client_id,
+            current_context_id_for_session(session_id),
+        );
         let pane_ids = ordered_pane_ids(session);
         let panes = pane_ids
             .iter()
@@ -4136,9 +4188,24 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         z: i32,
         name: Option<String>,
         command: Option<PaneLaunchCommand>,
+        anchor_pane_id: Option<Uuid>,
+        context_id: Option<Uuid>,
+        client_id: Option<ClientId>,
     ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
         self.with_lock(|m| {
-            m.create_floating_pane(session_id, target, rect, scope, layer, z, name, command)
+            m.create_floating_pane(
+                session_id,
+                target,
+                rect,
+                scope,
+                layer,
+                z,
+                name,
+                command,
+                anchor_pane_id,
+                context_id,
+                client_id,
+            )
         })
         .ok_or_else(Self::lock_poisoned_anyhow)?
     }

@@ -202,6 +202,55 @@ interface windows-commands {
         target: selector?,
     ) -> result<pane-ack, pane-mutation-error>;
 
+    command create-floating-pane(
+        session: selector?,
+        target: selector?,
+        x: u16?,
+        y: u16?,
+        w: u16?,
+        h: u16?,
+        z: i32?,
+        layer: string?,
+        scope: string?,
+        program: string?,
+        args: list<string>,
+    ) -> result<pane-ack, pane-mutation-error>;
+
+    command move-floating-pane(
+        session: selector?,
+        target: selector,
+        x: u16,
+        y: u16,
+    ) -> result<pane-ack, pane-mutation-error>;
+
+    command resize-floating-pane(
+        session: selector?,
+        target: selector,
+        w: u16,
+        h: u16,
+    ) -> result<pane-ack, pane-mutation-error>;
+
+    command focus-floating-pane(session: selector?, target: selector)
+        -> result<pane-ack, pane-mutation-error>;
+    command raise-floating-pane(session: selector?, target: selector)
+        -> result<pane-ack, pane-mutation-error>;
+    command lower-floating-pane(session: selector?, target: selector)
+        -> result<pane-ack, pane-mutation-error>;
+    command close-floating-pane(session: selector?, target: selector)
+        -> result<pane-ack, pane-mutation-error>;
+
+    command set-floating-pane-z(
+        session: selector?,
+        target: selector,
+        z: i32,
+    ) -> result<pane-ack, pane-mutation-error>;
+
+    command set-floating-pane-layer(
+        session: selector?,
+        target: selector,
+        layer: string,
+    ) -> result<pane-ack, pane-mutation-error>;
+
     // Window-level commands.
     command new-window(name: string?) -> result<window-ack, window-error>;
     command rename-window(name: string) -> result<window-ack, window-error>;

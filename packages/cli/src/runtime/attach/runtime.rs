@@ -4634,6 +4634,24 @@ pub fn focused_attach_pane_id(view_state: &AttachViewState) -> Option<Uuid> {
     Some(view_state.cached_layout_state.as_ref()?.focused_pane_id)
 }
 
+fn attach_view_is_floating_only(view_state: &AttachViewState) -> bool {
+    let Some(layout_state) = view_state.cached_layout_state.as_ref() else {
+        return false;
+    };
+    let mut has_floating = false;
+    for surface in &layout_state.scene.surfaces {
+        if !surface.visible || surface.pane_id.is_none() {
+            continue;
+        }
+        match surface.kind {
+            AttachSurfaceKind::Pane => return false,
+            AttachSurfaceKind::FloatingPane => has_floating = true,
+            AttachSurfaceKind::Modal | AttachSurfaceKind::Overlay | AttachSurfaceKind::Tooltip => {}
+        }
+    }
+    has_floating
+}
+
 pub fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(usize, usize)> {
     let layout_state = view_state.cached_layout_state.as_ref()?;
     layout_state
@@ -4751,6 +4769,8 @@ pub fn build_attach_status_line_for_draw(
         status.to_string()
     } else if scrollback_active {
         attach_scrollback_hint(keymap)
+    } else if attach_view_is_floating_only(view_state) {
+        "floating panes remain; close them before closing this tab".to_string()
     } else {
         attach_mode_hint(&view_state.active_mode_id, ui_mode, keymap)
     };

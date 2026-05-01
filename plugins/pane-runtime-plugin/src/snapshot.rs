@@ -11,7 +11,7 @@ use bmux_plugin_sdk::{
     PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
     StatefulPluginResult, StatefulPluginSnapshot,
 };
-use bmux_session_models::SessionId;
+use bmux_session_models::{ClientId, SessionId};
 use bmux_snapshot_runtime::StatefulPluginRegistry;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -111,6 +111,10 @@ pub struct PaneRuntimeSnapshotV1FloatingSurface {
     pub pane_id: Uuid,
     #[serde(default)]
     pub anchor_pane_id: Option<Uuid>,
+    #[serde(default)]
+    pub context_id: Option<Uuid>,
+    #[serde(default)]
+    pub client_id: Option<Uuid>,
     pub x: u16,
     pub y: u16,
     pub w: u16,
@@ -240,6 +244,8 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
                 id: surface.id,
                 pane_id: surface.pane_id,
                 anchor_pane_id: surface.anchor_pane_id,
+                context_id: surface.context_id,
+                client_id: surface.client_id.map(|client_id| client_id.0),
                 x: surface.rect.x,
                 y: surface.rect.y,
                 w: surface.rect.w,
@@ -330,6 +336,8 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
                 id: surface.id,
                 pane_id: surface.pane_id,
                 anchor_pane_id: surface.anchor_pane_id,
+                context_id: surface.context_id,
+                client_id: surface.client_id.map(ClientId),
                 rect: LayoutRect {
                     x: surface.x,
                     y: surface.y,
@@ -454,6 +462,8 @@ mod tests {
                     id: surface_id,
                     pane_id,
                     anchor_pane_id: None,
+                    context_id: None,
+                    client_id: None,
                     x: 1,
                     y: 2,
                     w: 40,

@@ -19,6 +19,9 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+// BPDL-generated command methods mirror wire records; rich commands like
+// create-floating-pane naturally exceed clippy's argument-count heuristic.
+#![allow(clippy::too_many_arguments)]
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/windows-plugin.bpdl",

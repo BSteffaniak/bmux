@@ -368,16 +368,26 @@ struct FloatingPaneCommandOptions {
     args: Vec<String>,
 }
 
-fn create_floating_pane_command(
+fn create_floating_pane(
     caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: Option<&Selector>,
     options: FloatingPaneCommandOptions,
 ) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
-    let session_id = resolve_session_id(caller, None)?;
+    let session_id = resolve_session_id(caller, session)?;
+    let target = resolve_target_pane_id(caller, session_id, target)?;
+    let context_id = current_context(caller)
+        .ok()
+        .flatten()
+        .map(|context| context.id);
     let mut client = dispatch_client(caller);
     let result = bmux_plugin::block_on_typed_dispatch(
         api_pane_runtime_commands::client::create_floating_pane(
             &mut client,
             session_id,
+            target,
+            target,
+            context_id,
             None,
             options.origin_x,
             options.origin_y,
@@ -396,12 +406,22 @@ fn create_floating_pane_command(
     result.map_err(|err| format!("create-floating-pane failed: {err:?}"))
 }
 
-fn mutate_floating_pane_command(
+fn create_floating_pane_command(
     caller: &(impl ServiceCaller + Sync),
-    command: &str,
-    pane_id: Uuid,
+    options: FloatingPaneCommandOptions,
 ) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
-    let session_id = resolve_session_id(caller, None)?;
+    create_floating_pane(caller, None, None, options)
+}
+
+fn mutate_floating_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: &Selector,
+    command: &str,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let session_id = resolve_session_id(caller, session)?;
+    let pane_id = resolve_target_pane_id(caller, session_id, Some(target))?
+        .ok_or_else(|| "floating pane target did not resolve".to_string())?;
     let mut client = dispatch_client(caller);
     let result = match command {
         "focus" => bmux_plugin::block_on_typed_dispatch(
@@ -438,13 +458,33 @@ fn mutate_floating_pane_command(
     result.map_err(|err| format!("{command}-floating-pane failed: {err:?}"))
 }
 
-fn move_floating_pane_command(
+fn mutate_floating_pane_command(
     caller: &(impl ServiceCaller + Sync),
+    command: &str,
     pane_id: Uuid,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    mutate_floating_pane(
+        caller,
+        None,
+        &Selector {
+            id: Some(pane_id),
+            name: None,
+            index: None,
+        },
+        command,
+    )
+}
+
+fn move_floating_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: &Selector,
     origin_x: u16,
     origin_y: u16,
 ) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
-    let session_id = resolve_session_id(caller, None)?;
+    let session_id = resolve_session_id(caller, session)?;
+    let pane_id = resolve_target_pane_id(caller, session_id, Some(target))?
+        .ok_or_else(|| "floating pane target did not resolve".to_string())?;
     let mut client = dispatch_client(caller);
     let result = bmux_plugin::block_on_typed_dispatch(
         api_pane_runtime_commands::client::move_floating_pane(
@@ -459,13 +499,35 @@ fn move_floating_pane_command(
     result.map_err(|err| format!("move-floating-pane failed: {err:?}"))
 }
 
-fn resize_floating_pane_command(
+fn move_floating_pane_command(
     caller: &(impl ServiceCaller + Sync),
     pane_id: Uuid,
+    origin_x: u16,
+    origin_y: u16,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    move_floating_pane(
+        caller,
+        None,
+        &Selector {
+            id: Some(pane_id),
+            name: None,
+            index: None,
+        },
+        origin_x,
+        origin_y,
+    )
+}
+
+fn resize_floating_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: &Selector,
     width: u16,
     height: u16,
 ) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
-    let session_id = resolve_session_id(caller, None)?;
+    let session_id = resolve_session_id(caller, session)?;
+    let pane_id = resolve_target_pane_id(caller, session_id, Some(target))?
+        .ok_or_else(|| "floating pane target did not resolve".to_string())?;
     let mut client = dispatch_client(caller);
     let result = bmux_plugin::block_on_typed_dispatch(
         api_pane_runtime_commands::client::resize_floating_pane(
@@ -480,12 +542,34 @@ fn resize_floating_pane_command(
     result.map_err(|err| format!("resize-floating-pane failed: {err:?}"))
 }
 
-fn set_floating_pane_z_command(
+fn resize_floating_pane_command(
     caller: &(impl ServiceCaller + Sync),
     pane_id: Uuid,
+    width: u16,
+    height: u16,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    resize_floating_pane(
+        caller,
+        None,
+        &Selector {
+            id: Some(pane_id),
+            name: None,
+            index: None,
+        },
+        width,
+        height,
+    )
+}
+
+fn set_floating_pane_z(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: &Selector,
     z: i32,
 ) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
-    let session_id = resolve_session_id(caller, None)?;
+    let session_id = resolve_session_id(caller, session)?;
+    let pane_id = resolve_target_pane_id(caller, session_id, Some(target))?
+        .ok_or_else(|| "floating pane target did not resolve".to_string())?;
     let mut client = dispatch_client(caller);
     let result = bmux_plugin::block_on_typed_dispatch(
         api_pane_runtime_commands::client::set_floating_pane_z(&mut client, session_id, pane_id, z),
@@ -494,12 +578,32 @@ fn set_floating_pane_z_command(
     result.map_err(|err| format!("set-floating-pane-z failed: {err:?}"))
 }
 
-fn set_floating_pane_layer_command(
+fn set_floating_pane_z_command(
     caller: &(impl ServiceCaller + Sync),
     pane_id: Uuid,
+    z: i32,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    set_floating_pane_z(
+        caller,
+        None,
+        &Selector {
+            id: Some(pane_id),
+            name: None,
+            index: None,
+        },
+        z,
+    )
+}
+
+fn set_floating_pane_layer(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: &Selector,
     layer: String,
 ) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
-    let session_id = resolve_session_id(caller, None)?;
+    let session_id = resolve_session_id(caller, session)?;
+    let pane_id = resolve_target_pane_id(caller, session_id, Some(target))?
+        .ok_or_else(|| "floating pane target did not resolve".to_string())?;
     let mut client = dispatch_client(caller);
     let result = bmux_plugin::block_on_typed_dispatch(
         api_pane_runtime_commands::client::set_floating_pane_layer(
@@ -511,6 +615,23 @@ fn set_floating_pane_layer_command(
     )
     .map_err(|err| typed_service_error("pane-runtime-commands/set-floating-pane-layer", err))?;
     result.map_err(|err| format!("set-floating-pane-layer failed: {err:?}"))
+}
+
+fn set_floating_pane_layer_command(
+    caller: &(impl ServiceCaller + Sync),
+    pane_id: Uuid,
+    layer: String,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    set_floating_pane_layer(
+        caller,
+        None,
+        &Selector {
+            id: Some(pane_id),
+            name: None,
+            index: None,
+        },
+        layer,
+    )
 }
 
 fn zoom_pane(
@@ -2795,6 +2916,184 @@ impl WindowsCommandsService for WindowsCommandsHandle {
             Err(PaneMutationError::Failed {
                 reason: "restart-pane typed command is not wired to a host primitive yet".into(),
             })
+        })
+    }
+
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "Generated BPDL trait uses geometry field names x/y/w/h/z."
+    )]
+    fn create_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Option<Selector>,
+        x: Option<u16>,
+        y: Option<u16>,
+        w: Option<u16>,
+        h: Option<u16>,
+        z: Option<i32>,
+        layer: Option<String>,
+        scope: Option<String>,
+        program: Option<String>,
+        args: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            create_floating_pane(
+                &*caller,
+                session.as_ref(),
+                target.as_ref(),
+                FloatingPaneCommandOptions {
+                    origin_x: x,
+                    origin_y: y,
+                    width: w,
+                    height: h,
+                    z_index: z,
+                    layer,
+                    scope,
+                    program,
+                    args,
+                },
+            )
+            .map(|ack| PaneAck {
+                ok: true,
+                pane_id: Some(ack.pane_id),
+            })
+            .map_err(map_host_error)
+        })
+    }
+
+    fn move_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Selector,
+        x: u16,
+        y: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            move_floating_pane(&*caller, session.as_ref(), &target, x, y)
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn resize_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Selector,
+        w: u16,
+        h: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            resize_floating_pane(&*caller, session.as_ref(), &target, w, h)
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn focus_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Selector,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            mutate_floating_pane(&*caller, session.as_ref(), &target, "focus")
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn raise_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Selector,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            mutate_floating_pane(&*caller, session.as_ref(), &target, "raise")
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn lower_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Selector,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            mutate_floating_pane(&*caller, session.as_ref(), &target, "lower")
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn close_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Selector,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            mutate_floating_pane(&*caller, session.as_ref(), &target, "close")
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn set_floating_pane_z<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Selector,
+        z: i32,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            set_floating_pane_z(&*caller, session.as_ref(), &target, z)
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn set_floating_pane_layer<'a>(
+        &'a self,
+        session: Option<Selector>,
+        target: Selector,
+        layer: String,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            set_floating_pane_layer(&*caller, session.as_ref(), &target, layer)
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
         })
     }
 

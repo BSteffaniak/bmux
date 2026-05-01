@@ -89,6 +89,8 @@ pub struct FloatingPaneRuntimeSummary {
     pub id: Uuid,
     pub pane_id: Uuid,
     pub anchor_pane_id: Option<Uuid>,
+    pub context_id: Option<Uuid>,
+    pub client_id: Option<ClientId>,
     pub rect: LayoutRect,
     pub scope: FloatingPaneScope,
     pub layer: FloatingPaneLayer,
@@ -197,6 +199,9 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         z: i32,
         name: Option<String>,
         command: Option<PaneLaunchCommand>,
+        anchor_pane_id: Option<Uuid>,
+        context_id: Option<Uuid>,
+        client_id: Option<ClientId>,
     ) -> anyhow::Result<FloatingPaneRuntimeSummary>;
 
     fn list_floating_panes(
@@ -608,6 +613,9 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _z: i32,
         _name: Option<String>,
         _command: Option<PaneLaunchCommand>,
+        _anchor_pane_id: Option<Uuid>,
+        _context_id: Option<Uuid>,
+        _client_id: Option<ClientId>,
     ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
         anyhow::bail!("pane-runtime plugin not active")
     }

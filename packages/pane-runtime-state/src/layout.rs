@@ -1,6 +1,7 @@
 //! Layout tree + floating surface types.
 
 use bmux_attach_layout_protocol::PaneSplitDirection;
+use bmux_session_models::ClientId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -67,6 +68,10 @@ pub struct FloatingSurfaceRuntime {
     pub pane_id: Uuid,
     #[serde(default)]
     pub anchor_pane_id: Option<Uuid>,
+    #[serde(default)]
+    pub context_id: Option<Uuid>,
+    #[serde(default)]
+    pub client_id: Option<ClientId>,
     pub rect: LayoutRect,
     #[serde(default)]
     pub scope: FloatingPaneScope,

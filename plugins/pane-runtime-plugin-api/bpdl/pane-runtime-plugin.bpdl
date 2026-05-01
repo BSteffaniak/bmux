@@ -40,6 +40,9 @@ interface pane-runtime-state {
     record floating-pane-summary {
         id: uuid,
         pane_id: uuid,
+        anchor_pane_id: uuid?,
+        context_id: uuid?,
+        client_id: uuid?,
         x: u16,
         y: u16,
         w: u16,
@@ -173,6 +176,9 @@ interface pane-runtime-commands {
     command create-floating-pane(
         session_id: uuid,
         target: uuid?,
+        anchor_pane_id: uuid?,
+        context_id: uuid?,
+        client_id: uuid?,
         x: u16?,
         y: u16?,
         w: u16?,

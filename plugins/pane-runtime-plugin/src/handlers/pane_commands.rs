@@ -16,7 +16,7 @@ use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, AttachViewComponen
 use bmux_pane_runtime_state::{
     FloatingPaneLayer, FloatingPaneScope, LayoutRect, PaneResizeDirection,
 };
-use bmux_session_models::SessionId;
+use bmux_session_models::{ClientId, SessionId};
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -94,6 +94,12 @@ pub struct CreateFloatingPaneArgs {
     pub session_id: Uuid,
     #[serde(default)]
     pub target: Option<Uuid>,
+    #[serde(default)]
+    pub anchor_pane_id: Option<Uuid>,
+    #[serde(default)]
+    pub context_id: Option<Uuid>,
+    #[serde(default)]
+    pub client_id: Option<Uuid>,
     #[serde(default)]
     pub x: Option<u16>,
     #[serde(default)]
@@ -619,6 +625,9 @@ pub fn create_floating_pane(
             req.z.unwrap_or(0),
             req.name,
             command,
+            req.anchor_pane_id,
+            req.context_id,
+            req.client_id.or(ctx.caller_client_id).map(ClientId),
         )
         .map_err(|e| failed_command(e.to_string()))?;
     emit_attach_view_changed_scene(session_id);
