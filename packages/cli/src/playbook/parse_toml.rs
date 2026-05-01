@@ -7,7 +7,8 @@ use serde::Deserialize;
 use super::parse_dsl::decode_c_escapes;
 use super::types::{
     Action, Playbook, PlaybookConfig, PlaybookRenderRowRef, PlaybookRenderRowSegmentRef,
-    PluginConfig, RenderAssertion, ServiceKind, SplitDirection, Step, Viewport,
+    PlaybookRenderTraceOp, PluginConfig, RenderAssertion, ServiceKind, SplitDirection, Step,
+    Viewport,
 };
 
 /// Parse a playbook from a TOML string.
@@ -263,6 +264,11 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
                         .as_deref()
                         .map(parse_render_row_segment_refs_toml)
                         .transpose()?,
+                    expected_trace_ops: step
+                        .expected_trace_ops
+                        .as_deref()
+                        .map(parse_render_trace_ops_toml)
+                        .transpose()?,
                 },
             })
         }
@@ -308,6 +314,36 @@ fn parse_render_row_segment_refs_toml(
                     .parse()
                     .context("invalid render row segment cells")?,
             })
+        })
+        .collect()
+}
+
+fn parse_render_trace_ops_toml(ops: &[String]) -> Result<Vec<PlaybookRenderTraceOp>> {
+    ops.iter()
+        .map(|entry| {
+            if entry == "full-frame" {
+                return Ok(PlaybookRenderTraceOp::FullFrame);
+            }
+            if entry == "status-line" {
+                return Ok(PlaybookRenderTraceOp::StatusLine);
+            }
+            if entry == "overlay" {
+                return Ok(PlaybookRenderTraceOp::Overlay);
+            }
+            let parts = entry.split(':').collect::<Vec<_>>();
+            if parts.len() == 5 && parts[0] == "pane-row-segment" {
+                return Ok(PlaybookRenderTraceOp::PaneRowSegment {
+                    pane: parts[1].parse().context("invalid trace op pane")?,
+                    row: parts[2].parse().context("invalid trace op row")?,
+                    start_col: parts[3]
+                        .parse()
+                        .context("invalid trace op start_col")?,
+                    cells: parts[4].parse().context("invalid trace op cells")?,
+                });
+            }
+            bail!(
+                "invalid render trace op '{entry}', expected full-frame, status-line, overlay, or pane-row-segment:pane:row:start_col:cells"
+            )
         })
         .collect()
 }
@@ -418,6 +454,7 @@ struct RawStep {
     overlay_rendered: Option<bool>,
     expected_emitted_rows: Option<Vec<String>>,
     expected_emitted_row_segments: Option<Vec<String>>,
+    expected_trace_ops: Option<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -487,6 +524,39 @@ contains = "hello"
         assert!(playbook.config.record);
         assert_eq!(playbook.config.plugins.enable, vec!["bmux.windows"]);
         assert_eq!(playbook.steps.len(), 5);
+    }
+
+    #[test]
+    fn parse_assert_render_trace_ops() {
+        let input = r#"
+[playbook]
+render_trace = true
+
+[[step]]
+action = "render-mark"
+id = "baseline"
+
+[[step]]
+action = "assert-render"
+since = "baseline"
+expected_trace_ops = ["full-frame", "pane-row-segment:1:2:3:4"]
+"#;
+        let (playbook, _includes) = parse_toml(input).unwrap();
+        match &playbook.steps[1].action {
+            Action::AssertRender { assertion, .. } => assert_eq!(
+                assertion.expected_trace_ops,
+                Some(vec![
+                    PlaybookRenderTraceOp::FullFrame,
+                    PlaybookRenderTraceOp::PaneRowSegment {
+                        pane: 1,
+                        row: 2,
+                        start_col: 3,
+                        cells: 4,
+                    },
+                ])
+            ),
+            other => panic!("expected assert-render, got {other:?}"),
+        }
     }
 
     #[test]

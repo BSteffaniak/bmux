@@ -43,8 +43,8 @@ use super::screen::ScreenInspector;
 use super::subst::RuntimeVars;
 use super::types::{
     Action, PaneCapture, Playbook, PlaybookRenderRowRef, PlaybookRenderRowSegmentRef,
-    PlaybookRenderSummary, PlaybookResult, RenderAssertion, ServiceKind, SnapshotCapture,
-    SplitDirection, Step, StepFailure, StepResult, StepStatus,
+    PlaybookRenderSummary, PlaybookRenderTraceOp, PlaybookResult, RenderAssertion, ServiceKind,
+    SnapshotCapture, SplitDirection, Step, StepFailure, StepResult, StepStatus,
 };
 
 /// Default timeout for waiting for the sandbox server to start.
@@ -721,6 +721,7 @@ fn summarize_playbook_render_delta(
         .map(|pane| (pane.index, pane))
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut full_frame = before.is_none_or(|panes| panes.len() != after.len());
+    let mut trace_ops = Vec::new();
     for pane in after {
         let Some(previous) = before_by_index.get(&pane.index) else {
             full_frame = true;
@@ -737,6 +738,7 @@ fn summarize_playbook_render_delta(
                     .map(|segment| u64::from(segment.cells))
                     .sum(),
             );
+            trace_ops.extend(changed_segments.iter().map(render_segment_ref_to_trace_op));
             summary.emitted_rows.extend(changed_rows);
             summary.emitted_row_segments.extend(changed_segments);
             continue;
@@ -748,6 +750,7 @@ fn summarize_playbook_render_delta(
             .row_segments_emitted
             .saturating_add(u64::try_from(emitted_segments.len()).unwrap_or(u64::MAX));
         summary.cells_emitted = summary.cells_emitted.saturating_add(cells);
+        trace_ops.extend(emitted_segments.iter().map(render_segment_ref_to_trace_op));
         summary.emitted_rows.extend(emitted_rows);
         summary.emitted_row_segments.extend(emitted_segments);
     }
@@ -759,8 +762,21 @@ fn summarize_playbook_render_delta(
     }
     if full_frame && summary.frames > 0 {
         summary.full_frame_frames = 1;
+        summary.trace_ops.push(PlaybookRenderTraceOp::FullFrame);
     }
+    summary.trace_ops.extend(trace_ops);
     summary
+}
+
+const fn render_segment_ref_to_trace_op(
+    segment: &PlaybookRenderRowSegmentRef,
+) -> PlaybookRenderTraceOp {
+    PlaybookRenderTraceOp::PaneRowSegment {
+        pane: segment.pane,
+        row: segment.row,
+        start_col: segment.start_col,
+        cells: segment.cells,
+    }
 }
 
 fn new_pane_render_rows(
@@ -886,6 +902,7 @@ fn aggregate_render_summaries(summaries: &[PlaybookRenderSummary]) -> PlaybookRe
                 .extend(summary.emitted_rows.iter().copied());
             acc.emitted_row_segments
                 .extend(summary.emitted_row_segments.iter().copied());
+            acc.trace_ops.extend(summary.trace_ops.iter().copied());
             acc
         })
 }
@@ -964,6 +981,15 @@ fn validate_render_assertion(
             "assert-render since='{since}': expected_emitted_row_segments expected {}, got {}",
             super::types::render_row_segment_refs_to_dsl(expected),
             super::types::render_row_segment_refs_to_dsl(&summary.emitted_row_segments)
+        );
+    }
+    if let Some(expected) = assertion.expected_trace_ops.as_deref()
+        && summary.trace_ops != expected
+    {
+        bail!(
+            "assert-render since='{since}': expected_trace_ops expected {}, got {}",
+            super::types::render_trace_ops_to_dsl(expected),
+            super::types::render_trace_ops_to_dsl(&summary.trace_ops)
         );
     }
     Ok(())
@@ -3764,6 +3790,101 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         })
+    }
+
+    fn pane_capture(index: u32, screen_text: &str) -> PaneCapture {
+        PaneCapture {
+            index,
+            focused: index == 1,
+            screen_text: screen_text.to_string(),
+            cursor_row: 0,
+            cursor_col: 0,
+        }
+    }
+
+    #[test]
+    fn render_delta_records_semantic_trace_ops() {
+        let before = vec![pane_capture(1, "prompt> old\nsame")];
+        let after = vec![pane_capture(1, "prompt> new\nsame")];
+
+        let summary = summarize_playbook_render_delta(Some(&before), Some(&after));
+
+        assert_eq!(summary.frames, 1);
+        assert_eq!(summary.full_frame_frames, 0);
+        assert_eq!(
+            summary.trace_ops,
+            vec![PlaybookRenderTraceOp::PaneRowSegment {
+                pane: 1,
+                row: 0,
+                start_col: 8,
+                cells: 3,
+            }]
+        );
+        validate_render_assertion(
+            "mark",
+            &summary,
+            &RenderAssertion {
+                expected_trace_ops: Some(summary.trace_ops.clone()),
+                ..RenderAssertion::default()
+            },
+        )
+        .expect("matching semantic trace should pass");
+    }
+
+    #[test]
+    fn render_delta_records_full_frame_trace_op() {
+        let after = vec![pane_capture(1, "prompt>")];
+
+        let summary = summarize_playbook_render_delta(None, Some(&after));
+
+        assert_eq!(summary.frames, 1);
+        assert_eq!(summary.full_frame_frames, 1);
+        assert_eq!(
+            summary.trace_ops,
+            vec![
+                PlaybookRenderTraceOp::FullFrame,
+                PlaybookRenderTraceOp::PaneRowSegment {
+                    pane: 1,
+                    row: 0,
+                    start_col: 0,
+                    cells: 7,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_assertion_reports_trace_snapshot_mismatch() {
+        let summary = PlaybookRenderSummary {
+            frames: 1,
+            trace_ops: vec![PlaybookRenderTraceOp::PaneRowSegment {
+                pane: 1,
+                row: 0,
+                start_col: 0,
+                cells: 4,
+            }],
+            ..PlaybookRenderSummary::default()
+        };
+
+        let error = validate_render_assertion(
+            "mark",
+            &summary,
+            &RenderAssertion {
+                expected_trace_ops: Some(vec![PlaybookRenderTraceOp::PaneRowSegment {
+                    pane: 1,
+                    row: 0,
+                    start_col: 0,
+                    cells: 3,
+                }]),
+                ..RenderAssertion::default()
+            },
+        )
+        .expect_err("mismatched semantic trace should fail");
+
+        assert!(
+            error.to_string().contains("expected_trace_ops expected"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

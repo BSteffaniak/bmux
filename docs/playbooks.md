@@ -584,7 +584,8 @@ When `@render-trace true` is enabled, playbooks attach a normalized render
 summary to each step result. Use `render-mark` to name the current trace
 position, then `assert-render` to verify bounded render work since that mark.
 The summary is derived from normalized pane/cell deltas and does not store raw
-ANSI bytes or pane text.
+ANSI bytes or pane text. Exact trace snapshots use compact semantic ops such as
+`full-frame` and `pane-row-segment:<pane>:<row>:<start_col>:<cells>`.
 
 ```
 @render-trace true
@@ -593,24 +594,25 @@ sleep ms=10
 assert-render since='baseline' max_frames=0 max_rows_emitted=0 max_cells_emitted=0 full_frame=false
 ```
 
-| Arg                             | Type | Required | Default | Description                                                 |
-| ------------------------------- | ---- | -------- | ------- | ----------------------------------------------------------- |
-| `since`                         | str  | yes      | -       | Existing `render-mark` ID                                   |
-| `min_frames`                    | u64  | no       | -       | Minimum observed frames                                     |
-| `max_frames`                    | u64  | no       | -       | Maximum observed frames                                     |
-| `full_frame`                    | bool | no       | -       | Whether any full-frame render is allowed/expected           |
-| `max_full_frame_frames`         | u64  | no       | -       | Maximum full-frame render count                             |
-| `max_full_surface_fallbacks`    | u64  | no       | -       | Maximum full-surface fallback count                         |
-| `max_damage_rects`              | u64  | no       | -       | Maximum damage rect count                                   |
-| `max_damage_area_cells`         | u64  | no       | -       | Maximum damaged cell area                                   |
-| `max_rows_emitted`              | u64  | no       | -       | Maximum changed/emitted rows                                |
-| `max_row_segments_emitted`      | u64  | no       | -       | Maximum emitted row segment count                           |
-| `max_cells_emitted`             | u64  | no       | -       | Maximum changed/emitted cells                               |
-| `max_frame_bytes`               | u64  | no       | -       | Maximum estimated frame bytes                               |
-| `status_rendered`               | bool | no       | -       | Whether status rendering was observed                       |
-| `overlay_rendered`              | bool | no       | -       | Whether overlay rendering was observed                      |
-| `expected_emitted_rows`         | str  | no       | -       | Exact normalized pane rows as `pane:row,pane:row`           |
-| `expected_emitted_row_segments` | str  | no       | -       | Exact normalized row segments as `pane:row:start_col:cells` |
+| Arg                             | Type | Required | Default | Description                                                                                                                     |
+| ------------------------------- | ---- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `since`                         | str  | yes      | -       | Existing `render-mark` ID                                                                                                       |
+| `min_frames`                    | u64  | no       | -       | Minimum observed frames                                                                                                         |
+| `max_frames`                    | u64  | no       | -       | Maximum observed frames                                                                                                         |
+| `full_frame`                    | bool | no       | -       | Whether any full-frame render is allowed/expected                                                                               |
+| `max_full_frame_frames`         | u64  | no       | -       | Maximum full-frame render count                                                                                                 |
+| `max_full_surface_fallbacks`    | u64  | no       | -       | Maximum full-surface fallback count                                                                                             |
+| `max_damage_rects`              | u64  | no       | -       | Maximum damage rect count                                                                                                       |
+| `max_damage_area_cells`         | u64  | no       | -       | Maximum damaged cell area                                                                                                       |
+| `max_rows_emitted`              | u64  | no       | -       | Maximum changed/emitted rows                                                                                                    |
+| `max_row_segments_emitted`      | u64  | no       | -       | Maximum emitted row segment count                                                                                               |
+| `max_cells_emitted`             | u64  | no       | -       | Maximum changed/emitted cells                                                                                                   |
+| `max_frame_bytes`               | u64  | no       | -       | Maximum estimated frame bytes                                                                                                   |
+| `status_rendered`               | bool | no       | -       | Whether status rendering was observed                                                                                           |
+| `overlay_rendered`              | bool | no       | -       | Whether overlay rendering was observed                                                                                          |
+| `expected_emitted_rows`         | str  | no       | -       | Exact normalized pane rows as `pane:row,pane:row`                                                                               |
+| `expected_emitted_row_segments` | str  | no       | -       | Exact normalized row segments as `pane:row:start_col:cells`                                                                     |
+| `expected_trace_ops`            | str  | no       | -       | Exact semantic trace ops, comma-separated (`full-frame`, `pane-row-segment:pane:row:start_col:cells`, `status-line`, `overlay`) |
 
 ### Inspection
 

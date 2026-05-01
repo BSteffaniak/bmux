@@ -251,6 +251,7 @@ pub struct RenderAssertion {
     pub overlay_rendered: Option<bool>,
     pub expected_emitted_rows: Option<Vec<PlaybookRenderRowRef>>,
     pub expected_emitted_row_segments: Option<Vec<PlaybookRenderRowSegmentRef>>,
+    pub expected_trace_ops: Option<Vec<PlaybookRenderTraceOp>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -265,6 +266,20 @@ pub struct PlaybookRenderRowSegmentRef {
     pub row: u16,
     pub start_col: u16,
     pub cells: u16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PlaybookRenderTraceOp {
+    FullFrame,
+    PaneRowSegment {
+        pane: u32,
+        row: u16,
+        start_col: u16,
+        cells: u16,
+    },
+    StatusLine,
+    Overlay,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,6 +299,8 @@ pub struct PlaybookRenderSummary {
     pub emitted_rows: Vec<PlaybookRenderRowRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emitted_row_segments: Vec<PlaybookRenderRowSegmentRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace_ops: Vec<PlaybookRenderTraceOp>,
 }
 
 /// Plugin service invocation kind.
@@ -636,6 +653,14 @@ fn append_render_assertion_dsl(line: &mut String, assertion: &RenderAssertion) {
         )
         .unwrap();
     }
+    if let Some(ops) = &assertion.expected_trace_ops {
+        write!(
+            line,
+            " expected_trace_ops='{}'",
+            render_trace_ops_to_dsl(ops)
+        )
+        .unwrap();
+    }
 }
 
 #[must_use]
@@ -655,6 +680,24 @@ pub fn render_row_segment_refs_to_dsl(segments: &[PlaybookRenderRowSegmentRef]) 
                 "{}:{}:{}:{}",
                 segment.pane, segment.row, segment.start_col, segment.cells
             )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[must_use]
+pub fn render_trace_ops_to_dsl(ops: &[PlaybookRenderTraceOp]) -> String {
+    ops.iter()
+        .map(|op| match *op {
+            PlaybookRenderTraceOp::FullFrame => "full-frame".to_string(),
+            PlaybookRenderTraceOp::PaneRowSegment {
+                pane,
+                row,
+                start_col,
+                cells,
+            } => format!("pane-row-segment:{pane}:{row}:{start_col}:{cells}"),
+            PlaybookRenderTraceOp::StatusLine => "status-line".to_string(),
+            PlaybookRenderTraceOp::Overlay => "overlay".to_string(),
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -1085,6 +1128,15 @@ mod tests {
                     start_col: 3,
                     cells: 5,
                 }]),
+                expected_trace_ops: Some(vec![
+                    PlaybookRenderTraceOp::FullFrame,
+                    PlaybookRenderTraceOp::PaneRowSegment {
+                        pane: 1,
+                        row: 1,
+                        start_col: 3,
+                        cells: 5,
+                    },
+                ]),
                 ..RenderAssertion::default()
             },
         });
@@ -1110,6 +1162,18 @@ mod tests {
                         start_col: 3,
                         cells: 5,
                     }])
+                );
+                assert_eq!(
+                    assertion.expected_trace_ops,
+                    Some(vec![
+                        PlaybookRenderTraceOp::FullFrame,
+                        PlaybookRenderTraceOp::PaneRowSegment {
+                            pane: 1,
+                            row: 1,
+                            start_col: 3,
+                            cells: 5,
+                        },
+                    ])
                 );
             }
             other => panic!("expected AssertRender, got {other:?}"),
