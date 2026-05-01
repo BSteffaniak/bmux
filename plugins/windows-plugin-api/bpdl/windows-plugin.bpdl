@@ -32,6 +32,24 @@ interface windows-state {
         status: pane-status,
     }
 
+    // Snapshot of a floating pane surface exposed through the windows UX facade.
+    record floating-pane-state {
+        id: uuid,
+        pane-id: uuid,
+        session-id: uuid,
+        anchor-pane-id: uuid?,
+        context-id: uuid?,
+        client-id: uuid?,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        z: i32,
+        layer: string,
+        scope: string,
+        visible: bool,
+    }
+
     // Snapshot of a window. Windows are a plugin-layered view over
     // sessions/contexts; the id is the underlying context id.
     record window-entry {
@@ -45,6 +63,7 @@ interface windows-state {
     query focused-pane(session: uuid) -> uuid?;
     query zoomed-pane(session: uuid) -> uuid?;
     query list-panes(session: uuid) -> list<pane-state>;
+    query list-floating-panes(session: uuid?) -> list<floating-pane-state>;
 
     // Window-level queries.
     query list-windows(session: string?) -> list<window-entry>;

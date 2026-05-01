@@ -433,6 +433,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
     }
 }
 
+#[allow(dead_code)]
 pub trait StreamingAttachInputExt {
     fn send_one_way_attach_input(
         &mut self,
@@ -441,6 +442,7 @@ pub trait StreamingAttachInputExt {
     ) -> impl Future<Output = ClientResult<()>> + Send;
 }
 
+#[allow(dead_code)]
 impl StreamingAttachInputExt for bmux_client::StreamingBmuxClient {
     async fn send_one_way_attach_input(
         &mut self,

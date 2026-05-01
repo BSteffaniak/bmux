@@ -20,6 +20,7 @@ owns_namespaces = [
     "split-pane",
     "resize-pane",
     "zoom-pane",
+    "list-floating-panes",
     "create-floating-pane",
     "focus-floating-pane",
     "raise-floating-pane",
@@ -362,6 +363,19 @@ value_name = "SESSION"
 
 [[commands]]
 expose_in_cli = true
+name          = "list-floating-panes"
+path          = ["list-floating-panes"]
+summary       = "List floating panes"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands]]
+expose_in_cli = true
 name          = "create-floating-pane"
 path          = ["create-floating-pane"]
 summary       = "Create a new floating pane"
@@ -618,6 +632,7 @@ o           = "plugin:bmux.windows:focus-pane-in-direction --direction next"
 "shift+k"           = "plugin:bmux.windows:resize-pane --direction up"
 "shift+l"           = "plugin:bmux.windows:resize-pane --direction right"
 # Pane zoom / close / restart
+f = "plugin:bmux.windows:create-floating-pane"
 r = "plugin:bmux.windows:restart-pane"
 x = "plugin:bmux.windows:close-active-pane"
 z = "plugin:bmux.windows:zoom-pane"

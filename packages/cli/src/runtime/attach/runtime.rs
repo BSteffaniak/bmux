@@ -83,7 +83,7 @@ use super::state::{
     AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget, AttachUiMode,
     AttachViewState, PaneRect, PaneRenderBuffer,
 };
-use crate::pane_runtime_client::{BmuxPaneRuntimeClientExt, StreamingAttachInputExt};
+use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
@@ -4634,22 +4634,34 @@ pub fn focused_attach_pane_id(view_state: &AttachViewState) -> Option<Uuid> {
     Some(view_state.cached_layout_state.as_ref()?.focused_pane_id)
 }
 
-fn attach_view_is_floating_only(view_state: &AttachViewState) -> bool {
+fn attach_view_floating_summary(view_state: &AttachViewState) -> (usize, bool, bool) {
     let Some(layout_state) = view_state.cached_layout_state.as_ref() else {
-        return false;
+        return (0, false, false);
     };
-    let mut has_floating = false;
+    let focused_pane_id = focused_attach_pane_id(view_state);
+    let mut has_tiled = false;
+    let mut focused_floating = false;
+    let mut floating_panes = BTreeSet::new();
     for surface in &layout_state.scene.surfaces {
         if !surface.visible || surface.pane_id.is_none() {
             continue;
         }
         match surface.kind {
-            AttachSurfaceKind::Pane => return false,
-            AttachSurfaceKind::FloatingPane => has_floating = true,
+            AttachSurfaceKind::Pane => has_tiled = true,
+            AttachSurfaceKind::FloatingPane => {
+                if let Some(pane_id) = surface.pane_id {
+                    floating_panes.insert(pane_id);
+                    focused_floating |= Some(pane_id) == focused_pane_id;
+                }
+            }
             AttachSurfaceKind::Modal | AttachSurfaceKind::Overlay | AttachSurfaceKind::Tooltip => {}
         }
     }
-    has_floating
+    (
+        floating_panes.len(),
+        !has_tiled && !floating_panes.is_empty(),
+        focused_floating,
+    )
 }
 
 pub fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(usize, usize)> {
@@ -4672,6 +4684,7 @@ pub fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(u
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     clippy::fn_params_excessive_bools,
     clippy::needless_pass_by_ref_mut
 )]
@@ -4769,10 +4782,19 @@ pub fn build_attach_status_line_for_draw(
         status.to_string()
     } else if scrollback_active {
         attach_scrollback_hint(keymap)
-    } else if attach_view_is_floating_only(view_state) {
-        "floating panes remain; close them before closing this tab".to_string()
     } else {
-        attach_mode_hint(&view_state.active_mode_id, ui_mode, keymap)
+        let (floating_count, floating_only, focused_floating) =
+            attach_view_floating_summary(view_state);
+        if floating_only {
+            format!("{floating_count} floating pane(s) remain; close them before closing this tab")
+        } else if focused_floating {
+            format!(
+                "floating pane focused ({floating_count} visible) | {}",
+                attach_mode_hint(&view_state.active_mode_id, ui_mode, keymap)
+            )
+        } else {
+            attach_mode_hint(&view_state.active_mode_id, ui_mode, keymap)
+        }
     };
 
     let mut status_line = build_attach_status_line(
@@ -7045,9 +7067,8 @@ pub async fn handle_attach_terminal_event(
                     // server-pushed events rather than per-keystroke
                     // responses.  Only transport-level send failures are
                     // treated as fatal here.
-                    if let Err(error) = client
-                        .send_one_way_attach_input(view_state.attached_id, bytes)
-                        .await
+                    if let Err(error) =
+                        send_attach_bytes_to_focused_pane(client, view_state, bytes).await
                     {
                         return Err(map_attach_client_error(error));
                     }
@@ -7528,9 +7549,8 @@ async fn handle_attach_action_dispatch(
         }
         AttachEventAction::Send(bytes) => {
             if view_state.can_write
-                && let Err(error) = client
-                    .send_one_way_attach_input(view_state.attached_id, bytes)
-                    .await
+                && let Err(error) =
+                    send_attach_bytes_to_focused_pane(client, view_state, bytes).await
             {
                 return Err(map_attach_client_error(error));
             }
@@ -8147,7 +8167,9 @@ pub async fn maybe_forward_attach_mouse_event(
         return Ok(false);
     };
 
-    let _bytes = client.attach_input(view_state.attached_id, bytes).await?;
+    client
+        .pane_direct_input(view_state.attached_id, target_pane, bytes)
+        .await?;
     Ok(true)
 }
 
@@ -8943,6 +8965,32 @@ pub fn handle_attach_mouse_scrollback(
     }
 }
 
+async fn send_attach_bytes_to_focused_pane(
+    client: &mut StreamingBmuxClient,
+    view_state: &AttachViewState,
+    bytes: Vec<u8>,
+) -> std::result::Result<(), ClientError> {
+    if let Some(pane_id) = focused_attach_pane_id(view_state) {
+        client
+            .pane_direct_input(view_state.attached_id, pane_id, bytes)
+            .await?;
+    }
+    Ok(())
+}
+
+fn attach_scene_pane_is_floating(view_state: &AttachViewState, pane_id: Uuid) -> bool {
+    view_state
+        .cached_layout_state
+        .as_ref()
+        .is_some_and(|layout_state| {
+            layout_state.scene.surfaces.iter().any(|surface| {
+                surface.visible
+                    && surface.pane_id == Some(pane_id)
+                    && surface.kind == AttachSurfaceKind::FloatingPane
+            })
+        })
+}
+
 pub async fn focus_attach_pane(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -8953,15 +9001,27 @@ pub async fn focus_attach_pane(
     }
 
     let selector = attached_session_selector(view_state);
-    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
-        client,
-        "focus-pane-by-selector",
-        &windows_commands::client::FocusPaneBySelectorRequest {
-            session: Some(ipc_to_windows_selector(selector)),
-            target: pane_id_windows_selector(pane_id),
-        },
-    )
-    .await?;
+    if attach_scene_pane_is_floating(view_state, pane_id) {
+        let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+            client,
+            "focus-floating-pane",
+            &windows_commands::client::FocusFloatingPaneRequest {
+                session: Some(ipc_to_windows_selector(selector)),
+                target: pane_id_windows_selector(pane_id),
+            },
+        )
+        .await?;
+    } else {
+        let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+            client,
+            "focus-pane-by-selector",
+            &windows_commands::client::FocusPaneBySelectorRequest {
+                session: Some(ipc_to_windows_selector(selector)),
+                target: pane_id_windows_selector(pane_id),
+            },
+        )
+        .await?;
+    }
 
     view_state.mouse.last_focused_pane_id = Some(pane_id);
     view_state

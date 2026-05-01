@@ -438,6 +438,9 @@ mod tests {
         let session_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let surface_id = Uuid::new_v4();
+        let anchor_pane_id = Uuid::new_v4();
+        let context_id = Uuid::new_v4();
+        let client_id = Uuid::new_v4();
         let snap = PaneRuntimeSnapshotV1 {
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
                 session_id,
@@ -461,9 +464,9 @@ mod tests {
                 floating_surfaces: vec![PaneRuntimeSnapshotV1FloatingSurface {
                     id: surface_id,
                     pane_id,
-                    anchor_pane_id: None,
-                    context_id: None,
-                    client_id: None,
+                    anchor_pane_id: Some(anchor_pane_id),
+                    context_id: Some(context_id),
+                    client_id: Some(client_id),
                     x: 1,
                     y: 2,
                     w: 40,

@@ -134,6 +134,7 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
     fn remove_runtime(&self, session_id: SessionId) -> Option<RemovedRuntimeInfo>;
     fn remove_all_runtimes(&self) -> Vec<RemovedRuntimeInfo>;
     fn session_exists(&self, session_id: SessionId) -> bool;
+    fn active_session_ids(&self) -> Vec<SessionId>;
 
     // ── Pane lifecycle ─────────────────────────────────────────────
 
@@ -544,6 +545,9 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
     }
     fn session_exists(&self, _session_id: SessionId) -> bool {
         false
+    }
+    fn active_session_ids(&self) -> Vec<SessionId> {
+        Vec::new()
     }
     fn split_pane(
         &self,

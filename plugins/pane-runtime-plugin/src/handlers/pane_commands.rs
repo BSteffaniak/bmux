@@ -367,6 +367,15 @@ fn emit_attach_view_changed_scene(session_id: SessionId) {
     super::publish_focus_state_snapshot();
 }
 
+fn emit_attach_view_changed_scene_all() {
+    let Some(handle) = super::session_runtime_handle() else {
+        return;
+    };
+    for session_id in handle.0.active_session_ids() {
+        emit_attach_view_changed_scene(session_id);
+    }
+}
+
 pub fn split_pane(
     req: &SplitPaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
@@ -630,7 +639,7 @@ pub fn create_floating_pane(
             req.client_id.or(ctx.caller_client_id).map(ClientId),
         )
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene_all();
     Ok(floating_ack(session_id, summary))
 }
 
@@ -646,7 +655,7 @@ pub fn move_floating_pane(
         .0
         .move_floating_pane(session_id, req.pane_id, req.x, req.y)
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene_all();
     Ok(floating_ack(session_id, summary))
 }
 
@@ -662,7 +671,7 @@ pub fn resize_floating_pane(
         .0
         .resize_floating_pane(session_id, req.pane_id, req.w.max(1), req.h.max(1))
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene_all();
     Ok(floating_ack(session_id, summary))
 }
 
@@ -682,7 +691,7 @@ fn mutate_floating_target(
     ensure_session_mutation_allowed(ctx, session_id, action)?;
     let summary =
         mutate(&handle, session_id, req.pane_id).map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene_all();
     Ok(floating_ack(session_id, summary))
 }
 
@@ -734,7 +743,7 @@ pub fn set_floating_pane_z(
         .0
         .set_floating_pane_z(session_id, req.pane_id, req.z)
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene_all();
     Ok(floating_ack(session_id, summary))
 }
 
@@ -754,7 +763,7 @@ pub fn set_floating_pane_layer(
             parse_floating_layer(Some(&req.layer))?,
         )
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene_all();
     Ok(floating_ack(session_id, summary))
 }
 
@@ -769,6 +778,7 @@ pub fn close_floating_pane(
         },
         ctx,
     )?;
+    emit_attach_view_changed_scene_all();
     Ok(FloatingPaneAck {
         session_id: ack.session_id,
         pane_id: ack.pane_id,

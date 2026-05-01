@@ -1280,6 +1280,10 @@ impl SessionRuntimeManager {
         runtime.attach_view_revision = runtime.attach_view_revision.saturating_add(1);
         Some(runtime.attach_view_revision)
     }
+
+    fn active_session_ids(&self) -> Vec<SessionId> {
+        self.runtimes.keys().copied().collect()
+    }
 }
 
 /// Lightweight ECMA-48 escape sequence phase tracker.
@@ -1952,21 +1956,68 @@ fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
 }
 
 fn floating_surface_visible_for_attach(
+    owner_session_id: SessionId,
+    attach_session_id: SessionId,
     runtime: &SessionRuntimeHandle,
     surface: &FloatingSurfaceRuntime,
     client_id: ClientId,
     context_id: Option<Uuid>,
 ) -> bool {
-    match surface.scope {
-        FloatingPaneScope::PerPane => surface
-            .anchor_pane_id
-            .is_some_and(|anchor| runtime.panes.contains_key(&anchor)),
-        FloatingPaneScope::PerWindow => {
-            surface.context_id.is_none() || surface.context_id == context_id
-        }
-        FloatingPaneScope::PerSession | FloatingPaneScope::ServerGlobal => true,
-        FloatingPaneScope::ClientGlobal => surface.client_id.is_none_or(|owner| owner == client_id),
+    if !runtime.panes.contains_key(&surface.pane_id) {
+        return false;
     }
+    match surface.scope {
+        FloatingPaneScope::PerPane => {
+            owner_session_id == attach_session_id
+                && surface
+                    .anchor_pane_id
+                    .is_some_and(|anchor| runtime.panes.contains_key(&anchor))
+        }
+        FloatingPaneScope::PerWindow => {
+            owner_session_id == attach_session_id
+                && (surface.context_id.is_none() || surface.context_id == context_id)
+        }
+        FloatingPaneScope::PerSession => owner_session_id == attach_session_id,
+        FloatingPaneScope::ClientGlobal => surface.client_id.is_none_or(|owner| owner == client_id),
+        FloatingPaneScope::ServerGlobal => true,
+    }
+}
+
+fn attach_surface_from_floating(surface: &FloatingSurfaceRuntime) -> AttachSurface {
+    let rect = attach_rect_from_layout_rect(surface.rect);
+    AttachSurface {
+        id: surface.id,
+        kind: AttachSurfaceKind::FloatingPane,
+        layer: surface.layer.to_attach_layer(),
+        z: surface.z,
+        rect,
+        content_rect: pane_content_rect_for_outer(rect),
+        interactive_regions: Vec::new(),
+        opaque: surface.opaque,
+        visible: surface.visible,
+        accepts_input: surface.accepts_input,
+        cursor_owner: surface.cursor_owner,
+        pane_id: Some(surface.pane_id),
+    }
+}
+
+fn focused_pane_for_scene(scene: &AttachScene, fallback: Uuid) -> Uuid {
+    let mut best: Option<(AttachLayer, i32, usize, Uuid)> = None;
+    for (index, surface) in scene.surfaces.iter().enumerate() {
+        let Some(pane_id) = surface.pane_id else {
+            continue;
+        };
+        if !surface.visible || !surface.accepts_input || !surface.cursor_owner {
+            continue;
+        }
+        let candidate = (surface.layer, surface.z, index, pane_id);
+        if best.as_ref().is_none_or(|current| {
+            (candidate.0, candidate.1, candidate.2) > (current.0, current.1, current.2)
+        }) {
+            best = Some(candidate);
+        }
+    }
+    best.map_or(fallback, |(_, _, _, pane_id)| pane_id)
 }
 
 // Building the attach scene requires constructing every surface's
@@ -2010,34 +2061,22 @@ fn build_attach_scene(
                 .floating_surfaces
                 .iter()
                 .filter(|surface| {
-                    runtime.panes.contains_key(&surface.pane_id)
-                        && floating_surface_visible_for_attach(
-                            runtime, surface, client_id, context_id,
-                        )
+                    floating_surface_visible_for_attach(
+                        session_id, session_id, runtime, surface, client_id, context_id,
+                    )
                 })
-                .map(|surface| {
-                    let rect = attach_rect_from_layout_rect(surface.rect);
-                    AttachSurface {
-                        id: surface.id,
-                        kind: AttachSurfaceKind::FloatingPane,
-                        layer: surface.layer.to_attach_layer(),
-                        z: surface.z,
-                        rect,
-                        content_rect: pane_content_rect_for_outer(rect),
-                        interactive_regions: Vec::new(),
-                        opaque: surface.opaque,
-                        visible: surface.visible,
-                        accepts_input: surface.accepts_input,
-                        cursor_owner: surface.cursor_owner,
-                        pane_id: Some(surface.pane_id),
-                    }
-                }),
+                .map(attach_surface_from_floating),
         );
 
-        return AttachScene {
+        let scene = AttachScene {
             session_id: session_id.0,
             focus: AttachFocusTarget::Pane { pane_id: zoomed_id },
             surfaces,
+        };
+        let pane_id = focused_pane_for_scene(&scene, zoomed_id);
+        return AttachScene {
+            focus: AttachFocusTarget::Pane { pane_id },
+            ..scene
         };
     }
     // Zoomed pane was removed; fall through to normal rendering.
@@ -2079,34 +2118,24 @@ fn build_attach_scene(
             .floating_surfaces
             .iter()
             .filter(|surface| {
-                runtime.panes.contains_key(&surface.pane_id)
-                    && floating_surface_visible_for_attach(runtime, surface, client_id, context_id)
+                floating_surface_visible_for_attach(
+                    session_id, session_id, runtime, surface, client_id, context_id,
+                )
             })
-            .map(|surface| {
-                let rect = attach_rect_from_layout_rect(surface.rect);
-                AttachSurface {
-                    id: surface.id,
-                    kind: AttachSurfaceKind::FloatingPane,
-                    layer: surface.layer.to_attach_layer(),
-                    z: surface.z,
-                    rect,
-                    content_rect: pane_content_rect_for_outer(rect),
-                    interactive_regions: Vec::new(),
-                    opaque: surface.opaque,
-                    visible: surface.visible,
-                    accepts_input: surface.accepts_input,
-                    cursor_owner: surface.cursor_owner,
-                    pane_id: Some(surface.pane_id),
-                }
-            }),
+            .map(attach_surface_from_floating),
     );
 
-    AttachScene {
+    let scene = AttachScene {
         session_id: session_id.0,
         focus: AttachFocusTarget::Pane {
             pane_id: runtime.focused_pane_id,
         },
         surfaces,
+    };
+    let pane_id = focused_pane_for_scene(&scene, runtime.focused_pane_id);
+    AttachScene {
+        focus: AttachFocusTarget::Pane { pane_id },
+        ..scene
     }
 }
 
@@ -3001,7 +3030,14 @@ impl SessionRuntimeManager {
             let pane_id =
                 resolve_pane_id_from_selector(session, &target.unwrap_or(PaneSelector::Active))
                     .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
-            (pane_id, session.panes.len() == 1)
+            let remove_count = 1 + session
+                .floating_surfaces
+                .iter()
+                .filter(|surface| {
+                    surface.anchor_pane_id == Some(pane_id) && surface.pane_id != pane_id
+                })
+                .count();
+            (pane_id, session.panes.len() <= remove_count)
         };
 
         if remove_runtime {
@@ -3302,14 +3338,24 @@ impl SessionRuntimeManager {
 
     fn update_floating_pane(
         &mut self,
-        session_id: SessionId,
+        _session_id: SessionId,
         pane_id: Uuid,
         update: impl FnOnce(&mut FloatingSurfaceRuntime, i32, i32),
     ) -> Result<FloatingPaneRuntimeSummary> {
-        let session = self
+        let owner_session_id = self
             .runtimes
-            .get_mut(&session_id)
-            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+            .iter()
+            .find_map(|(owner_session_id, runtime)| {
+                runtime
+                    .floating_surfaces
+                    .iter()
+                    .any(|surface| surface.pane_id == pane_id)
+                    .then_some(*owner_session_id)
+            })
+            .ok_or_else(|| anyhow::anyhow!("floating pane not found"))?;
+        let session = self.runtimes.get_mut(&owner_session_id).ok_or_else(|| {
+            anyhow::anyhow!("runtime not found for session {}", owner_session_id.0)
+        })?;
         let max_z = session
             .floating_surfaces
             .iter()
@@ -3329,7 +3375,7 @@ impl SessionRuntimeManager {
             .ok_or_else(|| anyhow::anyhow!("floating pane not found"))?;
         update(surface, min_z, max_z);
         let summary = floating_summary(*surface);
-        self.apply_stored_attach_viewport(session_id);
+        self.apply_stored_attach_viewport(owner_session_id);
         Ok(summary)
     }
 
@@ -3361,23 +3407,27 @@ impl SessionRuntimeManager {
 
     fn focus_floating_pane(
         &mut self,
-        session_id: SessionId,
+        _session_id: SessionId,
         pane_id: Uuid,
     ) -> Result<FloatingPaneRuntimeSummary> {
-        let session = self
-            .runtimes
-            .get_mut(&session_id)
-            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         let mut found = None;
-        for surface in &mut session.floating_surfaces {
-            surface.cursor_owner = surface.pane_id == pane_id;
-            if surface.cursor_owner {
-                found = Some(*surface);
+        let mut owner_session_id = None;
+        for (candidate_session_id, session) in &mut self.runtimes {
+            for surface in &mut session.floating_surfaces {
+                surface.cursor_owner = surface.pane_id == pane_id;
+                if surface.cursor_owner {
+                    found = Some(*surface);
+                    owner_session_id = Some(*candidate_session_id);
+                }
+            }
+            if session.panes.contains_key(&pane_id) {
+                session.focused_pane_id = pane_id;
             }
         }
         let surface = found.ok_or_else(|| anyhow::anyhow!("floating pane not found"))?;
-        session.focused_pane_id = pane_id;
-        self.apply_stored_attach_viewport(session_id);
+        if let Some(owner_session_id) = owner_session_id {
+            self.apply_stored_attach_viewport(owner_session_id);
+        }
         Ok(floating_summary(surface))
     }
 
@@ -3428,7 +3478,10 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         pane_id: Uuid,
     ) -> Result<(Uuid, Option<RemovedRuntime>)> {
-        self.close_pane(session_id, Some(PaneSelector::ById(pane_id)))
+        let owner_session_id = self
+            .pane_session_for_attach(session_id, pane_id)
+            .unwrap_or(session_id);
+        self.close_pane(owner_session_id, Some(PaneSelector::ById(pane_id)))
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -3455,6 +3508,86 @@ impl SessionRuntimeManager {
         Ok(panes)
     }
 
+    fn build_attach_scene_for_client(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<AttachScene, SessionRuntimeError> {
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let context_id = current_context_id_for_session(session_id);
+        let mut scene = build_attach_scene(
+            session_id,
+            session,
+            session.attach_viewport,
+            client_id,
+            context_id,
+        );
+        for (owner_session_id, owner_runtime) in &self.runtimes {
+            if *owner_session_id == session_id {
+                continue;
+            }
+            scene.surfaces.extend(
+                owner_runtime
+                    .floating_surfaces
+                    .iter()
+                    .filter(|surface| {
+                        floating_surface_visible_for_attach(
+                            *owner_session_id,
+                            session_id,
+                            owner_runtime,
+                            surface,
+                            client_id,
+                            context_id,
+                        )
+                    })
+                    .map(attach_surface_from_floating),
+            );
+        }
+        let pane_id = focused_pane_for_scene(&scene, session.focused_pane_id);
+        Ok(AttachScene {
+            focus: AttachFocusTarget::Pane { pane_id },
+            ..scene
+        })
+    }
+
+    fn pane_session_for_attach(
+        &self,
+        attach_session_id: SessionId,
+        pane_id: Uuid,
+    ) -> Option<SessionId> {
+        if self
+            .runtimes
+            .get(&attach_session_id)
+            .is_some_and(|runtime| runtime.panes.contains_key(&pane_id))
+        {
+            return Some(attach_session_id);
+        }
+        self.runtimes.iter().find_map(|(session_id, runtime)| {
+            runtime.panes.contains_key(&pane_id).then_some(*session_id)
+        })
+    }
+
+    fn attach_scene_pane_refs(
+        &self,
+        attach_session_id: SessionId,
+        scene: &AttachScene,
+    ) -> Vec<(SessionId, Uuid)> {
+        let mut seen = BTreeSet::new();
+        scene
+            .surfaces
+            .iter()
+            .filter(|surface| surface.visible && surface.pane_id.is_some())
+            .filter_map(|surface| surface.pane_id)
+            .filter_map(|pane_id| {
+                let owner_session_id = self.pane_session_for_attach(attach_session_id, pane_id)?;
+                seen.insert(pane_id).then_some((owner_session_id, pane_id))
+            })
+            .collect()
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn attach_layout_state(
         &self,
@@ -3468,30 +3601,29 @@ impl SessionRuntimeManager {
         if !session.attached_clients.contains(&client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
-        let scene = build_attach_scene(
-            session_id,
-            session,
-            session.attach_viewport,
-            client_id,
-            current_context_id_for_session(session_id),
-        );
-        let pane_ids = ordered_pane_ids(session);
-        let panes = pane_ids
+        let scene = self.build_attach_scene_for_client(session_id, client_id)?;
+        let pane_refs = self.attach_scene_pane_refs(session_id, &scene);
+        let focused_pane_id = focused_pane_for_scene(&scene, session.focused_pane_id);
+        let panes = pane_refs
             .iter()
             .enumerate()
-            .filter_map(|(index, pane_id)| {
-                session.panes.get(pane_id).map(|pane| PaneSummary {
-                    id: *pane_id,
-                    index: (index + 1) as u32,
-                    name: pane.meta.name.clone(),
-                    focused: *pane_id == session.focused_pane_id,
-                    state: pane_state_for_handle(pane),
-                    state_reason: pane_state_reason_for_handle(pane),
-                })
+            .filter_map(|(index, (owner_session_id, pane_id))| {
+                self.runtimes
+                    .get(owner_session_id)?
+                    .panes
+                    .get(pane_id)
+                    .map(|pane| PaneSummary {
+                        id: *pane_id,
+                        index: (index + 1) as u32,
+                        name: pane.meta.name.clone(),
+                        focused: *pane_id == focused_pane_id,
+                        state: pane_state_for_handle(pane),
+                        state_reason: pane_state_reason_for_handle(pane),
+                    })
             })
             .collect::<Vec<_>>();
         Ok(AttachLayoutState {
-            focused_pane_id: session.focused_pane_id,
+            focused_pane_id,
             panes,
             layout_root: fallback_ipc_layout(session),
             scene,
@@ -3506,44 +3638,54 @@ impl SessionRuntimeManager {
         client_id: ClientId,
         max_bytes_per_pane: usize,
     ) -> Result<AttachSnapshotState, SessionRuntimeError> {
-        let session = self
+        if !self
             .runtimes
-            .get_mut(&session_id)
-            .ok_or(SessionRuntimeError::NotFound)?;
-        if !session.attached_clients.contains(&client_id) {
+            .get(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?
+            .attached_clients
+            .contains(&client_id)
+        {
             return Err(SessionRuntimeError::NotAttached);
         }
-        let scene = build_attach_scene(
-            session_id,
-            session,
-            session.attach_viewport,
-            client_id,
-            current_context_id_for_session(session_id),
+        let scene = self.build_attach_scene_for_client(session_id, client_id)?;
+        let pane_refs = self.attach_scene_pane_refs(session_id, &scene);
+        let focused_pane_id = focused_pane_for_scene(
+            &scene,
+            self.runtimes
+                .get(&session_id)
+                .map_or(Uuid::nil(), |runtime| runtime.focused_pane_id),
         );
-        let pane_ids = ordered_pane_ids(session);
-        let panes = pane_ids
+        let panes = pane_refs
             .iter()
             .enumerate()
-            .filter_map(|(index, pane_id)| {
-                session.panes.get(pane_id).map(|pane| PaneSummary {
-                    id: *pane_id,
-                    index: (index + 1) as u32,
-                    name: pane.meta.name.clone(),
-                    focused: *pane_id == session.focused_pane_id,
-                    state: pane_state_for_handle(pane),
-                    state_reason: pane_state_reason_for_handle(pane),
-                })
+            .filter_map(|(index, (owner_session_id, pane_id))| {
+                self.runtimes
+                    .get(owner_session_id)?
+                    .panes
+                    .get(pane_id)
+                    .map(|pane| PaneSummary {
+                        id: *pane_id,
+                        index: (index + 1) as u32,
+                        name: pane.meta.name.clone(),
+                        focused: *pane_id == focused_pane_id,
+                        state: pane_state_for_handle(pane),
+                        state_reason: pane_state_reason_for_handle(pane),
+                    })
             })
             .collect::<Vec<_>>();
 
         let mut chunks = Vec::new();
         let mut pane_mouse_protocols = Vec::new();
         let mut pane_input_modes = Vec::new();
-        let num_panes = pane_ids.len().max(1);
+        let num_panes = pane_refs.len().max(1);
         let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes_per_pane);
         let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
-        for pane_id in pane_ids {
-            let Some(pane) = session.panes.get_mut(&pane_id) else {
+        for (owner_session_id, pane_id) in pane_refs {
+            let Some(pane) = self
+                .runtimes
+                .get_mut(&owner_session_id)
+                .and_then(|runtime| runtime.panes.get_mut(&pane_id))
+            else {
                 continue;
             };
             let protocol = pane
@@ -3580,8 +3722,12 @@ impl SessionRuntimeManager {
             });
         }
 
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
         Ok(AttachSnapshotState {
-            focused_pane_id: session.focused_pane_id,
+            focused_pane_id,
             panes,
             layout_root: fallback_ipc_layout(session),
             scene,
@@ -3600,11 +3746,13 @@ impl SessionRuntimeManager {
         max_bytes: usize,
     ) -> Result<Vec<AttachPaneChunk>, SessionRuntimeError> {
         let chunks = {
-            let session = self
+            if !self
                 .runtimes
-                .get_mut(&session_id)
-                .ok_or(SessionRuntimeError::NotFound)?;
-            if !session.attached_clients.contains(&client_id) {
+                .get(&session_id)
+                .ok_or(SessionRuntimeError::NotFound)?
+                .attached_clients
+                .contains(&client_id)
+            {
                 return Err(SessionRuntimeError::NotAttached);
             }
 
@@ -3613,7 +3761,15 @@ impl SessionRuntimeManager {
             let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes);
             let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
             for pane_id in pane_ids {
-                let Some(pane) = session.panes.get_mut(pane_id) else {
+                let Some(owner_session_id) = self.pane_session_for_attach(session_id, *pane_id)
+                else {
+                    continue;
+                };
+                let Some(pane) = self
+                    .runtimes
+                    .get_mut(&owner_session_id)
+                    .and_then(|runtime| runtime.panes.get_mut(pane_id))
+                else {
                     continue;
                 };
                 let allowed = per_pane_budget.min(budget_remaining);
@@ -3647,11 +3803,13 @@ impl SessionRuntimeManager {
         pane_ids: &[Uuid],
         max_bytes_per_pane: usize,
     ) -> Result<AttachPaneSnapshotState, SessionRuntimeError> {
-        let session = self
+        if !self
             .runtimes
-            .get_mut(&session_id)
-            .ok_or(SessionRuntimeError::NotFound)?;
-        if !session.attached_clients.contains(&client_id) {
+            .get(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?
+            .attached_clients
+            .contains(&client_id)
+        {
             return Err(SessionRuntimeError::NotAttached);
         }
 
@@ -3668,7 +3826,14 @@ impl SessionRuntimeManager {
                 continue;
             }
 
-            let Some(pane) = session.panes.get_mut(pane_id) else {
+            let Some(owner_session_id) = self.pane_session_for_attach(session_id, *pane_id) else {
+                continue;
+            };
+            let Some(pane) = self
+                .runtimes
+                .get_mut(&owner_session_id)
+                .and_then(|runtime| runtime.panes.get_mut(pane_id))
+            else {
                 continue;
             };
 
@@ -3869,19 +4034,29 @@ impl SessionRuntimeManager {
         client_id: ClientId,
         data: Vec<u8>,
     ) -> Result<(usize, Uuid), SessionRuntimeError> {
-        let runtime = self
-            .runtimes
-            .get_mut(&session_id)
+        let fallback_focused_pane_id = {
+            let runtime = self
+                .runtimes
+                .get(&session_id)
+                .ok_or(SessionRuntimeError::NotFound)?;
+            if !runtime.attached_clients.contains(&client_id) {
+                return Err(SessionRuntimeError::NotAttached);
+            }
+            runtime.focused_pane_id
+        };
+
+        let scene = self.build_attach_scene_for_client(session_id, client_id)?;
+        let focused_pane_id = match scene.focus {
+            AttachFocusTarget::Pane { pane_id } => pane_id,
+            AttachFocusTarget::None | AttachFocusTarget::Surface { .. } => fallback_focused_pane_id,
+        };
+        let owner_session_id = self
+            .pane_session_for_attach(session_id, focused_pane_id)
             .ok_or(SessionRuntimeError::NotFound)?;
-
-        if !runtime.attached_clients.contains(&client_id) {
-            return Err(SessionRuntimeError::NotAttached);
-        }
-
-        let focused_pane_id = runtime.focused_pane_id;
-        let pane = runtime
-            .panes
-            .get_mut(&focused_pane_id)
+        let pane = self
+            .runtimes
+            .get_mut(&owner_session_id)
+            .and_then(|owner_runtime| owner_runtime.panes.get_mut(&focused_pane_id))
             .ok_or(SessionRuntimeError::NotFound)?;
 
         if pane.exited.load(Ordering::SeqCst) {
@@ -3900,14 +4075,13 @@ impl SessionRuntimeManager {
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError> {
-        let runtime = self
-            .runtimes
-            .get_mut(&session_id)
+        let owner_session_id = self
+            .pane_session_for_attach(session_id, pane_id)
             .ok_or(SessionRuntimeError::NotFound)?;
-
-        let pane = runtime
-            .panes
-            .get_mut(&pane_id)
+        let pane = self
+            .runtimes
+            .get_mut(&owner_session_id)
+            .and_then(|runtime| runtime.panes.get_mut(&pane_id))
             .ok_or(SessionRuntimeError::NotFound)?;
 
         if pane.exited.load(Ordering::SeqCst) {
@@ -4099,6 +4273,11 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
     fn session_exists(&self, session_id: SessionId) -> bool {
         self.with_lock_read(|m| m.runtimes.contains_key(&session_id))
             .unwrap_or(false)
+    }
+
+    fn active_session_ids(&self) -> Vec<SessionId> {
+        self.with_lock_read(SessionRuntimeManager::active_session_ids)
+            .unwrap_or_default()
     }
 
     fn split_pane(
@@ -5248,6 +5427,192 @@ mod tests {
         assert_eq!(
             next_focus_after_close(&root, focused, closed, None),
             Some(focused)
+        );
+    }
+
+    fn dummy_pane(id: Uuid) -> PaneRuntimeHandle {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = stop_rx.await;
+        });
+        PaneRuntimeHandle {
+            meta: PaneRuntimeMeta {
+                id,
+                name: None,
+                shell: "sh".to_string(),
+                launch: None,
+                resurrection: PaneResurrectionSnapshot::default(),
+            },
+            process_id: Arc::new(std::sync::Mutex::new(None)),
+            process_group_id: Arc::new(std::sync::Mutex::new(None)),
+            resurrection_state: Arc::new(std::sync::Mutex::new(PaneResurrectionRuntime::default())),
+            exit_reason: Arc::new(std::sync::Mutex::new(None)),
+            stop_tx: Some(stop_tx),
+            task,
+            input_tx,
+            output_buffer: Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
+                MAX_WINDOW_OUTPUT_BUFFER_BYTES,
+            ))),
+            exited: Arc::new(AtomicBool::new(false)),
+            last_requested_size: Arc::new(std::sync::Mutex::new((1, 1))),
+            output_dirty: Arc::new(AtomicBool::new(false)),
+            sync_update_in_progress: Arc::new(AtomicBool::new(false)),
+            mouse_protocol_state: Arc::new(std::sync::Mutex::new(
+                AttachMouseProtocolState::default(),
+            )),
+            input_mode_state: Arc::new(std::sync::Mutex::new(AttachInputModeState::default())),
+            #[cfg(feature = "image-registry")]
+            image_registry: Arc::new(std::sync::Mutex::new(bmux_image::ImageRegistry::default())),
+            #[cfg(feature = "image-registry")]
+            cell_pixel_size: Arc::new(std::sync::Mutex::new((1, 1))),
+            #[cfg(feature = "image-registry")]
+            image_dirty: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn runtime_with_panes(pane_ids: &[Uuid]) -> SessionRuntimeHandle {
+        let panes = pane_ids
+            .iter()
+            .copied()
+            .map(|pane_id| (pane_id, dummy_pane(pane_id)))
+            .collect::<BTreeMap<_, _>>();
+        SessionRuntimeHandle {
+            panes,
+            layout_root: pane_ids
+                .first()
+                .copied()
+                .map(|pane_id| PaneLayoutNode::Leaf { pane_id }),
+            focused_pane_id: pane_ids[0],
+            zoomed_pane_id: None,
+            floating_surfaces: Vec::new(),
+            attached_clients: BTreeSet::new(),
+            attach_viewport: Some(AttachViewport {
+                cols: 120,
+                rows: 40,
+                status_top_inset: 0,
+                status_bottom_inset: 0,
+            }),
+            attach_view_revision: 0,
+        }
+    }
+
+    fn floating_surface(pane_id: Uuid, scope: FloatingPaneScope) -> FloatingSurfaceRuntime {
+        FloatingSurfaceRuntime {
+            id: Uuid::new_v4(),
+            pane_id,
+            anchor_pane_id: None,
+            context_id: None,
+            client_id: None,
+            rect: LayoutRect {
+                x: 1,
+                y: 1,
+                w: 10,
+                h: 5,
+            },
+            scope,
+            layer: FloatingPaneLayer::FloatingPane,
+            z: 0,
+            visible: true,
+            opaque: true,
+            accepts_input: true,
+            cursor_owner: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_scene_projects_client_and_server_global_floating_panes() {
+        let attach_session_id = SessionId(Uuid::new_v4());
+        let other_session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let attach_pane_id = Uuid::new_v4();
+        let client_global_pane_id = Uuid::new_v4();
+        let server_global_pane_id = Uuid::new_v4();
+        let other_client_pane_id = Uuid::new_v4();
+
+        let mut attach_runtime = runtime_with_panes(&[attach_pane_id]);
+        attach_runtime.attached_clients.insert(client_id);
+        let mut other_runtime = runtime_with_panes(&[
+            client_global_pane_id,
+            server_global_pane_id,
+            other_client_pane_id,
+        ]);
+        let mut client_global =
+            floating_surface(client_global_pane_id, FloatingPaneScope::ClientGlobal);
+        client_global.client_id = Some(client_id);
+        let server_global =
+            floating_surface(server_global_pane_id, FloatingPaneScope::ServerGlobal);
+        let mut other_client =
+            floating_surface(other_client_pane_id, FloatingPaneScope::ClientGlobal);
+        other_client.client_id = Some(ClientId(Uuid::new_v4()));
+        other_runtime.floating_surfaces = vec![client_global, server_global, other_client];
+
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        let manager = SessionRuntimeManager {
+            runtimes: BTreeMap::from([
+                (attach_session_id, attach_runtime),
+                (other_session_id, other_runtime),
+            ]),
+            shell: "sh".to_string(),
+            pane_term: "xterm-256color".to_string(),
+            protocol_profile: ProtocolProfile::Bmux,
+            shell_integration_root: None,
+            pane_exit_tx,
+        };
+
+        let scene = manager
+            .build_attach_scene_for_client(attach_session_id, client_id)
+            .expect("scene should build");
+        let visible_panes = scene
+            .surfaces
+            .iter()
+            .filter(|surface| surface.visible)
+            .filter_map(|surface| surface.pane_id)
+            .collect::<BTreeSet<_>>();
+        assert!(visible_panes.contains(&attach_pane_id));
+        assert!(visible_panes.contains(&client_global_pane_id));
+        assert!(visible_panes.contains(&server_global_pane_id));
+        assert!(!visible_panes.contains(&other_client_pane_id));
+    }
+
+    #[tokio::test]
+    async fn per_window_and_per_pane_scopes_stay_in_owner_session() {
+        let attach_session_id = SessionId(Uuid::new_v4());
+        let other_session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let attach_pane_id = Uuid::new_v4();
+        let other_pane_id = Uuid::new_v4();
+
+        let mut attach_runtime = runtime_with_panes(&[attach_pane_id]);
+        attach_runtime.attached_clients.insert(client_id);
+        let mut other_runtime = runtime_with_panes(&[other_pane_id]);
+        let mut per_window = floating_surface(other_pane_id, FloatingPaneScope::PerWindow);
+        per_window.context_id = Some(Uuid::new_v4());
+        let mut per_pane = floating_surface(other_pane_id, FloatingPaneScope::PerPane);
+        per_pane.anchor_pane_id = Some(other_pane_id);
+        other_runtime.floating_surfaces = vec![per_window, per_pane];
+
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        let manager = SessionRuntimeManager {
+            runtimes: BTreeMap::from([
+                (attach_session_id, attach_runtime),
+                (other_session_id, other_runtime),
+            ]),
+            shell: "sh".to_string(),
+            pane_term: "xterm-256color".to_string(),
+            protocol_profile: ProtocolProfile::Bmux,
+            shell_integration_root: None,
+            pane_exit_tx,
+        };
+
+        let scene = manager
+            .build_attach_scene_for_client(attach_session_id, client_id)
+            .expect("scene should build");
+        assert!(
+            scene
+                .surfaces
+                .iter()
+                .all(|surface| surface.pane_id != Some(other_pane_id))
         );
     }
 

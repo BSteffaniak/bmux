@@ -22,7 +22,9 @@ use bmux_windows_plugin_api::windows_commands::{
     self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, PaneResizeDirection,
     PaneZoomAck, Selector, WindowAck, WindowError, WindowMovePlacement, WindowsCommandsService,
 };
-use bmux_windows_plugin_api::windows_state::{self, PaneState, WindowEntry, WindowsStateService};
+use bmux_windows_plugin_api::windows_state::{
+    self, FloatingPaneState, PaneState, WindowEntry, WindowsStateService,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
@@ -206,6 +208,32 @@ fn list_panes(
     ))
     .map_err(|err| typed_service_error("pane-runtime-state/list-panes", err))?;
     result.map_err(|err| format!("list-panes failed: {err:?}"))
+}
+
+fn list_floating_panes(
+    caller: &(impl ServiceCaller + Sync),
+    session_id: Option<Uuid>,
+) -> Result<Vec<(Uuid, api_pane_runtime_state::FloatingPaneSummary)>, String> {
+    let session_ids = if let Some(session_id) = session_id {
+        vec![session_id]
+    } else {
+        list_contexts(caller)?
+            .into_iter()
+            .map(|context| context.id)
+            .collect()
+    };
+    let mut panes = Vec::new();
+    for session_id in session_ids {
+        let mut client = dispatch_client(caller);
+        let result = bmux_plugin::block_on_typed_dispatch(
+            api_pane_runtime_state::client::list_floating_panes(&mut client, session_id),
+        )
+        .map_err(|err| typed_service_error("pane-runtime-state/list-floating-panes", err))?;
+        if let Ok(list) = result {
+            panes.extend(list.panes.into_iter().map(|pane| (session_id, pane)));
+        }
+    }
+    Ok(panes)
 }
 
 fn resolve_target_pane_id(
@@ -1585,6 +1613,32 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             )?;
             if emit_to_stdout {
                 println!("created floating pane: {}", ack.pane_id);
+            }
+            Ok(())
+        }
+        "list-floating-panes" => {
+            let session_id = option_value(&context.arguments, "session")
+                .map(|value| {
+                    Uuid::parse_str(&value).map_err(|_| format!("invalid session id '{value}'"))
+                })
+                .transpose()?;
+            let panes = list_floating_panes(context, session_id)?;
+            if emit_to_stdout {
+                for (session_id, pane) in panes {
+                    println!(
+                        "{} session={} scope={} layer={} z={} rect={}x{}+{}+{} visible={}",
+                        pane.pane_id,
+                        session_id,
+                        pane.scope,
+                        pane.layer,
+                        pane.z,
+                        pane.w,
+                        pane.h,
+                        pane.x,
+                        pane.y,
+                        pane.visible
+                    );
+                }
             }
             Ok(())
         }
@@ -3229,6 +3283,37 @@ impl WindowsStateService for WindowsStateHandle {
                     zoomed: false,
                     name: pane.name,
                     status: windows_state::PaneStatus::default(),
+                })
+                .collect()
+        })
+    }
+
+    fn list_floating_panes<'a>(
+        &'a self,
+        session: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Vec<FloatingPaneState>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            let Ok(panes) = list_floating_panes(&*caller, session) else {
+                return Vec::new();
+            };
+            panes
+                .into_iter()
+                .map(|(session_id, pane)| FloatingPaneState {
+                    id: pane.id,
+                    pane_id: pane.pane_id,
+                    session_id,
+                    anchor_pane_id: pane.anchor_pane_id,
+                    context_id: pane.context_id,
+                    client_id: pane.client_id,
+                    x: pane.x,
+                    y: pane.y,
+                    w: pane.w,
+                    h: pane.h,
+                    z: pane.z,
+                    layer: pane.layer,
+                    scope: pane.scope,
+                    visible: pane.visible,
                 })
                 .collect()
         })
