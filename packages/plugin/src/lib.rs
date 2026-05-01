@@ -47,8 +47,10 @@ pub use event_bus::{
 };
 pub use host_runtime::{HostRuntimeApi, ServiceCaller};
 pub use loader::{
-    LoadedPlugin, NativePluginLoader, load_registered_plugin, load_static_plugin,
-    load_trusted_static_plugin,
+    LoadedPlugin, NativePluginLoader, NativeServiceBufferConfig, load_registered_plugin,
+    load_registered_plugin_with_native_service_buffer_config, load_static_plugin,
+    load_static_plugin_with_native_service_buffer_config, load_trusted_static_plugin,
+    load_trusted_static_plugin_with_native_service_buffer_config,
 };
 pub use manifest::{
     PluginManifest, PluginManifestCompatibility, PluginManifestKeybindings, PluginRuntime,

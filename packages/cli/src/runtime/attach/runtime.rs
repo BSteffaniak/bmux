@@ -103,7 +103,6 @@ const ATTACH_OVERRENDER_NON_FULL_FRAME_CELL_RATIO_PERCENT: u64 = 50;
 const ATTACH_OVERRENDER_EXTENSION_FULL_SURFACE_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB: u64 = 8;
-const ATTACH_MOUSE_RESIZE_DRAG_MIN_APPLY_INTERVAL: Duration = Duration::from_millis(32);
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
@@ -4362,6 +4361,7 @@ pub fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         provider,
         &plugin_host_metadata(),
         &available_capability_providers(&config, &registry)?,
+        &config,
     )
     .with_context(|| format!("failed loading clipboard service provider '{provider_plugin_id}'"))?;
 
@@ -7480,11 +7480,15 @@ async fn handle_attach_mouse_resize_drag(
 
     match mouse_event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            let Some(drag) =
+            let Some(mut drag) =
                 attach_scene_resize_separator_at(view_state, mouse_event.column, mouse_event.row)
             else {
                 return Ok(false);
             };
+            let throttle = Duration::from_millis(view_state.mouse.config.resize_drag_throttle_ms);
+            drag.last_applied_at = Instant::now()
+                .checked_sub(throttle)
+                .unwrap_or_else(Instant::now);
             view_state.mouse.resize_drag = Some(drag);
             Ok(true)
         }
@@ -7492,31 +7496,29 @@ async fn handle_attach_mouse_resize_drag(
             let Some(mut drag) = view_state.mouse.resize_drag else {
                 return Ok(false);
             };
-            let horizontal = resize_drag_axis_delta(
-                drag.horizontal,
-                i32::from(mouse_event.column) - i32::from(drag.last_column),
-            );
-            let vertical = resize_drag_axis_delta(
-                drag.vertical,
-                i32::from(mouse_event.row) - i32::from(drag.last_row),
-            );
-            if horizontal.is_none() && vertical.is_none() {
+            drag.latest_column = mouse_event.column;
+            drag.latest_row = mouse_event.row;
+            if !attach_mouse_resize_drag_has_pending_delta(&drag) {
+                view_state.mouse.resize_drag = Some(drag);
                 return Ok(true);
             }
             let now = Instant::now();
-            if now.duration_since(drag.last_applied_at)
-                < ATTACH_MOUSE_RESIZE_DRAG_MIN_APPLY_INTERVAL
-            {
+            let throttle = Duration::from_millis(view_state.mouse.config.resize_drag_throttle_ms);
+            if !throttle.is_zero() && now.duration_since(drag.last_applied_at) < throttle {
+                view_state.mouse.resize_drag = Some(drag);
                 return Ok(true);
             }
-            apply_attach_mouse_resize_delta(client, view_state, &mut drag, mouse_event).await;
-            drag.last_applied_at = now;
+            if apply_attach_mouse_resize_delta(client, view_state, &mut drag).await {
+                drag.last_applied_at = now;
+            }
             view_state.mouse.resize_drag = Some(drag);
             Ok(true)
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if let Some(mut drag) = view_state.mouse.resize_drag.take() {
-                apply_attach_mouse_resize_delta(client, view_state, &mut drag, mouse_event).await;
+                drag.latest_column = mouse_event.column;
+                drag.latest_row = mouse_event.row;
+                apply_attach_mouse_resize_delta(client, view_state, &mut drag).await;
                 return Ok(true);
             }
             Ok(false)
@@ -7525,28 +7527,49 @@ async fn handle_attach_mouse_resize_drag(
     }
 }
 
+fn attach_mouse_resize_drag_has_pending_delta(drag: &AttachMouseResizeDrag) -> bool {
+    resize_drag_axis_delta(
+        drag.horizontal,
+        i32::from(drag.latest_column) - i32::from(drag.last_column),
+    )
+    .is_some()
+        || resize_drag_axis_delta(
+            drag.vertical,
+            i32::from(drag.latest_row) - i32::from(drag.last_row),
+        )
+        .is_some()
+}
+
 async fn apply_attach_mouse_resize_delta(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     drag: &mut AttachMouseResizeDrag,
-    mouse_event: MouseEvent,
-) {
+) -> bool {
     let horizontal = resize_drag_axis_delta(
         drag.horizontal,
-        i32::from(mouse_event.column) - i32::from(drag.last_column),
+        i32::from(drag.latest_column) - i32::from(drag.last_column),
     );
     let vertical = resize_drag_axis_delta(
         drag.vertical,
-        i32::from(mouse_event.row) - i32::from(drag.last_row),
+        i32::from(drag.latest_row) - i32::from(drag.last_row),
     );
-    if let Some((target, direction, cells)) = horizontal {
-        apply_attach_pane_resize_or_log(client, view_state, target, direction, cells).await;
-        drag.last_column = mouse_event.column;
-    }
-    if let Some((target, direction, cells)) = vertical {
-        apply_attach_pane_resize_or_log(client, view_state, target, direction, cells).await;
-        drag.last_row = mouse_event.row;
-    }
+    let horizontal_applied = if let Some((target, direction, cells)) = horizontal
+        && apply_attach_pane_resize_or_log(client, view_state, target, direction, cells).await
+    {
+        drag.last_column = drag.latest_column;
+        true
+    } else {
+        false
+    };
+    let vertical_applied = if let Some((target, direction, cells)) = vertical
+        && apply_attach_pane_resize_or_log(client, view_state, target, direction, cells).await
+    {
+        drag.last_row = drag.latest_row;
+        true
+    } else {
+        false
+    };
+    horizontal_applied || vertical_applied
 }
 
 async fn apply_attach_pane_resize_or_log(
@@ -7555,7 +7578,7 @@ async fn apply_attach_pane_resize_or_log(
     pane_id: Uuid,
     direction: bmux_windows_plugin_api::windows_commands::PaneResizeDirection,
     cells: u16,
-) {
+) -> bool {
     if let Err(error) = resize_attach_pane(client, view_state, pane_id, direction, cells).await {
         tracing::warn!(
             %error,
@@ -7564,7 +7587,9 @@ async fn apply_attach_pane_resize_or_log(
             cells,
             "attach.mouse_resize.apply_failed"
         );
+        return false;
     }
+    true
 }
 
 fn resize_drag_axis_delta(
@@ -8420,6 +8445,8 @@ pub fn attach_scene_resize_separator_at(
         vertical,
         last_column: column,
         last_row: row,
+        latest_column: column,
+        latest_row: row,
         last_applied_at: Instant::now(),
     })
 }
@@ -10734,6 +10761,34 @@ mod tests {
         assert_eq!(cells, 2);
         assert!(resize_drag_axis_delta(Some(drag), 0).is_none());
         assert!(resize_drag_axis_delta(None, 2).is_none());
+    }
+
+    #[test]
+    fn resize_drag_pending_delta_tracks_latest_unapplied_position() {
+        let left_pane = Uuid::new_v4();
+        let right_pane = Uuid::new_v4();
+        let mut drag = AttachMouseResizeDrag {
+            horizontal: Some(AttachMouseResizeAxisDrag {
+                positive_target_pane_id: left_pane,
+                positive_direction:
+                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right,
+                negative_target_pane_id: right_pane,
+                negative_direction:
+                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Left,
+            }),
+            vertical: None,
+            last_column: 10,
+            last_row: 4,
+            latest_column: 10,
+            latest_row: 4,
+            last_applied_at: Instant::now(),
+        };
+
+        assert!(!attach_mouse_resize_drag_has_pending_delta(&drag));
+        drag.latest_column = 14;
+        assert!(attach_mouse_resize_drag_has_pending_delta(&drag));
+        drag.last_column = drag.latest_column;
+        assert!(!attach_mouse_resize_drag_has_pending_delta(&drag));
     }
 
     #[test]

@@ -64,14 +64,32 @@ const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 const PROCESS_PLUGIN_TIMEOUT_ENV_VAR: &str = "BMUX_PROCESS_PLUGIN_TIMEOUT_MS";
 const PROCESS_PLUGIN_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeServiceBufferConfig {
+    pub initial_response_bytes: usize,
+    pub max_response_bytes: usize,
+    pub buffer_resize_attempts: usize,
+}
+
+impl Default for NativeServiceBufferConfig {
+    fn default() -> Self {
+        Self {
+            initial_response_bytes: NATIVE_SERVICE_INITIAL_RESPONSE_BYTES,
+            max_response_bytes: NATIVE_SERVICE_MAX_RESPONSE_BYTES,
+            buffer_resize_attempts: NATIVE_SERVICE_BUFFER_RESIZE_ATTEMPTS,
+        }
+    }
+}
+
 fn invoke_native_service_resizing_output<F>(
     plugin_id: &str,
+    config: NativeServiceBufferConfig,
     mut call_service: F,
 ) -> Result<(Vec<u8>, usize)>
 where
     F: FnMut(&mut [u8], &mut usize) -> i32,
 {
-    let mut output = vec![0_u8; NATIVE_SERVICE_INITIAL_RESPONSE_BYTES];
+    let mut output = vec![0_u8; config.initial_response_bytes];
     let mut buffer_resize_attempts = 0_usize;
     let output_len = loop {
         let mut output_len = 0_usize;
@@ -87,7 +105,7 @@ where
         }
 
         buffer_resize_attempts += 1;
-        if buffer_resize_attempts > NATIVE_SERVICE_BUFFER_RESIZE_ATTEMPTS {
+        if buffer_resize_attempts > config.buffer_resize_attempts {
             return Err(PluginError::InvalidNativeServiceOutput {
                 plugin_id: plugin_id.to_string(),
                 details: format!(
@@ -99,11 +117,12 @@ where
 
         let doubled = output.len().saturating_mul(2);
         let next_len = output_len.max(doubled);
-        if next_len > NATIVE_SERVICE_MAX_RESPONSE_BYTES {
+        if next_len > config.max_response_bytes {
             return Err(PluginError::InvalidNativeServiceOutput {
                 plugin_id: plugin_id.to_string(),
                 details: format!(
-                    "service response requires {next_len} bytes, exceeding max native service response size of {NATIVE_SERVICE_MAX_RESPONSE_BYTES} bytes",
+                    "service response requires {next_len} bytes, exceeding max native service response size of {} bytes",
+                    config.max_response_bytes,
                 ),
             });
         }
@@ -1658,6 +1677,7 @@ pub struct LoadedPlugin {
     pub registered: RegisteredPlugin,
     pub declaration: PluginDeclaration,
     backend: PluginBackend,
+    native_service_buffers: NativeServiceBufferConfig,
 }
 
 impl LoadedPlugin {
@@ -2148,6 +2168,7 @@ impl LoadedPlugin {
         let call_started = Instant::now();
         let (output, buffer_resize_attempts) = invoke_native_service_resizing_output(
             self.declaration.id.as_str(),
+            self.native_service_buffers,
             |output, output_len| call_service(&payload, output, output_len),
         )?;
         let call_us = call_started.elapsed().as_micros();
@@ -2365,13 +2386,36 @@ fn lifecycle_hook_name(symbol: &str) -> &'static str {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct NativePluginLoader;
+#[derive(Debug, Clone, Copy)]
+pub struct NativePluginLoader {
+    native_service_buffers: NativeServiceBufferConfig,
+}
+
+impl Default for NativePluginLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl NativePluginLoader {
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self {
+            native_service_buffers: NativeServiceBufferConfig {
+                initial_response_bytes: NATIVE_SERVICE_INITIAL_RESPONSE_BYTES,
+                max_response_bytes: NATIVE_SERVICE_MAX_RESPONSE_BYTES,
+                buffer_resize_attempts: NATIVE_SERVICE_BUFFER_RESIZE_ATTEMPTS,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn with_native_service_buffer_config(
+        mut self,
+        config: NativeServiceBufferConfig,
+    ) -> Self {
+        self.native_service_buffers = config;
+        self
     }
 
     /// # Errors
@@ -2411,6 +2455,7 @@ impl NativePluginLoader {
                     persistent: Arc::new(Mutex::new(None)),
                     metrics: Arc::new(ProcessRuntimeMetrics::default()),
                 }),
+                native_service_buffers: self.native_service_buffers,
             });
         }
 
@@ -2448,6 +2493,7 @@ impl NativePluginLoader {
             registered: registered_plugin.clone(),
             declaration,
             backend: PluginBackend::Dynamic(library),
+            native_service_buffers: self.native_service_buffers,
         })
     }
 }
@@ -2467,6 +2513,20 @@ pub fn load_registered_plugin(
     )
 }
 
+/// # Errors
+///
+/// Returns an error when the plugin cannot be loaded.
+pub fn load_registered_plugin_with_native_service_buffer_config(
+    registered_plugin: &RegisteredPlugin,
+    host: &HostMetadata,
+    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
+    native_service_buffers: NativeServiceBufferConfig,
+) -> Result<LoadedPlugin> {
+    NativePluginLoader::new()
+        .with_native_service_buffer_config(native_service_buffers)
+        .load_registered_plugin(registered_plugin, host, available_capabilities)
+}
+
 /// Load a statically-linked bundled plugin from its vtable.
 ///
 /// This bypasses filesystem discovery and `dlopen` entirely.  The plugin's
@@ -2482,6 +2542,27 @@ pub fn load_static_plugin(
     vtable: StaticPluginVtable,
     host: &HostMetadata,
     available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
+) -> Result<LoadedPlugin> {
+    load_static_plugin_with_native_service_buffer_config(
+        registered_plugin,
+        vtable,
+        host,
+        available_capabilities,
+        NativeServiceBufferConfig::default(),
+    )
+}
+
+/// Load a statically-linked bundled plugin from its vtable with explicit native service buffering.
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be parsed or validated.
+pub fn load_static_plugin_with_native_service_buffer_config(
+    registered_plugin: &RegisteredPlugin,
+    vtable: StaticPluginVtable,
+    host: &HostMetadata,
+    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
+    native_service_buffers: NativeServiceBufferConfig,
 ) -> Result<LoadedPlugin> {
     let manifest_ptr = (vtable.entry)();
     if manifest_ptr.is_null() {
@@ -2516,6 +2597,7 @@ pub fn load_static_plugin(
         registered: registered_plugin.clone(),
         declaration,
         backend: PluginBackend::Static(vtable),
+        native_service_buffers,
     })
 }
 
@@ -2532,11 +2614,34 @@ pub fn load_trusted_static_plugin(
     host: &HostMetadata,
     available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
 ) -> Result<LoadedPlugin> {
+    load_trusted_static_plugin_with_native_service_buffer_config(
+        registered_plugin,
+        vtable,
+        host,
+        available_capabilities,
+        NativeServiceBufferConfig::default(),
+    )
+}
+
+/// Load a trusted statically-linked plugin with explicit native service buffering.
+///
+/// # Errors
+///
+/// Returns an error when the registered declaration is incompatible with the
+/// current host or declared available capabilities.
+pub fn load_trusted_static_plugin_with_native_service_buffer_config(
+    registered_plugin: &RegisteredPlugin,
+    vtable: StaticPluginVtable,
+    host: &HostMetadata,
+    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
+    native_service_buffers: NativeServiceBufferConfig,
+) -> Result<LoadedPlugin> {
     PluginRegistry::validate_static_plugin(registered_plugin, host, available_capabilities)?;
     Ok(LoadedPlugin {
         registered: registered_plugin.clone(),
         declaration: registered_plugin.declaration.clone(),
         backend: PluginBackend::Static(vtable),
+        native_service_buffers,
     })
 }
 
@@ -2707,7 +2812,7 @@ fn ensure_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadedPlugin, PluginBackend};
+    use super::{LoadedPlugin, NativeServiceBufferConfig, PluginBackend};
     use crate::{PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
     use bmux_plugin_sdk::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, NativeLifecycleContext,
@@ -2959,6 +3064,7 @@ minimum = "1.0"
                 .to_declaration()
                 .expect("declaration should build"),
             backend: PluginBackend::Dynamic(library),
+            native_service_buffers: NativeServiceBufferConfig::default(),
         };
 
         assert_eq!(loaded.commands().len(), 1);
@@ -3050,6 +3156,7 @@ minimum = "1.0"
                 .to_declaration()
                 .expect("declaration should build"),
             backend: PluginBackend::Static(vtable),
+            native_service_buffers: NativeServiceBufferConfig::default(),
         }
     }
 
@@ -4076,6 +4183,7 @@ minimum = "1.0"
                 ready_signals: Vec::new(),
             },
             backend: PluginBackend::Dynamic(library),
+            native_service_buffers: NativeServiceBufferConfig::default(),
         };
 
         assert!(loaded.receives_event(&PluginEvent {

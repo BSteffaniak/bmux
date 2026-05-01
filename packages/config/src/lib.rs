@@ -1588,6 +1588,42 @@ impl Default for EventCoalescingBehaviorConfig {
     }
 }
 
+fn validate_status_bar_config(status_bar: &StatusBarConfig) -> Result<()> {
+    if status_bar.max_tabs == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "status_bar.max_tabs".to_string(),
+            value: "0".to_string(),
+        });
+    }
+
+    if status_bar.tab_label_max_width == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "status_bar.tab_label_max_width".to_string(),
+            value: "0".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_plugin_native_service_config(native_service: &PluginNativeServiceConfig) -> Result<()> {
+    if native_service.initial_response_bytes == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "plugins.native_service.initial_response_bytes".to_string(),
+            value: "0".to_string(),
+        });
+    }
+
+    if native_service.max_response_bytes < native_service.initial_response_bytes {
+        return Err(ConfigError::InvalidValue {
+            field: "plugins.native_service.max_response_bytes".to_string(),
+            value: native_service.max_response_bytes.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 fn validate_damage_behavior_config(damage: &DamageBehaviorConfig) -> Result<()> {
     if damage.max_rects == 0 {
         return Err(ConfigError::InvalidValue {
@@ -1636,6 +1672,9 @@ pub struct MouseBehaviorConfig {
     pub selection_release: MouseSelectionReleaseBehavior,
     /// Resize panes by dragging shared pane borders.
     pub resize_borders: bool,
+    /// Minimum interval in milliseconds between resize requests while dragging pane borders.
+    /// Set to 0 to apply every drag event. Mouse release always applies the final position.
+    pub resize_drag_throttle_ms: u64,
     /// Optional mouse gesture overrides mapped to action names.
     ///
     /// Supported keys in the current core runtime are `click_left`,
@@ -1660,6 +1699,7 @@ impl Default for MouseBehaviorConfig {
             alternate_screen_wheel: AlternateScreenWheelBehavior::default(),
             selection_release: MouseSelectionReleaseBehavior::default(),
             resize_borders: true,
+            resize_drag_throttle_ms: 32,
             gesture_actions: BTreeMap::new(),
         }
     }
@@ -1925,9 +1965,36 @@ pub struct PluginConfig {
     /// Per-plugin settings keyed by plugin ID. Each plugin defines its own
     /// accepted keys and values.
     pub settings: BTreeMap<String, toml::Value>,
+    /// Native service output buffer sizing and retry behavior.
+    #[config_doc(nested)]
+    pub native_service: PluginNativeServiceConfig,
     /// Command routing policy for plugin ownership and startup validation.
     #[config_doc(nested)]
     pub routing: PluginRoutingPolicyConfig,
+}
+
+/// Native service output buffer sizing and retry behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "plugins.native_service")]
+#[serde(default)]
+pub struct PluginNativeServiceConfig {
+    /// Initial response buffer size, in bytes, for native service calls.
+    pub initial_response_bytes: usize,
+    /// Maximum response buffer size, in bytes, for native service calls.
+    pub max_response_bytes: usize,
+    /// Maximum number of buffer-too-small retries before failing the service call.
+    /// Set to 0 to disable retries beyond the initial buffer.
+    pub buffer_resize_attempts: usize,
+}
+
+impl Default for PluginNativeServiceConfig {
+    fn default() -> Self {
+        Self {
+            initial_response_bytes: 4096,
+            max_response_bytes: 64 * 1024 * 1024,
+            buffer_resize_attempts: 8,
+        }
+    }
 }
 
 /// Command routing policy for plugin CLI ownership.
@@ -2898,19 +2965,9 @@ impl BmuxConfig {
             });
         }
 
-        if self.status_bar.max_tabs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "status_bar.max_tabs".to_string(),
-                value: "0".to_string(),
-            });
-        }
+        validate_plugin_native_service_config(&self.plugins.native_service)?;
 
-        if self.status_bar.tab_label_max_width == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "status_bar.tab_label_max_width".to_string(),
-                value: "0".to_string(),
-            });
-        }
+        validate_status_bar_config(&self.status_bar)?;
 
         Ok(())
     }
@@ -2922,6 +2979,7 @@ impl BmuxConfig {
         let behavior_defaults = BehaviorConfig::default();
         let recording_defaults = RecordingConfig::default();
         let performance_defaults = PerformanceConfig::default();
+        let plugin_defaults = PluginConfig::default();
         let mut repaired_fields = Vec::new();
 
         if self.general.scrollback_limit == 0 {
@@ -3007,6 +3065,26 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "behavior.event_coalescing.max_events_per_frame=0 -> {}",
                 self.behavior.event_coalescing.max_events_per_frame
+            ));
+        }
+
+        if self.plugins.native_service.initial_response_bytes == 0 {
+            self.plugins.native_service.initial_response_bytes =
+                plugin_defaults.native_service.initial_response_bytes;
+            repaired_fields.push(format!(
+                "plugins.native_service.initial_response_bytes=0 -> {}",
+                self.plugins.native_service.initial_response_bytes
+            ));
+        }
+
+        if self.plugins.native_service.max_response_bytes
+            < self.plugins.native_service.initial_response_bytes
+        {
+            self.plugins.native_service.max_response_bytes =
+                plugin_defaults.native_service.max_response_bytes;
+            repaired_fields.push(format!(
+                "plugins.native_service.max_response_bytes -> {}",
+                self.plugins.native_service.max_response_bytes
             ));
         }
 
@@ -3206,6 +3284,29 @@ mod tests {
                 .expect("default timeout"),
             ResolvedTimeout::Indefinite
         );
+        assert_eq!(config.behavior.mouse.resize_drag_throttle_ms, 32);
+        assert_eq!(config.plugins.native_service.initial_response_bytes, 4096);
+        assert_eq!(
+            config.plugins.native_service.max_response_bytes,
+            64 * 1024 * 1024
+        );
+        assert_eq!(config.plugins.native_service.buffer_resize_attempts, 8);
+    }
+
+    #[test]
+    fn native_service_buffer_config_validates_bounds() {
+        let mut config = BmuxConfig::default();
+        config.plugins.native_service.initial_response_bytes = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = BmuxConfig::default();
+        config.plugins.native_service.initial_response_bytes = 1024;
+        config.plugins.native_service.max_response_bytes = 512;
+        assert!(config.validate().is_err());
+
+        let mut config = BmuxConfig::default();
+        config.plugins.native_service.buffer_resize_attempts = 0;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

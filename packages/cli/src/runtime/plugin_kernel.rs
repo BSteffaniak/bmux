@@ -688,12 +688,14 @@ pub(super) fn register_plugin_service_handlers(
         } else {
             let host = plugin_host_metadata();
             let loaded = Arc::new(
-                load_plugin(provider, &host, &available_capabilities).with_context(|| {
-                    format!(
-                        "failed loading service provider plugin '{}'",
-                        provider.declaration.id.as_str()
-                    )
-                })?,
+                load_plugin(provider, &host, &available_capabilities, config).with_context(
+                    || {
+                        format!(
+                            "failed loading service provider plugin '{}'",
+                            provider.declaration.id.as_str()
+                        )
+                    },
+                )?,
             );
             loaded_provider_cache.insert(provider_plugin_id.clone(), Arc::clone(&loaded));
             loaded

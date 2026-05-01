@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_plugin::{
-    PluginManifest, PluginRegistry, PluginRuntime,
-    load_registered_plugin as load_native_registered_plugin,
+    NativeServiceBufferConfig, PluginManifest, PluginRegistry, PluginRuntime,
+    load_registered_plugin_with_native_service_buffer_config as load_native_registered_plugin,
 };
 use bmux_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
@@ -207,7 +207,9 @@ pub(super) fn load_plugin(
     plugin: &bmux_plugin::RegisteredPlugin,
     host: &HostMetadata,
     available_capabilities: &std::collections::BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
+    config: &BmuxConfig,
 ) -> bmux_plugin_sdk::Result<bmux_plugin::LoadedPlugin> {
+    let native_service_buffers = native_service_buffer_config(config);
     if plugin.bundled_static {
         let vtable =
             bmux_plugin::static_vtable(plugin.declaration.id.as_str()).ok_or_else(|| {
@@ -215,9 +217,23 @@ pub(super) fn load_plugin(
                     plugin_id: plugin.declaration.id.as_str().to_string(),
                 }
             })?;
-        bmux_plugin::load_trusted_static_plugin(plugin, vtable, host, available_capabilities)
+        bmux_plugin::load_trusted_static_plugin_with_native_service_buffer_config(
+            plugin,
+            vtable,
+            host,
+            available_capabilities,
+            native_service_buffers,
+        )
     } else {
-        load_native_registered_plugin(plugin, host, available_capabilities)
+        load_native_registered_plugin(plugin, host, available_capabilities, native_service_buffers)
+    }
+}
+
+const fn native_service_buffer_config(config: &BmuxConfig) -> NativeServiceBufferConfig {
+    NativeServiceBufferConfig {
+        initial_response_bytes: config.plugins.native_service.initial_response_bytes,
+        max_response_bytes: config.plugins.native_service.max_response_bytes,
+        buffer_resize_attempts: config.plugins.native_service.buffer_resize_attempts,
     }
 }
 
@@ -816,7 +832,7 @@ pub(super) fn load_enabled_plugins(
         } else {
             "dynamic"
         };
-        let loaded = match load_plugin(plugin, &host, &available_capabilities) {
+        let loaded = match load_plugin(plugin, &host, &available_capabilities, config) {
             Ok(loaded) => {
                 emit_plugin_runtime_phase_timing(
                     &PhasePayload::new("plugin.load")
@@ -1929,6 +1945,7 @@ fn load_cached_plugin(
             plugin,
             &plugin_host_metadata(),
             &state.available_capability_providers,
+            &state.config,
         )
         .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
         let loaded = Rc::new(loaded);
@@ -2266,8 +2283,13 @@ mod tests {
         let providers = registry
             .capability_providers_for(&enabled, &core_provided_capabilities())
             .expect("providers should resolve");
-        let loaded = load_plugin(plugin, &plugin_host_metadata(), &providers)
-            .expect("registered static vtable should load bundled plugin");
+        let loaded = load_plugin(
+            plugin,
+            &plugin_host_metadata(),
+            &providers,
+            &BmuxConfig::default(),
+        )
+        .expect("registered static vtable should load bundled plugin");
 
         assert_eq!(loaded.declaration.id.as_str(), "bmux.theme");
     }

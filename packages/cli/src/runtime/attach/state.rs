@@ -341,6 +341,8 @@ pub struct AttachMouseResizeDrag {
     pub vertical: Option<AttachMouseResizeAxisDrag>,
     pub last_column: u16,
     pub last_row: u16,
+    pub latest_column: u16,
+    pub latest_row: u16,
     pub last_applied_at: Instant,
 }
 
