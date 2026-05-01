@@ -4106,7 +4106,11 @@ pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachVi
                 AttachInternalPromptAction::QuitSession,
             );
         }
-        RuntimeAction::CloseFocusedPane => {
+        RuntimeAction::PluginCommand {
+            plugin_id,
+            command_name,
+            ..
+        } if is_windows_close_active_pane_command(plugin_id, command_name) => {
             let Some(pane_id) = focused_attach_pane_id(view_state) else {
                 view_state.set_transient_status(
                     "no focused pane",
@@ -4655,6 +4659,29 @@ pub fn attach_mode_hint(mode_id: &str, _ui_mode: AttachUiMode, keymap: &Keymap) 
     );
     format!(
         "{prev}/{next} tabs | {detach} detach | {restart} restart pane | {quit} quit | {help} help"
+    )
+}
+
+fn windows_close_active_pane_action() -> RuntimeAction {
+    RuntimeAction::PluginCommand {
+        plugin_id: "bmux.windows".to_string(),
+        command_name: "close-active-pane".to_string(),
+        args: Vec::new(),
+    }
+}
+
+fn is_windows_close_active_pane_command(plugin_id: &str, command_name: &str) -> bool {
+    plugin_id == "bmux.windows" && command_name == "close-active-pane"
+}
+
+fn is_windows_close_active_pane_action(action: &RuntimeAction) -> bool {
+    matches!(
+        action,
+        RuntimeAction::PluginCommand {
+            plugin_id,
+            command_name,
+            ..
+        } if is_windows_close_active_pane_command(plugin_id, command_name)
     )
 }
 
@@ -5949,7 +5976,7 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     let help = key_hint_or_unbound(&keymap, active_mode_id, &RuntimeAction::ShowHelp);
     let detach = key_hint_or_unbound(&keymap, active_mode_id, &RuntimeAction::Detach);
     let scroll = key_hint_or_unbound(&keymap, active_mode_id, &RuntimeAction::EnterScrollMode);
-    let close = key_hint_or_unbound(&keymap, active_mode_id, &RuntimeAction::CloseFocusedPane);
+    let close = key_hint_or_unbound(&keymap, active_mode_id, &windows_close_active_pane_action());
     let restart = key_hint_or_unbound(
         &keymap,
         active_mode_id,
@@ -5969,7 +5996,11 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     for entry in effective_attach_keybindings(config) {
         let category = match &entry.action {
             RuntimeAction::Detach | RuntimeAction::Quit => "Session",
-            RuntimeAction::CloseFocusedPane => "Pane",
+            RuntimeAction::PluginCommand {
+                plugin_id,
+                command_name,
+                ..
+            } if is_windows_close_active_pane_command(plugin_id, command_name) => "Pane",
             RuntimeAction::PluginCommand {
                 plugin_id,
                 command_name,
@@ -6100,7 +6131,6 @@ pub const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::CopyScrollback
             | RuntimeAction::ConfirmScrollback
             | RuntimeAction::PluginCommand { .. }
-            | RuntimeAction::CloseFocusedPane
             | RuntimeAction::ShowHelp
             | RuntimeAction::EnterMode(_)
     )
@@ -6928,10 +6958,8 @@ pub async fn handle_attach_terminal_event(
                     }
                     continue;
                 }
-                let prompt_only_action = matches!(
-                    action,
-                    RuntimeAction::Quit | RuntimeAction::CloseFocusedPane
-                );
+                let prompt_only_action = matches!(action, RuntimeAction::Quit)
+                    || is_windows_close_active_pane_action(&action);
                 handle_attach_ui_action(&action, view_state);
                 if prompt_only_action && view_state.prompt.is_active() {
                     view_state
@@ -8552,7 +8580,6 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         RuntimeAction::Quit
         | RuntimeAction::NoOp
         | RuntimeAction::Detach
-        | RuntimeAction::CloseFocusedPane
         | RuntimeAction::ShowHelp
         | RuntimeAction::EnterScrollMode
         | RuntimeAction::ExitScrollMode
@@ -8575,13 +8602,23 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
             plugin_id,
             command_name,
             args,
+        } if is_windows_close_active_pane_command(&plugin_id, &command_name) => {
+            AttachEventAction::Ui(RuntimeAction::PluginCommand {
+                plugin_id,
+                command_name,
+                args,
+            })
+        }
+        RuntimeAction::PluginCommand {
+            plugin_id,
+            command_name,
+            args,
         } => AttachEventAction::PluginCommand {
             plugin_id,
             command_name,
             args,
         },
-        RuntimeAction::CloseFocusedPane
-        | RuntimeAction::NoOp
+        RuntimeAction::NoOp
         | RuntimeAction::ExitMode
         | RuntimeAction::Quit
         | RuntimeAction::ShowHelp
@@ -9252,7 +9289,7 @@ mod tests {
     #[test]
     fn action_supports_repeat_denies_mutating_actions() {
         assert!(!super::action_supports_repeat(
-            &RuntimeAction::CloseFocusedPane
+            &windows_close_active_pane_action()
         ));
         assert!(!super::action_supports_repeat(&RuntimeAction::Quit));
         assert!(!super::action_supports_repeat(&RuntimeAction::Detach));

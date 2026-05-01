@@ -113,7 +113,6 @@ fn windows_split_command(direction: &str) -> String {
 impl Keymap {
     pub(crate) fn default_runtime() -> Self {
         let runtime: BTreeMap<String, String> = [
-            ("x", RuntimeAction::CloseFocusedPane),
             ("?", RuntimeAction::ShowHelp),
             ("[", RuntimeAction::EnterScrollMode),
             ("]", RuntimeAction::ExitScrollMode),
@@ -133,6 +132,10 @@ impl Keymap {
         .chain([
             ("%".to_string(), windows_split_command("vertical")),
             ("\"".to_string(), windows_split_command("horizontal")),
+            (
+                "x".to_string(),
+                "plugin:bmux.windows:close-active-pane".to_string(),
+            ),
             (
                 "r".to_string(),
                 "plugin:bmux.windows:restart-pane".to_string(),

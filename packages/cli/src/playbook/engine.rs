@@ -3237,19 +3237,6 @@ async fn apply_attach_runtime_actions(
             crate::input::RuntimeAction::Detach => {
                 bail!("attach input requested detach; unsupported inside playbook step")
             }
-            crate::input::RuntimeAction::CloseFocusedPane => {
-                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
-                    client,
-                    "close-active-pane",
-                    &windows_commands::client::CloseActivePaneRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("close focused pane failed: {e}"))?;
-            }
             crate::input::RuntimeAction::EnterScrollMode => {
                 runtime.state.scrollback_active = true;
             }

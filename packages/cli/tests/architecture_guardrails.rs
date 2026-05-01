@@ -2567,10 +2567,6 @@ const RUNTIME_ACTION_ALLOWLIST: &[&str] = &[
     "SwitchProfile",
     "PluginCommand",
     "ForwardToPane",
-    // DOMAIN-leaking variants pending migration. Each should move to
-    // a `plugin:bmux.<plugin>:<cmd>` invocation before deletion.
-    // See `docs/runtime-action-migration.md` for the plan.
-    "CloseFocusedPane",
 ];
 
 #[test]
