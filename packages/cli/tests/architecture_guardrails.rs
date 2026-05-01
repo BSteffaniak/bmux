@@ -2216,6 +2216,82 @@ fn repo_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
+#[test]
+fn plugin_manifests_expose_generated_service_interfaces() {
+    let expected = [
+        (
+            "recording-plugin",
+            "bmux.recording.read",
+            "recording-state",
+            "query",
+        ),
+        (
+            "recording-plugin",
+            "bmux.recording.write",
+            "recording-commands",
+            "command",
+        ),
+        (
+            "performance-plugin",
+            "bmux.performance.read",
+            "performance-state",
+            "query",
+        ),
+        (
+            "performance-plugin",
+            "bmux.performance.write",
+            "performance-commands",
+            "command",
+        ),
+        (
+            "snapshot-plugin",
+            "bmux.snapshot.read",
+            "snapshot-state",
+            "query",
+        ),
+        (
+            "snapshot-plugin",
+            "bmux.snapshot.write",
+            "snapshot-commands",
+            "command",
+        ),
+    ];
+
+    for (plugin, capability, interface_id, kind) in expected {
+        assert!(
+            plugin_manifest_declares_service(plugin, capability, interface_id, kind),
+            "plugins/{plugin}/plugin.toml must declare {kind} service {capability}/{interface_id} so BPDL-generated clients can resolve a provider",
+        );
+    }
+}
+
+fn plugin_manifest_declares_service(
+    plugin_dir: &str,
+    capability: &str,
+    interface_id: &str,
+    kind: &str,
+) -> bool {
+    let path = repo_root()
+        .join("plugins")
+        .join(plugin_dir)
+        .join("plugin.toml");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed reading {}: {err}", path.display()));
+    let parsed: toml::Value = toml::from_str(&source)
+        .unwrap_or_else(|err| panic!("failed parsing {}: {err}", path.display()));
+    parsed
+        .get("services")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|services| {
+            services.iter().any(|service| {
+                service.get("capability").and_then(toml::Value::as_str) == Some(capability)
+                    && service.get("interface_id").and_then(toml::Value::as_str)
+                        == Some(interface_id)
+                    && service.get("kind").and_then(toml::Value::as_str) == Some(kind)
+            })
+        })
+}
+
 fn iter_plugin_dirs() -> Vec<std::path::PathBuf> {
     let plugins_dir = repo_root().join("plugins");
     let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&plugins_dir)

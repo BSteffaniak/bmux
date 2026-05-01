@@ -20,6 +20,11 @@ plugin_id   = "bmux.sessions"
 version_req = ">=0.0.1-alpha.0"
 
 [[services]]
+capability   = "bmux.snapshot.read"
+interface_id = "snapshot-state"
+kind         = "query"
+
+[[services]]
 capability   = "bmux.snapshot.write"
 interface_id = "snapshot-commands"
 kind         = "command"

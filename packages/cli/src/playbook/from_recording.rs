@@ -499,8 +499,18 @@ fn request_to_dsl(
                     "attach-set-viewport" => {
                         #[derive(serde::Deserialize)]
                         struct ViewportArgs {
+                            #[serde(rename = "session_id")]
+                            _session_id: Uuid,
                             cols: u16,
                             rows: u16,
+                            #[serde(rename = "status_top_inset")]
+                            _status_top_inset: u16,
+                            #[serde(rename = "status_bottom_inset")]
+                            _status_bottom_inset: u16,
+                            #[serde(rename = "cell_pixel_w")]
+                            _cell_pixel_w: u16,
+                            #[serde(rename = "cell_pixel_h")]
+                            _cell_pixel_h: u16,
                         }
                         if let Ok(args) = bmux_codec::from_bytes::<ViewportArgs>(payload) {
                             return RequestDslResult::Line(format!(
@@ -512,6 +522,8 @@ fn request_to_dsl(
                     "attach-input" => {
                         #[derive(serde::Deserialize)]
                         struct InputArgs {
+                            #[serde(rename = "session_id")]
+                            _session_id: Uuid,
                             data: Vec<u8>,
                         }
                         if let Ok(args) = bmux_codec::from_bytes::<InputArgs>(payload) {

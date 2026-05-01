@@ -9,12 +9,7 @@ version               = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.performance.read"
-interface_id = "performance-commands"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.performance.read"
-interface_id = "performance-commands"
+interface_id = "performance-state"
 kind         = "query"
 
 [[services]]

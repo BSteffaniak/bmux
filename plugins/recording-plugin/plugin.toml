@@ -9,6 +9,11 @@ version               = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.recording.read"
+interface_id = "recording-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.recording.write"
 interface_id = "recording-commands"
 kind         = "command"
 
