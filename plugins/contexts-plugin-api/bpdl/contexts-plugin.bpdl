@@ -67,6 +67,14 @@ interface contexts-commands {
         failed { reason: string },
     }
 
+    // Errors a `rename-context` command can produce.
+    variant rename-context-error {
+        not-found,
+        invalid-name { reason: string },
+        denied { reason: string },
+        failed { reason: string },
+    }
+
     // Acknowledgement returned by mutating context commands. `id`
     // carries the target context id after the operation (the newly
     // created one for `create-context`, or the resolved selector for
@@ -89,6 +97,8 @@ interface contexts-commands {
         -> result<context-ack, select-context-error>;
     command close-context(selector: contexts-state.context-selector, force: bool)
         -> result<context-ack, close-context-error>;
+    command rename-context(selector: contexts-state.context-selector, name: string)
+        -> result<context-ack, rename-context-error>;
 }
 
 interface contexts-events {
@@ -100,6 +110,8 @@ interface contexts-events {
         closed { context-id: uuid },
         // A context was selected (became current for a client).
         selected { context-id: uuid },
+        // A context's display name changed.
+        renamed { context-id: uuid, name: string },
         // The active context for a session changed. Emitted whenever
         // a client's "current context" for a given session flips
         // (create, select, or close that promotes a sibling). Carries

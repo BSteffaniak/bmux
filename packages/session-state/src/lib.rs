@@ -56,6 +56,12 @@ pub trait SessionManagerWriter: SessionManagerReader {
     ///
     /// Returns an error if a session with the same id already exists.
     fn insert_session(&self, session: Session) -> Result<()>;
+    /// Rename a session by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no session has the given id.
+    fn rename_session(&self, session_id: SessionId, name: String) -> Result<()>;
     /// Remove a session by id.
     ///
     /// # Errors
@@ -115,6 +121,9 @@ impl SessionManagerWriter for NoopSessionManager {
         Err(anyhow::anyhow!("sessions plugin not active"))
     }
     fn insert_session(&self, _session: Session) -> Result<()> {
+        Err(anyhow::anyhow!("sessions plugin not active"))
+    }
+    fn rename_session(&self, _session_id: SessionId, _name: String) -> Result<()> {
         Err(anyhow::anyhow!("sessions plugin not active"))
     }
     fn remove_session(&self, _session_id: SessionId) -> Result<()> {

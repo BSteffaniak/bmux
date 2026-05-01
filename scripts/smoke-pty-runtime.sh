@@ -74,7 +74,7 @@ run_smoke_with_retry() {
       set -euo pipefail
       (
 ${payload}
-      ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_STATE_DIR=\"$sandbox/state\" BMUX_LOG_DIR=\"$sandbox/logs\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null cargo run -q -p bmux_cli -- >/dev/null 2>&1
+      ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_STATE_HOME=\"$sandbox/state\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_CONFIG_DIR=\"$sandbox/config\" BMUX_DATA_DIR=\"$sandbox/data\" BMUX_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_STATE_DIR=\"$sandbox/state\" BMUX_LOG_DIR=\"$sandbox/logs\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null cargo run -q -p bmux_cli -- >/dev/null 2>&1
     "
     status=$?
     set -e

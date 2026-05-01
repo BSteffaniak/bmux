@@ -4,6 +4,7 @@ name = "bmux Windows"
 owns_namespaces = [
     "window",
     "new-window",
+    "rename-window",
     "list-windows",
     "kill-window",
     "kill-all-windows",
@@ -75,6 +76,21 @@ long       = "session"
 name       = "session"
 short      = "s"
 value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "name"
+name       = "name"
+short      = "n"
+value_name = "NAME"
+
+[[commands]]
+aliases       = [["window", "rename"]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "rename-window"
+path          = ["rename-window"]
+summary       = "Rename the current workspace window"
 
 [[commands.arguments]]
 kind       = "string"
@@ -333,10 +349,11 @@ value_name = "SESSION"
 
 [keybindings.runtime]
 # Window lifecycle
-c = "plugin:bmux.windows:new-window"
-n = "plugin:bmux.windows:next-window"
-p = "plugin:bmux.windows:prev-window"
-w = "plugin:bmux.windows:last-window"
+',' = "plugin:bmux.windows:rename-window"
+c   = "plugin:bmux.windows:new-window"
+n   = "plugin:bmux.windows:next-window"
+p   = "plugin:bmux.windows:prev-window"
+w   = "plugin:bmux.windows:last-window"
 # Pane focus (hjkl + arrows) — repeat-safe via accepts_repeat on focus-pane-in-direction
 arrow_down  = "plugin:bmux.windows:focus-pane-in-direction --direction down"
 arrow_left  = "plugin:bmux.windows:focus-pane-in-direction --direction left"

@@ -9,12 +9,13 @@ use bmux_pane_runtime_plugin_api::{
     pane_runtime_commands as api_pane_runtime_commands,
     pane_runtime_state as api_pane_runtime_state,
 };
-use bmux_plugin::{HostRuntimeApi, ServiceCaller, TypedServiceCaller};
+use bmux_plugin::{HostRuntimeApi, ServiceCaller, TypedServiceCaller, prompt};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    HostScope, StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext,
-    TypedServiceRegistry, VolatileStateClearRequest, VolatileStateGetRequest,
-    VolatileStateSetRequest,
+    HostScope, LogWriteLevel, LogWriteRequest, PromptPolicy, PromptRequest, PromptResponse,
+    PromptValidation, PromptValue, StorageGetRequest, StorageSetRequest,
+    TypedServiceRegistrationContext, TypedServiceRegistry, VolatileStateClearRequest,
+    VolatileStateGetRequest, VolatileStateSetRequest,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing},
 };
 use bmux_windows_plugin_api::windows_commands::{
@@ -109,6 +110,23 @@ fn create_context(
         name,
         attributes,
     })
+}
+
+fn rename_context(
+    caller: &(impl ServiceCaller + Sync),
+    selector: ContextSelector,
+    name: String,
+) -> Result<Uuid, String> {
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(contexts_commands::client::rename_context(
+        &mut client,
+        selector,
+        name,
+    ))
+    .map_err(|err| typed_service_error("contexts-commands/rename-context", err))?;
+    result
+        .map(|ack| ack.id)
+        .map_err(|err| format!("rename-context failed: {err:?}"))
 }
 
 fn select_context(
@@ -472,6 +490,10 @@ impl RustPlugin for WindowsPlugin {
                 create_window(ctx, &self.runtime_state, req.name)
                     .map_err(|e| ServiceResponse::error("new_failed", e))
             },
+            "windows-commands", "rename-window" => |req: RenameWindowArgs, ctx| {
+                rename_window(ctx, &self.runtime_state, &req.name)
+                    .map_err(|e| ServiceResponse::error("rename_failed", e))
+            },
             "windows-commands", "kill-window" => |req: KillWindowArgs, ctx| {
                 let selector = parse_selector(&req.target)
                     .map_err(|e| ServiceResponse::error("invalid_request", e))?;
@@ -721,6 +743,10 @@ fn handle_context_event(
         }
         ContextEvent::Selected { context_id } => {
             let _ = mark_context_active(caller, &shared.runtime_state, *context_id);
+            publish_window_list_snapshot(caller, &shared.runtime_state);
+        }
+        ContextEvent::Renamed { context_id, name } => {
+            cache_known_context(&shared.runtime_state, *context_id, Some(name.clone()));
             publish_window_list_snapshot(caller, &shared.runtime_state);
         }
         ContextEvent::SessionActiveContextChanged { context_id, .. } => {
@@ -993,6 +1019,25 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             if emit_to_stdout && let Some(context_id) = ack.id {
                 println!("created window context: {context_id}");
             }
+            Ok(())
+        }
+        "rename-window" => {
+            if let Some(name) = option_value(&context.arguments, "name") {
+                let ack = rename_window(context, &plugin.runtime_state, &name)?;
+                if emit_to_stdout && let Some(context_id) = ack.id {
+                    println!("renamed window context: {context_id}");
+                }
+                return Ok(());
+            }
+            if !matches!(
+                context.invocation_source,
+                bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding
+            ) {
+                return Err(
+                    "rename-window requires --name when not invoked from attach".to_string()
+                );
+            }
+            spawn_rename_window_prompt(context.clone(), Arc::clone(&plugin.runtime_state))?;
             Ok(())
         }
         "list-windows" => {
@@ -1390,6 +1435,94 @@ fn create_window(
         ok: true,
         id: Some(context_id.to_string()),
     })
+}
+
+fn normalize_window_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("name must not be empty".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn rename_window(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &WindowRuntimeStateHandle,
+    name: &str,
+) -> Result<WindowAck, String> {
+    let name = normalize_window_name(name)?;
+    let contexts = list_contexts(caller)?;
+    let contexts = order_contexts_for_navigation(caller, runtime_state, contexts)?;
+    let context_id =
+        resolve_effective_current_context_with_contexts(caller, runtime_state, &contexts)?
+            .ok_or_else(|| "no current window to rename".to_string())?;
+    let renamed_id = rename_context(caller, context_selector_by_id(context_id), name.clone())?;
+    cache_known_context(runtime_state, renamed_id, Some(name));
+    publish_window_list_snapshot(caller, runtime_state);
+    Ok(WindowAck {
+        ok: true,
+        id: Some(renamed_id.to_string()),
+    })
+}
+
+fn current_window_label(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &WindowRuntimeStateHandle,
+) -> Option<String> {
+    list_windows(caller, runtime_state, None)
+        .ok()?
+        .into_iter()
+        .find(|window| window.active)
+        .map(|window| window.name)
+}
+
+fn spawn_rename_window_prompt(
+    context: NativeCommandContext,
+    runtime_state: WindowRuntimeStateHandle,
+) -> Result<(), String> {
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| "rename-window prompt requires attach runtime".to_string())?;
+    handle.spawn(async move {
+        prompt_and_rename_window(context, runtime_state).await;
+    });
+    Ok(())
+}
+
+async fn prompt_and_rename_window(
+    context: NativeCommandContext,
+    runtime_state: WindowRuntimeStateHandle,
+) {
+    let initial = current_window_label(&context, &runtime_state).unwrap_or_default();
+    let request = PromptRequest::text_input("Rename window")
+        .message("Enter a new name for the current window.")
+        .submit_label("Rename")
+        .owner_plugin_id("bmux.windows")
+        .modal_id("rename-window")
+        .policy(PromptPolicy::Enqueue)
+        .input_initial(initial)
+        .input_required(true)
+        .input_validation(PromptValidation::NonEmpty);
+    let response = match prompt::request(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            log_window_rename_error(&context, format!("failed opening rename prompt: {error}"));
+            return;
+        }
+    };
+    let PromptResponse::Submitted(PromptValue::Text(name)) = response else {
+        return;
+    };
+    if let Err(error) = rename_window(&context, &runtime_state, &name) {
+        log_window_rename_error(&context, format!("rename-window failed: {error}"));
+    }
+}
+
+fn log_window_rename_error(context: &impl HostRuntimeApi, message: String) {
+    let _ = context.log_write(&LogWriteRequest {
+        level: LogWriteLevel::Warn,
+        message,
+        target: Some("bmux.windows".to_string()),
+    });
 }
 
 fn next_default_tab_name_for_contexts(contexts: &[ContextSummary]) -> String {
@@ -2363,6 +2496,17 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         })
     }
 
+    fn rename_window<'a>(
+        &'a self,
+        name: String,
+    ) -> Pin<Box<dyn Future<Output = Result<WindowAck, WindowError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            rename_window(&*caller, &self.shared.runtime_state, &name)
+                .map_err(|reason| WindowError::Failed { reason })
+        })
+    }
+
     fn kill_window<'a>(
         &'a self,
         target: String,
@@ -2554,6 +2698,11 @@ struct ListWindowsArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NewWindowArgs {
     name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RenameWindowArgs {
+    name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3542,6 +3691,12 @@ mod tests {
     #[test]
     fn parse_selector_rejects_blank_values() {
         let error = parse_selector("   ").expect_err("blank selector should fail");
+        assert!(error.contains("must not be empty"));
+    }
+
+    #[test]
+    fn normalize_window_name_rejects_blank_values() {
+        let error = normalize_window_name("  \t  ").expect_err("blank names should be rejected");
         assert!(error.contains("must not be empty"));
     }
 

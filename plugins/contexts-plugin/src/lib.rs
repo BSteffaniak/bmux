@@ -22,7 +22,7 @@ use bmux_context_state::{
 };
 use bmux_contexts_plugin_api::contexts_commands::{
     self, CloseContextError, ContextAck, ContextsCommandsService, CreateContextError,
-    SelectContextError,
+    RenameContextError, SelectContextError,
 };
 use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
 use bmux_contexts_plugin_api::contexts_state::{
@@ -40,6 +40,8 @@ use bmux_plugin_sdk::{
     TypedServiceRegistry,
 };
 use bmux_session_models::{ClientId, SessionId};
+use bmux_sessions_plugin_api::sessions_commands::{self, RenameSessionError};
+use bmux_sessions_plugin_api::sessions_state::SessionSelector;
 use bmux_snapshot_runtime::StatefulPluginRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -123,6 +125,17 @@ impl ContextStateWriter for ContextStateAdapter {
     ) -> std::result::Result<PrimitiveContextSummary, &'static str> {
         self.with_write(
             |state| state.select_for_client(client_id, selector),
+            Err("context-state lock poisoned"),
+        )
+    }
+
+    fn rename(
+        &self,
+        selector: &PrimitiveContextSelector,
+        name: String,
+    ) -> std::result::Result<PrimitiveContextSummary, &'static str> {
+        self.with_write(
+            |state| state.rename(selector, name),
             Err("context-state lock poisoned"),
         )
     }
@@ -289,6 +302,12 @@ struct CloseContextArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct RenameContextArgs {
+    selector: WireSelector,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WireSelector {
     #[serde(default)]
     id: Option<::uuid::Uuid>,
@@ -394,6 +413,11 @@ impl RustPlugin for ContextsPlugin {
             "contexts-commands", "close-context" => |req: CloseContextArgs, ctx| {
                 Ok::<Result<ContextAck, CloseContextError>, ServiceResponse>(
                     close_context_local(ctx, ctx.caller_client_id, &req.selector, req.force)
+                )
+            },
+            "contexts-commands", "rename-context" => |req: RenameContextArgs, ctx| {
+                Ok::<Result<ContextAck, RenameContextError>, ServiceResponse>(
+                    rename_context_local(ctx, &req.selector, &req.name)
                 )
             },
         })
@@ -859,6 +883,130 @@ struct CloseOutcome {
     replacement: Option<(::uuid::Uuid, Option<SessionId>)>,
 }
 
+fn validate_context_rename_name(name: &str) -> Result<String, RenameContextError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(RenameContextError::InvalidName {
+            reason: "name must not be empty".to_string(),
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+#[instrument(
+    level = "debug",
+    target = "bmux_contexts_plugin::lifecycle",
+    skip_all,
+    fields(
+        context_id = tracing::field::Empty,
+        session_id = tracing::field::Empty,
+        name = %name,
+    ),
+)]
+fn rename_context_local(
+    caller: &(impl ServiceCaller + Sync),
+    selector: &WireSelector,
+    name: &str,
+) -> Result<ContextAck, RenameContextError> {
+    let Some(context_selector) = selector.to_primitive() else {
+        return Err(RenameContextError::Denied {
+            reason: "selector must specify either id or name".to_string(),
+        });
+    };
+    let name = validate_context_rename_name(name)?;
+    let RenameContextMutation {
+        context_id,
+        old_name,
+        session_id,
+    } = mutate_state_rename(&context_selector, name.clone())?;
+
+    tracing::Span::current().record("context_id", tracing::field::display(context_id));
+    if let Some(session_id) = session_id {
+        tracing::Span::current().record("session_id", tracing::field::display(session_id.0));
+        if let Err(reason) = rename_session_via_sessions_plugin(caller, session_id, name.clone()) {
+            rollback_context_rename(context_id, old_name);
+            return Err(RenameContextError::Failed { reason });
+        }
+    }
+
+    let _ = global_event_bus().emit(
+        &contexts_events::EVENT_KIND,
+        ContextEvent::Renamed { context_id, name },
+    );
+
+    Ok(ContextAck {
+        id: context_id,
+        session_id: session_id.map(|id| id.0),
+    })
+}
+
+struct RenameContextMutation {
+    context_id: Uuid,
+    old_name: Option<String>,
+    session_id: Option<SessionId>,
+}
+
+#[allow(clippy::significant_drop_tightening)]
+fn mutate_state_rename(
+    context_selector: &PrimitiveContextSelector,
+    name: String,
+) -> Result<RenameContextMutation, RenameContextError> {
+    let state = local_state().map_err(|reason| RenameContextError::Failed { reason })?;
+    let mut guard = state.write().map_err(|_| RenameContextError::Failed {
+        reason: "context state lock poisoned".to_string(),
+    })?;
+    let context_id = guard
+        .resolve_id(context_selector)
+        .map_err(|_| RenameContextError::NotFound)?;
+    let Some(context) = guard.contexts.get_mut(&context_id) else {
+        return Err(RenameContextError::NotFound);
+    };
+    let old_name = context.name.clone();
+    context.name = Some(name);
+    let session_id = guard.session_by_context.get(&context_id).copied();
+    Ok(RenameContextMutation {
+        context_id,
+        old_name,
+        session_id,
+    })
+}
+
+fn rollback_context_rename(context_id: Uuid, old_name: Option<String>) {
+    let Ok(state) = local_state() else {
+        return;
+    };
+    let Ok(mut guard) = state.write() else {
+        return;
+    };
+    if let Some(context) = guard.contexts.get_mut(&context_id) {
+        context.name = old_name;
+    }
+}
+
+fn rename_session_via_sessions_plugin(
+    caller: &(impl ServiceCaller + Sync),
+    session_id: SessionId,
+    name: String,
+) -> Result<(), String> {
+    let mut client = dispatch_client(caller);
+    let selector = SessionSelector {
+        id: Some(session_id.0),
+        name: None,
+    };
+    let result = bmux_plugin::block_on_typed_dispatch(sessions_commands::client::rename_session(
+        &mut client,
+        selector,
+        name,
+    ))
+    .map_err(|err| format!("sessions-commands/rename-session failed: {err}"))?;
+    result.map(|_| ()).map_err(|err| match err {
+        RenameSessionError::NotFound => "session not found".to_string(),
+        RenameSessionError::InvalidName { reason } | RenameSessionError::Failed { reason } => {
+            reason
+        }
+    })
+}
+
 #[allow(clippy::significant_drop_tightening)]
 fn mutate_state_close(
     client_id: ClientId,
@@ -1063,6 +1211,22 @@ impl ContextsCommandsService for ContextsCommandsHandle {
             close_context_local(self.caller.as_ref(), None, &wire, force)
         })
     }
+
+    fn rename_context<'a>(
+        &'a self,
+        selector: StateContextSelector,
+        name: String,
+    ) -> Pin<
+        Box<dyn Future<Output = std::result::Result<ContextAck, RenameContextError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let wire = WireSelector {
+                id: selector.id,
+                name: selector.name,
+            };
+            rename_context_local(self.caller.as_ref(), &wire, &name)
+        })
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1120,6 +1284,29 @@ mod tests {
         assert_eq!(
             context_state.current_session_for_client(client_id),
             Some(second_session_id)
+        );
+    }
+
+    #[test]
+    fn rename_context_updates_display_name() {
+        let client_id = ClientId::new();
+        let mut context_state = ContextState::default();
+        let context = context_state.create(client_id, Some("old".to_string()), BTreeMap::new());
+
+        let renamed = context_state
+            .rename(
+                &PrimitiveContextSelector::ById(context.id),
+                "new".to_string(),
+            )
+            .expect("rename should succeed");
+
+        assert_eq!(renamed.name.as_deref(), Some("new"));
+        assert_eq!(
+            context_state
+                .contexts
+                .get(&context.id)
+                .and_then(|context| context.name.as_deref()),
+            Some("new")
         );
     }
 
@@ -1366,6 +1553,7 @@ mod tests {
             .filter(|(_, ev)| match ev {
                 ContextEvent::Created { context_id: id, .. }
                 | ContextEvent::Selected { context_id: id }
+                | ContextEvent::Renamed { context_id: id, .. }
                 | ContextEvent::SessionActiveContextChanged { context_id: id, .. } => {
                     *id == context_id
                 }

@@ -70,6 +70,19 @@ impl SessionManager {
         self.sessions.get(session_id)
     }
 
+    /// Rename a session by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no session has the given id.
+    pub fn rename_session(&mut self, session_id: SessionId, name: String) -> Result<()> {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return Err(anyhow::anyhow!("Session not found: {session_id}"));
+        };
+        session.name = Some(name);
+        Ok(())
+    }
+
     /// Mutable reference to a session by id.
     pub fn get_session_mut(&mut self, session_id: &SessionId) -> Option<&mut Session> {
         self.sessions.get_mut(session_id)
@@ -92,5 +105,27 @@ impl SessionManager {
         } else {
             Err(anyhow::anyhow!("Session not found: {session_id}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionManager;
+
+    #[test]
+    fn rename_session_updates_display_name() {
+        let mut manager = SessionManager::new();
+        let session_id = manager
+            .create_session(Some("old".to_string()))
+            .expect("create should succeed");
+
+        manager
+            .rename_session(session_id, "new".to_string())
+            .expect("rename should succeed");
+
+        let session = manager
+            .get_session(&session_id)
+            .expect("renamed session should exist");
+        assert_eq!(session.name.as_deref(), Some("new"));
     }
 }

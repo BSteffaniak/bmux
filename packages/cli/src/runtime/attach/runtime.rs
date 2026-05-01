@@ -2882,6 +2882,12 @@ async fn handle_attach_stream_server_event(
                         });
                     }
                 }
+                Ok(bmux_sessions_plugin_api::sessions_events::SessionEvent::Renamed { .. }) => {
+                    refresh_attach_status_catalog_best_effort(client, view_state).await;
+                    view_state
+                        .dirty
+                        .mark_status_dirty(AttachDirtySource::StatusChanged);
+                }
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
@@ -3251,6 +3257,12 @@ async fn handle_context_event_forwarded(
             view_state
                 .dirty
                 .mark_layout_frame_dirty(AttachDirtySource::SceneChanged);
+        }
+        ContextEvent::Renamed { .. } => {
+            refresh_attach_status_catalog_best_effort(client, view_state).await;
+            view_state
+                .dirty
+                .mark_status_dirty(AttachDirtySource::StatusChanged);
         }
         ContextEvent::Created { .. } | ContextEvent::Closed { .. } => {
             // Creation and closure are informational here. Retarget

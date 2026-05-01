@@ -13,6 +13,7 @@ client can navigate windows independently.
 
 - `windows list` -- list windows in the current session
 - `windows new [--name <name>]` -- create a new window
+- `windows rename [--name <name>]` -- rename the current window; attach keybindings prompt when `--name` is omitted
 - `windows kill <target>` -- close a specific window
 - `windows kill-all` -- close all windows in the session
 - `windows switch <target>` -- switch the active window
@@ -20,5 +21,5 @@ client can navigate windows independently.
 ## Services
 
 - **`windows-state`** -- `list-windows` (query)
-- **`windows-commands`** -- `new-window` / `kill-window` / `kill-all-windows` / `switch-window` (command)
+- **`windows-commands`** -- `new-window` / `rename-window` / `kill-window` / `kill-all-windows` / `switch-window` (command)
 - **`windows-events`** -- pane-event stream

@@ -88,6 +88,16 @@ pub trait ContextStateWriter: ContextStateReader {
         client_id: ClientId,
         selector: &ContextSelector,
     ) -> Result<ContextSummary, &'static str>;
+    /// Rename a context selected by `selector`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static error message when the selector doesn't resolve.
+    fn rename(
+        &self,
+        selector: &ContextSelector,
+        name: String,
+    ) -> Result<ContextSummary, &'static str>;
     /// Close a context selected by `selector`. Returns `(removed_id,
     /// removed_session)` when the context existed.
     ///
@@ -189,6 +199,13 @@ impl ContextStateWriter for NoopContextState {
         &self,
         _client_id: ClientId,
         _selector: &ContextSelector,
+    ) -> Result<ContextSummary, &'static str> {
+        Err("contexts plugin not active")
+    }
+    fn rename(
+        &self,
+        _selector: &ContextSelector,
+        _name: String,
     ) -> Result<ContextSummary, &'static str> {
         Err("contexts plugin not active")
     }

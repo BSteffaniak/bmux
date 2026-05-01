@@ -2621,7 +2621,8 @@ fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
             bmux_sessions_plugin_api::sessions_events::SessionEvent::Removed { .. } => {
                 "session_removed"
             }
-            bmux_sessions_plugin_api::sessions_events::SessionEvent::Selected { .. } => {
+            bmux_sessions_plugin_api::sessions_events::SessionEvent::Selected { .. }
+            | bmux_sessions_plugin_api::sessions_events::SessionEvent::Renamed { .. } => {
                 "plugin_bus_event"
             }
         });

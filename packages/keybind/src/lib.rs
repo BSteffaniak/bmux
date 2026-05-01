@@ -151,6 +151,9 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
         "exit_mode" => Ok(RuntimeAction::ExitMode),
         "window_prev" => Ok(plugin_command("bmux.windows", "prev-window", [])),
         "window_next" => Ok(plugin_command("bmux.windows", "next-window", [])),
+        "rename_window" | "window_rename" => {
+            Ok(plugin_command("bmux.windows", "rename-window", []))
+        }
         "window_goto_1" => Ok(plugin_command("bmux.windows", "goto-window", ["1"])),
         "window_goto_2" => Ok(plugin_command("bmux.windows", "goto-window", ["2"])),
         "window_goto_3" => Ok(plugin_command("bmux.windows", "goto-window", ["3"])),
@@ -329,6 +332,14 @@ mod tests {
             RuntimeAction::PluginCommand {
                 plugin_id: "bmux.windows".to_string(),
                 command_name: "close-current-window".to_string(),
+                args: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parse_action("window_rename").expect("legacy rename-window action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "rename-window".to_string(),
                 args: Vec::new(),
             }
         );

@@ -148,6 +148,25 @@ impl ContextState {
             .ok_or("context not found")
     }
 
+    /// Rename a context selected by `selector`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static error message when the selector does not
+    /// resolve or the context is already gone.
+    pub fn rename(
+        &mut self,
+        selector: &ContextSelector,
+        name: String,
+    ) -> core::result::Result<ContextSummary, &'static str> {
+        let id = self.resolve_id(selector)?;
+        let Some(context) = self.contexts.get_mut(&id) else {
+            return Err("context not found");
+        };
+        context.name = Some(name);
+        Ok(Self::to_summary(context))
+    }
+
     /// Close a context selected by `selector`, preferring `client_id`
     /// as a destination for replacement selection. Returns the removed
     /// context's id + bound session (if any).

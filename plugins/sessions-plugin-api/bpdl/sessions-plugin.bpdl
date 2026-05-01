@@ -65,6 +65,13 @@ interface sessions-commands {
         denied { reason: string },
     }
 
+    // Errors a `rename-session` command can produce.
+    variant rename-session-error {
+        not-found,
+        invalid-name { reason: string },
+        failed { reason: string },
+    }
+
     // Errors a `reconcile-client-membership` command can produce.
     variant reconcile-error {
         failed { reason: string },
@@ -83,6 +90,8 @@ interface sessions-commands {
         -> result<session-ack, kill-session-error>;
     command select-session(selector: sessions-state.session-selector)
         -> result<session-ack, select-session-error>;
+    command rename-session(selector: sessions-state.session-selector, name: string)
+        -> result<session-ack, rename-session-error>;
 
     // Update which client is considered attached to which session. When
     // follow orchestration reroutes a client to a new session, this
@@ -107,6 +116,8 @@ interface sessions-events {
         // A session became the currently-selected one for at least
         // one client.
         selected { session-id: uuid },
+        // A session's display name changed.
+        renamed { session-id: uuid, name: string },
     }
 
     events session-event;

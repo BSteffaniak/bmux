@@ -36,8 +36,8 @@ use bmux_session_state::{
     SessionManagerHandle, SessionManagerReader, SessionManagerSnapshot, SessionManagerWriter,
 };
 use bmux_sessions_plugin_api::sessions_commands::{
-    self, KillSessionError, NewSessionError, ReconcileError, SelectSessionError, SessionAck,
-    SessionsCommandsService,
+    self, KillSessionError, NewSessionError, ReconcileError, RenameSessionError,
+    SelectSessionError, SessionAck, SessionsCommandsService,
 };
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use bmux_sessions_plugin_api::sessions_state::{
@@ -101,6 +101,13 @@ impl SessionManagerWriter for SessionManagerAdapter {
             .write()
             .map_err(|_| anyhow::anyhow!("session-manager lock poisoned"))?
             .insert_session(session)
+    }
+
+    fn rename_session(&self, session_id: SessionId, name: String) -> anyhow::Result<()> {
+        self.inner
+            .write()
+            .map_err(|_| anyhow::anyhow!("session-manager lock poisoned"))?
+            .rename_session(session_id, name)
     }
 
     fn remove_session(&self, session_id: SessionId) -> anyhow::Result<()> {
@@ -233,6 +240,13 @@ struct SelectorArgs {
     selector: WireSelector,
 }
 
+/// Wire-format argument for `rename-session`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RenameSessionArgs {
+    selector: WireSelector,
+    name: String,
+}
+
 /// Wire-format argument for `reconcile-client-membership`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReconcileArgs {
@@ -360,6 +374,11 @@ impl RustPlugin for SessionsPlugin {
             "sessions-commands", "select-session" => |req: SelectorArgs, ctx| {
                 Ok::<Result<SessionAck, SelectSessionError>, ServiceResponse>(
                     select_session_via_ipc(ctx, &req.selector)
+                )
+            },
+            "sessions-commands", "rename-session" => |req: RenameSessionArgs, _ctx| {
+                Ok::<Result<SessionAck, RenameSessionError>, ServiceResponse>(
+                    rename_session_local(&req.selector, &req.name)
                 )
             },
             "sessions-commands", "reconcile-client-membership" => |req: ReconcileArgs, _ctx| {
@@ -614,6 +633,58 @@ struct AttachSessionArgs {
     can_write: bool,
 }
 
+fn validate_rename_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("name must not be empty".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn rename_session_local(
+    selector: &WireSelector,
+    name: &str,
+) -> Result<SessionAck, RenameSessionError> {
+    let name =
+        validate_rename_name(name).map_err(|reason| RenameSessionError::InvalidName { reason })?;
+    let Some(session_selector) = selector.to_selector() else {
+        return Err(RenameSessionError::Failed {
+            reason: "selector must specify either id or name".to_string(),
+        });
+    };
+    let Some(state) = global_plugin_state_registry().get::<SessionManager>() else {
+        return Err(RenameSessionError::Failed {
+            reason: "sessions plugin state not registered".to_string(),
+        });
+    };
+    let mut manager = state.write().map_err(|_| RenameSessionError::Failed {
+        reason: "session manager lock poisoned".to_string(),
+    })?;
+    let Some(session_id) = manager
+        .list_sessions()
+        .into_iter()
+        .find(|info| matches_session_info(info, &session_selector))
+        .map(|info| info.id)
+    else {
+        return Err(RenameSessionError::NotFound);
+    };
+    manager
+        .rename_session(session_id, name.clone())
+        .map_err(|error| RenameSessionError::Failed {
+            reason: error.to_string(),
+        })?;
+    drop(manager);
+
+    let _ = global_event_bus().emit(
+        &sessions_events::EVENT_KIND,
+        SessionEvent::Renamed {
+            session_id: session_id.0,
+            name,
+        },
+    );
+    Ok(SessionAck { id: session_id.0 })
+}
+
 fn select_session_via_ipc(
     caller: &impl ServiceCaller,
     selector: &WireSelector,
@@ -764,6 +835,22 @@ impl SessionsCommandsService for SessionsCommandsHandle {
                 name: selector.name,
             };
             select_session_via_ipc(self.caller.as_ref(), &wire)
+        })
+    }
+
+    fn rename_session<'a>(
+        &'a self,
+        selector: StateSessionSelector,
+        name: String,
+    ) -> Pin<
+        Box<dyn Future<Output = std::result::Result<SessionAck, RenameSessionError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let wire = WireSelector {
+                id: selector.id,
+                name: selector.name,
+            };
+            rename_session_local(&wire, &name)
         })
     }
 
