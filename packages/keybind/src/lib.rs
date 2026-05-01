@@ -9,17 +9,8 @@ pub enum RuntimeAction {
     Quit,
     Detach,
     ToggleSplitDirection,
-    SplitFocusedVertical,
-    SplitFocusedHorizontal,
-    IncreaseSplit,
-    DecreaseSplit,
-    ResizeLeft,
-    ResizeRight,
-    ResizeUp,
-    ResizeDown,
     RestartFocusedPane,
     CloseFocusedPane,
-    ZoomPane,
     ShowHelp,
     EnterScrollMode,
     ExitScrollMode,
@@ -54,17 +45,8 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::Quit => "quit",
         RuntimeAction::Detach => "detach",
         RuntimeAction::ToggleSplitDirection => "toggle_split_direction",
-        RuntimeAction::SplitFocusedVertical => "split_focused_vertical",
-        RuntimeAction::SplitFocusedHorizontal => "split_focused_horizontal",
-        RuntimeAction::IncreaseSplit => "increase_split",
-        RuntimeAction::DecreaseSplit => "decrease_split",
-        RuntimeAction::ResizeLeft => "resize_left",
-        RuntimeAction::ResizeRight => "resize_right",
-        RuntimeAction::ResizeUp => "resize_up",
-        RuntimeAction::ResizeDown => "resize_down",
         RuntimeAction::RestartFocusedPane => "restart_focused_pane",
         RuntimeAction::CloseFocusedPane => "close_focused_pane",
-        RuntimeAction::ZoomPane => "zoom_pane",
         RuntimeAction::ShowHelp => "show_help",
         RuntimeAction::EnterScrollMode => "enter_scroll_mode",
         RuntimeAction::ExitScrollMode => "exit_scroll_mode",
@@ -145,17 +127,17 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
         "focus_up_pane" => Ok(windows_focus_command("up")),
         "focus_down_pane" => Ok(windows_focus_command("down")),
         "toggle_split_direction" => Ok(RuntimeAction::ToggleSplitDirection),
-        "split_focused_vertical" => Ok(RuntimeAction::SplitFocusedVertical),
-        "split_focused_horizontal" => Ok(RuntimeAction::SplitFocusedHorizontal),
-        "increase_split" => Ok(RuntimeAction::IncreaseSplit),
-        "decrease_split" => Ok(RuntimeAction::DecreaseSplit),
-        "resize_left" => Ok(RuntimeAction::ResizeLeft),
-        "resize_right" => Ok(RuntimeAction::ResizeRight),
-        "resize_up" => Ok(RuntimeAction::ResizeUp),
-        "resize_down" => Ok(RuntimeAction::ResizeDown),
+        "split_focused_vertical" => Ok(windows_split_command("vertical")),
+        "split_focused_horizontal" => Ok(windows_split_command("horizontal")),
+        "increase_split" => Ok(windows_resize_command("increase")),
+        "decrease_split" => Ok(windows_resize_command("decrease")),
+        "resize_left" => Ok(windows_resize_command("left")),
+        "resize_right" => Ok(windows_resize_command("right")),
+        "resize_up" => Ok(windows_resize_command("up")),
+        "resize_down" => Ok(windows_resize_command("down")),
         "restart_focused_pane" => Ok(RuntimeAction::RestartFocusedPane),
         "close_focused_pane" => Ok(RuntimeAction::CloseFocusedPane),
-        "zoom_pane" => Ok(RuntimeAction::ZoomPane),
+        "zoom_pane" => Ok(plugin_command("bmux.windows", "zoom-pane", [])),
         "show_help" => Ok(RuntimeAction::ShowHelp),
         "enter_scroll_mode" => Ok(RuntimeAction::EnterScrollMode),
         "exit_scroll_mode" => Ok(RuntimeAction::ExitScrollMode),
@@ -208,6 +190,14 @@ fn windows_focus_command(direction: &str) -> RuntimeAction {
         "focus-pane-in-direction",
         ["--direction", direction],
     )
+}
+
+fn windows_resize_command(direction: &str) -> RuntimeAction {
+    plugin_command("bmux.windows", "resize-pane", ["--direction", direction])
+}
+
+fn windows_split_command(direction: &str) -> RuntimeAction {
+    plugin_command("bmux.windows", "split-pane", ["--direction", direction])
 }
 
 fn parse_enter_mode_action(value: &str) -> Option<Result<RuntimeAction>> {
@@ -367,6 +357,56 @@ mod tests {
                 plugin_id: "bmux.windows".to_string(),
                 command_name: "focus-pane-in-direction".to_string(),
                 args: vec!["--direction".to_string(), "left".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_action_maps_legacy_resize_actions_to_plugin_commands() {
+        assert_eq!(
+            parse_action("increase_split").expect("legacy increase split action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "resize-pane".to_string(),
+                args: vec!["--direction".to_string(), "increase".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_action("resize_left").expect("legacy resize left action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "resize-pane".to_string(),
+                args: vec!["--direction".to_string(), "left".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_action_maps_legacy_split_and_zoom_actions_to_plugin_commands() {
+        assert_eq!(
+            parse_action("split_focused_vertical")
+                .expect("legacy vertical split action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "split-pane".to_string(),
+                args: vec!["--direction".to_string(), "vertical".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_action("split_focused_horizontal")
+                .expect("legacy horizontal split action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "split-pane".to_string(),
+                args: vec!["--direction".to_string(), "horizontal".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_action("zoom_pane").expect("legacy zoom action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "zoom-pane".to_string(),
+                args: Vec::new(),
             }
         );
     }

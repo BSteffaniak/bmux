@@ -6,7 +6,7 @@ use bmux_attach_layout_protocol::attach_layout_protocol::{
 use bmux_attach_layout_protocol::{
     AttachInputModeState, AttachLayer as SurfaceLayer, AttachMouseProtocolEncoding,
     AttachMouseProtocolMode, AttachMouseProtocolState, AttachRect, AttachScene, AttachSurface,
-    AttachSurfaceKind, PaneSplitDirection,
+    AttachSurfaceKind,
 };
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
@@ -185,16 +185,6 @@ const fn pane_id_windows_selector(id: Uuid) -> windows_commands::Selector {
         id: Some(id),
         name: None,
         index: None,
-    }
-}
-
-#[must_use]
-const fn ipc_split_to_windows_direction(
-    direction: PaneSplitDirection,
-) -> windows_commands::PaneDirection {
-    match direction {
-        PaneSplitDirection::Vertical => windows_commands::PaneDirection::Vertical,
-        PaneSplitDirection::Horizontal => windows_commands::PaneDirection::Horizontal,
     }
 }
 
@@ -4127,74 +4117,6 @@ pub async fn handle_attach_ui_action(
                 AttachInternalPromptAction::QuitSession,
             );
         }
-        RuntimeAction::SplitFocusedVertical => {
-            let selector = attached_session_selector(view_state);
-            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
-                client,
-                "split-pane",
-                &windows_commands::client::SplitPaneRequest {
-                    session: Some(ipc_to_windows_selector(selector)),
-                    target: None,
-                    direction: ipc_split_to_windows_direction(PaneSplitDirection::Vertical),
-                    ratio_pct: None,
-                },
-            )
-            .await?;
-        }
-        RuntimeAction::SplitFocusedHorizontal => {
-            let selector = attached_session_selector(view_state);
-            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
-                client,
-                "split-pane",
-                &windows_commands::client::SplitPaneRequest {
-                    session: Some(ipc_to_windows_selector(selector)),
-                    target: None,
-                    direction: ipc_split_to_windows_direction(PaneSplitDirection::Horizontal),
-                    ratio_pct: None,
-                },
-            )
-            .await?;
-        }
-        RuntimeAction::IncreaseSplit
-        | RuntimeAction::DecreaseSplit
-        | RuntimeAction::ResizeLeft
-        | RuntimeAction::ResizeRight
-        | RuntimeAction::ResizeUp
-        | RuntimeAction::ResizeDown => {
-            let direction = match action {
-                RuntimeAction::IncreaseSplit => {
-                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Increase
-                }
-                RuntimeAction::DecreaseSplit => {
-                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Decrease
-                }
-                RuntimeAction::ResizeLeft => {
-                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Left
-                }
-                RuntimeAction::ResizeRight => {
-                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right
-                }
-                RuntimeAction::ResizeUp => {
-                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Up
-                }
-                RuntimeAction::ResizeDown => {
-                    bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Down
-                }
-                _ => unreachable!("non-resize action reached resize dispatch"),
-            };
-            let selector = attached_session_selector(view_state);
-            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
-                client,
-                "resize-pane",
-                &windows_commands::client::ResizePaneRequest {
-                    session: Some(ipc_to_windows_selector(selector)),
-                    target: None,
-                    direction,
-                    cells: 1,
-                },
-            )
-            .await?;
-        }
         RuntimeAction::CloseFocusedPane => {
             let Some(pane_id) = focused_attach_pane_id(view_state) else {
                 view_state.set_transient_status(
@@ -4221,24 +4143,6 @@ pub async fn handle_attach_ui_action(
                     .policy(prompt::PromptPolicy::RejectIfBusy),
                 AttachInternalPromptAction::ClosePane { pane_id },
             );
-        }
-        RuntimeAction::ZoomPane => {
-            let selector = attached_session_selector(view_state);
-            let ack: bmux_windows_plugin_api::windows_commands::PaneZoomAck =
-                invoke_windows_command(
-                    client,
-                    "zoom-pane",
-                    &windows_commands::client::ZoomPaneRequest {
-                        session: Some(ipc_to_windows_selector(selector)),
-                    },
-                )
-                .await?;
-            let status = if ack.zoomed {
-                "Pane zoomed"
-            } else {
-                "Zoom exited"
-            };
-            view_state.set_transient_status(status, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
         }
         RuntimeAction::RestartFocusedPane => {
             let selector = attached_session_selector(view_state);
@@ -6090,21 +5994,26 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     for entry in effective_attach_keybindings(config) {
         let category = match &entry.action {
             RuntimeAction::Detach | RuntimeAction::Quit => "Session",
-            RuntimeAction::SplitFocusedVertical
-            | RuntimeAction::SplitFocusedHorizontal
-            | RuntimeAction::IncreaseSplit
-            | RuntimeAction::DecreaseSplit
-            | RuntimeAction::ResizeLeft
-            | RuntimeAction::ResizeRight
-            | RuntimeAction::ResizeUp
-            | RuntimeAction::ResizeDown
-            | RuntimeAction::CloseFocusedPane
-            | RuntimeAction::RestartFocusedPane => "Pane",
+            RuntimeAction::CloseFocusedPane | RuntimeAction::RestartFocusedPane => "Pane",
             RuntimeAction::PluginCommand {
                 plugin_id,
                 command_name,
                 ..
             } if plugin_id == "bmux.windows" && command_name == "focus-pane-in-direction" => "Pane",
+            RuntimeAction::PluginCommand {
+                plugin_id,
+                command_name,
+                ..
+            } if plugin_id == "bmux.windows" && command_name == "resize-pane" => "Pane",
+            RuntimeAction::PluginCommand {
+                plugin_id,
+                command_name,
+                ..
+            } if plugin_id == "bmux.windows"
+                && matches!(command_name.as_str(), "split-pane" | "zoom-pane") =>
+            {
+                "Pane"
+            }
             RuntimeAction::EnterWindowMode
             | RuntimeAction::ExitMode
             | RuntimeAction::EnterScrollMode
@@ -6214,16 +6123,7 @@ pub const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::CopyScrollback
             | RuntimeAction::ConfirmScrollback
             | RuntimeAction::PluginCommand { .. }
-            | RuntimeAction::SplitFocusedVertical
-            | RuntimeAction::SplitFocusedHorizontal
-            | RuntimeAction::IncreaseSplit
-            | RuntimeAction::DecreaseSplit
-            | RuntimeAction::ResizeLeft
-            | RuntimeAction::ResizeRight
-            | RuntimeAction::ResizeUp
-            | RuntimeAction::ResizeDown
             | RuntimeAction::CloseFocusedPane
-            | RuntimeAction::ZoomPane
             | RuntimeAction::ShowHelp
             | RuntimeAction::EnterMode(_)
     )
@@ -8688,12 +8588,6 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         | RuntimeAction::MoveCursorRight
         | RuntimeAction::MoveCursorUp
         | RuntimeAction::MoveCursorDown
-        | RuntimeAction::IncreaseSplit
-        | RuntimeAction::DecreaseSplit
-        | RuntimeAction::ResizeLeft
-        | RuntimeAction::ResizeRight
-        | RuntimeAction::ResizeUp
-        | RuntimeAction::ResizeDown
         | RuntimeAction::ForwardToPane(_) => true,
         // Plugin commands: delegate to the manifest flag.
         RuntimeAction::PluginCommand {
@@ -8705,11 +8599,8 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         RuntimeAction::Quit
         | RuntimeAction::Detach
         | RuntimeAction::ToggleSplitDirection
-        | RuntimeAction::SplitFocusedVertical
-        | RuntimeAction::SplitFocusedHorizontal
         | RuntimeAction::RestartFocusedPane
         | RuntimeAction::CloseFocusedPane
-        | RuntimeAction::ZoomPane
         | RuntimeAction::ShowHelp
         | RuntimeAction::EnterScrollMode
         | RuntimeAction::ExitScrollMode
@@ -8739,16 +8630,7 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
             args,
         },
         RuntimeAction::EnterWindowMode
-        | RuntimeAction::SplitFocusedVertical
-        | RuntimeAction::SplitFocusedHorizontal
-        | RuntimeAction::IncreaseSplit
-        | RuntimeAction::DecreaseSplit
-        | RuntimeAction::ResizeLeft
-        | RuntimeAction::ResizeRight
-        | RuntimeAction::ResizeUp
-        | RuntimeAction::ResizeDown
         | RuntimeAction::CloseFocusedPane
-        | RuntimeAction::ZoomPane
         | RuntimeAction::ExitMode
         | RuntimeAction::Quit
         | RuntimeAction::ShowHelp
@@ -8822,6 +8704,14 @@ mod tests {
         RuntimeAction::PluginCommand {
             plugin_id: "bmux.windows".to_string(),
             command_name: "focus-pane-in-direction".to_string(),
+            args: vec!["--direction".to_string(), direction.to_string()],
+        }
+    }
+
+    fn resize_action(direction: &str) -> RuntimeAction {
+        RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "resize-pane".to_string(),
             args: vec!["--direction".to_string(), direction.to_string()],
         }
     }
@@ -9413,7 +9303,7 @@ mod tests {
     #[test]
     fn action_supports_repeat_allows_navigation() {
         assert!(super::action_supports_repeat(&focus_action("next")));
-        assert!(super::action_supports_repeat(&RuntimeAction::ResizeLeft));
+        assert!(super::action_supports_repeat(&resize_action("left")));
         assert!(super::action_supports_repeat(&RuntimeAction::ScrollUpLine));
         assert!(super::action_supports_repeat(
             &RuntimeAction::ForwardToPane(b"x".to_vec())
@@ -9926,7 +9816,7 @@ mod tests {
             state_reason: None,
         });
         next.layout_root = PaneLayoutNode::Split {
-            direction: PaneSplitDirection::Vertical,
+            direction: bmux_attach_layout_protocol::PaneSplitDirection::Vertical,
             ratio_percent: 50,
             first: Box::new(PaneLayoutNode::Leaf {
                 pane_id: existing_pane,
@@ -10896,9 +10786,10 @@ mod tests {
         .expect("attach key action should parse");
         assert!(matches!(
             split_vertical.first(),
-            Some(AttachEventAction::Ui(
-                crate::input::RuntimeAction::SplitFocusedVertical
-            ))
+            Some(AttachEventAction::PluginCommand { plugin_id, command_name, args })
+                if plugin_id == "bmux.windows"
+                    && command_name == "split-pane"
+                    && args == &["--direction".to_string(), "vertical".to_string()]
         ));
 
         let quit = attach_key_event_actions(

@@ -98,6 +98,14 @@ fn windows_focus_command(direction: &str) -> String {
     format!("plugin:bmux.windows:focus-pane-in-direction --direction {direction}")
 }
 
+fn windows_resize_command(direction: &str) -> String {
+    format!("plugin:bmux.windows:resize-pane --direction {direction}")
+}
+
+fn windows_split_command(direction: &str) -> String {
+    format!("plugin:bmux.windows:split-pane --direction {direction}")
+}
+
 // ============================================================================
 // Keymap
 // ============================================================================
@@ -106,18 +114,6 @@ impl Keymap {
     pub(crate) fn default_runtime() -> Self {
         let runtime: BTreeMap<String, String> = [
             ("t", RuntimeAction::ToggleSplitDirection),
-            ("%", RuntimeAction::SplitFocusedVertical),
-            ("\"", RuntimeAction::SplitFocusedHorizontal),
-            ("plus", RuntimeAction::IncreaseSplit),
-            ("minus", RuntimeAction::DecreaseSplit),
-            ("shift+h", RuntimeAction::ResizeLeft),
-            ("shift+l", RuntimeAction::ResizeRight),
-            ("shift+k", RuntimeAction::ResizeUp),
-            ("shift+j", RuntimeAction::ResizeDown),
-            ("shift+arrow_left", RuntimeAction::ResizeLeft),
-            ("shift+arrow_right", RuntimeAction::ResizeRight),
-            ("shift+arrow_up", RuntimeAction::ResizeUp),
-            ("shift+arrow_down", RuntimeAction::ResizeDown),
             ("r", RuntimeAction::RestartFocusedPane),
             ("x", RuntimeAction::CloseFocusedPane),
             ("?", RuntimeAction::ShowHelp),
@@ -137,6 +133,8 @@ impl Keymap {
         .into_iter()
         .map(|(key, action)| (key.to_string(), action_to_name(&action).to_string()))
         .chain([
+            ("%".to_string(), windows_split_command("vertical")),
+            ("\"".to_string(), windows_split_command("horizontal")),
             ("o".to_string(), windows_focus_command("next")),
             ("h".to_string(), windows_focus_command("left")),
             ("l".to_string(), windows_focus_command("right")),
@@ -146,6 +144,25 @@ impl Keymap {
             ("arrow_right".to_string(), windows_focus_command("right")),
             ("arrow_up".to_string(), windows_focus_command("up")),
             ("arrow_down".to_string(), windows_focus_command("down")),
+            ("plus".to_string(), windows_resize_command("increase")),
+            ("minus".to_string(), windows_resize_command("decrease")),
+            ("shift+h".to_string(), windows_resize_command("left")),
+            ("shift+l".to_string(), windows_resize_command("right")),
+            ("shift+k".to_string(), windows_resize_command("up")),
+            ("shift+j".to_string(), windows_resize_command("down")),
+            (
+                "shift+arrow_left".to_string(),
+                windows_resize_command("left"),
+            ),
+            (
+                "shift+arrow_right".to_string(),
+                windows_resize_command("right"),
+            ),
+            ("shift+arrow_up".to_string(), windows_resize_command("up")),
+            (
+                "shift+arrow_down".to_string(),
+                windows_resize_command("down"),
+            ),
         ])
         .chain(std::iter::once((
             "shift+c".to_string(),
@@ -1110,6 +1127,14 @@ mod tests {
         }
     }
 
+    fn resize_action(direction: &str) -> RuntimeAction {
+        RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "resize-pane".to_string(),
+            args: vec!["--direction".to_string(), direction.to_string()],
+        }
+    }
+
     fn modal_mode(
         label: &str,
         passthrough: bool,
@@ -1333,43 +1358,43 @@ mod tests {
 
         assert_eq!(
             processor.process_chunk(&[0x01, b'H']),
-            vec![RuntimeAction::ResizeLeft]
+            vec![resize_action("left")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, b'L']),
-            vec![RuntimeAction::ResizeRight]
+            vec![resize_action("right")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, b'K']),
-            vec![RuntimeAction::ResizeUp]
+            vec![resize_action("up")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, b'J']),
-            vec![RuntimeAction::ResizeDown]
+            vec![resize_action("down")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, 0x1b, b'[', b'1', b';', b'2', b'D']),
-            vec![RuntimeAction::ResizeLeft]
+            vec![resize_action("left")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, 0x1b, b'[', b'1', b';', b'2', b'C']),
-            vec![RuntimeAction::ResizeRight]
+            vec![resize_action("right")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, 0x1b, b'[', b'1', b';', b'2', b'A']),
-            vec![RuntimeAction::ResizeUp]
+            vec![resize_action("up")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, 0x1b, b'[', b'1', b';', b'2', b'B']),
-            vec![RuntimeAction::ResizeDown]
+            vec![resize_action("down")]
         );
     }
 
     #[test]
     fn supports_literal_alias_plus_minus() {
         let runtime = runtime_bindings(&[
-            ("+", RuntimeAction::IncreaseSplit),
-            ("minus", RuntimeAction::DecreaseSplit),
+            ("+", resize_action("increase")),
+            ("minus", resize_action("decrease")),
         ]);
         let keymap = Keymap::from_parts("ctrl+a", Some(400), &runtime, &BTreeMap::new())
             .expect("valid keymap");
@@ -1377,11 +1402,11 @@ mod tests {
         let mut processor = new_processor(keymap);
         assert_eq!(
             processor.process_chunk(&[0x01, b'+']),
-            vec![RuntimeAction::IncreaseSplit]
+            vec![resize_action("increase")]
         );
         assert_eq!(
             processor.process_chunk(&[0x01, b'-']),
-            vec![RuntimeAction::DecreaseSplit]
+            vec![resize_action("decrease")]
         );
     }
 
@@ -1645,7 +1670,11 @@ mod tests {
         );
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('%'), KeyModifiers::SHIFT)),
-            vec![RuntimeAction::SplitFocusedVertical]
+            vec![RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "split-pane".to_string(),
+                args: vec!["--direction".to_string(), "vertical".to_string()],
+            }]
         );
 
         assert_eq!(
@@ -1654,7 +1683,11 @@ mod tests {
         );
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('"'), KeyModifiers::SHIFT)),
-            vec![RuntimeAction::SplitFocusedHorizontal]
+            vec![RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "split-pane".to_string(),
+                args: vec!["--direction".to_string(), "horizontal".to_string()],
+            }]
         );
     }
 

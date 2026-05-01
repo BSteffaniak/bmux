@@ -3237,42 +3237,6 @@ async fn apply_attach_runtime_actions(
             crate::input::RuntimeAction::Detach => {
                 bail!("attach input requested detach; unsupported inside playbook step")
             }
-            crate::input::RuntimeAction::SplitFocusedVertical => {
-                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
-                    client,
-                    "split-pane",
-                    &windows_commands::client::SplitPaneRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                        target: None,
-                        direction: ipc_split_to_windows_direction(
-                            PaneSplitDirection::Vertical,
-                        ),
-                        ratio_pct: None,
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("split focused vertical failed: {e}"))?;
-            }
-            crate::input::RuntimeAction::SplitFocusedHorizontal => {
-                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
-                    client,
-                    "split-pane",
-                    &windows_commands::client::SplitPaneRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                        target: None,
-                        direction: ipc_split_to_windows_direction(
-                            PaneSplitDirection::Horizontal,
-                        ),
-                        ratio_pct: None,
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("split focused horizontal failed: {e}"))?;
-            }
             crate::input::RuntimeAction::CloseFocusedPane => {
                 invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
                     client,
@@ -3285,64 +3249,6 @@ async fn apply_attach_runtime_actions(
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("close focused pane failed: {e}"))?;
-            }
-            crate::input::RuntimeAction::ZoomPane => {
-                invoke_windows_command_bmux::<
-                    _,
-                    bmux_windows_plugin_api::windows_commands::PaneZoomAck,
-                >(
-                    client,
-                    "zoom-pane",
-                    &windows_commands::client::ZoomPaneRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("zoom pane failed: {e}"))?;
-            }
-            crate::input::RuntimeAction::IncreaseSplit
-            | crate::input::RuntimeAction::DecreaseSplit
-            | crate::input::RuntimeAction::ResizeLeft
-            | crate::input::RuntimeAction::ResizeRight
-            | crate::input::RuntimeAction::ResizeUp
-            | crate::input::RuntimeAction::ResizeDown => {
-                let direction = match runtime_action {
-                    crate::input::RuntimeAction::IncreaseSplit => {
-                        bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Increase
-                    }
-                    crate::input::RuntimeAction::DecreaseSplit => {
-                        bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Decrease
-                    }
-                    crate::input::RuntimeAction::ResizeLeft => {
-                        bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Left
-                    }
-                    crate::input::RuntimeAction::ResizeRight => {
-                        bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right
-                    }
-                    crate::input::RuntimeAction::ResizeUp => {
-                        bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Up
-                    }
-                    crate::input::RuntimeAction::ResizeDown => {
-                        bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Down
-                    }
-                    _ => unreachable!("non-resize action reached resize dispatch"),
-                };
-                invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::PaneAck>(
-                    client,
-                    "resize-pane",
-                    &windows_commands::client::ResizePaneRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(
-                            runtime.state.attached_id,
-                        ))),
-                        target: None,
-                        direction,
-                        cells: 1,
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("resize pane failed: {e}"))?;
             }
             crate::input::RuntimeAction::EnterScrollMode => {
                 runtime.state.scrollback_active = true;

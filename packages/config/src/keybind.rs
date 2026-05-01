@@ -107,14 +107,9 @@ impl ResolvedTimeout {
 }
 
 fn default_global_runtime_bindings() -> BTreeMap<String, String> {
-    let mut map = action_bindings(&[
-        // Resize
-        ("alt+plus", RuntimeAction::IncreaseSplit),
-        ("alt+=", RuntimeAction::IncreaseSplit),
-        ("alt+minus", RuntimeAction::DecreaseSplit),
-        // New pane
-        ("alt+n", RuntimeAction::SplitFocusedHorizontal),
-    ]);
+    let mut map = BTreeMap::new();
+    // New pane
+    map.insert("alt+n".to_string(), windows_split_command("horizontal"));
     map.insert(
         "ctrl+alt+t".to_string(),
         "plugin:bmux.theme:pick-theme".to_string(),
@@ -130,6 +125,9 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
     map.insert("ctrl+k".to_string(), windows_focus_command("prev"));
     map.insert("ctrl+t".to_string(), windows_focus_command("prev"));
     map.insert("alt+t".to_string(), windows_focus_command("next"));
+    map.insert("alt+plus".to_string(), windows_resize_command("increase"));
+    map.insert("alt+=".to_string(), windows_resize_command("increase"));
+    map.insert("alt+minus".to_string(), windows_resize_command("decrease"));
     // Last-window toggle (ctrl+o). The windows plugin owns all tab
     // navigation; this key binds to `last-window` (tmux's convention
     // for "jump back to the previous window").
@@ -178,21 +176,8 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
 fn default_runtime_bindings() -> BTreeMap<String, String> {
     let mut map = action_bindings(&[
         ("t", RuntimeAction::ToggleSplitDirection),
-        ("%", RuntimeAction::SplitFocusedVertical),
-        ("\"", RuntimeAction::SplitFocusedHorizontal),
-        ("plus", RuntimeAction::IncreaseSplit),
-        ("minus", RuntimeAction::DecreaseSplit),
-        ("shift+h", RuntimeAction::ResizeLeft),
-        ("shift+l", RuntimeAction::ResizeRight),
-        ("shift+k", RuntimeAction::ResizeUp),
-        ("shift+j", RuntimeAction::ResizeDown),
-        ("shift+arrow_left", RuntimeAction::ResizeLeft),
-        ("shift+arrow_right", RuntimeAction::ResizeRight),
-        ("shift+arrow_up", RuntimeAction::ResizeUp),
-        ("shift+arrow_down", RuntimeAction::ResizeDown),
         ("r", RuntimeAction::RestartFocusedPane),
         ("x", RuntimeAction::CloseFocusedPane),
-        ("z", RuntimeAction::ZoomPane),
         ("?", RuntimeAction::ShowHelp),
         ("[", RuntimeAction::EnterScrollMode),
         ("]", RuntimeAction::ExitScrollMode),
@@ -206,6 +191,9 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
         ("d", RuntimeAction::Detach),
         ("q", RuntimeAction::Quit),
     ]);
+    map.insert("%".to_string(), windows_split_command("vertical"));
+    map.insert("\"".to_string(), windows_split_command("horizontal"));
+    map.insert("z".to_string(), "plugin:bmux.windows:zoom-pane".to_string());
     map.insert("o".to_string(), windows_focus_command("next"));
     map.insert("h".to_string(), windows_focus_command("left"));
     map.insert("l".to_string(), windows_focus_command("right"));
@@ -215,6 +203,25 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     map.insert("arrow_right".to_string(), windows_focus_command("right"));
     map.insert("arrow_up".to_string(), windows_focus_command("up"));
     map.insert("arrow_down".to_string(), windows_focus_command("down"));
+    map.insert("plus".to_string(), windows_resize_command("increase"));
+    map.insert("minus".to_string(), windows_resize_command("decrease"));
+    map.insert("shift+h".to_string(), windows_resize_command("left"));
+    map.insert("shift+l".to_string(), windows_resize_command("right"));
+    map.insert("shift+k".to_string(), windows_resize_command("up"));
+    map.insert("shift+j".to_string(), windows_resize_command("down"));
+    map.insert(
+        "shift+arrow_left".to_string(),
+        windows_resize_command("left"),
+    );
+    map.insert(
+        "shift+arrow_right".to_string(),
+        windows_resize_command("right"),
+    );
+    map.insert("shift+arrow_up".to_string(), windows_resize_command("up"));
+    map.insert(
+        "shift+arrow_down".to_string(),
+        windows_resize_command("down"),
+    );
     // Window prev/next: (, ) bind via the windows plugin so the tab
     // bar and navigation stay in lockstep on whatever ordering the
     // plugin owns.
@@ -277,6 +284,14 @@ fn action_bindings(pairs: &[(&str, RuntimeAction)]) -> BTreeMap<String, String> 
 
 fn windows_focus_command(direction: &str) -> String {
     format!("plugin:bmux.windows:focus-pane-in-direction --direction {direction}")
+}
+
+fn windows_resize_command(direction: &str) -> String {
+    format!("plugin:bmux.windows:resize-pane --direction {direction}")
+}
+
+fn windows_split_command(direction: &str) -> String {
+    format!("plugin:bmux.windows:split-pane --direction {direction}")
 }
 
 impl KeyBindingConfig {
