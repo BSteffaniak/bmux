@@ -272,14 +272,142 @@ pub struct PlaybookRenderRowSegmentRef {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum PlaybookRenderTraceOp {
     FullFrame,
+    ClearRow {
+        row: u16,
+        cells: u16,
+    },
+    PaneRowFull {
+        pane: u32,
+        row: u16,
+        cells: u16,
+    },
     PaneRowSegment {
         pane: u32,
         row: u16,
         start_col: u16,
         cells: u16,
     },
+    PaneRowCacheSkip {
+        pane: u32,
+        row: u16,
+    },
+    PaneRowsSyncDeferred {
+        pane: u32,
+        rows: u16,
+    },
+    ExtensionOps {
+        surface: u32,
+        regions: u16,
+        full_surface: bool,
+    },
+    ExtensionCachedReplay {
+        surface: u32,
+    },
+    ExtensionImperative {
+        surface: u32,
+        regions: u16,
+        full_surface: bool,
+    },
     StatusLine,
+    HelpOverlay,
+    PromptOverlay,
+    DamageOverlay {
+        rects: u16,
+        cells: u64,
+    },
+    Cursor {
+        pane: u32,
+        visible: bool,
+    },
     Overlay,
+}
+
+impl PlaybookRenderTraceOp {
+    /// Parse the compact semantic render-trace operation used by DSL/TOML assertions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a string describing the invalid field when `entry` is not a supported compact
+    /// operation or one of its numeric/boolean fields cannot be parsed.
+    pub fn parse_compact(entry: &str) -> Result<Self, String> {
+        if entry == "full-frame" {
+            return Ok(Self::FullFrame);
+        }
+        if entry == "status-line" {
+            return Ok(Self::StatusLine);
+        }
+        if entry == "help-overlay" {
+            return Ok(Self::HelpOverlay);
+        }
+        if entry == "prompt-overlay" {
+            return Ok(Self::PromptOverlay);
+        }
+        if entry == "overlay" {
+            return Ok(Self::Overlay);
+        }
+        let parts = entry.split(':').collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["clear-row", row, cells] => Ok(Self::ClearRow {
+                row: parse_trace_part(row, "row")?,
+                cells: parse_trace_part(cells, "cells")?,
+            }),
+            ["pane-row-full", pane, row, cells] => Ok(Self::PaneRowFull {
+                pane: parse_trace_part(pane, "pane")?,
+                row: parse_trace_part(row, "row")?,
+                cells: parse_trace_part(cells, "cells")?,
+            }),
+            ["pane-row-segment", pane, row, start_col, cells] => Ok(Self::PaneRowSegment {
+                pane: parse_trace_part(pane, "pane")?,
+                row: parse_trace_part(row, "row")?,
+                start_col: parse_trace_part(start_col, "start_col")?,
+                cells: parse_trace_part(cells, "cells")?,
+            }),
+            ["pane-row-cache-skip", pane, row] => Ok(Self::PaneRowCacheSkip {
+                pane: parse_trace_part(pane, "pane")?,
+                row: parse_trace_part(row, "row")?,
+            }),
+            ["pane-rows-sync-deferred", pane, rows] => Ok(Self::PaneRowsSyncDeferred {
+                pane: parse_trace_part(pane, "pane")?,
+                rows: parse_trace_part(rows, "rows")?,
+            }),
+            ["extension-ops", surface, regions, full_surface] => Ok(Self::ExtensionOps {
+                surface: parse_trace_part(surface, "surface")?,
+                regions: parse_trace_part(regions, "regions")?,
+                full_surface: parse_trace_part(full_surface, "full_surface")?,
+            }),
+            ["extension-cached-replay", surface] => Ok(Self::ExtensionCachedReplay {
+                surface: parse_trace_part(surface, "surface")?,
+            }),
+            ["extension-imperative", surface, regions, full_surface] => {
+                Ok(Self::ExtensionImperative {
+                    surface: parse_trace_part(surface, "surface")?,
+                    regions: parse_trace_part(regions, "regions")?,
+                    full_surface: parse_trace_part(full_surface, "full_surface")?,
+                })
+            }
+            ["damage-overlay", rects, cells] => Ok(Self::DamageOverlay {
+                rects: parse_trace_part(rects, "rects")?,
+                cells: parse_trace_part(cells, "cells")?,
+            }),
+            ["cursor", pane, visible] => Ok(Self::Cursor {
+                pane: parse_trace_part(pane, "pane")?,
+                visible: parse_trace_part(visible, "visible")?,
+            }),
+            _ => Err(format!(
+                "invalid render trace op '{entry}', expected a compact semantic render op"
+            )),
+        }
+    }
+}
+
+fn parse_trace_part<T>(value: &str, name: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    value
+        .parse()
+        .map_err(|error| format!("invalid trace op {name}: {error}"))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -690,13 +818,46 @@ pub fn render_trace_ops_to_dsl(ops: &[PlaybookRenderTraceOp]) -> String {
     ops.iter()
         .map(|op| match *op {
             PlaybookRenderTraceOp::FullFrame => "full-frame".to_string(),
+            PlaybookRenderTraceOp::ClearRow { row, cells } => {
+                format!("clear-row:{row}:{cells}")
+            }
+            PlaybookRenderTraceOp::PaneRowFull { pane, row, cells } => {
+                format!("pane-row-full:{pane}:{row}:{cells}")
+            }
             PlaybookRenderTraceOp::PaneRowSegment {
                 pane,
                 row,
                 start_col,
                 cells,
             } => format!("pane-row-segment:{pane}:{row}:{start_col}:{cells}"),
+            PlaybookRenderTraceOp::PaneRowCacheSkip { pane, row } => {
+                format!("pane-row-cache-skip:{pane}:{row}")
+            }
+            PlaybookRenderTraceOp::PaneRowsSyncDeferred { pane, rows } => {
+                format!("pane-rows-sync-deferred:{pane}:{rows}")
+            }
+            PlaybookRenderTraceOp::ExtensionOps {
+                surface,
+                regions,
+                full_surface,
+            } => format!("extension-ops:{surface}:{regions}:{full_surface}"),
+            PlaybookRenderTraceOp::ExtensionCachedReplay { surface } => {
+                format!("extension-cached-replay:{surface}")
+            }
+            PlaybookRenderTraceOp::ExtensionImperative {
+                surface,
+                regions,
+                full_surface,
+            } => format!("extension-imperative:{surface}:{regions}:{full_surface}"),
             PlaybookRenderTraceOp::StatusLine => "status-line".to_string(),
+            PlaybookRenderTraceOp::HelpOverlay => "help-overlay".to_string(),
+            PlaybookRenderTraceOp::PromptOverlay => "prompt-overlay".to_string(),
+            PlaybookRenderTraceOp::DamageOverlay { rects, cells } => {
+                format!("damage-overlay:{rects}:{cells}")
+            }
+            PlaybookRenderTraceOp::Cursor { pane, visible } => {
+                format!("cursor:{pane}:{visible}")
+            }
             PlaybookRenderTraceOp::Overlay => "overlay".to_string(),
         })
         .collect::<Vec<_>>()
@@ -1136,6 +1297,8 @@ mod tests {
                         start_col: 3,
                         cells: 5,
                     },
+                    PlaybookRenderTraceOp::HelpOverlay,
+                    PlaybookRenderTraceOp::ExtensionCachedReplay { surface: 2 },
                 ]),
                 ..RenderAssertion::default()
             },
@@ -1173,6 +1336,8 @@ mod tests {
                             start_col: 3,
                             cells: 5,
                         },
+                        PlaybookRenderTraceOp::HelpOverlay,
+                        PlaybookRenderTraceOp::ExtensionCachedReplay { surface: 2 },
                     ])
                 );
             }

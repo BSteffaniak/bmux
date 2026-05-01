@@ -2,11 +2,15 @@
 //!
 //! Orchestrates the full lifecycle: parse → sandbox → execute steps → report.
 
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bmux_attach_layout_protocol::{PaneSelector, PaneSplitDirection};
+use bmux_attach_pipeline::{
+    AttachRenderTrace, AttachRenderTraceOp as AttachTraceOp, AttachSceneRenderStats,
+};
 use bmux_client::BmuxClient;
 use bmux_contexts_plugin_api::contexts_state;
 use bmux_ipc::InvokeServiceKind;
@@ -777,6 +781,217 @@ const fn render_segment_ref_to_trace_op(
         start_col: segment.start_col,
         cells: segment.cells,
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlaybookAttachRenderFrameFacts {
+    pub scene_render: AttachSceneRenderStats,
+    pub frame_bytes: usize,
+    pub damage_rects: usize,
+    pub damage_area_cells: u64,
+    pub full_surface_fallbacks: usize,
+    pub full_frame_fallback: bool,
+    pub status_rendered: bool,
+    pub overlay_rendered: bool,
+}
+
+#[must_use]
+pub fn summarize_attach_render_trace(
+    trace: &AttachRenderTrace,
+    facts: PlaybookAttachRenderFrameFacts,
+    surface_pane_indexes: &BTreeMap<usize, u32>,
+) -> PlaybookRenderSummary {
+    let stats = facts.scene_render;
+    let mut summary = PlaybookRenderSummary {
+        frames: u64::from(attach_render_facts_has_frame(trace, facts)),
+        full_frame_frames: u64::from(facts.full_frame_fallback || stats.full_frame),
+        full_surface_fallbacks: u64::try_from(facts.full_surface_fallbacks).unwrap_or(u64::MAX),
+        damage_rects: u64::try_from(facts.damage_rects).unwrap_or(u64::MAX),
+        damage_area_cells: facts.damage_area_cells,
+        rows_emitted: stats.pane_rows_emitted,
+        row_segments_emitted: stats.pane_row_segments_emitted,
+        cells_emitted: stats.pane_cells_emitted,
+        frame_bytes: u64::try_from(facts.frame_bytes).unwrap_or(u64::MAX),
+        status_rendered_frames: u64::from(facts.status_rendered),
+        overlay_rendered_frames: u64::from(facts.overlay_rendered),
+        ..PlaybookRenderSummary::default()
+    };
+    if facts.full_frame_fallback || stats.full_frame {
+        summary.trace_ops.push(PlaybookRenderTraceOp::FullFrame);
+    }
+    for op in trace.ops() {
+        record_attach_trace_op(&mut summary, *op, surface_pane_indexes);
+    }
+    summary
+}
+
+fn attach_render_facts_has_frame(
+    trace: &AttachRenderTrace,
+    facts: PlaybookAttachRenderFrameFacts,
+) -> bool {
+    facts.frame_bytes > 0
+        || facts.full_frame_fallback
+        || facts.status_rendered
+        || facts.overlay_rendered
+        || facts.scene_render.full_frame
+        || facts.scene_render.pane_rows_examined > 0
+        || facts.scene_render.extension_render_calls > 0
+        || !trace.ops().is_empty()
+}
+
+fn record_attach_trace_op(
+    summary: &mut PlaybookRenderSummary,
+    op: AttachTraceOp,
+    surface_pane_indexes: &BTreeMap<usize, u32>,
+) {
+    let trace_op = match op {
+        AttachTraceOp::ClearRow { row, cells } => PlaybookRenderTraceOp::ClearRow { row, cells },
+        AttachTraceOp::PaneRowFull {
+            surface_index,
+            row,
+            cells,
+        } => record_attach_trace_pane_row_full(
+            summary,
+            surface_pane_indexes,
+            surface_index,
+            row,
+            cells,
+        ),
+        AttachTraceOp::PaneRowSegment {
+            surface_index,
+            row,
+            start_col,
+            cells,
+        } => record_attach_trace_pane_row_segment(
+            summary,
+            surface_pane_indexes,
+            surface_index,
+            row,
+            start_col,
+            cells,
+        ),
+        AttachTraceOp::PaneRowCacheSkip { surface_index, row } => {
+            PlaybookRenderTraceOp::PaneRowCacheSkip {
+                pane: trace_surface_pane(surface_pane_indexes, surface_index),
+                row,
+            }
+        }
+        AttachTraceOp::PaneRowsSyncDeferred {
+            surface_index,
+            rows,
+        } => PlaybookRenderTraceOp::PaneRowsSyncDeferred {
+            pane: trace_surface_pane(surface_pane_indexes, surface_index),
+            rows,
+        },
+        AttachTraceOp::ExtensionOps {
+            surface_index,
+            regions,
+            full_surface,
+        } => PlaybookRenderTraceOp::ExtensionOps {
+            surface: trace_surface_index(surface_index),
+            regions,
+            full_surface,
+        },
+        AttachTraceOp::ExtensionCachedReplay { surface_index } => {
+            PlaybookRenderTraceOp::ExtensionCachedReplay {
+                surface: trace_surface_index(surface_index),
+            }
+        }
+        AttachTraceOp::ExtensionImperative {
+            surface_index,
+            regions,
+            full_surface,
+        } => PlaybookRenderTraceOp::ExtensionImperative {
+            surface: trace_surface_index(surface_index),
+            regions,
+            full_surface,
+        },
+        AttachTraceOp::StatusLine { .. } => {
+            summary.status_rendered_frames = 1;
+            PlaybookRenderTraceOp::StatusLine
+        }
+        AttachTraceOp::HelpOverlay { .. } => {
+            summary.overlay_rendered_frames = 1;
+            PlaybookRenderTraceOp::HelpOverlay
+        }
+        AttachTraceOp::PromptOverlay { .. } => {
+            summary.overlay_rendered_frames = 1;
+            PlaybookRenderTraceOp::PromptOverlay
+        }
+        AttachTraceOp::DamageOverlay { rects, cells } => {
+            summary.overlay_rendered_frames = 1;
+            PlaybookRenderTraceOp::DamageOverlay { rects, cells }
+        }
+        AttachTraceOp::Cursor {
+            surface_index,
+            visible,
+        } => PlaybookRenderTraceOp::Cursor {
+            pane: trace_surface_pane(surface_pane_indexes, surface_index),
+            visible,
+        },
+    };
+    summary.trace_ops.push(trace_op);
+}
+
+fn record_attach_trace_pane_row_full(
+    summary: &mut PlaybookRenderSummary,
+    surface_pane_indexes: &BTreeMap<usize, u32>,
+    surface_index: usize,
+    row: u16,
+    cells: u16,
+) -> PlaybookRenderTraceOp {
+    let pane = trace_surface_pane(surface_pane_indexes, surface_index);
+    summary
+        .emitted_rows
+        .push(PlaybookRenderRowRef { pane, row });
+    summary
+        .emitted_row_segments
+        .push(PlaybookRenderRowSegmentRef {
+            pane,
+            row,
+            start_col: 0,
+            cells,
+        });
+    PlaybookRenderTraceOp::PaneRowFull { pane, row, cells }
+}
+
+fn record_attach_trace_pane_row_segment(
+    summary: &mut PlaybookRenderSummary,
+    surface_pane_indexes: &BTreeMap<usize, u32>,
+    surface_index: usize,
+    row: u16,
+    start_col: u16,
+    cells: u16,
+) -> PlaybookRenderTraceOp {
+    let pane = trace_surface_pane(surface_pane_indexes, surface_index);
+    summary
+        .emitted_rows
+        .push(PlaybookRenderRowRef { pane, row });
+    summary
+        .emitted_row_segments
+        .push(PlaybookRenderRowSegmentRef {
+            pane,
+            row,
+            start_col,
+            cells,
+        });
+    PlaybookRenderTraceOp::PaneRowSegment {
+        pane,
+        row,
+        start_col,
+        cells,
+    }
+}
+
+fn trace_surface_pane(surface_pane_indexes: &BTreeMap<usize, u32>, surface_index: usize) -> u32 {
+    surface_pane_indexes
+        .get(&surface_index)
+        .copied()
+        .unwrap_or_else(|| trace_surface_index(surface_index))
+}
+
+fn trace_surface_index(surface_index: usize) -> u32 {
+    u32::try_from(surface_index).unwrap_or(u32::MAX)
 }
 
 fn new_pane_render_rows(
@@ -3884,6 +4099,83 @@ mod tests {
         assert!(
             error.to_string().contains("expected_trace_ops expected"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn attach_trace_summary_records_actual_semantic_ops() {
+        let mut trace = AttachRenderTrace::new();
+        trace.push(AttachTraceOp::StatusLine { row: 23, cells: 80 });
+        trace.push(AttachTraceOp::PaneRowSegment {
+            surface_index: 0,
+            row: 2,
+            start_col: 4,
+            cells: 6,
+        });
+        trace.push(AttachTraceOp::ExtensionCachedReplay { surface_index: 2 });
+        trace.push(AttachTraceOp::HelpOverlay {
+            rows: 3,
+            cells: 120,
+        });
+        trace.push(AttachTraceOp::Cursor {
+            surface_index: 0,
+            visible: true,
+        });
+        let mut surface_panes = BTreeMap::new();
+        surface_panes.insert(0, 1);
+        let summary = summarize_attach_render_trace(
+            &trace,
+            PlaybookAttachRenderFrameFacts {
+                scene_render: AttachSceneRenderStats {
+                    pane_row_segments_emitted: 1,
+                    pane_cells_emitted: 6,
+                    extension_cache_hits: 1,
+                    ..AttachSceneRenderStats::default()
+                },
+                frame_bytes: 256,
+                damage_rects: 2,
+                damage_area_cells: 12,
+                full_surface_fallbacks: 1,
+                ..PlaybookAttachRenderFrameFacts::default()
+            },
+            &surface_panes,
+        );
+
+        assert_eq!(summary.frames, 1);
+        assert_eq!(summary.row_segments_emitted, 1);
+        assert_eq!(summary.cells_emitted, 6);
+        assert_eq!(summary.frame_bytes, 256);
+        assert_eq!(summary.damage_rects, 2);
+        assert_eq!(summary.damage_area_cells, 12);
+        assert_eq!(summary.full_surface_fallbacks, 1);
+        assert_eq!(summary.status_rendered_frames, 1);
+        assert_eq!(summary.overlay_rendered_frames, 1);
+        assert_eq!(
+            summary.emitted_row_segments,
+            vec![PlaybookRenderRowSegmentRef {
+                pane: 1,
+                row: 2,
+                start_col: 4,
+                cells: 6,
+            }]
+        );
+        assert_eq!(
+            summary.trace_ops,
+            vec![
+                PlaybookRenderTraceOp::StatusLine,
+                PlaybookRenderTraceOp::PaneRowSegment {
+                    pane: 1,
+                    row: 2,
+                    start_col: 4,
+                    cells: 6,
+                },
+                PlaybookRenderTraceOp::ExtensionCachedReplay { surface: 2 },
+                PlaybookRenderTraceOp::HelpOverlay,
+                PlaybookRenderTraceOp::Cursor {
+                    pane: 1,
+                    visible: true,
+                },
+            ]
         );
     }
 

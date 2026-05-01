@@ -320,31 +320,7 @@ fn parse_render_row_segment_refs_toml(
 
 fn parse_render_trace_ops_toml(ops: &[String]) -> Result<Vec<PlaybookRenderTraceOp>> {
     ops.iter()
-        .map(|entry| {
-            if entry == "full-frame" {
-                return Ok(PlaybookRenderTraceOp::FullFrame);
-            }
-            if entry == "status-line" {
-                return Ok(PlaybookRenderTraceOp::StatusLine);
-            }
-            if entry == "overlay" {
-                return Ok(PlaybookRenderTraceOp::Overlay);
-            }
-            let parts = entry.split(':').collect::<Vec<_>>();
-            if parts.len() == 5 && parts[0] == "pane-row-segment" {
-                return Ok(PlaybookRenderTraceOp::PaneRowSegment {
-                    pane: parts[1].parse().context("invalid trace op pane")?,
-                    row: parts[2].parse().context("invalid trace op row")?,
-                    start_col: parts[3]
-                        .parse()
-                        .context("invalid trace op start_col")?,
-                    cells: parts[4].parse().context("invalid trace op cells")?,
-                });
-            }
-            bail!(
-                "invalid render trace op '{entry}', expected full-frame, status-line, overlay, or pane-row-segment:pane:row:start_col:cells"
-            )
-        })
+        .map(|entry| PlaybookRenderTraceOp::parse_compact(entry).map_err(anyhow::Error::msg))
         .collect()
 }
 
@@ -539,7 +515,7 @@ id = "baseline"
 [[step]]
 action = "assert-render"
 since = "baseline"
-expected_trace_ops = ["full-frame", "pane-row-segment:1:2:3:4"]
+expected_trace_ops = ["full-frame", "pane-row-segment:1:2:3:4", "prompt-overlay", "cursor:1:true"]
 "#;
         let (playbook, _includes) = parse_toml(input).unwrap();
         match &playbook.steps[1].action {
@@ -552,6 +528,11 @@ expected_trace_ops = ["full-frame", "pane-row-segment:1:2:3:4"]
                         row: 2,
                         start_col: 3,
                         cells: 4,
+                    },
+                    PlaybookRenderTraceOp::PromptOverlay,
+                    PlaybookRenderTraceOp::Cursor {
+                        pane: 1,
+                        visible: true,
                     },
                 ])
             ),
