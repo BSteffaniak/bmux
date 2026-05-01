@@ -299,6 +299,7 @@ mod tests {
                 required_capabilities: vec!["bmux.commands".to_string()],
                 provided_capabilities: vec!["bmux.example.read".to_string()],
                 commands: vec!["status".to_string(), "run".to_string()],
+                command_schemas: Vec::new(),
             }],
             host: HostMetadata {
                 product_name: "bmux".to_string(),

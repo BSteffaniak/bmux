@@ -2,7 +2,7 @@ use super::render::{AttachLayer, AttachLayerSurface, opaque_row_text, queue_laye
 use super::state::{AttachCursorState, PaneRect};
 use crate::runtime::prompt::{
     PromptField, PromptFormField, PromptFormFieldKind, PromptFormValue, PromptHostRequest,
-    PromptPolicy, PromptRequest, PromptResponse, PromptValue,
+    PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValue,
 };
 use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::{
@@ -81,6 +81,11 @@ enum PromptWidgetState {
         selected: usize,
         scroll: usize,
     },
+    SearchSelect {
+        query: String,
+        selected: usize,
+        scroll: usize,
+    },
     MultiToggle {
         cursor: usize,
         selected: BTreeSet<usize>,
@@ -127,6 +132,22 @@ impl ActivePrompt {
                     (*default_index).min(options.len().saturating_sub(1))
                 };
                 PromptWidgetState::SingleSelect {
+                    selected,
+                    scroll: 0,
+                }
+            }
+            PromptField::SearchSelect {
+                options,
+                default_index,
+                ..
+            } => {
+                let selected = if options.is_empty() {
+                    0
+                } else {
+                    (*default_index).min(options.len().saturating_sub(1))
+                };
+                PromptWidgetState::SearchSelect {
+                    query: String::new(),
                     selected,
                     scroll: 0,
                 }
@@ -194,6 +215,9 @@ impl AttachPromptState {
             PromptField::TextInput { .. } => "Prompt | type text | Enter submit | Esc cancel",
             PromptField::SingleSelect { .. } => {
                 "Prompt | Up/Down choose | Enter submit | Esc cancel"
+            }
+            PromptField::SearchSelect { .. } => {
+                "Prompt | type to search | Up/Down choose | Enter submit | Esc cancel"
             }
             PromptField::MultiToggle { .. } => {
                 "Prompt | Up/Down move | Space toggle | Enter submit | Esc cancel"
@@ -325,7 +349,8 @@ impl AttachPromptState {
                             *error = Some("value is required".to_string());
                             return PromptKeyDisposition::Consumed;
                         }
-                        if let Some(rule) = validation
+                        if (!value.trim().is_empty() || *required)
+                            && let Some(rule) = validation
                             && let Err(msg) = run_prompt_validation(rule, value)
                         {
                             *error = Some(msg);
@@ -379,6 +404,90 @@ impl AttachPromptState {
                         *scroll = (*scroll).min(*selected);
                         if *live_preview && *selected != previous_selected {
                             emit_selection_changed(&active.envelope, *selected);
+                        }
+                    }
+                }
+                (
+                    PromptField::SearchSelect {
+                        options,
+                        live_preview,
+                        ..
+                    },
+                    PromptWidgetState::SearchSelect {
+                        query,
+                        selected,
+                        scroll,
+                    },
+                ) => {
+                    let previous_selected_value = filtered_option_indices(options, query)
+                        .get(*selected)
+                        .and_then(|index| options.get(*index))
+                        .map(|option| option.value.clone());
+                    match key.code {
+                        KeyCode::Char(ch)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            query.push(ch);
+                            *selected = 0;
+                            *scroll = 0;
+                        }
+                        KeyCode::Backspace => {
+                            query.pop();
+                            *selected = 0;
+                            *scroll = 0;
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            query.clear();
+                            *selected = 0;
+                            *scroll = 0;
+                        }
+                        KeyCode::Up | KeyCode::Char('p')
+                            if matches!(key.code, KeyCode::Up)
+                                || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            *selected = selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('n')
+                            if matches!(key.code, KeyCode::Down)
+                                || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let len = filtered_option_indices(options, query).len();
+                            *selected = selected.saturating_add(1).min(len.saturating_sub(1));
+                        }
+                        KeyCode::Home => {
+                            *selected = 0;
+                        }
+                        KeyCode::End => {
+                            let len = filtered_option_indices(options, query).len();
+                            *selected = len.saturating_sub(1);
+                        }
+                        KeyCode::Enter => {
+                            let filtered = filtered_option_indices(options, query);
+                            if let Some(option) = filtered
+                                .get(*selected)
+                                .and_then(|index| options.get(*index))
+                            {
+                                completion = Some(PromptResponse::Submitted(PromptValue::Single(
+                                    option.value.clone(),
+                                )));
+                            }
+                        }
+                        _ => {}
+                    }
+                    let filtered = filtered_option_indices(options, query);
+                    *selected = (*selected).min(filtered.len().saturating_sub(1));
+                    *scroll = (*scroll).min(*selected);
+                    if *live_preview {
+                        let selected_value = filtered
+                            .get(*selected)
+                            .and_then(|index| options.get(*index))
+                            .map(|option| option.value.clone());
+                        if selected_value != previous_selected_value
+                            && let Some(option_index) = filtered.get(*selected)
+                        {
+                            emit_selection_changed(&active.envelope, *option_index);
                         }
                     }
                 }
@@ -774,7 +883,8 @@ fn emit_selection_changed(envelope: &AttachPromptEnvelope, selected: usize) {
     else {
         return;
     };
-    if let PromptField::SingleSelect { options, .. } = &envelope.request.field
+    if let PromptField::SingleSelect { options, .. } | PromptField::SearchSelect { options, .. } =
+        &envelope.request.field
         && let Some(option) = options.get(selected)
     {
         let _ = event_tx.send(crate::runtime::prompt::PromptEvent::SelectionChanged {
@@ -938,7 +1048,9 @@ fn validate_form_field(
             if field.required && value.trim().is_empty() {
                 return Err("value is required".to_string());
             }
-            if let Some(rule) = validation {
+            if (!value.trim().is_empty() || field.required)
+                && let Some(rule) = validation
+            {
                 run_prompt_validation(rule, value)?;
             }
         }
@@ -1111,7 +1223,9 @@ fn prompt_estimated_width(request: &PromptRequest) -> usize {
                     .saturating_add(4),
             );
         }
-        PromptField::SingleSelect { options, .. } | PromptField::MultiToggle { options, .. } => {
+        PromptField::SingleSelect { options, .. }
+        | PromptField::SearchSelect { options, .. }
+        | PromptField::MultiToggle { options, .. } => {
             for option in options {
                 width = width.max(option.label.chars().count().saturating_add(6));
             }
@@ -1140,6 +1254,7 @@ fn prompt_estimated_lines(request: &PromptRequest) -> usize {
         PromptField::SingleSelect { options, .. } | PromptField::MultiToggle { options, .. } => {
             options.len().max(1)
         }
+        PromptField::SearchSelect { options, .. } => options.len().saturating_add(1).max(2),
         PromptField::Form { sections, .. } => sections
             .iter()
             .map(|section| 1usize.saturating_add(section.fields.len()))
@@ -1255,6 +1370,58 @@ fn render_prompt_body(
             }
         }
         (
+            PromptField::SearchSelect {
+                options,
+                placeholder,
+                ..
+            },
+            PromptWidgetState::SearchSelect {
+                query,
+                selected,
+                scroll,
+            },
+        ) => {
+            let query_hint = if query.is_empty() {
+                placeholder.as_deref().unwrap_or("Type to search")
+            } else {
+                query.as_str()
+            };
+            let query_row = format!(
+                "> {}",
+                truncate_chars(query_hint, text_width.saturating_sub(2))
+            );
+            field_lines.push(opaque_row_text(&query_row, text_width));
+            let filtered = filtered_option_indices(options, query);
+            if filtered.is_empty() {
+                field_lines.push(opaque_row_text("(no matches)", text_width));
+            } else {
+                let visible_rows = body_rows
+                    .saturating_sub(lines.len())
+                    .saturating_sub(field_lines.len())
+                    .max(1);
+                *selected = (*selected).min(filtered.len().saturating_sub(1));
+                *scroll = adjust_scroll(*scroll, *selected, filtered.len(), visible_rows);
+                let end = (*scroll).saturating_add(visible_rows).min(filtered.len());
+                for (filtered_index, option_index) in
+                    filtered.iter().enumerate().take(end).skip(*scroll)
+                {
+                    let Some(option) = options.get(*option_index) else {
+                        continue;
+                    };
+                    let marker = if filtered_index == *selected {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    let row = format!(
+                        "{marker} {}",
+                        truncate_chars(&option.label, text_width.saturating_sub(2))
+                    );
+                    field_lines.push(opaque_row_text(&row, text_width));
+                }
+            }
+        }
+        (
             PromptField::MultiToggle { options, .. },
             PromptWidgetState::MultiToggle {
                 cursor: index,
@@ -1352,6 +1519,10 @@ fn prompt_footer_text(request: &PromptRequest) -> String {
             "Up/Down choose | Enter {} | Esc {}",
             request.submit_label, request.cancel_label
         ),
+        PromptField::SearchSelect { .. } => format!(
+            "Type search | Up/Down choose | Enter {} | Esc {}",
+            request.submit_label, request.cancel_label
+        ),
         PromptField::MultiToggle { .. } => format!(
             "Up/Down move | Space toggle | Enter {} | Esc {}",
             request.submit_label, request.cancel_label
@@ -1361,6 +1532,60 @@ fn prompt_footer_text(request: &PromptRequest) -> String {
             request.submit_label, request.cancel_label
         ),
     }
+}
+
+fn filtered_option_indices(options: &[PromptOption], query: &str) -> Vec<usize> {
+    let mut scored = options
+        .iter()
+        .enumerate()
+        .filter_map(|(index, option)| {
+            fuzzy_score(query, &option.label).map(|score| (index, score, option.label.as_str()))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.2.cmp(right.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    scored.into_iter().map(|(index, _, _)| index).collect()
+}
+
+fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let candidate_lower = candidate.to_ascii_lowercase();
+    let mut last_match: Option<usize> = None;
+    let mut score = 0_i64;
+    let mut search_from = 0_usize;
+    for needle in query.chars() {
+        let haystack = &candidate_lower[search_from..];
+        let found = haystack.find(needle)?;
+        let absolute = search_from.saturating_add(found);
+        if absolute == 0 {
+            score += 100;
+        } else if candidate_lower
+            .as_bytes()
+            .get(absolute.saturating_sub(1))
+            .is_some_and(|byte| matches!(*byte, b' ' | b'-' | b'_' | b':' | b'/'))
+        {
+            score += 50;
+        }
+        if let Some(previous) = last_match {
+            let gap = absolute.saturating_sub(previous).saturating_sub(1);
+            score -= i64::try_from(gap).unwrap_or(i64::MAX / 4);
+        }
+        score += 10;
+        last_match = Some(absolute);
+        search_from = absolute.saturating_add(needle.len_utf8());
+    }
+    if candidate_lower.starts_with(&query) {
+        score += 200;
+    }
+    Some(score)
 }
 
 fn adjust_scroll(current: usize, cursor: usize, total: usize, visible: usize) -> usize {
@@ -1497,7 +1722,9 @@ mod tests {
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, adjust_scroll,
         render_prompt_body,
     };
-    use crate::runtime::prompt::{PromptOption, PromptRequest, PromptResponse, PromptValue};
+    use crate::runtime::prompt::{
+        PromptOption, PromptRequest, PromptResponse, PromptValidation, PromptValue,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use uuid::Uuid;
 
@@ -1557,6 +1784,25 @@ mod tests {
         assert_eq!(
             completion.response,
             PromptResponse::Submitted(PromptValue::Text("h".to_string()))
+        );
+    }
+
+    #[test]
+    fn optional_text_input_prompt_allows_blank_value_with_validation() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::text_input("Count").input_validation(PromptValidation::Integer),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected prompt completion");
+        };
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Text(String::new()))
         );
     }
 

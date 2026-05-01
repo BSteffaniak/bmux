@@ -168,6 +168,15 @@ pub enum PromptField {
         /// Hosts can use this for live previews without waiting for submit.
         live_preview: bool,
     },
+    /// Fuzzy-search a list and pick one option.
+    SearchSelect {
+        options: Vec<PromptOption>,
+        default_index: usize,
+        placeholder: Option<String>,
+        /// Emit selection-change events while the user moves through the filtered list.
+        /// Hosts can use this for live previews without waiting for submit.
+        live_preview: bool,
+    },
     /// Toggle multiple options on/off.
     MultiToggle {
         options: Vec<PromptOption>,
@@ -386,6 +395,28 @@ impl PromptRequest {
     }
 
     #[must_use]
+    pub fn search_select(title: impl Into<String>, options: Vec<PromptOption>) -> Self {
+        Self {
+            id: next_prompt_id(),
+            owner_plugin_id: None,
+            modal_id: None,
+            title: title.into(),
+            message: None,
+            submit_label: "Select".to_string(),
+            cancel_label: "Cancel".to_string(),
+            esc_cancels: true,
+            policy: PromptPolicy::Enqueue,
+            width: PromptWidth::default(),
+            field: PromptField::SearchSelect {
+                options,
+                default_index: 0,
+                placeholder: Some("Type to search".to_string()),
+                live_preview: false,
+            },
+        }
+    }
+
+    #[must_use]
     pub fn multi_toggle(title: impl Into<String>, options: Vec<PromptOption>) -> Self {
         Self {
             id: next_prompt_id(),
@@ -560,8 +591,20 @@ impl PromptRequest {
 
     #[must_use]
     pub const fn single_live_preview(mut self, enabled: bool) -> Self {
-        if let PromptField::SingleSelect { live_preview, .. } = &mut self.field {
-            *live_preview = enabled;
+        match &mut self.field {
+            PromptField::SingleSelect { live_preview, .. }
+            | PromptField::SearchSelect { live_preview, .. } => {
+                *live_preview = enabled;
+            }
+            _ => {}
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn search_placeholder(mut self, value: impl Into<String>) -> Self {
+        if let PromptField::SearchSelect { placeholder, .. } = &mut self.field {
+            *placeholder = Some(value.into());
         }
         self
     }

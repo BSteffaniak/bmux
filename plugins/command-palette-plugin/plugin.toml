@@ -1,0 +1,15 @@
+execution_class = "native_fast"
+id              = "bmux.command_palette"
+name            = "bmux Command Palette"
+owns_namespaces = ["command-palette"]
+version         = "0.0.1-alpha.0"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "show"
+path          = ["command-palette", "show"]
+summary       = "Open the command palette"
+
+[keybindings.global]
+"ctrl+shift+p" = "plugin:bmux.command_palette:show"

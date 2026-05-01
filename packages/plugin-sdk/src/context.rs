@@ -98,6 +98,8 @@ pub struct RegisteredPluginInfo {
     pub required_capabilities: Vec<String>,
     pub provided_capabilities: Vec<String>,
     pub commands: Vec<String>,
+    #[serde(default)]
+    pub command_schemas: Vec<crate::PluginCommand>,
 }
 
 /// Context passed to [`RustPlugin::activate`] and [`RustPlugin::deactivate`].

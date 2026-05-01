@@ -134,6 +134,11 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/cluster-plugin/plugin.toml"),
     plugin_type = bmux_cluster_plugin::ClusterPlugin;
 
+    feature = "bundled-plugin-command-palette",
+    id = "bmux.command_palette",
+    manifest = include_str!("../../../../plugins/command-palette-plugin/plugin.toml"),
+    plugin_type = bmux_command_palette_plugin::CommandPalettePlugin;
+
     feature = "bundled-plugin-contexts",
     id = "bmux.contexts",
     manifest = include_str!("../../../../plugins/contexts-plugin/plugin.toml"),
@@ -363,6 +368,8 @@ const fn static_bundled_workspace_plugin_dirs() -> &'static [&'static str] {
         "clipboard-plugin",
         #[cfg(feature = "bundled-plugin-cluster")]
         "cluster-plugin",
+        #[cfg(feature = "bundled-plugin-command-palette")]
+        "command-palette-plugin",
         #[cfg(feature = "bundled-plugin-contexts")]
         "contexts-plugin",
         #[cfg(feature = "bundled-plugin-control-catalog")]
@@ -904,6 +911,7 @@ pub(super) fn registered_plugin_infos_from_loaded(
                 .iter()
                 .map(|c| c.name.clone())
                 .collect(),
+            command_schemas: plugin.declaration.commands.clone(),
         })
         .collect()
 }
@@ -936,6 +944,7 @@ pub(super) fn registered_plugin_infos_from_registry(
                 .iter()
                 .map(|c| c.name.clone())
                 .collect(),
+            command_schemas: plugin.declaration.commands.clone(),
         })
         .collect()
 }

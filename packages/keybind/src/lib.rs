@@ -79,7 +79,13 @@ pub fn action_to_config_name(action: &RuntimeAction) -> String {
             if args.is_empty() {
                 format!("plugin:{plugin_id}:{command_name}")
             } else {
-                format!("plugin:{plugin_id}:{command_name} {}", args.join(" "))
+                format!(
+                    "plugin:{plugin_id}:{command_name} {}",
+                    args.iter()
+                        .map(|arg| shell_quote(arg))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
             }
         }
         _ => action_to_name(action).to_string(),
@@ -226,6 +232,66 @@ fn parse_switch_profile_action(value: &str) -> Option<Result<RuntimeAction>> {
     )))
 }
 
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':' | b'=')
+        })
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn split_shell_words(value: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = value.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            ch if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+                while chars.peek().is_some_and(|next| next.is_whitespace()) {
+                    let _ = chars.next();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if quote.is_some() {
+        bail!("invalid plugin keymap action arguments (unterminated quote)");
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
+}
+
 fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
     // Case-insensitive check for the "plugin:" prefix without lowercasing
     // the entire string — arguments must preserve their original case.
@@ -245,13 +311,10 @@ fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
         )));
     }
     let (command_name, args) = match remainder.split_once(' ') {
-        Some((cmd, args_str)) => (
-            cmd,
-            args_str
-                .split_whitespace()
-                .map(String::from)
-                .collect::<Vec<_>>(),
-        ),
+        Some((cmd, args_str)) => match split_shell_words(args_str) {
+            Ok(args) => (cmd, args),
+            Err(error) => return Some(Err(error)),
+        },
         None => (remainder, Vec::new()),
     };
     if command_name.trim().is_empty() {
@@ -438,6 +501,33 @@ mod tests {
                 command_name: "switch-window".to_string(),
                 args: vec!["--session".to_string(), "dev".to_string()],
             }
+        );
+    }
+
+    #[test]
+    fn parse_action_accepts_quoted_plugin_args() {
+        let action = parse_action("plugin:bmux.test:run --name 'hello world'")
+            .expect("plugin action with quoted args should parse");
+        assert_eq!(
+            action,
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.test".to_string(),
+                command_name: "run".to_string(),
+                args: vec!["--name".to_string(), "hello world".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn action_to_config_name_quotes_plugin_args_with_spaces() {
+        let action = RuntimeAction::PluginCommand {
+            plugin_id: "bmux.test".to_string(),
+            command_name: "run".to_string(),
+            args: vec!["hello world".to_string()],
+        };
+        assert_eq!(
+            action_to_config_name(&action),
+            "plugin:bmux.test:run 'hello world'"
         );
     }
 
