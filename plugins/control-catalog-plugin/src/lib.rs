@@ -70,6 +70,8 @@ struct SnapshotArgs {
 pub struct ControlCatalogPlugin;
 
 impl RustPlugin for ControlCatalogPlugin {
+    type Contract = bmux_control_catalog_plugin_api::Contract;
+
     fn activate(
         &mut self,
         _context: NativeLifecycleContext,
@@ -114,10 +116,6 @@ impl RustPlugin for ControlCatalogPlugin {
         let state: Arc<dyn control_catalog_state::ControlCatalogStateService + Send + Sync> =
             Arc::new(ControlCatalogStateHandle::new(caller));
         let _ = control_catalog_state::register_provider(registry, state);
-    }
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        bmux_control_catalog_plugin_api::service_declarations()
     }
 }
 

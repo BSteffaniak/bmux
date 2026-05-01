@@ -28,6 +28,8 @@ const PROMPT_HOST_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 const PROMPT_HOST_WAIT_POLL: Duration = Duration::from_millis(75);
 
 impl RustPlugin for ExamplePlugin {
+    type Contract = bmux_plugin_sdk::NoPluginContract;
+
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
             "permissions-list" => Ok(run_permissions_list(&context)),

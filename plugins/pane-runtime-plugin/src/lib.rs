@@ -23,6 +23,8 @@ mod snapshot;
 pub struct PaneRuntimePlugin;
 
 impl RustPlugin for PaneRuntimePlugin {
+    type Contract = bmux_pane_runtime_plugin_api::Contract;
+
     fn activate(
         &mut self,
         _context: NativeLifecycleContext,
@@ -80,9 +82,5 @@ impl RustPlugin for PaneRuntimePlugin {
         _context: TypedServiceRegistrationContext<'_>,
         _registry: &mut TypedServiceRegistry,
     ) {
-    }
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        bmux_pane_runtime_plugin_api::service_declarations()
     }
 }

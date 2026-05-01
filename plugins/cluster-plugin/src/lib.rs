@@ -426,6 +426,8 @@ fn pane_close(
 pub struct ClusterPlugin;
 
 impl RustPlugin for ClusterPlugin {
+    type Contract = bmux_plugin_sdk::NoPluginContract;
+
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
             "cluster-hosts" => run_cluster_hosts(&context).map_err(PluginCommandError::from),

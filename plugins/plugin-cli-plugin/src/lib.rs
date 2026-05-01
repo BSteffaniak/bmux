@@ -22,6 +22,8 @@ use std::time::Instant;
 pub struct PluginCliPlugin;
 
 impl RustPlugin for PluginCliPlugin {
+    type Contract = bmux_plugin_sdk::NoPluginContract;
+
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         let started = Instant::now();
         let result = match context.command.as_str() {

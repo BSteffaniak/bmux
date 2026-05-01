@@ -2450,6 +2450,8 @@ fn invoke_performance_get_settings(loaded: &bmux_plugin::LoadedPlugin) -> Result
 struct PerfNoopPlugin;
 
 impl bmux_plugin_sdk::RustPlugin for PerfNoopPlugin {
+    type Contract = bmux_plugin_sdk::NoPluginContract;
+
     fn invoke_service(
         &mut self,
         context: bmux_plugin_sdk::NativeServiceContext,

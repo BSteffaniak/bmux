@@ -281,6 +281,8 @@ impl WireSelector {
 pub struct SessionsPlugin;
 
 impl RustPlugin for SessionsPlugin {
+    type Contract = bmux_sessions_plugin_api::Contract;
+
     fn activate(
         &mut self,
         _context: NativeLifecycleContext,
@@ -403,10 +405,6 @@ impl RustPlugin for SessionsPlugin {
         let commands: Arc<dyn SessionsCommandsService + Send + Sync> =
             Arc::new(SessionsCommandsHandle::new(caller));
         let _ = sessions_commands::register_provider(registry, commands);
-    }
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        bmux_sessions_plugin_api::service_declarations()
     }
 }
 

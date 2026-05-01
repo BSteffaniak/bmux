@@ -332,6 +332,8 @@ impl WireSelector {
 pub struct ContextsPlugin;
 
 impl RustPlugin for ContextsPlugin {
+    type Contract = bmux_contexts_plugin_api::Contract;
+
     fn activate(
         &mut self,
         _context: NativeLifecycleContext,
@@ -437,10 +439,6 @@ impl RustPlugin for ContextsPlugin {
         let commands: Arc<dyn ContextsCommandsService + Send + Sync> =
             Arc::new(ContextsCommandsHandle::new(caller));
         let _ = contexts_commands::register_provider(registry, commands);
-    }
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        bmux_contexts_plugin_api::service_declarations()
     }
 }
 

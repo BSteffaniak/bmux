@@ -349,6 +349,8 @@ struct SetFollowingArgs {
 pub struct ClientsPlugin;
 
 impl RustPlugin for ClientsPlugin {
+    type Contract = bmux_clients_plugin_api::Contract;
+
     fn activate(
         &mut self,
         _context: NativeLifecycleContext,
@@ -445,10 +447,6 @@ impl RustPlugin for ClientsPlugin {
         let commands: Arc<dyn ClientsCommandsService + Send + Sync> =
             Arc::new(ClientsCommandsHandle::new(caller));
         let _ = clients_commands::register_provider(registry, commands);
-    }
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        bmux_clients_plugin_api::service_declarations()
     }
 }
 

@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct ClipboardPlugin;
 
 impl RustPlugin for ClipboardPlugin {
+    type Contract = bmux_plugin_sdk::NoPluginContract;
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "clipboard-write/v1", "copy_text" => |req: ClipboardCopyRequest, _ctx| {

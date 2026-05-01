@@ -30,6 +30,8 @@ pub struct ThemePlugin {
 }
 
 impl RustPlugin for ThemePlugin {
+    type Contract = bmux_plugin_sdk::NoPluginContract;
+
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         self.lifecycle_context = Some(context.clone());
         apply_configured_appearance(&context);

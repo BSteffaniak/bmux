@@ -44,6 +44,8 @@ use bmux_plugin_sdk::prelude::*;
 pub struct PromptedActionsPlugin;
 
 impl RustPlugin for PromptedActionsPlugin {
+    type Contract = bmux_plugin_sdk::NoPluginContract;
+
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
             "run" => run_prompted_action(&context),

@@ -206,6 +206,13 @@ const SERVICE_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
 /// response with an optional error payload.  Use [`handle_service`](crate::handle_service)
 /// or [`route_service!`](crate::route_service) to reduce boilerplate.
 pub trait RustPlugin: Default + Send + 'static {
+    /// BPDL-generated contract this plugin implements.
+    ///
+    /// Use a generated `*_plugin_api::Contract` for BPDL-backed plugins or
+    /// [`crate::NoPluginContract`] for plugins whose service surface is manual
+    /// or command-only.
+    type Contract: crate::PluginContract;
+
     /// Handle a CLI command declared in the plugin manifest.
     ///
     /// The default returns `Err(PluginCommandError::unknown_command(""))`.
@@ -301,7 +308,7 @@ pub trait RustPlugin: Default + Send + 'static {
     where
         Self: Sized,
     {
-        Ok(Vec::new())
+        <Self::Contract as crate::PluginContract>::service_declarations()
     }
 }
 

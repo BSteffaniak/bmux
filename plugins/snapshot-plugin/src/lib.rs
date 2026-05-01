@@ -40,6 +40,8 @@ const DEBOUNCE_POLL_MS: u64 = 200;
 pub struct SnapshotPlugin;
 
 impl RustPlugin for SnapshotPlugin {
+    type Contract = bmux_snapshot_plugin_api::Contract;
+
     fn activate(
         &mut self,
         _context: NativeLifecycleContext,
@@ -136,10 +138,6 @@ impl RustPlugin for SnapshotPlugin {
     ) {
         // No typed Arc<dyn Trait> surface today — generated snapshot
         // operations dispatch through the byte-service path.
-    }
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        bmux_snapshot_plugin_api::service_declarations()
     }
 }
 

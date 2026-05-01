@@ -4,6 +4,8 @@ use bmux_plugin_sdk::prelude::*;
 pub struct HelloPlugin;
 
 impl RustPlugin for HelloPlugin {
+    type Contract = bmux_plugin_sdk::NoPluginContract;
+
     fn run_command(&mut self, ctx: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(ctx, {
             "hello" => {

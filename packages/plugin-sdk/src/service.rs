@@ -31,6 +31,30 @@ pub struct ServiceInterfaceDescriptor {
     pub interface_id: InterfaceId,
 }
 
+/// Type-level plugin contract exported by BPDL-generated API crates.
+///
+/// Rust plugin implementations associate themselves with one contract type via
+/// `RustPlugin::Contract`. Hosts then derive generated services from that type,
+/// so providers do not manually list BPDL services in manifests or plugin impls.
+pub trait PluginContract {
+    /// Return service declarations generated from the plugin contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns if any generated capability cannot be represented as a host scope.
+    fn service_declarations() -> Result<Vec<PluginService>>;
+}
+
+/// Explicit marker for plugins that do not have a BPDL contract.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoPluginContract;
+
+impl PluginContract for NoPluginContract {
+    fn service_declarations() -> Result<Vec<PluginService>> {
+        Ok(Vec::new())
+    }
+}
+
 impl ServiceInterfaceDescriptor {
     /// Convert this generated descriptor into a manifest-compatible service
     /// declaration.

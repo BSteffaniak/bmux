@@ -338,6 +338,14 @@ fn emit_schema_service_declarations(schema: &Schema, out: &mut String) {
         .map(|iface| snake_case(&iface.name))
         .collect::<Vec<_>>();
 
+    out.push_str("/// Type-level BPDL contract for this plugin API crate.\n");
+    out.push_str("pub struct Contract;\n\n");
+    out.push_str("impl ::bmux_plugin_sdk::PluginContract for Contract {\n");
+    out.push_str("    fn service_declarations() -> ::bmux_plugin_sdk::Result<Vec<::bmux_plugin_sdk::PluginService>> {\n");
+    out.push_str("        service_declarations()\n");
+    out.push_str("    }\n");
+    out.push_str("}\n\n");
+
     out.push_str("/// Service declarations generated from this BPDL schema.\n");
     out.push_str("///\n");
     out.push_str("/// Native providers return this from `RustPlugin::declared_services` so\n");

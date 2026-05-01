@@ -749,6 +749,8 @@ pub struct WindowsPlugin {
 }
 
 impl RustPlugin for WindowsPlugin {
+    type Contract = bmux_windows_plugin_api::Contract;
+
     fn activate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         // Register the typed event-bus channel for pane-event so
         // subscribers (decoration, future UI plugins) can wait on
@@ -969,10 +971,6 @@ impl RustPlugin for WindowsPlugin {
                 .field("total_us", total_started.elapsed().as_micros())
                 .finish(),
         );
-    }
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        bmux_windows_plugin_api::service_declarations()
     }
 }
 

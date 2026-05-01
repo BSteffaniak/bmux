@@ -24,6 +24,8 @@
 //! pub struct MyPlugin;
 //!
 //! impl RustPlugin for MyPlugin {
+//!     type Contract = bmux_plugin_sdk::NoPluginContract;
+//!
 //!     fn run_command(&mut self, ctx: NativeCommandContext) -> Result<i32, PluginCommandError> {
 //!         match ctx.command.as_str() {
 //!             "hello" => { println!("Hello!"); Ok(EXIT_OK) }
@@ -99,10 +101,11 @@ pub use process_runtime::{
 };
 pub use ready::{ReadySignalDecl, ReadyStatus, ReadyTracker};
 pub use service::{
-    CURRENT_SERVICE_PROTOCOL_VERSION, PluginService, ProviderId, RegisteredService,
-    ServiceEnvelope, ServiceEnvelopeKind, ServiceError, ServiceInterfaceDescriptor, ServiceKind,
-    ServiceProtocolVersion, ServiceRequest, ServiceResponse, decode_service_envelope,
-    decode_service_message, encode_service_envelope, encode_service_message,
+    CURRENT_SERVICE_PROTOCOL_VERSION, NoPluginContract, PluginContract, PluginService, ProviderId,
+    RegisteredService, ServiceEnvelope, ServiceEnvelopeKind, ServiceError,
+    ServiceInterfaceDescriptor, ServiceKind, ServiceProtocolVersion, ServiceRequest,
+    ServiceResponse, decode_service_envelope, decode_service_message, encode_service_envelope,
+    encode_service_message,
 };
 pub use stateful_plugin::{
     StatefulPlugin, StatefulPluginError, StatefulPluginHandle, StatefulPluginResult,

@@ -136,6 +136,8 @@ fn current_client_snapshot(
 pub struct PermissionsPlugin;
 
 impl RustPlugin for PermissionsPlugin {
+    type Contract = bmux_permissions_plugin_api::Contract;
+
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         handle_command(&context)?;
         Ok(EXIT_OK)
@@ -180,10 +182,6 @@ impl RustPlugin for PermissionsPlugin {
                 Ok(bmux_permissions_plugin_api::session_policy_commands::CommandAck { ok: true })
             },
         })
-    }
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        bmux_permissions_plugin_api::service_declarations()
     }
 }
 

@@ -1632,6 +1632,8 @@ fn resolve_decoration_script(
 }
 
 impl RustPlugin for DecorationPlugin {
+    type Contract = bmux_decoration_plugin_api::Contract;
+
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         if let Some(timeout) = startup_ready_gate_timeout(context.settings.as_ref()) {
             bmux_plugin::register_startup_ready_gate(
@@ -1717,10 +1719,6 @@ impl RustPlugin for DecorationPlugin {
             registry,
             command_service,
         );
-    }
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        bmux_decoration_plugin_api::service_declarations()
     }
 
     #[allow(clippy::too_many_lines)] // route_service! naturally spans every typed op; splitting hurts readability.

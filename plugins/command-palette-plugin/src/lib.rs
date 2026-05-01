@@ -16,6 +16,8 @@ use tracing::{debug, warn};
 pub struct CommandPalettePlugin;
 
 impl RustPlugin for CommandPalettePlugin {
+    type Contract = bmux_plugin_sdk::NoPluginContract;
+
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
             "show" => show_command_palette(&context),
