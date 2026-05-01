@@ -3462,7 +3462,6 @@ async fn apply_attach_runtime_actions(
             }
             crate::input::RuntimeAction::Quit
             | crate::input::RuntimeAction::ToggleSplitDirection
-            | crate::input::RuntimeAction::RestartFocusedPane
             | crate::input::RuntimeAction::ShowHelp
             | crate::input::RuntimeAction::BeginSelection
             | crate::input::RuntimeAction::MoveCursorLeft

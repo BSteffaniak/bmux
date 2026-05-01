@@ -114,7 +114,6 @@ impl Keymap {
     pub(crate) fn default_runtime() -> Self {
         let runtime: BTreeMap<String, String> = [
             ("t", RuntimeAction::ToggleSplitDirection),
-            ("r", RuntimeAction::RestartFocusedPane),
             ("x", RuntimeAction::CloseFocusedPane),
             ("?", RuntimeAction::ShowHelp),
             ("[", RuntimeAction::EnterScrollMode),
@@ -135,6 +134,10 @@ impl Keymap {
         .chain([
             ("%".to_string(), windows_split_command("vertical")),
             ("\"".to_string(), windows_split_command("horizontal")),
+            (
+                "r".to_string(),
+                "plugin:bmux.windows:restart-pane".to_string(),
+            ),
             ("o".to_string(), windows_focus_command("next")),
             ("h".to_string(), windows_focus_command("left")),
             ("l".to_string(), windows_focus_command("right")),
@@ -1156,7 +1159,14 @@ mod tests {
     fn maps_default_prefix_commands() {
         let mut processor = new_processor(Keymap::default_runtime());
         let actions = processor.process_chunk(&[0x01, b'r']);
-        assert_eq!(actions, vec![RuntimeAction::RestartFocusedPane]);
+        assert_eq!(
+            actions,
+            vec![RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "restart-pane".to_string(),
+                args: Vec::new(),
+            }]
+        );
         assert_eq!(
             processor.process_chunk(&[0x01, b'C']),
             vec![RuntimeAction::PluginCommand {

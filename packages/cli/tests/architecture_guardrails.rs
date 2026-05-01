@@ -2570,7 +2570,6 @@ const RUNTIME_ACTION_ALLOWLIST: &[&str] = &[
     // a `plugin:bmux.<plugin>:<cmd>` invocation before deletion.
     // See `docs/runtime-action-migration.md` for the plan.
     "ToggleSplitDirection",
-    "RestartFocusedPane",
     "CloseFocusedPane",
     "EnterWindowMode",
 ];

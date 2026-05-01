@@ -4010,11 +4010,7 @@ pub async fn handle_attach_plugin_command_action(
 }
 
 #[allow(clippy::too_many_lines)]
-pub async fn handle_attach_ui_action(
-    client: &mut StreamingBmuxClient,
-    action: RuntimeAction,
-    view_state: &mut AttachViewState,
-) -> std::result::Result<(), ClientError> {
+pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachViewState) {
     match action {
         RuntimeAction::EnterWindowMode => {
             view_state.set_transient_status(
@@ -4105,7 +4101,7 @@ pub async fn handle_attach_ui_action(
                     Instant::now(),
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
-                return Ok(());
+                return;
             }
             view_state.prompt.enqueue_internal(
                 PromptRequest::confirm("Quit session and all panes?")
@@ -4124,7 +4120,7 @@ pub async fn handle_attach_ui_action(
                     Instant::now(),
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
-                return Ok(());
+                return;
             };
             if view_state.prompt.is_busy() {
                 view_state.set_transient_status(
@@ -4132,7 +4128,7 @@ pub async fn handle_attach_ui_action(
                     Instant::now(),
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
-                return Ok(());
+                return;
             }
             view_state.prompt.enqueue_internal(
                 PromptRequest::confirm("Close focused pane?")
@@ -4144,38 +4140,8 @@ pub async fn handle_attach_ui_action(
                 AttachInternalPromptAction::ClosePane { pane_id },
             );
         }
-        RuntimeAction::RestartFocusedPane => {
-            let selector = attached_session_selector(view_state);
-            // Typed dispatch replaces the legacy `BmuxClient::restart_pane`
-            // convenience method; route through
-            // `windows-commands:restart-pane` directly.
-            let payload = bmux_codec::to_vec(&windows_commands::client::RestartPaneRequest {
-                session: Some(ipc_to_windows_selector(selector)),
-                target: None,
-            })
-            .map_err(|error| ClientError::ServerError {
-                code: bmux_ipc::ErrorCode::Internal,
-                message: format!("encoding restart-pane args: {error}"),
-            })?;
-            let _response_bytes = client
-                .invoke_service_raw(
-                    windows_commands::client::RestartPaneEndpoint::CAPABILITY.as_str(),
-                    windows_commands::client::RestartPaneEndpoint::KIND,
-                    windows_commands::client::RestartPaneEndpoint::INTERFACE_ID.as_str(),
-                    windows_commands::client::RestartPaneEndpoint::OPERATION.as_str(),
-                    payload,
-                )
-                .await?;
-            view_state.set_transient_status(
-                "pane restarted",
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-        }
         _ => {}
     }
-
-    Ok(())
 }
 
 pub fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
@@ -4667,7 +4633,15 @@ pub fn attach_mode_hint(mode_id: &str, _ui_mode: AttachUiMode, keymap: &Keymap) 
     let detach = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::Detach);
     let quit = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::Quit);
     let help = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::ShowHelp);
-    let restart = key_hint_or_unbound(keymap, mode_id, &RuntimeAction::RestartFocusedPane);
+    let restart = key_hint_or_unbound(
+        keymap,
+        mode_id,
+        &RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "restart-pane".to_string(),
+            args: Vec::new(),
+        },
+    );
     let prev = key_hint_or_unbound(
         keymap,
         mode_id,
@@ -5983,7 +5957,15 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     let detach = key_hint_or_unbound(&keymap, active_mode_id, &RuntimeAction::Detach);
     let scroll = key_hint_or_unbound(&keymap, active_mode_id, &RuntimeAction::EnterScrollMode);
     let close = key_hint_or_unbound(&keymap, active_mode_id, &RuntimeAction::CloseFocusedPane);
-    let restart = key_hint_or_unbound(&keymap, active_mode_id, &RuntimeAction::RestartFocusedPane);
+    let restart = key_hint_or_unbound(
+        &keymap,
+        active_mode_id,
+        &RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "restart-pane".to_string(),
+            args: Vec::new(),
+        },
+    );
     let mut groups: Vec<(&str, Vec<AttachKeybindingEntry>)> = vec![
         ("Session", Vec::new()),
         ("Pane", Vec::new()),
@@ -5994,7 +5976,7 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     for entry in effective_attach_keybindings(config) {
         let category = match &entry.action {
             RuntimeAction::Detach | RuntimeAction::Quit => "Session",
-            RuntimeAction::CloseFocusedPane | RuntimeAction::RestartFocusedPane => "Pane",
+            RuntimeAction::CloseFocusedPane => "Pane",
             RuntimeAction::PluginCommand {
                 plugin_id,
                 command_name,
@@ -6010,7 +5992,10 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
                 command_name,
                 ..
             } if plugin_id == "bmux.windows"
-                && matches!(command_name.as_str(), "split-pane" | "zoom-pane") =>
+                && matches!(
+                    command_name.as_str(),
+                    "split-pane" | "zoom-pane" | "restart-pane"
+                ) =>
             {
                 "Pane"
             }
@@ -6955,15 +6940,8 @@ pub async fn handle_attach_terminal_event(
                     action,
                     RuntimeAction::Quit | RuntimeAction::CloseFocusedPane
                 );
-                if let Err(error) = handle_attach_ui_action(client, action, view_state).await {
-                    let mapped = map_attach_client_error(error);
-                    warn!(error = %mapped, "attach.action.ui_failed");
-                    view_state.set_transient_status(
-                        format!("attach action failed: {mapped}"),
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                } else if prompt_only_action && view_state.prompt.is_active() {
+                handle_attach_ui_action(&action, view_state);
+                if prompt_only_action && view_state.prompt.is_active() {
                     view_state
                         .dirty
                         .mark_overlay_dirty(AttachDirtySource::PromptOverlay);
@@ -7166,20 +7144,10 @@ async fn handle_attach_action_dispatch(
             }
         }
         AttachEventAction::Ui(ui_action) => {
-            if let Err(error) = handle_attach_ui_action(client, ui_action, view_state).await {
-                view_state.set_transient_status(
-                    format!(
-                        "dispatched action failed: {}",
-                        map_attach_client_error(error)
-                    ),
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            } else {
-                view_state
-                    .dirty
-                    .mark_layout_frame_dirty(AttachDirtySource::ActionDispatch);
-            }
+            handle_attach_ui_action(&ui_action, view_state);
+            view_state
+                .dirty
+                .mark_layout_frame_dirty(AttachDirtySource::ActionDispatch);
             view_state
                 .dirty
                 .mark_status_dirty(AttachDirtySource::ActionDispatch);
@@ -7925,17 +7893,10 @@ pub async fn handle_attach_mouse_gesture_action(
             Ok(true)
         }
         AttachEventAction::Ui(action) => {
-            if let Err(error) = handle_attach_ui_action(client, action, view_state).await {
-                view_state.set_transient_status(
-                    format!("mouse action failed: {}", map_attach_client_error(error)),
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            } else {
-                view_state
-                    .dirty
-                    .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
-            }
+            handle_attach_ui_action(&action, view_state);
+            view_state
+                .dirty
+                .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
             Ok(true)
         }
         AttachEventAction::Ignore => Ok(true),
@@ -8599,7 +8560,6 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         RuntimeAction::Quit
         | RuntimeAction::Detach
         | RuntimeAction::ToggleSplitDirection
-        | RuntimeAction::RestartFocusedPane
         | RuntimeAction::CloseFocusedPane
         | RuntimeAction::ShowHelp
         | RuntimeAction::EnterScrollMode
@@ -8635,7 +8595,6 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
         | RuntimeAction::Quit
         | RuntimeAction::ShowHelp
         | RuntimeAction::ToggleSplitDirection
-        | RuntimeAction::RestartFocusedPane
         | RuntimeAction::EnterMode(_)
         | RuntimeAction::SwitchProfile(_)
         | RuntimeAction::EnterScrollMode

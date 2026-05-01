@@ -9,7 +9,6 @@ pub enum RuntimeAction {
     Quit,
     Detach,
     ToggleSplitDirection,
-    RestartFocusedPane,
     CloseFocusedPane,
     ShowHelp,
     EnterScrollMode,
@@ -45,7 +44,6 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::Quit => "quit",
         RuntimeAction::Detach => "detach",
         RuntimeAction::ToggleSplitDirection => "toggle_split_direction",
-        RuntimeAction::RestartFocusedPane => "restart_focused_pane",
         RuntimeAction::CloseFocusedPane => "close_focused_pane",
         RuntimeAction::ShowHelp => "show_help",
         RuntimeAction::EnterScrollMode => "enter_scroll_mode",
@@ -135,7 +133,7 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
         "resize_right" => Ok(windows_resize_command("right")),
         "resize_up" => Ok(windows_resize_command("up")),
         "resize_down" => Ok(windows_resize_command("down")),
-        "restart_focused_pane" => Ok(RuntimeAction::RestartFocusedPane),
+        "restart_focused_pane" => Ok(plugin_command("bmux.windows", "restart-pane", [])),
         "close_focused_pane" => Ok(RuntimeAction::CloseFocusedPane),
         "zoom_pane" => Ok(plugin_command("bmux.windows", "zoom-pane", [])),
         "show_help" => Ok(RuntimeAction::ShowHelp),
@@ -406,6 +404,18 @@ mod tests {
             RuntimeAction::PluginCommand {
                 plugin_id: "bmux.windows".to_string(),
                 command_name: "zoom-pane".to_string(),
+                args: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_action_maps_legacy_restart_action_to_plugin_command() {
+        assert_eq!(
+            parse_action("restart_focused_pane").expect("legacy restart action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "restart-pane".to_string(),
                 args: Vec::new(),
             }
         );

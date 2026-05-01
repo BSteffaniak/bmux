@@ -176,7 +176,6 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
 fn default_runtime_bindings() -> BTreeMap<String, String> {
     let mut map = action_bindings(&[
         ("t", RuntimeAction::ToggleSplitDirection),
-        ("r", RuntimeAction::RestartFocusedPane),
         ("x", RuntimeAction::CloseFocusedPane),
         ("?", RuntimeAction::ShowHelp),
         ("[", RuntimeAction::EnterScrollMode),
@@ -193,6 +192,10 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     ]);
     map.insert("%".to_string(), windows_split_command("vertical"));
     map.insert("\"".to_string(), windows_split_command("horizontal"));
+    map.insert(
+        "r".to_string(),
+        "plugin:bmux.windows:restart-pane".to_string(),
+    );
     map.insert("z".to_string(), "plugin:bmux.windows:zoom-pane".to_string());
     map.insert("o".to_string(), windows_focus_command("next"));
     map.insert("h".to_string(), windows_focus_command("left"));
