@@ -1,4 +1,4 @@
-use crate::{HostScope, PluginError, Result};
+use crate::{CapabilityId, HostScope, InterfaceId, PluginError, Result};
 use bmux_perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
@@ -17,6 +17,36 @@ pub struct PluginService {
     pub capability: HostScope,
     pub kind: ServiceKind,
     pub interface_id: String,
+}
+
+/// BPDL-generated descriptor for an interface-level service endpoint.
+///
+/// Unlike [`PluginService`], this is cheap to expose from generated Rust
+/// bindings because every field is a typed static identifier. Hosts convert it
+/// into a [`PluginService`] when building a plugin declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ServiceInterfaceDescriptor {
+    pub capability: CapabilityId,
+    pub kind: ServiceKind,
+    pub interface_id: InterfaceId,
+}
+
+impl ServiceInterfaceDescriptor {
+    /// Convert this generated descriptor into a manifest-compatible service
+    /// declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::InvalidCapabilityId`] if the generated capability
+    /// cannot be represented as a host scope. This should only happen for
+    /// invalid BPDL input or hand-written descriptors.
+    pub fn to_plugin_service(&self) -> Result<PluginService> {
+        Ok(PluginService {
+            capability: HostScope::new(self.capability.as_str())?,
+            kind: self.kind,
+            interface_id: self.interface_id.as_str().to_string(),
+        })
+    }
 }
 
 impl PluginService {

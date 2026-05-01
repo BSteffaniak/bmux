@@ -81,4 +81,8 @@ impl RustPlugin for PaneRuntimePlugin {
         _registry: &mut TypedServiceRegistry,
     ) {
     }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_pane_runtime_plugin_api::service_declarations()
+    }
 }

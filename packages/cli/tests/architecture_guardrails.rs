@@ -2217,79 +2217,75 @@ fn repo_root() -> std::path::PathBuf {
 }
 
 #[test]
-fn plugin_manifests_expose_generated_service_interfaces() {
+fn bpdl_generated_service_declarations_expose_runtime_interfaces() {
     let expected = [
         (
-            "recording-plugin",
-            "bmux.recording.read",
-            "recording-state",
-            "query",
+            "bmux.recording",
+            bmux_recording_plugin_api::service_declarations
+                as fn() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>>,
+            &[
+                (
+                    "bmux.recording.read",
+                    "recording-state",
+                    bmux_plugin_sdk::ServiceKind::Query,
+                ),
+                (
+                    "bmux.recording.write",
+                    "recording-commands",
+                    bmux_plugin_sdk::ServiceKind::Command,
+                ),
+            ][..],
         ),
         (
-            "recording-plugin",
-            "bmux.recording.write",
-            "recording-commands",
-            "command",
+            "bmux.performance",
+            bmux_performance_plugin_api::service_declarations
+                as fn() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>>,
+            &[
+                (
+                    "bmux.performance.read",
+                    "performance-state",
+                    bmux_plugin_sdk::ServiceKind::Query,
+                ),
+                (
+                    "bmux.performance.write",
+                    "performance-commands",
+                    bmux_plugin_sdk::ServiceKind::Command,
+                ),
+            ][..],
         ),
         (
-            "performance-plugin",
-            "bmux.performance.read",
-            "performance-state",
-            "query",
-        ),
-        (
-            "performance-plugin",
-            "bmux.performance.write",
-            "performance-commands",
-            "command",
-        ),
-        (
-            "snapshot-plugin",
-            "bmux.snapshot.read",
-            "snapshot-state",
-            "query",
-        ),
-        (
-            "snapshot-plugin",
-            "bmux.snapshot.write",
-            "snapshot-commands",
-            "command",
+            "bmux.snapshot",
+            bmux_snapshot_plugin_api::service_declarations
+                as fn() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>>,
+            &[
+                (
+                    "bmux.snapshot.read",
+                    "snapshot-state",
+                    bmux_plugin_sdk::ServiceKind::Query,
+                ),
+                (
+                    "bmux.snapshot.write",
+                    "snapshot-commands",
+                    bmux_plugin_sdk::ServiceKind::Command,
+                ),
+            ][..],
         ),
     ];
 
-    for (plugin, capability, interface_id, kind) in expected {
-        assert!(
-            plugin_manifest_declares_service(plugin, capability, interface_id, kind),
-            "plugins/{plugin}/plugin.toml must declare {kind} service {capability}/{interface_id} so BPDL-generated clients can resolve a provider",
-        );
+    for (plugin, declarations, services) in expected {
+        let generated = declarations()
+            .unwrap_or_else(|err| panic!("{plugin} generated service declarations failed: {err}"));
+        for (capability, interface_id, kind) in services {
+            assert!(
+                generated.iter().any(|service| {
+                    service.capability.as_str() == *capability
+                        && service.interface_id == *interface_id
+                        && service.kind == *kind
+                }),
+                "{plugin} BPDL service declarations must expose {kind:?} service {capability}/{interface_id}",
+            );
+        }
     }
-}
-
-fn plugin_manifest_declares_service(
-    plugin_dir: &str,
-    capability: &str,
-    interface_id: &str,
-    kind: &str,
-) -> bool {
-    let path = repo_root()
-        .join("plugins")
-        .join(plugin_dir)
-        .join("plugin.toml");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed reading {}: {err}", path.display()));
-    let parsed: toml::Value = toml::from_str(&source)
-        .unwrap_or_else(|err| panic!("failed parsing {}: {err}", path.display()));
-    parsed
-        .get("services")
-        .and_then(toml::Value::as_array)
-        .is_some_and(|services| {
-            services.iter().any(|service| {
-                service.get("capability").and_then(toml::Value::as_str) == Some(capability)
-                    && service.get("interface_id").and_then(toml::Value::as_str)
-                        == Some(interface_id)
-                    && service.get("kind").and_then(toml::Value::as_str) == Some(kind)
-            })
-        })
 }
 
 fn iter_plugin_dirs() -> Vec<std::path::PathBuf> {

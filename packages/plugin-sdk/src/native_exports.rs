@@ -1,5 +1,5 @@
 use crate::{
-    NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginEvent,
+    NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginEvent, PluginService,
     ServiceEnvelopeKind, ServiceResponse, TypedServiceRegistry, decode_service_envelope,
     encode_service_envelope,
 };
@@ -284,6 +284,25 @@ pub trait RustPlugin: Default + Send + 'static {
         _registry: &mut TypedServiceRegistry,
     ) {
     }
+
+    /// Return BPDL-generated services this plugin provides.
+    ///
+    /// Hosts merge these descriptors into the plugin declaration for native
+    /// bundled plugins, so BPDL service interfaces do not have to be repeated in
+    /// `plugin.toml`. Explicit manifest services remain supported for
+    /// non-BPDL surfaces, process plugins, dynamic compatibility, and override
+    /// use cases.
+    ///
+    /// # Errors
+    ///
+    /// Returns when generated descriptors cannot be converted into host service
+    /// declarations.
+    fn declared_services() -> crate::Result<Vec<PluginService>>
+    where
+        Self: Sized,
+    {
+        Ok(Vec::new())
+    }
 }
 
 /// Context passed to [`RustPlugin::register_typed_services`].
@@ -343,6 +362,12 @@ pub fn register_typed_services_bundled<P: RustPlugin>(
         plugin.register_typed_services(context, &mut registry);
     }
     registry
+}
+
+/// Collect BPDL-generated service declarations from a bundled plugin instance.
+#[doc(hidden)]
+pub fn declared_services_bundled<P: RustPlugin>() -> crate::Result<Vec<PluginService>> {
+    P::declared_services()
 }
 
 #[doc(hidden)]

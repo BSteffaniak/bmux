@@ -24,7 +24,7 @@
 //! [`InProcessTypedDispatch`] helpers serialize and deserialize JSON
 //! payloads so non-Rust SDKs can interoperate.
 
-use crate::{HostScope, InterfaceId, PluginError, Result, ServiceKind};
+use crate::{HostScope, InterfaceId, PluginError, Result, ServiceInterfaceDescriptor, ServiceKind};
 use serde::{Serialize, de::DeserializeOwned};
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
@@ -268,6 +268,27 @@ impl TypedServiceRegistry {
             kind,
             provider,
         ));
+    }
+
+    /// Insert a typed service handle from a BPDL-generated descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns if the descriptor's capability cannot be represented as a host
+    /// scope. Generated descriptors should always be valid.
+    pub fn insert_typed_descriptor<S: ?Sized + Send + Sync + 'static>(
+        &mut self,
+        descriptor: ServiceInterfaceDescriptor,
+        provider: Arc<S>,
+    ) -> Result<()> {
+        let service = descriptor.to_plugin_service()?;
+        self.insert_typed(
+            service.capability,
+            service.kind,
+            descriptor.interface_id,
+            provider,
+        );
+        Ok(())
     }
 
     /// Return the number of registered handles.

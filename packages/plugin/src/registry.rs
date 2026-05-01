@@ -129,8 +129,28 @@ impl PluginRegistry {
     ///
     /// Returns an error when the manifest is invalid or uses a duplicate id.
     pub fn register_bundled_manifest(&mut self, manifest_toml: &str) -> Result<()> {
+        self.register_bundled_manifest_with_services(manifest_toml, Vec::new())
+    }
+
+    /// Register a statically-linked bundled plugin and merge services exported
+    /// by the native plugin implementation.
+    ///
+    /// BPDL-generated descriptors reach the host through this path, making the
+    /// generated contract the routing source of truth for bundled plugins while
+    /// preserving explicit manifest services for compatibility/overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest is invalid, an exported service uses
+    /// an unowned capability, or the plugin id is a duplicate.
+    pub fn register_bundled_manifest_with_services(
+        &mut self,
+        manifest_toml: &str,
+        services: Vec<bmux_plugin_sdk::PluginService>,
+    ) -> Result<()> {
         let manifest = PluginManifest::from_toml_str(manifest_toml)?;
-        let declaration = manifest.to_declaration()?;
+        let mut declaration = manifest.to_declaration()?;
+        declaration.merge_services(services)?;
         let plugin_id = declaration.id.as_str().to_string();
 
         if self.plugins.contains_key(&plugin_id) {
@@ -606,7 +626,7 @@ fn command_is_executable(path: &Path) -> bool {
 mod tests {
     use super::PluginRegistry;
     use crate::PluginManifest;
-    use bmux_plugin_sdk::{ApiVersion, HostMetadata, HostScope};
+    use bmux_plugin_sdk::{ApiVersion, HostMetadata, HostScope, PluginService, ServiceKind};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -802,6 +822,38 @@ minimum = "1.0"
             .get(&HostScope::new("bmux.windows.read").expect("scope should parse"))
             .expect("capability should be present");
         assert_eq!(selected.provider.to_string(), "one.plugin");
+    }
+
+    #[test]
+    fn bundled_manifest_merges_generated_service_declarations() {
+        let generated = PluginService {
+            capability: HostScope::new("bmux.recording.write").expect("scope should parse"),
+            kind: ServiceKind::Command,
+            interface_id: "recording-commands".to_string(),
+        };
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_bundled_manifest_with_services(
+                r#"
+id = "bmux.recording"
+name = "Recording"
+version = "0.1.0"
+provided_capabilities = ["bmux.recording.write"]
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+                vec![generated.clone()],
+            )
+            .expect("bundled manifest should merge generated services");
+
+        let plugin = registry
+            .get("bmux.recording")
+            .expect("bundled plugin should register");
+        assert!(plugin.declaration.services.contains(&generated));
     }
 
     #[test]

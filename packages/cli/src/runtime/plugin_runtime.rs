@@ -100,18 +100,24 @@ macro_rules! declare_bundled_plugins {
         fn register_static_bundled_plugins(registry: &mut PluginRegistry) {
             $(
                 #[cfg(feature = $feature)]
-                if let Err(e) = registry.register_bundled_manifest($manifest) {
-                    let plugin_id = bmux_plugin::PluginManifest::from_toml_str($manifest)
-                        .ok()
-                        .map(|parsed| parsed.id)
-                        .unwrap_or_else(|| "<unknown-plugin-id>".to_string());
-                    tracing::warn!("failed to register bundled plugin '{plugin_id}': {e}");
+                {
+                    let vtable = bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest);
+                    let declared_services = (vtable.declared_services)().unwrap_or_else(|error| {
+                        tracing::warn!(
+                            "failed collecting generated service declarations for bundled plugin '{}': {error}",
+                            $plugin_id,
+                        );
+                        Vec::new()
+                    });
+                    if let Err(e) = registry.register_bundled_manifest_with_services($manifest, declared_services) {
+                        let plugin_id = bmux_plugin::PluginManifest::from_toml_str($manifest)
+                            .ok()
+                            .map(|parsed| parsed.id)
+                            .unwrap_or_else(|| "<unknown-plugin-id>".to_string());
+                        tracing::warn!("failed to register bundled plugin '{plugin_id}': {e}");
+                    }
+                    bmux_plugin::register_static_vtable($plugin_id, vtable);
                 }
-                #[cfg(feature = $feature)]
-                bmux_plugin::register_static_vtable(
-                    $plugin_id,
-                    bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest),
-                );
             )*
         }
 
@@ -1092,7 +1098,7 @@ fn install_typed_service_registry(
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
     config: &BmuxConfig,
     paths: &ConfigPaths,
-) {
+) -> Result<()> {
     let total_started = Instant::now();
     // Build a bridge that plugins may stash inside their typed
     // service handles. It shares the same dispatch function as the
@@ -1179,6 +1185,7 @@ fn install_typed_service_registry(
         let entries = plugin.collect_typed_services(context).into_entries();
         let service_count = entries.len();
         for (key, handle) in entries {
+            ensure_typed_service_declared(plugin, &key)?;
             map.insert(key, handle);
         }
         emit_plugin_runtime_phase_timing(
@@ -1209,6 +1216,27 @@ fn install_typed_service_registry(
             .field("service_count", total_service_count)
             .field("total_us", total_started.elapsed().as_micros())
             .finish(),
+    );
+    Ok(())
+}
+
+fn ensure_typed_service_declared(
+    plugin: &bmux_plugin::LoadedPlugin,
+    key: &bmux_plugin_sdk::TypedServiceKey,
+) -> Result<()> {
+    let (capability, kind, interface_id) = key;
+    if plugin.declaration.services.iter().any(|service| {
+        service.capability == *capability
+            && service.kind == *kind
+            && service.interface_id == interface_id.as_str()
+    }) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "plugin '{}' registered typed service capability='{}' kind='{kind:?}' interface='{}' but its effective declaration does not expose it; return the BPDL-generated service from RustPlugin::declared_services or declare an explicit manifest service",
+        plugin.declaration.id.as_str(),
+        capability.as_str(),
+        interface_id.as_str(),
     );
 }
 
@@ -1351,7 +1379,7 @@ pub(super) fn activate_loaded_plugins(
     // harvested without side effects, and consumers that resolve a
     // typed service observe a stable registry across the lifetime of
     // the attach session.
-    install_typed_service_registry(loaded_plugins, config, paths);
+    install_typed_service_registry(loaded_plugins, config, paths)?;
 
     let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
     let connection_info = HostConnectionInfo {

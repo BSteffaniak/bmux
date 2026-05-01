@@ -35,7 +35,7 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    HostScope, PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
+    PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
     StatefulPluginResult, StatefulPluginSnapshot, TypedServiceRegistrationContext,
     TypedServiceRegistry,
 };
@@ -430,30 +430,17 @@ impl RustPlugin for ContextsPlugin {
     ) {
         let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
 
-        let (Ok(read_cap), Ok(write_cap)) = (
-            HostScope::new(bmux_contexts_plugin_api::capabilities::CONTEXTS_READ.as_str()),
-            HostScope::new(bmux_contexts_plugin_api::capabilities::CONTEXTS_WRITE.as_str()),
-        ) else {
-            return;
-        };
-
         let state: Arc<dyn ContextsStateService + Send + Sync> =
             Arc::new(ContextsStateHandle::new(Arc::clone(&caller)));
-        registry.insert_typed::<dyn ContextsStateService + Send + Sync>(
-            read_cap,
-            ServiceKind::Query,
-            contexts_state::INTERFACE_ID,
-            state,
-        );
+        let _ = contexts_state::register_provider(registry, state);
 
         let commands: Arc<dyn ContextsCommandsService + Send + Sync> =
             Arc::new(ContextsCommandsHandle::new(caller));
-        registry.insert_typed::<dyn ContextsCommandsService + Send + Sync>(
-            write_cap,
-            ServiceKind::Command,
-            contexts_commands::INTERFACE_ID,
-            commands,
-        );
+        let _ = contexts_commands::register_provider(registry, commands);
+    }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_contexts_plugin_api::service_declarations()
     }
 }
 
@@ -1425,7 +1412,7 @@ mod tests {
             request: bmux_plugin_sdk::ServiceRequest {
                 caller_plugin_id: "bmux.windows".to_string(),
                 service: bmux_plugin_sdk::RegisteredService {
-                    capability: HostScope::new("bmux.contexts.write")
+                    capability: bmux_plugin_sdk::HostScope::new("bmux.contexts.write")
                         .expect("capability should parse"),
                     kind: SdkServiceKind::Command,
                     interface_id: "contexts-commands".to_string(),

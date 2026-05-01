@@ -22,20 +22,15 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use bmux_decoration_plugin_api::decoration_commands::{
-    DecorationCommandsService, INTERFACE_ID as DECORATION_COMMANDS_INTERFACE_ID, NotifyError,
-};
+use bmux_decoration_plugin_api::decoration_commands::{DecorationCommandsService, NotifyError};
 use bmux_decoration_plugin_api::decoration_events::{DecorationEvent, PaneEvent};
 use bmux_decoration_plugin_api::decoration_state::{
-    BorderSpec, BorderStyle, DecorationStateService, DecorationThemeExtension,
-    INTERFACE_ID as DECORATION_STATE_INTERFACE_ID, PaneActivity, PaneDecoration, PaneGeometry,
-    PaneLifecycle, SetStyleError, ValidationError, ValidationResult,
+    BorderSpec, BorderStyle, DecorationStateService, DecorationThemeExtension, PaneActivity,
+    PaneDecoration, PaneGeometry, PaneLifecycle, SetStyleError, ValidationError, ValidationResult,
 };
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{
-    HostScope, ServiceKind, TypedServiceRegistrationContext, TypedServiceRegistry,
-};
+use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
     BorderGlyphs, Color, DecorationScene, GradientAxis, InteractiveRegion, NamedColor,
     PaintCommand, Rect, Style, SurfaceDecoration,
@@ -1714,24 +1709,18 @@ impl RustPlugin for DecorationPlugin {
         let handle = Arc::new(DecorationServiceHandle::new(self.state.clone_arc()));
         let state_service: Arc<dyn DecorationStateService + Send + Sync> = handle.clone();
         let command_service: Arc<dyn DecorationCommandsService + Send + Sync> = handle;
-        let (Ok(read_cap), Ok(write_cap)) = (
-            HostScope::new("bmux.decoration.read"),
-            HostScope::new("bmux.decoration.write"),
-        ) else {
-            return;
-        };
-        registry.insert_typed::<dyn DecorationStateService + Send + Sync>(
-            read_cap,
-            ServiceKind::Query,
-            DECORATION_STATE_INTERFACE_ID,
+        let _ = bmux_decoration_plugin_api::decoration_state::register_provider(
+            registry,
             state_service,
         );
-        registry.insert_typed::<dyn DecorationCommandsService + Send + Sync>(
-            write_cap,
-            ServiceKind::Command,
-            DECORATION_COMMANDS_INTERFACE_ID,
+        let _ = bmux_decoration_plugin_api::decoration_commands::register_provider(
+            registry,
             command_service,
         );
+    }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_decoration_plugin_api::service_declarations()
     }
 
     #[allow(clippy::too_many_lines)] // route_service! naturally spans every typed op; splitting hurts readability.
@@ -2362,9 +2351,12 @@ pub const SCENE_PUBLISHED_SIGNAL: &str = "scene-published";
 #[cfg(test)]
 #[test]
 fn interface_ids_match_bpdl_constants() {
-    assert_eq!(DECORATION_STATE_INTERFACE_ID.as_str(), "decoration-state");
     assert_eq!(
-        DECORATION_COMMANDS_INTERFACE_ID.as_str(),
+        bmux_decoration_plugin_api::decoration_state::INTERFACE_ID.as_str(),
+        "decoration-state"
+    );
+    assert_eq!(
+        bmux_decoration_plugin_api::decoration_commands::INTERFACE_ID.as_str(),
         "decoration-commands"
     );
     assert_eq!(
@@ -3100,12 +3092,12 @@ mod tests {
             plugin_settings_map: &settings,
         };
         plugin.register_typed_services(context, &mut registry);
-        let cap = HostScope::new("bmux.decoration.read").expect("cap");
+        let cap = bmux_plugin_sdk::HostScope::new("bmux.decoration.read").expect("cap");
         let handle = registry
             .get(
                 &cap,
                 ServiceKind::Query,
-                DECORATION_STATE_INTERFACE_ID.as_str(),
+                bmux_decoration_plugin_api::decoration_state::INTERFACE_ID.as_str(),
             )
             .expect("handle present");
         let service = handle

@@ -29,7 +29,7 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    HostScope, PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
+    PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
     StatefulPluginResult, StatefulPluginSnapshot, TypedServiceRegistrationContext,
     TypedServiceRegistry,
 };
@@ -438,30 +438,17 @@ impl RustPlugin for ClientsPlugin {
     ) {
         let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
 
-        let (Ok(read_cap), Ok(write_cap)) = (
-            HostScope::new(bmux_clients_plugin_api::capabilities::CLIENTS_READ.as_str()),
-            HostScope::new(bmux_clients_plugin_api::capabilities::CLIENTS_WRITE.as_str()),
-        ) else {
-            return;
-        };
-
         let state: Arc<dyn ClientsStateService + Send + Sync> =
             Arc::new(ClientsStateHandle::new(Arc::clone(&caller)));
-        registry.insert_typed::<dyn ClientsStateService + Send + Sync>(
-            read_cap,
-            ServiceKind::Query,
-            clients_state::INTERFACE_ID,
-            state,
-        );
+        let _ = clients_state::register_provider(registry, state);
 
         let commands: Arc<dyn ClientsCommandsService + Send + Sync> =
             Arc::new(ClientsCommandsHandle::new(caller));
-        registry.insert_typed::<dyn ClientsCommandsService + Send + Sync>(
-            write_cap,
-            ServiceKind::Command,
-            clients_commands::INTERFACE_ID,
-            commands,
-        );
+        let _ = clients_commands::register_provider(registry, commands);
+    }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_clients_plugin_api::service_declarations()
     }
 }
 

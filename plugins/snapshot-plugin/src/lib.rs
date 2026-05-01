@@ -114,17 +114,17 @@ impl RustPlugin for SnapshotPlugin {
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
-            "snapshot-state", "status" => |_req: (), _ctx| {
-                Ok::<Result<snapshot_types::SnapshotStatusPayload, snapshot_types::SnapshotError>, ServiceResponse>(handle_status())
+            bmux_snapshot_plugin_api::snapshot_state::client::StatusEndpoint => |_req, _ctx| {
+                Ok(handle_status())
             },
-            "snapshot-state", "restore-dry-run" => |_req: (), _ctx| {
-                Ok::<Result<snapshot_types::SnapshotDryRunResult, snapshot_types::SnapshotError>, ServiceResponse>(handle_restore_dry_run())
+            bmux_snapshot_plugin_api::snapshot_state::client::RestoreDryRunEndpoint => |_req, _ctx| {
+                Ok(handle_restore_dry_run())
             },
-            "snapshot-commands", "save-now" => |_req: (), _ctx| {
-                Ok::<Result<snapshot_types::SnapshotSaveResult, snapshot_types::SnapshotError>, ServiceResponse>(handle_save_now())
+            bmux_snapshot_plugin_api::snapshot_commands::client::SaveNowEndpoint => |_req, _ctx| {
+                Ok(handle_save_now())
             },
-            "snapshot-commands", "restore-apply" => |_req: (), _ctx| {
-                Ok::<Result<snapshot_types::SnapshotApplySummary, snapshot_types::SnapshotError>, ServiceResponse>(handle_restore_apply())
+            bmux_snapshot_plugin_api::snapshot_commands::client::RestoreApplyEndpoint => |_req, _ctx| {
+                Ok(handle_restore_apply())
             },
         })
     }
@@ -136,6 +136,10 @@ impl RustPlugin for SnapshotPlugin {
     ) {
         // No typed Arc<dyn Trait> surface today — generated snapshot
         // operations dispatch through the byte-service path.
+    }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_snapshot_plugin_api::service_declarations()
     }
 }
 

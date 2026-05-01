@@ -25,7 +25,7 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    HostScope, PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
+    PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
     StatefulPluginResult, StatefulPluginSnapshot, TypedServiceRegistrationContext,
     TypedServiceRegistry,
 };
@@ -396,30 +396,17 @@ impl RustPlugin for SessionsPlugin {
     ) {
         let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
 
-        let (Ok(read_cap), Ok(write_cap)) = (
-            HostScope::new(bmux_sessions_plugin_api::capabilities::SESSIONS_READ.as_str()),
-            HostScope::new(bmux_sessions_plugin_api::capabilities::SESSIONS_WRITE.as_str()),
-        ) else {
-            return;
-        };
-
         let state: Arc<dyn SessionsStateService + Send + Sync> =
             Arc::new(SessionsStateHandle::new(Arc::clone(&caller)));
-        registry.insert_typed::<dyn SessionsStateService + Send + Sync>(
-            read_cap,
-            ServiceKind::Query,
-            sessions_state::INTERFACE_ID,
-            state,
-        );
+        let _ = sessions_state::register_provider(registry, state);
 
         let commands: Arc<dyn SessionsCommandsService + Send + Sync> =
             Arc::new(SessionsCommandsHandle::new(caller));
-        registry.insert_typed::<dyn SessionsCommandsService + Send + Sync>(
-            write_cap,
-            ServiceKind::Command,
-            sessions_commands::INTERFACE_ID,
-            commands,
-        );
+        let _ = sessions_commands::register_provider(registry, commands);
+    }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_sessions_plugin_api::service_declarations()
     }
 }
 

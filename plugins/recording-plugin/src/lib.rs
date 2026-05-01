@@ -278,6 +278,10 @@ impl RustPlugin for RecordingPlugin {
         // No typed Arc<dyn Trait> surface today — recording operations
         // dispatch exclusively through the byte-service path.
     }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_recording_plugin_api::service_declarations()
+    }
 }
 
 fn spawn_prune_loop(manual_runtime: Arc<Mutex<RecordingRuntime>>) {

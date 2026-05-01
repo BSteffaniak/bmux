@@ -24,7 +24,7 @@ use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
 };
 use bmux_plugin_sdk::prelude::*;
-use bmux_plugin_sdk::{HostScope, TypedServiceRegistrationContext, TypedServiceRegistry};
+use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_session_state::SessionManagerHandle;
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use serde::{Deserialize, Serialize};
@@ -111,21 +111,13 @@ impl RustPlugin for ControlCatalogPlugin {
     ) {
         let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
 
-        let Ok(read_cap) =
-            HostScope::new(bmux_control_catalog_plugin_api::capabilities::CATALOG_READ.as_str())
-        else {
-            return;
-        };
-
         let state: Arc<dyn control_catalog_state::ControlCatalogStateService + Send + Sync> =
             Arc::new(ControlCatalogStateHandle::new(caller));
-        registry
-            .insert_typed::<dyn control_catalog_state::ControlCatalogStateService + Send + Sync>(
-                read_cap,
-                ServiceKind::Query,
-                control_catalog_state::INTERFACE_ID,
-                state,
-            );
+        let _ = control_catalog_state::register_provider(registry, state);
+    }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_control_catalog_plugin_api::service_declarations()
     }
 }
 

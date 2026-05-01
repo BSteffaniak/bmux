@@ -138,6 +138,10 @@ impl RustPlugin for PerformancePlugin {
         // No typed Arc<dyn Trait> surface today — performance operations
         // dispatch exclusively through the byte-service path.
     }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_performance_plugin_api::service_declarations()
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

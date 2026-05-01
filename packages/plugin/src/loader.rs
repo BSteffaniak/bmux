@@ -2581,7 +2581,8 @@ pub fn load_static_plugin_with_native_service_buffer_config(
         })?;
 
     let embedded_manifest = crate::PluginManifest::from_toml_str(manifest_text)?;
-    let declaration = embedded_manifest.to_declaration()?;
+    let mut declaration = embedded_manifest.to_declaration()?;
+    declaration.merge_services((vtable.declared_services)()?)?;
 
     // Validate against host capabilities (skip entry file existence check
     // since there is no file -- the plugin is compiled into the binary).
@@ -3144,6 +3145,7 @@ minimum = "1.0"
             handle_event: test_static_plugin_event,
             invoke_service: test_static_plugin_service,
             register_typed_services: test_static_plugin_typed_services,
+            declared_services: || Ok(Vec::new()),
         };
 
         LoadedPlugin {

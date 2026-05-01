@@ -12,10 +12,10 @@ use bmux_pane_runtime_plugin_api::{
 use bmux_plugin::{HostRuntimeApi, ServiceCaller, TypedServiceCaller, prompt};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    HostScope, LogWriteLevel, LogWriteRequest, PromptPolicy, PromptRequest, PromptResponse,
-    PromptValidation, PromptValue, StorageGetRequest, StorageSetRequest,
-    TypedServiceRegistrationContext, TypedServiceRegistry, VolatileStateClearRequest,
-    VolatileStateGetRequest, VolatileStateSetRequest,
+    LogWriteLevel, LogWriteRequest, PromptPolicy, PromptRequest, PromptResponse, PromptValidation,
+    PromptValue, StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext,
+    TypedServiceRegistry, VolatileStateClearRequest, VolatileStateGetRequest,
+    VolatileStateSetRequest,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing},
 };
 use bmux_windows_plugin_api::windows_commands::{
@@ -914,31 +914,14 @@ impl RustPlugin for WindowsPlugin {
             runtime_state: self.runtime_state.clone(),
         };
 
-        let (Ok(read_cap), Ok(write_cap)) = (
-            HostScope::new(bmux_windows_plugin_api::capabilities::WINDOWS_READ.as_str()),
-            HostScope::new(bmux_windows_plugin_api::capabilities::WINDOWS_WRITE.as_str()),
-        ) else {
-            return;
-        };
-
         let handles_started = Instant::now();
         let commands: Arc<dyn WindowsCommandsService + Send + Sync> =
             Arc::new(WindowsCommandsHandle::new(shared.clone()));
-        registry.insert_typed::<dyn WindowsCommandsService + Send + Sync>(
-            write_cap,
-            ServiceKind::Command,
-            windows_commands::INTERFACE_ID,
-            commands,
-        );
+        let _ = windows_commands::register_provider(registry, commands);
 
         let state: Arc<dyn WindowsStateService + Send + Sync> =
             Arc::new(WindowsStateHandle::new(shared.clone()));
-        registry.insert_typed::<dyn WindowsStateService + Send + Sync>(
-            read_cap,
-            ServiceKind::Query,
-            windows_state::INTERFACE_ID,
-            state,
-        );
+        let _ = windows_state::register_provider(registry, state);
         let handle_register_us = handles_started.elapsed().as_micros();
 
         // Spawn the contexts-events subscriber. The windows plugin is
@@ -986,6 +969,10 @@ impl RustPlugin for WindowsPlugin {
                 .field("total_us", total_started.elapsed().as_micros())
                 .finish(),
         );
+    }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_windows_plugin_api::service_declarations()
     }
 }
 

@@ -181,6 +181,10 @@ impl RustPlugin for PermissionsPlugin {
             },
         })
     }
+
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        bmux_permissions_plugin_api::service_declarations()
+    }
 }
 
 #[allow(clippy::too_many_lines)]

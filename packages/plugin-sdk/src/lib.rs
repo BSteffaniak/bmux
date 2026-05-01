@@ -100,9 +100,9 @@ pub use process_runtime::{
 pub use ready::{ReadySignalDecl, ReadyStatus, ReadyTracker};
 pub use service::{
     CURRENT_SERVICE_PROTOCOL_VERSION, PluginService, ProviderId, RegisteredService,
-    ServiceEnvelope, ServiceEnvelopeKind, ServiceError, ServiceKind, ServiceProtocolVersion,
-    ServiceRequest, ServiceResponse, decode_service_envelope, decode_service_message,
-    encode_service_envelope, encode_service_message,
+    ServiceEnvelope, ServiceEnvelopeKind, ServiceError, ServiceInterfaceDescriptor, ServiceKind,
+    ServiceProtocolVersion, ServiceRequest, ServiceResponse, decode_service_envelope,
+    decode_service_message, encode_service_envelope, encode_service_message,
 };
 pub use stateful_plugin::{
     StatefulPlugin, StatefulPluginError, StatefulPluginHandle, StatefulPluginResult,
@@ -219,6 +219,30 @@ macro_rules! route_service {
             }
         }
     };
+    ($context:ident, { $( $endpoint:ty => $handler:expr ),* $(,)? }) => {{
+        let __interface = $context.request.service.interface_id.as_str();
+        let __operation = $context.request.operation.as_str();
+        $(
+            if __interface == <$endpoint as $crate::TypedServiceEndpoint>::INTERFACE_ID.as_str()
+                && __operation == <$endpoint as $crate::TypedServiceEndpoint>::OPERATION.as_str()
+            {
+                $crate::handle_service::<
+                    <$endpoint as $crate::TypedServiceEndpoint>::Request,
+                    <$endpoint as $crate::TypedServiceEndpoint>::Response,
+                    _,
+                >(&$context, $handler)
+            } else
+        )*
+        {
+            $crate::ServiceResponse::error(
+                "unsupported_service_operation",
+                format!(
+                    "plugin '{}' does not support service operation '{}:{}'",
+                    $context.plugin_id, __interface, __operation,
+                ),
+            )
+        }
+    }};
 }
 
 /// Route inbound commands to handler expressions.
@@ -301,8 +325,9 @@ pub mod prelude {
 #[doc(hidden)]
 pub mod __private {
     pub use crate::native_exports::{
-        activate_export, deactivate_export, handle_event_export, invoke_service_export,
-        manifest_toml_ptr, plugin_instance, register_typed_services_bundled, run_command_export,
+        activate_export, deactivate_export, declared_services_bundled, handle_event_export,
+        invoke_service_export, manifest_toml_ptr, plugin_instance, register_typed_services_bundled,
+        run_command_export,
     };
 }
 
@@ -457,6 +482,10 @@ macro_rules! bundled_plugin_vtable {
             $crate::__private::register_typed_services_bundled(__instance(), context)
         }
 
+        fn __declared_services() -> $crate::Result<Vec<$crate::PluginService>> {
+            $crate::__private::declared_services_bundled::<$plugin_ty>()
+        }
+
         $crate::StaticPluginVtable {
             entry: __entry,
             run_command_with_context: __run_command_with_context,
@@ -465,6 +494,7 @@ macro_rules! bundled_plugin_vtable {
             handle_event: __handle_event,
             invoke_service: __invoke_service,
             register_typed_services: __register_typed_services,
+            declared_services: __declared_services,
         }
     }};
 }
@@ -480,6 +510,7 @@ pub struct StaticPluginVtable {
     pub invoke_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
     pub register_typed_services:
         fn(context: TypedServiceRegistrationContext<'_>) -> TypedServiceRegistry,
+    pub declared_services: fn() -> Result<Vec<PluginService>>,
 }
 
 impl std::fmt::Debug for StaticPluginVtable {

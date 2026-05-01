@@ -24,7 +24,7 @@ use std::future::Future;
 use bmux_ipc::InvokeServiceKind;
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{CapabilityId, InterfaceId, OperationId};
+use crate::{CapabilityId, InterfaceId, OperationId, ServiceInterfaceDescriptor, ServiceKind};
 
 /// Errors returned by [`TypedDispatchClient::invoke_service_raw`].
 ///
@@ -127,6 +127,26 @@ pub trait TypedServiceEndpoint {
     const KIND: InvokeServiceKind;
     const INTERFACE_ID: InterfaceId;
     const OPERATION: OperationId;
+
+    /// Interface-level service descriptor for this endpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an endpoint declares the event kind. Generated BPDL request
+    /// endpoints are query/command only, so this indicates a hand-written
+    /// invalid endpoint implementation.
+    #[must_use]
+    fn service_descriptor() -> ServiceInterfaceDescriptor {
+        let kind = match Self::KIND {
+            InvokeServiceKind::Query => ServiceKind::Query,
+            InvokeServiceKind::Command => ServiceKind::Command,
+        };
+        ServiceInterfaceDescriptor {
+            capability: Self::CAPABILITY,
+            kind,
+            interface_id: Self::INTERFACE_ID,
+        }
+    }
 }
 
 /// Invoke a generated typed service endpoint.

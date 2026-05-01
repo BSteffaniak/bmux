@@ -75,6 +75,7 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
             &mut out,
         );
     }
+    emit_schema_service_declarations(schema, &mut out);
     out
 }
 
@@ -190,6 +191,7 @@ fn emit_interface(
     // Service trait contains queries + commands. Events are exposed
     // separately as a typed `EVENT_KIND` constant + payload type
     // alias below.
+    emit_interface_service_descriptor(iface, out);
     emit_service_trait(iface, imports, own_types, out);
     emit_transport_client(iface, imports, own_types, out);
 
@@ -328,6 +330,72 @@ fn emit_enum(e: &EnumDef, out: &mut String) {
     }
 }
 
+fn emit_schema_service_declarations(schema: &Schema, out: &mut String) {
+    let modules = schema
+        .interfaces
+        .iter()
+        .filter(|iface| iface.capability.is_some() && interface_service_kind(iface).is_some())
+        .map(|iface| snake_case(&iface.name))
+        .collect::<Vec<_>>();
+
+    out.push_str("/// Service declarations generated from this BPDL schema.\n");
+    out.push_str("///\n");
+    out.push_str("/// Native providers return this from `RustPlugin::declared_services` so\n");
+    out.push_str("/// the host can derive service routing from BPDL instead of duplicating\n");
+    out.push_str("/// capability/interface/kind tuples in plugin manifests.\n");
+    out.push_str("///\n");
+    out.push_str("/// # Errors\n");
+    out.push_str("///\n");
+    out.push_str(
+        "/// Returns if any generated capability id cannot be represented as a host scope.\n",
+    );
+    out.push_str("pub fn service_declarations() -> ::bmux_plugin_sdk::Result<Vec<::bmux_plugin_sdk::PluginService>> {\n");
+    out.push_str("    Ok(vec![\n");
+    for module in modules {
+        let _ = writeln!(out, "        {module}::service_declaration()?,");
+    }
+    out.push_str("    ])\n");
+    out.push_str("}\n\n");
+}
+
+fn emit_interface_service_descriptor(iface: &Interface, out: &mut String) {
+    let Some(capability) = iface.capability.as_deref() else {
+        return;
+    };
+    let Some(kind) = interface_service_kind(iface) else {
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "    /// BPDL-generated service descriptor for this interface.\n    pub const SERVICE_DESCRIPTOR: ::bmux_plugin_sdk::ServiceInterfaceDescriptor = ::bmux_plugin_sdk::ServiceInterfaceDescriptor {{\n        capability: super::capabilities::{capability},\n        kind: ::bmux_plugin_sdk::ServiceKind::{kind},\n        interface_id: INTERFACE_ID,\n    }};\n"
+    );
+    out.push_str(
+        "    /// Convert this BPDL interface descriptor into a plugin service declaration.\n",
+    );
+    out.push_str("    ///\n");
+    out.push_str("    /// # Errors\n");
+    out.push_str("    ///\n");
+    out.push_str(
+        "    /// Returns if the generated capability id cannot be represented as a host scope.\n",
+    );
+    out.push_str("    pub fn service_declaration() -> ::bmux_plugin_sdk::Result<::bmux_plugin_sdk::PluginService> {\n");
+    out.push_str("        SERVICE_DESCRIPTOR.to_plugin_service()\n");
+    out.push_str("    }\n\n");
+}
+
+fn interface_service_kind(iface: &Interface) -> Option<&'static str> {
+    let mut kind = None;
+    for item in &iface.items {
+        match item {
+            InterfaceItem::Query(_) => kind = Some("Query"),
+            InterfaceItem::Command(_) => kind = Some("Command"),
+            InterfaceItem::Events(_) => kind = Some("Event"),
+            InterfaceItem::Record(_) | InterfaceItem::Variant(_) | InterfaceItem::Enum(_) => {}
+        }
+    }
+    kind
+}
+
 fn emit_service_trait(
     iface: &Interface,
     imports: &ImportMap,
@@ -442,6 +510,13 @@ fn emit_service_client(
         "        inner: ::std::sync::Arc<dyn {trait_name} + Send + Sync>,",
     );
     out.push_str("    }\n\n");
+
+    if iface.capability.is_some() && interface_service_kind(iface).is_some() {
+        let _ = writeln!(
+            out,
+            "    /// Register a provider for this interface using the BPDL-generated service descriptor.\n    ///\n    /// # Errors\n    ///\n    /// Returns if the generated capability id cannot be represented as a host scope.\n    pub fn register_provider(registry: &mut ::bmux_plugin_sdk::TypedServiceRegistry, provider: ::std::sync::Arc<dyn {trait_name} + Send + Sync>) -> ::bmux_plugin_sdk::Result<()> {{\n        registry.insert_typed_descriptor(SERVICE_DESCRIPTOR, provider)\n    }}\n"
+        );
+    }
 
     let _ = writeln!(out, "    impl {client_name} {{");
     out.push_str("        /// Construct directly from a concrete `Arc` to a provider.\n");
@@ -911,6 +986,8 @@ mod tests {
         assert!(rust.contains("fn focus_pane"));
         assert!(rust.contains("Option<PaneState>"));
         assert!(rust.contains("::std::result::Result<(), String>"));
+        assert!(rust.contains("pub const SERVICE_DESCRIPTOR"));
+        assert!(rust.contains("pub fn service_declarations()"));
     }
 
     #[test]
@@ -943,6 +1020,10 @@ mod tests {
         assert!(
             rust.contains("self.inner.pane_state("),
             "client should forward pane_state through inner; got: {rust}"
+        );
+        assert!(
+            rust.contains("pub fn register_provider("),
+            "client module should expose descriptor-backed provider registration; got: {rust}"
         );
     }
 
@@ -978,6 +1059,10 @@ mod tests {
         assert!(
             rust.contains("pub async fn pane_state<C: ::bmux_plugin_sdk::TypedDispatchClient>"),
             "transport client function should be emitted; got: {rust}"
+        );
+        assert!(
+            rust.contains("SERVICE_DESCRIPTOR.to_plugin_service()"),
+            "interface should expose manifest-compatible service declaration conversion; got: {rust}"
         );
     }
 
