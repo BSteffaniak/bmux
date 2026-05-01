@@ -2688,16 +2688,42 @@ fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
         return serde_json::from_slice::<
             bmux_recording_plugin_api::recording_events::RecordingEvent,
         >(payload)
-        .map_or("plugin_bus_event", |event| match event {
-            bmux_recording_plugin_api::recording_events::RecordingEvent::Started { .. } => {
-                "recording_started"
-            }
-            bmux_recording_plugin_api::recording_events::RecordingEvent::Stopped { .. } => {
-                "recording_stopped"
-            }
+        .map_or("plugin_bus_event", |event| {
+            recording_plugin_bus_event_name(&event)
         });
     }
     "plugin_bus_event"
+}
+
+const fn recording_plugin_bus_event_name(
+    event: &bmux_recording_plugin_api::recording_events::RecordingEvent,
+) -> &'static str {
+    match event {
+        bmux_recording_plugin_api::recording_events::RecordingEvent::Started { .. } => {
+            "recording_started"
+        }
+        bmux_recording_plugin_api::recording_events::RecordingEvent::Stopped { .. } => {
+            "recording_stopped"
+        }
+        bmux_recording_plugin_api::recording_events::RecordingEvent::CutStarted { .. } => {
+            "recording_cut_started"
+        }
+        bmux_recording_plugin_api::recording_events::RecordingEvent::CutCompleted { .. } => {
+            "recording_cut_completed"
+        }
+        bmux_recording_plugin_api::recording_events::RecordingEvent::CutFailed { .. } => {
+            "recording_cut_failed"
+        }
+        bmux_recording_plugin_api::recording_events::RecordingEvent::ExportStarted { .. } => {
+            "recording_export_started"
+        }
+        bmux_recording_plugin_api::recording_events::RecordingEvent::ExportCompleted { .. } => {
+            "recording_export_completed"
+        }
+        bmux_recording_plugin_api::recording_events::RecordingEvent::ExportFailed { .. } => {
+            "recording_export_failed"
+        }
+    }
 }
 
 // ── Endpoint selection ────────────────────────────────────────────────────────

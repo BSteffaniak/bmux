@@ -7,7 +7,7 @@ use bmux_recording_protocol::{
 };
 use bmux_recording_runtime::RecordMeta;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -952,6 +952,7 @@ fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: 
         return Ok(());
     }
     let window_ns = window_secs.saturating_mul(1_000_000_000);
+    let mut tracks: BTreeMap<String, Vec<(u64, PathBuf)>> = BTreeMap::new();
     for entry in std::fs::read_dir(source_dir).with_context(|| {
         format!(
             "failed reading recording directory {}",
@@ -963,37 +964,42 @@ fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: 
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("display-")
-            || !std::path::Path::new(&name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
-        {
+        let Some((output_name, segment_index)) = parse_display_track_source_name(&name) else {
             continue;
-        }
+        };
+        tracks
+            .entry(output_name)
+            .or_default()
+            .push((segment_index, entry.path()));
+    }
 
-        let path = entry.path();
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("failed reading display track {}", path.display()))?;
-        let result = read_frames::<DisplayTrackEnvelope>(&bytes).map_err(|error| {
-            anyhow::anyhow!("failed parsing display track {}: {error}", path.display())
-        })?;
-        let output = cut_display_track_frames(&result.frames, window_ns);
+    for (output_name, mut segments) in tracks {
+        segments.sort_by_key(|(index, _)| *index);
+        let mut frames = Vec::new();
+        for (_, path) in segments {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("failed reading display track {}", path.display()))?;
+            let result = read_frames::<DisplayTrackEnvelope>(&bytes).map_err(|error| {
+                anyhow::anyhow!("failed parsing display track {}: {error}", path.display())
+            })?;
+            frames.extend(result.frames);
+        }
+        frames.sort_by_key(|frame| frame.mono_ns);
+        let output = cut_display_track_frames(&frames, window_ns);
 
         if output.is_empty() {
             continue;
         }
 
+        let output_path = dest_dir.join(&output_name);
         let mut writer = BufWriter::new(
             std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(dest_dir.join(&name))
+                .open(&output_path)
                 .with_context(|| {
-                    format!(
-                        "failed opening cut display track {}",
-                        dest_dir.join(&name).display()
-                    )
+                    format!("failed opening cut display track {}", output_path.display())
                 })?,
         );
         for frame in &output {
@@ -1004,6 +1010,17 @@ fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: 
         writer.flush()?;
     }
     Ok(())
+}
+
+fn parse_display_track_source_name(name: &str) -> Option<(String, u64)> {
+    let rest = name.strip_prefix("display-")?.strip_suffix(".bin")?;
+    if let Ok(client_id) = rest.parse::<Uuid>() {
+        return Some((format!("display-{client_id}.bin"), 0));
+    }
+    let (client_id_raw, index_raw) = rest.rsplit_once(".part")?;
+    let client_id = client_id_raw.parse::<Uuid>().ok()?;
+    let index = index_raw.parse::<u64>().ok()?;
+    Some((format!("display-{client_id}.bin"), index))
 }
 
 fn write_manifest(path: &Path, summary: &RecordingSummary) -> Result<()> {

@@ -369,6 +369,7 @@ impl DisplayCaptureFanout {
             target.recording_id,
             Path::new(&target.path),
             client_id,
+            target.rolling_window_secs,
         ) {
             Ok(writer) => {
                 self.writers.insert(target.recording_id, writer);
@@ -2847,6 +2848,85 @@ async fn handle_attach_stream_server_event(
                 Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::Stopped {
                     recording_id,
                 }) => display_capture.close_recording(recording_id),
+                Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::CutStarted {
+                    ..
+                }) => {
+                    view_state.set_transient_status(
+                        "recording cut started".to_string(),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    view_state
+                        .dirty
+                        .mark_status_dirty(AttachDirtySource::PluginCommand);
+                }
+                Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::CutCompleted {
+                    summary,
+                }) => {
+                    view_state.set_transient_status(
+                        format!("recording cut created: {}", summary.path),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    view_state
+                        .dirty
+                        .mark_status_dirty(AttachDirtySource::PluginCommand);
+                }
+                Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::CutFailed {
+                    reason,
+                }) => {
+                    view_state.set_transient_status(
+                        format!("recording cut failed: {reason}"),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    view_state
+                        .dirty
+                        .mark_status_dirty(AttachDirtySource::PluginCommand);
+                }
+                Ok(
+                    bmux_recording_plugin_api::recording_events::RecordingEvent::ExportStarted {
+                        output_path,
+                        ..
+                    },
+                ) => {
+                    view_state.set_transient_status(
+                        format!("recording GIF export started: {output_path}"),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    view_state
+                        .dirty
+                        .mark_status_dirty(AttachDirtySource::PluginCommand);
+                }
+                Ok(
+                    bmux_recording_plugin_api::recording_events::RecordingEvent::ExportCompleted {
+                        output_path,
+                        ..
+                    },
+                ) => {
+                    view_state.set_transient_status(
+                        format!("recording GIF exported: {output_path}"),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    view_state
+                        .dirty
+                        .mark_status_dirty(AttachDirtySource::PluginCommand);
+                }
+                Ok(bmux_recording_plugin_api::recording_events::RecordingEvent::ExportFailed {
+                    reason,
+                    ..
+                }) => {
+                    view_state.set_transient_status(
+                        format!("recording GIF export failed: {reason}"),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    view_state
+                        .dirty
+                        .mark_status_dirty(AttachDirtySource::PluginCommand);
+                }
                 Err(error) => {
                     tracing::warn!(
                         kind = %kind,

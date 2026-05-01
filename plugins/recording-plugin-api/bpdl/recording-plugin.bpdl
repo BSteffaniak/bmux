@@ -101,6 +101,12 @@ interface recording-events {
     variant recording-event {
         started { target: recording-types.recording-capture-target },
         stopped { recording_id: uuid },
+        cut-started { last_seconds: u64?, name: string? },
+        cut-completed { summary: recording-types.recording-summary },
+        cut-failed { reason: string },
+        export-started { recording_id: uuid, output_path: string },
+        export-completed { recording_id: uuid, output_path: string },
+        export-failed { recording_id: uuid, output_path: string, reason: string },
     }
 
     events recording-event;

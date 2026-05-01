@@ -398,9 +398,18 @@ fn recording_delete_all_generated() -> u64 {
 fn recording_cut_generated(
     req: CutRequest,
 ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
-    handle_cut(req.last_seconds, req.name)
-        .map(Into::into)
-        .map_err(|error| generated_failed(error.to_string()))
+    publish_recording_cut_started(req.last_seconds, req.name.clone());
+    match handle_cut(req.last_seconds, req.name) {
+        Ok(summary) => {
+            publish_recording_cut_completed(&summary);
+            Ok(summary.into())
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            publish_recording_cut_failed(reason.clone());
+            Err(generated_failed(reason))
+        }
+    }
 }
 
 fn recording_rolling_start_generated(
@@ -408,7 +417,7 @@ fn recording_rolling_start_generated(
 ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
     let recording =
         handle_rolling_start(options.into()).ok_or(recording_types::RecordingError::Unavailable)?;
-    publish_recording_started(&recording, None);
+    publish_recording_started(&recording, handle_rolling_status().rolling_window_secs);
     Ok(recording.into())
 }
 
@@ -426,7 +435,7 @@ fn recording_rolling_clear_generated(
         publish_recording_stopped(recording_id);
     }
     if let Some(recording) = report.restarted_recording.as_ref() {
-        publish_recording_started(recording, None);
+        publish_recording_started(recording, handle_rolling_status().rolling_window_secs);
     }
     report.into()
 }
@@ -467,6 +476,29 @@ fn publish_recording_stopped(recording_id: uuid::Uuid) {
     let _ = bmux_plugin::global_event_bus().emit(
         &recording_events::EVENT_KIND,
         recording_events::RecordingEvent::Stopped { recording_id },
+    );
+}
+
+fn publish_recording_cut_started(last_seconds: Option<u64>, name: Option<String>) {
+    let _ = bmux_plugin::global_event_bus().emit(
+        &recording_events::EVENT_KIND,
+        recording_events::RecordingEvent::CutStarted { last_seconds, name },
+    );
+}
+
+fn publish_recording_cut_completed(summary: &RecordingSummary) {
+    let _ = bmux_plugin::global_event_bus().emit(
+        &recording_events::EVENT_KIND,
+        recording_events::RecordingEvent::CutCompleted {
+            summary: summary.clone().into(),
+        },
+    );
+}
+
+fn publish_recording_cut_failed(reason: String) {
+    let _ = bmux_plugin::global_event_bus().emit(
+        &recording_events::EVENT_KIND,
+        recording_events::RecordingEvent::CutFailed { reason },
     );
 }
 

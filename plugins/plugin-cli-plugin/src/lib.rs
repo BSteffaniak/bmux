@@ -10,8 +10,8 @@ mod suggest;
 
 use bmux_plugin::HostRuntimeApi;
 use bmux_plugin_sdk::{
-    CoreCliCommandRequest, CoreCliCommandResponse, NativeCommandContext, PluginCommandError,
-    RustPlugin,
+    CoreCliCommandRequest, CoreCliCommandResponse, NativeCommandContext,
+    NativeCommandInvocationSource, PluginCommandError, RustPlugin,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_perf_phase},
 };
 use serde::Serialize;
@@ -60,6 +60,54 @@ fn emit_phase_timing(command: &str, total_us: u128, result: &Result<i32, PluginC
 include!(concat!(env!("OUT_DIR"), "/core_proxy_commands.rs"));
 
 fn run_core_proxy_command(
+    context: &NativeCommandContext,
+    command_path: &[&str],
+) -> Result<i32, PluginCommandError> {
+    if should_run_core_proxy_in_background(context, command_path) {
+        return run_core_proxy_command_background(context, command_path);
+    }
+
+    run_core_proxy_command_sync(context, command_path)
+}
+
+fn should_run_core_proxy_in_background(
+    context: &NativeCommandContext,
+    command_path: &[&str],
+) -> bool {
+    matches!(
+        context.invocation_source,
+        NativeCommandInvocationSource::AttachKeybinding | NativeCommandInvocationSource::Internal
+    ) && command_path == ["recording", "cut"]
+}
+
+fn run_core_proxy_command_background(
+    context: &NativeCommandContext,
+    command_path: &[&str],
+) -> Result<i32, PluginCommandError> {
+    bmux_plugin_sdk::record_command_outcome_metadata(
+        bmux_plugin_sdk::COMMAND_OUTCOME_STATUS_MESSAGE_KEY,
+        serde_json::json!("recording cut queued"),
+    );
+    let context = context.clone();
+    let command_path = command_path
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    std::thread::Builder::new()
+        .name("bmux-recording-cut-command".to_string())
+        .spawn(move || {
+            let command_path = command_path.iter().map(String::as_str).collect::<Vec<_>>();
+            let _ = run_core_proxy_command_sync(&context, &command_path);
+        })
+        .map_err(|error| {
+            PluginCommandError::failed(format!(
+                "failed spawning background recording cut command: {error}"
+            ))
+        })?;
+    Ok(0)
+}
+
+fn run_core_proxy_command_sync(
     context: &NativeCommandContext,
     command_path: &[&str],
 ) -> Result<i32, PluginCommandError> {
