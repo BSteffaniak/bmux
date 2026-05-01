@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral structured terminal grid and scrollback reflow primitives for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "grid", "scrollback"]
+license     = { workspace = true }
+name        = "bmux_terminal_grid"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde         = { workspace = true, features = ["derive", "std"] }
+thiserror     = { workspace = true }
+unicode-width = { workspace = true }
+vte           = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -250,7 +250,11 @@ pub fn resize_attach_parsers_for_scene_with_size(
             h: inner_h,
         };
         let buffer = pane_buffers.entry(pane_id).or_default();
+        let previous_size = buffer.parser.screen().size();
         buffer.parser.screen_mut().set_size(inner_h, inner_w);
+        if buffer.parser.screen().size() != previous_size {
+            buffer.prev_rows.clear();
+        }
     }
 }
 
@@ -302,6 +306,27 @@ mod tests {
             },
             surfaces,
         }
+    }
+
+    #[test]
+    fn resize_attach_parsers_clears_row_cache_on_dimension_change() {
+        let pane_id = Uuid::from_u128(1);
+        let test_scene = scene(vec![pane_surface(
+            Uuid::from_u128(2),
+            pane_id,
+            0,
+            0,
+            10,
+            3,
+            0,
+        )]);
+        let mut pane_buffers: BTreeMap<Uuid, PaneRenderBuffer> = BTreeMap::new();
+        let buffer = pane_buffers.entry(pane_id).or_default();
+        buffer.prev_rows.push("cached".to_string());
+
+        resize_attach_parsers_for_scene_with_size(&mut pane_buffers, &test_scene, 10, 3);
+
+        assert!(pane_buffers[&pane_id].prev_rows.is_empty());
     }
 
     #[test]

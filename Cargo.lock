@@ -2080,6 +2080,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_terminal_grid"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+ "unicode-width",
+ "vte",
+]
+
+[[package]]
 name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.0"
 dependencies = [
