@@ -1286,7 +1286,12 @@ impl TypedDispatchClient for StreamingBmuxClient {
                 .map_err(|err| map_client_error(&iface_for_err, &op_for_err, err))?
             {
                 Response::Ok(ResponsePayload::ServiceInvoked { payload }) => Ok(payload),
-                _ => Err(TypedDispatchClientError::unexpected_response(
+                Response::Err(error) => Err(TypedDispatchClientError::server(
+                    iface_for_err,
+                    op_for_err,
+                    format!("{:?}: {}", error.code, error.message),
+                )),
+                Response::Ok(_) => Err(TypedDispatchClientError::unexpected_response(
                     iface_for_err,
                     op_for_err,
                     "expected service invoked",

@@ -543,6 +543,7 @@ fn parse_and_validate_fixtures() {
         "render_assert_focus_change.dsl",
         "render_assert_split_pane.dsl",
         "render_assert_resize_viewport.dsl",
+        "render_assert_alt_screen_transition.dsl",
     ];
 
     for name in &fixtures {
@@ -590,6 +591,11 @@ fn playbook_render_assert_split_pane() {
 #[test]
 fn playbook_render_assert_resize_viewport() {
     assert_render_fixture_passes("render_assert_resize_viewport.dsl");
+}
+
+#[test]
+fn playbook_render_assert_alt_screen_transition() {
+    assert_render_fixture_passes("render_assert_alt_screen_transition.dsl");
 }
 
 fn assert_render_fixture_passes(fixture: &str) {

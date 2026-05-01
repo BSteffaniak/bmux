@@ -8731,6 +8731,10 @@ pub fn is_attach_stream_closed_error(error: &ClientError) -> bool {
         error,
         ClientError::ServerError { code: bmux_ipc::ErrorCode::NotFound, message }
             if message.contains("session runtime not found")
+    ) || matches!(
+        error,
+        ClientError::ServerError { code: bmux_ipc::ErrorCode::Internal, message }
+            if message.contains("plugin 'bmux.pane_runtime' service invocation failed with status 4")
     )
 }
 
@@ -8769,6 +8773,18 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
+
+    #[test]
+    fn pane_runtime_status_four_is_treated_as_closed_attach_stream() {
+        let error = ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message:
+                "service invocation failed: plugin 'bmux.pane_runtime' service invocation failed with status 4"
+                    .to_string(),
+        };
+
+        assert!(is_attach_stream_closed_error(&error));
+    }
 
     fn focus_action(direction: &str) -> RuntimeAction {
         RuntimeAction::PluginCommand {
@@ -11614,6 +11630,42 @@ mod tests {
         assert_eq!(
             damage.content_surface_rects(pane_id),
             &[DamageRect::new(0, 0, 3, 2)]
+        );
+        assert!(!damage.is_full_frame());
+    }
+
+    #[test]
+    fn overlay_rect_damage_repaints_previous_and_current_bounds() {
+        let view_state = attach_view_state_with_scrollback_fixture();
+        let layout_state = view_state.cached_layout_state.expect("layout state");
+        let pane_id = layout_state.focused_pane_id;
+        let overlay_surface = |x, y| AttachSurface {
+            id: HELP_OVERLAY_SURFACE_ID,
+            kind: AttachSurfaceKind::Overlay,
+            layer: SurfaceLayer::Overlay,
+            z: i32::MAX,
+            rect: AttachRect { x, y, w: 2, h: 1 },
+            content_rect: AttachRect { x, y, w: 2, h: 1 },
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner: true,
+            pane_id: None,
+        };
+        let previous_overlay = overlay_surface(1, 1);
+        let current_overlay = overlay_surface(5, 4);
+
+        let damage = overlay_rect_damage(
+            &layout_state,
+            Some(&previous_overlay),
+            Some(&current_overlay),
+            DamageCoalescingPolicy::default(),
+        );
+
+        assert_eq!(
+            damage.content_surface_rects(pane_id),
+            &[DamageRect::new(0, 0, 2, 1), DamageRect::new(4, 3, 2, 1)]
         );
         assert!(!damage.is_full_frame());
     }
