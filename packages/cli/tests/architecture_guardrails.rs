@@ -218,6 +218,12 @@ fn core_ipc_does_not_advertise_domain_feature_capabilities() {
     )
     .expect("packages/ipc/src/lib.rs should be readable");
     for marker in [
+        "core.session",
+        "core.attach",
+        "core.pane_io",
+        "core.detach",
+        "HelloV2",
+        "hello_v2",
         "feature.attach_pane_snapshot",
         "feature.attach_snapshot",
         "feature.contexts",
@@ -225,7 +231,7 @@ fn core_ipc_does_not_advertise_domain_feature_capabilities() {
     ] {
         assert!(
             !source.contains(marker),
-            "core IPC must not advertise stale domain feature capability {marker}",
+            "core IPC must not advertise domain-named protocol capability {marker}",
         );
     }
 }
@@ -1312,6 +1318,53 @@ fn source_tree_has_no_backup_rust_files() {
     assert!(
         offenders.is_empty(),
         "source backup files must not live under packages/ or plugins/: {offenders:#?}",
+    );
+}
+
+#[test]
+fn source_tree_has_no_legacy_hello_v2_handshake() {
+    fn visit(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let legacy_type = ["Hello", "V2"].concat();
+        let legacy_wire = ["hello", "_v2"].concat();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if name == "target" || name.starts_with('.') {
+                    continue;
+                }
+                visit(&path, offenders);
+            } else if name.ends_with(".rs") && name != "architecture_guardrails.rs" {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if text.contains(&legacy_type) || text.contains(&legacy_wire) {
+                    offenders.push(
+                        path.strip_prefix(repo_root())
+                            .unwrap_or(path.as_path())
+                            .display()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    let mut offenders = Vec::new();
+    for root in [
+        repo_root().join("packages"),
+        repo_root().join("plugins"),
+        repo_root().join("examples"),
+    ] {
+        visit(&root, &mut offenders);
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "the transitional hello_v2 handshake surface must stay deleted: {offenders:#?}",
     );
 }
 

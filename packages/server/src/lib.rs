@@ -1393,7 +1393,7 @@ async fn handle_connection(
         .context("handshake timed out")??;
 
     let handshake = parse_request(&first_envelope)?;
-    if let Request::HelloV2 {
+    if let Request::Hello {
         contract,
         client_name,
         principal_id,
@@ -1404,7 +1404,7 @@ async fn handle_connection(
             Ok(negotiated) => {
                 client_principal_id = principal_id;
                 debug!(
-                    "accepted client handshake (v2): {client_name} revision={} caps={}",
+                    "accepted client handshake: {client_name} revision={} caps={}",
                     negotiated.revision,
                     negotiated.capabilities.join(",")
                 );
@@ -1433,7 +1433,7 @@ async fn handle_connection(
             &mut stream,
             first_envelope.request_id,
             ErrorCode::InvalidRequest,
-            "first request must be hello_v2".to_string(),
+            "first request must be hello".to_string(),
         )
         .await?;
         return Ok(());
@@ -2101,7 +2101,7 @@ async fn handle_request(
     )?;
 
     let response = match request {
-        Request::Hello { .. } | Request::HelloV2 { .. } => Response::Err(ErrorResponse {
+        Request::Hello { .. } => Response::Err(ErrorResponse {
             code: ErrorCode::InvalidRequest,
             message: "hello request is only valid during handshake".to_string(),
         }),
@@ -2366,7 +2366,6 @@ const fn response_requires_snapshot(_response: &Response) -> bool {
 const fn request_kind_name(request: &Request) -> &'static str {
     match request {
         Request::Hello { .. } => "hello",
-        Request::HelloV2 { .. } => "hello_v2",
         Request::Ping => "ping",
         Request::WhoAmIPrincipal => "whoami_principal",
         Request::ServerStatus => "server_status",

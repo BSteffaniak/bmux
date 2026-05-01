@@ -80,7 +80,7 @@ impl IrohConnectAttemptErrorKind {
 enum IrohConnectStage {
     Connect,
     OpenBi,
-    HelloV2,
+    Hello,
 }
 
 impl IrohConnectStage {
@@ -88,7 +88,7 @@ impl IrohConnectStage {
         match self {
             Self::Connect => "connect",
             Self::OpenBi => "open_bi",
-            Self::HelloV2 => "hello_v2",
+            Self::Hello => "hello",
         }
     }
 }
@@ -688,7 +688,7 @@ impl RemoteTerminalBackend {
         .map_err(|error| {
             Self::classify_iroh_connect_error(
                 error,
-                IrohConnectStage::HelloV2,
+                IrohConnectStage::Hello,
                 Self::elapsed_ms(started),
             )
         })
@@ -840,10 +840,10 @@ impl RemoteTerminalBackend {
             failure.error.stage == IrohConnectStage::Connect && failure.error.is_timeout()
         });
         let has_hello_timeout = failures.iter().any(|failure| {
-            failure.error.stage == IrohConnectStage::HelloV2 && failure.error.is_timeout()
+            failure.error.stage == IrohConnectStage::Hello && failure.error.is_timeout()
         });
         let has_hello_eof = failures.iter().any(|failure| {
-            failure.error.stage == IrohConnectStage::HelloV2
+            failure.error.stage == IrohConnectStage::Hello
                 && failure.error.message.to_ascii_lowercase().contains("eof")
         });
 
@@ -869,7 +869,7 @@ impl RemoteTerminalBackend {
             && error.is_timeout()
             && matches!(
                 error.stage,
-                IrohConnectStage::OpenBi | IrohConnectStage::HelloV2
+                IrohConnectStage::OpenBi | IrohConnectStage::Hello
             )
     }
 
@@ -1831,7 +1831,7 @@ mod tests {
     #[test]
     fn retry_with_extended_hello_timeout_for_hello_probe_timeout() {
         let error = IrohConnectAttemptError::timeout(
-            IrohConnectStage::HelloV2,
+            IrohConnectStage::Hello,
             2_500,
             "request timed out after 2.5s".to_string(),
         );

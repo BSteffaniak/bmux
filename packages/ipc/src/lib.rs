@@ -69,17 +69,17 @@ pub const CURRENT_PROTOCOL_REVISION: u32 = 1;
 /// Minimum protocol revision this build can negotiate.
 pub const MIN_SUPPORTED_PROTOCOL_REVISION: u32 = 1;
 
-pub const CORE_CAPABILITY_SESSION: &str = "core.session";
-pub const CORE_CAPABILITY_ATTACH: &str = "core.attach";
-pub const CORE_CAPABILITY_PANE_IO: &str = "core.pane_io";
-pub const CORE_CAPABILITY_DETACH: &str = "core.detach";
+pub const CORE_CAPABILITY_CONTROL: &str = "core.control";
+pub const CORE_CAPABILITY_SERVICE_INVOCATION: &str = "core.service_invocation";
+pub const CORE_CAPABILITY_EVENT_STREAM: &str = "core.event_stream";
+pub const CORE_CAPABILITY_LIFECYCLE: &str = "core.lifecycle";
 
 /// Core protocol capabilities required for baseline bmux operation.
 pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
-    CORE_CAPABILITY_SESSION,
-    CORE_CAPABILITY_ATTACH,
-    CORE_CAPABILITY_PANE_IO,
-    CORE_CAPABILITY_DETACH,
+    CORE_CAPABILITY_CONTROL,
+    CORE_CAPABILITY_SERVICE_INVOCATION,
+    CORE_CAPABILITY_EVENT_STREAM,
+    CORE_CAPABILITY_LIFECYCLE,
 ];
 
 // Compression capability strings (non-core, optional).
@@ -157,10 +157,10 @@ pub enum IncompatibilityReason {
 pub fn default_supported_capabilities() -> Vec<String> {
     #[allow(unused_mut)]
     let mut caps = vec![
-        CORE_CAPABILITY_SESSION.to_string(),
-        CORE_CAPABILITY_ATTACH.to_string(),
-        CORE_CAPABILITY_PANE_IO.to_string(),
-        CORE_CAPABILITY_DETACH.to_string(),
+        CORE_CAPABILITY_CONTROL.to_string(),
+        CORE_CAPABILITY_SERVICE_INVOCATION.to_string(),
+        CORE_CAPABILITY_EVENT_STREAM.to_string(),
+        CORE_CAPABILITY_LIFECYCLE.to_string(),
     ];
     // Advertise compression capabilities when compiled in.
     // Note: Frame compression capabilities are NOT advertised by default
@@ -305,7 +305,7 @@ pub enum InvokeServiceKind {
 #[serde(rename_all = "snake_case")]
 pub enum Request {
     Hello {
-        protocol_version: ProtocolVersion,
+        contract: ProtocolContract,
         client_name: String,
         principal_id: Uuid,
     },
@@ -328,10 +328,10 @@ pub enum Request {
     /// under `kind`. The server looks up the registered channel and
     /// invokes its decoder to deserialise the bytes into the channel's
     /// typed value, then publishes on the same bus. Used by the
-    /// attach runtime to relay state-channel payloads (e.g. attach
-    /// layout snapshots) from client-process plugins to their
-    /// server-process counterparts so every plugin can subscribe to
-    /// the same wire vocabulary regardless of which process owns it.
+    /// clients to relay typed state-channel payloads from local plugin
+    /// producers to their server-process counterparts so every plugin
+    /// can subscribe to the same wire vocabulary regardless of which
+    /// process owns it.
     EmitOnPluginBus {
         kind: String,
         #[serde(with = "bmux_codec::serde_bytes_vec")]
@@ -348,11 +348,6 @@ pub enum Request {
     /// clients (which split the socket into read/write halves and demux
     /// incoming frames) should send this request.
     EnableEventPush,
-    HelloV2 {
-        contract: ProtocolContract,
-        client_name: String,
-        principal_id: Uuid,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -645,10 +640,10 @@ mod tests {
             wire_epoch: CURRENT_WIRE_EPOCH,
             revisions: ProtocolRevisionRange::new(1, 4),
             capabilities: vec![
-                CORE_CAPABILITY_SESSION.to_string(),
-                CORE_CAPABILITY_ATTACH.to_string(),
-                CORE_CAPABILITY_PANE_IO.to_string(),
-                CORE_CAPABILITY_DETACH.to_string(),
+                CORE_CAPABILITY_CONTROL.to_string(),
+                CORE_CAPABILITY_SERVICE_INVOCATION.to_string(),
+                CORE_CAPABILITY_EVENT_STREAM.to_string(),
+                CORE_CAPABILITY_LIFECYCLE.to_string(),
             ],
         };
         let server = ProtocolContract {
@@ -695,12 +690,12 @@ mod tests {
         let client = ProtocolContract {
             wire_epoch: CURRENT_WIRE_EPOCH,
             revisions: ProtocolRevisionRange::new(1, 1),
-            capabilities: vec![CORE_CAPABILITY_SESSION.to_string()],
+            capabilities: vec![CORE_CAPABILITY_CONTROL.to_string()],
         };
         let server = ProtocolContract {
             wire_epoch: CURRENT_WIRE_EPOCH,
             revisions: ProtocolRevisionRange::new(1, 1),
-            capabilities: vec![CORE_CAPABILITY_SESSION.to_string()],
+            capabilities: vec![CORE_CAPABILITY_CONTROL.to_string()],
         };
 
         let error = negotiate_protocol(&client, &server, CORE_PROTOCOL_CAPABILITIES)
@@ -708,7 +703,7 @@ mod tests {
         assert!(matches!(
             error,
             IncompatibilityReason::MissingCoreCapabilities { missing }
-                if missing.contains(&CORE_CAPABILITY_ATTACH.to_string())
+                if missing.contains(&CORE_CAPABILITY_SERVICE_INVOCATION.to_string())
         ));
     }
 
@@ -766,13 +761,8 @@ mod tests {
 
         let variants: Vec<Request> = vec![
             Request::Hello {
-                protocol_version: ProtocolVersion::current(),
                 client_name: "test-client".into(),
-                principal_id: id,
-            },
-            Request::HelloV2 {
                 contract: ProtocolContract::current(default_supported_capabilities()),
-                client_name: "test-client-v2".into(),
                 principal_id: id,
             },
             Request::Ping,

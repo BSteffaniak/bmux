@@ -542,7 +542,6 @@ fn request_to_dsl(
         // Skip high-frequency / non-structural requests.
         Request::Ping
         | Request::Hello { .. }
-        | Request::HelloV2 { .. }
         | Request::InvokeServicePipeline { .. }
         | Request::WhoAmIPrincipal
         | Request::SubscribeEvents

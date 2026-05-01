@@ -249,15 +249,15 @@ impl BmuxClient {
             negotiated_protocol: None,
         };
 
-        let v2_attempt = client
-            .request(Request::HelloV2 {
+        let handshake_attempt = client
+            .request(Request::Hello {
                 contract: ProtocolContract::current(default_supported_capabilities()),
                 client_name: client_name.clone(),
                 principal_id,
             })
             .await;
 
-        match v2_attempt {
+        match handshake_attempt {
             Ok(ResponsePayload::HelloNegotiated { negotiated }) => {
                 client.negotiated_protocol = Some(negotiated);
                 Ok(client)
@@ -1299,7 +1299,6 @@ impl TypedDispatchClient for StreamingBmuxClient {
 const fn request_kind_name(request: &Request) -> &'static str {
     match request {
         Request::Hello { .. } => "hello",
-        Request::HelloV2 { .. } => "hello_v2",
         Request::Ping => "ping",
         Request::WhoAmIPrincipal => "whoami_principal",
         Request::ServerStatus => "server_status",
