@@ -164,11 +164,8 @@ pub fn default_supported_capabilities() -> Vec<String> {
         CORE_CAPABILITY_ATTACH.to_string(),
         CORE_CAPABILITY_PANE_IO.to_string(),
         CORE_CAPABILITY_DETACH.to_string(),
-        "feature.contexts".to_string(),
-        "feature.attach_snapshot".to_string(),
         CAPABILITY_ATTACH_PANE_SNAPSHOT.to_string(),
         CAPABILITY_CONTROL_CATALOG_SYNC.to_string(),
-        "feature.recording.v4".to_string(),
     ];
     // Advertise compression capabilities when compiled in.
     // Note: Frame compression capabilities are NOT advertised by default
@@ -658,7 +655,7 @@ mod tests {
                 CORE_CAPABILITY_PANE_IO.to_string(),
                 CORE_CAPABILITY_DETACH.to_string(),
                 CAPABILITY_CONTROL_CATALOG_SYNC.to_string(),
-                "feature.recording.v4".to_string(),
+                CAPABILITY_ATTACH_PANE_SNAPSHOT.to_string(),
             ],
         };
         let server = ProtocolContract {
@@ -673,7 +670,7 @@ mod tests {
         assert!(
             negotiated
                 .capabilities
-                .contains(&"feature.recording.v4".to_string())
+                .contains(&CAPABILITY_ATTACH_PANE_SNAPSHOT.to_string())
         );
     }
 
