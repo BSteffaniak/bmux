@@ -44,18 +44,6 @@ pub enum RuntimeAction {
     ConfirmScrollback,
     EnterWindowMode,
     ExitMode,
-    WindowPrev,
-    WindowNext,
-    WindowGoto1,
-    WindowGoto2,
-    WindowGoto3,
-    WindowGoto4,
-    WindowGoto5,
-    WindowGoto6,
-    WindowGoto7,
-    WindowGoto8,
-    WindowGoto9,
-    WindowClose,
     EnterMode(String),
     SwitchProfile(String),
     PluginCommand {
@@ -107,18 +95,6 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::ConfirmScrollback => "confirm_scrollback",
         RuntimeAction::EnterWindowMode => "enter_window_mode",
         RuntimeAction::ExitMode => "exit_mode",
-        RuntimeAction::WindowPrev => "window_prev",
-        RuntimeAction::WindowNext => "window_next",
-        RuntimeAction::WindowGoto1 => "window_goto_1",
-        RuntimeAction::WindowGoto2 => "window_goto_2",
-        RuntimeAction::WindowGoto3 => "window_goto_3",
-        RuntimeAction::WindowGoto4 => "window_goto_4",
-        RuntimeAction::WindowGoto5 => "window_goto_5",
-        RuntimeAction::WindowGoto6 => "window_goto_6",
-        RuntimeAction::WindowGoto7 => "window_goto_7",
-        RuntimeAction::WindowGoto8 => "window_goto_8",
-        RuntimeAction::WindowGoto9 => "window_goto_9",
-        RuntimeAction::WindowClose => "window_close",
         RuntimeAction::EnterMode(_) => "enter_mode",
         RuntimeAction::SwitchProfile(_) => "switch_profile",
         RuntimeAction::PluginCommand { .. } => "plugin_command",
@@ -210,19 +186,31 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
         "confirm_scrollback" => Ok(RuntimeAction::ConfirmScrollback),
         "enter_window_mode" => Ok(RuntimeAction::EnterWindowMode),
         "exit_mode" => Ok(RuntimeAction::ExitMode),
-        "window_prev" => Ok(RuntimeAction::WindowPrev),
-        "window_next" => Ok(RuntimeAction::WindowNext),
-        "window_goto_1" => Ok(RuntimeAction::WindowGoto1),
-        "window_goto_2" => Ok(RuntimeAction::WindowGoto2),
-        "window_goto_3" => Ok(RuntimeAction::WindowGoto3),
-        "window_goto_4" => Ok(RuntimeAction::WindowGoto4),
-        "window_goto_5" => Ok(RuntimeAction::WindowGoto5),
-        "window_goto_6" => Ok(RuntimeAction::WindowGoto6),
-        "window_goto_7" => Ok(RuntimeAction::WindowGoto7),
-        "window_goto_8" => Ok(RuntimeAction::WindowGoto8),
-        "window_goto_9" => Ok(RuntimeAction::WindowGoto9),
-        "window_close" => Ok(RuntimeAction::WindowClose),
+        "window_prev" => Ok(plugin_command("bmux.windows", "prev-window", [])),
+        "window_next" => Ok(plugin_command("bmux.windows", "next-window", [])),
+        "window_goto_1" => Ok(plugin_command("bmux.windows", "goto-window", ["1"])),
+        "window_goto_2" => Ok(plugin_command("bmux.windows", "goto-window", ["2"])),
+        "window_goto_3" => Ok(plugin_command("bmux.windows", "goto-window", ["3"])),
+        "window_goto_4" => Ok(plugin_command("bmux.windows", "goto-window", ["4"])),
+        "window_goto_5" => Ok(plugin_command("bmux.windows", "goto-window", ["5"])),
+        "window_goto_6" => Ok(plugin_command("bmux.windows", "goto-window", ["6"])),
+        "window_goto_7" => Ok(plugin_command("bmux.windows", "goto-window", ["7"])),
+        "window_goto_8" => Ok(plugin_command("bmux.windows", "goto-window", ["8"])),
+        "window_goto_9" => Ok(plugin_command("bmux.windows", "goto-window", ["9"])),
+        "window_close" => Ok(plugin_command("bmux.windows", "close-current-window", [])),
         unknown => bail!("unknown keymap action '{unknown}'"),
+    }
+}
+
+fn plugin_command<const N: usize>(
+    plugin_id: &str,
+    command_name: &str,
+    args: [&str; N],
+) -> RuntimeAction {
+    RuntimeAction::PluginCommand {
+        plugin_id: plugin_id.to_string(),
+        command_name: command_name.to_string(),
+        args: args.into_iter().map(ToString::to_string).collect(),
     }
 }
 
@@ -335,6 +323,34 @@ mod tests {
                 plugin_id: "bmux.windows".to_string(),
                 command_name: "goto-window".to_string(),
                 args: vec!["1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_action_maps_legacy_window_actions_to_plugin_commands() {
+        assert_eq!(
+            parse_action("window_prev").expect("legacy previous-window action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "prev-window".to_string(),
+                args: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parse_action("window_goto_3").expect("legacy goto-window action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "goto-window".to_string(),
+                args: vec!["3".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_action("window_close").expect("legacy close-window action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "close-current-window".to_string(),
+                args: Vec::new(),
             }
         );
     }

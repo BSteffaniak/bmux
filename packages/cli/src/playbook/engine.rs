@@ -3672,18 +3672,6 @@ async fn apply_attach_runtime_actions(
             | crate::input::RuntimeAction::CopyScrollback
             | crate::input::RuntimeAction::EnterWindowMode
             | crate::input::RuntimeAction::ExitMode
-            | crate::input::RuntimeAction::WindowPrev
-            | crate::input::RuntimeAction::WindowNext
-            | crate::input::RuntimeAction::WindowGoto1
-            | crate::input::RuntimeAction::WindowGoto2
-            | crate::input::RuntimeAction::WindowGoto3
-            | crate::input::RuntimeAction::WindowGoto4
-            | crate::input::RuntimeAction::WindowGoto5
-            | crate::input::RuntimeAction::WindowGoto6
-            | crate::input::RuntimeAction::WindowGoto7
-            | crate::input::RuntimeAction::WindowGoto8
-            | crate::input::RuntimeAction::WindowGoto9
-            | crate::input::RuntimeAction::WindowClose
             | crate::input::RuntimeAction::EnterMode(_)
             | crate::input::RuntimeAction::SwitchProfile(_) => {}
         }

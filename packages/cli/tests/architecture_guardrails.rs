@@ -2524,8 +2524,8 @@ mod capability_guardrail_helpers {
 //
 // AGENTS.md forbids domain leaks in core architecture crates.
 // `packages/keybind/src/lib.rs::RuntimeAction` historically grew
-// domain-named variants (NewWindow, FocusLeft, ZoomPane,
-// WindowGoto1..9 etc.) that belong to plugins, not core. The
+// domain-named variants (NewWindow, FocusLeft, ZoomPane, etc.) that
+// belong to plugins, not core. The
 // migration in `docs/runtime-action-migration.md` tracks removing
 // them in favor of `RuntimeAction::PluginCommand { plugin_id, command_name, args }`.
 //
@@ -2588,18 +2588,6 @@ const RUNTIME_ACTION_ALLOWLIST: &[&str] = &[
     "CloseFocusedPane",
     "ZoomPane",
     "EnterWindowMode",
-    "WindowPrev",
-    "WindowNext",
-    "WindowGoto1",
-    "WindowGoto2",
-    "WindowGoto3",
-    "WindowGoto4",
-    "WindowGoto5",
-    "WindowGoto6",
-    "WindowGoto7",
-    "WindowGoto8",
-    "WindowGoto9",
-    "WindowClose",
 ];
 
 #[test]

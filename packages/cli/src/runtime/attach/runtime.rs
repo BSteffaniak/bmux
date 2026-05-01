@@ -4137,20 +4137,6 @@ pub async fn handle_attach_ui_action(
                 AttachInternalPromptAction::QuitSession,
             );
         }
-        RuntimeAction::WindowPrev
-        | RuntimeAction::WindowNext
-        | RuntimeAction::WindowGoto1
-        | RuntimeAction::WindowGoto2
-        | RuntimeAction::WindowGoto3
-        | RuntimeAction::WindowGoto4
-        | RuntimeAction::WindowGoto5
-        | RuntimeAction::WindowGoto6
-        | RuntimeAction::WindowGoto7
-        | RuntimeAction::WindowGoto8
-        | RuntimeAction::WindowGoto9
-        | RuntimeAction::WindowClose => {
-            view_state.exit_scrollback();
-        }
         RuntimeAction::SplitFocusedVertical => {
             let selector = attached_session_selector(view_state);
             let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
@@ -6263,18 +6249,6 @@ pub const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::BeginSelection
             | RuntimeAction::CopyScrollback
             | RuntimeAction::ConfirmScrollback
-            | RuntimeAction::WindowPrev
-            | RuntimeAction::WindowNext
-            | RuntimeAction::WindowGoto1
-            | RuntimeAction::WindowGoto2
-            | RuntimeAction::WindowGoto3
-            | RuntimeAction::WindowGoto4
-            | RuntimeAction::WindowGoto5
-            | RuntimeAction::WindowGoto6
-            | RuntimeAction::WindowGoto7
-            | RuntimeAction::WindowGoto8
-            | RuntimeAction::WindowGoto9
-            | RuntimeAction::WindowClose
             | RuntimeAction::PluginCommand { .. }
             | RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
@@ -8754,8 +8728,6 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         | RuntimeAction::FocusRight
         | RuntimeAction::FocusUp
         | RuntimeAction::FocusDown
-        | RuntimeAction::WindowNext
-        | RuntimeAction::WindowPrev
         | RuntimeAction::ScrollUpLine
         | RuntimeAction::ScrollDownLine
         | RuntimeAction::ScrollUpPage
@@ -8796,16 +8768,6 @@ pub(super) fn action_supports_repeat(action: &RuntimeAction) -> bool {
         | RuntimeAction::ConfirmScrollback
         | RuntimeAction::EnterWindowMode
         | RuntimeAction::ExitMode
-        | RuntimeAction::WindowGoto1
-        | RuntimeAction::WindowGoto2
-        | RuntimeAction::WindowGoto3
-        | RuntimeAction::WindowGoto4
-        | RuntimeAction::WindowGoto5
-        | RuntimeAction::WindowGoto6
-        | RuntimeAction::WindowGoto7
-        | RuntimeAction::WindowGoto8
-        | RuntimeAction::WindowGoto9
-        | RuntimeAction::WindowClose
         | RuntimeAction::EnterMode(_)
         | RuntimeAction::SwitchProfile(_) => false,
     }
@@ -8842,18 +8804,6 @@ pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEve
         | RuntimeAction::CloseFocusedPane
         | RuntimeAction::ZoomPane
         | RuntimeAction::ExitMode
-        | RuntimeAction::WindowPrev
-        | RuntimeAction::WindowNext
-        | RuntimeAction::WindowGoto1
-        | RuntimeAction::WindowGoto2
-        | RuntimeAction::WindowGoto3
-        | RuntimeAction::WindowGoto4
-        | RuntimeAction::WindowGoto5
-        | RuntimeAction::WindowGoto6
-        | RuntimeAction::WindowGoto7
-        | RuntimeAction::WindowGoto8
-        | RuntimeAction::WindowGoto9
-        | RuntimeAction::WindowClose
         | RuntimeAction::Quit
         | RuntimeAction::ShowHelp
         | RuntimeAction::ToggleSplitDirection

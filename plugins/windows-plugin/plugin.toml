@@ -170,18 +170,20 @@ short      = "s"
 value_name = "SESSION"
 
 [[commands]]
-aliases       = [["window", "next"]]
-expose_in_cli = true
-name          = "next-window"
-path          = ["next-window"]
-summary       = "Switch to the next workspace window"
+accepts_repeat = true
+aliases        = [["window", "next"]]
+expose_in_cli  = true
+name           = "next-window"
+path           = ["next-window"]
+summary        = "Switch to the next workspace window"
 
 [[commands]]
-aliases       = [["window", "prev"]]
-expose_in_cli = true
-name          = "prev-window"
-path          = ["prev-window"]
-summary       = "Switch to the previous workspace window"
+accepts_repeat = true
+aliases        = [["window", "prev"]]
+expose_in_cli  = true
+name           = "prev-window"
+path           = ["prev-window"]
+summary        = "Switch to the previous workspace window"
 
 [[commands]]
 aliases       = [["window", "last"]]
