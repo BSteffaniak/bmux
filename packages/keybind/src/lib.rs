@@ -36,6 +36,88 @@ pub enum RuntimeAction {
     ForwardToPane(Vec<u8>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindableActionArgument {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub placeholder: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindableActionInfo {
+    pub action: &'static str,
+    pub label: &'static str,
+    pub detail: &'static str,
+    pub argument: Option<BindableActionArgument>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticBindableAction {
+    info: BindableActionInfo,
+    target: ActionTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionTarget {
+    NoOp,
+    Quit,
+    Detach,
+    ShowHelp,
+    EnterScrollMode,
+    ExitScrollMode,
+    ScrollUpLine,
+    ScrollDownLine,
+    ScrollUpPage,
+    ScrollDownPage,
+    ScrollTop,
+    ScrollBottom,
+    BeginSelection,
+    MoveCursorLeft,
+    MoveCursorRight,
+    MoveCursorUp,
+    MoveCursorDown,
+    CopyScrollback,
+    ConfirmScrollback,
+    ExitMode,
+    Plugin {
+        plugin_id: &'static str,
+        command_name: &'static str,
+        args: &'static [&'static str],
+    },
+}
+
+impl ActionTarget {
+    fn to_runtime_action(self) -> RuntimeAction {
+        match self {
+            Self::NoOp => RuntimeAction::NoOp,
+            Self::Quit => RuntimeAction::Quit,
+            Self::Detach => RuntimeAction::Detach,
+            Self::ShowHelp => RuntimeAction::ShowHelp,
+            Self::EnterScrollMode => RuntimeAction::EnterScrollMode,
+            Self::ExitScrollMode => RuntimeAction::ExitScrollMode,
+            Self::ScrollUpLine => RuntimeAction::ScrollUpLine,
+            Self::ScrollDownLine => RuntimeAction::ScrollDownLine,
+            Self::ScrollUpPage => RuntimeAction::ScrollUpPage,
+            Self::ScrollDownPage => RuntimeAction::ScrollDownPage,
+            Self::ScrollTop => RuntimeAction::ScrollTop,
+            Self::ScrollBottom => RuntimeAction::ScrollBottom,
+            Self::BeginSelection => RuntimeAction::BeginSelection,
+            Self::MoveCursorLeft => RuntimeAction::MoveCursorLeft,
+            Self::MoveCursorRight => RuntimeAction::MoveCursorRight,
+            Self::MoveCursorUp => RuntimeAction::MoveCursorUp,
+            Self::MoveCursorDown => RuntimeAction::MoveCursorDown,
+            Self::CopyScrollback => RuntimeAction::CopyScrollback,
+            Self::ConfirmScrollback => RuntimeAction::ConfirmScrollback,
+            Self::ExitMode => RuntimeAction::ExitMode,
+            Self::Plugin {
+                plugin_id,
+                command_name,
+                args,
+            } => plugin_command_vec(plugin_id, command_name, args),
+        }
+    }
+}
+
 #[must_use]
 pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
     match action {
@@ -92,6 +174,501 @@ pub fn action_to_config_name(action: &RuntimeAction) -> String {
     }
 }
 
+const fn static_action(
+    action: &'static str,
+    label: &'static str,
+    detail: &'static str,
+    target: ActionTarget,
+) -> StaticBindableAction {
+    StaticBindableAction {
+        info: BindableActionInfo {
+            action,
+            label,
+            detail,
+            argument: None,
+        },
+        target,
+    }
+}
+
+const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
+    static_action("quit", "Quit", "keybind: quit", ActionTarget::Quit),
+    static_action(
+        "quit_destroy",
+        "Quit Destroy",
+        "keybind alias: quit_destroy",
+        ActionTarget::Quit,
+    ),
+    static_action("detach", "Detach", "keybind: detach", ActionTarget::Detach),
+    static_action("no_op", "No Op", "keybind: no_op", ActionTarget::NoOp),
+    static_action(
+        "toggle_split_direction",
+        "Toggle Split Direction",
+        "legacy keybind alias: toggle_split_direction",
+        ActionTarget::NoOp,
+    ),
+    static_action(
+        "enter_window_mode",
+        "Enter Window Mode",
+        "legacy keybind alias: enter_window_mode",
+        ActionTarget::NoOp,
+    ),
+    static_action(
+        "show_help",
+        "Show Help",
+        "keybind: show_help",
+        ActionTarget::ShowHelp,
+    ),
+    static_action(
+        "enter_scroll_mode",
+        "Enter Scroll Mode",
+        "keybind: enter_scroll_mode",
+        ActionTarget::EnterScrollMode,
+    ),
+    static_action(
+        "exit_scroll_mode",
+        "Exit Scroll Mode",
+        "keybind: exit_scroll_mode",
+        ActionTarget::ExitScrollMode,
+    ),
+    static_action(
+        "scroll_up_line",
+        "Scroll Up Line",
+        "keybind: scroll_up_line",
+        ActionTarget::ScrollUpLine,
+    ),
+    static_action(
+        "scroll_down_line",
+        "Scroll Down Line",
+        "keybind: scroll_down_line",
+        ActionTarget::ScrollDownLine,
+    ),
+    static_action(
+        "scroll_up_page",
+        "Scroll Up Page",
+        "keybind: scroll_up_page",
+        ActionTarget::ScrollUpPage,
+    ),
+    static_action(
+        "scroll_down_page",
+        "Scroll Down Page",
+        "keybind: scroll_down_page",
+        ActionTarget::ScrollDownPage,
+    ),
+    static_action(
+        "scroll_top",
+        "Scroll Top",
+        "keybind: scroll_top",
+        ActionTarget::ScrollTop,
+    ),
+    static_action(
+        "scroll_bottom",
+        "Scroll Bottom",
+        "keybind: scroll_bottom",
+        ActionTarget::ScrollBottom,
+    ),
+    static_action(
+        "begin_selection",
+        "Begin Selection",
+        "keybind: begin_selection",
+        ActionTarget::BeginSelection,
+    ),
+    static_action(
+        "move_cursor_left",
+        "Move Cursor Left",
+        "keybind: move_cursor_left",
+        ActionTarget::MoveCursorLeft,
+    ),
+    static_action(
+        "move_cursor_right",
+        "Move Cursor Right",
+        "keybind: move_cursor_right",
+        ActionTarget::MoveCursorRight,
+    ),
+    static_action(
+        "move_cursor_up",
+        "Move Cursor Up",
+        "keybind: move_cursor_up",
+        ActionTarget::MoveCursorUp,
+    ),
+    static_action(
+        "move_cursor_down",
+        "Move Cursor Down",
+        "keybind: move_cursor_down",
+        ActionTarget::MoveCursorDown,
+    ),
+    static_action(
+        "copy_scrollback",
+        "Copy Scrollback",
+        "keybind: copy_scrollback",
+        ActionTarget::CopyScrollback,
+    ),
+    static_action(
+        "confirm_scrollback",
+        "Confirm Scrollback",
+        "keybind: confirm_scrollback",
+        ActionTarget::ConfirmScrollback,
+    ),
+    static_action(
+        "exit_mode",
+        "Exit Mode",
+        "keybind: exit_mode",
+        ActionTarget::ExitMode,
+    ),
+    static_action(
+        "focus_next_pane",
+        "Focus Next Pane",
+        "keybind: focus_next_pane",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "focus-pane-in-direction",
+            args: &["--direction", "next"],
+        },
+    ),
+    static_action(
+        "focus_previous_pane",
+        "Focus Previous Pane",
+        "keybind: focus_previous_pane",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "focus-pane-in-direction",
+            args: &["--direction", "prev"],
+        },
+    ),
+    static_action(
+        "focus_prev_pane",
+        "Focus Previous Pane",
+        "keybind alias: focus_prev_pane",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "focus-pane-in-direction",
+            args: &["--direction", "prev"],
+        },
+    ),
+    static_action(
+        "focus_left_pane",
+        "Focus Left Pane",
+        "keybind: focus_left_pane",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "focus-pane-in-direction",
+            args: &["--direction", "left"],
+        },
+    ),
+    static_action(
+        "focus_right_pane",
+        "Focus Right Pane",
+        "keybind: focus_right_pane",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "focus-pane-in-direction",
+            args: &["--direction", "right"],
+        },
+    ),
+    static_action(
+        "focus_up_pane",
+        "Focus Up Pane",
+        "keybind: focus_up_pane",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "focus-pane-in-direction",
+            args: &["--direction", "up"],
+        },
+    ),
+    static_action(
+        "focus_down_pane",
+        "Focus Down Pane",
+        "keybind: focus_down_pane",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "focus-pane-in-direction",
+            args: &["--direction", "down"],
+        },
+    ),
+    static_action(
+        "split_focused_vertical",
+        "Split Focused Vertical",
+        "keybind: split_focused_vertical",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "split-pane",
+            args: &["--direction", "vertical"],
+        },
+    ),
+    static_action(
+        "split_focused_horizontal",
+        "Split Focused Horizontal",
+        "keybind: split_focused_horizontal",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "split-pane",
+            args: &["--direction", "horizontal"],
+        },
+    ),
+    static_action(
+        "increase_split",
+        "Increase Split",
+        "keybind: increase_split",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "resize-pane",
+            args: &["--direction", "increase"],
+        },
+    ),
+    static_action(
+        "decrease_split",
+        "Decrease Split",
+        "keybind: decrease_split",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "resize-pane",
+            args: &["--direction", "decrease"],
+        },
+    ),
+    static_action(
+        "resize_left",
+        "Resize Left",
+        "keybind: resize_left",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "resize-pane",
+            args: &["--direction", "left"],
+        },
+    ),
+    static_action(
+        "resize_right",
+        "Resize Right",
+        "keybind: resize_right",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "resize-pane",
+            args: &["--direction", "right"],
+        },
+    ),
+    static_action(
+        "resize_up",
+        "Resize Up",
+        "keybind: resize_up",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "resize-pane",
+            args: &["--direction", "up"],
+        },
+    ),
+    static_action(
+        "resize_down",
+        "Resize Down",
+        "keybind: resize_down",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "resize-pane",
+            args: &["--direction", "down"],
+        },
+    ),
+    static_action(
+        "restart_focused_pane",
+        "Restart Focused Pane",
+        "keybind: restart_focused_pane",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "restart-pane",
+            args: &[],
+        },
+    ),
+    static_action(
+        "close_focused_pane",
+        "Close Focused Pane",
+        "keybind: close_focused_pane",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "close-active-pane",
+            args: &[],
+        },
+    ),
+    static_action(
+        "zoom_pane",
+        "Zoom Pane",
+        "keybind: zoom_pane",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "zoom-pane",
+            args: &[],
+        },
+    ),
+    static_action(
+        "window_prev",
+        "Previous Window",
+        "keybind: window_prev",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "prev-window",
+            args: &[],
+        },
+    ),
+    static_action(
+        "window_next",
+        "Next Window",
+        "keybind: window_next",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "next-window",
+            args: &[],
+        },
+    ),
+    static_action(
+        "rename_window",
+        "Rename Window",
+        "keybind: rename_window",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "rename-window",
+            args: &[],
+        },
+    ),
+    static_action(
+        "window_rename",
+        "Rename Window",
+        "keybind alias: window_rename",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "rename-window",
+            args: &[],
+        },
+    ),
+    static_action(
+        "window_close",
+        "Close Window",
+        "keybind: window_close",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "close-current-window",
+            args: &[],
+        },
+    ),
+    static_action(
+        "window_goto_1",
+        "Go To Window 1",
+        "keybind: window_goto_1",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "goto-window",
+            args: &["1"],
+        },
+    ),
+    static_action(
+        "window_goto_2",
+        "Go To Window 2",
+        "keybind: window_goto_2",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "goto-window",
+            args: &["2"],
+        },
+    ),
+    static_action(
+        "window_goto_3",
+        "Go To Window 3",
+        "keybind: window_goto_3",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "goto-window",
+            args: &["3"],
+        },
+    ),
+    static_action(
+        "window_goto_4",
+        "Go To Window 4",
+        "keybind: window_goto_4",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "goto-window",
+            args: &["4"],
+        },
+    ),
+    static_action(
+        "window_goto_5",
+        "Go To Window 5",
+        "keybind: window_goto_5",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "goto-window",
+            args: &["5"],
+        },
+    ),
+    static_action(
+        "window_goto_6",
+        "Go To Window 6",
+        "keybind: window_goto_6",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "goto-window",
+            args: &["6"],
+        },
+    ),
+    static_action(
+        "window_goto_7",
+        "Go To Window 7",
+        "keybind: window_goto_7",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "goto-window",
+            args: &["7"],
+        },
+    ),
+    static_action(
+        "window_goto_8",
+        "Go To Window 8",
+        "keybind: window_goto_8",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "goto-window",
+            args: &["8"],
+        },
+    ),
+    static_action(
+        "window_goto_9",
+        "Go To Window 9",
+        "keybind: window_goto_9",
+        ActionTarget::Plugin {
+            plugin_id: "bmux.windows",
+            command_name: "goto-window",
+            args: &["9"],
+        },
+    ),
+];
+
+const PARAMETERIZED_BINDABLE_ACTIONS: &[BindableActionInfo] = &[
+    BindableActionInfo {
+        action: "enter_mode",
+        label: "Enter Mode",
+        detail: "keybind: enter_mode <mode>",
+        argument: Some(BindableActionArgument {
+            name: "mode",
+            label: "Mode",
+            placeholder: "normal",
+        }),
+    },
+    BindableActionInfo {
+        action: "switch_profile",
+        label: "Switch Profile",
+        detail: "keybind: switch_profile <profile>",
+        argument: Some(BindableActionArgument {
+            name: "profile",
+            label: "Profile",
+            placeholder: "default",
+        }),
+    },
+];
+
+#[must_use]
+pub fn bindable_action_catalog() -> Vec<BindableActionInfo> {
+    STATIC_BINDABLE_ACTIONS
+        .iter()
+        .map(|spec| spec.info)
+        .chain(PARAMETERIZED_BINDABLE_ACTIONS.iter().copied())
+        .collect()
+}
+
 /// Parse a string action name into a `RuntimeAction`.
 ///
 /// Plugin command arguments are preserved verbatim (case-sensitive).
@@ -114,92 +691,21 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
     if let Some(plugin_action) = parse_plugin_action(trimmed) {
         return plugin_action;
     }
-    // Built-in actions are single tokens — safe to lowercase for
-    // case-insensitive matching.
-    let normalized = trimmed.to_ascii_lowercase();
-    match normalized.as_str() {
-        "quit" | "quit_destroy" => Ok(RuntimeAction::Quit),
-        "detach" => Ok(RuntimeAction::Detach),
-        "focus_next_pane" => Ok(windows_focus_command("next")),
-        "focus_previous_pane" | "focus_prev_pane" => Ok(windows_focus_command("prev")),
-        "focus_left_pane" => Ok(windows_focus_command("left")),
-        "focus_right_pane" => Ok(windows_focus_command("right")),
-        "focus_up_pane" => Ok(windows_focus_command("up")),
-        "focus_down_pane" => Ok(windows_focus_command("down")),
-        "no_op" | "toggle_split_direction" | "enter_window_mode" => Ok(RuntimeAction::NoOp),
-        "split_focused_vertical" => Ok(windows_split_command("vertical")),
-        "split_focused_horizontal" => Ok(windows_split_command("horizontal")),
-        "increase_split" => Ok(windows_resize_command("increase")),
-        "decrease_split" => Ok(windows_resize_command("decrease")),
-        "resize_left" => Ok(windows_resize_command("left")),
-        "resize_right" => Ok(windows_resize_command("right")),
-        "resize_up" => Ok(windows_resize_command("up")),
-        "resize_down" => Ok(windows_resize_command("down")),
-        "restart_focused_pane" => Ok(plugin_command("bmux.windows", "restart-pane", [])),
-        "close_focused_pane" => Ok(plugin_command("bmux.windows", "close-active-pane", [])),
-        "zoom_pane" => Ok(plugin_command("bmux.windows", "zoom-pane", [])),
-        "show_help" => Ok(RuntimeAction::ShowHelp),
-        "enter_scroll_mode" => Ok(RuntimeAction::EnterScrollMode),
-        "exit_scroll_mode" => Ok(RuntimeAction::ExitScrollMode),
-        "scroll_up_line" => Ok(RuntimeAction::ScrollUpLine),
-        "scroll_down_line" => Ok(RuntimeAction::ScrollDownLine),
-        "scroll_up_page" => Ok(RuntimeAction::ScrollUpPage),
-        "scroll_down_page" => Ok(RuntimeAction::ScrollDownPage),
-        "scroll_top" => Ok(RuntimeAction::ScrollTop),
-        "scroll_bottom" => Ok(RuntimeAction::ScrollBottom),
-        "begin_selection" => Ok(RuntimeAction::BeginSelection),
-        "move_cursor_left" => Ok(RuntimeAction::MoveCursorLeft),
-        "move_cursor_right" => Ok(RuntimeAction::MoveCursorRight),
-        "move_cursor_up" => Ok(RuntimeAction::MoveCursorUp),
-        "move_cursor_down" => Ok(RuntimeAction::MoveCursorDown),
-        "copy_scrollback" => Ok(RuntimeAction::CopyScrollback),
-        "confirm_scrollback" => Ok(RuntimeAction::ConfirmScrollback),
-        "exit_mode" => Ok(RuntimeAction::ExitMode),
-        "window_prev" => Ok(plugin_command("bmux.windows", "prev-window", [])),
-        "window_next" => Ok(plugin_command("bmux.windows", "next-window", [])),
-        "rename_window" | "window_rename" => {
-            Ok(plugin_command("bmux.windows", "rename-window", []))
-        }
-        "window_goto_1" => Ok(plugin_command("bmux.windows", "goto-window", ["1"])),
-        "window_goto_2" => Ok(plugin_command("bmux.windows", "goto-window", ["2"])),
-        "window_goto_3" => Ok(plugin_command("bmux.windows", "goto-window", ["3"])),
-        "window_goto_4" => Ok(plugin_command("bmux.windows", "goto-window", ["4"])),
-        "window_goto_5" => Ok(plugin_command("bmux.windows", "goto-window", ["5"])),
-        "window_goto_6" => Ok(plugin_command("bmux.windows", "goto-window", ["6"])),
-        "window_goto_7" => Ok(plugin_command("bmux.windows", "goto-window", ["7"])),
-        "window_goto_8" => Ok(plugin_command("bmux.windows", "goto-window", ["8"])),
-        "window_goto_9" => Ok(plugin_command("bmux.windows", "goto-window", ["9"])),
-        "window_close" => Ok(plugin_command("bmux.windows", "close-current-window", [])),
-        unknown => bail!("unknown keymap action '{unknown}'"),
+    if let Some(spec) = STATIC_BINDABLE_ACTIONS
+        .iter()
+        .find(|spec| spec.info.action.eq_ignore_ascii_case(trimmed))
+    {
+        return Ok(spec.target.to_runtime_action());
     }
+    bail!("unknown keymap action '{trimmed}'")
 }
 
-fn plugin_command<const N: usize>(
-    plugin_id: &str,
-    command_name: &str,
-    args: [&str; N],
-) -> RuntimeAction {
+fn plugin_command_vec(plugin_id: &str, command_name: &str, args: &[&str]) -> RuntimeAction {
     RuntimeAction::PluginCommand {
         plugin_id: plugin_id.to_string(),
         command_name: command_name.to_string(),
-        args: args.into_iter().map(ToString::to_string).collect(),
+        args: args.iter().map(ToString::to_string).collect(),
     }
-}
-
-fn windows_focus_command(direction: &str) -> RuntimeAction {
-    plugin_command(
-        "bmux.windows",
-        "focus-pane-in-direction",
-        ["--direction", direction],
-    )
-}
-
-fn windows_resize_command(direction: &str) -> RuntimeAction {
-    plugin_command("bmux.windows", "resize-pane", ["--direction", direction])
-}
-
-fn windows_split_command(direction: &str) -> RuntimeAction {
-    plugin_command("bmux.windows", "split-pane", ["--direction", direction])
 }
 
 fn parse_enter_mode_action(value: &str) -> Option<Result<RuntimeAction>> {
@@ -334,7 +840,45 @@ fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeAction, action_to_config_name, parse_action};
+    use super::{RuntimeAction, action_to_config_name, bindable_action_catalog, parse_action};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn bindable_action_catalog_static_entries_parse() {
+        for action in bindable_action_catalog()
+            .into_iter()
+            .filter(|action| action.argument.is_none())
+        {
+            parse_action(action.action).unwrap_or_else(|error| {
+                panic!("catalog action {:?} should parse: {error}", action.action);
+            });
+        }
+    }
+
+    #[test]
+    fn bindable_action_catalog_parameterized_entries_parse_with_sample_values() {
+        for action in bindable_action_catalog()
+            .into_iter()
+            .filter(|action| action.argument.is_some())
+        {
+            let value = format!("{} sample", action.action);
+            parse_action(&value).unwrap_or_else(|error| {
+                panic!("parameterized catalog action {value:?} should parse: {error}");
+            });
+        }
+    }
+
+    #[test]
+    fn bindable_action_catalog_has_no_duplicate_actions() {
+        let mut seen = BTreeSet::new();
+        for action in bindable_action_catalog() {
+            assert!(
+                seen.insert(action.action),
+                "duplicate bindable action {:?}",
+                action.action
+            );
+        }
+    }
 
     #[test]
     fn parse_action_accepts_quit_destroy_alias() {

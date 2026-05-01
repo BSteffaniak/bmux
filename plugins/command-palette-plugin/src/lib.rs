@@ -3,6 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
+use bmux_keybind::{BindableActionArgument, bindable_action_catalog};
 use bmux_plugin::{action_dispatch, prompt};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
@@ -34,8 +35,9 @@ fn show_command_palette(context: &NativeCommandContext) -> Result<i32, PluginCom
 
 #[derive(Debug, Clone)]
 enum PaletteEntryKind {
-    BuiltIn {
+    BindableAction {
         action: String,
+        argument: Option<BindableActionArgument>,
     },
     PluginCommand {
         plugin_id: String,
@@ -97,7 +99,17 @@ async fn run_command_palette(context: NativeCommandContext) {
     };
 
     match entry.kind {
-        PaletteEntryKind::BuiltIn { action } => dispatch_action(&action),
+        PaletteEntryKind::BindableAction { action, argument } => {
+            if let Some(argument) = argument {
+                let Some(value) = prompt_for_bindable_action_argument(&action, argument).await
+                else {
+                    return;
+                };
+                dispatch_action(&format!("{action} {value}"));
+            } else {
+                dispatch_action(&action);
+            }
+        }
         PaletteEntryKind::PluginCommand {
             plugin_id,
             command_name,
@@ -120,7 +132,7 @@ fn dispatch_action(action: &str) {
 }
 
 fn build_palette_entries(context: &NativeCommandContext) -> Vec<PaletteEntry> {
-    let mut entries = built_in_entries();
+    let mut entries = bindable_action_entries();
     entries.extend(plugin_command_entries(
         &context.registered_plugins,
         &context.enabled_plugins,
@@ -133,50 +145,18 @@ fn build_palette_entries(context: &NativeCommandContext) -> Vec<PaletteEntry> {
     entries
 }
 
-fn built_in_entries() -> Vec<PaletteEntry> {
-    [
-        ("No Op", "no_op", "no_op"),
-        ("Quit", "quit", "quit"),
-        ("Detach", "detach", "detach"),
-        ("Show Help", "show_help", "show_help"),
-        (
-            "Enter Scroll Mode",
-            "enter_scroll_mode",
-            "enter_scroll_mode",
-        ),
-        ("Exit Scroll Mode", "exit_scroll_mode", "exit_scroll_mode"),
-        ("Scroll Up Line", "scroll_up_line", "scroll_up_line"),
-        ("Scroll Down Line", "scroll_down_line", "scroll_down_line"),
-        ("Scroll Up Page", "scroll_up_page", "scroll_up_page"),
-        ("Scroll Down Page", "scroll_down_page", "scroll_down_page"),
-        ("Scroll Top", "scroll_top", "scroll_top"),
-        ("Scroll Bottom", "scroll_bottom", "scroll_bottom"),
-        ("Begin Selection", "begin_selection", "begin_selection"),
-        ("Move Cursor Left", "move_cursor_left", "move_cursor_left"),
-        (
-            "Move Cursor Right",
-            "move_cursor_right",
-            "move_cursor_right",
-        ),
-        ("Move Cursor Up", "move_cursor_up", "move_cursor_up"),
-        ("Move Cursor Down", "move_cursor_down", "move_cursor_down"),
-        ("Copy Scrollback", "copy_scrollback", "copy_scrollback"),
-        (
-            "Confirm Scrollback",
-            "confirm_scrollback",
-            "confirm_scrollback",
-        ),
-        ("Exit Mode", "exit_mode", "exit_mode"),
-    ]
-    .into_iter()
-    .map(|(label, detail, action)| PaletteEntry {
-        label: label.to_string(),
-        detail: format!("built-in: {detail}"),
-        kind: PaletteEntryKind::BuiltIn {
-            action: action.to_string(),
-        },
-    })
-    .collect()
+fn bindable_action_entries() -> Vec<PaletteEntry> {
+    bindable_action_catalog()
+        .into_iter()
+        .map(|action| PaletteEntry {
+            label: action.label.to_string(),
+            detail: action.detail.to_string(),
+            kind: PaletteEntryKind::BindableAction {
+                action: action.action.to_string(),
+                argument: action.argument,
+            },
+        })
+        .collect()
 }
 
 fn plugin_command_entries(
@@ -208,6 +188,31 @@ fn command_label(plugin: &RegisteredPluginInfo, command: &PluginCommand) -> Stri
         format!("{}: {}", plugin.display_name, command.name)
     } else {
         format!("{}: {}", plugin.display_name, command.summary)
+    }
+}
+
+async fn prompt_for_bindable_action_argument(
+    action: &str,
+    argument: BindableActionArgument,
+) -> Option<String> {
+    let response = prompt::request(
+        PromptRequest::text_input(format!("{action}: {}", argument.label))
+            .message(format!(
+                "Required keybinding action argument: {}",
+                argument.name
+            ))
+            .input_placeholder(argument.placeholder)
+            .input_required(true)
+            .input_validation(PromptValidation::NonEmpty)
+            .modal_id("command-palette-action-argument"),
+    )
+    .await
+    .ok()?;
+    match response {
+        PromptResponse::Submitted(PromptValue::Text(value)) => Some(value.trim().to_string()),
+        PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_) => {
+            None
+        }
     }
 }
 
