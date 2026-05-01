@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::runtime::{session_handle, session_runtime_handle};
 use bmux_pane_runtime_state::{
-    FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec, PaneLayoutNode,
-    PaneResurrectionSnapshot, PaneRuntimeMeta,
+    FloatingPaneLayer, FloatingPaneScope, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource,
+    PaneLaunchSpec, PaneLayoutNode, PaneResurrectionSnapshot, PaneRuntimeMeta,
 };
 
 /// Stable id for the pane-runtime plugin snapshot surface.
@@ -109,11 +109,17 @@ pub enum PaneRuntimeSnapshotV1SplitDirection {
 pub struct PaneRuntimeSnapshotV1FloatingSurface {
     pub id: Uuid,
     pub pane_id: Uuid,
+    #[serde(default)]
+    pub anchor_pane_id: Option<Uuid>,
     pub x: u16,
     pub y: u16,
     pub w: u16,
     pub h: u16,
     pub z: i32,
+    #[serde(default)]
+    pub scope: FloatingPaneScope,
+    #[serde(default)]
+    pub layer: FloatingPaneLayer,
     pub visible: bool,
     pub opaque: bool,
     pub accepts_input: bool,
@@ -233,11 +239,14 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
             .map(|surface| PaneRuntimeSnapshotV1FloatingSurface {
                 id: surface.id,
                 pane_id: surface.pane_id,
+                anchor_pane_id: surface.anchor_pane_id,
                 x: surface.rect.x,
                 y: surface.rect.y,
                 w: surface.rect.w,
                 h: surface.rect.h,
                 z: surface.z,
+                scope: surface.scope,
+                layer: surface.layer,
                 visible: surface.visible,
                 opaque: surface.opaque,
                 accepts_input: surface.accepts_input,
@@ -249,7 +258,7 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
             session_id: session_info.id.0,
             panes,
             focused_pane_id: Some(runtime.focused_pane_id),
-            layout_root: Some(layout_to_snapshot(&runtime.layout_root)),
+            layout_root: runtime.layout_root.as_ref().map(layout_to_snapshot),
             floating_surfaces,
         });
     }
@@ -320,6 +329,7 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
             .map(|surface| FloatingSurfaceRuntime {
                 id: surface.id,
                 pane_id: surface.pane_id,
+                anchor_pane_id: surface.anchor_pane_id,
                 rect: LayoutRect {
                     x: surface.x,
                     y: surface.y,
@@ -327,6 +337,8 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) {
                     h: surface.h,
                 },
                 z: surface.z,
+                scope: surface.scope,
+                layer: surface.layer,
                 visible: surface.visible,
                 opaque: surface.opaque,
                 accepts_input: surface.accepts_input,
@@ -403,7 +415,7 @@ mod tests {
         PaneRuntimeSnapshotV1SplitDirection,
     };
     use bmux_attach_layout_protocol::PaneLaunchCommand;
-    use bmux_pane_runtime_state::PaneCommandSource;
+    use bmux_pane_runtime_state::{FloatingPaneLayer, FloatingPaneScope, PaneCommandSource};
     use std::collections::BTreeMap;
     use uuid::Uuid;
 
@@ -441,11 +453,14 @@ mod tests {
                 floating_surfaces: vec![PaneRuntimeSnapshotV1FloatingSurface {
                     id: surface_id,
                     pane_id,
+                    anchor_pane_id: None,
                     x: 1,
                     y: 2,
                     w: 40,
                     h: 10,
                     z: 0,
+                    scope: FloatingPaneScope::PerWindow,
+                    layer: FloatingPaneLayer::FloatingPane,
                     visible: true,
                     opaque: false,
                     accepts_input: true,

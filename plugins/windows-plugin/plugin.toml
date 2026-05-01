@@ -20,6 +20,15 @@ owns_namespaces = [
     "split-pane",
     "resize-pane",
     "zoom-pane",
+    "create-floating-pane",
+    "focus-floating-pane",
+    "raise-floating-pane",
+    "lower-floating-pane",
+    "move-floating-pane",
+    "resize-floating-pane",
+    "set-floating-pane-z",
+    "set-floating-pane-layer",
+    "close-floating-pane",
     "close-active-pane",
     "restart-pane",
 ]
@@ -350,6 +359,206 @@ long       = "session"
 name       = "session"
 short      = "s"
 value_name = "SESSION"
+
+[[commands]]
+expose_in_cli = true
+name          = "create-floating-pane"
+path          = ["create-floating-pane"]
+summary       = "Create a new floating pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "program"
+name       = "program"
+value_name = "PROGRAM"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "scope"
+name       = "scope"
+value_name = "SCOPE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "layer"
+name       = "layer"
+value_name = "LAYER"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "z"
+name       = "z"
+value_name = "Z"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "x"
+name       = "x"
+value_name = "X"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "y"
+name       = "y"
+value_name = "Y"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "w"
+name       = "w"
+value_name = "WIDTH"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "h"
+name       = "h"
+value_name = "HEIGHT"
+
+[[commands]]
+expose_in_cli = true
+name          = "focus-floating-pane"
+path          = ["focus-floating-pane"]
+summary       = "Focus a floating pane by pane id"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+required   = true
+value_name = "PANE_ID"
+
+[[commands]]
+expose_in_cli = true
+name          = "raise-floating-pane"
+path          = ["raise-floating-pane"]
+summary       = "Raise a floating pane above its peers"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+required   = true
+value_name = "PANE_ID"
+
+[[commands]]
+expose_in_cli = true
+name          = "lower-floating-pane"
+path          = ["lower-floating-pane"]
+summary       = "Lower a floating pane below its peers"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+required   = true
+value_name = "PANE_ID"
+
+[[commands]]
+expose_in_cli = true
+name          = "move-floating-pane"
+path          = ["move-floating-pane"]
+summary       = "Move a floating pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+required   = true
+value_name = "PANE_ID"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "x"
+name       = "x"
+required   = true
+value_name = "X"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "y"
+name       = "y"
+required   = true
+value_name = "Y"
+
+[[commands]]
+expose_in_cli = true
+name          = "resize-floating-pane"
+path          = ["resize-floating-pane"]
+summary       = "Resize a floating pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+required   = true
+value_name = "PANE_ID"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "w"
+name       = "w"
+required   = true
+value_name = "WIDTH"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "h"
+name       = "h"
+required   = true
+value_name = "HEIGHT"
+
+[[commands]]
+expose_in_cli = true
+name          = "set-floating-pane-z"
+path          = ["set-floating-pane-z"]
+summary       = "Set a floating pane z-index"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+required   = true
+value_name = "PANE_ID"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "z"
+name       = "z"
+required   = true
+value_name = "Z"
+
+[[commands]]
+expose_in_cli = true
+name          = "set-floating-pane-layer"
+path          = ["set-floating-pane-layer"]
+summary       = "Set a floating pane layer bucket"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+required   = true
+value_name = "PANE_ID"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "layer"
+name       = "layer"
+required   = true
+value_name = "LAYER"
+
+[[commands]]
+expose_in_cli = true
+name          = "close-floating-pane"
+path          = ["close-floating-pane"]
+summary       = "Close a floating pane by pane id"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+required   = true
+value_name = "PANE_ID"
 
 [[commands]]
 expose_in_cli = true

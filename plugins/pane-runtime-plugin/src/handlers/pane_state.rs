@@ -2,8 +2,10 @@
 
 use bmux_client_state::FollowStateHandle;
 use bmux_pane_runtime_plugin_api::pane_runtime_state::{
-    PaneProcessIdentity, PaneProcessList, PaneStateError, PaneSummary, SessionPaneList,
+    FloatingPaneList, FloatingPaneSummary, PaneProcessIdentity, PaneProcessList, PaneStateError,
+    PaneSummary, SessionPaneList,
 };
+use bmux_pane_runtime_state::{FloatingPaneLayer, FloatingPaneScope};
 use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
@@ -28,6 +30,30 @@ pub struct GetPaneArgs {
 pub struct GetPaneProcessArgs {
     pub session_id: Uuid,
     pub pane_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListFloatingPanesArgs {
+    pub session_id: Uuid,
+}
+
+const fn floating_scope_name(scope: FloatingPaneScope) -> &'static str {
+    match scope {
+        FloatingPaneScope::PerPane => "per_pane",
+        FloatingPaneScope::PerWindow => "per_window",
+        FloatingPaneScope::PerSession => "per_session",
+        FloatingPaneScope::ClientGlobal => "client_global",
+        FloatingPaneScope::ServerGlobal => "server_global",
+    }
+}
+
+const fn floating_layer_name(layer: FloatingPaneLayer) -> &'static str {
+    match layer {
+        FloatingPaneLayer::Pane => "pane",
+        FloatingPaneLayer::Overlay => "overlay",
+        FloatingPaneLayer::FloatingPane => "floating_pane",
+        FloatingPaneLayer::Tooltip => "tooltip",
+    }
 }
 
 /// Resolve a caller-optional session id to a concrete session.
@@ -73,6 +99,38 @@ pub fn list_panes(
                 focused: p.focused,
             })
             .collect(),
+    })
+}
+
+pub fn list_floating_panes(
+    req: &ListFloatingPanesArgs,
+) -> Result<FloatingPaneList, PaneStateError> {
+    let handle = super::session_runtime_handle().ok_or(PaneStateError::SessionNotFound)?;
+    let session_id = SessionId(req.session_id);
+    let panes = handle
+        .0
+        .list_floating_panes(session_id)
+        .map_err(|_| PaneStateError::SessionNotFound)?
+        .into_iter()
+        .map(|surface| FloatingPaneSummary {
+            id: surface.id,
+            pane_id: surface.pane_id,
+            x: surface.rect.x,
+            y: surface.rect.y,
+            w: surface.rect.w,
+            h: surface.rect.h,
+            scope: floating_scope_name(surface.scope).to_string(),
+            layer: floating_layer_name(surface.layer).to_string(),
+            z: surface.z,
+            visible: surface.visible,
+            opaque: surface.opaque,
+            accepts_input: surface.accepts_input,
+            cursor_owner: surface.cursor_owner,
+        })
+        .collect();
+    Ok(FloatingPaneList {
+        session_id: req.session_id,
+        panes,
     })
 }
 

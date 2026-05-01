@@ -32,12 +32,13 @@ pub mod output;
 pub use attach::AttachViewport;
 pub use error::SessionRuntimeError;
 pub use layout::{
-    FloatingSurfaceRuntime, LayoutRect, PaneLayoutNode, PaneResizeDirection, contains_pane,
+    FloatingPaneLayer, FloatingPaneScope, FloatingSurfaceRuntime, LayoutRect, PaneLayoutNode,
+    PaneResizeDirection, contains_pane,
 };
 pub use manager_handle::{
-    AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, NoopSessionRuntimeManager,
-    PaneProcessIdentity, RemovedRuntimeInfo, SessionRuntimeManagerApi, SessionRuntimeManagerHandle,
-    SessionRuntimeSnapshot,
+    AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, FloatingPaneRuntimeSummary,
+    NoopSessionRuntimeManager, PaneProcessIdentity, RemovedRuntimeInfo, SessionRuntimeManagerApi,
+    SessionRuntimeManagerHandle, SessionRuntimeSnapshot,
 };
 pub use meta::{PaneCommandSource, PaneLaunchSpec, PaneResurrectionSnapshot, PaneRuntimeMeta};
 pub use output::{OutputRead, PaneOutputReader, PaneOutputReaderHandle};

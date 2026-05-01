@@ -356,6 +356,163 @@ fn close_pane(
     Ok(ack)
 }
 
+struct FloatingPaneCommandOptions {
+    origin_x: Option<u16>,
+    origin_y: Option<u16>,
+    width: Option<u16>,
+    height: Option<u16>,
+    z_index: Option<i32>,
+    layer: Option<String>,
+    scope: Option<String>,
+    program: Option<String>,
+    args: Vec<String>,
+}
+
+fn create_floating_pane_command(
+    caller: &(impl ServiceCaller + Sync),
+    options: FloatingPaneCommandOptions,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let session_id = resolve_session_id(caller, None)?;
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        api_pane_runtime_commands::client::create_floating_pane(
+            &mut client,
+            session_id,
+            None,
+            options.origin_x,
+            options.origin_y,
+            options.width,
+            options.height,
+            options.z_index,
+            options.layer,
+            options.scope,
+            None,
+            options.program,
+            options.args,
+            None,
+        ),
+    )
+    .map_err(|err| typed_service_error("pane-runtime-commands/create-floating-pane", err))?;
+    result.map_err(|err| format!("create-floating-pane failed: {err:?}"))
+}
+
+fn mutate_floating_pane_command(
+    caller: &(impl ServiceCaller + Sync),
+    command: &str,
+    pane_id: Uuid,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let session_id = resolve_session_id(caller, None)?;
+    let mut client = dispatch_client(caller);
+    let result = match command {
+        "focus" => bmux_plugin::block_on_typed_dispatch(
+            api_pane_runtime_commands::client::focus_floating_pane(
+                &mut client,
+                session_id,
+                pane_id,
+            ),
+        ),
+        "raise" => bmux_plugin::block_on_typed_dispatch(
+            api_pane_runtime_commands::client::raise_floating_pane(
+                &mut client,
+                session_id,
+                pane_id,
+            ),
+        ),
+        "lower" => bmux_plugin::block_on_typed_dispatch(
+            api_pane_runtime_commands::client::lower_floating_pane(
+                &mut client,
+                session_id,
+                pane_id,
+            ),
+        ),
+        "close" => bmux_plugin::block_on_typed_dispatch(
+            api_pane_runtime_commands::client::close_floating_pane(
+                &mut client,
+                session_id,
+                pane_id,
+            ),
+        ),
+        other => return Err(format!("unknown floating pane command '{other}'")),
+    }
+    .map_err(|err| typed_service_error("pane-runtime-commands/floating-pane", err))?;
+    result.map_err(|err| format!("{command}-floating-pane failed: {err:?}"))
+}
+
+fn move_floating_pane_command(
+    caller: &(impl ServiceCaller + Sync),
+    pane_id: Uuid,
+    origin_x: u16,
+    origin_y: u16,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let session_id = resolve_session_id(caller, None)?;
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        api_pane_runtime_commands::client::move_floating_pane(
+            &mut client,
+            session_id,
+            pane_id,
+            origin_x,
+            origin_y,
+        ),
+    )
+    .map_err(|err| typed_service_error("pane-runtime-commands/move-floating-pane", err))?;
+    result.map_err(|err| format!("move-floating-pane failed: {err:?}"))
+}
+
+fn resize_floating_pane_command(
+    caller: &(impl ServiceCaller + Sync),
+    pane_id: Uuid,
+    width: u16,
+    height: u16,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let session_id = resolve_session_id(caller, None)?;
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        api_pane_runtime_commands::client::resize_floating_pane(
+            &mut client,
+            session_id,
+            pane_id,
+            width,
+            height,
+        ),
+    )
+    .map_err(|err| typed_service_error("pane-runtime-commands/resize-floating-pane", err))?;
+    result.map_err(|err| format!("resize-floating-pane failed: {err:?}"))
+}
+
+fn set_floating_pane_z_command(
+    caller: &(impl ServiceCaller + Sync),
+    pane_id: Uuid,
+    z: i32,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let session_id = resolve_session_id(caller, None)?;
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        api_pane_runtime_commands::client::set_floating_pane_z(&mut client, session_id, pane_id, z),
+    )
+    .map_err(|err| typed_service_error("pane-runtime-commands/set-floating-pane-z", err))?;
+    result.map_err(|err| format!("set-floating-pane-z failed: {err:?}"))
+}
+
+fn set_floating_pane_layer_command(
+    caller: &(impl ServiceCaller + Sync),
+    pane_id: Uuid,
+    layer: String,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let session_id = resolve_session_id(caller, None)?;
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        api_pane_runtime_commands::client::set_floating_pane_layer(
+            &mut client,
+            session_id,
+            pane_id,
+            layer,
+        ),
+    )
+    .map_err(|err| typed_service_error("pane-runtime-commands/set-floating-pane-layer", err))?;
+    result.map_err(|err| format!("set-floating-pane-layer failed: {err:?}"))
+}
+
 fn zoom_pane(
     caller: &(impl ServiceCaller + Sync),
     session: Option<&Selector>,
@@ -1278,6 +1435,82 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
         }
         "zoom-pane" => {
             zoom_pane(context, None)?;
+            Ok(())
+        }
+        "create-floating-pane" => {
+            let ack = create_floating_pane_command(
+                context,
+                FloatingPaneCommandOptions {
+                    origin_x: option_value(&context.arguments, "x")
+                        .map(|v| parse_u16_arg(&v, "x"))
+                        .transpose()?,
+                    origin_y: option_value(&context.arguments, "y")
+                        .map(|v| parse_u16_arg(&v, "y"))
+                        .transpose()?,
+                    width: option_value(&context.arguments, "w")
+                        .map(|v| parse_u16_arg(&v, "w"))
+                        .transpose()?,
+                    height: option_value(&context.arguments, "h")
+                        .map(|v| parse_u16_arg(&v, "h"))
+                        .transpose()?,
+                    z_index: option_value(&context.arguments, "z")
+                        .map(|v| parse_i32_arg(&v, "z"))
+                        .transpose()?,
+                    layer: option_value(&context.arguments, "layer"),
+                    scope: option_value(&context.arguments, "scope"),
+                    program: option_value(&context.arguments, "program"),
+                    args: Vec::new(),
+                },
+            )?;
+            if emit_to_stdout {
+                println!("created floating pane: {}", ack.pane_id);
+            }
+            Ok(())
+        }
+        "focus-floating-pane"
+        | "raise-floating-pane"
+        | "lower-floating-pane"
+        | "close-floating-pane" => {
+            let pane_id = parse_pane_id_argument(&context.arguments)?;
+            let command = context.command.trim_end_matches("-floating-pane");
+            mutate_floating_pane_command(context, command, pane_id)?;
+            Ok(())
+        }
+        "move-floating-pane" => {
+            let pane_id = parse_pane_id_argument(&context.arguments)?;
+            let origin_x = option_value(&context.arguments, "x")
+                .ok_or_else(|| "--x is required".to_string())
+                .and_then(|value| parse_u16_arg(&value, "x"))?;
+            let origin_y = option_value(&context.arguments, "y")
+                .ok_or_else(|| "--y is required".to_string())
+                .and_then(|value| parse_u16_arg(&value, "y"))?;
+            move_floating_pane_command(context, pane_id, origin_x, origin_y)?;
+            Ok(())
+        }
+        "resize-floating-pane" => {
+            let pane_id = parse_pane_id_argument(&context.arguments)?;
+            let width = option_value(&context.arguments, "w")
+                .ok_or_else(|| "--w is required".to_string())
+                .and_then(|value| parse_u16_arg(&value, "w"))?;
+            let height = option_value(&context.arguments, "h")
+                .ok_or_else(|| "--h is required".to_string())
+                .and_then(|value| parse_u16_arg(&value, "h"))?;
+            resize_floating_pane_command(context, pane_id, width, height)?;
+            Ok(())
+        }
+        "set-floating-pane-z" => {
+            let pane_id = parse_pane_id_argument(&context.arguments)?;
+            let z = option_value(&context.arguments, "z")
+                .ok_or_else(|| "--z is required".to_string())
+                .and_then(|value| parse_i32_arg(&value, "z"))?;
+            set_floating_pane_z_command(context, pane_id, z)?;
+            Ok(())
+        }
+        "set-floating-pane-layer" => {
+            let pane_id = parse_pane_id_argument(&context.arguments)?;
+            let layer = option_value(&context.arguments, "layer")
+                .ok_or_else(|| "--layer is required".to_string())?;
+            set_floating_pane_layer_command(context, pane_id, layer)?;
             Ok(())
         }
         "close-active-pane" => {
@@ -2802,6 +3035,27 @@ fn parse_pane_resize_direction_arg(value: &str) -> Result<PaneResizeDirection, S
             "unknown resize direction '{other}' (expected increase/decrease/left/right/up/down)"
         )),
     }
+}
+
+fn parse_u16_arg(value: &str, name: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid --{name} value '{value}'"))
+}
+
+fn parse_i32_arg(value: &str, name: &str) -> Result<i32, String> {
+    value
+        .parse::<i32>()
+        .map_err(|_| format!("invalid --{name} value '{value}'"))
+}
+
+fn parse_pane_id_argument(arguments: &[String]) -> Result<Uuid, String> {
+    let raw = option_value(arguments, "pane-id")
+        .or_else(|| option_value(arguments, "pane"))
+        .or_else(|| positional_value(arguments))
+        .ok_or_else(|| "missing floating pane id (pass --pane-id <uuid>)".to_string())?;
+    raw.parse::<Uuid>()
+        .map_err(|_| format!("invalid pane id '{raw}'"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

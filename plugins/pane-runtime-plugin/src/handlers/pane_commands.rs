@@ -10,10 +10,12 @@ use bmux_attach_layout_protocol::{
     PaneFocusDirection, PaneLaunchCommand, PaneSelector, PaneSplitDirection,
 };
 use bmux_pane_runtime_plugin_api::pane_runtime_commands::{
-    PaneAck, PaneCommandError, SessionAck, SessionRuntimeCommandError,
+    FloatingPaneAck, PaneAck, PaneCommandError, SessionAck, SessionRuntimeCommandError,
 };
 use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, AttachViewComponent, PaneEvent};
-use bmux_pane_runtime_state::PaneResizeDirection;
+use bmux_pane_runtime_state::{
+    FloatingPaneLayer, FloatingPaneScope, LayoutRect, PaneResizeDirection,
+};
 use bmux_session_models::SessionId;
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use serde::{Deserialize, Serialize};
@@ -85,6 +87,71 @@ pub struct RestartPaneArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZoomPaneArgs {
     pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateFloatingPaneArgs {
+    pub session_id: Uuid,
+    #[serde(default)]
+    pub target: Option<Uuid>,
+    #[serde(default)]
+    pub x: Option<u16>,
+    #[serde(default)]
+    pub y: Option<u16>,
+    #[serde(default)]
+    pub w: Option<u16>,
+    #[serde(default)]
+    pub h: Option<u16>,
+    #[serde(default)]
+    pub z: Option<i32>,
+    #[serde(default)]
+    pub layer: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub program: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FloatingPaneTargetArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveFloatingPaneArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub x: u16,
+    pub y: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResizeFloatingPaneArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub w: u16,
+    pub h: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetFloatingPaneZArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub z: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetFloatingPaneLayerArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub layer: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +281,42 @@ fn parse_resize_direction(raw: &str) -> Result<PaneResizeDirection, PaneCommandE
         other => Err(failed_command(format!(
             "invalid resize direction: '{other}' (expected increase|decrease|left|right|up|down)"
         ))),
+    }
+}
+
+fn parse_floating_scope(raw: Option<&str>) -> Result<FloatingPaneScope, PaneCommandError> {
+    match raw.unwrap_or("per_window") {
+        "per_pane" | "pane" => Ok(FloatingPaneScope::PerPane),
+        "per_window" | "per_tab" | "window" | "tab" => Ok(FloatingPaneScope::PerWindow),
+        "per_session" | "session" => Ok(FloatingPaneScope::PerSession),
+        "client_global" | "client" => Ok(FloatingPaneScope::ClientGlobal),
+        "server_global" | "global" | "server" => Ok(FloatingPaneScope::ServerGlobal),
+        other => Err(failed_command(format!(
+            "invalid floating pane scope: '{other}'"
+        ))),
+    }
+}
+
+fn parse_floating_layer(raw: Option<&str>) -> Result<FloatingPaneLayer, PaneCommandError> {
+    match raw.unwrap_or("floating_pane") {
+        "pane" => Ok(FloatingPaneLayer::Pane),
+        "overlay" => Ok(FloatingPaneLayer::Overlay),
+        "floating" | "floating_pane" => Ok(FloatingPaneLayer::FloatingPane),
+        "tooltip" | "top" => Ok(FloatingPaneLayer::Tooltip),
+        other => Err(failed_command(format!(
+            "invalid floating pane layer: '{other}'"
+        ))),
+    }
+}
+
+fn floating_ack(
+    session_id: SessionId,
+    summary: bmux_pane_runtime_state::FloatingPaneRuntimeSummary,
+) -> FloatingPaneAck {
+    FloatingPaneAck {
+        session_id: session_id.0,
+        pane_id: summary.pane_id,
+        surface_id: summary.id,
     }
 }
 
@@ -483,6 +586,184 @@ pub fn zoom_pane(
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
+    })
+}
+
+pub fn create_floating_pane(
+    req: CreateFloatingPaneArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<FloatingPaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.floating.create")?;
+    let command = req.program.map(|program| PaneLaunchCommand {
+        program,
+        args: req.args,
+        cwd: req.cwd,
+        env: std::collections::BTreeMap::new(),
+    });
+    let summary = handle
+        .0
+        .create_floating_pane(
+            session_id,
+            target_selector(req.target),
+            LayoutRect {
+                x: req.x.unwrap_or(2),
+                y: req.y.unwrap_or(2),
+                w: req.w.unwrap_or(80).max(1),
+                h: req.h.unwrap_or(24).max(1),
+            },
+            parse_floating_scope(req.scope.as_deref())?,
+            parse_floating_layer(req.layer.as_deref())?,
+            req.z.unwrap_or(0),
+            req.name,
+            command,
+        )
+        .map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
+    Ok(floating_ack(session_id, summary))
+}
+
+pub fn move_floating_pane(
+    req: &MoveFloatingPaneArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<FloatingPaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.floating.move")?;
+    let summary = handle
+        .0
+        .move_floating_pane(session_id, req.pane_id, req.x, req.y)
+        .map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
+    Ok(floating_ack(session_id, summary))
+}
+
+pub fn resize_floating_pane(
+    req: &ResizeFloatingPaneArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<FloatingPaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.floating.resize")?;
+    let summary = handle
+        .0
+        .resize_floating_pane(session_id, req.pane_id, req.w.max(1), req.h.max(1))
+        .map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
+    Ok(floating_ack(session_id, summary))
+}
+
+fn mutate_floating_target(
+    req: &FloatingPaneTargetArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+    action: &str,
+    mutate: impl FnOnce(
+        &bmux_pane_runtime_state::SessionRuntimeManagerHandle,
+        SessionId,
+        Uuid,
+    ) -> anyhow::Result<bmux_pane_runtime_state::FloatingPaneRuntimeSummary>,
+) -> Result<FloatingPaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, action)?;
+    let summary =
+        mutate(&handle, session_id, req.pane_id).map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
+    Ok(floating_ack(session_id, summary))
+}
+
+pub fn focus_floating_pane(
+    req: &FloatingPaneTargetArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<FloatingPaneAck, PaneCommandError> {
+    mutate_floating_target(
+        req,
+        ctx,
+        "pane.floating.focus",
+        |handle, session_id, pane_id| handle.0.focus_floating_pane(session_id, pane_id),
+    )
+}
+
+pub fn raise_floating_pane(
+    req: &FloatingPaneTargetArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<FloatingPaneAck, PaneCommandError> {
+    mutate_floating_target(
+        req,
+        ctx,
+        "pane.floating.raise",
+        |handle, session_id, pane_id| handle.0.raise_floating_pane(session_id, pane_id),
+    )
+}
+
+pub fn lower_floating_pane(
+    req: &FloatingPaneTargetArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<FloatingPaneAck, PaneCommandError> {
+    mutate_floating_target(
+        req,
+        ctx,
+        "pane.floating.lower",
+        |handle, session_id, pane_id| handle.0.lower_floating_pane(session_id, pane_id),
+    )
+}
+
+pub fn set_floating_pane_z(
+    req: &SetFloatingPaneZArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<FloatingPaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.floating.set_z")?;
+    let summary = handle
+        .0
+        .set_floating_pane_z(session_id, req.pane_id, req.z)
+        .map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
+    Ok(floating_ack(session_id, summary))
+}
+
+pub fn set_floating_pane_layer(
+    req: &SetFloatingPaneLayerArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<FloatingPaneAck, PaneCommandError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
+    let session_id = SessionId(req.session_id);
+    ensure_session_mutation_allowed(ctx, session_id, "pane.floating.set_layer")?;
+    let summary = handle
+        .0
+        .set_floating_pane_layer(
+            session_id,
+            req.pane_id,
+            parse_floating_layer(Some(&req.layer))?,
+        )
+        .map_err(|e| failed_command(e.to_string()))?;
+    emit_attach_view_changed_scene(session_id);
+    Ok(floating_ack(session_id, summary))
+}
+
+pub fn close_floating_pane(
+    req: &FloatingPaneTargetArgs,
+    ctx: &bmux_plugin_sdk::NativeServiceContext,
+) -> Result<FloatingPaneAck, PaneCommandError> {
+    let ack = close_pane(
+        &ClosePaneArgs {
+            session_id: req.session_id,
+            target: Some(req.pane_id),
+        },
+        ctx,
+    )?;
+    Ok(FloatingPaneAck {
+        session_id: ack.session_id,
+        pane_id: ack.pane_id,
+        surface_id: Uuid::nil(),
     })
 }
 

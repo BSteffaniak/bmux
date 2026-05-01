@@ -25,7 +25,8 @@ pub mod pane_state;
 /// Route an inbound typed service call to the correct handler.
 #[allow(
     clippy::needless_pass_by_value,
-    reason = "`route_service!` macro requires the context to be owned so it can access `context.request.*` + `context.plugin_id` across match arms."
+    clippy::too_many_lines,
+    reason = "`route_service!` centralizes all generated service route arms; splitting would obscure the macro dispatch table."
 )]
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
@@ -35,6 +36,9 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         },
         "pane-runtime-state", "get-pane" => |req: pane_state::GetPaneArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_state::get_pane(&req, ctx))
+        },
+        "pane-runtime-state", "list-floating-panes" => |req: pane_state::ListFloatingPanesArgs, _ctx| {
+            Ok::<_, ServiceResponse>(pane_state::list_floating_panes(&req))
         },
         "pane-runtime-state", "list-pane-processes" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(pane_state::list_pane_processes())
@@ -64,6 +68,33 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         },
         "pane-runtime-commands", "zoom-pane" => |req: pane_commands::ZoomPaneArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_commands::zoom_pane(&req, ctx))
+        },
+        "pane-runtime-commands", "create-floating-pane" => |req: pane_commands::CreateFloatingPaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::create_floating_pane(req, ctx))
+        },
+        "pane-runtime-commands", "move-floating-pane" => |req: pane_commands::MoveFloatingPaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::move_floating_pane(&req, ctx))
+        },
+        "pane-runtime-commands", "resize-floating-pane" => |req: pane_commands::ResizeFloatingPaneArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::resize_floating_pane(&req, ctx))
+        },
+        "pane-runtime-commands", "focus-floating-pane" => |req: pane_commands::FloatingPaneTargetArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::focus_floating_pane(&req, ctx))
+        },
+        "pane-runtime-commands", "raise-floating-pane" => |req: pane_commands::FloatingPaneTargetArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::raise_floating_pane(&req, ctx))
+        },
+        "pane-runtime-commands", "lower-floating-pane" => |req: pane_commands::FloatingPaneTargetArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::lower_floating_pane(&req, ctx))
+        },
+        "pane-runtime-commands", "set-floating-pane-z" => |req: pane_commands::SetFloatingPaneZArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::set_floating_pane_z(&req, ctx))
+        },
+        "pane-runtime-commands", "set-floating-pane-layer" => |req: pane_commands::SetFloatingPaneLayerArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::set_floating_pane_layer(&req, ctx))
+        },
+        "pane-runtime-commands", "close-floating-pane" => |req: pane_commands::FloatingPaneTargetArgs, ctx| {
+            Ok::<_, ServiceResponse>(pane_commands::close_floating_pane(&req, ctx))
         },
         "pane-runtime-commands", "pane-direct-input" => |req: pane_commands::PaneDirectInputArgs, ctx| {
             Ok::<_, ServiceResponse>(pane_commands::pane_direct_input(req, ctx))

@@ -15,9 +15,9 @@ use bmux_pane_runtime_plugin_api::{
     pane_runtime_events::{self, AttachViewComponent, PaneEvent},
 };
 use bmux_pane_runtime_state::{
-    AttachViewport, FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec,
-    PaneLayoutNode, PaneResizeDirection, PaneResurrectionSnapshot, PaneRuntimeMeta,
-    SessionRuntimeError,
+    AttachViewport, FloatingPaneLayer, FloatingPaneRuntimeSummary, FloatingPaneScope,
+    FloatingSurfaceRuntime, LayoutRect, PaneCommandSource, PaneLaunchSpec, PaneLayoutNode,
+    PaneResizeDirection, PaneResurrectionSnapshot, PaneRuntimeMeta, SessionRuntimeError,
 };
 use bmux_recording_protocol::{RecordingEventKind, RecordingPayload as ProtocolRecordingPayload};
 use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
@@ -162,7 +162,7 @@ struct SessionRuntimeManager {
 
 struct SessionRuntimeHandle {
     panes: BTreeMap<Uuid, PaneRuntimeHandle>,
-    layout_root: PaneLayoutNode,
+    layout_root: Option<PaneLayoutNode>,
     focused_pane_id: Uuid,
     zoomed_pane_id: Option<Uuid>,
     floating_surfaces: Vec<FloatingSurfaceRuntime>,
@@ -1688,16 +1688,76 @@ fn collect_runtime_layout_pane_ids(node: &PaneLayoutNode, out: &mut BTreeSet<Uui
     Ok(())
 }
 
-fn validate_runtime_layout_matches_panes(
-    layout_root: &PaneLayoutNode,
-    panes: &BTreeMap<Uuid, PaneRuntimeHandle>,
-) -> Result<()> {
-    let pane_ids = panes.keys().copied().collect::<BTreeSet<_>>();
+fn floating_pane_ids(runtime: &SessionRuntimeHandle) -> BTreeSet<Uuid> {
+    runtime
+        .floating_surfaces
+        .iter()
+        .map(|surface| surface.pane_id)
+        .collect()
+}
+
+fn tiled_pane_ids(runtime: &SessionRuntimeHandle) -> BTreeSet<Uuid> {
+    let floating = floating_pane_ids(runtime);
+    runtime
+        .panes
+        .keys()
+        .copied()
+        .filter(|pane_id| !floating.contains(pane_id))
+        .collect()
+}
+
+fn ordered_tiled_pane_ids(runtime: &SessionRuntimeHandle) -> Vec<Uuid> {
+    let mut pane_ids = Vec::new();
+    if let Some(layout_root) = &runtime.layout_root {
+        layout_root.pane_order(&mut pane_ids);
+    }
+    pane_ids
+}
+
+fn ordered_pane_ids(runtime: &SessionRuntimeHandle) -> Vec<Uuid> {
+    let mut pane_ids = ordered_tiled_pane_ids(runtime);
+    for surface in &runtime.floating_surfaces {
+        if runtime.panes.contains_key(&surface.pane_id) && !pane_ids.contains(&surface.pane_id) {
+            pane_ids.push(surface.pane_id);
+        }
+    }
+    pane_ids
+}
+
+fn fallback_ipc_layout(runtime: &SessionRuntimeHandle) -> IpcPaneLayoutNode {
+    runtime.layout_root.as_ref().map_or_else(
+        || IpcPaneLayoutNode::Leaf {
+            pane_id: runtime.focused_pane_id,
+        },
+        ipc_layout_from_runtime,
+    )
+}
+
+fn floating_summary(surface: FloatingSurfaceRuntime) -> FloatingPaneRuntimeSummary {
+    FloatingPaneRuntimeSummary {
+        id: surface.id,
+        pane_id: surface.pane_id,
+        anchor_pane_id: surface.anchor_pane_id,
+        rect: surface.rect,
+        scope: surface.scope,
+        layer: surface.layer,
+        z: surface.z,
+        visible: surface.visible,
+        opaque: surface.opaque,
+        accepts_input: surface.accepts_input,
+        cursor_owner: surface.cursor_owner,
+    }
+}
+
+fn validate_runtime_layout_matches_panes(runtime: &SessionRuntimeHandle) -> Result<()> {
+    let pane_ids = tiled_pane_ids(runtime);
     let mut layout_ids = BTreeSet::new();
-    collect_runtime_layout_pane_ids(layout_root, &mut layout_ids)?;
+    if let Some(layout_root) = &runtime.layout_root {
+        collect_runtime_layout_pane_ids(layout_root, &mut layout_ids)?;
+    }
     if pane_ids != layout_ids {
         anyhow::bail!(
-            "runtime layout panes do not match runtime pane map (layout: {}, panes: {})",
+            "runtime layout panes do not match tiled runtime pane map (layout: {}, panes: {})",
             layout_ids.len(),
             pane_ids.len()
         )
@@ -1933,7 +1993,7 @@ fn build_attach_scene(
                     AttachSurface {
                         id: surface.id,
                         kind: AttachSurfaceKind::FloatingPane,
-                        layer: AttachLayer::FloatingPane,
+                        layer: surface.layer.to_attach_layer(),
                         z: surface.z,
                         rect,
                         content_rect: pane_content_rect_for_outer(rect),
@@ -1956,10 +2016,11 @@ fn build_attach_scene(
     // Zoomed pane was removed; fall through to normal rendering.
 
     let mut rects = BTreeMap::new();
-    collect_layout_rects(&runtime.layout_root, scene_root, &mut rects);
+    if let Some(layout_root) = &runtime.layout_root {
+        collect_layout_rects(layout_root, scene_root, &mut rects);
+    }
 
-    let mut pane_ids = Vec::new();
-    runtime.layout_root.pane_order(&mut pane_ids);
+    let pane_ids = ordered_tiled_pane_ids(runtime);
 
     let mut surfaces = pane_ids
         .into_iter()
@@ -1996,7 +2057,7 @@ fn build_attach_scene(
                 AttachSurface {
                     id: surface.id,
                     kind: AttachSurfaceKind::FloatingPane,
-                    layer: AttachLayer::FloatingPane,
+                    layer: surface.layer.to_attach_layer(),
                     z: surface.z,
                     rect,
                     content_rect: pane_content_rect_for_outer(rect),
@@ -2058,12 +2119,21 @@ fn resize_session_ptys(
     }
 
     let mut rects = BTreeMap::new();
-    collect_layout_rects(&runtime.layout_root, root, &mut rects);
+    if let Some(layout_root) = &runtime.layout_root {
+        collect_layout_rects(layout_root, root, &mut rects);
+    }
     for (pane_id, pane) in &runtime.panes {
         if pane.exited.load(Ordering::SeqCst) {
             continue;
         }
-        if let Some(rect) = rects.get(pane_id).copied() {
+        let rect = rects.get(pane_id).copied().or_else(|| {
+            runtime
+                .floating_surfaces
+                .iter()
+                .find(|surface| surface.pane_id == *pane_id)
+                .map(|surface| surface.rect)
+        });
+        if let Some(rect) = rect {
             let (rows, cols) = pane_pty_size(rect);
             pane.resize_pty(rows, cols);
         }
@@ -2137,9 +2207,9 @@ impl SessionRuntimeManager {
             session_id,
             SessionRuntimeHandle {
                 panes,
-                layout_root: PaneLayoutNode::Leaf {
+                layout_root: Some(PaneLayoutNode::Leaf {
                     pane_id: first_pane_id,
-                },
+                }),
                 focused_pane_id: first_pane_id,
                 zoomed_pane_id: None,
                 floating_surfaces: Vec::new(),
@@ -2176,9 +2246,7 @@ impl SessionRuntimeManager {
             runtime_panes.insert(pane_meta.id, pane);
         }
 
-        let runtime_layout_root = layout_root
-            .unwrap_or_else(|| layout_from_panes(panes).expect("restored runtime has panes"));
-        validate_runtime_layout_matches_panes(&runtime_layout_root, &runtime_panes)?;
+        let runtime_layout_root = layout_root.or_else(|| layout_from_panes(panes));
 
         self.runtimes.insert(
             session_id,
@@ -2193,6 +2261,11 @@ impl SessionRuntimeManager {
                 attach_view_revision: 0,
             },
         );
+        let runtime = self
+            .runtimes
+            .get(&session_id)
+            .expect("runtime inserted before validation");
+        validate_runtime_layout_matches_panes(runtime)?;
 
         Ok(())
     }
@@ -2816,10 +2889,12 @@ impl SessionRuntimeManager {
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         session.panes.insert(pane_id, handle);
-        let replaced =
-            session
-                .layout_root
-                .replace_leaf_with_split(target_pane_id, direction, 0.5, pane_id);
+        let replaced = if let Some(layout_root) = &mut session.layout_root {
+            layout_root.replace_leaf_with_split(target_pane_id, direction, 0.5, pane_id)
+        } else {
+            session.layout_root = Some(PaneLayoutNode::Leaf { pane_id });
+            true
+        };
         if !replaced {
             anyhow::bail!("failed to apply split to layout tree")
         }
@@ -2835,8 +2910,7 @@ impl SessionRuntimeManager {
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         // If zoomed, stay zoomed but update to the new focused pane.
         let was_zoomed = session.zoomed_pane_id.is_some();
-        let mut pane_ids = Vec::new();
-        session.layout_root.pane_order(&mut pane_ids);
+        let pane_ids = ordered_pane_ids(session);
         if pane_ids.is_empty() {
             anyhow::bail!("no panes in session runtime")
         }
@@ -2908,22 +2982,57 @@ impl SessionRuntimeManager {
             .runtimes
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-        let next_focus = next_focus_after_close(
-            &session.layout_root,
-            session.focused_pane_id,
-            pane_id,
-            session.attach_viewport,
-        );
+        let next_focus = session.layout_root.as_ref().and_then(|layout_root| {
+            next_focus_after_close(
+                layout_root,
+                session.focused_pane_id,
+                pane_id,
+                session.attach_viewport,
+            )
+        });
         let pane = session
             .panes
             .remove(&pane_id)
             .ok_or_else(|| anyhow::anyhow!("focused pane not found"))?;
-        let _ = session.layout_root.remove_leaf(pane_id);
-        if (session.focused_pane_id == pane_id
-            || !session.panes.contains_key(&session.focused_pane_id))
-            && let Some(next_id) = next_focus
+        let anchored_floating_panes = session
+            .floating_surfaces
+            .iter()
+            .filter(|surface| surface.anchor_pane_id == Some(pane_id))
+            .map(|surface| surface.pane_id)
+            .filter(|floating_pane_id| *floating_pane_id != pane_id)
+            .collect::<Vec<_>>();
+        session.floating_surfaces.retain(|surface| {
+            surface.pane_id != pane_id && surface.anchor_pane_id != Some(pane_id)
+        });
+        for floating_pane_id in anchored_floating_panes {
+            if let Some(floating_pane) = session.panes.remove(&floating_pane_id) {
+                tokio::spawn(async move {
+                    shutdown_pane_handle(floating_pane).await;
+                });
+            }
+        }
+        if let Some(layout_root) = &mut session.layout_root {
+            let _ = layout_root.remove_leaf(pane_id);
+        }
+        let layout_ids = session
+            .layout_root
+            .as_ref()
+            .map(|layout| {
+                let mut ids = Vec::new();
+                layout.pane_order(&mut ids);
+                ids
+            })
+            .unwrap_or_default();
+        if layout_ids.iter().any(|id| !session.panes.contains_key(id)) {
+            session.layout_root = None;
+        }
+        if session.focused_pane_id == pane_id
+            || !session.panes.contains_key(&session.focused_pane_id)
         {
-            session.focused_pane_id = next_id;
+            let next_focus = next_focus.or_else(|| ordered_pane_ids(session).first().copied());
+            if let Some(next_id) = next_focus {
+                session.focused_pane_id = next_id;
+            }
         }
 
         tokio::spawn(async move {
@@ -3026,9 +3135,9 @@ impl SessionRuntimeManager {
             resolve_pane_id_from_selector(session, &target.unwrap_or(PaneSelector::Active))
                 .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
         let root = scene_root_from_viewport(session.attach_viewport);
-        let _ = session
-            .layout_root
-            .resize_focused(pane_id, direction, root, cells.max(1));
+        if let Some(layout_root) = &mut session.layout_root {
+            let _ = layout_root.resize_focused(pane_id, direction, root, cells.max(1));
+        }
         self.apply_stored_attach_viewport(session_id);
         Ok(())
     }
@@ -3044,9 +3153,8 @@ impl SessionRuntimeManager {
             self.apply_stored_attach_viewport(session_id);
             Ok((focused, false))
         } else {
-            // Only zoom if there are at least 2 panes (zooming a single pane is a no-op).
-            let mut pane_ids = Vec::new();
-            session.layout_root.pane_order(&mut pane_ids);
+            // Only zoom if there are at least 2 tiled panes (zooming a single pane is a no-op).
+            let pane_ids = ordered_tiled_pane_ids(session);
             if pane_ids.len() < 2 {
                 return Ok((focused, false));
             }
@@ -3056,14 +3164,240 @@ impl SessionRuntimeManager {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Floating pane creation mirrors the BPDL command fields and avoids a plugin-private options type at this boundary."
+    )]
+    fn create_floating_pane(
+        &mut self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        rect: LayoutRect,
+        scope: FloatingPaneScope,
+        layer: FloatingPaneLayer,
+        z: i32,
+        name: Option<String>,
+        command: Option<PaneLaunchCommand>,
+    ) -> Result<FloatingPaneRuntimeSummary> {
+        let (target_pane_id, next_pane_name, shell, client_ids) = {
+            let session = self
+                .runtimes
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+            let target_pane_id =
+                resolve_pane_id_from_selector(session, &target.unwrap_or(PaneSelector::Active))
+                    .unwrap_or(session.focused_pane_id);
+            let shell = session
+                .panes
+                .get(&target_pane_id)
+                .map_or_else(|| self.shell.clone(), |pane| pane.meta.shell.clone());
+            (
+                target_pane_id,
+                name.or_else(|| Some(format!("floating-pane-{}", session.panes.len() + 1))),
+                shell,
+                session.attached_clients.iter().copied().collect::<Vec<_>>(),
+            )
+        };
+
+        let pane_id = Uuid::new_v4();
+        let pane_meta = PaneRuntimeMeta {
+            id: pane_id,
+            name: next_pane_name,
+            shell,
+            launch: command.map(pane_launch_spec_from_command).transpose()?,
+            resurrection: PaneResurrectionSnapshot::default(),
+        };
+        let handle = self.spawn_pane_runtime(session_id, pane_meta);
+        for client_id in client_ids {
+            if let Ok(mut output) = handle.output_buffer.lock() {
+                output.register_client_at_tail(client_id);
+            }
+        }
+
+        let surface = FloatingSurfaceRuntime {
+            id: Uuid::new_v4(),
+            pane_id,
+            anchor_pane_id: matches!(scope, FloatingPaneScope::PerPane).then_some(target_pane_id),
+            rect,
+            scope,
+            layer,
+            z,
+            visible: true,
+            opaque: true,
+            accepts_input: true,
+            cursor_owner: true,
+        };
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let _ = target_pane_id;
+        session.panes.insert(pane_id, handle);
+        session
+            .floating_surfaces
+            .iter_mut()
+            .for_each(|surface| surface.cursor_owner = false);
+        session.floating_surfaces.push(surface);
+        session.focused_pane_id = pane_id;
+        self.apply_stored_attach_viewport(session_id);
+        Ok(floating_summary(surface))
+    }
+
+    fn list_floating_panes(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<FloatingPaneRuntimeSummary>> {
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        Ok(session
+            .floating_surfaces
+            .iter()
+            .copied()
+            .filter(|surface| session.panes.contains_key(&surface.pane_id))
+            .map(floating_summary)
+            .collect())
+    }
+
+    fn update_floating_pane(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        update: impl FnOnce(&mut FloatingSurfaceRuntime, i32, i32),
+    ) -> Result<FloatingPaneRuntimeSummary> {
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let max_z = session
+            .floating_surfaces
+            .iter()
+            .map(|surface| surface.z)
+            .max()
+            .unwrap_or(0);
+        let min_z = session
+            .floating_surfaces
+            .iter()
+            .map(|surface| surface.z)
+            .min()
+            .unwrap_or(0);
+        let surface = session
+            .floating_surfaces
+            .iter_mut()
+            .find(|surface| surface.pane_id == pane_id)
+            .ok_or_else(|| anyhow::anyhow!("floating pane not found"))?;
+        update(surface, min_z, max_z);
+        let summary = floating_summary(*surface);
+        self.apply_stored_attach_viewport(session_id);
+        Ok(summary)
+    }
+
+    fn move_floating_pane(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        x: u16,
+        y: u16,
+    ) -> Result<FloatingPaneRuntimeSummary> {
+        self.update_floating_pane(session_id, pane_id, |surface, _, _| {
+            surface.rect.x = x;
+            surface.rect.y = y;
+        })
+    }
+
+    fn resize_floating_pane(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        w: u16,
+        h: u16,
+    ) -> Result<FloatingPaneRuntimeSummary> {
+        self.update_floating_pane(session_id, pane_id, |surface, _, _| {
+            surface.rect.w = w.max(1);
+            surface.rect.h = h.max(1);
+        })
+    }
+
+    fn focus_floating_pane(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> Result<FloatingPaneRuntimeSummary> {
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let mut found = None;
+        for surface in &mut session.floating_surfaces {
+            surface.cursor_owner = surface.pane_id == pane_id;
+            if surface.cursor_owner {
+                found = Some(*surface);
+            }
+        }
+        let surface = found.ok_or_else(|| anyhow::anyhow!("floating pane not found"))?;
+        session.focused_pane_id = pane_id;
+        self.apply_stored_attach_viewport(session_id);
+        Ok(floating_summary(surface))
+    }
+
+    fn raise_floating_pane(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> Result<FloatingPaneRuntimeSummary> {
+        self.update_floating_pane(session_id, pane_id, |surface, _, max_z| {
+            surface.z = max_z.saturating_add(1);
+        })
+    }
+
+    fn lower_floating_pane(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> Result<FloatingPaneRuntimeSummary> {
+        self.update_floating_pane(session_id, pane_id, |surface, min_z, _| {
+            surface.z = min_z.saturating_sub(1);
+        })
+    }
+
+    fn set_floating_pane_z(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        z: i32,
+    ) -> Result<FloatingPaneRuntimeSummary> {
+        self.update_floating_pane(session_id, pane_id, |surface, _, _| {
+            surface.z = z;
+        })
+    }
+
+    fn set_floating_pane_layer(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        layer: FloatingPaneLayer,
+    ) -> Result<FloatingPaneRuntimeSummary> {
+        self.update_floating_pane(session_id, pane_id, |surface, _, _| {
+            surface.layer = layer;
+        })
+    }
+
+    fn close_floating_pane(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> Result<(Uuid, Option<RemovedRuntime>)> {
+        self.close_pane(session_id, Some(PaneSelector::ById(pane_id)))
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn list_panes(&self, session_id: SessionId) -> Result<Vec<PaneSummary>> {
         let session = self
             .runtimes
             .get(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-        let mut pane_ids = Vec::new();
-        session.layout_root.pane_order(&mut pane_ids);
+        let pane_ids = ordered_pane_ids(session);
         let panes = pane_ids
             .iter()
             .enumerate()
@@ -3095,8 +3429,7 @@ impl SessionRuntimeManager {
             return Err(SessionRuntimeError::NotAttached);
         }
         let scene = build_attach_scene(session_id, session, session.attach_viewport);
-        let mut pane_ids = Vec::new();
-        session.layout_root.pane_order(&mut pane_ids);
+        let pane_ids = ordered_pane_ids(session);
         let panes = pane_ids
             .iter()
             .enumerate()
@@ -3114,7 +3447,7 @@ impl SessionRuntimeManager {
         Ok(AttachLayoutState {
             focused_pane_id: session.focused_pane_id,
             panes,
-            layout_root: ipc_layout_from_runtime(&session.layout_root),
+            layout_root: fallback_ipc_layout(session),
             scene,
             zoomed: session.zoomed_pane_id.is_some(),
         })
@@ -3135,8 +3468,7 @@ impl SessionRuntimeManager {
             return Err(SessionRuntimeError::NotAttached);
         }
         let scene = build_attach_scene(session_id, session, session.attach_viewport);
-        let mut pane_ids = Vec::new();
-        session.layout_root.pane_order(&mut pane_ids);
+        let pane_ids = ordered_pane_ids(session);
         let panes = pane_ids
             .iter()
             .enumerate()
@@ -3199,7 +3531,7 @@ impl SessionRuntimeManager {
         Ok(AttachSnapshotState {
             focused_pane_id: session.focused_pane_id,
             panes,
-            layout_root: ipc_layout_from_runtime(&session.layout_root),
+            layout_root: fallback_ipc_layout(session),
             scene,
             chunks,
             pane_mouse_protocols,
@@ -3584,8 +3916,7 @@ fn resolve_pane_id_from_selector(
             if *index == 0 {
                 return None;
             }
-            let mut pane_ids = Vec::new();
-            runtime.layout_root.pane_order(&mut pane_ids);
+            let pane_ids = ordered_pane_ids(runtime);
             let position = usize::try_from(index.saturating_sub(1)).ok()?;
             let pane_id = pane_ids.get(position).copied()?;
             runtime.panes.contains_key(&pane_id).then_some(pane_id)
@@ -3793,6 +4124,112 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
     fn toggle_zoom(&self, session_id: SessionId) -> anyhow::Result<(Uuid, bool)> {
         self.with_lock(|m| m.toggle_zoom(session_id))
             .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn create_floating_pane(
+        &self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        rect: LayoutRect,
+        scope: FloatingPaneScope,
+        layer: FloatingPaneLayer,
+        z: i32,
+        name: Option<String>,
+        command: Option<PaneLaunchCommand>,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        self.with_lock(|m| {
+            m.create_floating_pane(session_id, target, rect, scope, layer, z, name, command)
+        })
+        .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn list_floating_panes(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<Vec<FloatingPaneRuntimeSummary>> {
+        self.with_lock_read(|m| m.list_floating_panes(session_id))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn move_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        x: u16,
+        y: u16,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        self.with_lock(|m| m.move_floating_pane(session_id, pane_id, x, y))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn resize_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        w: u16,
+        h: u16,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        self.with_lock(|m| m.resize_floating_pane(session_id, pane_id, w, h))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn focus_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        self.with_lock(|m| m.focus_floating_pane(session_id, pane_id))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn raise_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        self.with_lock(|m| m.raise_floating_pane(session_id, pane_id))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn lower_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        self.with_lock(|m| m.lower_floating_pane(session_id, pane_id))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn set_floating_pane_z(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        z: i32,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        self.with_lock(|m| m.set_floating_pane_z(session_id, pane_id, z))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn set_floating_pane_layer(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        layer: FloatingPaneLayer,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        self.with_lock(|m| m.set_floating_pane_layer(session_id, pane_id, layer))
+            .ok_or_else(Self::lock_poisoned_anyhow)?
+    }
+
+    fn close_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> anyhow::Result<(Uuid, Option<bmux_pane_runtime_state::RemovedRuntimeInfo>)> {
+        let (pane_id, removed) = self
+            .with_lock(|m| m.close_floating_pane(session_id, pane_id))
+            .ok_or_else(Self::lock_poisoned_anyhow)??;
+        let info = removed.map(|r| Self::remove_to_info(r.session_id, r.handle));
+        Ok((pane_id, info))
     }
 
     fn list_panes(&self, session_id: SessionId) -> anyhow::Result<Vec<PaneSummary>> {
@@ -4204,16 +4641,14 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 return Ok(None);
             };
 
-            validate_runtime_layout_matches_panes(&runtime.layout_root, &runtime.panes)
-                .with_context(|| {
-                    format!(
-                        "cannot snapshot inconsistent layout for session {}",
-                        session_id.0
-                    )
-                })?;
+            validate_runtime_layout_matches_panes(runtime).with_context(|| {
+                format!(
+                    "cannot snapshot inconsistent layout for session {}",
+                    session_id.0
+                )
+            })?;
 
-            let mut pane_ids = Vec::new();
-            runtime.layout_root.pane_order(&mut pane_ids);
+            let pane_ids = ordered_pane_ids(runtime);
             let mut panes = Vec::with_capacity(pane_ids.len());
             for pane_id in pane_ids {
                 let Some(pane) = runtime.panes.get_mut(&pane_id) else {

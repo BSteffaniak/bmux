@@ -14,6 +14,49 @@ pub struct LayoutRect {
     pub h: u16,
 }
 
+/// Scope controlling where a floating pane is projected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FloatingPaneScope {
+    /// Floating pane is tied to its source pane and is removed when that pane is removed.
+    PerPane,
+    /// Floating pane belongs to the current tab/window view. This is the default user-facing scope.
+    #[default]
+    PerWindow,
+    /// Floating pane belongs to the whole session and is visible in every session attach view.
+    PerSession,
+    /// Floating pane belongs to the current client across views.
+    ClientGlobal,
+    /// Floating pane belongs to the server across clients/views.
+    ServerGlobal,
+}
+
+/// User-selectable layer buckets for floating panes.
+///
+/// This intentionally exposes a safe subset of the attach scene's protocol layers rather than
+/// allowing pane content to target status/cursor internals directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FloatingPaneLayer {
+    Pane,
+    Overlay,
+    #[default]
+    FloatingPane,
+    Tooltip,
+}
+
+impl FloatingPaneLayer {
+    #[must_use]
+    pub const fn to_attach_layer(self) -> bmux_attach_layout_protocol::AttachLayer {
+        match self {
+            Self::Pane => bmux_attach_layout_protocol::AttachLayer::Pane,
+            Self::Overlay => bmux_attach_layout_protocol::AttachLayer::Overlay,
+            Self::FloatingPane => bmux_attach_layout_protocol::AttachLayer::FloatingPane,
+            Self::Tooltip => bmux_attach_layout_protocol::AttachLayer::Tooltip,
+        }
+    }
+}
+
 /// Floating surface anchored to a pane in a session. The surface is
 /// rendered on top of the pane layout grid; it can be visible / opaque /
 /// input-accepting / cursor-owning independently.
@@ -22,7 +65,13 @@ pub struct LayoutRect {
 pub struct FloatingSurfaceRuntime {
     pub id: Uuid,
     pub pane_id: Uuid,
+    #[serde(default)]
+    pub anchor_pane_id: Option<Uuid>,
     pub rect: LayoutRect,
+    #[serde(default)]
+    pub scope: FloatingPaneScope,
+    #[serde(default)]
+    pub layer: FloatingPaneLayer,
     pub z: i32,
     pub visible: bool,
     pub opaque: bool,

@@ -37,6 +37,27 @@ interface pane-runtime-state {
         panes: list<pane-summary>,
     }
 
+    record floating-pane-summary {
+        id: uuid,
+        pane_id: uuid,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        scope: string,
+        layer: string,
+        z: i32,
+        visible: bool,
+        opaque: bool,
+        accepts_input: bool,
+        cursor_owner: bool,
+    }
+
+    record floating-pane-list {
+        session_id: uuid,
+        panes: list<floating-pane-summary>,
+    }
+
     record pane-process-identity {
         session_id: uuid,
         pane_id: uuid,
@@ -56,6 +77,8 @@ interface pane-runtime-state {
     query list-panes(session_id: uuid?) -> result<session-pane-list, pane-state-error>;
     query get-pane(session_id: uuid, pane_id: uuid)
         -> result<pane-summary, pane-state-error>;
+    query list-floating-panes(session_id: uuid)
+        -> result<floating-pane-list, pane-state-error>;
     query list-pane-processes() -> result<pane-process-list, pane-state-error>;
     query get-pane-process(session_id: uuid, pane_id: uuid)
         -> result<pane-process-identity, pane-state-error>;
@@ -73,6 +96,12 @@ interface pane-runtime-commands {
 
     record session-ack {
         session_id: uuid,
+    }
+
+    record floating-pane-ack {
+        session_id: uuid,
+        pane_id: uuid,
+        surface_id: uuid,
     }
 
     variant pane-command-error {
@@ -140,6 +169,68 @@ interface pane-runtime-commands {
     command zoom-pane(
         session_id: uuid,
     ) -> result<pane-ack, pane-command-error>;
+
+    command create-floating-pane(
+        session_id: uuid,
+        target: uuid?,
+        x: u16?,
+        y: u16?,
+        w: u16?,
+        h: u16?,
+        z: i32?,
+        layer: string?,
+        scope: string?,
+        name: string?,
+        program: string?,
+        args: list<string>,
+        cwd: string?,
+    ) -> result<floating-pane-ack, pane-command-error>;
+
+    command move-floating-pane(
+        session_id: uuid,
+        pane_id: uuid,
+        x: u16,
+        y: u16,
+    ) -> result<floating-pane-ack, pane-command-error>;
+
+    command resize-floating-pane(
+        session_id: uuid,
+        pane_id: uuid,
+        w: u16,
+        h: u16,
+    ) -> result<floating-pane-ack, pane-command-error>;
+
+    command focus-floating-pane(
+        session_id: uuid,
+        pane_id: uuid,
+    ) -> result<floating-pane-ack, pane-command-error>;
+
+    command raise-floating-pane(
+        session_id: uuid,
+        pane_id: uuid,
+    ) -> result<floating-pane-ack, pane-command-error>;
+
+    command lower-floating-pane(
+        session_id: uuid,
+        pane_id: uuid,
+    ) -> result<floating-pane-ack, pane-command-error>;
+
+    command set-floating-pane-z(
+        session_id: uuid,
+        pane_id: uuid,
+        z: i32,
+    ) -> result<floating-pane-ack, pane-command-error>;
+
+    command set-floating-pane-layer(
+        session_id: uuid,
+        pane_id: uuid,
+        layer: string,
+    ) -> result<floating-pane-ack, pane-command-error>;
+
+    command close-floating-pane(
+        session_id: uuid,
+        pane_id: uuid,
+    ) -> result<floating-pane-ack, pane-command-error>;
 
     // Send raw input bytes directly to a pane. Used for unattached
     // programmatic input (e.g. playbook-driven tests).

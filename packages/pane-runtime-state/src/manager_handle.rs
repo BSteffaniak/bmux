@@ -13,8 +13,8 @@
 #![allow(clippy::must_use_candidate)]
 
 use crate::{
-    AttachViewport, FloatingSurfaceRuntime, PaneLayoutNode, PaneResizeDirection, PaneRuntimeMeta,
-    SessionRuntimeError,
+    AttachViewport, FloatingPaneLayer, FloatingPaneScope, FloatingSurfaceRuntime, LayoutRect,
+    PaneLayoutNode, PaneResizeDirection, PaneRuntimeMeta, SessionRuntimeError,
 };
 use bmux_attach_layout_protocol::{
     AttachPaneChunk, AttachPaneInputMode, AttachPaneMouseProtocol, AttachScene, PaneFocusDirection,
@@ -82,6 +82,23 @@ pub struct PaneProcessIdentity {
     pub process_group_id: Option<i32>,
 }
 
+/// Public projection of a floating pane runtime.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloatingPaneRuntimeSummary {
+    pub id: Uuid,
+    pub pane_id: Uuid,
+    pub anchor_pane_id: Option<Uuid>,
+    pub rect: LayoutRect,
+    pub scope: FloatingPaneScope,
+    pub layer: FloatingPaneLayer,
+    pub z: i32,
+    pub visible: bool,
+    pub opaque: bool,
+    pub accepts_input: bool,
+    pub cursor_owner: bool,
+}
+
 /// Per-session pane-runtime projection used when building a
 /// persistence snapshot.
 #[derive(Debug, Clone)]
@@ -89,7 +106,7 @@ pub struct SessionRuntimeSnapshot {
     pub session_id: SessionId,
     pub panes: Vec<PaneRuntimeMeta>,
     pub focused_pane_id: Uuid,
-    pub layout_root: PaneLayoutNode,
+    pub layout_root: Option<PaneLayoutNode>,
     pub floating_surfaces: Vec<FloatingSurfaceRuntime>,
     pub attached_clients: BTreeSet<ClientId>,
     pub attach_viewport: Option<AttachViewport>,
@@ -167,6 +184,79 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
     ) -> anyhow::Result<Uuid>;
 
     fn toggle_zoom(&self, session_id: SessionId) -> anyhow::Result<(Uuid, bool)>;
+
+    // ── Floating pane lifecycle ────────────────────────────────────
+
+    fn create_floating_pane(
+        &self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        rect: LayoutRect,
+        scope: FloatingPaneScope,
+        layer: FloatingPaneLayer,
+        z: i32,
+        name: Option<String>,
+        command: Option<PaneLaunchCommand>,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary>;
+
+    fn list_floating_panes(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<Vec<FloatingPaneRuntimeSummary>>;
+
+    fn move_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        x: u16,
+        y: u16,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary>;
+
+    fn resize_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        w: u16,
+        h: u16,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary>;
+
+    fn focus_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary>;
+
+    fn raise_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary>;
+
+    fn lower_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary>;
+
+    fn set_floating_pane_z(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        z: i32,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary>;
+
+    fn set_floating_pane_layer(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        layer: FloatingPaneLayer,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary>;
+
+    fn close_floating_pane(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> anyhow::Result<(Uuid, Option<RemovedRuntimeInfo>)>;
 
     // ── Pane I/O ───────────────────────────────────────────────────
 
@@ -506,6 +596,87 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         anyhow::bail!("pane-runtime plugin not active")
     }
     fn toggle_zoom(&self, _session_id: SessionId) -> anyhow::Result<(Uuid, bool)> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
+    fn create_floating_pane(
+        &self,
+        _session_id: SessionId,
+        _target: Option<PaneSelector>,
+        _rect: LayoutRect,
+        _scope: FloatingPaneScope,
+        _layer: FloatingPaneLayer,
+        _z: i32,
+        _name: Option<String>,
+        _command: Option<PaneLaunchCommand>,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
+    fn list_floating_panes(
+        &self,
+        _session_id: SessionId,
+    ) -> anyhow::Result<Vec<FloatingPaneRuntimeSummary>> {
+        Ok(Vec::new())
+    }
+    fn move_floating_pane(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+        _x: u16,
+        _y: u16,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
+    fn resize_floating_pane(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+        _w: u16,
+        _h: u16,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
+    fn focus_floating_pane(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
+    fn raise_floating_pane(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
+    fn lower_floating_pane(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
+    fn set_floating_pane_z(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+        _z: i32,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
+    fn set_floating_pane_layer(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+        _layer: FloatingPaneLayer,
+    ) -> anyhow::Result<FloatingPaneRuntimeSummary> {
+        anyhow::bail!("pane-runtime plugin not active")
+    }
+    fn close_floating_pane(
+        &self,
+        _session_id: SessionId,
+        _pane_id: Uuid,
+    ) -> anyhow::Result<(Uuid, Option<RemovedRuntimeInfo>)> {
         anyhow::bail!("pane-runtime plugin not active")
     }
     fn list_panes(&self, _session_id: SessionId) -> anyhow::Result<Vec<PaneSummary>> {
