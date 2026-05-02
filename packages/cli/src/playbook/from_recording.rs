@@ -10,14 +10,14 @@
 //! 1. **State tracking** — a `RecordingStateTracker` processes the event stream
 //!    to track pane creation/destruction, focus changes, and viewport dimensions.
 //!    This lets us attribute input events to specific panes and use correct
-//!    terminal dimensions for vt100 parsing.
+//!    terminal dimensions for structured-grid parsing.
 //!
 //! 2. **Input/output correlation** — input events are grouped with subsequent
 //!    output events from the same pane (the "response window") until the next
 //!    input or a quiescent gap.
 //!
 //! 3. **Assertion generation** — output in each response window is parsed through
-//!    a vt100 terminal emulator to extract the rendered screen. The last non-empty
+//!    the structured terminal grid to extract the rendered screen. The last non-empty
 //!    line (typically a shell prompt after command completion) becomes a `wait-for`
 //!    barrier. Distinctive content lines become `assert-screen contains=` checks.
 
@@ -311,7 +311,7 @@ fn flush_input(
 // ---------------------------------------------------------------------------
 
 /// Generate `wait-for` barriers and `assert-screen` checks from accumulated
-/// output bytes, using vt100 parsing to extract the rendered screen content.
+/// output bytes, using structured-grid parsing to extract rendered screen content.
 fn generate_assertions_from_output(
     lines: &mut Vec<String>,
     output_accum: &[PaneOutputAccumulator],
@@ -326,17 +326,17 @@ fn generate_assertions_from_output(
 
         let pane_index = state.pane_index(&accum.pane_id);
 
-        // Parse the output through a vt100 terminal emulator.
-        let mut parser = vt100::Parser::new(rows, cols, 0);
-        parser.process(&accum.bytes);
-        let screen = parser.screen();
+        // Parse the output through the structured terminal grid.
+        let mut stream = bmux_terminal_grid::TerminalGridStream::new(
+            cols.max(1),
+            rows.max(1),
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .expect("recording playbook grid dimensions are valid");
+        stream.process(&accum.bytes);
 
         // Extract visible text lines.
-        let mut text_lines: Vec<String> = Vec::new();
-        for row in 0..rows {
-            let line = screen.contents_between(row, 0, row, cols);
-            text_lines.push(line);
-        }
+        let text_lines = terminal_grid_text_lines(stream.grid(), usize::from(rows.max(1)));
 
         // Find the last non-empty line (often a shell prompt).
         let last_nonempty = text_lines.iter().rposition(|l| !l.trim().is_empty());
@@ -390,6 +390,27 @@ fn generate_assertions_from_output(
             }
         }
     }
+}
+
+fn terminal_grid_text_lines(grid: &bmux_terminal_grid::TerminalGrid, rows: usize) -> Vec<String> {
+    grid.display_rows(0, rows)
+        .into_iter()
+        .map(|row| terminal_grid_row_text(&row, grid.width()))
+        .collect()
+}
+
+fn terminal_grid_row_text(row: &bmux_terminal_grid::PhysicalRow, width: usize) -> String {
+    let mut text = String::new();
+    for col in 0..width {
+        let Some(cell) = row.cells().get(col) else {
+            text.push(' ');
+            continue;
+        };
+        if !cell.is_wide_continuation() {
+            text.push_str(cell.text());
+        }
+    }
+    text
 }
 
 /// Build a regex pattern from a screen line, making it robust to non-deterministic

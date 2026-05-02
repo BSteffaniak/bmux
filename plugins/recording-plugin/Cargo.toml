@@ -23,12 +23,12 @@ bmux_plugin_sdk           = { workspace = true }
 bmux_recording_plugin_api = { workspace = true }
 bmux_recording_protocol   = { workspace = true }
 bmux_recording_runtime    = { workspace = true }
+bmux_terminal_grid        = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std"] }
 serde_json                = { workspace = true, features = ["std"] }
 thiserror                 = { workspace = true }
 tracing                   = { workspace = true, features = ["std"] }
 uuid                      = { workspace = true, features = ["serde", "std", "v4"] }
-vt100                     = { workspace = true }
 
 [features]
 fail-on-warnings = [

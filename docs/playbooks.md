@@ -1228,16 +1228,16 @@ runnable playbook.
 
 ### What Gets Generated
 
-| Element         | Source                                   | How                                                                                                             |
-| --------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `new-session`   | `NewSession` request in recording        | Direct mapping                                                                                                  |
-| `split-pane`    | `SplitPane` request                      | Direct mapping with direction                                                                                   |
-| `focus-pane`    | `FocusPane` request                      | Direct mapping with target index                                                                                |
-| `send-keys`     | `AttachInput` / `PaneDirectInput` events | Consecutive inputs within 100ms are coalesced. `pane=N` added when input targets a non-focused pane.            |
-| `wait-for`      | `PaneOutputRaw` events after a command   | Last non-empty line of vt100-parsed output becomes the barrier pattern. Digit sequences are collapsed to `\d+`. |
-| `assert-screen` | `PaneOutputRaw` events                   | Up to 3 distinctive content lines per response window become `contains=` checks.                                |
-| `sleep`         | Gaps > 200ms with no input/output        | Mapped to `sleep ms=N`                                                                                          |
-| `@viewport`     | First `AttachSetViewport` request        | Emitted as a directive                                                                                          |
+| Element         | Source                                   | How                                                                                                                       |
+| --------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `new-session`   | `NewSession` request in recording        | Direct mapping                                                                                                            |
+| `split-pane`    | `SplitPane` request                      | Direct mapping with direction                                                                                             |
+| `focus-pane`    | `FocusPane` request                      | Direct mapping with target index                                                                                          |
+| `send-keys`     | `AttachInput` / `PaneDirectInput` events | Consecutive inputs within 100ms are coalesced. `pane=N` added when input targets a non-focused pane.                      |
+| `wait-for`      | `PaneOutputRaw` events after a command   | Last non-empty line of structured-grid-parsed output becomes the barrier pattern. Digit sequences are collapsed to `\d+`. |
+| `assert-screen` | `PaneOutputRaw` events                   | Up to 3 distinctive content lines per response window become `contains=` checks.                                          |
+| `sleep`         | Gaps > 200ms with no input/output        | Mapped to `sleep ms=N`                                                                                                    |
+| `@viewport`     | First `AttachSetViewport` request        | Emitted as a directive                                                                                                    |
 
 ### Pattern Robustness
 

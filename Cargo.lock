@@ -1152,7 +1152,6 @@ dependencies = [
  "ttf-parser",
  "unicode-width",
  "uuid",
- "vt100",
  "windows-sys 0.61.2",
 ]
 
@@ -1623,7 +1622,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "vt100",
 ]
 
 [[package]]
@@ -1867,12 +1865,12 @@ dependencies = [
  "bmux_recording_plugin_api",
  "bmux_recording_protocol",
  "bmux_recording_runtime",
+ "bmux_terminal_grid",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "uuid",
- "vt100",
 ]
 
 [[package]]
@@ -11375,17 +11373,6 @@ name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
-
-[[package]]
-name = "vt100"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
-dependencies = [
- "itoa",
- "unicode-width",
- "vte",
-]
 
 [[package]]
 name = "vte"

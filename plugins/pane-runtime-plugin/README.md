@@ -2,7 +2,7 @@
 
 Owns pane runtime for bmux: PTY handles (spawned via `portable-pty`),
 per-session layout tree, per-pane output fanout buffer, per-pane
-terminal-protocol + vt100 cursor + shell-integration parsers, per-pane
+terminal-protocol + structured cursor + shell-integration parsers, per-pane
 resurrection state, per-session attach viewport.
 
 Consumed by the server via three trait-object handles registered in

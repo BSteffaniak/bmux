@@ -267,6 +267,7 @@ pub struct TerminalGrid {
     current_style: Style,
     palette: StylePalette,
     revision: u64,
+    total_scrolled_rows: u64,
     autowrap: bool,
     pending_wrap: bool,
     scroll_region: Option<(usize, usize)>,
@@ -311,6 +312,7 @@ impl TerminalGrid {
             current_style: Style::default(),
             palette: StylePalette::default(),
             revision: 0,
+            total_scrolled_rows: 0,
             autowrap: true,
             pending_wrap: false,
             scroll_region: None,
@@ -382,6 +384,7 @@ impl TerminalGrid {
             current_style: snapshot.current_style,
             palette,
             revision: snapshot.revision,
+            total_scrolled_rows: u64::from(snapshot.scrollback_rows),
             autowrap: snapshot.autowrap,
             pending_wrap: snapshot.pending_wrap,
             scroll_region: snapshot.scroll_region.map(|region| {
@@ -413,6 +416,11 @@ impl TerminalGrid {
     #[must_use]
     pub const fn height(&self) -> usize {
         self.height
+    }
+
+    #[must_use]
+    pub const fn total_scrolled_rows(&self) -> u64 {
+        self.total_scrolled_rows
     }
 
     #[must_use]
@@ -1083,6 +1091,7 @@ impl TerminalGrid {
         match self.mode {
             GridMode::Main => {
                 self.main_rows.push_back(PhysicalRow::new());
+                self.total_scrolled_rows = self.total_scrolled_rows.saturating_add(1);
                 self.evict_excess_history();
             }
             GridMode::Alternate => {

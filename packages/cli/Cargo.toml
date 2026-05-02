@@ -171,7 +171,6 @@ tracing-subscriber = { workspace = true, features = [
 ttf-parser = { workspace = true }
 unicode-width = { workspace = true }
 uuid = { workspace = true, features = ["std"] }
-vt100 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

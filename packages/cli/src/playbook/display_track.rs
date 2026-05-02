@@ -19,7 +19,7 @@ use uuid::Uuid;
 pub struct PlaybookDisplayTrackWriter {
     started_at: Instant,
     writer: std::io::BufWriter<std::fs::File>,
-    parser: vt100::Parser,
+    terminal_grid: bmux_terminal_grid::TerminalGridStream,
     cursor_shape: DisplayCursorShape,
     cursor_blink_enabled: bool,
 }
@@ -60,7 +60,12 @@ impl PlaybookDisplayTrackWriter {
         let mut writer = Self {
             started_at: Instant::now(),
             writer: std::io::BufWriter::new(file),
-            parser: vt100::Parser::new(rows.max(1), cols.max(1), 4_096),
+            terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
+                cols.max(1),
+                rows.max(1),
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .context("failed to create playbook display track grid")?,
             cursor_shape: DisplayCursorShape::Block,
             cursor_blink_enabled: true,
         };
@@ -92,7 +97,7 @@ impl PlaybookDisplayTrackWriter {
             return Ok(());
         }
         self.update_cursor_style(data);
-        self.parser.process(data);
+        self.terminal_grid.process(data);
         self.record(DisplayTrackEvent::FrameBytes {
             data: data.to_vec(),
         })?;
@@ -108,7 +113,7 @@ impl PlaybookDisplayTrackWriter {
     ///
     /// Returns an error if writing to the display track file fails.
     pub fn record_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
+        let _ = self.terminal_grid.resize_delta(cols.max(1), rows.max(1));
         self.record(DisplayTrackEvent::Resize { cols, rows })
     }
 
@@ -149,11 +154,11 @@ impl PlaybookDisplayTrackWriter {
     }
 
     fn record_cursor_snapshot(&mut self) -> Result<()> {
-        let (y, x) = self.parser.screen().cursor_position();
+        let cursor = self.terminal_grid.grid().cursor();
         self.record(DisplayTrackEvent::CursorSnapshot {
-            x,
-            y,
-            visible: !self.parser.screen().hide_cursor(),
+            x: u16::try_from(cursor.col).unwrap_or(u16::MAX),
+            y: u16::try_from(cursor.row).unwrap_or(u16::MAX),
+            visible: cursor.visible,
             shape: self.cursor_shape,
             blink_enabled: self.cursor_blink_enabled,
         })

@@ -1,6 +1,6 @@
 //! Image sequence interceptor.
 //!
-//! Sits between the raw PTY reader and the vt100 parser.  Detects and
+//! Sits between the raw PTY reader and terminal parser. Detects and
 //! extracts image escape sequences (Sixel DCS, Kitty APC, iTerm2 OSC 1337)
 //! from the byte stream, returning filtered bytes (images stripped) and
 //! structured [`ImageEvent`]s.
@@ -52,7 +52,7 @@ enum State {
 
 /// Result of processing a chunk of PTY output through the interceptor.
 pub struct InterceptResult {
-    /// Bytes with image sequences removed.  Feed this to the vt100 parser.
+    /// Bytes with image sequences removed. Feed this to the terminal parser.
     pub filtered: Vec<u8>,
     /// Image events extracted from the stream.
     pub events: Vec<ImageEvent>,

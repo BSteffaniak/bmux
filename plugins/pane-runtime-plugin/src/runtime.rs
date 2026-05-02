@@ -438,7 +438,7 @@ impl PaneTerminalModeTracker {
 }
 
 struct PaneCursorTracker {
-    parser: vt100::Parser,
+    terminal_grid: bmux_terminal_grid::TerminalGridStream,
     rows: u16,
     cols: u16,
     cursor_escape_state: CursorEscapeState,
@@ -459,9 +459,12 @@ impl PaneCursorTracker {
     fn new(rows: u16, cols: u16) -> Self {
         let (rows, cols) = sanitize_pty_size(rows, cols);
         Self {
-            // Use scrollback of 1 so we can detect scroll events via
-            // screen().scrollback() incrementing from 0 to 1.
-            parser: vt100::Parser::new(rows, cols, 1),
+            terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
+                cols,
+                rows,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .expect("pane cursor tracker grid dimensions are valid"),
             rows,
             cols,
             cursor_escape_state: CursorEscapeState::Ground,
@@ -475,7 +478,7 @@ impl PaneCursorTracker {
         if self.rows == rows && self.cols == cols {
             return;
         }
-        self.parser.screen_mut().set_size(rows, cols);
+        let _ = self.terminal_grid.resize_delta(cols, rows);
         self.rows = rows;
         self.cols = cols;
     }
@@ -508,10 +511,8 @@ impl PaneCursorTracker {
                 }
                 CursorEscapeState::EscBracket => {
                     match *byte {
-                        // vt100::Parser reliably restores cursor for ESC 7/8 but
-                        // can miss CSI s/u (especially when apps emit save/probe/
-                        // restore around alt-screen transitions). Normalize those
-                        // short forms to ESC 7/8 before feeding the parser.
+                        // Preserve CSI s/u save/restore short forms across split
+                        // escape chunks before feeding the structured grid.
                         b's' => normalized.extend_from_slice(b"\x1b7"),
                         b'u' => normalized.extend_from_slice(b"\x1b8"),
                         _ => {
@@ -525,28 +526,26 @@ impl PaneCursorTracker {
         }
 
         if !normalized.is_empty() {
-            self.parser.process(&normalized);
+            self.terminal_grid.process(&normalized);
         }
     }
 
     fn cursor_position(&self) -> (u16, u16) {
-        self.parser.screen().cursor_position()
+        let cursor = self.terminal_grid.grid().cursor();
+        (
+            u16::try_from(cursor.row).unwrap_or(u16::MAX),
+            u16::try_from(cursor.col).unwrap_or(u16::MAX),
+        )
     }
 
     /// Consume any scrollback that accumulated since the last call.
     /// Returns the number of lines that scrolled since last drain.
     #[cfg(feature = "image-registry")]
     fn drain_scroll_delta(&mut self) -> u16 {
-        #[allow(clippy::cast_possible_truncation)]
-        let scrollback = self.parser.screen().scrollback() as u16;
-        if scrollback > 0 {
-            self.total_scrollback += u64::from(scrollback);
-            // Reset scrollback to 0 so we can detect the next scroll.
-            self.parser.screen_mut().set_scrollback(0);
-            scrollback
-        } else {
-            0
-        }
+        let total_scrolled = self.terminal_grid.grid().total_scrolled_rows();
+        let delta = total_scrolled.saturating_sub(self.total_scrollback);
+        self.total_scrollback = total_scrolled;
+        u16::try_from(delta).unwrap_or(u16::MAX)
     }
 }
 
@@ -666,7 +665,10 @@ fn protocol_reply_for_chunk(
                 tracked_col = tracked_col.saturating_add(1),
                 pane_rows = cursor_tracker.rows,
                 pane_cols = cursor_tracker.cols,
-                alternate_screen = cursor_tracker.parser.screen().alternate_screen(),
+                alternate_screen = matches!(
+                    cursor_tracker.terminal_grid.grid().mode(),
+                    bmux_terminal_grid::GridMode::Alternate
+                ),
                 "pane protocol reply: cursor position report"
             );
         }
@@ -2781,7 +2783,7 @@ impl SessionRuntimeManager {
                                 // When image support is enabled, run the interceptor
                                 // to extract image sequences from the byte stream.
                                 // The filtered bytes (images stripped) are what gets
-                                // pushed to the output buffer for vt100 parsing.
+                                // pushed to the structured grid cursor tracker.
                                 #[cfg(feature = "image-registry")]
                                 let chunk = {
                                     let mut result = image_interceptor.process(chunk);

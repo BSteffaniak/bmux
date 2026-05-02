@@ -864,8 +864,8 @@ pub(super) async fn verify_recording_report(
     .await?;
 
     // Compare output: first try byte-exact, then fall back to structural
-    // (vt100-rendered) comparison which tolerates byte-level differences from
-    // timing/chunking while catching actual content divergence.
+    // (terminal-grid-rendered) comparison which tolerates byte-level differences
+    // from timing/chunking while catching actual content divergence.
     let byte_mismatch = expected_output
         .iter()
         .zip(actual_output.iter())
@@ -873,10 +873,10 @@ pub(super) async fn verify_recording_report(
     let length_mismatch = expected_output.len() != actual_output.len();
 
     if byte_mismatch.is_some() || length_mismatch {
-        // Byte comparison failed — try structural comparison via vt100.
+        // Byte comparison failed — try structural comparison via the structured grid.
         let (vp_cols, vp_rows) = viewport.unwrap_or((120, 40));
-        let expected_text = render_output_via_vt100(&expected_output, vp_cols, vp_rows);
-        let actual_text = render_output_via_vt100(&actual_output, vp_cols, vp_rows);
+        let expected_text = render_output_via_terminal_grid(&expected_output, vp_cols, vp_rows);
+        let actual_text = render_output_via_terminal_grid(&actual_output, vp_cols, vp_rows);
 
         // Normalize both: collapse digit sequences, strip trailing whitespace.
         let expected_norm = normalize_screen_text(&expected_text);
@@ -1036,21 +1036,43 @@ pub(super) fn extract_viewport_from_events(
     None
 }
 
-/// Render raw output bytes through a vt100 terminal emulator and return the
+/// Render raw output bytes through the structured terminal grid and return the
 /// visible screen text.
-pub(super) fn render_output_via_vt100(output: &[u8], cols: u16, rows: u16) -> String {
-    let mut parser = vt100::Parser::new(rows, cols, 0);
-    parser.process(output);
-    let screen = parser.screen();
-    let mut lines = Vec::new();
-    for row in 0..rows {
-        lines.push(screen.contents_between(row, 0, row, cols));
-    }
-    // Trim trailing empty lines.
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+pub(super) fn render_output_via_terminal_grid(output: &[u8], cols: u16, rows: u16) -> String {
+    let mut stream = bmux_terminal_grid::TerminalGridStream::new(
+        cols.max(1),
+        rows.max(1),
+        bmux_terminal_grid::GridLimits::default(),
+    )
+    .expect("recording verify grid dimensions are valid");
+    stream.process(output);
+    terminal_grid_visible_text(stream.grid(), usize::from(rows.max(1)))
+}
+
+fn terminal_grid_visible_text(grid: &bmux_terminal_grid::TerminalGrid, rows: usize) -> String {
+    let mut lines = grid
+        .display_rows(0, rows)
+        .into_iter()
+        .map(|row| terminal_grid_row_text(&row, grid.width()))
+        .collect::<Vec<_>>();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
     lines.join("\n")
+}
+
+fn terminal_grid_row_text(row: &bmux_terminal_grid::PhysicalRow, width: usize) -> String {
+    let mut text = String::new();
+    for col in 0..width {
+        let Some(cell) = row.cells().get(col) else {
+            text.push(' ');
+            continue;
+        };
+        if !cell.is_wide_continuation() {
+            text.push_str(cell.text());
+        }
+    }
+    text
 }
 
 /// Normalize screen text for structural comparison: collapse digit sequences

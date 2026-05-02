@@ -5,7 +5,7 @@
 //! plus the trait abstractions + handle newtypes that let core code
 //! (`packages/server`) consume pane runtime owned by the
 //! `bmux.pane_runtime` plugin without depending on the plugin impl
-//! crate or on `portable-pty`/tokio/vt100.
+//! crate or on `portable-pty`/tokio terminal runtime internals.
 //!
 //! ## Layout
 //!

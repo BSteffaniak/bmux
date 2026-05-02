@@ -2787,15 +2787,15 @@ const fn display_cursor_shape_from_visual(shape: CursorVisualShape) -> DisplayCu
     }
 }
 
-fn cursor_snapshot_from_parser_fallback(
-    parser: &vt100::Parser,
+fn cursor_snapshot_from_grid_fallback(
+    grid: &bmux_terminal_grid::TerminalGrid,
     replay_state: CursorReplayState,
 ) -> RecordedCursorSnapshot {
-    let (y, x) = parser.screen().cursor_position();
+    let cursor = grid.cursor();
     RecordedCursorSnapshot {
-        x,
-        y,
-        visible: !parser.screen().hide_cursor(),
+        x: u16::try_from(cursor.col).unwrap_or(u16::MAX),
+        y: u16::try_from(cursor.row).unwrap_or(u16::MAX),
+        visible: cursor.visible,
         shape: display_cursor_shape_from_visual(replay_state.shape),
         blink_enabled: replay_state.blink_enabled,
     }
@@ -3386,7 +3386,12 @@ fn export_recording_gif(
         .set_repeat(Repeat::Infinite)
         .context("failed setting gif repeat")?;
 
-    let mut parser = vt100::Parser::new(max_rows, max_cols, 20_000);
+    let mut terminal_grid = bmux_terminal_grid::TerminalGridStream::new(
+        max_cols.max(1),
+        max_rows.max(1),
+        bmux_terminal_grid::GridLimits::default(),
+    )
+    .expect("recording export grid dimensions are valid");
     let mut current_cols = max_cols;
     let mut current_rows = max_rows;
     let mut emitted_frames = 0_u32;
@@ -3463,12 +3468,12 @@ fn export_recording_gif(
                 DisplayTrackEvent::Resize { cols, rows } => {
                     current_cols = (*cols).max(1);
                     current_rows = (*rows).max(1);
-                    parser.screen_mut().set_size(current_rows, current_cols);
+                    let _ = terminal_grid.resize_delta(current_cols, current_rows);
                     frame_had_display_change = true;
                 }
                 DisplayTrackEvent::FrameBytes { data } => {
                     update_cursor_replay_state(&mut cursor_state, data);
-                    parser.process(data);
+                    terminal_grid.process(data);
                     processed_frame_events = processed_frame_events.saturating_add(1);
                     frame_had_display_change = true;
                 }
@@ -3526,26 +3531,26 @@ fn export_recording_gif(
             || {
                 if !warned_cursor_snapshot_fallback {
                     tracing::warn!(
-                        "recording export: display track missing initial cursor snapshot; using parser cursor fallback until snapshots appear"
+                        "recording export: display track missing initial cursor snapshot; using structured grid cursor fallback until snapshots appear"
                     );
                     warned_cursor_snapshot_fallback = true;
                 }
                 (
-                    cursor_snapshot_from_parser_fallback(&parser, cursor_state),
-                    "parser_fallback",
+                    cursor_snapshot_from_grid_fallback(terminal_grid.grid(), cursor_state),
+                    "grid_fallback",
                 )
             },
             |snapshot| (snapshot, "snapshot"),
         );
         let cursor_row = snapshot.y;
         let cursor_col = snapshot.x;
-        let parser_cursor_visible = snapshot.visible;
+        let grid_cursor_visible = snapshot.visible;
         let shape = effective_cursor_shape(&cursor_options, cursor_state, snapshot.shape);
         let (cursor_visible, blink_on, visible_reason) = compute_cursor_visibility(
             &cursor_options,
             cursor_state,
             snapshot.blink_enabled,
-            parser_cursor_visible,
+            grid_cursor_visible,
             frame_time_ns,
             last_input_activity_ns,
             last_output_activity_ns,
@@ -3573,7 +3578,7 @@ fn export_recording_gif(
         let render_started_at = profiler.stage_started();
         let mut pixels = if render_options.mode == RecordingRenderMode::Font {
             if let Some(renderer) = resvg_renderer.as_mut() {
-                match renderer.render(parser.screen(), current_rows, current_cols, &palette) {
+                match renderer.render(terminal_grid.grid(), current_rows, current_cols, &palette) {
                     Ok(pixels) => pixels,
                     Err(error) => {
                         profiler.note_resvg_fallback();
@@ -3582,7 +3587,7 @@ fn export_recording_gif(
                         );
                         resvg_renderer = None;
                         render_screen_rgba(
-                            parser.screen(),
+                            terminal_grid.grid(),
                             current_rows,
                             current_cols,
                             max_rows,
@@ -3597,7 +3602,7 @@ fn export_recording_gif(
                 }
             } else {
                 render_screen_rgba(
-                    parser.screen(),
+                    terminal_grid.grid(),
                     current_rows,
                     current_cols,
                     max_rows,
@@ -3611,7 +3616,7 @@ fn export_recording_gif(
             }
         } else {
             render_screen_rgba(
-                parser.screen(),
+                terminal_grid.grid(),
                 current_rows,
                 current_cols,
                 max_rows,
@@ -3642,12 +3647,14 @@ fn export_recording_gif(
         }
 
         if cursor_visible && cursor_row < current_rows && cursor_col < current_cols {
-            let (cell_foreground, cell_background) = parser
-                .screen()
-                .cell(cursor_row, cursor_col)
-                .map_or(((255, 255, 255), (0, 0, 0)), |cell| {
-                    resolved_cell_colors(cell, &palette)
-                });
+            let (cell_foreground, cell_background) = grid_cell_at(
+                terminal_grid.grid(),
+                usize::from(cursor_row),
+                usize::from(cursor_col),
+            )
+            .map_or(((255, 255, 255), (0, 0, 0)), |cell| {
+                resolved_grid_cell_colors(terminal_grid.grid(), &cell, &palette)
+            });
             let cursor_color_rgb = cursor_options.color_override.unwrap_or(cell_foreground);
             let (paint_mode_used, text_mode_used, paint_fallback_reason) = overlay_cursor_rgba(
                 &mut pixels,
@@ -4149,7 +4156,7 @@ fn format_duration_compact(duration: std::time::Duration) -> String {
     clippy::cast_precision_loss
 )]
 fn render_screen_rgba(
-    screen: &vt100::Screen,
+    grid: &bmux_terminal_grid::TerminalGrid,
     rows: u16,
     cols: u16,
     max_rows: u16,
@@ -4166,12 +4173,21 @@ fn render_screen_rgba(
     let cw = usize::from(cell_w);
     let cell_height_px = usize::from(cell_h);
 
+    let display_rows = grid.display_rows(0, usize::from(rows));
     for row in 0..rows {
         for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else {
-                continue;
-            };
-            let ((fg_r, fg_g, fg_b), (bg_r, bg_g, bg_b)) = resolved_cell_colors(cell, palette);
+            let cell = display_rows
+                .get(usize::from(row))
+                .and_then(|grid_row| grid_row.cells().get(usize::from(col)));
+            let ((fg_r, fg_g, fg_b), (bg_r, bg_g, bg_b)) = cell.map_or_else(
+                || {
+                    (
+                        resolve_grid_color(None, true, palette),
+                        resolve_grid_color(None, false, palette),
+                    )
+                },
+                |cell| resolved_grid_cell_colors(grid, cell, palette),
+            );
             let x0 = usize::from(col).saturating_mul(cw);
             let y0 = usize::from(row).saturating_mul(cell_height_px);
             for py in 0..cell_height_px {
@@ -4193,11 +4209,10 @@ fn render_screen_rgba(
                 }
             }
 
-            let glyph_char = if cell.has_contents() {
-                cell.contents().chars().next().unwrap_or(' ')
-            } else {
-                ' '
-            };
+            let glyph_char = cell
+                .filter(|cell| !cell.is_wide_continuation())
+                .and_then(|cell| cell.text().chars().next())
+                .unwrap_or(' ');
             if glyph_char == ' ' {
                 continue;
             }
@@ -4328,7 +4343,7 @@ impl ResvgFrameRenderer {
     #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
     fn render(
         &mut self,
-        screen: &vt100::Screen,
+        grid: &bmux_terminal_grid::TerminalGrid,
         rows: u16,
         cols: u16,
         palette: &ExportPalette,
@@ -4348,15 +4363,27 @@ impl ResvgFrameRenderer {
         )
         .expect("svg write cannot fail");
 
+        let display_rows = grid.display_rows(0, usize::from(rows));
         for row in 0..rows {
             let mut row_runs = Vec::<TextRun>::new();
             let mut current_run = None::<TextRun>;
             for col in 0..cols {
-                let Some(cell) = screen.cell(row, col) else {
-                    continue;
-                };
-                let (mut fg_rgb, bg_rgb) = resolved_cell_colors(cell, palette);
-                if cell.dim() {
+                let cell = display_rows
+                    .get(usize::from(row))
+                    .and_then(|grid_row| grid_row.cells().get(usize::from(col)));
+                let grid_style = cell
+                    .map(|cell| grid.palette().get(cell.style()))
+                    .unwrap_or_default();
+                let (mut fg_rgb, bg_rgb) = cell.map_or_else(
+                    || {
+                        (
+                            resolve_grid_color(None, true, palette),
+                            resolve_grid_color(None, false, palette),
+                        )
+                    },
+                    |cell| resolved_grid_cell_colors(grid, cell, palette),
+                );
+                if grid_style.dim {
                     fg_rgb = dim_rgb(fg_rgb);
                 }
                 let bg_rgb =
@@ -4370,17 +4397,14 @@ impl ResvgFrameRenderer {
                 )
                 .expect("svg write cannot fail");
 
-                let cell_text = if cell.has_contents() {
-                    let text = cell.contents();
-                    if text.is_empty() { " " } else { text }
-                } else {
-                    " "
-                };
+                let cell_text = cell
+                    .filter(|cell| !cell.is_wide_continuation() && !cell.text().is_empty())
+                    .map_or(" ", bmux_terminal_grid::Cell::text);
                 let style = TextStyle {
                     fg_rgb,
-                    bold: cell.bold(),
-                    italic: cell.italic(),
-                    underline: cell.underline(),
+                    bold: grid_style.bold,
+                    italic: grid_style.italic,
+                    underline: grid_style.underline,
                 };
                 match current_run.take() {
                     Some(mut run) if run.style == style => {
@@ -4459,13 +4483,27 @@ struct TextRun {
     style: TextStyle,
 }
 
-fn resolved_cell_colors(
-    cell: &vt100::Cell,
+fn grid_cell_at(
+    grid: &bmux_terminal_grid::TerminalGrid,
+    row: usize,
+    col: usize,
+) -> Option<bmux_terminal_grid::Cell> {
+    grid.display_rows(0, grid.height())
+        .get(row)
+        .and_then(|grid_row| grid_row.cells().get(col))
+        .filter(|cell| !cell.is_wide_continuation())
+        .cloned()
+}
+
+fn resolved_grid_cell_colors(
+    grid: &bmux_terminal_grid::TerminalGrid,
+    cell: &bmux_terminal_grid::Cell,
     palette: &ExportPalette,
 ) -> ((u8, u8, u8), (u8, u8, u8)) {
-    let mut fg = resolve_vt100_color(cell.fgcolor(), true, palette);
-    let mut bg = resolve_vt100_color(cell.bgcolor(), false, palette);
-    if cell.inverse() {
+    let style = grid.palette().get(cell.style());
+    let mut fg = resolve_grid_color(style.fg, true, palette);
+    let mut bg = resolve_grid_color(style.bg, false, palette);
+    if style.inverse {
         std::mem::swap(&mut fg, &mut bg);
     }
     (fg, bg)
@@ -5386,21 +5424,21 @@ fn parse_palette_index(value: &str) -> Option<u8> {
     u8::try_from(parsed).ok()
 }
 
-fn resolve_vt100_color(
-    color: vt100::Color,
+fn resolve_grid_color(
+    color: Option<bmux_terminal_grid::Color>,
     foreground: bool,
     palette: &ExportPalette,
 ) -> (u8, u8, u8) {
     match color {
-        vt100::Color::Default => {
+        None => {
             if foreground {
                 palette.default_fg
             } else {
                 palette.default_bg
             }
         }
-        vt100::Color::Idx(idx) => palette.colors[usize::from(idx)],
-        vt100::Color::Rgb(r, g, b) => (r, g, b),
+        Some(bmux_terminal_grid::Color::Indexed(idx)) => palette.colors[usize::from(idx)],
+        Some(bmux_terminal_grid::Color::Rgb { r, g, b }) => (r, g, b),
     }
 }
 
@@ -6024,7 +6062,7 @@ struct DisplayCaptureFileWriter {
     closed_segments: VecDeque<(PathBuf, u64)>,
     stream_opened_baseline: DisplayTrackEvent,
     latest_resize: Option<(u16, u16)>,
-    replay_parser: vt100::Parser,
+    replay_grid: bmux_terminal_grid::TerminalGridStream,
     cursor_replay_state: CursorReplayState,
     #[cfg(any(
         feature = "image-sixel",
@@ -6183,7 +6221,12 @@ impl DisplayCaptureFileWriter {
         let stream_opened_baseline = capture_stream_opened_event(recording_id, client_id);
         let latest_resize = current_terminal_size();
         let (initial_cols, initial_rows) = latest_resize.unwrap_or((80, 24));
-        let replay_parser = vt100::Parser::new(initial_rows, initial_cols, 20_000);
+        let replay_grid = bmux_terminal_grid::TerminalGridStream::new(
+            initial_cols.max(1),
+            initial_rows.max(1),
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .expect("display capture replay grid dimensions are valid");
         Ok(Self {
             recording_path: recording_path.to_path_buf(),
             client_id,
@@ -6195,7 +6238,7 @@ impl DisplayCaptureFileWriter {
             closed_segments: VecDeque::new(),
             stream_opened_baseline,
             latest_resize,
-            replay_parser,
+            replay_grid,
             cursor_replay_state: CursorReplayState::default(),
             #[cfg(any(
                 feature = "image-sixel",
@@ -6215,7 +6258,7 @@ impl DisplayCaptureFileWriter {
         if let Some((cols, rows)) = self.latest_resize {
             self.record(DisplayTrackEvent::Resize { cols, rows })?;
         }
-        let repaint = full_screen_repaint_bytes(self.replay_parser.screen());
+        let repaint = full_screen_repaint_bytes(self.replay_grid.grid());
         if !repaint.is_empty() {
             self.record(DisplayTrackEvent::FrameBytes { data: repaint })?;
         }
@@ -6243,11 +6286,11 @@ impl DisplayCaptureFileWriter {
             && *rows > 0
         {
             self.latest_resize = Some((*cols, *rows));
-            self.replay_parser.screen_mut().set_size(*rows, *cols);
+            let _ = self.replay_grid.resize_delta(*cols, *rows);
         }
         if let DisplayTrackEvent::FrameBytes { data } = &event {
             update_cursor_replay_state(&mut self.cursor_replay_state, data);
-            self.replay_parser.process(data);
+            self.replay_grid.process(data);
         }
         #[cfg(any(
             feature = "image-sixel",
@@ -6365,8 +6408,83 @@ fn display_capture_writer_loop(
     }
 }
 
-fn full_screen_repaint_bytes(screen: &vt100::Screen) -> Vec<u8> {
-    screen.contents_formatted()
+fn full_screen_repaint_bytes(grid: &bmux_terminal_grid::TerminalGrid) -> Vec<u8> {
+    let rows = grid.viewport_rows();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut bytes = b"\x1b[0m\x1b[2J".to_vec();
+    for (row_index, row) in rows.iter().enumerate() {
+        bytes.extend_from_slice(format!("\x1b[{};1H", row_index.saturating_add(1)).as_bytes());
+        let mut current_style = bmux_terminal_grid::Style::default();
+        for col in 0..grid.width() {
+            let cell = row.cells().get(col);
+            let style = cell
+                .map(|cell| grid.palette().get(cell.style()))
+                .unwrap_or_default();
+            if style != current_style {
+                bytes.extend_from_slice(grid_style_sgr(style).as_bytes());
+                current_style = style;
+            }
+            if let Some(cell) = cell
+                && !cell.is_wide_continuation()
+                && !cell.text().is_empty()
+            {
+                bytes.extend_from_slice(cell.text().as_bytes());
+            } else {
+                bytes.push(b' ');
+            }
+        }
+    }
+    bytes.extend_from_slice(b"\x1b[0m");
+    bytes
+}
+
+fn grid_style_sgr(style: bmux_terminal_grid::Style) -> String {
+    let mut parts = vec!["0".to_string()];
+    if style.bold {
+        parts.push("1".to_string());
+    }
+    if style.dim {
+        parts.push("2".to_string());
+    }
+    if style.italic {
+        parts.push("3".to_string());
+    }
+    if style.underline {
+        parts.push("4".to_string());
+    }
+    if style.inverse {
+        parts.push("7".to_string());
+    }
+    if style.strike {
+        parts.push("9".to_string());
+    }
+    push_grid_color_sgr(&mut parts, style.fg, true);
+    push_grid_color_sgr(&mut parts, style.bg, false);
+    format!("\x1b[{}m", parts.join(";"))
+}
+
+fn push_grid_color_sgr(
+    parts: &mut Vec<String>,
+    color: Option<bmux_terminal_grid::Color>,
+    foreground: bool,
+) {
+    match color {
+        None => parts.push(if foreground { "39" } else { "49" }.to_string()),
+        Some(bmux_terminal_grid::Color::Indexed(index)) => {
+            parts.push(if foreground { "38" } else { "48" }.to_string());
+            parts.push("5".to_string());
+            parts.push(index.to_string());
+        }
+        Some(bmux_terminal_grid::Color::Rgb { r, g, b }) => {
+            parts.push(if foreground { "38" } else { "48" }.to_string());
+            parts.push("2".to_string());
+            parts.push(r.to_string());
+            parts.push(g.to_string());
+            parts.push(b.to_string());
+        }
+    }
 }
 
 fn capture_stream_opened_event(recording_id: Uuid, client_id: Uuid) -> DisplayTrackEvent {
@@ -6507,14 +6625,14 @@ mod tests {
 
     #[test]
     fn full_screen_repaint_bytes_reconstructs_visible_text() {
-        let mut parser = vt100::Parser::new(24, 80, 20_000);
-        parser.process(b"hello\r\nworld");
+        let mut grid = test_grid(80, 24);
+        grid.process(b"hello\r\nworld");
 
-        let repaint = full_screen_repaint_bytes(parser.screen());
-        let mut replay = vt100::Parser::new(24, 80, 20_000);
+        let repaint = full_screen_repaint_bytes(grid.grid());
+        let mut replay = test_grid(80, 24);
         replay.process(&repaint);
 
-        let contents = replay.screen().contents();
+        let contents = test_grid_contents(replay.grid());
         assert!(contents.contains("hello"));
         assert!(contents.contains("world"));
     }
@@ -6557,10 +6675,10 @@ mod tests {
                 _ => None,
             })
             .expect("rotated segment should contain repaint frame");
-        let mut replay = vt100::Parser::new(24, 80, 20_000);
+        let mut replay = test_grid(80, 24);
         replay.process(repaint);
         assert!(
-            replay.screen().contents().contains("hello before rotation"),
+            test_grid_contents(replay.grid()).contains("hello before rotation"),
             "rotated segment baseline should carry prior visible content"
         );
     }
@@ -6956,10 +7074,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_vt100_color_preserves_truecolor_rgb() {
+    fn resolve_grid_color_preserves_truecolor_rgb() {
         let palette = ExportPalette::xterm();
         assert_eq!(
-            resolve_vt100_color(vt100::Color::Rgb(1, 2, 3), true, &palette),
+            resolve_grid_color(
+                Some(bmux_terminal_grid::Color::Rgb { r: 1, g: 2, b: 3 }),
+                true,
+                &palette,
+            ),
             (1, 2, 3)
         );
     }
@@ -7051,11 +7173,11 @@ mod tests {
     }
 
     #[test]
-    fn cursor_snapshot_from_parser_fallback_uses_parser_cursor_state() {
-        let mut parser = vt100::Parser::new(24, 80, 1024);
-        parser.process(b"\x1b[6;11H");
-        let snapshot = cursor_snapshot_from_parser_fallback(
-            &parser,
+    fn cursor_snapshot_from_grid_fallback_uses_grid_cursor_state() {
+        let mut grid = test_grid(80, 24);
+        grid.process(b"\x1b[6;11H");
+        let snapshot = cursor_snapshot_from_grid_fallback(
+            grid.grid(),
             CursorReplayState {
                 shape: CursorVisualShape::Bar,
                 blink_enabled: false,
@@ -7066,6 +7188,35 @@ mod tests {
         assert!(snapshot.visible);
         assert_eq!(snapshot.shape, DisplayCursorShape::Bar);
         assert!(!snapshot.blink_enabled);
+    }
+
+    fn test_grid(cols: u16, rows: u16) -> bmux_terminal_grid::TerminalGridStream {
+        bmux_terminal_grid::TerminalGridStream::new(
+            cols,
+            rows,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .expect("test grid dimensions are valid")
+    }
+
+    fn test_grid_contents(grid: &bmux_terminal_grid::TerminalGrid) -> String {
+        grid.display_rows(0, grid.height())
+            .into_iter()
+            .map(|row| {
+                let mut line = String::new();
+                for col in 0..grid.width() {
+                    let Some(cell) = row.cells().get(col) else {
+                        line.push(' ');
+                        continue;
+                    };
+                    if !cell.is_wide_continuation() {
+                        line.push_str(cell.text());
+                    }
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn temp_dir() -> std::path::PathBuf {
