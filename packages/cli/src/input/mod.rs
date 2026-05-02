@@ -10,7 +10,7 @@ use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_keyboard::encode::KeyEncodingModes;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use crossterm::event::Event;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crossterm_adapter::crossterm_event_to_input_event;
@@ -55,6 +55,14 @@ struct ModalMode {
 pub struct DoctorBinding {
     pub chord: String,
     pub action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveKeyBinding {
+    pub scope: String,
+    pub chord: String,
+    pub action: RuntimeAction,
+    pub action_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +557,57 @@ impl Keymap {
     }
 
     #[must_use]
+    pub fn active_bindings_for_state(
+        &self,
+        mode_id: Option<&str>,
+        scroll_mode: bool,
+    ) -> Vec<ActiveKeyBinding> {
+        let mut entries = Vec::new();
+        let mut occupied_chords = BTreeSet::new();
+
+        if scroll_mode {
+            push_active_bindings(
+                &mut entries,
+                &mut occupied_chords,
+                "scroll",
+                &self.scroll_bindings,
+            );
+        }
+
+        if let Some(mode_id) = mode_id
+            && let Some(mode) = self.modal_mode(mode_id)
+        {
+            push_active_bindings(
+                &mut entries,
+                &mut occupied_chords,
+                "global",
+                &self.global_bindings,
+            );
+            push_active_bindings(
+                &mut entries,
+                &mut occupied_chords,
+                &canonical_mode_id(mode_id),
+                &mode.bindings,
+            );
+            return entries;
+        }
+
+        push_active_bindings(
+            &mut entries,
+            &mut occupied_chords,
+            "global",
+            &self.global_bindings,
+        );
+        push_active_bindings(
+            &mut entries,
+            &mut occupied_chords,
+            "runtime",
+            &self.runtime_bindings,
+        );
+        entries
+    }
+
+    #[must_use]
     pub fn overlap_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
@@ -902,6 +961,25 @@ fn find_exact(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> Option<RuntimeA
         .map(|binding| binding.action.clone())
 }
 
+fn push_active_bindings(
+    entries: &mut Vec<ActiveKeyBinding>,
+    occupied_chords: &mut BTreeSet<Vec<KeyStroke>>,
+    scope: &str,
+    bindings: &[KeyBinding],
+) {
+    for binding in bindings {
+        if !occupied_chords.insert(binding.chord.clone()) {
+            continue;
+        }
+        entries.push(ActiveKeyBinding {
+            scope: scope.to_string(),
+            chord: display_chord(&binding.chord),
+            action: binding.action.clone(),
+            action_name: action_to_config_name(&binding.action),
+        });
+    }
+}
+
 #[must_use]
 pub fn primary_binding_for_sets<const N: usize>(
     action: &RuntimeAction,
@@ -1155,6 +1233,88 @@ mod tests {
     // Helper: create a processor with enhanced=false (legacy mode) for backward compat tests.
     fn new_processor(keymap: Keymap) -> InputProcessor {
         InputProcessor::new(keymap, false)
+    }
+
+    #[test]
+    fn active_bindings_for_state_include_global_and_current_mode() {
+        let modes = BTreeMap::from([(
+            "normal".to_string(),
+            modal_mode("NORMAL", false, &[("q", RuntimeAction::Quit)]),
+        )]);
+        let global = global_bindings(&[("ctrl+p", RuntimeAction::ShowHelp)]);
+        let keymap = Keymap::from_modal_parts_with_scroll(
+            Some(400),
+            "normal",
+            &modes,
+            &global,
+            &BTreeMap::new(),
+        )
+        .expect("valid keymap");
+
+        let bindings = keymap.active_bindings_for_state(Some("normal"), false);
+
+        assert!(bindings.iter().any(|binding| {
+            binding.scope == "global"
+                && binding.chord == "Ctrl-P"
+                && binding.action_name == "show_help"
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.scope == "normal" && binding.chord == "q" && binding.action_name == "quit"
+        }));
+    }
+
+    #[test]
+    fn active_bindings_for_state_uses_highest_precedence_chord() {
+        let modes = BTreeMap::from([(
+            "normal".to_string(),
+            modal_mode("NORMAL", false, &[("q", RuntimeAction::Quit)]),
+        )]);
+        let global = global_bindings(&[("q", RuntimeAction::Detach)]);
+        let keymap = Keymap::from_modal_parts_with_scroll(
+            Some(400),
+            "normal",
+            &modes,
+            &global,
+            &BTreeMap::new(),
+        )
+        .expect("valid keymap");
+
+        let bindings = keymap.active_bindings_for_state(Some("normal"), false);
+
+        assert!(bindings.iter().any(|binding| {
+            binding.scope == "global" && binding.chord == "q" && binding.action_name == "detach"
+        }));
+        assert!(!bindings.iter().any(|binding| {
+            binding.scope == "normal" && binding.chord == "q" && binding.action_name == "quit"
+        }));
+    }
+
+    #[test]
+    fn active_bindings_for_state_prioritizes_scroll_bindings_when_scroll_active() {
+        let modes = BTreeMap::from([(
+            "normal".to_string(),
+            modal_mode("NORMAL", false, &[("q", RuntimeAction::Quit)]),
+        )]);
+        let scroll = global_bindings(&[("q", RuntimeAction::ExitScrollMode)]);
+        let keymap = Keymap::from_modal_parts_with_scroll(
+            Some(400),
+            "normal",
+            &modes,
+            &BTreeMap::new(),
+            &scroll,
+        )
+        .expect("valid keymap");
+
+        let bindings = keymap.active_bindings_for_state(Some("normal"), true);
+
+        assert!(bindings.iter().any(|binding| {
+            binding.scope == "scroll"
+                && binding.chord == "q"
+                && binding.action_name == "exit_scroll_mode"
+        }));
+        assert!(!bindings.iter().any(|binding| {
+            binding.scope == "normal" && binding.chord == "q" && binding.action_name == "quit"
+        }));
     }
 
     #[test]

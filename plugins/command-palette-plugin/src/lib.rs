@@ -3,12 +3,16 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
-use bmux_keybind::{BindableActionArgument, bindable_action_catalog};
+use bmux_keybind::{
+    BindableActionArgument, RuntimeAction, action_to_config_name, bindable_action_catalog,
+    parse_action,
+};
 use bmux_plugin::{action_dispatch, prompt};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PromptOption, PromptRequest,
-    PromptResponse, PromptValidation, PromptValue, RegisteredPluginInfo,
+    ActiveKeybinding, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,
+    PromptOption, PromptRequest, PromptResponse, PromptValidation, PromptValue,
+    RegisteredPluginInfo,
 };
 use tracing::{debug, warn};
 
@@ -52,6 +56,7 @@ enum PaletteEntryKind {
 struct PaletteEntry {
     label: String,
     detail: String,
+    key_hint: Option<String>,
     kind: PaletteEntryKind,
 }
 
@@ -65,12 +70,7 @@ async fn run_command_palette(context: NativeCommandContext) {
     let options = entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| {
-            PromptOption::new(
-                index.to_string(),
-                format!("{}  —  {}", entry.label, entry.detail),
-            )
-        })
+        .map(|(index, entry)| PromptOption::new(index.to_string(), option_label(entry)))
         .collect::<Vec<_>>();
 
     let request = PromptRequest::search_select("Command Palette", options)
@@ -134,10 +134,11 @@ fn dispatch_action(action: &str) {
 }
 
 fn build_palette_entries(context: &NativeCommandContext) -> Vec<PaletteEntry> {
-    let mut entries = bindable_action_entries();
+    let mut entries = bindable_action_entries(&context.active_keybindings);
     entries.extend(plugin_command_entries(
         &context.registered_plugins,
         &context.enabled_plugins,
+        &context.active_keybindings,
     ));
     entries.sort_by(|left, right| {
         left.label
@@ -147,12 +148,13 @@ fn build_palette_entries(context: &NativeCommandContext) -> Vec<PaletteEntry> {
     entries
 }
 
-fn bindable_action_entries() -> Vec<PaletteEntry> {
+fn bindable_action_entries(active_keybindings: &[ActiveKeybinding]) -> Vec<PaletteEntry> {
     bindable_action_catalog()
         .into_iter()
         .map(|action| PaletteEntry {
             label: action.label.to_string(),
             detail: action.detail.to_string(),
+            key_hint: bindable_action_key_hint(active_keybindings, action.action, action.argument),
             kind: PaletteEntryKind::BindableAction {
                 action: action.action.to_string(),
                 argument: action.argument,
@@ -164,6 +166,7 @@ fn bindable_action_entries() -> Vec<PaletteEntry> {
 fn plugin_command_entries(
     plugins: &[RegisteredPluginInfo],
     enabled_plugins: &[String],
+    active_keybindings: &[ActiveKeybinding],
 ) -> Vec<PaletteEntry> {
     let enabled = enabled_plugins
         .iter()
@@ -175,6 +178,7 @@ fn plugin_command_entries(
             plugin.command_schemas.iter().map(|command| PaletteEntry {
                 label: command_label(plugin, command),
                 detail: format!("{}:{}", plugin.id, command.name),
+                key_hint: plugin_command_key_hint(active_keybindings, &plugin.id, &command.name),
                 kind: PaletteEntryKind::PluginCommand {
                     plugin_id: plugin.id.clone(),
                     command_name: command.name.clone(),
@@ -190,6 +194,67 @@ fn command_label(plugin: &RegisteredPluginInfo, command: &PluginCommand) -> Stri
         format!("{}: {}", plugin.display_name, command.name)
     } else {
         format!("{}: {}", plugin.display_name, command.summary)
+    }
+}
+
+fn option_label(entry: &PaletteEntry) -> String {
+    entry.key_hint.as_ref().map_or_else(
+        || format!("{}  —  {}", entry.label, entry.detail),
+        |key_hint| format!("{}  [{key_hint}]  —  {}", entry.label, entry.detail),
+    )
+}
+
+fn bindable_action_key_hint(
+    active_keybindings: &[ActiveKeybinding],
+    action: &str,
+    argument: Option<BindableActionArgument>,
+) -> Option<String> {
+    if argument.is_some() {
+        return key_hint_for_actions(active_keybindings, |active_action| {
+            active_action == action
+                || active_action
+                    .strip_prefix(action)
+                    .is_some_and(|suffix| suffix.starts_with(' '))
+        });
+    }
+    let canonical = parse_action(action)
+        .ok()
+        .map(|runtime_action| action_to_config_name(&runtime_action))?;
+    key_hint_for_actions(active_keybindings, |active_action| {
+        active_action == canonical
+    })
+}
+
+fn plugin_command_key_hint(
+    active_keybindings: &[ActiveKeybinding],
+    plugin_id: &str,
+    command_name: &str,
+) -> Option<String> {
+    key_hint_for_actions(active_keybindings, |active_action| {
+        matches!(
+            parse_action(active_action),
+            Ok(RuntimeAction::PluginCommand {
+                plugin_id: active_plugin_id,
+                command_name: active_command_name,
+                ..
+            }) if active_plugin_id == plugin_id && active_command_name == command_name
+        )
+    })
+}
+
+fn key_hint_for_actions(
+    active_keybindings: &[ActiveKeybinding],
+    matches_action: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let chords = active_keybindings
+        .iter()
+        .filter(|binding| matches_action(&binding.action))
+        .map(|binding| binding.chord.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if chords.is_empty() {
+        None
+    } else {
+        Some(chords.into_iter().collect::<Vec<_>>().join(", "))
     }
 }
 
@@ -411,7 +476,11 @@ bmux_plugin_sdk::export_plugin!(CommandPalettePlugin, include_str!("../plugin.to
 
 #[cfg(test)]
 mod tests {
-    use super::{plugin_action_string, shell_quote};
+    use super::{
+        PaletteEntry, PaletteEntryKind, bindable_action_key_hint, option_label,
+        plugin_action_string, plugin_command_key_hint, shell_quote,
+    };
+    use bmux_plugin_sdk::ActiveKeybinding;
 
     #[test]
     fn shell_quote_leaves_simple_values_unquoted() {
@@ -429,6 +498,71 @@ mod tests {
         assert_eq!(
             plugin_action_string("bmux.test", "run", &["hello world".to_string()]),
             "plugin:bmux.test:run 'hello world'"
+        );
+    }
+
+    #[test]
+    fn option_label_includes_key_hint_when_available() {
+        let entry = PaletteEntry {
+            label: "Quit".to_string(),
+            detail: "keybind: quit".to_string(),
+            key_hint: Some("Ctrl-A q".to_string()),
+            kind: PaletteEntryKind::BindableAction {
+                action: "quit".to_string(),
+                argument: None,
+            },
+        };
+
+        assert_eq!(option_label(&entry), "Quit  [Ctrl-A q]  —  keybind: quit");
+    }
+
+    #[test]
+    fn bindable_action_key_hint_matches_canonical_static_action() {
+        let active = vec![ActiveKeybinding {
+            scope: "normal".to_string(),
+            chord: "Ctrl-A q".to_string(),
+            action: "quit".to_string(),
+        }];
+
+        assert_eq!(
+            bindable_action_key_hint(&active, "quit_destroy", None),
+            Some("Ctrl-A q".to_string())
+        );
+    }
+
+    #[test]
+    fn bindable_action_key_hint_matches_parameterized_action_prefix() {
+        let active = vec![ActiveKeybinding {
+            scope: "normal".to_string(),
+            chord: "i".to_string(),
+            action: "enter_mode insert".to_string(),
+        }];
+
+        assert_eq!(
+            bindable_action_key_hint(
+                &active,
+                "enter_mode",
+                Some(bmux_keybind::BindableActionArgument {
+                    name: "mode",
+                    label: "Mode",
+                    placeholder: "normal",
+                })
+            ),
+            Some("i".to_string())
+        );
+    }
+
+    #[test]
+    fn plugin_command_key_hint_matches_command_binding() {
+        let active = vec![ActiveKeybinding {
+            scope: "normal".to_string(),
+            chord: "Ctrl-A %".to_string(),
+            action: "plugin:bmux.windows:split-pane --direction vertical".to_string(),
+        }];
+
+        assert_eq!(
+            plugin_command_key_hint(&active, "bmux.windows", "split-pane"),
+            Some("Ctrl-A %".to_string())
         );
     }
 }

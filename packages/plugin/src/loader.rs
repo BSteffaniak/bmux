@@ -3549,6 +3549,7 @@ minimum = "1.0"
             enabled_plugins: vec!["bmux.permissions".to_string()],
             plugin_search_roots: Vec::new(),
             registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),
@@ -3594,6 +3595,7 @@ minimum = "1.0"
             enabled_plugins: vec!["bmux.permissions".to_string()],
             plugin_search_roots: Vec::new(),
             registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),
@@ -3653,6 +3655,7 @@ minimum = "1.0"
             enabled_plugins: Vec::new(),
             plugin_search_roots: Vec::new(),
             registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),
@@ -3726,6 +3729,7 @@ minimum = "1.0"
             enabled_plugins: Vec::new(),
             plugin_search_roots: Vec::new(),
             registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),
@@ -3798,6 +3802,7 @@ minimum = "1.0"
             enabled_plugins: Vec::new(),
             plugin_search_roots: Vec::new(),
             registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),
@@ -3853,6 +3858,7 @@ minimum = "1.0"
             enabled_plugins: Vec::new(),
             plugin_search_roots: Vec::new(),
             registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),
@@ -3907,6 +3913,7 @@ minimum = "1.0"
             enabled_plugins: Vec::new(),
             plugin_search_roots: Vec::new(),
             registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),
@@ -3968,6 +3975,7 @@ minimum = "1.0"
             enabled_plugins: Vec::new(),
             plugin_search_roots: Vec::new(),
             registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),
@@ -4023,6 +4031,7 @@ minimum = "1.0"
             enabled_plugins: Vec::new(),
             plugin_search_roots: Vec::new(),
             registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),

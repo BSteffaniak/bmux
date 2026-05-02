@@ -354,6 +354,7 @@ mod tests {
                 commands: vec!["status".to_string(), "run".to_string()],
                 command_schemas: Vec::new(),
             }],
+            active_keybindings: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "test".to_string(),

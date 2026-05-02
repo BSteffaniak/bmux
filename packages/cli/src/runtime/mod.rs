@@ -114,7 +114,8 @@ use plugin_runtime::{
     plugin_host_metadata, plugin_system_event, registered_plugin_entry_exists,
     resolve_plugin_search_paths, run_external_plugin_command, run_plugin_command,
     run_plugin_command_with_state, run_plugin_keybinding_command,
-    run_plugin_keybinding_command_with_state, scan_available_plugins, validate_enabled_plugins,
+    run_plugin_keybinding_command_with_active_bindings, run_plugin_keybinding_command_with_state,
+    scan_available_plugins, validate_enabled_plugins,
 };
 pub use prompt::{
     PromptEvent, PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse,

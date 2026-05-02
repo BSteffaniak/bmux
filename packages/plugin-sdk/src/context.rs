@@ -102,6 +102,17 @@ pub struct RegisteredPluginInfo {
     pub command_schemas: Vec<crate::PluginCommand>,
 }
 
+/// A keybinding that is active for the current command invocation context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveKeybinding {
+    /// Binding scope, such as `global`, `scroll`, or the active mode id.
+    pub scope: String,
+    /// Human-readable chord, such as `Ctrl-A q`.
+    pub chord: String,
+    /// Canonical action string dispatched by this binding.
+    pub action: String,
+}
+
 /// Context passed to [`RustPlugin::activate`] and [`RustPlugin::deactivate`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeLifecycleContext {
@@ -173,6 +184,10 @@ pub struct NativeCommandContext {
     /// Summary of all registered plugins (for introspection).
     #[serde(default)]
     pub registered_plugins: Vec<RegisteredPluginInfo>,
+    /// Keybindings active for this command invocation, if the host has an
+    /// interactive keymap context.
+    #[serde(default)]
+    pub active_keybindings: Vec<ActiveKeybinding>,
     /// Host runtime metadata (product name, version, API version).
     pub host: HostMetadata,
     /// Host connection paths (config dir, runtime dir, data dir, state dir).

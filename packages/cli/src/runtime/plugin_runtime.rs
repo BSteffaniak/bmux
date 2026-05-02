@@ -1010,6 +1010,7 @@ pub(super) fn plugin_command_context(
     enabled_plugins: Vec<String>,
     plugin_search_roots: Vec<String>,
     registered_plugins: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
+    active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
     caller_client_id: Option<uuid::Uuid>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
 ) -> NativeCommandContext {
@@ -1033,6 +1034,7 @@ pub(super) fn plugin_command_context(
         enabled_plugins,
         plugin_search_roots,
         registered_plugins,
+        active_keybindings,
         host: plugin_host_metadata(),
         connection: bmux_plugin_sdk::PluginHost::connection(&host).clone(),
         settings: config
@@ -1694,6 +1696,7 @@ pub(super) async fn run_plugin_command(
         args,
         None,
         None,
+        Vec::new(),
         bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
     )?;
     // Standalone CLI context: the process has no interactive TUI so
@@ -1724,6 +1727,7 @@ pub(super) async fn run_plugin_command_with_state(
         args,
         None,
         None,
+        Vec::new(),
         bmux_plugin_sdk::NativeCommandInvocationSource::Cli,
     )?;
     if execution.status != 0
@@ -1741,12 +1745,31 @@ pub(super) fn run_plugin_keybinding_command(
     kernel_client_factory: Option<&KernelClientFactory>,
     caller_client_id: Option<uuid::Uuid>,
 ) -> Result<PluginCommandExecution> {
+    run_plugin_keybinding_command_with_active_bindings(
+        plugin_id,
+        command_name,
+        args,
+        kernel_client_factory,
+        caller_client_id,
+        Vec::new(),
+    )
+}
+
+pub(super) fn run_plugin_keybinding_command_with_active_bindings(
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+    kernel_client_factory: Option<&KernelClientFactory>,
+    caller_client_id: Option<uuid::Uuid>,
+    active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
+) -> Result<PluginCommandExecution> {
     run_plugin_command_internal(
         plugin_id,
         command_name,
         args,
         kernel_client_factory,
         caller_client_id,
+        active_keybindings,
         bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
     )
 }
@@ -1766,6 +1789,7 @@ pub(super) fn run_plugin_keybinding_command_with_state(
         args,
         kernel_client_factory,
         caller_client_id,
+        Vec::new(),
         bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding,
     )
 }
@@ -1840,6 +1864,7 @@ pub(super) fn run_plugin_command_internal(
     args: &[String],
     kernel_client_factory: Option<&KernelClientFactory>,
     caller_client_id: Option<uuid::Uuid>,
+    active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
 ) -> Result<PluginCommandExecution> {
     run_plugin_command_internal_with_state(
@@ -1849,10 +1874,12 @@ pub(super) fn run_plugin_command_internal(
         args,
         kernel_client_factory,
         caller_client_id,
+        active_keybindings,
         invocation_source,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Command execution context is assembled from separate runtime subsystems.
 fn run_plugin_command_internal_with_state(
     provided_state: Option<&RuntimeCommandState>,
     plugin_id: &str,
@@ -1860,6 +1887,7 @@ fn run_plugin_command_internal_with_state(
     args: &[String],
     kernel_client_factory: Option<&KernelClientFactory>,
     caller_client_id: Option<uuid::Uuid>,
+    active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
     invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource,
 ) -> Result<PluginCommandExecution> {
     let total_started = Instant::now();
@@ -1902,6 +1930,7 @@ fn run_plugin_command_internal_with_state(
         enabled_plugins,
         state.plugin_search_roots.clone(),
         state.registered_plugin_infos.clone(),
+        active_keybindings,
         caller_client_id,
         invocation_source,
     );
@@ -2864,6 +2893,7 @@ mod tests {
             ],
             vec!["provider.plugin".to_string()],
             vec!["/plugins".to_string()],
+            Vec::new(),
             Vec::new(),
             None,
             bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,

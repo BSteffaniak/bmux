@@ -64,7 +64,7 @@ use super::super::{
     effective_enabled_plugins, enter_host_kernel_connection, host_kernel_bridge, load_plugin,
     map_attach_client_error, merged_runtime_keybindings, parse_session_selector, parse_uuid_value,
     plugin_command_policy_hints, plugin_host_metadata, recording, resolve_plugin_search_paths,
-    run_plugin_keybinding_command, scan_available_plugins,
+    run_plugin_keybinding_command_with_active_bindings, scan_available_plugins,
 };
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent};
@@ -3699,13 +3699,15 @@ fn run_attach_plugin_command_local(
     args: &[String],
     kernel_client_factory: Option<&KernelClientFactory>,
     caller_client_id: Option<Uuid>,
+    active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
 ) -> std::result::Result<AttachPluginCommandPipelineExecution, ClientError> {
-    let execution = run_plugin_keybinding_command(
+    let execution = run_plugin_keybinding_command_with_active_bindings(
         plugin_id,
         command_name,
         args,
         kernel_client_factory,
         caller_client_id,
+        active_keybindings,
     )
     .map_err(|error| ClientError::ServerError {
         code: bmux_ipc::ErrorCode::Internal,
@@ -3718,6 +3720,22 @@ fn run_attach_plugin_command_local(
     })
 }
 
+fn active_keybindings_for_context(
+    keymap: &Keymap,
+    mode_id: Option<&str>,
+    scroll_mode: bool,
+) -> Vec<bmux_plugin_sdk::ActiveKeybinding> {
+    keymap
+        .active_bindings_for_state(mode_id, scroll_mode)
+        .into_iter()
+        .map(|binding| bmux_plugin_sdk::ActiveKeybinding {
+            scope: binding.scope,
+            chord: binding.chord,
+            action: binding.action_name,
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn handle_attach_plugin_command_action(
     client: &mut StreamingBmuxClient,
@@ -3726,6 +3744,7 @@ pub async fn handle_attach_plugin_command_action(
     args: &[String],
     view_state: &mut AttachViewState,
     kernel_client_factory: Option<&KernelClientFactory>,
+    active_keybindings: Vec<bmux_plugin_sdk::ActiveKeybinding>,
 ) -> std::result::Result<(), ClientError> {
     let total_started = Instant::now();
     let before_started = Instant::now();
@@ -3807,6 +3826,7 @@ pub async fn handle_attach_plugin_command_action(
             args,
             kernel_client_factory,
             view_state.self_client_id,
+            active_keybindings,
         ),
     };
     match command_execution {
@@ -7377,6 +7397,11 @@ pub async fn handle_attach_terminal_event(
                     &args,
                     view_state,
                     kernel_client_factory,
+                    active_keybindings_for_context(
+                        attach_input_processor.keymap(),
+                        attach_input_processor.active_mode_id(),
+                        view_state.scrollback_active,
+                    ),
                 )
                 .await
                 {
@@ -7854,6 +7879,7 @@ async fn handle_attach_action_dispatch(
                 &args,
                 view_state,
                 kernel_client_factory,
+                Vec::new(),
             )
             .await
             {
@@ -8961,6 +8987,7 @@ async fn switch_attach_status_tab(
         &[target_context_id.to_string()],
         view_state,
         kernel_client_factory,
+        Vec::new(),
     )
     .await
 }
@@ -9020,6 +9047,7 @@ pub async fn handle_attach_status_tab_click(
         &[target_context_id.to_string()],
         view_state,
         kernel_client_factory,
+        Vec::new(),
     )
     .await?;
     view_state
@@ -9061,6 +9089,7 @@ pub async fn handle_attach_mouse_gesture_action(
                 &args,
                 view_state,
                 kernel_client_factory,
+                Vec::new(),
             )
             .await?;
             Ok(true)
