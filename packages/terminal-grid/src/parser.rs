@@ -10,6 +10,7 @@ use vte::{Params, Perform};
 pub struct TerminalGridStream {
     parser: vte::Parser,
     grid: TerminalGrid,
+    pending_bytes: Vec<u8>,
 }
 
 impl TerminalGridStream {
@@ -28,7 +29,32 @@ impl TerminalGridStream {
         Self {
             parser: vte::Parser::new(),
             grid,
+            pending_bytes: Vec::new(),
         }
+    }
+
+    /// Hydrate a stream from a structured snapshot, including parser-prefix
+    /// bytes that were consumed by the source stream but had not completed a
+    /// terminal sequence yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot cannot hydrate a grid.
+    pub fn from_snapshot(
+        snapshot: &crate::snapshot::GridSnapshot,
+        limits: GridLimits,
+    ) -> Result<Self, TerminalGridError> {
+        let mut stream = Self::from_grid(TerminalGrid::from_snapshot(snapshot, limits)?);
+        if !snapshot.pending_bytes.is_empty() {
+            let mut performer = GridPerformer {
+                grid: &mut stream.grid,
+            };
+            stream
+                .parser
+                .advance(&mut performer, &snapshot.pending_bytes);
+            stream.pending_bytes.clone_from(&snapshot.pending_bytes);
+        }
+        Ok(stream)
     }
 
     /// Borrow the structured grid.
@@ -50,10 +76,22 @@ impl TerminalGridStream {
 
     /// Process one chunk of PTY output.
     pub fn process(&mut self, bytes: &[u8]) {
+        let mut continuity = self.pending_bytes.clone();
+        continuity.extend_from_slice(bytes);
+        self.pending_bytes = trailing_incomplete_sequence(&continuity);
         let mut performer = GridPerformer {
             grid: &mut self.grid,
         };
         self.parser.advance(&mut performer, bytes);
+    }
+
+    /// Snapshot the grid plus parser-prefix bytes needed to continue a split
+    /// terminal sequence from a newly hydrated stream.
+    #[must_use]
+    pub fn snapshot(&self, scrollback_offset: usize, rows: usize) -> crate::GridSnapshot {
+        let mut snapshot = self.grid.snapshot(scrollback_offset, rows);
+        snapshot.pending_bytes.clone_from(&self.pending_bytes);
+        snapshot
     }
 
     /// Process one chunk and return a structured row delta when state changed.
@@ -142,9 +180,49 @@ impl Perform for GridPerformer<'_> {
                 let col = one_based(values.get(1)).saturating_sub(1);
                 self.grid.move_cursor_to(row, col);
             }
+            'E' => {
+                self.grid
+                    .move_cursor_relative(one_based(values.first()).cast_signed(), 0);
+                self.grid.carriage_return();
+            }
+            'F' => {
+                self.grid
+                    .move_cursor_relative(-one_based(values.first()).cast_signed(), 0);
+                self.grid.carriage_return();
+            }
             'J' => self.grid.erase_display(default_zero(values.first())),
             'K' => self.grid.erase_line(default_zero(values.first())),
+            'L' => self.grid.insert_blank_lines(one_based(values.first())),
+            'M' => self.grid.delete_lines(one_based(values.first())),
+            'P' => self.grid.delete_chars(one_based(values.first())),
+            'S' => {
+                let (_, bottom) = self
+                    .grid
+                    .scroll_region()
+                    .unwrap_or_else(|| (0, self.grid.height().saturating_sub(1)));
+                self.grid
+                    .scroll_region_up(0, bottom, one_based(values.first()));
+            }
+            'T' => {
+                let (_, bottom) = self
+                    .grid
+                    .scroll_region()
+                    .unwrap_or_else(|| (0, self.grid.height().saturating_sub(1)));
+                self.grid
+                    .scroll_region_down(0, bottom, one_based(values.first()));
+            }
+            'X' => self.grid.erase_chars(one_based(values.first())),
+            '@' => self.grid.insert_blank_chars(one_based(values.first())),
             'm' => self.grid.set_graphic_rendition(&values),
+            'r' => {
+                if values.is_empty() {
+                    self.grid.set_scroll_region(None, None);
+                } else {
+                    let top = one_based(values.first()).saturating_sub(1);
+                    let bottom = one_based(values.get(1)).saturating_sub(1);
+                    self.grid.set_scroll_region(Some(top), Some(bottom));
+                }
+            }
             'h' | 'l' if intermediates == [b'?'] => {
                 let enabled = action == 'h';
                 for value in values {
@@ -176,7 +254,7 @@ impl Perform for GridPerformer<'_> {
                 self.grid.linefeed();
                 self.grid.carriage_return();
             }
-            b'M' => self.grid.move_cursor_relative(-1, 0),
+            b'M' => self.grid.reverse_index(),
             b'c' => {
                 let width = u16::try_from(self.grid.width()).unwrap_or(u16::MAX);
                 let height = u16::try_from(self.grid.height()).unwrap_or(u16::MAX);
@@ -222,6 +300,49 @@ fn default_zero(value: Option<&i64>) -> usize {
         .unwrap_or(0)
 }
 
+fn trailing_incomplete_sequence(bytes: &[u8]) -> Vec<u8> {
+    let utf8_pending_start = match std::str::from_utf8(bytes) {
+        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+        Ok(_) | Err(_) => bytes.len(),
+    };
+    let esc_pending_start = bytes
+        .iter()
+        .rposition(|byte| *byte == 0x1b)
+        .filter(|position| !escape_sequence_complete(&bytes[*position..]));
+    let start = esc_pending_start
+        .into_iter()
+        .chain((utf8_pending_start < bytes.len()).then_some(utf8_pending_start))
+        .min();
+    start.map_or_else(Vec::new, |start| bytes[start..].to_vec())
+}
+
+fn escape_sequence_complete(sequence: &[u8]) -> bool {
+    let Some((&first, rest)) = sequence.split_first() else {
+        return true;
+    };
+    if first != 0x1b {
+        return true;
+    }
+    let Some((&next, rest)) = rest.split_first() else {
+        return false;
+    };
+    match next {
+        b'[' => rest.iter().any(|byte| (0x40..=0x7e).contains(byte)),
+        b']' => has_bel_or_string_terminator(rest),
+        b'P' | b'_' | b'^' | b'X' => has_string_terminator(rest),
+        0x20..=0x2f => rest.iter().any(|byte| (0x30..=0x7e).contains(byte)),
+        _ => true,
+    }
+}
+
+fn has_bel_or_string_terminator(bytes: &[u8]) -> bool {
+    bytes.contains(&0x07) || has_string_terminator(bytes)
+}
+
+fn has_string_terminator(bytes: &[u8]) -> bool {
+    bytes.windows(2).any(|window| window == [0x1b, b'\\'])
+}
+
 #[cfg(test)]
 mod tests {
     use crate::model::{GridLimits, TerminalGrid};
@@ -256,5 +377,73 @@ mod tests {
             grid.palette().get(red).fg,
             Some(crate::style::Color::Indexed(1))
         );
+    }
+
+    #[test]
+    fn snapshot_hydrates_pending_escape_sequence() {
+        let mut stream = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        stream.process(b"\x1b[");
+        let snapshot = stream.snapshot(0, 2);
+
+        let mut hydrated = TerminalGridStream::from_snapshot(&snapshot, GridLimits::default())
+            .expect("snapshot should hydrate");
+        hydrated.process(b"31mR");
+
+        let grid = hydrated.grid();
+        let red = grid.viewport_rows()[0].cells()[0].style();
+        assert_eq!(
+            grid.palette().get(red).fg,
+            Some(crate::style::Color::Indexed(1))
+        );
+    }
+
+    #[test]
+    fn insert_and_delete_character_sequences_shift_row_cells() {
+        let mut grid = TerminalGrid::new(5, 2, GridLimits::default()).unwrap();
+        grid.process(b"abcd\x1b[1;2H\x1b[@Z");
+        assert_eq!(row_text(&grid.viewport_rows()[0]), "aZbcd");
+
+        grid.process(b"\x1b[1;2H\x1b[P");
+        assert_eq!(row_text(&grid.viewport_rows()[0]), "abcd");
+    }
+
+    #[test]
+    fn insert_and_delete_line_sequences_shift_scroll_region() {
+        let mut grid = TerminalGrid::new(5, 4, GridLimits::default()).unwrap();
+        grid.process(b"aaaa\r\nbbbb\r\ncccc\r\ndddd");
+        grid.process(b"\x1b[2;3r\x1b[2;1H\x1b[L");
+        let rows = grid.viewport_rows();
+        assert_eq!(row_text(&rows[0]), "aaaa");
+        assert_eq!(row_text(&rows[1]), "");
+        assert_eq!(row_text(&rows[2]), "bbbb");
+        assert_eq!(row_text(&rows[3]), "dddd");
+
+        grid.process(b"\x1b[2;1H\x1b[M");
+        let rows = grid.viewport_rows();
+        assert_eq!(row_text(&rows[1]), "bbbb");
+        assert_eq!(row_text(&rows[2]), "");
+    }
+
+    #[test]
+    fn linefeed_scrolls_only_active_scroll_region() {
+        let mut grid = TerminalGrid::new(5, 4, GridLimits::default()).unwrap();
+        grid.process(b"aaaa\r\nbbbb\r\ncccc\r\ndddd");
+        grid.process(b"\x1b[2;3r\x1b[3;1H\n");
+
+        let rows = grid.viewport_rows();
+        assert_eq!(row_text(&rows[0]), "aaaa");
+        assert_eq!(row_text(&rows[1]), "cccc");
+        assert_eq!(row_text(&rows[2]), "");
+        assert_eq!(row_text(&rows[3]), "dddd");
+    }
+
+    fn row_text(row: &crate::model::PhysicalRow) -> String {
+        row.cells()
+            .iter()
+            .filter(|cell| !cell.is_wide_continuation())
+            .map(crate::model::Cell::text)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 }

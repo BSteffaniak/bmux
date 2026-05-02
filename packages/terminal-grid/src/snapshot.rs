@@ -15,11 +15,17 @@ pub struct RowSnapshot {
     pub runs: Vec<CellRunSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorSnapshot {
     pub row: u16,
     pub col: u16,
     pub visible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrollRegionSnapshot {
+    pub top: u16,
+    pub bottom: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +36,18 @@ pub struct GridSnapshot {
     pub mode: String,
     pub scrollback_rows: u32,
     pub cursor: CursorSnapshot,
+    #[serde(default)]
+    pub saved_cursor: CursorSnapshot,
+    #[serde(default)]
+    pub current_style: Style,
+    #[serde(default = "default_autowrap")]
+    pub autowrap: bool,
+    #[serde(default)]
+    pub pending_wrap: bool,
+    #[serde(default)]
+    pub scroll_region: Option<ScrollRegionSnapshot>,
+    #[serde(default)]
+    pub pending_bytes: Vec<u8>,
     pub styles: Vec<Style>,
     pub rows: Vec<RowSnapshot>,
 }
@@ -62,10 +80,25 @@ impl GridSnapshot {
             },
             scrollback_rows,
             cursor,
+            saved_cursor: cursor_snapshot(grid.saved_cursor()),
+            current_style: grid.current_style(),
+            autowrap: grid.autowrap(),
+            pending_wrap: grid.pending_wrap(),
+            scroll_region: grid
+                .scroll_region()
+                .map(|(top, bottom)| ScrollRegionSnapshot {
+                    top: u16::try_from(top).unwrap_or(u16::MAX),
+                    bottom: u16::try_from(bottom).unwrap_or(u16::MAX),
+                }),
+            pending_bytes: Vec::new(),
             styles: grid.palette().styles().to_vec(),
             rows: selected_rows,
         }
     }
+}
+
+const fn default_autowrap() -> bool {
+    true
 }
 
 fn cursor_snapshot(cursor: Cursor) -> CursorSnapshot {
@@ -149,6 +182,25 @@ mod tests {
         assert_eq!(hydrated.cursor(), grid.cursor());
         assert_eq!(hydrated.palette().styles(), grid.palette().styles());
         assert_eq!(hydrated.viewport_rows(), grid.viewport_rows());
+    }
+
+    #[test]
+    fn snapshot_preserves_current_style_for_future_output() {
+        let mut grid = TerminalGrid::new(8, 2, GridLimits::default()).unwrap();
+        grid.process(b"\x1b[31mred");
+        let snapshot = grid.snapshot(0, 2);
+
+        let mut hydrated = TerminalGrid::from_snapshot(&snapshot, GridLimits::default()).unwrap();
+        hydrated.process(b"X");
+
+        let rows = hydrated.viewport_rows();
+        let original_red = rows[0].cells()[0].style();
+        let continued_red = rows[0].cells()[3].style();
+        assert_eq!(original_red, continued_red);
+        assert_eq!(
+            hydrated.palette().get(continued_red).fg,
+            Some(crate::Color::Indexed(1))
+        );
     }
 
     #[test]

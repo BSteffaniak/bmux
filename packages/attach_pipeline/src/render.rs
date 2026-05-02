@@ -1218,18 +1218,6 @@ struct CellStyle {
     inverse: bool,
 }
 
-fn cell_style(cell: &vt100::Cell) -> CellStyle {
-    CellStyle {
-        fg: cell.fgcolor(),
-        bg: cell.bgcolor(),
-        bold: cell.bold(),
-        dim: cell.dim(),
-        italic: cell.italic(),
-        underline: cell.underline(),
-        inverse: cell.inverse(),
-    }
-}
-
 const fn grid_cell_style(style: GridStyle) -> CellStyle {
     CellStyle {
         fg: grid_color_to_vt100(style.fg),
@@ -1375,14 +1363,6 @@ const fn selected_style(mut style: CellStyle) -> CellStyle {
 }
 
 #[derive(Clone, Copy)]
-struct ContentRowRenderContext<'a> {
-    screen: &'a vt100::Screen,
-    selection: Option<(AttachScrollbackPosition, AttachScrollbackPosition)>,
-    scrollback_offset: usize,
-    runtime_appearance: &'a RuntimeAppearance,
-}
-
-#[derive(Clone, Copy)]
 struct GridRowRenderContext<'a> {
     row: &'a PhysicalRow,
     selection: Option<(AttachScrollbackPosition, AttachScrollbackPosition)>,
@@ -1451,72 +1431,6 @@ fn render_grid_row_segment(
     line
 }
 
-fn render_content_row_segment(
-    context: ContentRowRenderContext<'_>,
-    row: u16,
-    start_col: u16,
-    end_col: u16,
-) -> String {
-    let mut line = String::new();
-    let mut current = CellStyle::default();
-    let mut emitted_cols = 0_usize;
-    let target_cols = usize::from(end_col.saturating_sub(start_col));
-    let mut col = start_col;
-    while col < end_col {
-        if let Some(cell) = context.screen.cell(row, col) {
-            let absolute_row = context.scrollback_offset.saturating_add(usize::from(row));
-            let style = if cell_selected(context.selection, absolute_row, usize::from(col)) {
-                selected_style(cell_style(cell))
-            } else {
-                cell_style(cell)
-            };
-            let style = apply_content_effects(style, context.runtime_appearance);
-            if style != current {
-                line.push_str(&style_sgr(style));
-                current = style;
-            }
-            if cell.is_wide_continuation() {
-                line.push(' ');
-                emitted_cols = emitted_cols.saturating_add(1);
-                col = col.saturating_add(1);
-                continue;
-            }
-            let text = if cell.has_contents() {
-                cell.contents()
-            } else {
-                " "
-            };
-            line.push_str(text);
-            emitted_cols = emitted_cols.saturating_add(UnicodeWidthStr::width(text).max(1));
-            if cell.is_wide() {
-                col = col.saturating_add(2);
-            } else {
-                col = col.saturating_add(1);
-            }
-        } else {
-            if current != CellStyle::default() {
-                line.push_str("\x1b[0m");
-                current = CellStyle::default();
-            }
-            line.push(' ');
-            emitted_cols = emitted_cols.saturating_add(1);
-            col = col.saturating_add(1);
-        }
-    }
-
-    if emitted_cols < target_cols {
-        if current != CellStyle::default() {
-            line.push_str("\x1b[0m");
-            current = CellStyle::default();
-        }
-        line.push_str(&" ".repeat(target_cols - emitted_cols));
-    }
-    if current != CellStyle::default() {
-        line.push_str("\x1b[0m");
-    }
-    line
-}
-
 fn damaged_grid_row_ranges(
     row: &PhysicalRow,
     row_index: u16,
@@ -1546,41 +1460,6 @@ fn damaged_grid_row_ranges(
                 .cells()
                 .get(usize::from(end))
                 .is_some_and(Cell::is_wide_continuation)
-        {
-            end = end.saturating_add(1).min(width);
-        }
-        ranges.push((start, end));
-    }
-    merge_ranges(ranges)
-}
-
-fn damaged_row_ranges(
-    screen: &vt100::Screen,
-    row: u16,
-    width: u16,
-    rects: &[DamageRect],
-) -> Vec<(u16, u16)> {
-    let mut ranges = Vec::new();
-    for rect in rects {
-        if row < rect.y || row >= rect.bottom() {
-            continue;
-        }
-        let mut start = rect.x.min(width);
-        let mut end = rect.right().min(width);
-        if start >= end {
-            continue;
-        }
-        if start > 0
-            && screen
-                .cell(row, start)
-                .is_some_and(vt100::Cell::is_wide_continuation)
-        {
-            start = start.saturating_sub(1);
-        }
-        if end < width
-            && screen
-                .cell(row, end)
-                .is_some_and(vt100::Cell::is_wide_continuation)
         {
             end = end.saturating_add(1).min(width);
         }
@@ -2101,7 +1980,6 @@ fn render_attach_scene_inner<W: io::Write>(
         let inner_h = usize::from(inner_height);
         if let Some(entry) = pane_buffers.get_mut(&pane_id) {
             let (old_rows, old_cols) = entry.parser.screen().size();
-            let had_structured_content = entry.terminal_grid.grid().revision() > 0;
             let previous_grid_size = (
                 entry.terminal_grid.grid().width(),
                 entry.terminal_grid.grid().height(),
@@ -2110,11 +1988,9 @@ fn render_attach_scene_inner<W: io::Write>(
                 .parser
                 .screen_mut()
                 .set_size(inner_height.max(1), inner_width.max(1));
-            if had_structured_content {
-                let _ = entry
-                    .terminal_grid
-                    .resize_delta(inner_width.max(1), inner_height.max(1));
-            }
+            let _ = entry
+                .terminal_grid
+                .resize_delta(inner_width.max(1), inner_height.max(1));
             // Invalidate the row cache when the pane dimensions change, since
             // the row strings are no longer comparable at a different size.
             let (new_rows, new_cols) = entry.parser.screen().size();
@@ -2128,18 +2004,10 @@ fn render_attach_scene_inner<W: io::Write>(
                 entry.prev_rows.clear();
             }
             let use_scrollback = scrollback_active && focus;
-            let previous_scrollback = entry.parser.screen().scrollback();
-            if use_scrollback {
-                entry.parser.screen_mut().set_scrollback(scrollback_offset);
-            }
-            let use_structured_grid = had_structured_content;
-            let grid_rows = use_structured_grid.then(|| {
-                entry
-                    .terminal_grid
-                    .grid()
-                    .display_rows(if use_scrollback { scrollback_offset } else { 0 }, inner_h)
-            });
-            let screen = entry.parser.screen();
+            let grid_rows = entry
+                .terminal_grid
+                .grid()
+                .display_rows(if use_scrollback { scrollback_offset } else { 0 }, inner_h);
             let selection = if use_scrollback {
                 selection_bounds(selection_anchor, scrollback_cursor, scrollback_offset)
             } else {
@@ -2153,7 +2021,7 @@ fn render_attach_scene_inner<W: io::Write>(
                         cursor.row.min(inner_h.saturating_sub(1)) as u16,
                         cursor.col.min(inner_w.saturating_sub(1)) as u16,
                     )
-                } else if use_structured_grid {
+                } else {
                     let cursor = entry.terminal_grid.grid().cursor();
                     (
                         u16::try_from(cursor.row.min(inner_h.saturating_sub(1)))
@@ -2161,19 +2029,11 @@ fn render_attach_scene_inner<W: io::Write>(
                         u16::try_from(cursor.col.min(inner_w.saturating_sub(1)))
                             .unwrap_or(u16::MAX),
                     )
-                } else {
-                    let (cursor_row, cursor_col) = screen.cursor_position();
-                    (
-                        cursor_row.min(inner_height.saturating_sub(1)),
-                        cursor_col.min(inner_width.saturating_sub(1)),
-                    )
                 };
                 let cursor_visible = if use_scrollback {
                     true
-                } else if use_structured_grid {
-                    entry.terminal_grid.grid().cursor().visible
                 } else {
-                    !screen.hide_cursor()
+                    entry.terminal_grid.grid().cursor().visible
                 };
                 cursor_state = Some(AttachCursorState {
                     x: content.x.saturating_add(cursor_col),
@@ -2202,51 +2062,36 @@ fn render_attach_scene_inner<W: io::Write>(
                 continue;
             }
             let damaged_content_rows = frame_damage.content_surface_rects(pane_id);
-            let render_context = ContentRowRenderContext {
-                screen,
-                selection,
-                scrollback_offset,
-                runtime_appearance,
-            };
             for row in 0..inner_h {
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
                 }
                 let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
-                let damaged_ranges = grid_rows.as_ref().map_or_else(
-                    || damaged_row_ranges(screen, row_u16, inner_width, damaged_content_rows),
-                    |rows| {
-                        rows.get(row).map_or_else(Vec::new, |grid_row| {
-                            damaged_grid_row_ranges(
-                                grid_row,
-                                row_u16,
-                                inner_width,
-                                damaged_content_rows,
-                            )
-                        })
-                    },
-                );
+                let damaged_ranges = grid_rows.get(row).map_or_else(Vec::new, |grid_row| {
+                    damaged_grid_row_ranges(grid_row, row_u16, inner_width, damaged_content_rows)
+                });
                 let force_row_damage = !damaged_ranges.is_empty();
                 let y = content.y.saturating_add(row_u16);
-                let line = if let Some(rows) = grid_rows.as_ref().and_then(|rows| rows.get(row)) {
-                    render_grid_row_segment(
-                        GridRowRenderContext {
-                            row: rows,
-                            selection,
-                            absolute_row: if use_scrollback {
-                                scrollback_offset.saturating_add(row)
-                            } else {
-                                row
+                let line = grid_rows.get(row).map_or_else(
+                    || " ".repeat(usize::from(inner_width)),
+                    |grid_row| {
+                        render_grid_row_segment(
+                            GridRowRenderContext {
+                                row: grid_row,
+                                selection,
+                                absolute_row: if use_scrollback {
+                                    scrollback_offset.saturating_add(row)
+                                } else {
+                                    row
+                                },
+                                runtime_appearance,
+                                palette: entry.terminal_grid.grid().palette(),
                             },
-                            runtime_appearance,
-                            palette: entry.terminal_grid.grid().palette(),
-                        },
-                        0,
-                        inner_width,
-                    )
-                } else {
-                    render_content_row_segment(render_context, row_u16, 0, inner_width)
-                };
+                            0,
+                            inner_width,
+                        )
+                    },
+                );
 
                 // Row-level diff: skip emitting if the rendered string
                 // matches the previous frame's cached version for this row.
@@ -2269,27 +2114,26 @@ fn render_attach_scene_inner<W: io::Write>(
                     }
                 } else if force_row_damage {
                     for (start_col, end_col) in damaged_ranges {
-                        let segment = if let Some(rows) =
-                            grid_rows.as_ref().and_then(|rows| rows.get(row))
-                        {
-                            render_grid_row_segment(
-                                GridRowRenderContext {
-                                    row: rows,
-                                    selection,
-                                    absolute_row: if use_scrollback {
-                                        scrollback_offset.saturating_add(row)
-                                    } else {
-                                        row
+                        let segment = grid_rows.get(row).map_or_else(
+                            || " ".repeat(usize::from(end_col.saturating_sub(start_col))),
+                            |grid_row| {
+                                render_grid_row_segment(
+                                    GridRowRenderContext {
+                                        row: grid_row,
+                                        selection,
+                                        absolute_row: if use_scrollback {
+                                            scrollback_offset.saturating_add(row)
+                                        } else {
+                                            row
+                                        },
+                                        runtime_appearance,
+                                        palette: entry.terminal_grid.grid().palette(),
                                     },
-                                    runtime_appearance,
-                                    palette: entry.terminal_grid.grid().palette(),
-                                },
-                                start_col,
-                                end_col,
-                            )
-                        } else {
-                            render_content_row_segment(render_context, row_u16, start_col, end_col)
-                        };
+                                    start_col,
+                                    end_col,
+                                )
+                            },
+                        );
                         queue!(
                             stdout,
                             MoveTo(content.x.saturating_add(start_col), y),
@@ -2332,12 +2176,6 @@ fn render_attach_scene_inner<W: io::Write>(
             }
             // Trim stale cache entries if the visible row count shrank.
             entry.prev_rows.truncate(inner_h);
-            if use_scrollback {
-                entry
-                    .parser
-                    .screen_mut()
-                    .set_scrollback(previous_scrollback);
-            }
         } else if should_draw_content {
             for row in 0..inner_h {
                 let y = content.y.saturating_add(row as u16);
@@ -2391,6 +2229,15 @@ mod tests {
         let mut damage = FrameDamage::default();
         damage.mark_content_surface(pane_id);
         damage
+    }
+
+    fn feed_pane_buffer(buffer: &mut PaneRenderBuffer, rows: u16, cols: u16, bytes: &[u8]) {
+        buffer.parser.screen_mut().set_size(rows, cols);
+        buffer
+            .terminal_grid
+            .resize_delta(cols.max(1), rows.max(1))
+            .expect("test terminal grid dimensions should be valid");
+        append_pane_output(buffer, bytes);
     }
 
     #[test]
@@ -2946,8 +2793,7 @@ mod tests {
         };
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer::default();
-        buffer.parser.screen_mut().set_size(3, 8);
-        buffer.parser.process(b"abcdefgh\r\nijklmnop\r\nqrstuvwx");
+        feed_pane_buffer(&mut buffer, 3, 8, b"abcdefgh\r\nijklmnop\r\nqrstuvwx");
         pane_buffers.insert(pane_id, buffer);
 
         render_attach_scene(
@@ -3059,8 +2905,7 @@ mod tests {
         };
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer::default();
-        buffer.parser.screen_mut().set_size(1, 8);
-        buffer.parser.process("ab界ef".as_bytes());
+        feed_pane_buffer(&mut buffer, 1, 8, "ab界ef".as_bytes());
         pane_buffers.insert(pane_id, buffer);
 
         render_attach_scene(
@@ -3149,9 +2994,7 @@ mod tests {
         };
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer::default();
-        buffer.parser.screen_mut().set_size(4, 18);
-        buffer.parser.process(b"hello\nworld\n");
-        buffer.parser.process(b"\x1b[?25l");
+        feed_pane_buffer(&mut buffer, 4, 18, b"hello\r\nworld\r\n\x1b[?25l");
         buffer.parser.screen_mut().set_scrollback(1);
         pane_buffers.insert(pane_id, buffer);
 
@@ -3214,8 +3057,7 @@ mod tests {
         };
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer::default();
-        buffer.parser.screen_mut().set_size(2, 10);
-        buffer.parser.process(b"abcdef\n");
+        feed_pane_buffer(&mut buffer, 2, 10, b"abcdef\r\n");
         pane_buffers.insert(pane_id, buffer);
 
         let mut output = Vec::new();
@@ -3275,8 +3117,7 @@ mod tests {
         };
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer::default();
-        buffer.parser.screen_mut().set_size(1, 8);
-        buffer.parser.process(b"x");
+        feed_pane_buffer(&mut buffer, 1, 8, b"x");
         pane_buffers.insert(pane_id, buffer);
         let mut appearance = RuntimeAppearance {
             background: "#000000".to_string(),
@@ -3656,8 +3497,7 @@ mod tests {
         };
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer::default();
-        buffer.parser.screen_mut().set_size(2, 10);
-        buffer.parser.process(b"hello");
+        feed_pane_buffer(&mut buffer, 2, 10, b"hello");
 
         // Populate prev_rows with an initial render.
         let mut output1 = Vec::new();
@@ -3785,8 +3625,7 @@ mod tests {
         };
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer::default();
-        buffer.parser.screen_mut().set_size(2, 10);
-        buffer.parser.process(b"content");
+        feed_pane_buffer(&mut buffer, 2, 10, b"content");
         // Flag is set but full_pane_redraw overrides deferral.
         buffer.sync_update_in_progress = true;
         pane_buffers.insert(pane_id, buffer);

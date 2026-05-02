@@ -4844,7 +4844,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                         .terminal_grid
                         .lock()
                         .map_err(|_| SessionRuntimeError::Closed)?;
-                    grid.grid().snapshot(0, max_rows_per_pane)
+                    grid.snapshot(0, max_rows_per_pane)
                 };
                 let stream_end = {
                     let mut output = pane

@@ -6647,18 +6647,18 @@ async fn hydrate_attach_structured_grid_snapshots(
                 continue;
             }
         };
-        let grid = match bmux_terminal_grid::TerminalGrid::from_snapshot(
+        let stream = match bmux_terminal_grid::TerminalGridStream::from_snapshot(
             &decoded,
             bmux_terminal_grid::GridLimits::default(),
         ) {
-            Ok(grid) => grid,
+            Ok(stream) => stream,
             Err(error) => {
                 tracing::warn!(pane_id = %snapshot.pane_id, %error, "failed hydrating structured pane grid snapshot");
                 continue;
             }
         };
         let buffer = view_state.pane_buffers.entry(snapshot.pane_id).or_default();
-        buffer.terminal_grid = bmux_terminal_grid::TerminalGridStream::from_grid(grid);
+        buffer.terminal_grid = stream;
         buffer.expected_stream_start = Some(snapshot.stream_end);
         buffer.prev_rows.clear();
     }
