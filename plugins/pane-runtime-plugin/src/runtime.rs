@@ -1289,6 +1289,52 @@ impl SessionRuntimeManager {
     fn active_session_ids(&self) -> Vec<SessionId> {
         self.runtimes.keys().copied().collect()
     }
+
+    fn reconcile_exited_pane_focus(&mut self, session_id: SessionId, pane_id: Uuid) -> bool {
+        let Some(runtime) = self.runtimes.get_mut(&session_id) else {
+            return false;
+        };
+
+        let exited_surface_scopes = runtime
+            .floating_surfaces
+            .iter()
+            .filter(|surface| surface.pane_id == pane_id)
+            .map(|surface| surface.scope)
+            .collect::<Vec<_>>();
+        let exited_was_floating = !exited_surface_scopes.is_empty();
+
+        let floating_focus_is_exited = runtime
+            .floating_surfaces
+            .iter()
+            .any(|surface| surface.pane_id == pane_id && surface.cursor_owner);
+
+        for surface in &mut runtime.floating_surfaces {
+            if surface.pane_id == pane_id {
+                surface.cursor_owner = false;
+            }
+        }
+
+        let focus_is_exited = runtime
+            .panes
+            .get(&runtime.focused_pane_id)
+            .is_none_or(|pane| pane.exited.load(Ordering::SeqCst));
+        if (runtime.focused_pane_id == pane_id || focus_is_exited || floating_focus_is_exited)
+            && let Some(next_focus) = next_live_focus_after_exit(runtime, pane_id)
+        {
+            runtime.focused_pane_id = next_focus;
+            for surface in &mut runtime.floating_surfaces {
+                surface.cursor_owner = surface.pane_id == next_focus;
+            }
+        }
+
+        exited_was_floating
+            && exited_surface_scopes.iter().any(|scope| {
+                matches!(
+                    scope,
+                    FloatingPaneScope::ClientGlobal | FloatingPaneScope::ServerGlobal
+                )
+            })
+    }
 }
 
 /// Lightweight ECMA-48 escape sequence phase tracker.
@@ -2028,6 +2074,43 @@ fn focused_pane_for_scene(scene: &AttachScene, fallback: Uuid) -> Uuid {
         }
     }
     best.map_or(fallback, |(_, _, _, pane_id)| pane_id)
+}
+
+fn runtime_pane_is_live(runtime: &SessionRuntimeHandle, pane_id: Uuid) -> bool {
+    runtime
+        .panes
+        .get(&pane_id)
+        .is_some_and(|pane| !pane.exited.load(Ordering::SeqCst))
+}
+
+fn next_live_focus_after_exit(
+    runtime: &SessionRuntimeHandle,
+    exited_pane_id: Uuid,
+) -> Option<Uuid> {
+    let floating_focus = runtime
+        .floating_surfaces
+        .iter()
+        .enumerate()
+        .filter(|(_, surface)| {
+            surface.pane_id != exited_pane_id
+                && surface.visible
+                && surface.accepts_input
+                && runtime_pane_is_live(runtime, surface.pane_id)
+        })
+        .max_by_key(|(index, surface)| (surface.layer.to_attach_layer(), surface.z, *index))
+        .map(|(_, surface)| surface.pane_id);
+
+    floating_focus
+        .or_else(|| {
+            ordered_tiled_pane_ids(runtime).into_iter().find(|pane_id| {
+                *pane_id != exited_pane_id && runtime_pane_is_live(runtime, *pane_id)
+            })
+        })
+        .or_else(|| {
+            runtime.panes.keys().copied().find(|pane_id| {
+                *pane_id != exited_pane_id && runtime_pane_is_live(runtime, *pane_id)
+            })
+        })
 }
 
 // Building the attach scene requires constructing every surface's
@@ -5177,20 +5260,42 @@ struct PaneExitEvent {
     pane_id: Uuid,
 }
 
-fn reap_exited_pane(session_id: SessionId, pane_id: Uuid) {
-    let state_reason = session_runtime_handle()
-        .0
-        .pane_state_reason(session_id, pane_id);
+fn reap_exited_pane(
+    manager: &Arc<Mutex<SessionRuntimeManager>>,
+    session_id: SessionId,
+    pane_id: Uuid,
+) {
+    let (state_reason, update_sessions) = manager.lock().map_or_else(
+        |_| (None, vec![session_id]),
+        |mut manager| {
+            let state_reason = manager
+                .runtimes
+                .get(&session_id)
+                .and_then(|runtime| runtime.panes.get(&pane_id))
+                .and_then(pane_state_reason_for_handle);
+            let publish_all = manager.reconcile_exited_pane_focus(session_id, pane_id);
+            let update_sessions = if publish_all {
+                manager.active_session_ids()
+            } else {
+                vec![session_id]
+            };
+            (state_reason, update_sessions)
+        },
+    );
     publish_pane_event(PaneEvent::Exited {
         session_id: session_id.0,
         pane_id,
         reason: state_reason,
     });
-    emit_attach_view_changed_for_layout(session_id);
+    for session_id in update_sessions {
+        emit_attach_view_changed_for_layout(session_id);
+    }
+    crate::handlers::publish_focus_state_snapshot();
     mark_snapshot_dirty_flag();
 }
 
 async fn process_pane_exit_events(
+    manager: Arc<Mutex<SessionRuntimeManager>>,
     mut pane_exit_rx: mpsc::UnboundedReceiver<PaneExitEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -5208,7 +5313,7 @@ async fn process_pane_exit_events(
                 let Some(event) = maybe_event else {
                     break;
                 };
-                reap_exited_pane(event.session_id, event.pane_id);
+                reap_exited_pane(&manager, event.session_id, event.pane_id);
             }
         }
     }
@@ -5469,8 +5574,9 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig) {
         ));
 
     let shutdown_rx = watch::channel(false).1;
+    let exit_manager = Arc::clone(&manager);
     tokio::spawn(async move {
-        process_pane_exit_events(pane_exit_rx, shutdown_rx).await;
+        process_pane_exit_events(exit_manager, pane_exit_rx, shutdown_rx).await;
     });
 
     crate::snapshot::PaneRuntimeStateful::register();
@@ -5751,6 +5857,48 @@ mod tests {
         assert!(runtime.panes.contains_key(&floating_pane_id));
         assert_eq!(runtime.focused_pane_id, floating_pane_id);
         assert_eq!(runtime.floating_surfaces.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exiting_focused_floating_pane_restores_live_focus() {
+        let session_id = SessionId(Uuid::new_v4());
+        let tiled_pane_id = Uuid::new_v4();
+        let floating_pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[tiled_pane_id, floating_pane_id]);
+        runtime.layout_root = Some(PaneLayoutNode::Leaf {
+            pane_id: tiled_pane_id,
+        });
+        runtime.focused_pane_id = floating_pane_id;
+        let mut surface = floating_surface(floating_pane_id, FloatingPaneScope::PerSession);
+        surface.cursor_owner = true;
+        runtime.floating_surfaces = vec![surface];
+        runtime
+            .panes
+            .get(&floating_pane_id)
+            .expect("floating pane exists")
+            .exited
+            .store(true, Ordering::SeqCst);
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        let mut manager = SessionRuntimeManager {
+            runtimes: BTreeMap::from([(session_id, runtime)]),
+            shell: "sh".to_string(),
+            pane_term: "xterm-256color".to_string(),
+            protocol_profile: ProtocolProfile::Bmux,
+            shell_integration_root: None,
+            pane_exit_tx,
+        };
+
+        let publish_all = manager.reconcile_exited_pane_focus(session_id, floating_pane_id);
+
+        assert!(!publish_all);
+        let runtime = manager.runtimes.get(&session_id).expect("runtime remains");
+        assert_eq!(runtime.focused_pane_id, tiled_pane_id);
+        assert!(
+            runtime
+                .floating_surfaces
+                .iter()
+                .all(|surface| !surface.cursor_owner)
+        );
     }
 
     #[tokio::test]

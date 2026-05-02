@@ -7,14 +7,14 @@
 //! `PaneCommandError::Failed { reason }` / `SessionRuntimeCommandError::Failed`.
 
 use bmux_attach_layout_protocol::{
-    PaneFocusDirection, PaneLaunchCommand, PaneSelector, PaneSplitDirection,
+    PaneFocusDirection, PaneLaunchCommand, PaneSelector, PaneSplitDirection, PaneState,
 };
 use bmux_pane_runtime_plugin_api::pane_runtime_commands::{
     FloatingPaneAck, PaneAck, PaneCommandError, SessionAck, SessionRuntimeCommandError,
 };
 use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, AttachViewComponent, PaneEvent};
 use bmux_pane_runtime_state::{
-    FloatingPaneLayer, FloatingPaneScope, LayoutRect, PaneResizeDirection,
+    FloatingPaneLayer, FloatingPaneScope, LayoutRect, PaneResizeDirection, SessionRuntimeError,
 };
 use bmux_session_models::{ClientId, SessionId};
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
@@ -794,10 +794,15 @@ pub fn pane_direct_input(
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.direct_input")?;
-    handle
+    match handle
         .0
         .write_input_to_pane(session_id, req.pane_id, req.data)
-        .map_err(|e| failed_command(e.to_string()))?;
+    {
+        Ok(_) => {}
+        Err(SessionRuntimeError::Closed)
+            if handle.0.pane_state(session_id, req.pane_id) == Some(PaneState::Exited) => {}
+        Err(error) => return Err(failed_command(error.to_string())),
+    }
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id: req.pane_id,
