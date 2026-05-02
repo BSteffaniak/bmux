@@ -1,5 +1,7 @@
-use crate::snapshot::{CursorSnapshot, GridSnapshot, RowSnapshot};
+use crate::snapshot::{CursorSnapshot, GridSnapshot, RowSnapshot, ScrollRegionSnapshot};
+use crate::style::Style;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// One changed retained row in a structured grid delta.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +23,19 @@ pub struct GridDeltaBatch {
     pub mode: String,
     pub scrollback_rows: u32,
     pub cursor: CursorSnapshot,
+    #[serde(default)]
+    pub saved_cursor: CursorSnapshot,
+    #[serde(default)]
+    pub current_style: Style,
+    #[serde(default = "default_autowrap")]
+    pub autowrap: bool,
+    #[serde(default)]
+    pub pending_wrap: bool,
+    #[serde(default)]
+    pub scroll_region: Option<ScrollRegionSnapshot>,
+    #[serde(default)]
+    pub pending_bytes: Vec<u8>,
+    pub styles: Vec<Style>,
     /// True when row indexes or dimensions changed enough that receivers should
     /// discard their local row set before applying `row_updates`.
     pub reset_rows: bool,
@@ -70,10 +85,76 @@ impl GridDeltaBatch {
             mode: after.mode.clone(),
             scrollback_rows: after.scrollback_rows,
             cursor: after.cursor,
+            saved_cursor: after.saved_cursor,
+            current_style: after.current_style,
+            autowrap: after.autowrap,
+            pending_wrap: after.pending_wrap,
+            scroll_region: after.scroll_region,
+            pending_bytes: after.pending_bytes.clone(),
+            styles: after.styles.clone(),
             reset_rows,
             row_updates,
         })
     }
+
+    /// Apply this delta to a retained grid snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the receiver does not have `base_revision` or a
+    /// row update indexes outside the current row set.
+    pub fn apply_to_snapshot(
+        &self,
+        snapshot: &mut GridSnapshot,
+    ) -> Result<(), GridDeltaApplyError> {
+        if snapshot.revision != self.base_revision {
+            return Err(GridDeltaApplyError::RevisionMismatch {
+                expected: self.base_revision,
+                actual: snapshot.revision,
+            });
+        }
+        if self.reset_rows {
+            snapshot.rows = self
+                .row_updates
+                .iter()
+                .map(|update| update.row.clone())
+                .collect();
+        } else {
+            for update in &self.row_updates {
+                let index = usize::try_from(update.row_index).unwrap_or(usize::MAX);
+                let Some(row) = snapshot.rows.get_mut(index) else {
+                    return Err(GridDeltaApplyError::RowIndexOutOfBounds(update.row_index));
+                };
+                *row = update.row.clone();
+            }
+        }
+        snapshot.revision = self.revision;
+        snapshot.width = self.width;
+        snapshot.height = self.height;
+        snapshot.mode.clone_from(&self.mode);
+        snapshot.scrollback_rows = self.scrollback_rows;
+        snapshot.cursor = self.cursor;
+        snapshot.saved_cursor = self.saved_cursor;
+        snapshot.current_style = self.current_style;
+        snapshot.autowrap = self.autowrap;
+        snapshot.pending_wrap = self.pending_wrap;
+        snapshot.scroll_region = self.scroll_region;
+        snapshot.pending_bytes.clone_from(&self.pending_bytes);
+        snapshot.styles.clone_from(&self.styles);
+        Ok(())
+    }
+}
+
+const fn default_autowrap() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum GridDeltaApplyError {
+    #[error("grid delta base revision mismatch: expected {expected}, actual {actual}")]
+    RevisionMismatch { expected: u64, actual: u64 },
+    #[error("grid delta row index {0} is outside the retained row set")]
+    RowIndexOutOfBounds(u32),
 }
 
 #[cfg(test)]
@@ -107,5 +188,20 @@ mod tests {
 
         assert!(delta.reset_rows);
         assert_eq!(delta.row_updates.len(), after.rows.len());
+    }
+
+    #[test]
+    fn delta_applies_to_snapshot() {
+        let mut grid = TerminalGrid::new(10, 2, GridLimits::default()).unwrap();
+        let mut snapshot = grid.snapshot(0, 10);
+        grid.process(b"hello");
+        let after = grid.snapshot(0, 10);
+        let delta = GridDeltaBatch::between(&snapshot, &after).expect("revision changed");
+
+        delta
+            .apply_to_snapshot(&mut snapshot)
+            .expect("delta should apply to base snapshot");
+
+        assert_eq!(snapshot, after);
     }
 }

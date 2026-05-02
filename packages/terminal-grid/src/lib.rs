@@ -16,9 +16,9 @@ mod reflow;
 mod snapshot;
 mod style;
 
-pub use delta::{GridDeltaBatch, RowUpdateSnapshot};
+pub use delta::{GridDeltaApplyError, GridDeltaBatch, RowUpdateSnapshot};
 pub use model::{Cell, Cursor, GridLimits, GridMode, PhysicalRow, TerminalGrid, TerminalGridError};
-pub use parser::TerminalGridStream;
+pub use parser::{TerminalGridStream, TerminalGridStreamDeltaError};
 pub use snapshot::{
     CellRunSnapshot, CursorSnapshot, GridSnapshot, RowSnapshot, ScrollRegionSnapshot,
 };

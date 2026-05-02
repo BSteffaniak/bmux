@@ -24,7 +24,7 @@ use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::SessionManagerHandle;
 use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotDirtyFlagHandle};
-use bmux_terminal_grid::{GridLimits, TerminalGridStream};
+use bmux_terminal_grid::{GridDeltaBatch, GridLimits, TerminalGridStream};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -40,6 +40,7 @@ use uuid::Uuid;
 type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
 
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
+const MAX_TERMINAL_GRID_DELTA_BATCHES: usize = 1_024;
 const RESPONSE_METADATA_HEADROOM: usize = 65_536;
 const RESPONSE_OUTPUT_BUDGET: usize =
     bmux_ipc::frame::MAX_FRAME_PAYLOAD_SIZE - RESPONSE_METADATA_HEADROOM;
@@ -229,6 +230,7 @@ struct PaneRuntimeHandle {
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
     output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
     terminal_grid: Arc<std::sync::Mutex<TerminalGridStream>>,
+    terminal_grid_deltas: Arc<std::sync::Mutex<VecDeque<GridDeltaBatch>>>,
     exited: Arc<AtomicBool>,
     last_requested_size: Arc<std::sync::Mutex<(u16, u16)>>,
     /// Set to `true` by the PTY reader when new output arrives. The broadcast
@@ -1259,6 +1261,18 @@ $env.config = (
 "#
 }
 
+fn push_terminal_grid_delta(
+    deltas: &Arc<std::sync::Mutex<VecDeque<GridDeltaBatch>>>,
+    delta: GridDeltaBatch,
+) {
+    if let Ok(mut deltas) = deltas.lock() {
+        deltas.push_back(delta);
+        while deltas.len() > MAX_TERMINAL_GRID_DELTA_BATCHES {
+            deltas.pop_front();
+        }
+    }
+}
+
 impl PaneRuntimeHandle {
     fn send_input(&self, data: Vec<u8>) -> std::result::Result<(), SessionRuntimeError> {
         self.input_tx
@@ -1270,8 +1284,10 @@ impl PaneRuntimeHandle {
         if let Ok(mut last) = self.last_requested_size.lock() {
             *last = (rows, cols);
         }
-        if let Ok(mut grid) = self.terminal_grid.lock() {
-            let _ = grid.resize_delta(cols, rows);
+        if let Ok(mut grid) = self.terminal_grid.lock()
+            && let Ok(Some(delta)) = grid.resize_delta(cols, rows)
+        {
+            push_terminal_grid_delta(&self.terminal_grid_deltas, delta);
         }
         let _ = self
             .input_tx
@@ -2438,6 +2454,8 @@ impl SessionRuntimeManager {
                 .expect("default pane terminal grid dimensions are valid"),
         ));
         let terminal_grid_for_reader = Arc::clone(&terminal_grid);
+        let terminal_grid_deltas = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let terminal_grid_deltas_for_reader = Arc::clone(&terminal_grid_deltas);
         let last_requested_size = Arc::new(std::sync::Mutex::new((24_u16, 80_u16)));
         let shell = pane_meta.shell.clone();
         let launch = pane_meta.launch.clone();
@@ -2810,7 +2828,12 @@ impl SessionRuntimeManager {
                                     .store(terminal_mode_tracker.sync_update, Ordering::SeqCst);
 
                                 if let Ok(mut grid) = terminal_grid_for_reader.lock() {
-                                    grid.process(chunk);
+                                    if let Some(delta) = grid.process_delta(chunk) {
+                                        push_terminal_grid_delta(
+                                            &terminal_grid_deltas_for_reader,
+                                            delta,
+                                        );
+                                    }
                                 } else {
                                     break;
                                 }
@@ -2961,6 +2984,7 @@ impl SessionRuntimeManager {
             input_tx,
             output_buffer,
             terminal_grid,
+            terminal_grid_deltas,
             exited,
             last_requested_size,
             output_dirty,
@@ -4951,6 +4975,85 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         .unwrap_or(Err(SessionRuntimeError::Closed))
     }
 
+    fn attach_grid_delta_state(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_ids: &[Uuid],
+        base_revisions: &[u64],
+        max_batches_per_pane: usize,
+    ) -> Result<bmux_pane_runtime_state::AttachGridDeltaState, SessionRuntimeError> {
+        self.with_lock(|m| {
+            let session = m
+                .runtimes
+                .get(&session_id)
+                .ok_or(SessionRuntimeError::NotFound)?;
+            if !session.attached_clients.contains(&client_id) {
+                return Err(SessionRuntimeError::NotAttached);
+            }
+            let mut deltas = Vec::new();
+            let mut seen = BTreeSet::new();
+            for (index, pane_id) in pane_ids.iter().enumerate() {
+                if !seen.insert(*pane_id) {
+                    continue;
+                }
+                let Some(pane) = session.panes.get(pane_id) else {
+                    continue;
+                };
+                let base_revision = base_revisions.get(index).copied().unwrap_or_default();
+                let current_revision = pane
+                    .terminal_grid
+                    .lock()
+                    .map_err(|_| SessionRuntimeError::Closed)?
+                    .grid()
+                    .revision();
+                let (encoded, revision, desynced) = if base_revision == current_revision {
+                    (Vec::new(), current_revision, false)
+                } else {
+                    let log = pane
+                        .terminal_grid_deltas
+                        .lock()
+                        .map_err(|_| SessionRuntimeError::Closed)?;
+                    let Some(start) = log
+                        .iter()
+                        .position(|delta| delta.base_revision == base_revision)
+                    else {
+                        deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
+                            pane_id: *pane_id,
+                            base_revision,
+                            revision: current_revision,
+                            desynced: true,
+                            encoded: Vec::new(),
+                        });
+                        continue;
+                    };
+                    let selected = log
+                        .iter()
+                        .skip(start)
+                        .take(max_batches_per_pane.max(1))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let revision = selected
+                        .last()
+                        .map_or(base_revision, |delta| delta.revision);
+                    let desynced = revision != current_revision;
+                    let encoded =
+                        serde_json::to_vec(&selected).map_err(|_| SessionRuntimeError::Closed)?;
+                    (encoded, revision, desynced)
+                };
+                deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
+                    pane_id: *pane_id,
+                    base_revision,
+                    revision,
+                    desynced,
+                    encoded,
+                });
+            }
+            Ok(bmux_pane_runtime_state::AttachGridDeltaState { deltas })
+        })
+        .unwrap_or(Err(SessionRuntimeError::Closed))
+    }
+
     fn pane_state(&self, session_id: SessionId, pane_id: Uuid) -> Option<PaneState> {
         self.with_lock_read(|m| {
             m.runtimes
@@ -5662,6 +5765,7 @@ mod tests {
                 TerminalGridStream::new(1, 1, GridLimits::default())
                     .expect("dummy pane terminal grid dimensions are valid"),
             )),
+            terminal_grid_deltas: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             exited: Arc::new(AtomicBool::new(false)),
             last_requested_size: Arc::new(std::sync::Mutex::new((1, 1))),
             output_dirty: Arc::new(AtomicBool::new(false)),

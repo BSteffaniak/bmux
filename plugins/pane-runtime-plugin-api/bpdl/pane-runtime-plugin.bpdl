@@ -457,6 +457,18 @@ interface attach-runtime-state {
         snapshots: list<pane-grid-snapshot>,
     }
 
+    record pane-grid-delta {
+        pane_id: uuid,
+        base_revision: u64,
+        revision: u64,
+        desynced: bool,
+        encoded: list<u8>,
+    }
+
+    record attach-pane-grid-delta {
+        deltas: list<pane-grid-delta>,
+    }
+
     record attach-pane-images {
         // JSON-encoded `Vec<AttachPaneImageDelta>`.
         encoded: list<u8>,
@@ -494,6 +506,13 @@ interface attach-runtime-state {
         pane_ids: list<uuid>,
         max_rows_per_pane: u32,
     ) -> result<attach-pane-grid-snapshot, attach-state-error>;
+
+    query attach-pane-grid-delta-state(
+        session_id: uuid,
+        pane_ids: list<uuid>,
+        base_revisions: list<u64>,
+        max_batches_per_pane: u32,
+    ) -> result<attach-pane-grid-delta, attach-state-error>;
 
     query attach-pane-images(
         session_id: uuid,

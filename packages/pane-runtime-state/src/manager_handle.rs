@@ -85,6 +85,22 @@ pub struct AttachGridSnapshotState {
     pub snapshots: Vec<AttachPaneGridSnapshot>,
 }
 
+/// Structured terminal-grid delta batches for one pane.
+#[derive(Debug, Clone)]
+pub struct AttachPaneGridDelta {
+    pub pane_id: Uuid,
+    pub base_revision: u64,
+    pub revision: u64,
+    pub desynced: bool,
+    pub encoded: Vec<u8>,
+}
+
+/// Structured terminal-grid delta DTO.
+#[derive(Debug, Clone)]
+pub struct AttachGridDeltaState {
+    pub deltas: Vec<AttachPaneGridDelta>,
+}
+
 /// Process identity for a running pane runtime. `pid` is the spawned
 /// shell/process id; `process_group_id` is the platform process-group
 /// root when available.
@@ -340,6 +356,15 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         pane_ids: &[Uuid],
         max_rows_per_pane: usize,
     ) -> Result<AttachGridSnapshotState, SessionRuntimeError>;
+
+    fn attach_grid_delta_state(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_ids: &[Uuid],
+        base_revisions: &[u64],
+        max_batches_per_pane: usize,
+    ) -> Result<AttachGridDeltaState, SessionRuntimeError>;
 
     /// Composite: clear `image_dirty` on each pane, then compute image
     /// registry deltas per pane since the provided sequence numbers.
@@ -775,6 +800,16 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _pane_ids: &[Uuid],
         _max_rows_per_pane: usize,
     ) -> Result<AttachGridSnapshotState, SessionRuntimeError> {
+        Err(SessionRuntimeError::NotFound)
+    }
+    fn attach_grid_delta_state(
+        &self,
+        _session_id: SessionId,
+        _client_id: ClientId,
+        _pane_ids: &[Uuid],
+        _base_revisions: &[u64],
+        _max_batches_per_pane: usize,
+    ) -> Result<AttachGridDeltaState, SessionRuntimeError> {
         Err(SessionRuntimeError::NotFound)
     }
     fn attach_pane_image_deltas(

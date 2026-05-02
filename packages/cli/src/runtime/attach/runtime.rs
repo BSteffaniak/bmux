@@ -85,12 +85,14 @@ use super::state::{
     AttachViewState, PaneRect, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{
-    BmuxPaneRuntimeClientExt, attach_pane_grid_snapshot_state_streaming,
+    BmuxPaneRuntimeClientExt, attach_pane_grid_delta_state_streaming,
+    attach_pane_grid_snapshot_state_streaming,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_GRID_SNAPSHOT_MAX_ROWS_PER_PANE: usize = u32::MAX as usize;
+const ATTACH_GRID_DELTA_MAX_BATCHES_PER_PANE: usize = 128;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
 const ATTACH_PLUGIN_STATUS_MESSAGE_MAX_CHARS: usize = 180;
@@ -2615,6 +2617,10 @@ pub async fn run_session_attach_with_client(
                     }
                 }
             }
+            if apply_attach_structured_grid_deltas(&mut client, &mut view_state, pane_ids).await? {
+                frame_needs_render = true;
+            }
+
             // Keep output pending if the last round still produced bytes OR
             // if any pane is mid-synchronized-update so the next iteration
             // re-enters the drain immediately.
@@ -2729,6 +2735,12 @@ pub async fn run_session_attach_with_client(
         )
         .await?;
     }
+
+    // Stop the crossterm event stream before terminal restoration and async
+    // runtime shutdown. Leaving it alive until the end of the function can keep
+    // its terminal reader task around after a normal detach under pseudo-TTY
+    // harnesses such as `script(1)`.
+    drop(terminal_stream);
 
     if perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
         let mut payload = serde_json::json!({
@@ -6612,6 +6624,94 @@ pub async fn hydrate_attach_state_from_snapshot(
 enum SnapshotHydrationMode {
     Incremental,
     FullResync,
+}
+
+async fn apply_attach_structured_grid_deltas(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    pane_ids: Vec<Uuid>,
+) -> std::result::Result<bool, ClientError> {
+    if pane_ids.is_empty() {
+        return Ok(false);
+    }
+    let base_revisions = pane_ids
+        .iter()
+        .map(|pane_id| {
+            view_state
+                .pane_buffers
+                .get(pane_id)
+                .map_or(0, |buffer| buffer.terminal_grid.grid().revision())
+        })
+        .collect::<Vec<_>>();
+    let deltas = match attach_pane_grid_delta_state_streaming(
+        client,
+        view_state.attached_id,
+        pane_ids,
+        base_revisions,
+        ATTACH_GRID_DELTA_MAX_BATCHES_PER_PANE,
+    )
+    .await
+    {
+        Ok(deltas) => deltas,
+        Err(error) => {
+            tracing::debug!(%error, "structured pane grid delta unavailable; continuing with local raw-fed grid");
+            return Ok(false);
+        }
+    };
+
+    let mut needs_snapshot = Vec::new();
+    let mut applied_any = false;
+    for delta_result in deltas {
+        if delta_result.desynced {
+            needs_snapshot.push(delta_result.pane_id);
+            continue;
+        }
+        if delta_result.encoded.is_empty() {
+            continue;
+        }
+        let batches = match serde_json::from_slice::<Vec<bmux_terminal_grid::GridDeltaBatch>>(
+            &delta_result.encoded,
+        ) {
+            Ok(batches) => batches,
+            Err(error) => {
+                tracing::warn!(pane_id = %delta_result.pane_id, %error, "failed decoding structured pane grid deltas");
+                needs_snapshot.push(delta_result.pane_id);
+                continue;
+            }
+        };
+        let mut pane_applied = false;
+        {
+            let buffer = view_state
+                .pane_buffers
+                .entry(delta_result.pane_id)
+                .or_default();
+            for batch in &batches {
+                if let Err(error) = buffer
+                    .terminal_grid
+                    .apply_delta(batch, bmux_terminal_grid::GridLimits::default())
+                {
+                    tracing::warn!(pane_id = %delta_result.pane_id, %error, "failed applying structured pane grid delta");
+                    needs_snapshot.push(delta_result.pane_id);
+                    break;
+                }
+                pane_applied = true;
+            }
+            if pane_applied {
+                buffer.prev_rows.clear();
+            }
+        }
+        if pane_applied {
+            applied_any = true;
+            view_state
+                .dirty
+                .mark_pane_dirty(delta_result.pane_id, AttachDirtySource::PaneOutput);
+        }
+    }
+    if !needs_snapshot.is_empty() {
+        hydrate_attach_structured_grid_snapshots(client, view_state, needs_snapshot).await?;
+        applied_any = true;
+    }
+    Ok(applied_any)
 }
 
 async fn hydrate_attach_structured_grid_snapshots(

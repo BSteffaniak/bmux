@@ -1,4 +1,4 @@
-use crate::delta::GridDeltaBatch;
+use crate::delta::{GridDeltaApplyError, GridDeltaBatch};
 use crate::model::{GridLimits, GridMode, TerminalGrid, TerminalGridError};
 use vte::{Params, Perform};
 
@@ -94,6 +94,24 @@ impl TerminalGridStream {
         snapshot
     }
 
+    /// Apply a structured delta by rebuilding the stream from the resulting
+    /// snapshot. This keeps parser-prefix state in sync with the producer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the delta does not apply to the current revision
+    /// or the resulting snapshot is invalid.
+    pub fn apply_delta(
+        &mut self,
+        delta: &GridDeltaBatch,
+        limits: GridLimits,
+    ) -> Result<(), TerminalGridStreamDeltaError> {
+        let mut snapshot = self.snapshot(0, usize::MAX);
+        delta.apply_to_snapshot(&mut snapshot)?;
+        *self = Self::from_snapshot(&snapshot, limits)?;
+        Ok(())
+    }
+
     /// Process one chunk and return a structured row delta when state changed.
     #[must_use]
     pub fn process_delta(&mut self, bytes: &[u8]) -> Option<GridDeltaBatch> {
@@ -118,6 +136,14 @@ impl TerminalGridStream {
         let after = self.grid.snapshot(0, usize::MAX);
         Ok(GridDeltaBatch::between(&before, &after))
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TerminalGridStreamDeltaError {
+    #[error(transparent)]
+    Delta(#[from] GridDeltaApplyError),
+    #[error(transparent)]
+    Grid(#[from] TerminalGridError),
 }
 
 pub(crate) fn process(grid: &mut TerminalGrid, bytes: &[u8]) {

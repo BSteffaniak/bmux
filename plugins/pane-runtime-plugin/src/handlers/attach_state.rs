@@ -11,10 +11,10 @@ use bmux_attach_layout_protocol::{
     PaneSummary,
 };
 use bmux_pane_runtime_plugin_api::attach_runtime_state::{
-    AttachLayout as AttachLayoutRecord, AttachPaneGridSnapshot, AttachPaneImages,
-    AttachPaneOutputBatch, AttachPaneSnapshot as AttachPaneSnapshotRecord,
-    AttachSnapshot as AttachSnapshotRecord, AttachStateError, PaneChunk, PaneGridSnapshot,
-    PaneInputMode, PaneMouseProtocol,
+    AttachLayout as AttachLayoutRecord, AttachPaneGridDelta, AttachPaneGridSnapshot,
+    AttachPaneImages, AttachPaneOutputBatch, AttachPaneSnapshot as AttachPaneSnapshotRecord,
+    AttachSnapshot as AttachSnapshotRecord, AttachStateError, PaneChunk, PaneGridDelta,
+    PaneGridSnapshot, PaneInputMode, PaneMouseProtocol,
 };
 use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
@@ -51,6 +51,14 @@ pub struct AttachPaneGridSnapshotArgs {
     pub session_id: Uuid,
     pub pane_ids: Vec<Uuid>,
     pub max_rows_per_pane: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachPaneGridDeltaArgs {
+    pub session_id: Uuid,
+    pub pane_ids: Vec<Uuid>,
+    pub base_revisions: Vec<u64>,
+    pub max_batches_per_pane: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +240,37 @@ pub fn attach_pane_grid_snapshot_state(
 
 /// `attach-pane-images` delivers image-registry deltas serialized as
 /// JSON (`Vec<AttachPaneImageDelta>`).
+pub fn attach_pane_grid_delta_state(
+    req: &AttachPaneGridDeltaArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachPaneGridDelta, AttachStateError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let state = handle
+        .0
+        .attach_grid_delta_state(
+            SessionId(req.session_id),
+            caller_client_id(ctx),
+            &req.pane_ids,
+            &req.base_revisions,
+            req.max_batches_per_pane as usize,
+        )
+        .map_err(|_| AttachStateError::NotAttached)?;
+    Ok(AttachPaneGridDelta {
+        deltas: state
+            .deltas
+            .into_iter()
+            .map(|delta| PaneGridDelta {
+                pane_id: delta.pane_id,
+                base_revision: delta.base_revision,
+                revision: delta.revision,
+                desynced: delta.desynced,
+                encoded: delta.encoded,
+            })
+            .collect(),
+    })
+}
+
 pub fn attach_pane_images(
     req: &AttachPaneImagesArgs,
     _ctx: &NativeServiceContext,
