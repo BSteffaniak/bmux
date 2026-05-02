@@ -70,7 +70,7 @@ use super::super::{
 };
 use super::adapters::{AttachClock, SystemAttachClock};
 use super::cursor::apply_attach_cursor_state;
-use super::events::{AttachLoopControl, AttachLoopEvent};
+use super::events::{AttachLoopControl, AttachLoopEvent, AttachTerminalEvent};
 use super::input::{
     TerminalGeometry, TerminalInputEvent, TerminalMouseButton, TerminalMouseEvent,
     TerminalMousePhase,
@@ -2116,11 +2116,15 @@ pub async fn run_session_attach_with_client(
                     exit_reason = AttachExitReason::StreamClosed;
                     break;
                 };
-                let terminal_event = result.context("failed reading terminal event")?;
+                let terminal_event = AttachTerminalEvent::from_crossterm(
+                    result.context("failed reading terminal event")?,
+                    SystemAttachClock.now(),
+                    current_attach_terminal_geometry(),
+                );
                 perf_window.record_wake(AttachWakeSource::Terminal);
 
-                if let Event::Resize(cols, rows) = terminal_event {
-                    display_capture.record_resize(cols, rows);
+                if let Some(TerminalInputEvent::Resize { cols, rows }) = &terminal_event.normalized {
+                    display_capture.record_resize(*cols, *rows);
                 }
 
                 match handle_attach_loop_event(
@@ -2471,8 +2475,8 @@ pub async fn run_session_attach_with_client(
                 true,
             ));
             let help_scroll = view_state.help_overlay_scroll;
-            let render_started_at = Instant::now();
-            let (cols, rows) = terminal::size().unwrap_or((0, 0));
+            let render_started_at = SystemAttachClock.now();
+            let render_geometry = current_attach_terminal_geometry();
             let frame_stats = render_attach_frame(
                 &mut client,
                 &mut view_state,
@@ -2488,7 +2492,7 @@ pub async fn run_session_attach_with_client(
                 attach_config.logs.client.slow_terminal_write_ms,
                 &mut display_capture,
                 render_started_at,
-                TerminalGeometry { cols, rows },
+                render_geometry,
                 None,
             )?;
             let render_ms = duration_millis_u64(render_started_at.elapsed());
@@ -2747,8 +2751,8 @@ pub async fn run_session_attach_with_client(
             false,
         ));
         let help_scroll = view_state.help_overlay_scroll;
-        let render_started_at = Instant::now();
-        let (cols, rows) = terminal::size().unwrap_or((0, 0));
+        let render_started_at = SystemAttachClock.now();
+        let render_geometry = current_attach_terminal_geometry();
         let frame_stats = render_attach_frame(
             &mut client,
             &mut view_state,
@@ -2764,7 +2768,7 @@ pub async fn run_session_attach_with_client(
             attach_config.logs.client.slow_terminal_write_ms,
             &mut display_capture,
             render_started_at,
-            TerminalGeometry { cols, rows },
+            render_geometry,
             None,
         )?;
         let render_ms = duration_millis_u64(render_started_at.elapsed());
@@ -7310,12 +7314,17 @@ pub fn attach_layout_requires_snapshot_hydration(
     bmux_attach_pipeline::reconcile::attach_layout_requires_snapshot_hydration(previous, next)
 }
 
+fn current_attach_terminal_geometry() -> TerminalGeometry {
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    TerminalGeometry { cols, rows }
+}
+
 pub fn resize_attach_grids_for_scene(
     pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
     scene: &AttachScene,
 ) {
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    resize_attach_grids_for_scene_with_size(pane_buffers, scene, cols, rows);
+    let geometry = current_attach_terminal_geometry();
+    resize_attach_grids_for_scene_with_size(pane_buffers, scene, geometry.cols, geometry.rows);
 }
 
 pub fn resize_attach_grids_for_scene_with_size(
@@ -7604,20 +7613,22 @@ pub fn attach_view_event_matches_target(
 #[allow(clippy::too_many_arguments)] // Attach event handling threads shared mutable runtime state through one hot path.
 pub async fn handle_attach_terminal_event(
     client: &mut StreamingBmuxClient,
-    terminal_event: Event,
+    terminal_event: AttachTerminalEvent,
     attach_input_processor: &mut InputProcessor,
     help_lines: &[String],
     view_state: &mut AttachViewState,
     display_capture: &mut DisplayCaptureFanout,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
-    let now = SystemAttachClock.now();
-    if matches!(terminal_event, Event::Resize(_, _)) {
+    let now = terminal_event.received_at;
+    let geometry = terminal_event.geometry;
+    let raw_event = terminal_event.raw;
+    if matches!(&raw_event, Event::Resize(_, _)) {
         update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
     }
 
     if view_state.prompt.is_active() {
-        match &terminal_event {
+        match &raw_event {
             Event::Key(key) if prompt_accepts_key_kind(key.kind) => {
                 match view_state.prompt.handle_key_event(key) {
                     PromptKeyDisposition::Completed(completion) => {
@@ -7638,8 +7649,8 @@ pub async fn handle_attach_terminal_event(
                 return Ok(AttachLoopControl::Continue);
             }
             Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => {
-                if let Event::Mouse(mouse) = terminal_event {
-                    match view_state.prompt.handle_mouse_event(mouse) {
+                if let Event::Mouse(mouse) = &raw_event {
+                    match view_state.prompt.handle_mouse_event(*mouse) {
                         PromptKeyDisposition::Completed(completion) => {
                             if let Some(control) = handle_attach_prompt_completion_at(
                                 client, view_state, completion, now,
@@ -7664,13 +7675,13 @@ pub async fn handle_attach_terminal_event(
     }
 
     if view_state.help_overlay_open
-        && let Event::Key(key) = &terminal_event
+        && let Event::Key(key) = &raw_event
         && handle_help_overlay_key_event(key, help_lines, view_state)
     {
         return Ok(AttachLoopControl::Continue);
     }
 
-    if matches!(terminal_event, Event::Key(_)) {
+    if matches!(&raw_event, Event::Key(_)) {
         let focused_input_mode = focused_attach_pane_input_mode(view_state);
         attach_input_processor.set_pane_input_mode(
             focused_input_mode.application_cursor,
@@ -7679,7 +7690,7 @@ pub async fn handle_attach_terminal_event(
     }
 
     for attach_action in
-        attach_event_actions(&terminal_event, attach_input_processor, view_state.ui_mode)?
+        attach_event_actions(&raw_event, attach_input_processor, view_state.ui_mode)?
     {
         match attach_action {
             AttachEventAction::Detach => {
@@ -7736,11 +7747,13 @@ pub async fn handle_attach_terminal_event(
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }
             AttachEventAction::Mouse(mouse_event) => {
-                if let Err(error) = handle_attach_mouse_event(
+                if let Err(error) = handle_attach_mouse_event_at(
                     client,
                     mouse_event,
                     view_state,
                     kernel_client_factory,
+                    now,
+                    geometry,
                 )
                 .await
                 {
@@ -8263,24 +8276,6 @@ pub const fn record_attach_mouse_event(
 ) {
     view_state.mouse.last_position = Some((mouse_event.column, mouse_event.row));
     view_state.mouse.last_event_at = Some(now);
-}
-
-pub async fn handle_attach_mouse_event(
-    client: &mut StreamingBmuxClient,
-    mouse_event: MouseEvent,
-    view_state: &mut AttachViewState,
-    kernel_client_factory: Option<&KernelClientFactory>,
-) -> std::result::Result<(), ClientError> {
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    handle_attach_mouse_event_at(
-        client,
-        mouse_event,
-        view_state,
-        kernel_client_factory,
-        SystemAttachClock.now(),
-        TerminalGeometry { cols, rows },
-    )
-    .await
 }
 
 #[allow(clippy::too_many_lines)]
