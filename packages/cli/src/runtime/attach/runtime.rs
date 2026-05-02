@@ -79,10 +79,10 @@ use super::render::{
     render_attach_scene_with_stats_and_trace, visible_scene_pane_ids,
 };
 use super::state::{
-    AttachDirtySource, AttachEventAction, AttachExitReason, AttachMouseResizeAxisDrag,
-    AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag, AttachScrollbackCursor,
-    AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget, AttachUiMode,
-    AttachViewState, PaneRect, PaneRenderBuffer,
+    AttachDirtySource, AttachEventAction, AttachExitReason, AttachMouseFloatingDrag,
+    AttachMouseResizeAxisDrag, AttachMouseResizeDrag, AttachMouseSelectionDrag, AttachMouseTabDrag,
+    AttachScrollbackCursor, AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget,
+    AttachUiMode, AttachViewState, PaneRect, PaneRenderBuffer,
 };
 use crate::pane_runtime_client::{
     BmuxPaneRuntimeClientExt, attach_pane_grid_delta_state_streaming,
@@ -7920,11 +7920,13 @@ pub async fn handle_attach_mouse_event(
 
     if !view_state.mouse.config.enabled {
         view_state.mouse.resize_drag = None;
+        view_state.mouse.floating_drag = None;
         view_state.mouse.tab_drag = None;
         return Ok(());
     }
     if view_state.help_overlay_open || view_state.prompt.is_active() {
         view_state.mouse.resize_drag = None;
+        view_state.mouse.floating_drag = None;
         view_state.mouse.tab_drag = None;
         return Ok(());
     }
@@ -7937,11 +7939,16 @@ pub async fn handle_attach_mouse_event(
 
     if !view_state.can_write {
         view_state.mouse.resize_drag = None;
+        view_state.mouse.floating_drag = None;
         view_state.mouse.tab_drag = None;
         return Ok(());
     }
 
     if handle_attach_mouse_resize_drag(client, view_state, mouse_event).await? {
+        return Ok(());
+    }
+
+    if handle_attach_mouse_floating_drag(client, view_state, mouse_event).await? {
         return Ok(());
     }
 
@@ -8158,6 +8165,69 @@ pub async fn handle_attach_mouse_event(
     }
 
     Ok(())
+}
+
+async fn handle_attach_mouse_floating_drag(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+) -> std::result::Result<bool, ClientError> {
+    match mouse_event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(surface) = attach_scene_floating_drag_surface_at(
+                view_state,
+                mouse_event.column,
+                mouse_event.row,
+            ) else {
+                return Ok(false);
+            };
+            let Some(pane_id) = surface.pane_id else {
+                return Ok(false);
+            };
+            focus_attach_pane(client, view_state, pane_id).await?;
+            view_state.mouse.selection_drag = None;
+            let (scene_max_x, scene_max_y) =
+                attach_scene_bounds(view_state).unwrap_or((u16::MAX, u16::MAX));
+            view_state.mouse.floating_drag = Some(AttachMouseFloatingDrag {
+                pane_id,
+                start_x: surface.rect.x,
+                start_y: surface.rect.y,
+                width: surface.rect.w,
+                height: surface.rect.h,
+                scene_max_x,
+                scene_max_y,
+                last_x: surface.rect.x,
+                last_y: surface.rect.y,
+                start_column: mouse_event.column,
+                start_row: mouse_event.row,
+            });
+            Ok(true)
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(mut drag) = view_state.mouse.floating_drag.take() else {
+                return Ok(false);
+            };
+            let (x, y) = floating_drag_position(drag, mouse_event.column, mouse_event.row);
+            if x != drag.last_x || y != drag.last_y {
+                move_attach_floating_pane(client, view_state, drag.pane_id, x, y).await?;
+                drag.last_x = x;
+                drag.last_y = y;
+            }
+            view_state.mouse.floating_drag = Some(drag);
+            Ok(true)
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(drag) = view_state.mouse.floating_drag.take() else {
+                return Ok(false);
+            };
+            let (x, y) = floating_drag_position(drag, mouse_event.column, mouse_event.row);
+            if x != drag.last_x || y != drag.last_y {
+                move_attach_floating_pane(client, view_state, drag.pane_id, x, y).await?;
+            }
+            Ok(true)
+        }
+        _ => Ok(view_state.mouse.floating_drag.is_some()),
+    }
 }
 
 async fn handle_attach_mouse_resize_drag(
@@ -9343,9 +9413,95 @@ async fn resize_attach_pane(
     Ok(())
 }
 
+async fn move_attach_floating_pane(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    pane_id: Uuid,
+    x: u16,
+    y: u16,
+) -> std::result::Result<(), ClientError> {
+    let selector = attached_session_selector(view_state);
+    let _ack: bmux_windows_plugin_api::windows_commands::PaneAck = invoke_windows_command(
+        client,
+        "move-floating-pane",
+        &windows_commands::client::MoveFloatingPaneRequest {
+            session: Some(ipc_to_windows_selector(selector)),
+            target: pane_id_windows_selector(pane_id),
+            x,
+            y,
+        },
+    )
+    .await?;
+
+    view_state
+        .dirty
+        .mark_layout_frame_and_status_dirty(AttachDirtySource::LayoutChanged);
+    Ok(())
+}
+
 pub fn attach_scene_pane_at(view_state: &AttachViewState, column: u16, row: u16) -> Option<Uuid> {
     let layout_state = view_state.cached_layout_state.as_ref()?;
     attach_mouse::pane_at(&layout_state.scene, column, row)
+}
+
+fn attach_scene_floating_drag_surface_at(
+    view_state: &AttachViewState,
+    column: u16,
+    row: u16,
+) -> Option<AttachSurface> {
+    let layout_state = view_state.cached_layout_state.as_ref()?;
+    layout_state
+        .scene
+        .surfaces
+        .iter()
+        .filter(|surface| {
+            surface.visible
+                && surface.accepts_input
+                && matches!(surface.kind, AttachSurfaceKind::FloatingPane)
+                && attach_rect_contains(surface.rect, column, row)
+                && !attach_rect_contains(surface.content_rect, column, row)
+        })
+        .enumerate()
+        .max_by_key(|(index, surface)| (surface.layer, surface.z, *index))
+        .map(|(_, surface)| surface.clone())
+}
+
+fn floating_drag_position(drag: AttachMouseFloatingDrag, column: u16, row: u16) -> (u16, u16) {
+    let dx = i32::from(column) - i32::from(drag.start_column);
+    let dy = i32::from(row) - i32::from(drag.start_row);
+    let max_x = drag
+        .scene_max_x
+        .saturating_sub(drag.width.saturating_sub(1));
+    let max_y = drag
+        .scene_max_y
+        .saturating_sub(drag.height.saturating_sub(1));
+    (
+        u16::try_from((i32::from(drag.start_x) + dx).clamp(0, i32::from(max_x)))
+            .unwrap_or(u16::MAX),
+        u16::try_from((i32::from(drag.start_y) + dy).clamp(0, i32::from(max_y)))
+            .unwrap_or(u16::MAX),
+    )
+}
+
+fn attach_scene_bounds(view_state: &AttachViewState) -> Option<(u16, u16)> {
+    let layout_state = view_state.cached_layout_state.as_ref()?;
+    layout_state
+        .scene
+        .surfaces
+        .iter()
+        .filter(|surface| surface.visible)
+        .filter_map(|surface| Some((rect_max_x(surface.rect)?, rect_max_y(surface.rect)?)))
+        .reduce(|(max_x, max_y), (x, y)| (max_x.max(x), max_y.max(y)))
+}
+
+fn attach_rect_contains(rect: AttachRect, column: u16, row: u16) -> bool {
+    let Some(max_x) = rect_max_x(rect) else {
+        return false;
+    };
+    let Some(max_y) = rect_max_y(rect) else {
+        return false;
+    };
+    (rect.x..=max_x).contains(&column) && (rect.y..=max_y).contains(&row)
 }
 
 pub fn attach_scene_resize_separator_at(
@@ -11659,6 +11815,152 @@ mod tests {
             Some(background_pane)
         );
         assert_eq!(attach_scene_pane_at(&view_state, 30, 30), None);
+    }
+
+    #[test]
+    fn floating_drag_hit_testing_uses_border_not_content() {
+        let session_id = Uuid::new_v4();
+        let background_pane = Uuid::new_v4();
+        let floating_pane = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: background_pane,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf {
+                pane_id: background_pane,
+            },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane {
+                    pane_id: background_pane,
+                },
+                surfaces: vec![AttachSurface {
+                    id: Uuid::new_v4(),
+                    kind: AttachSurfaceKind::FloatingPane,
+                    layer: SurfaceLayer::FloatingPane,
+                    z: 1,
+                    rect: AttachRect {
+                        x: 2,
+                        y: 2,
+                        w: 8,
+                        h: 5,
+                    },
+                    content_rect: AttachRect {
+                        x: 3,
+                        y: 3,
+                        w: 6,
+                        h: 3,
+                    },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: false,
+                    pane_id: Some(floating_pane),
+                }],
+            },
+            zoomed: false,
+        });
+
+        assert_eq!(
+            attach_scene_floating_drag_surface_at(&view_state, 2, 2)
+                .and_then(|surface| surface.pane_id),
+            Some(floating_pane)
+        );
+        assert_eq!(
+            attach_scene_floating_drag_surface_at(&view_state, 4, 4),
+            None
+        );
+    }
+
+    #[test]
+    fn floating_drag_hit_testing_prefers_topmost_surface() {
+        let session_id = Uuid::new_v4();
+        let background_pane = Uuid::new_v4();
+        let low_floating = Uuid::new_v4();
+        let high_floating = Uuid::new_v4();
+        let floating_surface = |pane_id, z| AttachSurface {
+            id: Uuid::new_v4(),
+            kind: AttachSurfaceKind::FloatingPane,
+            layer: SurfaceLayer::FloatingPane,
+            z,
+            rect: AttachRect {
+                x: 2,
+                y: 2,
+                w: 8,
+                h: 5,
+            },
+            content_rect: AttachRect {
+                x: 3,
+                y: 3,
+                w: 6,
+                h: 3,
+            },
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner: false,
+            pane_id: Some(pane_id),
+        };
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: background_pane,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf {
+                pane_id: background_pane,
+            },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane {
+                    pane_id: background_pane,
+                },
+                surfaces: vec![
+                    floating_surface(low_floating, 1),
+                    floating_surface(high_floating, 2),
+                ],
+            },
+            zoomed: false,
+        });
+
+        assert_eq!(
+            attach_scene_floating_drag_surface_at(&view_state, 2, 2)
+                .and_then(|surface| surface.pane_id),
+            Some(high_floating)
+        );
+    }
+
+    #[test]
+    fn floating_drag_position_clamps_top_left_and_applies_delta() {
+        let drag = AttachMouseFloatingDrag {
+            pane_id: Uuid::new_v4(),
+            start_x: 5,
+            start_y: 4,
+            width: 8,
+            height: 5,
+            scene_max_x: 19,
+            scene_max_y: 9,
+            last_x: 5,
+            last_y: 4,
+            start_column: 10,
+            start_row: 10,
+        };
+
+        assert_eq!(floating_drag_position(drag, 12, 11), (7, 5));
+        assert_eq!(floating_drag_position(drag, 30, 30), (12, 5));
+        assert_eq!(floating_drag_position(drag, 0, 0), (0, 0));
     }
 
     #[test]

@@ -326,6 +326,7 @@ pub struct AttachMouseState {
     pub hovered_pane_id: Option<Uuid>,
     pub last_focused_pane_id: Option<Uuid>,
     pub resize_drag: Option<AttachMouseResizeDrag>,
+    pub floating_drag: Option<AttachMouseFloatingDrag>,
     pub selection_drag: Option<AttachMouseSelectionDrag>,
     pub tab_drag: Option<AttachMouseTabDrag>,
 }
@@ -341,6 +342,7 @@ impl Default for AttachMouseState {
             hovered_pane_id: None,
             last_focused_pane_id: None,
             resize_drag: None,
+            floating_drag: None,
             selection_drag: None,
             tab_drag: None,
         }
@@ -366,6 +368,21 @@ pub struct AttachTabDropTarget {
 pub enum AttachTabDropPlacement {
     Before,
     After,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachMouseFloatingDrag {
+    pub pane_id: Uuid,
+    pub start_x: u16,
+    pub start_y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub scene_max_x: u16,
+    pub scene_max_y: u16,
+    pub last_x: u16,
+    pub last_y: u16,
+    pub start_column: u16,
+    pub start_row: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
