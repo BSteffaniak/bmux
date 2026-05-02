@@ -11,7 +11,6 @@ clean = [
     "/**/dist",
     "/node_modules",
     "/**/node_modules",
-    "/.direnv",
     "/.codeql",
     "/.sst",
     "/**/.sst",
@@ -24,4 +23,9 @@ clean = [
     "/sandbox-artifacts",
     "/**/*.db",
     "/**/*.bak",
+]
+
+# Keep OpenCode's repo-local dependencies intact while still cleaning other node_modules dirs.
+cleanIgnore = [
+    "/.opencode/node_modules",
 ]
