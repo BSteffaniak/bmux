@@ -1,4 +1,4 @@
-use crate::model::{Cursor, GridMode, PhysicalRow, TerminalGrid};
+use crate::model::{Cursor, GridMode, PhysicalRow, ProtocolState, TerminalGrid};
 use crate::style::{Style, StyleId};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,8 @@ pub struct GridSnapshot {
     #[serde(default)]
     pub scroll_region: Option<ScrollRegionSnapshot>,
     #[serde(default)]
+    pub protocol: ProtocolState,
+    #[serde(default)]
     pub pending_bytes: Vec<u8>,
     pub styles: Vec<Style>,
     pub rows: Vec<RowSnapshot>,
@@ -90,6 +92,7 @@ impl GridSnapshot {
                     top: u16::try_from(top).unwrap_or(u16::MAX),
                     bottom: u16::try_from(bottom).unwrap_or(u16::MAX),
                 }),
+            protocol: grid.protocol_state(),
             pending_bytes: Vec::new(),
             styles: grid.palette().styles().to_vec(),
             rows: selected_rows,

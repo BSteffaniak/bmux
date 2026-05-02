@@ -5,11 +5,10 @@ use crate::reconcile::{
     resize_attach_parsers_for_scene_with_size,
 };
 use crate::render::{
-    DamageCoalescingPolicy, FrameDamage, append_pane_output, render_attach_scene,
-    visible_scene_pane_ids,
+    DamageCoalescingPolicy, FrameDamage, render_attach_scene, visible_scene_pane_ids,
 };
 use crate::types::{AttachCursorState, PaneRenderBuffer};
-use crate::{mouse_protocol_encoding_to_ipc, mouse_protocol_mode_to_ipc};
+use crate::update_protocol_hints_from_state;
 use anyhow::Result;
 use bmux_attach_layout_protocol::{
     AttachInputModeState, AttachMouseProtocolState, AttachPaneChunk,
@@ -20,7 +19,7 @@ use bmux_attach_pipeline_models::{
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState};
-use bmux_terminal_grid::{GridLimits, GridSnapshot, TerminalGridStream};
+use bmux_terminal_grid::{GridDeltaBatch, GridLimits, GridMode, GridSnapshot, TerminalGridStream};
 use crossterm::cursor::{Hide, SavePosition};
 use crossterm::queue;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
@@ -33,6 +32,12 @@ pub struct AttachPaneGridSnapshotState {
     pub pane_id: Uuid,
     pub stream_end: u64,
     pub snapshot: GridSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachPaneGridDeltaState {
+    pub pane_id: Uuid,
+    pub batches: Vec<GridDeltaBatch>,
 }
 
 pub struct AttachScenePipeline {
@@ -120,10 +125,10 @@ impl AttachScenePipeline {
         for chunk in chunks {
             let pane_id = chunk.pane_id;
             let buffer = self.pane_buffers.entry(pane_id).or_default();
-            let _ = append_pane_output(buffer, &chunk.data);
+            let _ = buffer.protocol_tracker.process(&chunk.data);
             buffer.sync_update_in_progress = chunk.sync_update_active;
             buffer.expected_stream_start = Some(chunk.stream_end);
-            update_parser_mode_hints(
+            sync_protocol_hints_from_buffer(
                 &mut self.pane_mouse_protocol_hints,
                 &mut self.pane_input_mode_hints,
                 pane_id,
@@ -156,10 +161,22 @@ impl AttachScenePipeline {
         for pane_snapshot in snapshots {
             let stream =
                 TerminalGridStream::from_snapshot(&pane_snapshot.snapshot, GridLimits::default())?;
+            let protocol = stream.grid().protocol_state();
+            let alternate_screen = stream.grid().mode() == GridMode::Alternate;
             let buffer = self.pane_buffers.entry(pane_snapshot.pane_id).or_default();
             buffer.terminal_grid = stream;
+            buffer.protocol_tracker.set_protocol_state(protocol);
+            buffer
+                .protocol_tracker
+                .set_alternate_screen(alternate_screen);
             buffer.expected_stream_start = Some(pane_snapshot.stream_end);
             buffer.prev_rows.clear();
+            sync_protocol_hints_from_buffer(
+                &mut self.pane_mouse_protocol_hints,
+                &mut self.pane_input_mode_hints,
+                pane_snapshot.pane_id,
+                buffer,
+            );
             self.dirty_pane_ids.insert(pane_snapshot.pane_id);
         }
         self.full_pane_redraw = true;
@@ -187,16 +204,15 @@ impl AttachScenePipeline {
                 continue;
             }
             let buffer = self.pane_buffers.entry(chunk.pane_id).or_default();
-            let _ = append_pane_output(buffer, &chunk.data);
+            let _ = buffer.protocol_tracker.process(&chunk.data);
             buffer.sync_update_in_progress = chunk.sync_update_active;
             buffer.expected_stream_start = Some(chunk.stream_end);
-            update_parser_mode_hints(
+            sync_protocol_hints_from_buffer(
                 &mut self.pane_mouse_protocol_hints,
                 &mut self.pane_input_mode_hints,
                 chunk.pane_id,
                 buffer,
             );
-            self.dirty_pane_ids.insert(chunk.pane_id);
         }
 
         self.push_diagnostic(
@@ -287,14 +303,14 @@ impl AttachScenePipeline {
                 sync_update_active: chunk.sync_update_active,
             },
             |buffer, bytes| {
-                let toggled_alternate = append_pane_output(buffer, bytes);
-                update_parser_mode_hints(
+                let protocol_outcome = buffer.protocol_tracker.process(bytes);
+                sync_protocol_hints_from_buffer(
                     &mut self.pane_mouse_protocol_hints,
                     &mut self.pane_input_mode_hints,
                     pane_id,
                     buffer,
                 );
-                if toggled_alternate {
+                if protocol_outcome.toggled_alternate {
                     self.full_pane_redraw = true;
                 }
                 !bytes.is_empty()
@@ -302,11 +318,7 @@ impl AttachScenePipeline {
         );
 
         match outcome {
-            AttachChunkApplyOutcome::Applied { had_data } => {
-                if had_data {
-                    self.dirty_pane_ids.insert(pane_id);
-                }
-            }
+            AttachChunkApplyOutcome::Applied { .. } => {}
             AttachChunkApplyOutcome::Stale => {
                 self.push_diagnostic(
                     AttachPipelineDiagnosticCode::ChunkStale,
@@ -324,6 +336,53 @@ impl AttachScenePipeline {
         }
 
         outcome
+    }
+
+    /// Apply authoritative structured terminal-grid deltas.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any delta cannot be applied to the local grid.
+    pub fn apply_pane_grid_deltas(&mut self, deltas: Vec<AttachPaneGridDeltaState>) -> Result<()> {
+        for pane_delta in deltas {
+            let buffer = self.pane_buffers.entry(pane_delta.pane_id).or_default();
+            let mut applied = false;
+            for batch in &pane_delta.batches {
+                buffer
+                    .terminal_grid
+                    .apply_delta(batch, GridLimits::default())?;
+                applied = true;
+            }
+            if applied {
+                let protocol = buffer.terminal_grid.grid().protocol_state();
+                let alternate_screen = buffer.terminal_grid.grid().mode() == GridMode::Alternate;
+                buffer.protocol_tracker.set_protocol_state(protocol);
+                buffer
+                    .protocol_tracker
+                    .set_alternate_screen(alternate_screen);
+                buffer.prev_rows.clear();
+                sync_protocol_hints_from_buffer(
+                    &mut self.pane_mouse_protocol_hints,
+                    &mut self.pane_input_mode_hints,
+                    pane_delta.pane_id,
+                    buffer,
+                );
+                self.dirty_pane_ids.insert(pane_delta.pane_id);
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn pane_grid_revisions(&self, pane_ids: &[Uuid]) -> Vec<u64> {
+        pane_ids
+            .iter()
+            .map(|pane_id| {
+                self.pane_buffers
+                    .get(pane_id)
+                    .map_or(0, |buffer| buffer.terminal_grid.grid().revision())
+            })
+            .collect()
     }
 
     /// Render a composed frame when any pane/layout state is dirty.
@@ -433,26 +492,17 @@ impl AttachScenePipeline {
     }
 }
 
-fn update_parser_mode_hints(
+fn sync_protocol_hints_from_buffer(
     pane_mouse_protocol_hints: &mut BTreeMap<Uuid, AttachMouseProtocolState>,
     pane_input_mode_hints: &mut BTreeMap<Uuid, AttachInputModeState>,
     pane_id: Uuid,
     buffer: &PaneRenderBuffer,
 ) {
-    let screen = buffer.parser.screen();
-    pane_mouse_protocol_hints.insert(
+    update_protocol_hints_from_state(
+        pane_mouse_protocol_hints,
+        pane_input_mode_hints,
         pane_id,
-        AttachMouseProtocolState {
-            mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
-            encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
-        },
-    );
-    pane_input_mode_hints.insert(
-        pane_id,
-        AttachInputModeState {
-            application_cursor: screen.application_cursor(),
-            application_keypad: screen.application_keypad(),
-        },
+        buffer.protocol_tracker.protocol_state(),
     );
 }
 

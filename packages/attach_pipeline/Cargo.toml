@@ -26,7 +26,9 @@ crossterm     = { workspace = true }
 tracing       = { workspace = true, features = ["std"] }
 unicode-width = { workspace = true }
 uuid          = { workspace = true, features = ["std"] }
-vt100         = { workspace = true }
+
+[dev-dependencies]
+vt100 = { workspace = true }
 
 [features]
 default = []

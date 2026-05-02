@@ -17,6 +17,84 @@ use uuid::Uuid;
 
 type ClientResult<T> = bmux_client::Result<T>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneGridSnapshotResult {
+    pub pane_id: Uuid,
+    pub stream_end: u64,
+    pub encoded: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneGridDeltaResult {
+    pub pane_id: Uuid,
+    pub base_revision: u64,
+    pub revision: u64,
+    pub desynced: bool,
+    pub encoded: Vec<u8>,
+}
+
+pub async fn attach_pane_grid_snapshot_state_streaming(
+    client: &mut bmux_client::StreamingBmuxClient,
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+    max_rows_per_pane: usize,
+) -> ClientResult<Vec<PaneGridSnapshotResult>> {
+    let max_rows_per_pane = u32::try_from(max_rows_per_pane).unwrap_or(u32::MAX);
+    match attach_state::client::attach_pane_grid_snapshot_state(
+        client,
+        session_id,
+        pane_ids,
+        max_rows_per_pane,
+    )
+    .await
+    {
+        Ok(Ok(state)) => Ok(state
+            .snapshots
+            .into_iter()
+            .map(|snapshot| PaneGridSnapshotResult {
+                pane_id: snapshot.pane_id,
+                stream_end: snapshot.stream_end,
+                encoded: snapshot.encoded,
+            })
+            .collect()),
+        Ok(Err(err)) => typed_server_error("attach-pane-grid-snapshot-state", err),
+        Err(err) => typed_dispatch_error("attach-pane-grid-snapshot-state", err),
+    }
+}
+
+pub async fn attach_pane_grid_delta_state_streaming(
+    client: &mut bmux_client::StreamingBmuxClient,
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+    base_revisions: Vec<u64>,
+    max_batches_per_pane: usize,
+) -> ClientResult<Vec<PaneGridDeltaResult>> {
+    let max_batches_per_pane = u32::try_from(max_batches_per_pane).unwrap_or(u32::MAX);
+    match attach_state::client::attach_pane_grid_delta_state(
+        client,
+        session_id,
+        pane_ids,
+        base_revisions,
+        max_batches_per_pane,
+    )
+    .await
+    {
+        Ok(Ok(state)) => Ok(state
+            .deltas
+            .into_iter()
+            .map(|delta| PaneGridDeltaResult {
+                pane_id: delta.pane_id,
+                base_revision: delta.base_revision,
+                revision: delta.revision,
+                desynced: delta.desynced,
+                encoded: delta.encoded,
+            })
+            .collect()),
+        Ok(Err(err)) => typed_server_error("attach-pane-grid-delta-state", err),
+        Err(err) => typed_dispatch_error("attach-pane-grid-delta-state", err),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct LayoutPayload {
     panes: Vec<PaneSummary>,

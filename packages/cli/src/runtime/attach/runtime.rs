@@ -4,9 +4,8 @@ use bmux_attach_layout_protocol::attach_layout_protocol::{
     AttachLayoutSnapshot, AttachSurfaceSummary, STATE_KIND as ATTACH_LAYOUT_STATE_KIND,
 };
 use bmux_attach_layout_protocol::{
-    AttachInputModeState, AttachLayer as SurfaceLayer, AttachMouseProtocolEncoding,
-    AttachMouseProtocolMode, AttachMouseProtocolState, AttachRect, AttachScene, AttachSurface,
-    AttachSurfaceKind,
+    AttachLayer as SurfaceLayer, AttachMouseProtocolEncoding, AttachMouseProtocolMode, AttachRect,
+    AttachScene, AttachSurface, AttachSurfaceKind,
 };
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
@@ -15,6 +14,7 @@ use bmux_attach_pipeline::reconcile::{
 };
 use bmux_attach_pipeline::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy, DamageRect,
+    update_protocol_hints_from_state,
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{
@@ -496,20 +496,11 @@ fn apply_attach_output_chunk(
 
             toggled_alternate =
                 super::render::append_pane_output(buffer, data) || toggled_alternate;
-            let screen = buffer.parser.screen();
-            pane_mouse_protocol_hints.insert(
+            update_protocol_hints_from_state(
+                pane_mouse_protocol_hints,
+                pane_input_mode_hints,
                 pane_id,
-                AttachMouseProtocolState {
-                    mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
-                    encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
-                },
-            );
-            pane_input_mode_hints.insert(
-                pane_id,
-                AttachInputModeState {
-                    application_cursor: screen.application_cursor(),
-                    application_keypad: screen.application_keypad(),
-                },
+                buffer.protocol_tracker.protocol_state(),
             );
             true
         },
@@ -536,20 +527,6 @@ fn bytes_contain_sequence(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
 }
 
-fn chunk_may_toggle_alternate_screen(bytes: &[u8]) -> bool {
-    const ALTERNATE_SCREEN_SEQUENCES: &[&[u8]] = &[
-        b"\x1b[?47h",
-        b"\x1b[?47l",
-        b"\x1b[?1047h",
-        b"\x1b[?1047l",
-        b"\x1b[?1049h",
-        b"\x1b[?1049l",
-    ];
-    ALTERNATE_SCREEN_SEQUENCES
-        .iter()
-        .any(|sequence| bytes_contain_sequence(bytes, sequence))
-}
-
 fn chunk_may_disable_mouse_protocol(bytes: &[u8]) -> bool {
     const MOUSE_DISABLE_SEQUENCES: &[&[u8]] = &[
         b"\x1b[?9l",
@@ -563,55 +540,6 @@ fn chunk_may_disable_mouse_protocol(bytes: &[u8]) -> bool {
     MOUSE_DISABLE_SEQUENCES
         .iter()
         .any(|sequence| bytes_contain_sequence(bytes, sequence))
-}
-
-fn chunk_may_disable_application_cursor(bytes: &[u8]) -> bool {
-    bytes_contain_sequence(bytes, b"\x1b[?1l")
-}
-
-fn chunk_may_disable_application_keypad(bytes: &[u8]) -> bool {
-    bytes_contain_sequence(bytes, b"\x1b>")
-}
-
-fn merge_protocol_only_mouse_hint(
-    previous: Option<AttachMouseProtocolState>,
-    parsed: AttachMouseProtocolState,
-    bytes: &[u8],
-) -> AttachMouseProtocolState {
-    if parsed.mode != AttachMouseProtocolMode::None
-        || previous.is_none_or(|hint| hint.mode == AttachMouseProtocolMode::None)
-        || chunk_may_disable_mouse_protocol(bytes)
-    {
-        parsed
-    } else {
-        previous.expect("checked previous mouse hint is present")
-    }
-}
-
-fn merge_protocol_only_input_hint(
-    previous: Option<AttachInputModeState>,
-    parsed: AttachInputModeState,
-    bytes: &[u8],
-) -> AttachInputModeState {
-    let previous = previous.unwrap_or_default();
-    AttachInputModeState {
-        application_cursor: if parsed.application_cursor
-            || !previous.application_cursor
-            || chunk_may_disable_application_cursor(bytes)
-        {
-            parsed.application_cursor
-        } else {
-            previous.application_cursor
-        },
-        application_keypad: if parsed.application_keypad
-            || !previous.application_keypad
-            || chunk_may_disable_application_keypad(bytes)
-        {
-            parsed.application_keypad
-        } else {
-            previous.application_keypad
-        },
-    }
 }
 
 fn apply_attach_output_chunk_protocol_only(
@@ -633,36 +561,27 @@ fn apply_attach_output_chunk_protocol_only(
                 return false;
             }
 
-            let was_alternate = buffer.last_alternate_screen;
-            buffer.parser.process(data);
-            let screen = buffer.parser.screen();
-            let is_alternate = screen.alternate_screen();
-            buffer.last_alternate_screen = is_alternate;
+            let previous_mouse_hint = pane_mouse_protocol_hints.get(&pane_id).copied();
+            let was_alternate = buffer.protocol_tracker.alternate_screen();
+            let protocol_outcome = buffer.protocol_tracker.process(data);
+            let is_alternate = buffer.protocol_tracker.alternate_screen();
             toggled_alternate = toggled_alternate
-                || was_alternate != is_alternate
-                || chunk_may_toggle_alternate_screen(data);
-
-            let parsed_mouse_hint = AttachMouseProtocolState {
-                mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
-                encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
-            };
-            let mouse_hint = merge_protocol_only_mouse_hint(
-                pane_mouse_protocol_hints.get(&pane_id).copied(),
-                parsed_mouse_hint,
-                data,
+                || protocol_outcome.toggled_alternate
+                || was_alternate != is_alternate;
+            update_protocol_hints_from_state(
+                pane_mouse_protocol_hints,
+                pane_input_mode_hints,
+                pane_id,
+                buffer.protocol_tracker.protocol_state(),
             );
-            pane_mouse_protocol_hints.insert(pane_id, mouse_hint);
-
-            let parsed_input_hint = AttachInputModeState {
-                application_cursor: screen.application_cursor(),
-                application_keypad: screen.application_keypad(),
-            };
-            let input_hint = merge_protocol_only_input_hint(
-                pane_input_mode_hints.get(&pane_id).copied(),
-                parsed_input_hint,
-                data,
-            );
-            pane_input_mode_hints.insert(pane_id, input_hint);
+            if pane_mouse_protocol_hints
+                .get(&pane_id)
+                .is_some_and(|hint| hint.mode == AttachMouseProtocolMode::None)
+                && !chunk_may_disable_mouse_protocol(data)
+                && let Some(previous) = previous_mouse_hint
+            {
+                pane_mouse_protocol_hints.insert(pane_id, previous);
+            }
             true
         },
     );
@@ -4587,12 +4506,12 @@ pub fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
     let Some(buffer) = focused_attach_pane_buffer(view_state) else {
         return false;
     };
-    let (row, col) = buffer.parser.screen().cursor_position();
+    let cursor = buffer.terminal_grid.grid().cursor();
     view_state.scrollback_active = true;
     view_state.scrollback_offset = 0;
     view_state.scrollback_cursor = Some(AttachScrollbackCursor {
-        row: usize::from(row).min(inner_h.saturating_sub(1)),
-        col: usize::from(col).min(inner_w.saturating_sub(1)),
+        row: cursor.row.min(inner_h.saturating_sub(1)),
+        col: cursor.col.min(inner_w.saturating_sub(1)),
     });
     view_state.selection_anchor = None;
     true
@@ -4874,26 +4793,63 @@ pub fn selected_attach_text(view_state: &mut AttachViewState) -> Option<String> 
     extract_attach_text(view_state, start, end)
 }
 
-#[allow(clippy::cast_possible_truncation)] // Terminal dimensions bounded by u16
 pub fn extract_attach_text(
     view_state: &mut AttachViewState,
     start: AttachScrollbackPosition,
     end: AttachScrollbackPosition,
 ) -> Option<String> {
     let buffer = focused_attach_pane_buffer(view_state)?;
-    let original_scrollback = buffer.parser.screen().scrollback();
-    buffer.parser.screen_mut().set_scrollback(start.row);
-    let text = buffer.parser.screen().contents_between(
-        0,
-        start.col as u16,
-        end.row.saturating_sub(start.row) as u16,
-        end.col.saturating_add(1) as u16,
-    );
-    buffer
-        .parser
-        .screen_mut()
-        .set_scrollback(original_scrollback);
-    Some(text)
+    let grid = buffer.terminal_grid.grid();
+    let width = grid.width();
+    if width == 0 {
+        return Some(String::new());
+    }
+    let selected_rows = end.row.saturating_sub(start.row).saturating_add(1);
+    let all_rows = grid.all_main_rows();
+    if all_rows.is_empty() {
+        return Some(String::new());
+    }
+    let display_end = all_rows.len().saturating_sub(start.row.min(all_rows.len()));
+    let display_start = display_end.saturating_sub(grid.height());
+    let rows = &all_rows[display_start..display_end];
+    if rows.is_empty() {
+        return Some(String::new());
+    }
+    let end_row = selected_rows
+        .saturating_sub(1)
+        .min(rows.len().saturating_sub(1));
+    let mut lines = Vec::with_capacity(end_row.saturating_add(1));
+    for (row_index, row) in rows.iter().enumerate().take(end_row.saturating_add(1)) {
+        let start_col = if row_index == 0 { start.col } else { 0 };
+        let end_col = if row_index == end_row {
+            end.col.saturating_add(1)
+        } else {
+            width
+        };
+        lines.push(grid_row_text_range(row, width, start_col, end_col));
+    }
+    Some(lines.join("\n"))
+}
+
+fn grid_row_text_range(
+    row: &bmux_terminal_grid::PhysicalRow,
+    width: usize,
+    start_col: usize,
+    end_col: usize,
+) -> String {
+    let mut text = String::new();
+    let start = start_col.min(width);
+    let end = end_col.min(width);
+    for col in start..end {
+        let Some(cell) = row.cells().get(col) else {
+            text.push(' ');
+            continue;
+        };
+        if !cell.is_wide_continuation() {
+            text.push_str(cell.text());
+        }
+    }
+    text.trim_end().to_string()
 }
 
 pub fn adjust_attach_scrollback_offset(current: usize, delta: isize, max_offset: usize) -> usize {
@@ -4908,19 +4864,12 @@ pub fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
     let Some(buffer) = focused_attach_pane_buffer(view_state) else {
         return 0;
     };
-    if buffer.terminal_grid.grid().revision() > 0 {
-        return buffer
-            .terminal_grid
-            .grid()
-            .all_main_rows()
-            .len()
-            .saturating_sub(buffer.terminal_grid.grid().height());
-    }
-    let previous = buffer.parser.screen().scrollback();
-    buffer.parser.screen_mut().set_scrollback(usize::MAX);
-    let max_offset = buffer.parser.screen().scrollback();
-    buffer.parser.screen_mut().set_scrollback(previous);
-    max_offset
+    buffer
+        .terminal_grid
+        .grid()
+        .all_main_rows()
+        .len()
+        .saturating_sub(buffer.terminal_grid.grid().height())
 }
 
 pub fn clamp_attach_scrollback_cursor(view_state: &mut AttachViewState) {
@@ -8648,34 +8597,14 @@ pub const fn should_forward_click_like_mouse(view_state: &AttachViewState) -> bo
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttachPaneMouseProtocol {
-    pub mode: vt100::MouseProtocolMode,
-    pub encoding: vt100::MouseProtocolEncoding,
+    pub mode: AttachMouseProtocolMode,
+    pub encoding: AttachMouseProtocolEncoding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct AttachPaneInputMode {
     pub application_cursor: bool,
     pub application_keypad: bool,
-}
-
-pub const fn mouse_protocol_mode_to_ipc(mode: vt100::MouseProtocolMode) -> AttachMouseProtocolMode {
-    match mode {
-        vt100::MouseProtocolMode::None => AttachMouseProtocolMode::None,
-        vt100::MouseProtocolMode::Press => AttachMouseProtocolMode::Press,
-        vt100::MouseProtocolMode::PressRelease => AttachMouseProtocolMode::PressRelease,
-        vt100::MouseProtocolMode::ButtonMotion => AttachMouseProtocolMode::ButtonMotion,
-        vt100::MouseProtocolMode::AnyMotion => AttachMouseProtocolMode::AnyMotion,
-    }
-}
-
-pub const fn mouse_protocol_encoding_to_ipc(
-    encoding: vt100::MouseProtocolEncoding,
-) -> AttachMouseProtocolEncoding {
-    match encoding {
-        vt100::MouseProtocolEncoding::Default => AttachMouseProtocolEncoding::Default,
-        vt100::MouseProtocolEncoding::Utf8 => AttachMouseProtocolEncoding::Utf8,
-        vt100::MouseProtocolEncoding::Sgr => AttachMouseProtocolEncoding::Sgr,
-    }
 }
 
 pub fn attach_pane_mouse_protocol(
@@ -8697,11 +8626,11 @@ pub fn attach_pane_input_mode(
     view_state: &AttachViewState,
     pane_id: Uuid,
 ) -> Option<AttachPaneInputMode> {
-    let parser_mode = view_state.pane_buffers.get(&pane_id).map(|buffer| {
-        let screen = buffer.parser.screen();
+    let structured_mode = view_state.pane_buffers.get(&pane_id).map(|buffer| {
+        let protocol = buffer.protocol_tracker.protocol_state();
         AttachPaneInputMode {
-            application_cursor: screen.application_cursor(),
-            application_keypad: screen.application_keypad(),
+            application_cursor: protocol.application_cursor,
+            application_keypad: protocol.application_keypad,
         }
     });
 
@@ -8714,12 +8643,12 @@ pub fn attach_pane_input_mode(
                 application_keypad: hint.application_keypad,
             });
 
-    match (parser_mode, hint_mode) {
-        (Some(parser), Some(hint)) => Some(AttachPaneInputMode {
-            application_cursor: parser.application_cursor || hint.application_cursor,
-            application_keypad: parser.application_keypad || hint.application_keypad,
+    match (structured_mode, hint_mode) {
+        (Some(structured), Some(hint)) => Some(AttachPaneInputMode {
+            application_cursor: structured.application_cursor || hint.application_cursor,
+            application_keypad: structured.application_keypad || hint.application_keypad,
         }),
-        (Some(parser), None) => Some(parser),
+        (Some(structured), None) => Some(structured),
         (None, Some(hint)) => Some(hint),
         (None, None) => None,
     }
@@ -8733,7 +8662,7 @@ pub fn focused_attach_pane_input_mode(view_state: &AttachViewState) -> AttachPan
 
 #[cfg(test)]
 pub const fn mouse_protocol_mode_reports_event(
-    mode: vt100::MouseProtocolMode,
+    mode: AttachMouseProtocolMode,
     kind: MouseEventKind,
 ) -> bool {
     attach_mouse::mode_reports_event(mode, mouse_event_kind_to_shared(kind))
@@ -9442,7 +9371,7 @@ pub fn attach_pane_uses_alternate_screen(view_state: &AttachViewState, pane_id: 
     view_state
         .pane_buffers
         .get(&pane_id)
-        .is_some_and(|buffer| buffer.parser.screen().alternate_screen())
+        .is_some_and(|buffer| buffer.protocol_tracker.alternate_screen())
 }
 
 pub fn maybe_begin_attach_mouse_selection_drag(
@@ -10232,8 +10161,8 @@ mod tests {
     use crate::status::AttachStatusTabHitbox;
 
     use bmux_attach_layout_protocol::{
-        AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        PaneLayoutNode, PaneState, PaneSummary,
+        AttachFocusTarget, AttachInputModeState, AttachMouseProtocolState, AttachRect, AttachScene,
+        AttachSurface, AttachSurfaceKind, PaneLayoutNode, PaneState, PaneSummary,
     };
     use bmux_attach_view_protocol::AttachViewComponent;
     use bmux_client::{AttachLayoutState, AttachOpenInfo};
@@ -10956,7 +10885,6 @@ mod tests {
             .pane_buffers
             .entry(pane_id)
             .or_insert_with(|| PaneRenderBuffer {
-                parser: vt100::Parser::new(4, 20, 4_096),
                 terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
                     20,
                     4,
@@ -11175,7 +11103,7 @@ mod tests {
             .pane_buffers
             .get(&pane_id)
             .expect("pane render buffer");
-        assert!(!buffer.parser.screen().alternate_screen());
+        assert!(!buffer.protocol_tracker.alternate_screen());
     }
 
     #[test]
@@ -11910,8 +11838,8 @@ mod tests {
         append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
 
         let protocol = attach_pane_mouse_protocol(&view_state, pane_id).expect("pane protocol");
-        assert_eq!(protocol.mode, vt100::MouseProtocolMode::PressRelease);
-        assert_eq!(protocol.encoding, vt100::MouseProtocolEncoding::Sgr);
+        assert_eq!(protocol.mode, AttachMouseProtocolMode::PressRelease);
+        assert_eq!(protocol.encoding, AttachMouseProtocolEncoding::Sgr);
     }
 
     #[test]
@@ -11928,8 +11856,8 @@ mod tests {
         );
 
         let protocol = attach_pane_mouse_protocol(&view_state, pane_id).expect("pane protocol");
-        assert_eq!(protocol.mode, vt100::MouseProtocolMode::AnyMotion);
-        assert_eq!(protocol.encoding, vt100::MouseProtocolEncoding::Sgr);
+        assert_eq!(protocol.mode, AttachMouseProtocolMode::AnyMotion);
+        assert_eq!(protocol.encoding, AttachMouseProtocolEncoding::Sgr);
     }
 
     #[test]
@@ -12043,8 +11971,8 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
             AttachPaneMouseProtocol {
-                mode: vt100::MouseProtocolMode::None,
-                encoding: vt100::MouseProtocolEncoding::Sgr,
+                mode: AttachMouseProtocolMode::None,
+                encoding: AttachMouseProtocolEncoding::Sgr,
             },
         );
         assert!(encoded.is_none());
@@ -12053,11 +11981,11 @@ mod tests {
     #[test]
     fn mouse_protocol_mode_reports_event_rejects_move_without_any_motion_mode() {
         assert!(!mouse_protocol_mode_reports_event(
-            vt100::MouseProtocolMode::PressRelease,
+            AttachMouseProtocolMode::PressRelease,
             MouseEventKind::Moved,
         ));
         assert!(mouse_protocol_mode_reports_event(
-            vt100::MouseProtocolMode::AnyMotion,
+            AttachMouseProtocolMode::AnyMotion,
             MouseEventKind::Moved,
         ));
     }
@@ -12065,11 +11993,11 @@ mod tests {
     #[test]
     fn mouse_protocol_mode_reports_event_rejects_release_in_press_mode() {
         assert!(!mouse_protocol_mode_reports_event(
-            vt100::MouseProtocolMode::Press,
+            AttachMouseProtocolMode::Press,
             MouseEventKind::Up(MouseButton::Left),
         ));
         assert!(mouse_protocol_mode_reports_event(
-            vt100::MouseProtocolMode::Press,
+            AttachMouseProtocolMode::Press,
             MouseEventKind::Down(MouseButton::Left),
         ));
     }
@@ -12084,8 +12012,8 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
             AttachPaneMouseProtocol {
-                mode: vt100::MouseProtocolMode::PressRelease,
-                encoding: vt100::MouseProtocolEncoding::Default,
+                mode: AttachMouseProtocolMode::PressRelease,
+                encoding: AttachMouseProtocolEncoding::Default,
             },
         )
         .expect("default-encoded mouse event");
@@ -12103,8 +12031,8 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
             AttachPaneMouseProtocol {
-                mode: vt100::MouseProtocolMode::PressRelease,
-                encoding: vt100::MouseProtocolEncoding::Default,
+                mode: AttachMouseProtocolMode::PressRelease,
+                encoding: AttachMouseProtocolEncoding::Default,
             },
         );
 
@@ -12121,8 +12049,8 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
             AttachPaneMouseProtocol {
-                mode: vt100::MouseProtocolMode::PressRelease,
-                encoding: vt100::MouseProtocolEncoding::Utf8,
+                mode: AttachMouseProtocolMode::PressRelease,
+                encoding: AttachMouseProtocolEncoding::Utf8,
             },
         )
         .expect("utf8-encoded mouse event");
@@ -12243,7 +12171,6 @@ mod tests {
             .pane_buffers
             .entry(pane_id)
             .or_insert_with(|| PaneRenderBuffer {
-                parser: vt100::Parser::new(40, 90, 4_096),
                 terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
                     90,
                     40,
@@ -12366,7 +12293,6 @@ mod tests {
             .pane_buffers
             .entry(pane_id)
             .or_insert_with(|| PaneRenderBuffer {
-                parser: vt100::Parser::new(38, 88, 4_096),
                 terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
                     88,
                     38,
@@ -12533,7 +12459,6 @@ mod tests {
             .pane_buffers
             .entry(pane_id)
             .or_insert_with(|| PaneRenderBuffer {
-                parser: vt100::Parser::new(6, 36, 4_096),
                 terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
                     36,
                     6,
@@ -14025,10 +13950,16 @@ mod tests {
             .get_mut(&pane_id)
             .expect("pane buffer should exist");
         append_pane_output(&mut *buffer, b"\x1b[999;999H");
-        let (row, col) = buffer.parser.screen().cursor_position();
+        let cursor = buffer.terminal_grid.grid().cursor();
 
-        assert_eq!(row, 46, "cursor row should clamp to pane inner height");
-        assert_eq!(col, 117, "cursor col should clamp to pane inner width");
+        assert_eq!(
+            cursor.row, 46,
+            "cursor row should clamp to pane inner height"
+        );
+        assert_eq!(
+            cursor.col, 117,
+            "cursor col should clamp to pane inner width"
+        );
     }
 
     #[test]

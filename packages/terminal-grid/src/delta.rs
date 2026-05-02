@@ -1,3 +1,4 @@
+use crate::model::ProtocolState;
 use crate::snapshot::{CursorSnapshot, GridSnapshot, RowSnapshot, ScrollRegionSnapshot};
 use crate::style::Style;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,8 @@ pub struct GridDeltaBatch {
     pub pending_wrap: bool,
     #[serde(default)]
     pub scroll_region: Option<ScrollRegionSnapshot>,
+    #[serde(default)]
+    pub protocol: ProtocolState,
     #[serde(default)]
     pub pending_bytes: Vec<u8>,
     pub styles: Vec<Style>,
@@ -90,6 +93,7 @@ impl GridDeltaBatch {
             autowrap: after.autowrap,
             pending_wrap: after.pending_wrap,
             scroll_region: after.scroll_region,
+            protocol: after.protocol,
             pending_bytes: after.pending_bytes.clone(),
             styles: after.styles.clone(),
             reset_rows,
@@ -139,6 +143,7 @@ impl GridDeltaBatch {
         snapshot.autowrap = self.autowrap;
         snapshot.pending_wrap = self.pending_wrap;
         snapshot.scroll_region = self.scroll_region;
+        snapshot.protocol = self.protocol;
         snapshot.pending_bytes.clone_from(&self.pending_bytes);
         snapshot.styles.clone_from(&self.styles);
         Ok(())

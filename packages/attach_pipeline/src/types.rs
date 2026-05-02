@@ -1,6 +1,6 @@
 use bmux_attach_layout_protocol::{AttachInputModeState, AttachMouseProtocolState};
 use bmux_plugin::{ExtensionRect, RenderDamage};
-use bmux_terminal_grid::{GridLimits, TerminalGridStream};
+use bmux_terminal_grid::{GridLimits, TerminalGridStream, TerminalProtocolTracker};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -41,9 +41,8 @@ pub struct ExtensionRenderCacheEntry {
 }
 
 pub struct PaneRenderBuffer {
-    pub parser: vt100::Parser,
     pub terminal_grid: TerminalGridStream,
-    pub last_alternate_screen: bool,
+    pub protocol_tracker: TerminalProtocolTracker,
     pub prev_rows: Vec<String>,
     pub sync_update_in_progress: bool,
     pub expected_stream_start: Option<u64>,
@@ -53,10 +52,9 @@ pub struct PaneRenderBuffer {
 impl Default for PaneRenderBuffer {
     fn default() -> Self {
         Self {
-            parser: vt100::Parser::new(24, 80, 4_096),
             terminal_grid: TerminalGridStream::new(80, 24, GridLimits::default())
                 .expect("default pane render grid dimensions are valid"),
-            last_alternate_screen: false,
+            protocol_tracker: TerminalProtocolTracker::new(),
             prev_rows: Vec::new(),
             sync_update_in_progress: false,
             expected_stream_start: None,

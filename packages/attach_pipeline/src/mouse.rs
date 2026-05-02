@@ -42,8 +42,8 @@ pub struct Event {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaneProtocol {
-    pub mode: vt100::MouseProtocolMode,
-    pub encoding: vt100::MouseProtocolEncoding,
+    pub mode: AttachMouseProtocolMode,
+    pub encoding: AttachMouseProtocolEncoding,
 }
 
 #[must_use]
@@ -117,66 +117,41 @@ pub const fn rect_contains_point(rect: AttachRect, column: u16, row: u16) -> boo
 }
 
 #[must_use]
-pub const fn mode_from_ipc(mode: AttachMouseProtocolMode) -> vt100::MouseProtocolMode {
-    match mode {
-        AttachMouseProtocolMode::None => vt100::MouseProtocolMode::None,
-        AttachMouseProtocolMode::Press => vt100::MouseProtocolMode::Press,
-        AttachMouseProtocolMode::PressRelease => vt100::MouseProtocolMode::PressRelease,
-        AttachMouseProtocolMode::ButtonMotion => vt100::MouseProtocolMode::ButtonMotion,
-        AttachMouseProtocolMode::AnyMotion => vt100::MouseProtocolMode::AnyMotion,
-    }
-}
-
-#[must_use]
-pub const fn encoding_from_ipc(
-    encoding: AttachMouseProtocolEncoding,
-) -> vt100::MouseProtocolEncoding {
-    match encoding {
-        AttachMouseProtocolEncoding::Default => vt100::MouseProtocolEncoding::Default,
-        AttachMouseProtocolEncoding::Utf8 => vt100::MouseProtocolEncoding::Utf8,
-        AttachMouseProtocolEncoding::Sgr => vt100::MouseProtocolEncoding::Sgr,
-    }
-}
-
-#[must_use]
 pub fn pane_protocol(
     pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
     pane_mouse_protocol_hints: &BTreeMap<Uuid, AttachMouseProtocolState>,
     pane_id: Uuid,
 ) -> Option<PaneProtocol> {
-    let parser_protocol = pane_buffers.get(&pane_id).map(|buffer| {
-        let screen = buffer.parser.screen();
-        PaneProtocol {
-            mode: screen.mouse_protocol_mode(),
-            encoding: screen.mouse_protocol_encoding(),
-        }
-    });
-
-    let hint_protocol = pane_mouse_protocol_hints
+    let hinted_protocol = pane_mouse_protocol_hints
         .get(&pane_id)
         .map(|hint| PaneProtocol {
-            mode: mode_from_ipc(hint.mode),
-            encoding: encoding_from_ipc(hint.encoding),
+            mode: hint.mode,
+            encoding: hint.encoding,
         });
-
-    match (parser_protocol, hint_protocol) {
-        (Some(protocol), Some(hint))
-            if protocol.mode == vt100::MouseProtocolMode::None
-                && hint.mode != vt100::MouseProtocolMode::None =>
-        {
-            Some(hint)
-        }
-        (Some(protocol), _) => Some(protocol),
-        (None, Some(hint)) => Some(hint),
-        (None, None) => None,
-    }
+    pane_buffers
+        .get(&pane_id)
+        .map(|buffer| {
+            let protocol = buffer.protocol_tracker.protocol_state();
+            PaneProtocol {
+                mode: crate::mouse_protocol_mode_to_ipc(protocol.mouse_mode()),
+                encoding: crate::mouse_protocol_encoding_to_ipc(protocol.mouse_encoding()),
+            }
+        })
+        .and_then(|protocol| {
+            if protocol.mode == AttachMouseProtocolMode::None {
+                hinted_protocol
+            } else {
+                Some(protocol)
+            }
+        })
+        .or(hinted_protocol)
 }
 
 #[must_use]
-pub const fn mode_reports_event(mode: vt100::MouseProtocolMode, kind: EventKind) -> bool {
+pub const fn mode_reports_event(mode: AttachMouseProtocolMode, kind: EventKind) -> bool {
     match mode {
-        vt100::MouseProtocolMode::None => false,
-        vt100::MouseProtocolMode::Press => {
+        AttachMouseProtocolMode::None => false,
+        AttachMouseProtocolMode::Press => {
             matches!(
                 kind,
                 EventKind::Down(_)
@@ -186,7 +161,7 @@ pub const fn mode_reports_event(mode: vt100::MouseProtocolMode, kind: EventKind)
                     | EventKind::ScrollRight
             )
         }
-        vt100::MouseProtocolMode::PressRelease => {
+        AttachMouseProtocolMode::PressRelease => {
             matches!(
                 kind,
                 EventKind::Down(_)
@@ -197,7 +172,7 @@ pub const fn mode_reports_event(mode: vt100::MouseProtocolMode, kind: EventKind)
                     | EventKind::ScrollRight
             )
         }
-        vt100::MouseProtocolMode::ButtonMotion => {
+        AttachMouseProtocolMode::ButtonMotion => {
             matches!(
                 kind,
                 EventKind::Down(_)
@@ -209,7 +184,7 @@ pub const fn mode_reports_event(mode: vt100::MouseProtocolMode, kind: EventKind)
                     | EventKind::ScrollRight
             )
         }
-        vt100::MouseProtocolMode::AnyMotion => {
+        AttachMouseProtocolMode::AnyMotion => {
             matches!(
                 kind,
                 EventKind::Down(_)
@@ -232,9 +207,9 @@ pub fn encode_for_protocol(event: Event, protocol: PaneProtocol) -> Option<Vec<u
     }
 
     match protocol.encoding {
-        vt100::MouseProtocolEncoding::Sgr => encode_sgr(event),
-        vt100::MouseProtocolEncoding::Default => encode_x10(event, false),
-        vt100::MouseProtocolEncoding::Utf8 => encode_x10(event, true),
+        AttachMouseProtocolEncoding::Sgr => encode_sgr(event),
+        AttachMouseProtocolEncoding::Default => encode_x10(event, false),
+        AttachMouseProtocolEncoding::Utf8 => encode_x10(event, true),
     }
 }
 
@@ -499,8 +474,8 @@ mod tests {
             h: 40,
         };
         let protocol = PaneProtocol {
-            mode: vt100::MouseProtocolMode::PressRelease,
-            encoding: vt100::MouseProtocolEncoding::Sgr,
+            mode: AttachMouseProtocolMode::PressRelease,
+            encoding: AttachMouseProtocolEncoding::Sgr,
         };
 
         let first_cell = Event {

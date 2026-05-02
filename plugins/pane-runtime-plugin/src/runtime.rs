@@ -5969,6 +5969,7 @@ mod tests {
             autowrap: true,
             pending_wrap: false,
             scroll_region: None,
+            protocol: bmux_terminal_grid::ProtocolState::default(),
             pending_bytes: Vec::new(),
             styles: Vec::new(),
             reset_rows: false,

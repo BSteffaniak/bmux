@@ -1,5 +1,6 @@
 use crate::snapshot::{GridSnapshot, RowSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use thiserror::Error;
 use unicode_width::UnicodeWidthChar;
@@ -32,6 +33,80 @@ pub struct Cursor {
     pub row: usize,
     pub col: usize,
     pub visible: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseProtocolMode {
+    #[default]
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseProtocolEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "protocol modes mirror independent DEC/private terminal toggles for stable snapshot encoding"
+)]
+pub struct ProtocolState {
+    #[serde(default)]
+    pub mouse_x10: bool,
+    #[serde(default)]
+    pub mouse_press_release: bool,
+    #[serde(default)]
+    pub mouse_button_motion: bool,
+    #[serde(default)]
+    pub mouse_any_motion: bool,
+    #[serde(default)]
+    pub mouse_utf8: bool,
+    #[serde(default)]
+    pub mouse_sgr: bool,
+    #[serde(default)]
+    pub mouse_urxvt: bool,
+    #[serde(default)]
+    pub application_cursor: bool,
+    #[serde(default)]
+    pub application_keypad: bool,
+}
+
+impl ProtocolState {
+    #[must_use]
+    pub const fn mouse_mode(self) -> MouseProtocolMode {
+        if self.mouse_any_motion {
+            MouseProtocolMode::AnyMotion
+        } else if self.mouse_button_motion {
+            MouseProtocolMode::ButtonMotion
+        } else if self.mouse_press_release {
+            MouseProtocolMode::PressRelease
+        } else if self.mouse_x10 {
+            MouseProtocolMode::Press
+        } else {
+            MouseProtocolMode::None
+        }
+    }
+
+    #[must_use]
+    pub const fn mouse_encoding(self) -> MouseProtocolEncoding {
+        if self.mouse_sgr || self.mouse_urxvt {
+            MouseProtocolEncoding::Sgr
+        } else if self.mouse_utf8 {
+            MouseProtocolEncoding::Utf8
+        } else {
+            MouseProtocolEncoding::Default
+        }
+    }
 }
 
 /// One display cell. Wide-character spacer cells are represented with
@@ -195,6 +270,7 @@ pub struct TerminalGrid {
     autowrap: bool,
     pending_wrap: bool,
     scroll_region: Option<(usize, usize)>,
+    protocol: ProtocolState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -238,6 +314,7 @@ impl TerminalGrid {
             autowrap: true,
             pending_wrap: false,
             scroll_region: None,
+            protocol: ProtocolState::default(),
         })
     }
 
@@ -316,6 +393,7 @@ impl TerminalGrid {
                     (0, height.saturating_sub(1))
                 }
             }),
+            protocol: snapshot.protocol,
         };
         grid.saved_cursor = Cursor {
             row: usize::from(snapshot.saved_cursor.row),
@@ -345,6 +423,11 @@ impl TerminalGrid {
     #[must_use]
     pub const fn cursor(&self) -> Cursor {
         self.cursor
+    }
+
+    #[must_use]
+    pub const fn protocol_state(&self) -> ProtocolState {
+        self.protocol
     }
 
     #[must_use]
@@ -451,6 +534,54 @@ impl TerminalGrid {
     pub(crate) fn set_autowrap(&mut self, enabled: bool) {
         self.autowrap = enabled;
         self.bump_revision();
+    }
+
+    pub(crate) fn set_mouse_tracking_mode(&mut self, mode: MouseProtocolMode, enabled: bool) {
+        let before = self.protocol;
+        match mode {
+            MouseProtocolMode::None => {}
+            MouseProtocolMode::Press => self.protocol.mouse_x10 = enabled,
+            MouseProtocolMode::PressRelease => self.protocol.mouse_press_release = enabled,
+            MouseProtocolMode::ButtonMotion => self.protocol.mouse_button_motion = enabled,
+            MouseProtocolMode::AnyMotion => self.protocol.mouse_any_motion = enabled,
+        }
+        if self.protocol != before {
+            self.bump_revision();
+        }
+    }
+
+    pub(crate) fn set_mouse_encoding(&mut self, encoding: MouseProtocolEncoding, enabled: bool) {
+        let before = self.protocol;
+        match encoding {
+            MouseProtocolEncoding::Default => {}
+            MouseProtocolEncoding::Utf8 => self.protocol.mouse_utf8 = enabled,
+            MouseProtocolEncoding::Sgr => self.protocol.mouse_sgr = enabled,
+        }
+        if self.protocol != before {
+            self.bump_revision();
+        }
+    }
+
+    pub(crate) fn set_mouse_urxvt_encoding(&mut self, enabled: bool) {
+        let before = self.protocol;
+        self.protocol.mouse_urxvt = enabled;
+        if self.protocol != before {
+            self.bump_revision();
+        }
+    }
+
+    pub(crate) fn set_application_cursor(&mut self, enabled: bool) {
+        if self.protocol.application_cursor != enabled {
+            self.protocol.application_cursor = enabled;
+            self.bump_revision();
+        }
+    }
+
+    pub(crate) fn set_application_keypad(&mut self, enabled: bool) {
+        if self.protocol.application_keypad != enabled {
+            self.protocol.application_keypad = enabled;
+            self.bump_revision();
+        }
     }
 
     pub(crate) fn set_scroll_region(&mut self, top: Option<usize>, bottom: Option<usize>) {

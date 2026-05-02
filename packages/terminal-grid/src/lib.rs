@@ -17,8 +17,14 @@ mod snapshot;
 mod style;
 
 pub use delta::{GridDeltaApplyError, GridDeltaBatch, RowUpdateSnapshot};
-pub use model::{Cell, Cursor, GridLimits, GridMode, PhysicalRow, TerminalGrid, TerminalGridError};
-pub use parser::{TerminalGridStream, TerminalGridStreamDeltaError};
+pub use model::{
+    Cell, Cursor, GridLimits, GridMode, MouseProtocolEncoding, MouseProtocolMode, PhysicalRow,
+    ProtocolState, TerminalGrid, TerminalGridError,
+};
+pub use parser::{
+    ProtocolProcessOutcome, TerminalGridStream, TerminalGridStreamDeltaError,
+    TerminalProtocolTracker,
+};
 pub use snapshot::{
     CellRunSnapshot, CursorSnapshot, GridSnapshot, RowSnapshot, ScrollRegionSnapshot,
 };

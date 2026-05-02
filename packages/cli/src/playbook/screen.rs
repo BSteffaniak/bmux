@@ -1,9 +1,8 @@
-//! Screen inspector: maintain persistent terminal parsers per pane and expose
+//! Screen inspector: hydrate structured terminal grids per pane and expose
 //! text/cursor state for playbook assertions.
 //!
-//! Unlike snapshot-tail reparsing, this keeps parser state alive and feeds
-//! incremental pane output chunks in stream order. This matches the incremental
-//! parser model used by mature multiplexers.
+//! Raw pane-output batches are drained only for stream continuity and activity
+//! detection; cell rendering state comes from structured grid snapshots.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -41,8 +40,7 @@ struct PaneStreamState {
     focused: bool,
     rows: u16,
     cols: u16,
-    parser: vt100::Parser,
-    terminal_grid: Option<bmux_terminal_grid::TerminalGridStream>,
+    terminal_grid: bmux_terminal_grid::TerminalGridStream,
     /// Expected start offset of the next incremental chunk for this pane.
     /// None means no continuity baseline has been established yet.
     expected_stream_start: Option<u64>,
@@ -73,7 +71,7 @@ pub struct OutputDrainResult {
 pub struct ScreenInspector {
     /// Parsed pane state from the most recent synchronization cycle.
     panes: Vec<ParsedPane>,
-    /// Persistent parser state keyed by pane id.
+    /// Persistent structured state keyed by pane id.
     pane_states: BTreeMap<Uuid, PaneStreamState>,
     viewport_rows: u16,
     viewport_cols: u16,
@@ -171,7 +169,7 @@ impl ScreenInspector {
         Ok(snapshot_from_layout(layout))
     }
 
-    /// Drain one incremental pane-output batch and update parser state.
+    /// Drain one incremental pane-output batch and update stream continuity.
     /// # Errors
     ///
     /// Returns an error if reading pane output fails.
@@ -259,8 +257,12 @@ impl ScreenInspector {
                     focused: pane.focused,
                     rows,
                     cols,
-                    parser: vt100::Parser::new(rows, cols, 4_096),
-                    terminal_grid: None,
+                    terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
+                        cols.max(1),
+                        rows.max(1),
+                        bmux_terminal_grid::GridLimits::default(),
+                    )
+                    .expect("playbook pane dimensions should be valid"),
                     expected_stream_start: None,
                     sync_update_active: false,
                 });
@@ -271,10 +273,7 @@ impl ScreenInspector {
             if state.rows != rows || state.cols != cols {
                 state.rows = rows;
                 state.cols = cols;
-                state.parser.screen_mut().set_size(rows, cols);
-                if let Some(grid) = state.terminal_grid.as_mut() {
-                    let _ = grid.resize_delta(cols.max(1), rows.max(1));
-                }
+                let _ = state.terminal_grid.resize_delta(cols.max(1), rows.max(1));
             }
         }
 
@@ -300,14 +299,12 @@ impl ScreenInspector {
                 .copied()
                 .unwrap_or_else(|| self.default_pane_dimensions());
 
-            let mut parser = vt100::Parser::new(rows, cols, 4_096);
-            if let Some(chunk) = snapshot
-                .chunks
-                .iter()
-                .find(|chunk| chunk.pane_id == pane.id)
-            {
-                parser.process(&chunk.data);
-            }
+            let terminal_grid = bmux_terminal_grid::TerminalGridStream::new(
+                cols.max(1),
+                rows.max(1),
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .expect("playbook pane dimensions should be valid");
 
             next_states.insert(
                 pane.id,
@@ -317,8 +314,7 @@ impl ScreenInspector {
                     focused: pane.focused,
                     rows,
                     cols,
-                    parser,
-                    terminal_grid: None,
+                    terminal_grid,
                     // Snapshot data is a recent tail, not offset-addressed stream
                     // data, so continuity baseline starts with the first batch.
                     expected_stream_start: None,
@@ -413,7 +409,6 @@ impl ScreenInspector {
             }
 
             if !data.is_empty() {
-                state.parser.process(&data);
                 result.pane_outputs.push(PaneOutputChunk {
                     pane_index: state.pane_index,
                     data,
@@ -480,7 +475,7 @@ impl ScreenInspector {
                 }
             };
             if let Some(state) = self.pane_states.get_mut(&snapshot.pane_id) {
-                state.terminal_grid = Some(stream);
+                state.terminal_grid = stream;
                 state.expected_stream_start = Some(snapshot.stream_end);
             }
         }
@@ -491,34 +486,18 @@ impl ScreenInspector {
             .pane_states
             .values()
             .map(|state| {
-                state.terminal_grid.as_ref().map_or_else(
-                    || {
-                        let screen = state.parser.screen();
-                        let (cursor_row, cursor_col) = screen.cursor_position();
-                        ParsedPane {
-                            _pane_id: state.pane_id,
-                            pane_index: state.pane_index,
-                            focused: state.focused,
-                            screen_text: screen_to_text(screen),
-                            cursor_row,
-                            cursor_col,
-                        }
-                    },
-                    |terminal_grid| {
-                        let cursor = terminal_grid.grid().cursor();
-                        ParsedPane {
-                            _pane_id: state.pane_id,
-                            pane_index: state.pane_index,
-                            focused: state.focused,
-                            screen_text: terminal_grid_to_text(
-                                terminal_grid.grid(),
-                                usize::from(state.rows),
-                            ),
-                            cursor_row: u16::try_from(cursor.row).unwrap_or(u16::MAX),
-                            cursor_col: u16::try_from(cursor.col).unwrap_or(u16::MAX),
-                        }
-                    },
-                )
+                let cursor = state.terminal_grid.grid().cursor();
+                ParsedPane {
+                    _pane_id: state.pane_id,
+                    pane_index: state.pane_index,
+                    focused: state.focused,
+                    screen_text: terminal_grid_to_text(
+                        state.terminal_grid.grid(),
+                        usize::from(state.rows),
+                    ),
+                    cursor_row: u16::try_from(cursor.row).unwrap_or(u16::MAX),
+                    cursor_col: u16::try_from(cursor.col).unwrap_or(u16::MAX),
+                }
             })
             .collect::<Vec<_>>();
         panes.sort_by_key(|pane| pane.pane_index);
@@ -532,7 +511,7 @@ impl ScreenInspector {
         )
     }
 
-    /// Copy current pane parser state into attach render buffers while preserving renderer caches.
+    /// Copy current structured pane state into attach render buffers while preserving renderer caches.
     pub fn sync_attach_render_buffers(
         &self,
         layout: &AttachLayoutState,
@@ -546,20 +525,14 @@ impl ScreenInspector {
                 .copied()
                 .unwrap_or((state.cols, state.rows));
             let buffer = buffers.entry(*pane_id).or_default();
-            let screen_text = if let Some(terminal_grid) = state.terminal_grid.as_ref() {
-                let snapshot = terminal_grid.snapshot(0, usize::from(rows));
-                if let Ok(stream) = bmux_terminal_grid::TerminalGridStream::from_snapshot(
-                    &snapshot,
-                    bmux_terminal_grid::GridLimits::default(),
-                ) {
-                    buffer.terminal_grid = stream;
-                }
-                terminal_grid_to_text(terminal_grid.grid(), usize::from(rows))
-            } else {
-                screen_to_text(state.parser.screen())
-            };
-            buffer.parser = parser_from_screen_text(&screen_text, rows, cols);
-            buffer.last_alternate_screen = state.parser.screen().alternate_screen();
+            let snapshot = state.terminal_grid.snapshot(0, usize::from(rows));
+            if let Ok(mut stream) = bmux_terminal_grid::TerminalGridStream::from_snapshot(
+                &snapshot,
+                bmux_terminal_grid::GridLimits::default(),
+            ) {
+                let _ = stream.resize_delta(cols.max(1), rows.max(1));
+                buffer.terminal_grid = stream;
+            }
             buffer.sync_update_in_progress = state.sync_update_active;
             buffer.expected_stream_start = state.expected_stream_start;
         }
@@ -582,7 +555,7 @@ impl ScreenInspector {
             .values()
             .find(|state| state.pane_index == pane_index)
             .map(|state| state.pane_id)?;
-        let grid = self.pane_states.get(&pane_id)?.terminal_grid.as_ref()?;
+        let grid = &self.pane_states.get(&pane_id)?.terminal_grid;
         Some(terminal_grid_rows_to_text(grid.grid().all_main_rows()))
     }
 
@@ -906,62 +879,37 @@ fn terminal_grid_rows_to_text(rows: Vec<bmux_terminal_grid::PhysicalRow>) -> Str
     lines.join("\n")
 }
 
-/// Extract visible text from a vt100 screen, with trailing whitespace trimmed per line.
-fn screen_to_text(screen: &vt100::Screen) -> String {
-    let mut lines = Vec::new();
-    let (rows, cols) = screen.size();
-    for row in 0..rows {
-        let row_text = screen.contents_between(row, 0, row, cols);
-        lines.push(row_text.trim_end().to_string());
-    }
-
-    // Trim trailing empty lines
-    while lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-
-    lines.join("\n")
-}
-
-fn parser_from_screen_text(text: &str, rows: u16, cols: u16) -> vt100::Parser {
-    let mut parser = vt100::Parser::new(rows.max(1), cols.max(1), 4_096);
-    for (row, line) in text.lines().take(usize::from(rows)).enumerate() {
-        let cursor_row = row.saturating_add(1);
-        let sequence = format!("\x1b[{cursor_row};1H{line}");
-        parser.process(sequence.as_bytes());
-    }
-    parser
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn screen_to_text_basic() {
-        let mut parser = vt100::Parser::new(24, 80, 100);
-        parser.process(b"hello world\r\nsecond line");
-        let text = screen_to_text(parser.screen());
+    fn terminal_grid_to_text_basic() {
+        let mut grid = bmux_terminal_grid::TerminalGridStream::new(
+            80,
+            24,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .expect("test grid dimensions are valid");
+        grid.process(b"hello world\r\nsecond line");
+        let text = terminal_grid_to_text(grid.grid(), 24);
         assert!(text.contains("hello world"));
         assert!(text.contains("second line"));
     }
 
     #[test]
-    fn screen_to_text_trims_trailing_empty_lines() {
-        let mut parser = vt100::Parser::new(24, 80, 100);
-        parser.process(b"line one\r\nline two");
-        let text = screen_to_text(parser.screen());
+    fn terminal_grid_to_text_trims_trailing_empty_lines() {
+        let mut grid = bmux_terminal_grid::TerminalGridStream::new(
+            80,
+            24,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .expect("test grid dimensions are valid");
+        grid.process(b"line one\r\nline two");
+        let text = terminal_grid_to_text(grid.grid(), 24);
         assert!(!text.ends_with('\n'));
         let line_count = text.lines().count();
         assert_eq!(line_count, 2);
-    }
-
-    #[test]
-    fn parser_from_screen_text_reconstructs_visible_rows_with_requested_size() {
-        let parser = parser_from_screen_text("alpha\nbeta", 4, 10);
-
-        assert_eq!(parser.screen().size(), (4, 10));
-        assert_eq!(screen_to_text(parser.screen()), "alpha\nbeta");
     }
 
     #[test]
@@ -977,8 +925,13 @@ mod tests {
         let session_id = Uuid::from_u128(91);
         let pane_id = Uuid::from_u128(92);
         let surface_id = Uuid::from_u128(93);
-        let mut pane_parser = vt100::Parser::new(5, 12, 4_096);
-        pane_parser.process(b"first\r\nsecond");
+        let mut pane_grid = bmux_terminal_grid::TerminalGridStream::new(
+            12,
+            5,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .expect("test grid dimensions are valid");
+        pane_grid.process(b"first\r\nsecond");
         let mut inspector = ScreenInspector {
             panes: Vec::new(),
             pane_states: BTreeMap::new(),
@@ -995,8 +948,7 @@ mod tests {
                 focused: true,
                 rows: 5,
                 cols: 12,
-                parser: pane_parser,
-                terminal_grid: None,
+                terminal_grid: pane_grid,
                 expected_stream_start: Some(42),
                 sync_update_active: true,
             },
@@ -1071,8 +1023,17 @@ mod tests {
         inspector.sync_attach_render_buffers(&layout, &mut buffers);
 
         let synced = buffers.get(&pane_id).expect("buffer should remain");
-        assert_eq!(synced.parser.screen().size(), (3, 6));
-        assert_eq!(screen_to_text(synced.parser.screen()), "first\nsecond");
+        assert_eq!(
+            (
+                synced.terminal_grid.grid().height(),
+                synced.terminal_grid.grid().width()
+            ),
+            (3, 6)
+        );
+        assert_eq!(
+            terminal_grid_to_text(synced.terminal_grid.grid(), 3),
+            "first\nsecond"
+        );
         assert_eq!(synced.prev_rows, vec!["cached row".to_string()]);
         assert_eq!(synced.extension_render_cache.len(), 1);
         assert_eq!(synced.expected_stream_start, Some(42));
@@ -1080,16 +1041,21 @@ mod tests {
     }
 
     #[test]
-    fn incremental_parser_handles_split_alt_exit_sequence() {
-        let mut parser = vt100::Parser::new(30, 120, 4_096);
+    fn structured_grid_handles_split_alt_exit_sequence() {
+        let mut grid = bmux_terminal_grid::TerminalGridStream::new(
+            120,
+            30,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .expect("test grid dimensions are valid");
 
-        parser.process(b"\x1b[12;34H");
-        parser.process(b"\x1b[?1049h\x1b[2J\x1b[HSEQ_TUI");
-        parser.process(b"\x1b[?10");
-        parser.process(b"49l");
+        grid.process(b"\x1b[12;34H");
+        grid.process(b"\x1b[?1049h\x1b[2J\x1b[HSEQ_TUI");
+        grid.process(b"\x1b[?10");
+        grid.process(b"49l");
 
-        let (row, col) = parser.screen().cursor_position();
-        assert_eq!((row, col), (11, 33));
+        let cursor = grid.grid().cursor();
+        assert_eq!((cursor.row, cursor.col), (11, 33));
     }
 
     #[test]

@@ -1,5 +1,8 @@
 use crate::delta::{GridDeltaApplyError, GridDeltaBatch};
-use crate::model::{GridLimits, GridMode, TerminalGrid, TerminalGridError};
+use crate::model::{
+    GridLimits, GridMode, MouseProtocolEncoding, MouseProtocolMode, ProtocolState, TerminalGrid,
+    TerminalGridError,
+};
 use vte::{Params, Perform};
 
 /// Streaming terminal parser plus structured grid state.
@@ -138,6 +141,70 @@ impl TerminalGridStream {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolProcessOutcome {
+    pub toggled_alternate: bool,
+}
+
+/// Streaming parser for terminal protocol/input hints without retaining pane cells.
+pub struct TerminalProtocolTracker {
+    parser: vte::Parser,
+    protocol: ProtocolState,
+    alternate_screen: bool,
+    pending_bytes: Vec<u8>,
+}
+
+impl Default for TerminalProtocolTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TerminalProtocolTracker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            parser: vte::Parser::new(),
+            protocol: ProtocolState::default(),
+            alternate_screen: false,
+            pending_bytes: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn protocol_state(&self) -> ProtocolState {
+        self.protocol
+    }
+
+    #[must_use]
+    pub const fn alternate_screen(&self) -> bool {
+        self.alternate_screen
+    }
+
+    pub fn set_protocol_state(&mut self, protocol: ProtocolState) {
+        self.protocol = protocol;
+    }
+
+    pub fn set_alternate_screen(&mut self, alternate_screen: bool) {
+        self.alternate_screen = alternate_screen;
+    }
+
+    pub fn process(&mut self, bytes: &[u8]) -> ProtocolProcessOutcome {
+        let mut continuity = self.pending_bytes.clone();
+        continuity.extend_from_slice(bytes);
+        self.pending_bytes = trailing_incomplete_sequence(&continuity);
+        let mut performer = ProtocolPerformer {
+            protocol: &mut self.protocol,
+            alternate_screen: &mut self.alternate_screen,
+            toggled_alternate: false,
+        };
+        self.parser.advance(&mut performer, bytes);
+        ProtocolProcessOutcome {
+            toggled_alternate: performer.toggled_alternate,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalGridStreamDeltaError {
     #[error(transparent)]
@@ -150,6 +217,89 @@ pub(crate) fn process(grid: &mut TerminalGrid, bytes: &[u8]) {
     let mut parser = vte::Parser::new();
     let mut performer = GridPerformer { grid };
     parser.advance(&mut performer, bytes);
+}
+
+struct ProtocolPerformer<'a> {
+    protocol: &'a mut ProtocolState,
+    alternate_screen: &'a mut bool,
+    toggled_alternate: bool,
+}
+
+impl ProtocolPerformer<'_> {
+    fn set_alternate_screen(&mut self, enabled: bool) {
+        if *self.alternate_screen != enabled {
+            *self.alternate_screen = enabled;
+            self.toggled_alternate = true;
+        }
+    }
+
+    fn set_mouse_tracking_mode(&mut self, mode: MouseProtocolMode, enabled: bool) {
+        match mode {
+            MouseProtocolMode::None => {}
+            MouseProtocolMode::Press => self.protocol.mouse_x10 = enabled,
+            MouseProtocolMode::PressRelease => self.protocol.mouse_press_release = enabled,
+            MouseProtocolMode::ButtonMotion => self.protocol.mouse_button_motion = enabled,
+            MouseProtocolMode::AnyMotion => self.protocol.mouse_any_motion = enabled,
+        }
+    }
+
+    fn set_mouse_encoding(&mut self, encoding: MouseProtocolEncoding, enabled: bool) {
+        match encoding {
+            MouseProtocolEncoding::Default => {}
+            MouseProtocolEncoding::Utf8 => self.protocol.mouse_utf8 = enabled,
+            MouseProtocolEncoding::Sgr => self.protocol.mouse_sgr = enabled,
+        }
+    }
+}
+
+impl Perform for ProtocolPerformer<'_> {
+    fn print(&mut self, _c: char) {}
+
+    fn execute(&mut self, _byte: u8) {}
+
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+
+    fn put(&mut self, _byte: u8) {}
+
+    fn unhook(&mut self) {}
+
+    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        if ignore || intermediates != [b'?'] || !matches!(action, 'h' | 'l') {
+            return;
+        }
+        let enabled = action == 'h';
+        for value in flatten_params(params) {
+            match value {
+                1 => self.protocol.application_cursor = enabled,
+                9 => self.set_mouse_tracking_mode(MouseProtocolMode::Press, enabled),
+                47 | 1047 | 1049 => self.set_alternate_screen(enabled),
+                1000 => self.set_mouse_tracking_mode(MouseProtocolMode::PressRelease, enabled),
+                1002 => self.set_mouse_tracking_mode(MouseProtocolMode::ButtonMotion, enabled),
+                1003 => self.set_mouse_tracking_mode(MouseProtocolMode::AnyMotion, enabled),
+                1005 => self.set_mouse_encoding(MouseProtocolEncoding::Utf8, enabled),
+                1006 => self.set_mouse_encoding(MouseProtocolEncoding::Sgr, enabled),
+                1015 => self.protocol.mouse_urxvt = enabled,
+                _ => {}
+            }
+        }
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        if ignore || !intermediates.is_empty() {
+            return;
+        }
+        match byte {
+            b'=' => self.protocol.application_keypad = true,
+            b'>' => self.protocol.application_keypad = false,
+            b'c' => {
+                *self.protocol = ProtocolState::default();
+                self.set_alternate_screen(false);
+            }
+            _ => {}
+        }
+    }
 }
 
 struct GridPerformer<'a> {
@@ -179,6 +329,10 @@ impl Perform for GridPerformer<'_> {
 
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single CSI dispatcher keeps terminal escape handling in one explicit state-machine branch"
+    )]
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         if ignore {
             return;
@@ -253,7 +407,11 @@ impl Perform for GridPerformer<'_> {
                 let enabled = action == 'h';
                 for value in values {
                     match value {
+                        1 => self.grid.set_application_cursor(enabled),
                         7 => self.grid.set_autowrap(enabled),
+                        9 => self
+                            .grid
+                            .set_mouse_tracking_mode(MouseProtocolMode::Press, enabled),
                         25 => self.grid.set_cursor_visible(enabled),
                         47 | 1047 => self.grid.set_mode(if enabled {
                             GridMode::Alternate
@@ -269,6 +427,22 @@ impl Perform for GridPerformer<'_> {
                                 self.grid.restore_cursor();
                             }
                         }
+                        1000 => self
+                            .grid
+                            .set_mouse_tracking_mode(MouseProtocolMode::PressRelease, enabled),
+                        1002 => self
+                            .grid
+                            .set_mouse_tracking_mode(MouseProtocolMode::ButtonMotion, enabled),
+                        1003 => self
+                            .grid
+                            .set_mouse_tracking_mode(MouseProtocolMode::AnyMotion, enabled),
+                        1005 => self
+                            .grid
+                            .set_mouse_encoding(MouseProtocolEncoding::Utf8, enabled),
+                        1006 => self
+                            .grid
+                            .set_mouse_encoding(MouseProtocolEncoding::Sgr, enabled),
+                        1015 => self.grid.set_mouse_urxvt_encoding(enabled),
                         _ => {}
                     }
                 }
@@ -290,6 +464,8 @@ impl Perform for GridPerformer<'_> {
                 self.grid.carriage_return();
             }
             b'M' => self.grid.reverse_index(),
+            b'=' => self.grid.set_application_keypad(true),
+            b'>' => self.grid.set_application_keypad(false),
             b'c' => {
                 let width = u16::try_from(self.grid.width()).unwrap_or(u16::MAX);
                 let height = u16::try_from(self.grid.height()).unwrap_or(u16::MAX);
@@ -384,6 +560,36 @@ mod tests {
     use crate::parser::TerminalGridStream;
 
     #[test]
+    fn protocol_tracker_tracks_hints_without_rows() {
+        let mut tracker = crate::TerminalProtocolTracker::new();
+        let outcome = tracker.process(b"text\x1b[?1000h\x1b[?1006h\x1b[?1049h\x1b=");
+
+        assert!(outcome.toggled_alternate);
+        assert!(tracker.alternate_screen());
+        let protocol = tracker.protocol_state();
+        assert_eq!(
+            protocol.mouse_mode(),
+            crate::model::MouseProtocolMode::PressRelease
+        );
+        assert_eq!(
+            protocol.mouse_encoding(),
+            crate::model::MouseProtocolEncoding::Sgr
+        );
+        assert!(protocol.application_keypad);
+
+        let outcome = tracker.process(b"\x1b[?1049l\x1b[?1000l\x1b[?1006l\x1b>");
+        assert!(outcome.toggled_alternate);
+        assert!(!tracker.alternate_screen());
+        let protocol = tracker.protocol_state();
+        assert_eq!(protocol.mouse_mode(), crate::model::MouseProtocolMode::None);
+        assert_eq!(
+            protocol.mouse_encoding(),
+            crate::model::MouseProtocolEncoding::Default
+        );
+        assert!(!protocol.application_keypad);
+    }
+
+    #[test]
     fn csi_cursor_position_moves_print_location() {
         let mut grid = TerminalGrid::new(10, 3, GridLimits::default()).unwrap();
         grid.process(b"\x1b[2;3HX");
@@ -451,6 +657,57 @@ mod tests {
             .expect("visible output should produce a delta");
 
         assert_eq!(delta.pending_bytes, b"\x1b[");
+    }
+
+    #[test]
+    fn protocol_state_tracks_mouse_and_input_modes() {
+        let mut stream = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+        stream.process(b"\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b=");
+
+        let protocol = stream.grid().protocol_state();
+        assert_eq!(
+            protocol.mouse_mode(),
+            crate::model::MouseProtocolMode::PressRelease
+        );
+        assert_eq!(
+            protocol.mouse_encoding(),
+            crate::model::MouseProtocolEncoding::Sgr
+        );
+        assert!(protocol.application_cursor);
+        assert!(protocol.application_keypad);
+
+        stream.process(b"\x1b[?1000l\x1b[?1006l\x1b[?1l\x1b>");
+        let protocol = stream.grid().protocol_state();
+        assert_eq!(protocol.mouse_mode(), crate::model::MouseProtocolMode::None);
+        assert_eq!(
+            protocol.mouse_encoding(),
+            crate::model::MouseProtocolEncoding::Default
+        );
+        assert!(!protocol.application_cursor);
+        assert!(!protocol.application_keypad);
+    }
+
+    #[test]
+    fn snapshot_and_delta_preserve_protocol_state() {
+        let mut producer = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+        let delta = producer
+            .process_delta(b"\x1b[?1003h\x1b[?1006h\x1b=")
+            .expect("protocol-only change should produce a delta");
+        let mut consumer = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+        consumer
+            .apply_delta(&delta, GridLimits::default())
+            .expect("protocol delta should apply");
+
+        let protocol = consumer.grid().protocol_state();
+        assert_eq!(
+            protocol.mouse_mode(),
+            crate::model::MouseProtocolMode::AnyMotion
+        );
+        assert_eq!(
+            protocol.mouse_encoding(),
+            crate::model::MouseProtocolEncoding::Sgr
+        );
+        assert!(protocol.application_keypad);
     }
 
     #[test]

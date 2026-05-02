@@ -229,10 +229,9 @@ pub fn resize_attach_parsers_for_scene_with_size(
         if !surface.visible {
             continue;
         }
-        // Size the pane parser to the scene's authoritative content_rect
-        // (the PTY interior), clamped to the viewport. This keeps the
-        // parser's dimensions aligned with what the renderer, PTY sizer,
-        // and mouse translator all agree is the pane's interior — no
+        // Size the structured grid to the scene's authoritative content_rect
+        // (the PTY interior), clamped to the viewport. This keeps render
+        // dimensions aligned with the PTY sizer and mouse translator — no
         // hardcoded border math here.
         let content_x = surface.content_rect.x.min(cols.saturating_sub(1));
         let content_y = surface.content_rect.y.min(rows.saturating_sub(1));
@@ -250,18 +249,16 @@ pub fn resize_attach_parsers_for_scene_with_size(
             h: inner_h,
         };
         let buffer = pane_buffers.entry(pane_id).or_default();
-        let previous_size = buffer.parser.screen().size();
         let previous_grid_size = (
             buffer.terminal_grid.grid().width(),
             buffer.terminal_grid.grid().height(),
         );
-        buffer.parser.screen_mut().set_size(inner_h, inner_w);
         let _ = buffer.terminal_grid.resize_delta(inner_w, inner_h);
         let next_grid_size = (
             buffer.terminal_grid.grid().width(),
             buffer.terminal_grid.grid().height(),
         );
-        if buffer.parser.screen().size() != previous_size || next_grid_size != previous_grid_size {
+        if next_grid_size != previous_grid_size {
             buffer.prev_rows.clear();
         }
     }

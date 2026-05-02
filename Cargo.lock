@@ -1567,6 +1567,7 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_session_models",
  "bmux_sessions_plugin_api",
+ "bmux_terminal_grid",
  "bmux_windows_plugin_api",
  "iroh",
  "rustls",

@@ -1411,41 +1411,22 @@ impl AttachLayerSurface {
     }
 }
 
+#[cfg(test)]
 pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }
-    let was_alternate = buffer.last_alternate_screen;
-    buffer.parser.process(bytes);
+    let outcome = buffer.protocol_tracker.process(bytes);
     buffer.terminal_grid.process(bytes);
-    let is_alternate = buffer.parser.screen().alternate_screen();
-    buffer.last_alternate_screen = is_alternate;
 
-    let toggled_alternate =
-        was_alternate != is_alternate || contains_alternate_screen_sequence(bytes);
-    if toggled_alternate {
+    if outcome.toggled_alternate {
         // Alternate-screen transitions can restore or replace rows without
         // re-emitting every line. Invalidate row diff cache so next render
         // repaints the pane deterministically.
         buffer.prev_rows.clear();
     }
 
-    toggled_alternate
-}
-
-fn contains_alternate_screen_sequence(bytes: &[u8]) -> bool {
-    const SEQUENCES: [&[u8]; 6] = [
-        b"\x1b[?47h",
-        b"\x1b[?47l",
-        b"\x1b[?1047h",
-        b"\x1b[?1047l",
-        b"\x1b[?1049h",
-        b"\x1b[?1049l",
-    ];
-
-    SEQUENCES
-        .iter()
-        .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle))
+    outcome.toggled_alternate
 }
 
 /// Truncate or pad `content` to exactly `width` columns.
@@ -1487,8 +1468,8 @@ pub fn queue_layer_fill<W: io::Write>(stdout: &mut W, surface: AttachLayerSurfac
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct CellStyle {
-    fg: vt100::Color,
-    bg: vt100::Color,
+    fg: CellColor,
+    bg: CellColor,
     bold: bool,
     dim: bool,
     italic: bool,
@@ -1498,8 +1479,8 @@ struct CellStyle {
 
 const fn grid_cell_style(style: GridStyle) -> CellStyle {
     CellStyle {
-        fg: grid_color_to_vt100(style.fg),
-        bg: grid_color_to_vt100(style.bg),
+        fg: grid_color_to_cell_color(style.fg),
+        bg: grid_color_to_cell_color(style.bg),
         bold: style.bold,
         dim: style.dim,
         italic: style.italic,
@@ -1508,11 +1489,19 @@ const fn grid_cell_style(style: GridStyle) -> CellStyle {
     }
 }
 
-const fn grid_color_to_vt100(color: Option<GridColor>) -> vt100::Color {
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum CellColor {
+    #[default]
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+const fn grid_color_to_cell_color(color: Option<GridColor>) -> CellColor {
     match color {
-        Some(GridColor::Indexed(index)) => vt100::Color::Idx(index),
-        Some(GridColor::Rgb { r, g, b }) => vt100::Color::Rgb(r, g, b),
-        None => vt100::Color::Default,
+        Some(GridColor::Indexed(index)) => CellColor::Indexed(index),
+        Some(GridColor::Rgb { r, g, b }) => CellColor::Rgb(r, g, b),
+        None => CellColor::Default,
     }
 }
 
@@ -1565,7 +1554,7 @@ fn apply_content_effect(
         return style;
     }
     if !matches!(effect.when_bg, RuntimeContentEffectBgPredicate::Default)
-        || !matches!(style.bg, vt100::Color::Default)
+        || !matches!(style.bg, CellColor::Default)
     {
         return style;
     }
@@ -1583,27 +1572,27 @@ fn apply_content_effect(
         return style;
     };
     let blended = blend_rgb(base, overlay, *amount_permille);
-    style.bg = vt100::Color::Rgb(blended.r, blended.g, blended.b);
+    style.bg = CellColor::Rgb(blended.r, blended.g, blended.b);
     style
 }
 
-fn color_sgr(color: vt100::Color, foreground: bool) -> String {
+fn color_sgr(color: CellColor, foreground: bool) -> String {
     match color {
-        vt100::Color::Default => {
+        CellColor::Default => {
             if foreground {
                 "39".to_string()
             } else {
                 "49".to_string()
             }
         }
-        vt100::Color::Idx(idx) => {
+        CellColor::Indexed(idx) => {
             if foreground {
                 format!("38;5;{idx}")
             } else {
                 format!("48;5;{idx}")
             }
         }
-        vt100::Color::Rgb(r, g, b) => {
+        CellColor::Rgb(r, g, b) => {
             if foreground {
                 format!("38;2;{r};{g};{b}")
             } else {
@@ -2266,28 +2255,20 @@ fn render_attach_scene_inner<W: io::Write>(
         let inner_w = usize::from(inner_width);
         let inner_h = usize::from(inner_height);
         if let Some(entry) = pane_buffers.get_mut(&pane_id) {
-            let (old_rows, old_cols) = entry.parser.screen().size();
             let previous_grid_size = (
                 entry.terminal_grid.grid().width(),
                 entry.terminal_grid.grid().height(),
             );
-            entry
-                .parser
-                .screen_mut()
-                .set_size(inner_height.max(1), inner_width.max(1));
             let _ = entry
                 .terminal_grid
                 .resize_delta(inner_width.max(1), inner_height.max(1));
             // Invalidate the row cache when the pane dimensions change, since
             // the row strings are no longer comparable at a different size.
-            let (new_rows, new_cols) = entry.parser.screen().size();
             let next_grid_size = (
                 entry.terminal_grid.grid().width(),
                 entry.terminal_grid.grid().height(),
             );
-            let parser_size_changed = (new_rows, new_cols) != (old_rows, old_cols);
-            let grid_size_changed = next_grid_size != previous_grid_size;
-            if parser_size_changed || grid_size_changed {
+            if next_grid_size != previous_grid_size {
                 entry.prev_rows.clear();
             }
             let use_scrollback = scrollback_active && focus;
@@ -2522,7 +2503,6 @@ mod tests {
     }
 
     fn feed_pane_buffer(buffer: &mut PaneRenderBuffer, rows: u16, cols: u16, bytes: &[u8]) {
-        buffer.parser.screen_mut().set_size(rows, cols);
         buffer
             .terminal_grid
             .resize_delta(cols.max(1), rows.max(1))
@@ -3286,7 +3266,7 @@ mod tests {
 
         let toggled = append_pane_output(&mut buffer, b"\x1b[?1049h");
         assert!(toggled);
-        assert!(buffer.parser.screen().alternate_screen());
+        assert!(buffer.protocol_tracker.alternate_screen());
         assert!(buffer.prev_rows.is_empty());
     }
 
@@ -3296,7 +3276,7 @@ mod tests {
 
         let toggled = append_pane_output(&mut buffer, b"\x1b[?1049hhello\x1b[?1049l");
         assert!(toggled);
-        assert!(!buffer.parser.screen().alternate_screen());
+        assert!(!buffer.protocol_tracker.alternate_screen());
     }
 
     #[test]
@@ -3332,7 +3312,6 @@ mod tests {
         };
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer {
-            parser: vt100::Parser::new(3, 10, 4_096),
             terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
                 10,
                 3,
@@ -3606,7 +3585,6 @@ mod tests {
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer::default();
         feed_pane_buffer(&mut buffer, 4, 18, b"hello\r\nworld\r\n\x1b[?25l");
-        buffer.parser.screen_mut().set_scrollback(1);
         pane_buffers.insert(pane_id, buffer);
 
         let mut output = Vec::new();

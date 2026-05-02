@@ -18,6 +18,7 @@ pub use bmux_attach_pipeline_models::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, AttachPipelineDiagnosticCode,
     AttachPipelineDiagnosticEvent, AttachViewport,
 };
+use bmux_terminal_grid::{MouseProtocolEncoding, MouseProtocolMode, ProtocolState};
 
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -55,44 +56,57 @@ pub fn apply_attach_output_chunk(
             return false;
         }
 
-        let _ = render::append_pane_output(buffer, data);
-        let screen = buffer.parser.screen();
-        pane_mouse_protocol_hints.insert(
+        let _ = buffer.protocol_tracker.process(data);
+        update_protocol_hints_from_state(
+            pane_mouse_protocol_hints,
+            pane_input_mode_hints,
             pane_id,
-            AttachMouseProtocolState {
-                mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
-                encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
-            },
-        );
-        pane_input_mode_hints.insert(
-            pane_id,
-            AttachInputModeState {
-                application_cursor: screen.application_cursor(),
-                application_keypad: screen.application_keypad(),
-            },
+            buffer.protocol_tracker.protocol_state(),
         );
         true
     })
 }
 
 #[must_use]
-pub const fn mouse_protocol_mode_to_ipc(mode: vt100::MouseProtocolMode) -> AttachMouseProtocolMode {
+pub const fn mouse_protocol_mode_to_ipc(mode: MouseProtocolMode) -> AttachMouseProtocolMode {
     match mode {
-        vt100::MouseProtocolMode::None => AttachMouseProtocolMode::None,
-        vt100::MouseProtocolMode::Press => AttachMouseProtocolMode::Press,
-        vt100::MouseProtocolMode::PressRelease => AttachMouseProtocolMode::PressRelease,
-        vt100::MouseProtocolMode::ButtonMotion => AttachMouseProtocolMode::ButtonMotion,
-        vt100::MouseProtocolMode::AnyMotion => AttachMouseProtocolMode::AnyMotion,
+        MouseProtocolMode::None => AttachMouseProtocolMode::None,
+        MouseProtocolMode::Press => AttachMouseProtocolMode::Press,
+        MouseProtocolMode::PressRelease => AttachMouseProtocolMode::PressRelease,
+        MouseProtocolMode::ButtonMotion => AttachMouseProtocolMode::ButtonMotion,
+        MouseProtocolMode::AnyMotion => AttachMouseProtocolMode::AnyMotion,
     }
 }
 
 #[must_use]
 pub const fn mouse_protocol_encoding_to_ipc(
-    encoding: vt100::MouseProtocolEncoding,
+    encoding: MouseProtocolEncoding,
 ) -> AttachMouseProtocolEncoding {
     match encoding {
-        vt100::MouseProtocolEncoding::Default => AttachMouseProtocolEncoding::Default,
-        vt100::MouseProtocolEncoding::Utf8 => AttachMouseProtocolEncoding::Utf8,
-        vt100::MouseProtocolEncoding::Sgr => AttachMouseProtocolEncoding::Sgr,
+        MouseProtocolEncoding::Default => AttachMouseProtocolEncoding::Default,
+        MouseProtocolEncoding::Utf8 => AttachMouseProtocolEncoding::Utf8,
+        MouseProtocolEncoding::Sgr => AttachMouseProtocolEncoding::Sgr,
     }
+}
+
+pub fn update_protocol_hints_from_state(
+    pane_mouse_protocol_hints: &mut BTreeMap<Uuid, AttachMouseProtocolState>,
+    pane_input_mode_hints: &mut BTreeMap<Uuid, AttachInputModeState>,
+    pane_id: Uuid,
+    protocol: ProtocolState,
+) {
+    pane_mouse_protocol_hints.insert(
+        pane_id,
+        AttachMouseProtocolState {
+            mode: mouse_protocol_mode_to_ipc(protocol.mouse_mode()),
+            encoding: mouse_protocol_encoding_to_ipc(protocol.mouse_encoding()),
+        },
+    );
+    pane_input_mode_hints.insert(
+        pane_id,
+        AttachInputModeState {
+            application_cursor: protocol.application_cursor,
+            application_keypad: protocol.application_keypad,
+        },
+    );
 }
