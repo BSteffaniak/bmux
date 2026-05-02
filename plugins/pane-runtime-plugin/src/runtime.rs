@@ -3481,6 +3481,30 @@ impl SessionRuntimeManager {
         let owner_session_id = self
             .pane_session_for_attach(session_id, pane_id)
             .unwrap_or(session_id);
+        let remove_runtime = {
+            let session = self.runtimes.get(&owner_session_id).ok_or_else(|| {
+                anyhow::anyhow!("runtime not found for session {}", owner_session_id.0)
+            })?;
+            if !session
+                .floating_surfaces
+                .iter()
+                .any(|surface| surface.pane_id == pane_id)
+            {
+                anyhow::bail!("floating pane not found");
+            }
+            let remove_count = 1 + session
+                .floating_surfaces
+                .iter()
+                .filter(|surface| {
+                    surface.anchor_pane_id == Some(pane_id) && surface.pane_id != pane_id
+                })
+                .count();
+            session.panes.len() <= remove_count
+        };
+        if remove_runtime {
+            let removed = self.remove_runtime(owner_session_id)?;
+            return Ok((pane_id, Some(removed)));
+        }
         self.close_pane(owner_session_id, Some(PaneSelector::ById(pane_id)))
     }
 
@@ -5614,6 +5638,69 @@ mod tests {
                 .iter()
                 .all(|surface| surface.pane_id != Some(other_pane_id))
         );
+    }
+
+    #[tokio::test]
+    async fn closing_last_tiled_pane_leaves_unanchored_floating_pane_visible() {
+        let session_id = SessionId(Uuid::new_v4());
+        let tiled_pane_id = Uuid::new_v4();
+        let floating_pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[tiled_pane_id, floating_pane_id]);
+        runtime.layout_root = Some(PaneLayoutNode::Leaf {
+            pane_id: tiled_pane_id,
+        });
+        runtime.floating_surfaces = vec![floating_surface(
+            floating_pane_id,
+            FloatingPaneScope::PerSession,
+        )];
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        let mut manager = SessionRuntimeManager {
+            runtimes: BTreeMap::from([(session_id, runtime)]),
+            shell: "sh".to_string(),
+            pane_term: "xterm-256color".to_string(),
+            protocol_profile: ProtocolProfile::Bmux,
+            shell_integration_root: None,
+            pane_exit_tx,
+        };
+
+        let (_closed_pane_id, removed) = manager
+            .close_pane(session_id, Some(PaneSelector::ById(tiled_pane_id)))
+            .expect("last tiled pane should close");
+
+        assert!(removed.is_none());
+        let runtime = manager.runtimes.get(&session_id).expect("runtime remains");
+        assert!(runtime.layout_root.is_none());
+        assert!(runtime.panes.contains_key(&floating_pane_id));
+        assert_eq!(runtime.focused_pane_id, floating_pane_id);
+        assert_eq!(runtime.floating_surfaces.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closing_final_floating_pane_removes_runtime() {
+        let session_id = SessionId(Uuid::new_v4());
+        let floating_pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[floating_pane_id]);
+        runtime.layout_root = None;
+        runtime.floating_surfaces = vec![floating_surface(
+            floating_pane_id,
+            FloatingPaneScope::PerSession,
+        )];
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        let mut manager = SessionRuntimeManager {
+            runtimes: BTreeMap::from([(session_id, runtime)]),
+            shell: "sh".to_string(),
+            pane_term: "xterm-256color".to_string(),
+            protocol_profile: ProtocolProfile::Bmux,
+            shell_integration_root: None,
+            pane_exit_tx,
+        };
+
+        let (_closed_pane_id, removed) = manager
+            .close_floating_pane(session_id, floating_pane_id)
+            .expect("final floating pane should close runtime");
+
+        assert!(removed.is_some());
+        assert!(!manager.runtimes.contains_key(&session_id));
     }
 
     #[test]

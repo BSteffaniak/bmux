@@ -23,13 +23,17 @@ owns_namespaces = [
     "list-floating-panes",
     "create-floating-pane",
     "focus-floating-pane",
+    "focus-next-floating-pane",
     "raise-floating-pane",
+    "raise-active-floating-pane",
     "lower-floating-pane",
+    "lower-active-floating-pane",
     "move-floating-pane",
     "resize-floating-pane",
     "set-floating-pane-z",
     "set-floating-pane-layer",
     "close-floating-pane",
+    "close-active-floating-pane",
     "close-active-pane",
     "restart-pane",
 ]
@@ -469,6 +473,30 @@ value_name = "PANE_ID"
 
 [[commands]]
 expose_in_cli = true
+name          = "focus-next-floating-pane"
+path          = ["focus-next-floating-pane"]
+summary       = "Focus the next visible floating pane"
+
+[[commands]]
+expose_in_cli = true
+name          = "raise-active-floating-pane"
+path          = ["raise-active-floating-pane"]
+summary       = "Raise the active floating pane"
+
+[[commands]]
+expose_in_cli = true
+name          = "lower-active-floating-pane"
+path          = ["lower-active-floating-pane"]
+summary       = "Lower the active floating pane"
+
+[[commands]]
+expose_in_cli = true
+name          = "close-active-floating-pane"
+path          = ["close-active-floating-pane"]
+summary       = "Close the active floating pane"
+
+[[commands]]
+expose_in_cli = true
 name          = "move-floating-pane"
 path          = ["move-floating-pane"]
 summary       = "Move a floating pane"
@@ -632,7 +660,8 @@ o           = "plugin:bmux.windows:focus-pane-in-direction --direction next"
 "shift+k"           = "plugin:bmux.windows:resize-pane --direction up"
 "shift+l"           = "plugin:bmux.windows:resize-pane --direction right"
 # Pane zoom / close / restart
-f = "plugin:bmux.windows:create-floating-pane"
-r = "plugin:bmux.windows:restart-pane"
-x = "plugin:bmux.windows:close-active-pane"
-z = "plugin:bmux.windows:zoom-pane"
+f         = "plugin:bmux.windows:create-floating-pane"
+r         = "plugin:bmux.windows:restart-pane"
+"shift+f" = "plugin:bmux.windows:focus-next-floating-pane"
+x         = "plugin:bmux.windows:close-active-pane"
+z         = "plugin:bmux.windows:zoom-pane"

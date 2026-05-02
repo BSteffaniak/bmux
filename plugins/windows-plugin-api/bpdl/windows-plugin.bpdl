@@ -257,6 +257,14 @@ interface windows-commands {
         -> result<pane-ack, pane-mutation-error>;
     command close-floating-pane(session: selector?, target: selector)
         -> result<pane-ack, pane-mutation-error>;
+    command focus-next-floating-pane(session: selector?)
+        -> result<pane-ack, pane-mutation-error>;
+    command raise-active-floating-pane(session: selector?)
+        -> result<pane-ack, pane-mutation-error>;
+    command lower-active-floating-pane(session: selector?)
+        -> result<pane-ack, pane-mutation-error>;
+    command close-active-floating-pane(session: selector?)
+        -> result<pane-ack, pane-mutation-error>;
 
     command set-floating-pane-z(
         session: selector?,

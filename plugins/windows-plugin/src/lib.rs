@@ -589,6 +589,83 @@ fn resize_floating_pane_command(
     )
 }
 
+fn active_floating_pane_target(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+) -> Result<(Selector, Selector), String> {
+    let requested_session_id = session
+        .map(|selector| resolve_session_id(caller, Some(selector)))
+        .transpose()?;
+    let mut panes = list_floating_panes(caller, requested_session_id)?;
+    panes.sort_by_key(|(session_id, pane)| (*session_id, pane.z, pane.pane_id));
+    let (session_id, pane) = panes
+        .iter()
+        .find(|(_, pane)| pane.cursor_owner)
+        .or_else(|| panes.iter().find(|(_, pane)| pane.visible))
+        .ok_or_else(|| "no floating panes found".to_string())?;
+    Ok((
+        Selector {
+            id: Some(*session_id),
+            name: None,
+            index: None,
+        },
+        Selector {
+            id: Some(pane.pane_id),
+            name: None,
+            index: None,
+        },
+    ))
+}
+
+fn next_floating_pane_target(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+) -> Result<(Selector, Selector), String> {
+    let requested_session_id = session
+        .map(|selector| resolve_session_id(caller, Some(selector)))
+        .transpose()?;
+    let mut panes = list_floating_panes(caller, requested_session_id)?;
+    panes.retain(|(_, pane)| pane.visible);
+    panes.sort_by_key(|(session_id, pane)| (*session_id, pane.z, pane.pane_id));
+    if panes.is_empty() {
+        return Err("no floating panes found".to_string());
+    }
+    let current_index = panes
+        .iter()
+        .position(|(_, pane)| pane.cursor_owner)
+        .unwrap_or_else(|| panes.len().saturating_sub(1));
+    let (session_id, pane) = &panes[(current_index + 1) % panes.len()];
+    Ok((
+        Selector {
+            id: Some(*session_id),
+            name: None,
+            index: None,
+        },
+        Selector {
+            id: Some(pane.pane_id),
+            name: None,
+            index: None,
+        },
+    ))
+}
+
+fn mutate_active_floating_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    command: &str,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let (owner_session, target) = active_floating_pane_target(caller, session)?;
+    mutate_floating_pane(caller, Some(&owner_session), &target, command)
+}
+
+fn focus_next_floating_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let (owner_session, target) = next_floating_pane_target(caller, session)?;
+    mutate_floating_pane(caller, Some(&owner_session), &target, "focus")
+}
+
 fn set_floating_pane_z(
     caller: &(impl ServiceCaller + Sync),
     session: Option<&Selector>,
@@ -1625,6 +1702,22 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
                     );
                 }
             }
+            Ok(())
+        }
+        "focus-next-floating-pane" => {
+            focus_next_floating_pane(context, None)?;
+            Ok(())
+        }
+        "raise-active-floating-pane" => {
+            mutate_active_floating_pane(context, None, "raise")?;
+            Ok(())
+        }
+        "lower-active-floating-pane" => {
+            mutate_active_floating_pane(context, None, "lower")?;
+            Ok(())
+        }
+        "close-active-floating-pane" => {
+            mutate_active_floating_pane(context, None, "close")?;
             Ok(())
         }
         "focus-floating-pane"
@@ -3094,6 +3187,66 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
             mutate_floating_pane(&*caller, session.as_ref(), &target, "close")
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn focus_next_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            focus_next_floating_pane(&*caller, session.as_ref())
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn raise_active_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            mutate_active_floating_pane(&*caller, session.as_ref(), "raise")
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn lower_active_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            mutate_active_floating_pane(&*caller, session.as_ref(), "lower")
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn close_active_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            mutate_active_floating_pane(&*caller, session.as_ref(), "close")
                 .map(|ack| PaneAck {
                     ok: true,
                     pane_id: Some(ack.pane_id),
