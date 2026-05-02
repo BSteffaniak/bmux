@@ -44,7 +44,7 @@ use bmux_scene_protocol::scene_protocol::{
     GradientAxis, NamedColor, PaintCommand, Rect as SceneRect, STATE_KIND as SCENE_STATE_KIND,
     Style as SceneStyle, SurfaceDecoration,
 };
-use bmux_scene_protocol_render::paint::apply_paint_commands;
+use bmux_scene_protocol_render::paint::{apply_paint_commands, interpolate_style};
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
@@ -304,18 +304,7 @@ fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) 
             to_style,
             ..
         } => {
-            if text.is_empty() {
-                return Some(());
-            }
-            if axis != &GradientAxis::Horizontal || from_style != to_style {
-                return None;
-            }
-            ops.push(RenderOp::TextRun {
-                x: *col,
-                y: *row,
-                text: text.clone(),
-                style: render_style_from_scene(from_style),
-            });
+            push_gradient_run_ops(ops, *col, *row, text, *axis, from_style, to_style);
         }
         PaintCommand::CellGrid {
             origin_col,
@@ -360,6 +349,78 @@ const fn paint_command_z(command: &PaintCommand) -> i16 {
         | PaintCommand::CellGrid { z, .. }
         | PaintCommand::BoxBorder { z, .. } => *z,
     }
+}
+
+fn push_gradient_run_ops(
+    ops: &mut Vec<RenderOp>,
+    col: u16,
+    row: u16,
+    text: &str,
+    axis: GradientAxis,
+    from_style: &SceneStyle,
+    to_style: &SceneStyle,
+) {
+    let segments: Vec<&str> = text_scalar_segments(text).collect();
+    let n = segments.len();
+    if n == 0 {
+        return;
+    }
+    if n == 1 {
+        ops.push(RenderOp::TextRun {
+            x: col,
+            y: row,
+            text: text.to_string(),
+            style: render_style_from_scene(from_style),
+        });
+        return;
+    }
+
+    let mut offset = 0_u16;
+    #[allow(clippy::cast_precision_loss)] // Segment count is bounded by terminal UI text length.
+    let denom = (n - 1) as f32;
+    for (index, segment) in segments.into_iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        let t = index as f32 / denom;
+        let style = render_style_from_scene(&interpolate_style(from_style, to_style, t));
+        match axis {
+            GradientAxis::Horizontal => {
+                ops.push(RenderOp::TextRun {
+                    x: col.saturating_add(offset),
+                    y: row,
+                    text: segment.to_string(),
+                    style,
+                });
+                offset = offset.saturating_add(text_width_u16(segment).max(1));
+            }
+            GradientAxis::Vertical => {
+                ops.push(RenderOp::TextRun {
+                    x: col,
+                    y: row.saturating_add(offset),
+                    text: segment.to_string(),
+                    style,
+                });
+                offset = offset.saturating_add(1);
+            }
+            GradientAxis::Diagonal => {
+                ops.push(RenderOp::TextRun {
+                    x: col.saturating_add(offset),
+                    y: row.saturating_add(offset),
+                    text: segment.to_string(),
+                    style,
+                });
+                offset = offset.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn text_scalar_segments(text: &str) -> impl Iterator<Item = &str> {
+    let mut chars = text.char_indices().peekable();
+    std::iter::from_fn(move || {
+        let (start, _) = chars.next()?;
+        let end = chars.peek().map_or(text.len(), |(index, _)| *index);
+        Some(&text[start..end])
+    })
 }
 
 fn render_style_from_scene(style: &SceneStyle) -> RenderStyle {
@@ -415,11 +476,12 @@ fn render_cell_grid_rows(cols: u16, cells: &[SceneCell]) -> Option<Vec<Vec<Rende
     for row_cells in cells.chunks(usize::from(cols)) {
         let mut row = Vec::with_capacity(row_cells.len());
         for cell in row_cells {
-            if cell.glyph.is_empty() {
-                return None;
-            }
             row.push(RenderCell {
-                ch: single_display_cell_char(&cell.glyph)?,
+                ch: if cell.glyph.is_empty() {
+                    None
+                } else {
+                    Some(single_display_cell_char(&cell.glyph)?)
+                },
                 style: render_style_from_scene(&cell.style),
             });
         }
@@ -786,6 +848,52 @@ mod tests {
     }
 
     #[test]
+    fn render_ops_converts_empty_cell_grid_cells_to_sparse_cells() {
+        let surface_id = Uuid::from_u128(11);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::CellGrid {
+                origin_col: 0,
+                origin_row: 0,
+                z: 0,
+                cols: 2,
+                cells: vec![
+                    SceneCell {
+                        glyph: "A".to_string(),
+                        style: scene_style(),
+                    },
+                    SceneCell {
+                        glyph: String::new(),
+                        style: scene_style(),
+                    },
+                ],
+            }],
+        );
+
+        let ops = extension
+            .render_ops(
+                surface_id,
+                &ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+                &RenderDamage::FullSurface,
+            )
+            .expect("empty grid cells should be sparse declarative cells");
+
+        assert!(matches!(
+            &ops[..],
+            [RenderOp::CellGrid { rows, .. }]
+                if rows == &vec![vec![
+                    RenderCell { ch: Some('A'), style: RenderStyle::default() },
+                    RenderCell { ch: None, style: RenderStyle::default() },
+                ]]
+        ));
+    }
+
+    #[test]
     fn render_ops_falls_back_for_wide_cell_grid_glyphs() {
         let surface_id = Uuid::from_u128(7);
         let (extension, _cache) = extension_with_surface(
@@ -970,6 +1078,92 @@ mod tests {
             &ops[..],
             [RenderOp::TextRun { text: low, .. }, RenderOp::TextRun { text: high, .. }]
                 if low == "low" && high == "high"
+        ));
+    }
+
+    #[test]
+    fn render_ops_lowers_horizontal_gradient_runs() {
+        let surface_id = Uuid::from_u128(9);
+        let mut from_style = scene_style();
+        from_style.fg = Some(SceneColor::Rgb { r: 0, g: 0, b: 0 });
+        let mut to_style = scene_style();
+        to_style.fg = Some(SceneColor::Rgb { r: 255, g: 0, b: 0 });
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::GradientRun {
+                col: 4,
+                row: 2,
+                z: 0,
+                text: "abc".to_string(),
+                axis: GradientAxis::Horizontal,
+                from_style,
+                to_style,
+            }],
+        );
+
+        let ops = extension
+            .render_ops(
+                surface_id,
+                &ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+                &RenderDamage::FullSurface,
+            )
+            .expect("gradient runs should lower to text ops");
+
+        assert!(matches!(
+            &ops[..],
+            [
+                RenderOp::TextRun { x: 4, y: 2, text: a, style: a_style },
+                RenderOp::TextRun { x: 5, y: 2, text: b, style: b_style },
+                RenderOp::TextRun { x: 6, y: 2, text: c, style: c_style },
+            ] if a == "a"
+                && b == "b"
+                && c == "c"
+                && a_style.fg == Some(RenderColor::Rgb { r: 0, g: 0, b: 0 })
+                && b_style.fg == Some(RenderColor::Rgb { r: 128, g: 0, b: 0 })
+                && c_style.fg == Some(RenderColor::Rgb { r: 255, g: 0, b: 0 })
+        ));
+    }
+
+    #[test]
+    fn render_ops_lowers_vertical_gradient_runs() {
+        let surface_id = Uuid::from_u128(10);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::GradientRun {
+                col: 4,
+                row: 2,
+                z: 0,
+                text: "ab".to_string(),
+                axis: GradientAxis::Vertical,
+                from_style: scene_style(),
+                to_style: scene_style(),
+            }],
+        );
+
+        let ops = extension
+            .render_ops(
+                surface_id,
+                &ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+                &RenderDamage::FullSurface,
+            )
+            .expect("vertical gradients should lower to text ops");
+
+        assert!(matches!(
+            &ops[..],
+            [
+                RenderOp::TextRun { x: 4, y: 2, text: a, .. },
+                RenderOp::TextRun { x: 4, y: 3, text: b, .. },
+            ] if a == "a" && b == "b"
         ));
     }
 

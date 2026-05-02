@@ -298,7 +298,8 @@ fn queue_box_border<W: io::Write>(
 /// whichever style is "closer" at `t` (`< 0.5` → `from`, `>= 0.5` → `to`).
 /// Colour interpolation works for paired truecolor endpoints; every
 /// other pair falls back to the nearest endpoint.
-fn interpolate_style(from: &Style, to: &Style, t: f32) -> Style {
+#[must_use]
+pub fn interpolate_style(from: &Style, to: &Style, t: f32) -> Style {
     let pick = |a, b| if t < 0.5 { a } else { b };
     Style {
         fg: interpolate_color(from.fg.as_ref(), to.fg.as_ref(), t),

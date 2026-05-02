@@ -139,7 +139,9 @@ pub struct RenderStyle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderCell {
-    pub ch: char,
+    /// Display-cell glyph to paint. `None` represents a transparent/sparse
+    /// cell: it reserves a grid position but emits no terminal bytes.
+    pub ch: Option<char>,
     pub style: RenderStyle,
 }
 

@@ -483,8 +483,11 @@ fn queue_render_cell_grid<W: io::Write>(
             if cell_x < surface_rect.x || cell_x >= surface_rect.right() {
                 continue;
             }
+            let Some(ch) = cell.ch else {
+                continue;
+            };
             queue_render_style(stdout, cell.style)?;
-            queue!(stdout, MoveTo(cell_x, cell_y), Print(cell.ch))
+            queue!(stdout, MoveTo(cell_x, cell_y), Print(ch))
                 .context("failed queueing declarative cell-grid render op")?;
             wrote = true;
         }
@@ -2732,6 +2735,49 @@ mod tests {
         assert!(output.contains("\u{1b}[1;2H   "), "{output:?}");
         assert!(output.contains("\u{1b}[2;2H   "), "{output:?}");
         assert!(output.contains("\u{1b}[2;6H  "), "{output:?}");
+    }
+
+    #[test]
+    fn queue_render_ops_skips_sparse_cell_grid_cells() {
+        let ops = [RenderOp::CellGrid {
+            x: 0,
+            y: 0,
+            rows: vec![vec![
+                bmux_plugin::RenderCell {
+                    ch: Some('A'),
+                    style: RenderStyle::default(),
+                },
+                bmux_plugin::RenderCell {
+                    ch: None,
+                    style: RenderStyle::default(),
+                },
+                bmux_plugin::RenderCell {
+                    ch: Some('B'),
+                    style: RenderStyle::default(),
+                },
+            ]],
+        }];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 4,
+                    h: 1,
+                },
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+            .expect("sparse cell grid should queue")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        assert!(output.contains("\u{1b}[1;1HA"), "{output:?}");
+        assert!(output.contains("\u{1b}[1;3HB"), "{output:?}");
+        assert!(!output.contains("\u{1b}[1;2H"), "{output:?}");
     }
 
     #[test]
