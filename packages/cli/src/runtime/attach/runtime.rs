@@ -14,7 +14,10 @@ use bmux_attach_pipeline::reconcile::{
 };
 use bmux_attach_pipeline::{
     AttachChunkApplyOutcome, AttachOutputChunkMeta, DamageCoalescingPolicy, DamageRect,
-    update_protocol_hints_from_state,
+    RetainedOpacity, RetainedRepaintSurface, RetainedSurface, RetainedSurfacePayload,
+    merge_retained_damages, retained_damage_from_absolute_rects,
+    retained_frame_damage_from_frame_damage, retained_layer_order,
+    retained_surfaces_from_attach_scene, update_protocol_hints_from_state,
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{
@@ -74,7 +77,7 @@ use super::input::{
 };
 use super::prompt_ui::{
     AttachCloseFallbackTarget, AttachInternalPromptAction, AttachPromptCompletion,
-    AttachPromptOrigin, PromptKeyDisposition, prompt_accepts_key_kind,
+    AttachPromptOrigin, AttachPromptOverlayRender, PromptKeyDisposition, prompt_accepts_key_kind,
 };
 use super::render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, opaque_row_text,
@@ -116,6 +119,7 @@ const ATTACH_OVERRENDER_NON_FULL_FRAME_CELL_RATIO_PERCENT: u64 = 50;
 const ATTACH_OVERRENDER_EXTENSION_FULL_SURFACE_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB: u64 = 8;
+const STATUS_SURFACE_ID: Uuid = Uuid::from_u128(3);
 
 fn emit_attach_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Attach, payload);
@@ -5345,18 +5349,11 @@ pub const fn status_row_for_position(status_position: StatusPosition, rows: u16)
     }
 }
 
-pub fn queue_attach_status_line(
-    stdout: &mut impl Write,
+fn status_line_render_ops(
     status_line: &AttachStatusLine,
-    status_position: StatusPosition,
-) -> Result<()> {
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    if cols == 0 || rows == 0 {
-        return Ok(());
-    }
-    let Some(status_row) = status_row_for_position(status_position, rows) else {
-        return Ok(());
-    };
+    status_row: u16,
+    cols: u16,
+) -> Vec<RenderOp> {
     let mut ops = Vec::new();
     if status_line.spans.is_empty() {
         ops.push(RenderOp::text_run(
@@ -5380,14 +5377,27 @@ pub fn queue_attach_status_line(
             RenderStyle::new(),
         ));
     }
-    queue_render_ops(
-        stdout,
-        ExtensionRect::new(0, status_row, cols, 1),
-        &RenderDamage::FullSurface,
-        &ops,
+    ops
+}
+
+fn retained_status_surface(
+    status_line: &AttachStatusLine,
+    status_position: StatusPosition,
+    terminal_size: (u16, u16),
+) -> Option<RetainedSurface> {
+    let (cols, rows) = terminal_size;
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let status_row = status_row_for_position(status_position, rows)?;
+    Some(
+        RetainedSurface::builder(STATUS_SURFACE_ID, DamageRect::new(0, status_row, cols, 1))
+            .layer(retained_layer_order(SurfaceLayer::Status))
+            .z(i32::MAX)
+            .opaque()
+            .render_ops(status_line_render_ops(status_line, status_row, cols))
+            .build(),
     )
-    .context("failed queueing declarative attach status line")?;
-    Ok(())
 }
 
 pub fn help_overlay_visible_rows(lines: &[String]) -> usize {
@@ -5558,25 +5568,6 @@ pub fn help_overlay_surface(lines: &[String]) -> Option<AttachSurface> {
     })
 }
 
-#[allow(clippy::cast_possible_truncation)] // Terminal dimensions bounded by u16
-pub fn queue_attach_help_overlay(
-    stdout: &mut impl Write,
-    surface_meta: &AttachSurface,
-    lines: &[String],
-    scroll: usize,
-) -> Result<()> {
-    let surface_rect = ExtensionRect::new(
-        surface_meta.rect.x,
-        surface_meta.rect.y,
-        surface_meta.rect.w,
-        surface_meta.rect.h,
-    );
-    let ops = help_overlay_render_ops(surface_meta, lines, scroll);
-    queue_render_ops(stdout, surface_rect, &RenderDamage::FullSurface, &ops)
-        .context("failed queueing declarative help overlay")?;
-    Ok(())
-}
-
 #[allow(clippy::cast_possible_truncation)] // Overlay geometry is clamped to terminal bounds before u16 conversion.
 fn help_overlay_render_ops(
     surface_meta: &AttachSurface,
@@ -5657,6 +5648,66 @@ const fn attach_surface_damage_rect(surface: &AttachSurface) -> DamageRect {
         surface.rect.w,
         surface.rect.h,
     )
+}
+
+fn retained_surface_from_attach_surface(
+    surface: &AttachSurface,
+    opacity: RetainedOpacity,
+    ops: Vec<RenderOp>,
+) -> RetainedSurface {
+    RetainedSurface::builder(surface.id, attach_surface_damage_rect(surface))
+        .layer(retained_layer_order(surface.layer))
+        .z(surface.z)
+        .opacity(opacity)
+        .render_ops(ops)
+        .build()
+}
+
+fn retained_help_overlay_surface(
+    surface: &AttachSurface,
+    lines: &[String],
+    scroll: usize,
+) -> RetainedSurface {
+    retained_surface_from_attach_surface(
+        surface,
+        RetainedOpacity::Opaque,
+        help_overlay_render_ops(surface, lines, scroll),
+    )
+}
+
+fn retained_prompt_overlay_surface(render: &AttachPromptOverlayRender) -> RetainedSurface {
+    retained_surface_from_attach_surface(
+        &render.surface,
+        RetainedOpacity::Opaque,
+        render.ops.clone(),
+    )
+}
+
+fn render_damage_from_retained_damage_rects(rects: &[DamageRect]) -> RenderDamage {
+    RenderDamage::from_rects(
+        rects
+            .iter()
+            .map(|rect| ExtensionRect::new(rect.x, rect.y, rect.w, rect.h)),
+    )
+}
+
+fn queue_retained_render_ops(
+    stdout: &mut impl Write,
+    surface: &RetainedSurface,
+    repaint: &RetainedRepaintSurface,
+) -> Result<bool> {
+    let RetainedSurfacePayload::RenderOps(ops) = &surface.payload else {
+        return Ok(false);
+    };
+    let surface_rect = ExtensionRect::new(
+        surface.rect.x,
+        surface.rect.y,
+        surface.rect.w,
+        surface.rect.h,
+    );
+    let damage = render_damage_from_retained_damage_rects(&repaint.damage);
+    queue_render_ops(stdout, surface_rect, &damage, ops)
+        .context("failed queueing retained render ops")
 }
 
 fn overlay_rect_damage(
@@ -5752,7 +5803,74 @@ pub fn render_attach_frame(
     let (status_top_inset, status_bottom_inset) =
         status_insets_for_position(view_state.status_position);
     let terminal_size = (geometry.cols, geometry.rows);
+    let viewport = DamageRect::new(0, 0, terminal_size.0, terminal_size.1);
+    let status_surface = view_state
+        .cached_status_line
+        .as_ref()
+        .and_then(|status_line| {
+            retained_status_surface(status_line, view_state.status_position, terminal_size)
+        });
+    let help_retained_surface = current_help_overlay_surface
+        .as_ref()
+        .map(|surface| retained_help_overlay_surface(surface, help_lines, help_scroll));
+    let prompt_overlay_render = if view_state.prompt.is_active() {
+        view_state.prompt.attach_prompt_overlay_render()
+    } else {
+        None
+    };
+    let prompt_retained_surface = prompt_overlay_render
+        .as_ref()
+        .map(retained_prompt_overlay_surface);
+
     let render_scene = frame_damage.scene_damaged();
+    let retained_frame_damage = retained_frame_damage_from_frame_damage(
+        &layout_state.scene,
+        &frame_damage,
+        viewport,
+        damage_policy,
+    );
+    let mut explicit_ui_damage_rects = Vec::new();
+    if frame_damage.status_damaged()
+        && let Some(surface) = status_surface.as_ref()
+    {
+        explicit_ui_damage_rects.push(surface.rect);
+    }
+    if frame_damage.overlay_damaged() {
+        if let Some(surface) = help_retained_surface.as_ref() {
+            explicit_ui_damage_rects.push(surface.rect);
+        }
+        if let Some(surface) = prompt_retained_surface.as_ref() {
+            explicit_ui_damage_rects.push(surface.rect);
+        }
+    }
+    let explicit_ui_damage =
+        retained_damage_from_absolute_rects(explicit_ui_damage_rects, viewport, damage_policy);
+    let mut retained_surfaces = retained_surfaces_from_attach_scene(&layout_state.scene);
+    retained_surfaces.extend(status_surface.iter().cloned());
+    retained_surfaces.extend(help_retained_surface.iter().cloned());
+    retained_surfaces.extend(prompt_retained_surface.iter().cloned());
+    let retained_graph_damage = view_state.retained_compositor.replace_surfaces(
+        retained_surfaces.clone(),
+        viewport,
+        damage_policy,
+    );
+    let retained_damage = merge_retained_damages(
+        [
+            retained_frame_damage,
+            explicit_ui_damage,
+            retained_graph_damage,
+        ],
+        viewport,
+        damage_policy,
+    );
+    let retained_repaint_plan = view_state
+        .retained_compositor
+        .repaint_plan(&retained_damage);
+    let retained_repaint_by_id = retained_repaint_plan
+        .iter()
+        .map(|surface| (surface.surface_id, surface))
+        .collect::<BTreeMap<_, _>>();
+
     let use_synchronized_update =
         frame_uses_synchronized_update(&frame_damage) || damage_config.visualize;
 
@@ -5775,17 +5893,22 @@ pub fn render_attach_frame(
     if let Some(ref mut cs) = view_state.last_cursor_state {
         cs.visible = false;
     }
-    let status_rendered = frame_damage.status_damaged() && view_state.cached_status_line.is_some();
-    if status_rendered && let Some(status_line) = view_state.cached_status_line.as_ref() {
-        queue_attach_status_line(&mut frame_bytes, status_line, view_state.status_position)?;
-        if let Some(trace) = render_trace.as_deref_mut()
-            && let Some(row) = status_row_for_position(view_state.status_position, terminal_size.1)
-        {
-            trace.push(AttachRenderTraceOp::StatusLine {
-                row,
-                cells: terminal_size.0,
-            });
-        }
+    let status_rendered = if let Some((surface, repaint)) = status_surface
+        .as_ref()
+        .zip(retained_repaint_by_id.get(&STATUS_SURFACE_ID))
+    {
+        queue_retained_render_ops(&mut frame_bytes, surface, repaint)?
+    } else {
+        false
+    };
+    if status_rendered
+        && let Some(trace) = render_trace.as_deref_mut()
+        && let Some(row) = status_row_for_position(view_state.status_position, terminal_size.1)
+    {
+        trace.push(AttachRenderTraceOp::StatusLine {
+            row,
+            cells: terminal_size.0,
+        });
     }
     let appearance_mode_id = if view_state.help_overlay_open {
         "help"
@@ -5870,10 +5993,10 @@ pub fn render_attach_frame(
     let previous_cursor_state = view_state.last_cursor_state;
     let mut overlay_rendered = false;
     let mut overlay_cursor_state = None;
-    let help_overlay_needs_render =
-        view_state.help_overlay_open && (frame_damage.overlay_damaged() || render_scene);
-    if help_overlay_needs_render && let Some(help_surface) = current_help_overlay_surface.as_ref() {
-        queue_attach_help_overlay(&mut frame_bytes, help_surface, help_lines, help_scroll)?;
+    if let Some(help_surface) = help_retained_surface.as_ref()
+        && let Some(repaint) = retained_repaint_by_id.get(&help_surface.id)
+        && queue_retained_render_ops(&mut frame_bytes, help_surface, repaint)?
+    {
         if let Some(trace) = render_trace.as_deref_mut() {
             trace.push(AttachRenderTraceOp::HelpOverlay {
                 rows: help_surface.rect.h,
@@ -5883,15 +6006,14 @@ pub fn render_attach_frame(
         }
         overlay_rendered = true;
     }
-    let prompt_overlay_needs_render =
-        view_state.prompt.is_active() && (frame_damage.overlay_damaged() || render_scene);
-    if prompt_overlay_needs_render {
-        overlay_cursor_state = view_state
-            .prompt
-            .queue_attach_prompt_overlay(&mut frame_bytes)?;
-        if let Some(trace) = render_trace.as_deref_mut()
-            && let Some(prompt_surface) = current_prompt_overlay_surface.as_ref()
-        {
+    if let Some(prompt_surface) = prompt_retained_surface.as_ref()
+        && let Some(repaint) = retained_repaint_by_id.get(&prompt_surface.id)
+        && queue_retained_render_ops(&mut frame_bytes, prompt_surface, repaint)?
+    {
+        overlay_cursor_state = prompt_overlay_render
+            .as_ref()
+            .and_then(|render| render.cursor_state);
+        if let Some(trace) = render_trace.as_deref_mut() {
             trace.push(AttachRenderTraceOp::PromptOverlay {
                 rows: prompt_surface.rect.h,
                 cells: u64::from(prompt_surface.rect.w)
@@ -13831,6 +13953,68 @@ mod tests {
         assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.overlay_needs_redraw);
         assert!(!view_state.dirty.full_pane_redraw);
+    }
+
+    #[test]
+    fn retained_status_surface_uses_render_ops_payload() {
+        let status_line = AttachStatusLine {
+            rendered: "NORMAL".to_owned(),
+            spans: vec![bmux_plugin::RenderTextSpan::new(
+                "NORMAL",
+                RenderStyle::new().bold(),
+            )],
+            tab_hitboxes: Vec::new(),
+            drag_marker_col: Some(3),
+        };
+
+        let surface = retained_status_surface(&status_line, StatusPosition::Bottom, (20, 5))
+            .expect("status surface");
+
+        assert_eq!(surface.id, STATUS_SURFACE_ID);
+        assert_eq!(surface.rect, DamageRect::new(0, 4, 20, 1));
+        assert_eq!(surface.opacity, RetainedOpacity::Opaque);
+        let RetainedSurfacePayload::RenderOps(ops) = surface.payload else {
+            panic!("status should lower to render ops");
+        };
+        assert_eq!(ops.len(), 2);
+    }
+
+    #[test]
+    fn retained_help_overlay_surface_uses_render_ops_payload() {
+        let surface = AttachSurface {
+            id: HELP_OVERLAY_SURFACE_ID,
+            kind: AttachSurfaceKind::Overlay,
+            layer: SurfaceLayer::Overlay,
+            z: i32::MAX,
+            rect: AttachRect {
+                x: 2,
+                y: 3,
+                w: 20,
+                h: 6,
+            },
+            content_rect: AttachRect {
+                x: 2,
+                y: 3,
+                w: 20,
+                h: 6,
+            },
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner: true,
+            pane_id: None,
+        };
+
+        let retained = retained_help_overlay_surface(&surface, &["line".to_owned()], 0);
+
+        assert_eq!(retained.id, HELP_OVERLAY_SURFACE_ID);
+        assert_eq!(retained.rect, DamageRect::new(2, 3, 20, 6));
+        assert_eq!(retained.layer, retained_layer_order(SurfaceLayer::Overlay));
+        let RetainedSurfacePayload::RenderOps(ops) = retained.payload else {
+            panic!("help overlay should lower to render ops");
+        };
+        assert!(ops.iter().any(|op| matches!(op, RenderOp::Border { .. })));
     }
 
     #[test]

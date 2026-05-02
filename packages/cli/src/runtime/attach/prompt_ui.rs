@@ -1,24 +1,30 @@
-use super::render::{opaque_row_text, queue_render_ops};
+use super::render::opaque_row_text;
 use super::state::AttachCursorState;
 use crate::runtime::prompt::{
     PromptField, PromptFormField, PromptFormFieldKind, PromptFormValue, PromptHostRequest,
     PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValue,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bmux_attach_layout_protocol::{
     AttachLayer as SurfaceLayer, AttachRect, AttachSurface, AttachSurfaceKind,
 };
-use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderDamage, RenderOp, RenderStyle};
+use bmux_plugin::{BorderGlyphs, ExtensionRect, RenderOp, RenderStyle};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::Write;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const PROMPT_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(2);
+
+#[derive(Debug, Clone)]
+pub struct AttachPromptOverlayRender {
+    pub surface: AttachSurface,
+    pub ops: Vec<RenderOp>,
+    pub cursor_state: Option<AttachCursorState>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachCloseFallbackTarget {
@@ -723,19 +729,10 @@ impl AttachPromptState {
     }
 
     #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are bounded by terminal::size() u16 dimensions.
-    pub fn queue_attach_prompt_overlay(
-        &mut self,
-        stdout: &mut impl Write,
-    ) -> Result<Option<AttachCursorState>> {
-        let Some(layout) =
-            prompt_overlay_layout(self.active.as_ref().map(|active| &active.envelope.request))
-        else {
-            return Ok(None);
-        };
-
-        let Some(active) = self.active.as_mut() else {
-            return Ok(None);
-        };
+    pub fn attach_prompt_overlay_render(&mut self) -> Option<AttachPromptOverlayRender> {
+        let layout =
+            prompt_overlay_layout(self.active.as_ref().map(|active| &active.envelope.request))?;
+        let active = self.active.as_mut()?;
 
         let width = usize::from(layout.surface.rect.w);
         let height = usize::from(layout.surface.rect.h);
@@ -784,8 +781,6 @@ impl AttachPromptState {
             opaque_row_text(&footer, text_width),
             style,
         ));
-        queue_render_ops(stdout, surface_rect, &RenderDamage::FullSurface, &ops)
-            .context("failed queueing declarative prompt overlay")?;
 
         let cursor_state = body.cursor.map(|(row, col)| AttachCursorState {
             x: (x + 2 + col).min(u16::MAX as usize) as u16,
@@ -793,7 +788,11 @@ impl AttachPromptState {
             visible: true,
         });
 
-        Ok(cursor_state)
+        Some(AttachPromptOverlayRender {
+            surface: layout.surface,
+            ops,
+            cursor_state,
+        })
     }
 
     fn enqueue(&mut self, envelope: AttachPromptEnvelope) {

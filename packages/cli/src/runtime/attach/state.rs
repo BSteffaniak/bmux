@@ -3,10 +3,10 @@ use crate::status::AttachStatusLine;
 use bmux_attach_layout_protocol::{
     AttachInputModeState, AttachMouseProtocolState, AttachScene, AttachSurface,
 };
-use bmux_attach_pipeline::FrameDamage;
 pub use bmux_attach_pipeline::{
     AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
 };
+use bmux_attach_pipeline::{FrameDamage, RetainedCompositor};
 use bmux_client::AttachLayoutState;
 use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use bmux_control_catalog_plugin_api::control_catalog_state::{
@@ -271,6 +271,7 @@ pub struct AttachViewState {
     pub status_position: StatusPosition,
     pub cached_status_line: Option<AttachStatusLine>,
     pub cached_layout_state: Option<AttachLayoutState>,
+    pub retained_compositor: RetainedCompositor,
     pub last_help_overlay_surface: Option<AttachSurface>,
     pub last_prompt_overlay_surface: Option<AttachSurface>,
     pub last_cursor_state: Option<AttachCursorState>,
@@ -498,6 +499,7 @@ impl AttachViewState {
             status_position: StatusPosition::Bottom,
             cached_status_line: None,
             cached_layout_state: None,
+            retained_compositor: RetainedCompositor::new(),
             last_help_overlay_surface: None,
             last_prompt_overlay_surface: None,
             last_cursor_state: None,

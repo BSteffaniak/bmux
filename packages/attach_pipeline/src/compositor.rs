@@ -357,6 +357,32 @@ impl RetainedDamage {
     }
 }
 
+#[must_use]
+pub fn retained_damage_from_absolute_rects(
+    rects: impl IntoIterator<Item = DamageRect>,
+    viewport: DamageRect,
+    policy: DamageCoalescingPolicy,
+) -> RetainedDamage {
+    coalesce_absolute_damage(rects.into_iter().collect(), viewport, policy)
+}
+
+#[must_use]
+pub fn merge_retained_damages(
+    damages: impl IntoIterator<Item = RetainedDamage>,
+    viewport: DamageRect,
+    policy: DamageCoalescingPolicy,
+) -> RetainedDamage {
+    let mut rects = Vec::new();
+    for damage in damages {
+        match damage {
+            RetainedDamage::None => {}
+            RetainedDamage::Full { .. } => return RetainedDamage::Full { viewport },
+            RetainedDamage::Regions(next) => rects.extend(next),
+        }
+    }
+    coalesce_absolute_damage(rects, viewport, policy)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedRepaintSurface {
     pub surface_id: Uuid,
@@ -486,7 +512,8 @@ const fn translate_damage_rect(rect: DamageRect, origin: DamageRect) -> DamageRe
     )
 }
 
-const fn retained_layer_order(layer: AttachLayer) -> i16 {
+#[must_use]
+pub const fn retained_layer_order(layer: AttachLayer) -> i16 {
     match layer {
         AttachLayer::Status => 0,
         AttachLayer::Pane => 10,
@@ -851,6 +878,38 @@ mod tests {
             surfaces[0].interactive_regions,
             vec![DamageRect::new(1, 2, 10, 1)]
         );
+    }
+
+    #[test]
+    fn retained_damage_helpers_merge_absolute_rects_and_full_damage() {
+        let viewport = DamageRect::new(0, 0, 10, 5);
+        let policy = DamageCoalescingPolicy::default();
+        let rect_damage = retained_damage_from_absolute_rects(
+            [DamageRect::new(1, 1, 2, 1), DamageRect::new(2, 1, 2, 1)],
+            viewport,
+            policy,
+        );
+        assert_eq!(rect_damage.rects(), &[DamageRect::new(1, 1, 3, 1)]);
+
+        let merged = merge_retained_damages(
+            [
+                rect_damage,
+                RetainedDamage::Regions(vec![DamageRect::new(9, 4, 1, 1)]),
+            ],
+            viewport,
+            policy,
+        );
+        assert_eq!(
+            merged.rects(),
+            &[DamageRect::new(1, 1, 3, 1), DamageRect::new(9, 4, 1, 1)]
+        );
+
+        let full = merge_retained_damages(
+            [merged, RetainedDamage::Full { viewport }],
+            viewport,
+            policy,
+        );
+        assert_eq!(full, RetainedDamage::Full { viewport });
     }
 
     #[test]
