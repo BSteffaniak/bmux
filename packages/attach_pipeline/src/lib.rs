@@ -22,7 +22,11 @@ pub use bmux_attach_pipeline_models::{
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub use compositor::{RetainedCompositor, RetainedDamage, RetainedRepaintSurface, RetainedSurface};
+pub use compositor::{
+    RetainedCompositor, RetainedDamage, RetainedOpacity, RetainedRepaintSurface, RetainedSurface,
+    RetainedSurfacePayload, retained_frame_damage_from_frame_damage,
+    retained_repaint_plan_from_frame_damage, retained_surfaces_from_attach_scene,
+};
 pub use mouse::{
     Button as AttachMouseButton, Event as AttachMouseEvent, EventKind as AttachMouseEventKind,
     Modifiers as AttachMouseModifiers, PaneProtocol as AttachPaneMouseProtocol,

@@ -1,3 +1,4 @@
+use crate::compositor::retained_repaint_plan_from_frame_damage;
 use crate::types::{
     AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, ExtensionRenderCacheEntry,
     PaneRect, PaneRenderBuffer,
@@ -1016,6 +1017,11 @@ impl FrameDamage {
     }
 
     #[must_use]
+    pub const fn extension_surfaces(&self) -> &BTreeSet<Uuid> {
+        &self.extension_surfaces
+    }
+
+    #[must_use]
     pub fn content_surface_rects(&self, pane_id: Uuid) -> &[DamageRect] {
         self.content_surface_rects
             .get(&pane_id)
@@ -2022,6 +2028,12 @@ fn render_attach_scene_inner<W: io::Write>(
 
     let mut ordered_surfaces = scene.surfaces.iter().enumerate().collect::<Vec<_>>();
     ordered_surfaces.sort_by_key(|(index, surface)| (surface.layer, surface.z, *index));
+    let viewport = DamageRect::new(0, 0, cols, rows);
+    let retained_repaint_ids =
+        retained_repaint_plan_from_frame_damage(scene, frame_damage, viewport, damage_policy)
+            .into_iter()
+            .map(|surface| surface.surface_id)
+            .collect::<BTreeSet<_>>();
 
     for (surface_index, surface) in ordered_surfaces {
         if !surface.visible {
@@ -2082,6 +2094,9 @@ fn render_attach_scene_inner<W: io::Write>(
         let focus = surface.cursor_owner
             || focused_surface_id == Some(surface.id)
             || focused_pane_id == Some(pane_id);
+        if !focus && !retained_repaint_ids.contains(&surface.id) {
+            continue;
+        }
         if should_draw_extensions {
             // Consult every registered render extension for this
             // surface. Extensions report generic surface damage;
