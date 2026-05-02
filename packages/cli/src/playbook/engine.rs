@@ -2024,6 +2024,7 @@ fn execute_attach_sim_step(
             let expected = runtime_vars.resolve_opt(equals);
             let actual = match path.as_str() {
                 "windows.names" => serde_json::to_string(&sim.window_names())?,
+                "windows.active_name" => serde_json::to_string(&sim.active_window_name())?,
                 other => bail!("unsupported attach-sim state path '{other}'"),
             };
             ensure!(

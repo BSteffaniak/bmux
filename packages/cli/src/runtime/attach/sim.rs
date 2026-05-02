@@ -152,6 +152,13 @@ impl AttachSimHarness {
             .collect()
     }
 
+    pub fn active_window_name(&self) -> Option<&str> {
+        self.windows
+            .iter()
+            .find(|window| window.active)
+            .map(|window| window.name.as_str())
+    }
+
     pub fn locate_text(&self, text: &str) -> Option<AttachSimLocatedText> {
         let status_line = self.view_state.cached_status_line.as_ref()?;
         for (index, window) in self.windows.iter().enumerate() {

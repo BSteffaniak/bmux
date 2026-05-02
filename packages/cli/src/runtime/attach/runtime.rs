@@ -10505,6 +10505,139 @@ mod tests {
     }
 
     #[test]
+    fn status_tab_reducer_left_half_moves_before_target() {
+        let mut view_state = tab_reducer_view_state();
+        let first = Uuid::from_u128(1);
+        let third = Uuid::from_u128(3);
+
+        let down = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Down, 15, 23),
+            tab_reducer_geometry(),
+        );
+        assert!(down.consumed);
+
+        let up = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Up, 2, 23),
+            tab_reducer_geometry(),
+        );
+        assert_eq!(
+            up.effects,
+            vec![AttachUiEffect::MoveWindow {
+                source_context_id: third,
+                target_context_id: first,
+                placement: AttachTabDropPlacement::Before,
+            }]
+        );
+    }
+
+    #[test]
+    fn status_tab_reducer_right_half_moves_after_target() {
+        let mut view_state = tab_reducer_view_state();
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+
+        let down = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Down, 3, 23),
+            tab_reducer_geometry(),
+        );
+        assert!(down.consumed);
+
+        let up = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Up, 11, 23),
+            tab_reducer_geometry(),
+        );
+        assert_eq!(
+            up.effects,
+            vec![AttachUiEffect::MoveWindow {
+                source_context_id: first,
+                target_context_id: second,
+                placement: AttachTabDropPlacement::After,
+            }]
+        );
+    }
+
+    #[test]
+    fn status_tab_reducer_gap_drop_resolves_to_nearest_insertion_point() {
+        let mut view_state = tab_reducer_view_state();
+        let first = Uuid::from_u128(1);
+        let third = Uuid::from_u128(3);
+
+        let down = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Down, 3, 23),
+            tab_reducer_geometry(),
+        );
+        assert!(down.consumed);
+
+        let up = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Up, 79, 23),
+            tab_reducer_geometry(),
+        );
+        assert_eq!(
+            up.effects,
+            vec![AttachUiEffect::MoveWindow {
+                source_context_id: first,
+                target_context_id: third,
+                placement: AttachTabDropPlacement::After,
+            }]
+        );
+    }
+
+    #[test]
+    fn status_tab_reducer_tracks_marker_target_and_clears_drag_after_release() {
+        let mut view_state = tab_reducer_view_state();
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+
+        let down = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Down, 3, 23),
+            tab_reducer_geometry(),
+        );
+        assert!(down.consumed);
+
+        let motion = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Move, 8, 23),
+            tab_reducer_geometry(),
+        );
+        assert!(motion.consumed);
+        let drag = view_state.mouse.tab_drag.expect("active tab drag");
+        let drop_target = drag.drop_target.expect("drop target");
+        assert!(drag.active);
+        assert_eq!(drop_target.context_id, second);
+        assert_eq!(drop_target.placement, AttachTabDropPlacement::Before);
+        let status_line = view_state
+            .cached_status_line
+            .as_ref()
+            .expect("cached status line");
+        assert_eq!(
+            attach_tab_drop_marker_col(status_line, drop_target, tab_reducer_geometry().cols),
+            Some(8)
+        );
+
+        let up = reduce_attach_status_tab_mouse_event(
+            &mut view_state,
+            tab_mouse_event(TerminalMousePhase::Up, 8, 23),
+            tab_reducer_geometry(),
+        );
+        assert_eq!(
+            up.effects,
+            vec![AttachUiEffect::MoveWindow {
+                source_context_id: first,
+                target_context_id: second,
+                placement: AttachTabDropPlacement::Before,
+            }]
+        );
+        assert!(view_state.mouse.tab_drag.is_none());
+    }
+
+    #[test]
     fn status_tab_reducer_mru_disables_move() {
         let mut view_state = tab_reducer_view_state();
         let first = Uuid::from_u128(1);

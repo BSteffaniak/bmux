@@ -545,6 +545,13 @@ fn parse_and_validate_fixtures() {
         "render_assert_split_pane.dsl",
         "render_assert_resize_viewport.dsl",
         "render_assert_alt_screen_transition.dsl",
+        "attach_sim_tab_drag.dsl",
+        "attach_sim_tab_drag_no_motion.dsl",
+        "attach_sim_tab_drag_left_half.dsl",
+        "attach_sim_tab_drag_right_half.dsl",
+        "attach_sim_tab_drag_gap.dsl",
+        "attach_sim_tab_drag_mru_noop.dsl",
+        "attach_sim_tab_click_switch.dsl",
     ];
 
     for name in &fixtures {
@@ -557,6 +564,24 @@ fn parse_and_validate_fixtures() {
             errors.is_empty(),
             "validation errors for {name}: {errors:?}"
         );
+    }
+}
+
+#[test]
+fn attach_sim_fixtures_run_without_sandbox() {
+    let fixtures = [
+        "attach_sim_tab_drag.dsl",
+        "attach_sim_tab_drag_no_motion.dsl",
+        "attach_sim_tab_drag_left_half.dsl",
+        "attach_sim_tab_drag_right_half.dsl",
+        "attach_sim_tab_drag_gap.dsl",
+        "attach_sim_tab_drag_mru_noop.dsl",
+        "attach_sim_tab_click_switch.dsl",
+    ];
+
+    for name in fixtures {
+        let (_json, pass) = run_playbook_fixture(name);
+        assert!(pass, "attach-sim fixture failed: {name}");
     }
 }
 

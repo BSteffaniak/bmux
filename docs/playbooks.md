@@ -340,7 +340,7 @@ Supported attach-sim actions:
 | `assert-rendered`  | Assert rendered output contains or matches text                                                     |
 | `assert-effect`    | Assert an effect such as `move-window` was emitted                                                  |
 | `assert-no-effect` | Assert an effect was not emitted                                                                    |
-| `assert-state`     | Assert fake state; currently supports `path='windows.names'`                                        |
+| `assert-state`     | Assert fake state; currently supports `path='windows.names'` and `path='windows.active_name'`       |
 
 This driver is intentionally generic around terminal events, rendering,
 effects, and state assertions. Feature fixtures are allowed, but the input and

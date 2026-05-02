@@ -256,6 +256,27 @@ mod tests {
     }
 
     #[test]
+    fn maps_crossterm_mouse_up_and_drag() {
+        let up = TerminalMouseEvent::from(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Right),
+            column: 5,
+            row: 7,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(up.phase, TerminalMousePhase::Up);
+        assert_eq!(up.button, Some(TerminalMouseButton::Right));
+
+        let drag = TerminalMouseEvent::from(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Middle),
+            column: 9,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(drag.phase, TerminalMousePhase::Drag);
+        assert_eq!(drag.button, Some(TerminalMouseButton::Middle));
+    }
+
+    #[test]
     fn maps_crossterm_mouse_motion_and_scroll() {
         let moved = TerminalMouseEvent::from(MouseEvent {
             kind: MouseEventKind::Moved,
