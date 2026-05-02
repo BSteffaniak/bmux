@@ -96,6 +96,7 @@ const ATTACH_GRID_DELTA_MAX_BATCHES_PER_PANE: usize = 128;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
 const ATTACH_PLUGIN_STATUS_MESSAGE_MAX_CHARS: usize = 180;
+const ATTACH_TAB_DRAG_THRESHOLD_CELLS: u16 = 1;
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
 /// progress output burst to complete (e.g. when the server indicates
 /// `output_still_pending` or the inner application is mid-synchronized-
@@ -8699,7 +8700,7 @@ pub async fn handle_attach_status_tab_mouse_event(
             view_state.dirty.mark_status_dirty(AttachDirtySource::Mouse);
             Ok(true)
         }
-        MouseEventKind::Drag(MouseButton::Left) => {
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
             if view_state.mouse.tab_drag.is_none() {
                 return Ok(false);
             }
@@ -8714,7 +8715,7 @@ pub async fn handle_attach_status_tab_mouse_event(
                 None
             };
             if let Some(drag) = view_state.mouse.tab_drag.as_mut() {
-                drag.active = true;
+                drag.active |= attach_tab_drag_motion_is_active(drag, mouse_event, drop_target);
                 drag.drop_target = drop_target;
             }
             view_state.dirty.mark_status_dirty(AttachDirtySource::Mouse);
@@ -8736,7 +8737,8 @@ pub async fn handle_attach_status_tab_mouse_event(
             }
             .or_else(|| drag.drop_target.take());
 
-            if let (true, Some(target)) = (drag.active, drop_target) {
+            let drag_active = attach_tab_drag_motion_is_active(&drag, mouse_event, drop_target);
+            if let (true, Some(target)) = (drag_active, drop_target) {
                 if !view_state.can_write {
                     view_state.set_transient_status(
                         "tab reorder unavailable in read-only attach".to_string(),
@@ -8744,24 +8746,21 @@ pub async fn handle_attach_status_tab_mouse_event(
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 } else if target.context_id != drag.source_context_id {
-                    let placement = attach_tab_drop_placement_arg(target.placement);
-                    let args = vec![
-                        drag.source_context_id.to_string(),
-                        target.context_id.to_string(),
-                        "--placement".to_string(),
-                        placement.to_string(),
-                    ];
-                    handle_attach_plugin_command_action(
+                    move_attach_status_tab(
                         client,
-                        "bmux.windows",
-                        "move-window",
-                        &args,
-                        view_state,
-                        kernel_client_factory,
+                        drag.source_context_id,
+                        target.context_id,
+                        target.placement,
                     )
                     .await?;
+                    optimistically_reorder_attach_window_list(
+                        view_state,
+                        drag.source_context_id,
+                        target.context_id,
+                        target.placement,
+                    );
                 }
-            } else if !drag.active {
+            } else if !drag_active {
                 switch_attach_status_tab(
                     client,
                     view_state,
@@ -8867,11 +8866,85 @@ fn attach_tab_drop_marker_col(
     Some(col.min(cols.saturating_sub(1)))
 }
 
-const fn attach_tab_drop_placement_arg(placement: AttachTabDropPlacement) -> &'static str {
+fn attach_tab_drag_motion_is_active(
+    drag: &AttachMouseTabDrag,
+    mouse_event: MouseEvent,
+    drop_target: Option<AttachTabDropTarget>,
+) -> bool {
+    drag.active
+        || drop_target.is_some_and(|target| target.context_id != drag.source_context_id)
+        || mouse_event
+            .column
+            .abs_diff(drag.started_col)
+            .max(mouse_event.row.abs_diff(drag.started_row))
+            > ATTACH_TAB_DRAG_THRESHOLD_CELLS
+}
+
+const fn attach_tab_drop_placement_api(
+    placement: AttachTabDropPlacement,
+) -> windows_commands::WindowMovePlacement {
     match placement {
-        AttachTabDropPlacement::Before => "before",
-        AttachTabDropPlacement::After => "after",
+        AttachTabDropPlacement::Before => windows_commands::WindowMovePlacement::Before,
+        AttachTabDropPlacement::After => windows_commands::WindowMovePlacement::After,
     }
+}
+
+async fn move_attach_status_tab(
+    client: &mut StreamingBmuxClient,
+    source_context_id: Uuid,
+    target_context_id: Uuid,
+    placement: AttachTabDropPlacement,
+) -> std::result::Result<(), ClientError> {
+    let _ack: windows_commands::WindowAck = invoke_windows_command(
+        client,
+        "move-window",
+        &windows_commands::client::MoveWindowRequest {
+            source: source_context_id,
+            target: target_context_id,
+            placement: attach_tab_drop_placement_api(placement),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn optimistically_reorder_attach_window_list(
+    view_state: &mut AttachViewState,
+    source_context_id: Uuid,
+    target_context_id: Uuid,
+    placement: AttachTabDropPlacement,
+) {
+    if source_context_id == target_context_id {
+        return;
+    }
+
+    let Some(snapshot) = view_state.cached_window_list.as_ref() else {
+        return;
+    };
+    let mut next = snapshot.as_ref().clone();
+    let Some(source_index) = next
+        .windows
+        .iter()
+        .position(|entry| entry.id == source_context_id)
+    else {
+        return;
+    };
+    let source = next.windows.remove(source_index);
+    let Some(target_index) = next
+        .windows
+        .iter()
+        .position(|entry| entry.id == target_context_id)
+    else {
+        return;
+    };
+    let insert_index = match placement {
+        AttachTabDropPlacement::Before => target_index,
+        AttachTabDropPlacement::After => target_index.saturating_add(1),
+    };
+    next.windows
+        .insert(insert_index.min(next.windows.len()), source);
+    next.revision = next.revision.saturating_add(1);
+    view_state.cached_window_list = Some(std::sync::Arc::new(next));
 }
 
 async fn switch_attach_status_tab(
@@ -10018,6 +10091,106 @@ mod tests {
             ),
             Some(12)
         );
+    }
+
+    #[test]
+    fn tab_drag_motion_is_active_for_move_events_and_cross_tab_release() {
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let drag = AttachMouseTabDrag {
+            source_context_id: first,
+            started_col: 4,
+            started_row: 23,
+            active: false,
+            drop_target: Some(AttachTabDropTarget {
+                context_id: first,
+                placement: AttachTabDropPlacement::Before,
+            }),
+        };
+        let same_cell = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 4,
+            row: 23,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(!attach_tab_drag_motion_is_active(
+            &drag,
+            same_cell,
+            drag.drop_target
+        ));
+
+        let moved_cell = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 6,
+            row: 23,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(attach_tab_drag_motion_is_active(
+            &drag,
+            moved_cell,
+            drag.drop_target
+        ));
+
+        assert!(attach_tab_drag_motion_is_active(
+            &drag,
+            same_cell,
+            Some(AttachTabDropTarget {
+                context_id: second,
+                placement: AttachTabDropPlacement::After,
+            })
+        ));
+    }
+
+    #[test]
+    fn optimistic_window_list_reorder_moves_entry_and_bumps_revision() {
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let third = Uuid::from_u128(3);
+        let session_id = Uuid::from_u128(10);
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: Some(first),
+            session_id,
+            can_write: true,
+        });
+        view_state.cached_window_list = Some(std::sync::Arc::new(
+            bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+                windows: vec![
+                    bmux_windows_plugin_api::windows_list::WindowListEntry {
+                        id: first,
+                        name: "one".to_string(),
+                        active: true,
+                    },
+                    bmux_windows_plugin_api::windows_list::WindowListEntry {
+                        id: second,
+                        name: "two".to_string(),
+                        active: false,
+                    },
+                    bmux_windows_plugin_api::windows_list::WindowListEntry {
+                        id: third,
+                        name: "three".to_string(),
+                        active: false,
+                    },
+                ],
+                revision: 7,
+            },
+        ));
+
+        optimistically_reorder_attach_window_list(
+            &mut view_state,
+            first,
+            third,
+            AttachTabDropPlacement::After,
+        );
+
+        let snapshot = view_state.cached_window_list.as_ref().expect("window list");
+        let order = snapshot
+            .windows
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![second, third, first]);
+        assert_eq!(snapshot.revision, 8);
+        assert!(snapshot.windows[2].active);
     }
 
     #[test]
