@@ -1650,16 +1650,19 @@ fn render_grid_row_segment(
     let mut col = start_col;
     while col < end_col {
         let cell = context.row.cells().get(usize::from(col));
+        let mut style = cell.map_or_else(CellStyle::default, |cell| {
+            grid_cell_style(context.palette.get(cell.style()))
+        });
+        if cell_selected(context.selection, context.absolute_row, usize::from(col)) {
+            style = selected_style(style);
+        }
+        style = apply_content_effects(style, context.runtime_appearance);
+        if style != current {
+            line.push_str(&style_sgr(style));
+            current = style;
+        }
+
         if let Some(cell) = cell {
-            let mut style = grid_cell_style(context.palette.get(cell.style()));
-            if cell_selected(context.selection, context.absolute_row, usize::from(col)) {
-                style = selected_style(style);
-            }
-            style = apply_content_effects(style, context.runtime_appearance);
-            if style != current {
-                line.push_str(&style_sgr(style));
-                current = style;
-            }
             if cell.is_wide_continuation() {
                 line.push(' ');
                 emitted_cols = emitted_cols.saturating_add(1);
@@ -1675,20 +1678,30 @@ fn render_grid_row_segment(
             emitted_cols = emitted_cols.saturating_add(UnicodeWidthStr::width(text).max(1));
             col = col.saturating_add(u16::from(cell.width()).max(1));
         } else {
-            if current != CellStyle::default() {
-                line.push_str("\x1b[0m");
-                current = CellStyle::default();
-            }
-            line.push(' ');
-            emitted_cols = emitted_cols.saturating_add(1);
-            col = col.saturating_add(1);
+            let run_width = if context.selection.is_none() {
+                end_col.saturating_sub(col)
+            } else {
+                1
+            };
+            line.push_str(&" ".repeat(usize::from(run_width)));
+            emitted_cols = emitted_cols.saturating_add(usize::from(run_width));
+            col = col.saturating_add(run_width);
         }
     }
 
     if emitted_cols < target_cols {
-        if current != CellStyle::default() {
-            line.push_str("\x1b[0m");
-            current = CellStyle::default();
+        let mut style = CellStyle::default();
+        if cell_selected(
+            context.selection,
+            context.absolute_row,
+            usize::from(end_col),
+        ) {
+            style = selected_style(style);
+        }
+        style = apply_content_effects(style, context.runtime_appearance);
+        if style != current {
+            line.push_str(&style_sgr(style));
+            current = style;
         }
         line.push_str(&" ".repeat(target_cols - emitted_cols));
     }
@@ -2341,7 +2354,24 @@ fn render_attach_scene_inner<W: io::Write>(
                 let force_row_damage = !damaged_ranges.is_empty();
                 let y = content.y.saturating_add(row_u16);
                 let line = grid_rows.get(row).map_or_else(
-                    || " ".repeat(usize::from(inner_width)),
+                    || {
+                        let blank_row = PhysicalRow::new();
+                        render_grid_row_segment(
+                            GridRowRenderContext {
+                                row: &blank_row,
+                                selection,
+                                absolute_row: if use_scrollback {
+                                    scrollback_offset.saturating_add(row)
+                                } else {
+                                    row
+                                },
+                                runtime_appearance,
+                                palette: entry.terminal_grid.grid().palette(),
+                            },
+                            0,
+                            inner_width,
+                        )
+                    },
                     |grid_row| {
                         render_grid_row_segment(
                             GridRowRenderContext {
@@ -2383,7 +2413,24 @@ fn render_attach_scene_inner<W: io::Write>(
                 } else if force_row_damage {
                     for (start_col, end_col) in damaged_ranges {
                         let segment = grid_rows.get(row).map_or_else(
-                            || " ".repeat(usize::from(end_col.saturating_sub(start_col))),
+                            || {
+                                let blank_row = PhysicalRow::new();
+                                render_grid_row_segment(
+                                    GridRowRenderContext {
+                                        row: &blank_row,
+                                        selection,
+                                        absolute_row: if use_scrollback {
+                                            scrollback_offset.saturating_add(row)
+                                        } else {
+                                            row
+                                        },
+                                        runtime_appearance,
+                                        palette: entry.terminal_grid.grid().palette(),
+                                    },
+                                    start_col,
+                                    end_col,
+                                )
+                            },
                             |grid_row| {
                                 render_grid_row_segment(
                                     GridRowRenderContext {
@@ -2445,9 +2492,22 @@ fn render_attach_scene_inner<W: io::Write>(
             // Trim stale cache entries if the visible row count shrank.
             entry.prev_rows.truncate(inner_h);
         } else if should_draw_content {
+            let palette = bmux_terminal_grid::StylePalette::default();
             for row in 0..inner_h {
                 let y = content.y.saturating_add(row as u16);
-                queue!(stdout, MoveTo(content.x, y), Print(" ".repeat(inner_w)))
+                let blank_row = PhysicalRow::new();
+                let line = render_grid_row_segment(
+                    GridRowRenderContext {
+                        row: &blank_row,
+                        selection: None,
+                        absolute_row: row,
+                        runtime_appearance,
+                        palette: &palette,
+                    },
+                    0,
+                    inner_width,
+                );
+                queue!(stdout, MoveTo(content.x, y), Print(line))
                     .context("failed clearing pane content")?;
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.pane_rows_emitted = stats.pane_rows_emitted.saturating_add(1);
@@ -2508,6 +2568,55 @@ mod tests {
             .resize_delta(cols.max(1), rows.max(1))
             .expect("test terminal grid dimensions should be valid");
         append_pane_output(buffer, bytes);
+    }
+
+    fn single_pane_scene(pane_id: Uuid, width: u16, height: u16) -> AttachScene {
+        AttachScene {
+            session_id: Uuid::from_u128(10_000),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: width,
+                    h: height,
+                },
+                content_rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: width,
+                    h: height,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        }
+    }
+
+    fn red_wash_appearance() -> RuntimeAppearance {
+        let mut appearance = RuntimeAppearance {
+            background: "#000000".to_string(),
+            ..RuntimeAppearance::default()
+        };
+        appearance.content_effects.insert(
+            "wash".to_string(),
+            RuntimeContentEffect {
+                background_blend: Some(RuntimeContentBlend {
+                    color: "#ff0000".to_string(),
+                    amount_permille: 100,
+                }),
+                ..RuntimeContentEffect::default()
+            },
+        );
+        appearance
     }
 
     #[test]
@@ -3676,52 +3785,12 @@ mod tests {
     #[test]
     fn render_attach_scene_applies_default_background_content_effect() {
         let pane_id = Uuid::from_u128(31);
-        let scene = AttachScene {
-            session_id: Uuid::from_u128(32),
-            focus: AttachFocusTarget::Pane { pane_id },
-            surfaces: vec![AttachSurface {
-                id: pane_id,
-                kind: AttachSurfaceKind::Pane,
-                layer: SurfaceLayer::Pane,
-                z: 0,
-                rect: AttachRect {
-                    x: 0,
-                    y: 0,
-                    w: 8,
-                    h: 3,
-                },
-                content_rect: AttachRect {
-                    x: 0,
-                    y: 0,
-                    w: 8,
-                    h: 3,
-                },
-                interactive_regions: Vec::new(),
-                opaque: true,
-                visible: true,
-                accepts_input: true,
-                cursor_owner: true,
-                pane_id: Some(pane_id),
-            }],
-        };
+        let scene = single_pane_scene(pane_id, 8, 3);
         let mut pane_buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer::default();
         feed_pane_buffer(&mut buffer, 1, 8, b"x");
         pane_buffers.insert(pane_id, buffer);
-        let mut appearance = RuntimeAppearance {
-            background: "#000000".to_string(),
-            ..RuntimeAppearance::default()
-        };
-        appearance.content_effects.insert(
-            "wash".to_string(),
-            RuntimeContentEffect {
-                background_blend: Some(RuntimeContentBlend {
-                    color: "#ff0000".to_string(),
-                    amount_permille: 100,
-                }),
-                ..RuntimeContentEffect::default()
-            },
-        );
+        let appearance = red_wash_appearance();
 
         let mut output = Vec::new();
         let _ = render_attach_scene(
@@ -3746,6 +3815,156 @@ mod tests {
 
         let rendered = String::from_utf8(output).expect("render output should be utf8");
         assert!(rendered.contains("\x1b[0;39;48;2;25;0;0m"));
+        assert!(rendered.contains("x       \x1b[0m"), "{rendered:?}");
+    }
+
+    #[test]
+    fn render_attach_scene_applies_content_effect_to_blank_rows() {
+        let pane_id = Uuid::from_u128(33);
+        let scene = single_pane_scene(pane_id, 8, 3);
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut buffer, 1, 8, b"x");
+        pane_buffers.insert(pane_id, buffer);
+        let appearance = red_wash_appearance();
+
+        let mut output = Vec::new();
+        render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 3),
+            &appearance,
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("render should succeed");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        let blank_row = "\x1b[0;39;48;2;25;0;0m        \x1b[0m";
+        assert!(rendered.contains(blank_row), "{rendered:?}");
+    }
+
+    #[test]
+    fn render_attach_scene_keeps_row_cache_effective_with_content_effects() {
+        let pane_id = Uuid::from_u128(34);
+        let scene = single_pane_scene(pane_id, 8, 3);
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut buffer, 1, 8, b"x");
+        pane_buffers.insert(pane_id, buffer);
+        let appearance = red_wash_appearance();
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 3),
+            &appearance,
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("initial render should populate row cache");
+
+        let mut output = Vec::new();
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &content_damage(pane_id),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 3),
+            &appearance,
+            DamageCoalescingPolicy::default(),
+            &[],
+            None,
+        )
+        .expect("cached render should succeed");
+
+        assert!(output.is_empty(), "unchanged rows should not be emitted");
+        assert_eq!(stats.pane_rows_emitted, 0);
+        assert_eq!(stats.pane_rows_cached_skipped, 3);
+    }
+
+    #[test]
+    fn render_attach_scene_full_frame_repaints_after_appearance_change() {
+        let pane_id = Uuid::from_u128(35);
+        let scene = single_pane_scene(pane_id, 8, 3);
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut buffer, 1, 8, b"x");
+        pane_buffers.insert(pane_id, buffer);
+
+        render_attach_scene(
+            &mut Vec::new(),
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 3),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("initial render should populate row cache");
+
+        let mut output = Vec::new();
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (8, 3),
+            &red_wash_appearance(),
+            DamageCoalescingPolicy::default(),
+            &[],
+            None,
+        )
+        .expect("appearance render should succeed");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        assert_eq!(stats.pane_rows_emitted, 3);
+        assert!(rendered.contains("x       \x1b[0m"), "{rendered:?}");
     }
 
     #[test]

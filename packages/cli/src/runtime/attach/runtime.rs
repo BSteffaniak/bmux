@@ -5211,8 +5211,22 @@ pub fn sync_attach_active_mode_from_processor(
     let mode_label = keymap
         .mode_label(&mode_id)
         .map_or_else(|| mode_id.to_ascii_uppercase(), ToString::to_string);
+    let mode_changed = view_state.active_mode_id != mode_id;
+    let label_changed = view_state.active_mode_label != mode_label;
     view_state.active_mode_id = mode_id;
     view_state.active_mode_label = mode_label;
+    if mode_changed {
+        view_state
+            .dirty
+            .mark_full_frame(AttachDirtySource::ActionDispatch);
+        view_state
+            .dirty
+            .mark_status_dirty(AttachDirtySource::ActionDispatch);
+    } else if label_changed {
+        view_state
+            .dirty
+            .mark_status_dirty(AttachDirtySource::ActionDispatch);
+    }
 }
 
 pub fn apply_attach_profile_switch(
@@ -13980,6 +13994,24 @@ mod tests {
 
         // This must not panic or return Err.
         let _keymap = attach_keymap_from_config(&config);
+    }
+
+    #[test]
+    fn sync_attach_active_mode_marks_full_frame_on_mode_change() {
+        let keymap = attach_keymap_from_config(&BmuxConfig::default());
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::new_v4(),
+            can_write: true,
+        });
+        view_state.dirty.clear_frame_damage();
+        view_state.dirty.status_needs_redraw = false;
+
+        sync_attach_active_mode_from_processor(&mut view_state, &keymap, Some("inspect"));
+
+        assert_eq!(view_state.active_mode_id, "inspect");
+        assert!(view_state.dirty.full_pane_redraw);
+        assert!(view_state.dirty.status_needs_redraw);
     }
 
     #[test]
