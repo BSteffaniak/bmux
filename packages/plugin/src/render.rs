@@ -211,10 +211,121 @@ pub struct RenderStyle {
     pub strikethrough: bool,
 }
 
+impl RenderStyle {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            fg: None,
+            bg: None,
+            bold: false,
+            underline: false,
+            italic: false,
+            reverse: false,
+            dim: false,
+            blink: false,
+            strikethrough: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn foreground(mut self, color: RenderColor) -> Self {
+        self.fg = Some(color);
+        self
+    }
+
+    #[must_use]
+    pub const fn background(mut self, color: RenderColor) -> Self {
+        self.bg = Some(color);
+        self
+    }
+
+    #[must_use]
+    pub const fn named_foreground(self, color: RenderNamedColor) -> Self {
+        self.foreground(RenderColor::Named(color))
+    }
+
+    #[must_use]
+    pub const fn named_background(self, color: RenderNamedColor) -> Self {
+        self.background(RenderColor::Named(color))
+    }
+
+    #[must_use]
+    pub const fn rgb_foreground(self, r: u8, g: u8, b: u8) -> Self {
+        self.foreground(RenderColor::Rgb { r, g, b })
+    }
+
+    #[must_use]
+    pub const fn rgb_background(self, r: u8, g: u8, b: u8) -> Self {
+        self.background(RenderColor::Rgb { r, g, b })
+    }
+
+    #[must_use]
+    pub const fn indexed_foreground(self, color: u8) -> Self {
+        self.foreground(RenderColor::Indexed(color))
+    }
+
+    #[must_use]
+    pub const fn indexed_background(self, color: u8) -> Self {
+        self.background(RenderColor::Indexed(color))
+    }
+
+    #[must_use]
+    pub const fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn underline(mut self) -> Self {
+        self.underline = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn italic(mut self) -> Self {
+        self.italic = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn reverse(mut self) -> Self {
+        self.reverse = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn dim(mut self) -> Self {
+        self.dim = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn blink(mut self) -> Self {
+        self.blink = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn strikethrough(mut self) -> Self {
+        self.strikethrough = true;
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderTextSpan {
     pub text: String,
     pub style: RenderStyle,
+}
+
+impl RenderTextSpan {
+    #[must_use]
+    pub fn new(text: impl Into<String>, style: RenderStyle) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +334,21 @@ pub struct RenderCell {
     /// cell: it reserves a grid position but emits no terminal bytes.
     pub ch: Option<char>,
     pub style: RenderStyle,
+}
+
+impl RenderCell {
+    #[must_use]
+    pub const fn new(ch: char, style: RenderStyle) -> Self {
+        Self {
+            ch: Some(ch),
+            style,
+        }
+    }
+
+    #[must_use]
+    pub const fn sparse(style: RenderStyle) -> Self {
+        Self { ch: None, style }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,8 +361,9 @@ pub struct BorderGlyphs {
     pub vertical: char,
 }
 
-impl Default for BorderGlyphs {
-    fn default() -> Self {
+impl BorderGlyphs {
+    #[must_use]
+    pub const fn ascii() -> Self {
         Self {
             top_left: '+',
             top_right: '+',
@@ -245,6 +372,36 @@ impl Default for BorderGlyphs {
             horizontal: '-',
             vertical: '|',
         }
+    }
+
+    #[must_use]
+    pub const fn rounded() -> Self {
+        Self {
+            top_left: '╭',
+            top_right: '╮',
+            bottom_left: '╰',
+            bottom_right: '╯',
+            horizontal: '─',
+            vertical: '│',
+        }
+    }
+
+    #[must_use]
+    pub const fn square() -> Self {
+        Self {
+            top_left: '┌',
+            top_right: '┐',
+            bottom_left: '└',
+            bottom_right: '┘',
+            horizontal: '─',
+            vertical: '│',
+        }
+    }
+}
+
+impl Default for BorderGlyphs {
+    fn default() -> Self {
+        Self::ascii()
     }
 }
 
@@ -303,6 +460,133 @@ pub enum RenderOp {
         y: u16,
         rows: Vec<Vec<RenderCell>>,
     },
+}
+
+impl RenderOp {
+    #[must_use]
+    pub fn text_run(x: u16, y: u16, text: impl Into<String>, style: RenderStyle) -> Self {
+        Self::TextRun {
+            x,
+            y,
+            text: text.into(),
+            style,
+        }
+    }
+
+    #[must_use]
+    pub fn styled_text(x: u16, y: u16, spans: impl Into<Vec<RenderTextSpan>>) -> Self {
+        Self::StyledText {
+            x,
+            y,
+            spans: spans.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn clear_rect(rect: ExtensionRect, style: RenderStyle) -> Self {
+        Self::ClearRect { rect, style }
+    }
+
+    #[must_use]
+    pub const fn erase_row_segment(x: u16, y: u16, width: u16, style: RenderStyle) -> Self {
+        Self::EraseRowSegment { x, y, width, style }
+    }
+
+    #[must_use]
+    pub const fn fill_rect(rect: ExtensionRect, ch: char, style: RenderStyle) -> Self {
+        Self::FillRect { rect, ch, style }
+    }
+
+    #[must_use]
+    pub const fn border(rect: ExtensionRect, glyphs: BorderGlyphs, style: RenderStyle) -> Self {
+        Self::Border {
+            rect,
+            glyphs,
+            style,
+        }
+    }
+
+    #[must_use]
+    pub fn cell_grid(x: u16, y: u16, rows: impl Into<Vec<Vec<RenderCell>>>) -> Self {
+        Self::CellGrid {
+            x,
+            y,
+            rows: rows.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RenderOpBatchBuilder {
+    ops: Vec<RenderOp>,
+}
+
+impl RenderOpBatchBuilder {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { ops: Vec::new() }
+    }
+
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            ops: Vec::with_capacity(capacity),
+        }
+    }
+
+    #[must_use]
+    pub fn text_run(mut self, x: u16, y: u16, text: impl Into<String>, style: RenderStyle) -> Self {
+        self.ops.push(RenderOp::text_run(x, y, text, style));
+        self
+    }
+
+    #[must_use]
+    pub fn styled_text(mut self, x: u16, y: u16, spans: impl Into<Vec<RenderTextSpan>>) -> Self {
+        self.ops.push(RenderOp::styled_text(x, y, spans));
+        self
+    }
+
+    #[must_use]
+    pub fn clear_rect(mut self, rect: ExtensionRect, style: RenderStyle) -> Self {
+        self.ops.push(RenderOp::clear_rect(rect, style));
+        self
+    }
+
+    #[must_use]
+    pub fn erase_row_segment(mut self, x: u16, y: u16, width: u16, style: RenderStyle) -> Self {
+        self.ops
+            .push(RenderOp::erase_row_segment(x, y, width, style));
+        self
+    }
+
+    #[must_use]
+    pub fn fill_rect(mut self, rect: ExtensionRect, ch: char, style: RenderStyle) -> Self {
+        self.ops.push(RenderOp::fill_rect(rect, ch, style));
+        self
+    }
+
+    #[must_use]
+    pub fn border(mut self, rect: ExtensionRect, glyphs: BorderGlyphs, style: RenderStyle) -> Self {
+        self.ops.push(RenderOp::border(rect, glyphs, style));
+        self
+    }
+
+    #[must_use]
+    pub fn cell_grid(mut self, x: u16, y: u16, rows: impl Into<Vec<Vec<RenderCell>>>) -> Self {
+        self.ops.push(RenderOp::cell_grid(x, y, rows));
+        self
+    }
+
+    #[must_use]
+    pub fn push(mut self, op: RenderOp) -> Self {
+        self.ops.push(op);
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> Vec<RenderOp> {
+        self.ops
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -567,6 +851,62 @@ mod tests {
             ),
             Some((0, "界".to_string()))
         );
+    }
+
+    #[test]
+    fn render_builders_create_expected_ops() {
+        let style = RenderStyle::new()
+            .named_foreground(RenderNamedColor::BrightCyan)
+            .rgb_background(1, 2, 3)
+            .bold()
+            .underline()
+            .italic()
+            .reverse()
+            .dim()
+            .blink()
+            .strikethrough();
+        assert_eq!(
+            style.fg,
+            Some(RenderColor::Named(RenderNamedColor::BrightCyan))
+        );
+        assert_eq!(style.bg, Some(RenderColor::Rgb { r: 1, g: 2, b: 3 }));
+        assert!(style.bold);
+        assert!(style.underline);
+        assert!(style.italic);
+        assert!(style.reverse);
+        assert!(style.dim);
+        assert!(style.blink);
+        assert!(style.strikethrough);
+
+        let ops = RenderOpBatchBuilder::new()
+            .clear_rect(ExtensionRect::new(0, 0, 10, 2), RenderStyle::new())
+            .border(
+                ExtensionRect::new(0, 0, 10, 2),
+                BorderGlyphs::rounded(),
+                style,
+            )
+            .styled_text(
+                1,
+                1,
+                vec![RenderTextSpan::new("ok", RenderStyle::new().bold())],
+            )
+            .cell_grid(
+                2,
+                2,
+                vec![vec![
+                    RenderCell::new('x', RenderStyle::new()),
+                    RenderCell::sparse(RenderStyle::new()),
+                ]],
+            )
+            .build();
+
+        assert_eq!(ops.len(), 4);
+        assert!(matches!(ops[0], RenderOp::ClearRect { .. }));
+        assert!(
+            matches!(ops[1], RenderOp::Border { glyphs, .. } if glyphs == BorderGlyphs::rounded())
+        );
+        assert!(matches!(ops[2], RenderOp::StyledText { .. }));
+        assert!(matches!(ops[3], RenderOp::CellGrid { .. }));
     }
 
     #[test]

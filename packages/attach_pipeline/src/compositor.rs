@@ -56,6 +56,11 @@ pub struct RetainedSurface {
 
 impl RetainedSurface {
     #[must_use]
+    pub const fn builder(id: Uuid, rect: DamageRect) -> RetainedSurfaceBuilder {
+        RetainedSurfaceBuilder::new(id, rect)
+    }
+
+    #[must_use]
     pub const fn new(
         id: Uuid,
         rect: DamageRect,
@@ -117,6 +122,97 @@ impl RetainedSurface {
     pub fn paint_rect(&self) -> Option<DamageRect> {
         self.clip_rect
             .map_or(Some(self.rect), |clip| intersect_rects(self.rect, clip))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedSurfaceBuilder {
+    surface: RetainedSurface,
+}
+
+impl RetainedSurfaceBuilder {
+    #[must_use]
+    pub const fn new(id: Uuid, rect: DamageRect) -> Self {
+        Self {
+            surface: RetainedSurface::with_payload(
+                id,
+                rect,
+                0,
+                0,
+                RetainedOpacity::Unknown,
+                RetainedSurfacePayload::Unknown,
+            ),
+        }
+    }
+
+    #[must_use]
+    pub const fn layer(mut self, layer: i16) -> Self {
+        self.surface.layer = layer;
+        self
+    }
+
+    #[must_use]
+    pub const fn z(mut self, z: i32) -> Self {
+        self.surface.z = z;
+        self
+    }
+
+    #[must_use]
+    pub const fn opacity(mut self, opacity: RetainedOpacity) -> Self {
+        self.surface.opacity = opacity;
+        self.surface.opaque = opacity.is_opaque();
+        self
+    }
+
+    #[must_use]
+    pub const fn opaque(self) -> Self {
+        self.opacity(RetainedOpacity::Opaque)
+    }
+
+    #[must_use]
+    pub const fn transparent(self) -> Self {
+        self.opacity(RetainedOpacity::Transparent)
+    }
+
+    #[must_use]
+    pub fn render_ops(mut self, ops: Vec<RenderOp>) -> Self {
+        self.surface.payload = RetainedSurfacePayload::RenderOps(ops);
+        self
+    }
+
+    #[must_use]
+    pub fn content(mut self, content_id: Uuid) -> Self {
+        self.surface.payload = RetainedSurfacePayload::Content { content_id };
+        self
+    }
+
+    #[must_use]
+    pub fn unknown_payload(mut self) -> Self {
+        self.surface.payload = RetainedSurfacePayload::Unknown;
+        self
+    }
+
+    #[must_use]
+    pub const fn clip_rect(mut self, clip_rect: DamageRect) -> Self {
+        self.surface.clip_rect = Some(clip_rect);
+        self
+    }
+
+    #[must_use]
+    pub fn interactive_region(mut self, region: DamageRect) -> Self {
+        self.surface.interactive_regions.push(region);
+        self
+    }
+
+    #[must_use]
+    pub fn interactive_regions(mut self, regions: Vec<DamageRect>) -> Self {
+        self.surface.interactive_regions = regions;
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> RetainedSurface {
+        self.surface
     }
 }
 
@@ -527,6 +623,35 @@ mod tests {
                 style: RenderStyle::default(),
             }],
         )
+    }
+
+    #[test]
+    fn retained_surface_builder_sets_payload_opacity_clip_and_regions() {
+        let surface = RetainedSurface::builder(Uuid::from_u128(42), DamageRect::new(1, 2, 3, 4))
+            .layer(5)
+            .z(6)
+            .opaque()
+            .content(Uuid::from_u128(7))
+            .clip_rect(DamageRect::new(1, 2, 2, 2))
+            .interactive_region(DamageRect::new(1, 2, 1, 1))
+            .build();
+
+        assert_eq!(surface.id, Uuid::from_u128(42));
+        assert_eq!(surface.layer, 5);
+        assert_eq!(surface.z, 6);
+        assert!(surface.opaque);
+        assert_eq!(surface.opacity, RetainedOpacity::Opaque);
+        assert_eq!(
+            surface.payload,
+            RetainedSurfacePayload::Content {
+                content_id: Uuid::from_u128(7),
+            }
+        );
+        assert_eq!(surface.paint_rect(), Some(DamageRect::new(1, 2, 2, 2)));
+        assert_eq!(
+            surface.interactive_regions,
+            vec![DamageRect::new(1, 2, 1, 1)]
+        );
     }
 
     #[test]

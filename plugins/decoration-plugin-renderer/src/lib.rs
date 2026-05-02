@@ -246,9 +246,14 @@ fn filter_surface_for_damage(
     filtered
 }
 
-fn render_ops_for_surface(surface: &SurfaceDecoration) -> Option<Vec<RenderOp>> {
-    let mut ordered: Vec<(usize, &PaintCommand)> =
-        surface.paint_commands.iter().enumerate().collect();
+#[must_use]
+pub fn render_ops_for_surface(surface: &SurfaceDecoration) -> Option<Vec<RenderOp>> {
+    render_ops_for_paint_commands(&surface.paint_commands)
+}
+
+#[must_use]
+pub fn render_ops_for_paint_commands(paint_commands: &[PaintCommand]) -> Option<Vec<RenderOp>> {
+    let mut ordered: Vec<(usize, &PaintCommand)> = paint_commands.iter().enumerate().collect();
     ordered.sort_by_key(|(index, command)| (paint_command_z(command), *index));
 
     let mut ops = Vec::new();
@@ -423,7 +428,8 @@ fn text_scalar_segments(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-fn render_style_from_scene(style: &SceneStyle) -> RenderStyle {
+#[must_use]
+pub fn render_style_from_scene(style: &SceneStyle) -> RenderStyle {
     RenderStyle {
         fg: style.fg.as_ref().map(render_color_from_scene),
         bg: style.bg.as_ref().map(render_color_from_scene),
@@ -437,7 +443,8 @@ fn render_style_from_scene(style: &SceneStyle) -> RenderStyle {
     }
 }
 
-fn render_color_from_scene(color: &SceneColor) -> RenderColor {
+#[must_use]
+pub fn render_color_from_scene(color: &SceneColor) -> RenderColor {
     match color {
         SceneColor::Default | SceneColor::Reset => RenderColor::Default,
         SceneColor::Indexed { index } => RenderColor::Indexed(*index),
@@ -450,7 +457,8 @@ fn render_color_from_scene(color: &SceneColor) -> RenderColor {
     }
 }
 
-const fn render_named_color_from_scene(color: NamedColor) -> RenderNamedColor {
+#[must_use]
+pub const fn render_named_color_from_scene(color: NamedColor) -> RenderNamedColor {
     match color {
         NamedColor::Black => RenderNamedColor::Black,
         NamedColor::Red => RenderNamedColor::Red,
@@ -471,7 +479,8 @@ const fn render_named_color_from_scene(color: NamedColor) -> RenderNamedColor {
     }
 }
 
-fn render_cell_grid_rows(cols: u16, cells: &[SceneCell]) -> Option<Vec<Vec<RenderCell>>> {
+#[must_use]
+pub fn render_cell_grid_rows(cols: u16, cells: &[SceneCell]) -> Option<Vec<Vec<RenderCell>>> {
     let mut rows = Vec::new();
     for row_cells in cells.chunks(usize::from(cols)) {
         let mut row = Vec::with_capacity(row_cells.len());
@@ -490,7 +499,8 @@ fn render_cell_grid_rows(cols: u16, cells: &[SceneCell]) -> Option<Vec<Vec<Rende
     Some(rows)
 }
 
-fn render_border_glyphs(glyphs: &SceneBorderGlyphs) -> Option<RenderBorderGlyphs> {
+#[must_use]
+pub fn render_border_glyphs(glyphs: &SceneBorderGlyphs) -> Option<RenderBorderGlyphs> {
     let glyphs = border_glyphs_corners_or_custom(glyphs)?;
     Some(RenderBorderGlyphs {
         top_left: render_single_display_cell_char(glyphs.top_left)?,

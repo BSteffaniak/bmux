@@ -5763,6 +5763,7 @@ pub fn render_attach_frame(
     queue!(frame_bytes, Hide).context("failed queuing cursor hide for attach frame")?;
     // Reflect the forced-hide in tracked state so apply_attach_cursor_state
     // will re-emit Show if the cursor should be visible after the frame.
+    let cursor_state_before_forced_hide = view_state.last_cursor_state;
     if let Some(ref mut cs) = view_state.last_cursor_state {
         cs.visible = false;
     }
@@ -5874,10 +5875,9 @@ pub fn render_attach_frame(
         }
         overlay_rendered = true;
     }
-    if view_state.prompt.is_active() {
-        // The prompt renderer owns the prompt cursor state, so keep drawing it on
-        // every attach frame until that cursor state can be reported separately
-        // from prompt bytes.
+    let prompt_overlay_needs_render =
+        view_state.prompt.is_active() && (frame_damage.overlay_damaged() || render_scene);
+    if prompt_overlay_needs_render {
         overlay_cursor_state = view_state
             .prompt
             .queue_attach_prompt_overlay(&mut frame_bytes)?;
@@ -5891,6 +5891,11 @@ pub fn render_attach_frame(
             });
         }
         overlay_rendered = true;
+    } else if view_state.prompt.is_active() {
+        overlay_cursor_state = cursor_state_before_forced_hide.map(|mut cursor| {
+            cursor.visible = true;
+            cursor
+        });
     }
 
     if damage_config.visualize {

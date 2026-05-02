@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 pub use compositor::{
     RetainedCompositor, RetainedDamage, RetainedOpacity, RetainedRepaintSurface, RetainedSurface,
-    RetainedSurfacePayload, retained_frame_damage_from_frame_damage,
+    RetainedSurfaceBuilder, RetainedSurfacePayload, retained_frame_damage_from_frame_damage,
     retained_repaint_plan_from_frame_damage, retained_surfaces_from_attach_scene,
 };
 pub use mouse::{
