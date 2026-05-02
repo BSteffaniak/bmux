@@ -385,7 +385,7 @@ pub async fn run() -> Result<u8> {
             }
 
             if let Some(command) = &cli.command {
-                return run_command(command, connection_context).await;
+                return Box::pin(run_command(command, connection_context)).await;
             }
 
             let options = DefaultAttachOptions {

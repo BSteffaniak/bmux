@@ -8874,7 +8874,14 @@ pub async fn handle_attach_status_tab_mouse_event(
     if !reduction.consumed {
         return Ok(false);
     }
-    execute_attach_ui_effects(client, view_state, reduction.effects, kernel_client_factory).await?;
+    execute_attach_ui_effects(
+        client,
+        view_state,
+        reduction.effects,
+        kernel_client_factory,
+        Instant::now(),
+    )
+    .await?;
     Ok(true)
 }
 
@@ -8989,6 +8996,7 @@ async fn execute_attach_ui_effects(
     view_state: &mut AttachViewState,
     effects: Vec<AttachUiEffect>,
     kernel_client_factory: Option<&KernelClientFactory>,
+    now: Instant,
 ) -> std::result::Result<(), ClientError> {
     for effect in effects {
         match effect {
@@ -9019,11 +9027,7 @@ async fn execute_attach_ui_effects(
                 );
             }
             AttachUiEffect::ShowTransientStatus { message } => {
-                view_state.set_transient_status(
-                    message,
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
+                view_state.set_transient_status(message, now, ATTACH_TRANSIENT_STATUS_TTL);
             }
         }
     }
