@@ -255,11 +255,20 @@ impl Perform for GridPerformer<'_> {
                     match value {
                         7 => self.grid.set_autowrap(enabled),
                         25 => self.grid.set_cursor_visible(enabled),
-                        47 | 1047 | 1049 => self.grid.set_mode(if enabled {
+                        47 | 1047 => self.grid.set_mode(if enabled {
                             GridMode::Alternate
                         } else {
                             GridMode::Main
                         }),
+                        1049 => {
+                            if enabled {
+                                self.grid.save_cursor();
+                                self.grid.set_mode(GridMode::Alternate);
+                            } else {
+                                self.grid.set_mode(GridMode::Main);
+                                self.grid.restore_cursor();
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -403,6 +412,16 @@ mod tests {
             grid.palette().get(red).fg,
             Some(crate::style::Color::Indexed(1))
         );
+    }
+
+    #[test]
+    fn decset_1049_restores_main_screen_cursor_on_exit() {
+        let mut stream = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+        stream.process(b"\x1b[12;34H\x1b[?1049hALT\x1b[?1049l");
+
+        let cursor = stream.grid().cursor();
+        assert_eq!((cursor.row, cursor.col), (11, 33));
+        assert_eq!(stream.grid().mode(), crate::model::GridMode::Main);
     }
 
     #[test]

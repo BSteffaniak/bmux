@@ -545,6 +545,8 @@ fn parse_and_validate_fixtures() {
         "render_assert_split_pane.dsl",
         "render_assert_resize_viewport.dsl",
         "render_assert_alt_screen_transition.dsl",
+        "structured_reflow_basic.dsl",
+        "structured_reflow_layout.dsl",
         "attach_sim_tab_drag.dsl",
         "attach_sim_tab_drag_no_motion.dsl",
         "attach_sim_tab_drag_left_half.dsl",
@@ -627,6 +629,23 @@ fn playbook_render_assert_resize_viewport() {
 #[test]
 fn playbook_render_assert_alt_screen_transition() {
     assert_render_fixture_passes("render_assert_alt_screen_transition.dsl");
+}
+
+#[test]
+#[serial]
+fn playbook_structured_reflow_basic() {
+    let (json, pass) = run_playbook_fixture("structured_reflow_basic.dsl");
+    assert!(pass, "structured reflow playbook should pass: {json:#}");
+}
+
+#[test]
+#[serial]
+fn playbook_structured_reflow_layout_changes() {
+    let (json, pass) = run_playbook_fixture("structured_reflow_layout.dsl");
+    assert!(
+        pass,
+        "structured reflow layout playbook should pass: {json:#}"
+    );
 }
 
 fn assert_render_fixture_passes(fixture: &str) {
