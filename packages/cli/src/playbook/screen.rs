@@ -828,6 +828,128 @@ mod tests {
     }
 
     #[test]
+    fn parser_from_screen_text_reconstructs_visible_rows_with_requested_size() {
+        let parser = parser_from_screen_text("alpha\nbeta", 4, 10);
+
+        assert_eq!(parser.screen().size(), (4, 10));
+        assert_eq!(screen_to_text(parser.screen()), "alpha\nbeta");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Inline fixture keeps the render-buffer sync contract visible in one place.
+    fn sync_attach_render_buffers_preserves_render_caches_and_uses_scene_dimensions() {
+        use bmux_attach_layout_protocol::{
+            AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface,
+            AttachSurfaceKind, PaneLayoutNode, PaneState, PaneSummary,
+        };
+        use bmux_attach_pipeline::types::ExtensionRenderCacheEntry;
+        use bmux_plugin::{ExtensionRect, RenderDamage};
+
+        let session_id = Uuid::from_u128(91);
+        let pane_id = Uuid::from_u128(92);
+        let surface_id = Uuid::from_u128(93);
+        let mut pane_parser = vt100::Parser::new(5, 12, 4_096);
+        pane_parser.process(b"first\r\nsecond");
+        let mut inspector = ScreenInspector {
+            panes: Vec::new(),
+            pane_states: BTreeMap::new(),
+            viewport_rows: 8,
+            viewport_cols: 20,
+            session_id: Some(session_id),
+            needs_bootstrap: false,
+        };
+        inspector.pane_states.insert(
+            pane_id,
+            PaneStreamState {
+                pane_id,
+                pane_index: 1,
+                focused: true,
+                rows: 5,
+                cols: 12,
+                parser: pane_parser,
+                expected_stream_start: Some(42),
+                sync_update_active: true,
+            },
+        );
+
+        let mut buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer {
+            prev_rows: vec!["cached row".to_string()],
+            ..PaneRenderBuffer::default()
+        };
+        buffer.extension_render_cache.insert(
+            ("test.extension".to_string(), surface_id),
+            ExtensionRenderCacheEntry {
+                surface_id,
+                surface_rect: ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 6,
+                    h: 3,
+                },
+                damage: RenderDamage::FullSurface,
+                revision: 7,
+                bytes: b"cached".to_vec(),
+            },
+        );
+        buffers.insert(pane_id, buffer);
+
+        let layout = AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: vec![PaneSummary {
+                id: pane_id,
+                index: 1,
+                name: None,
+                focused: true,
+                state: PaneState::Running,
+                state_reason: None,
+            }],
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![AttachSurface {
+                    id: surface_id,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: AttachLayer::Pane,
+                    z: 0,
+                    rect: AttachRect {
+                        x: 0,
+                        y: 0,
+                        w: 8,
+                        h: 5,
+                    },
+                    content_rect: AttachRect {
+                        x: 1,
+                        y: 1,
+                        w: 6,
+                        h: 3,
+                    },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                    pane_id: Some(pane_id),
+                }],
+            },
+            zoomed: false,
+        };
+
+        inspector.sync_attach_render_buffers(&layout, &mut buffers);
+
+        let synced = buffers.get(&pane_id).expect("buffer should remain");
+        assert_eq!(synced.parser.screen().size(), (3, 6));
+        assert_eq!(screen_to_text(synced.parser.screen()), "first\nsecond");
+        assert_eq!(synced.prev_rows, vec!["cached row".to_string()]);
+        assert_eq!(synced.extension_render_cache.len(), 1);
+        assert_eq!(synced.expected_stream_start, Some(42));
+        assert!(synced.sync_update_in_progress);
+    }
+
+    #[test]
     fn incremental_parser_handles_split_alt_exit_sequence() {
         let mut parser = vt100::Parser::new(30, 120, 4_096);
 

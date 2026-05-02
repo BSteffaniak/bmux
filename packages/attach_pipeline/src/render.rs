@@ -3251,7 +3251,8 @@ mod tests {
             as Arc<dyn AttachRenderExtension>];
 
         let mut output = Vec::new();
-        let _ = render_attach_scene(
+        let mut trace = AttachRenderTrace::new();
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
             &mut output,
             &scene,
             &[],
@@ -3268,6 +3269,7 @@ mod tests {
             &bmux_appearance::RuntimeAppearance::default(),
             DamageCoalescingPolicy::default(),
             &extensions,
+            Some(&mut trace),
         )
         .expect("render should succeed");
 
@@ -3276,9 +3278,17 @@ mod tests {
         assert!(rendered.contains("\x1b[38;2;1;2;3m"));
         assert!(rendered.contains("\x1b[1m"));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.extension_render_op_calls, 1);
+        assert_eq!(stats.extension_cache_hits, 0);
+        assert!(trace.ops().contains(&AttachRenderTraceOp::ExtensionOps {
+            surface_index: 0,
+            regions: 0,
+            full_surface: true,
+        }));
 
         let mut cached_output = Vec::new();
-        let _ = render_attach_scene(
+        let mut cached_trace = AttachRenderTrace::new();
+        let (_cursor, cached_stats) = render_attach_scene_with_stats_and_trace(
             &mut cached_output,
             &scene,
             &[],
@@ -3295,6 +3305,7 @@ mod tests {
             &bmux_appearance::RuntimeAppearance::default(),
             DamageCoalescingPolicy::default(),
             &extensions,
+            Some(&mut cached_trace),
         )
         .expect("cached render should succeed");
         assert!(
@@ -3303,6 +3314,12 @@ mod tests {
                 .contains("OPS")
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(cached_stats.extension_cache_hits, 1);
+        assert!(
+            cached_trace
+                .ops()
+                .contains(&AttachRenderTraceOp::ExtensionCachedReplay { surface_index: 0 })
+        );
     }
 
     #[test]
@@ -3420,7 +3437,8 @@ mod tests {
             vec![Arc::new(StyledRunExtension) as Arc<dyn AttachRenderExtension>];
 
         let mut output = Vec::new();
-        let _ = render_attach_scene(
+        let mut trace = AttachRenderTrace::new();
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
             &mut output,
             &scene,
             &panes,
@@ -3437,6 +3455,7 @@ mod tests {
             &bmux_appearance::RuntimeAppearance::default(),
             DamageCoalescingPolicy::default(),
             &extensions,
+            Some(&mut trace),
         )
         .expect("render should succeed");
 
@@ -3452,6 +3471,16 @@ mod tests {
         assert!(
             rendered.contains("\x1b[0m"),
             "style reset should terminate the paint command; got: {rendered:?}"
+        );
+        assert_eq!(stats.extension_imperative_calls, 1);
+        assert!(
+            trace
+                .ops()
+                .contains(&AttachRenderTraceOp::ExtensionImperative {
+                    surface_index: 0,
+                    regions: 0,
+                    full_surface: true,
+                })
         );
     }
 
