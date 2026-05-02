@@ -78,9 +78,8 @@ use super::prompt_ui::{
 };
 use super::render::{
     AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
-    AttachSceneRenderStats, append_pane_output, opaque_row_text,
-    queue_frame_damage_overlay_with_trace, queue_layer_fill,
-    render_attach_scene_with_stats_and_trace, visible_scene_pane_ids,
+    AttachSceneRenderStats, opaque_row_text, queue_frame_damage_overlay_with_trace,
+    queue_layer_fill, render_attach_scene_with_stats_and_trace, visible_scene_pane_ids,
 };
 use super::state::{
     AttachDirtySource, AttachEventAction, AttachExitReason, AttachMouseFloatingDrag,
@@ -473,48 +472,6 @@ impl DisplayCaptureFanout {
     }
 }
 
-fn apply_attach_output_bytes(
-    view_state: &mut AttachViewState,
-    pane_id: Uuid,
-    bytes: &[u8],
-    frame_needs_render: &mut bool,
-) -> bool {
-    if bytes.is_empty() {
-        return false;
-    }
-
-    let buffer = view_state.pane_buffers.entry(pane_id).or_default();
-    let toggled_alternate = append_pane_output(buffer, bytes);
-    let screen = buffer.parser.screen();
-    view_state.pane_mouse_protocol_hints.insert(
-        pane_id,
-        AttachMouseProtocolState {
-            mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
-            encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
-        },
-    );
-    view_state.pane_input_mode_hints.insert(
-        pane_id,
-        AttachInputModeState {
-            application_cursor: screen.application_cursor(),
-            application_keypad: screen.application_keypad(),
-        },
-    );
-    view_state
-        .dirty
-        .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
-    *frame_needs_render = true;
-
-    if toggled_alternate {
-        view_state
-            .dirty
-            .mark_full_frame(AttachDirtySource::AlternateScreenTransition);
-        view_state.force_cursor_move_next_frame = true;
-    }
-
-    true
-}
-
 #[cfg(test)]
 fn apply_attach_output_chunk(
     view_state: &mut AttachViewState,
@@ -536,7 +493,8 @@ fn apply_attach_output_chunk(
                 return false;
             }
 
-            toggled_alternate = append_pane_output(buffer, data) || toggled_alternate;
+            toggled_alternate =
+                super::render::append_pane_output(buffer, data) || toggled_alternate;
             let screen = buffer.parser.screen();
             pane_mouse_protocol_hints.insert(
                 pane_id,
@@ -575,6 +533,20 @@ fn apply_attach_output_chunk(
 
 fn bytes_contain_sequence(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
+}
+
+fn chunk_may_toggle_alternate_screen(bytes: &[u8]) -> bool {
+    const ALTERNATE_SCREEN_SEQUENCES: &[&[u8]] = &[
+        b"\x1b[?47h",
+        b"\x1b[?47l",
+        b"\x1b[?1047h",
+        b"\x1b[?1047l",
+        b"\x1b[?1049h",
+        b"\x1b[?1049l",
+    ];
+    ALTERNATE_SCREEN_SEQUENCES
+        .iter()
+        .any(|sequence| bytes_contain_sequence(bytes, sequence))
 }
 
 fn chunk_may_disable_mouse_protocol(bytes: &[u8]) -> bool {
@@ -665,7 +637,9 @@ fn apply_attach_output_chunk_protocol_only(
             let screen = buffer.parser.screen();
             let is_alternate = screen.alternate_screen();
             buffer.last_alternate_screen = is_alternate;
-            toggled_alternate = toggled_alternate || was_alternate != is_alternate;
+            toggled_alternate = toggled_alternate
+                || was_alternate != is_alternate
+                || chunk_may_toggle_alternate_screen(data);
 
             let parsed_mouse_hint = AttachMouseProtocolState {
                 mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
@@ -6911,7 +6885,7 @@ async fn hydrate_attach_structured_grid_snapshots(
     {
         Ok(snapshots) => snapshots,
         Err(error) => {
-            tracing::debug!(%error, "structured pane grid snapshot unavailable; continuing with raw snapshot hydration");
+            tracing::debug!(%error, "structured pane grid snapshot unavailable; pane rendering will wait for structured state");
             return Ok(BTreeSet::new());
         }
     };
@@ -7033,7 +7007,6 @@ async fn hydrate_attach_state_from_snapshot_mode(
         active_pane_ids.iter().copied().collect(),
     )
     .await?;
-    let mut frame_needs_render = false;
     for chunk in chunks {
         if structured_hydrated.contains(&chunk.pane_id) {
             if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
@@ -7045,11 +7018,16 @@ async fn hydrate_attach_state_from_snapshot_mode(
         if !session_changed && !full_resync && retained_pane_ids.contains(&chunk.pane_id) {
             continue;
         }
-        let _ = apply_attach_output_bytes(
+        let _ = apply_attach_output_chunk_protocol_only(
             view_state,
             chunk.pane_id,
             &chunk.data,
-            &mut frame_needs_render,
+            AttachOutputChunkMeta {
+                stream_start: chunk.stream_start,
+                stream_end: chunk.stream_end,
+                stream_gap: chunk.stream_gap,
+                sync_update_active: chunk.sync_update_active,
+            },
         );
         if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
             buffer.sync_update_in_progress = chunk.sync_update_active;
@@ -7099,7 +7077,6 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
     let structured_hydrated =
         hydrate_attach_structured_grid_snapshots(client, view_state, pane_ids.to_vec()).await?;
 
-    let mut frame_needs_render = false;
     for chunk in chunks {
         if !requested_pane_ids.contains(&chunk.pane_id) {
             continue;
@@ -7112,11 +7089,16 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
             continue;
         }
 
-        let _ = apply_attach_output_bytes(
+        let _ = apply_attach_output_chunk_protocol_only(
             view_state,
             chunk.pane_id,
             &chunk.data,
-            &mut frame_needs_render,
+            AttachOutputChunkMeta {
+                stream_start: chunk.stream_start,
+                stream_end: chunk.stream_end,
+                stream_gap: chunk.stream_gap,
+                sync_update_active: chunk.sync_update_active,
+            },
         );
         if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
             buffer.sync_update_in_progress = chunk.sync_update_active;
@@ -11057,7 +11039,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_attach_output_marks_full_redraw_on_alt_screen_toggle() {
+    fn protocol_only_output_marks_full_redraw_on_alt_screen_toggle() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         view_state.dirty.full_pane_redraw = false;
         view_state.force_cursor_move_next_frame = false;
@@ -11076,17 +11058,23 @@ mod tests {
         ));
         payload.extend_from_slice(b"\x1b[?1049l\r\n$ ");
 
-        let mut frame_needs_render = false;
-        let had_data = super::apply_attach_output_bytes(
+        let outcome = super::apply_attach_output_chunk_protocol_only(
             &mut view_state,
             pane_id,
             &payload,
-            &mut frame_needs_render,
+            super::AttachOutputChunkMeta {
+                stream_start: 0,
+                stream_end: u64::try_from(payload.len()).expect("payload length fits u64"),
+                stream_gap: false,
+                sync_update_active: false,
+            },
         );
 
-        assert!(had_data);
-        assert!(frame_needs_render);
-        assert!(view_state.dirty.pane_dirty_ids.contains(&pane_id));
+        assert!(matches!(
+            outcome,
+            super::AttachChunkApplyOutcome::Applied { had_data: true }
+        ));
+        assert!(!view_state.dirty.pane_dirty_ids.contains(&pane_id));
         assert!(view_state.dirty.full_pane_redraw);
         assert!(view_state.force_cursor_move_next_frame);
 
