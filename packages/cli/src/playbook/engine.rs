@@ -1971,6 +1971,22 @@ fn execute_attach_sim_step(
             sim.seed_window_list(&name_refs, &active);
             Ok(Some(format!("seeded {} windows", resolved_names.len())))
         }
+        Action::SeedPaneText {
+            lines,
+            cursor_row,
+            cursor_col,
+        } => {
+            let resolved_lines = lines
+                .iter()
+                .map(|line| runtime_vars.resolve_opt(line))
+                .collect::<Vec<_>>();
+            let line_refs = resolved_lines
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            sim.seed_pane_lines(&line_refs, *cursor_row, *cursor_col);
+            Ok(Some(format!("seeded {} pane lines", resolved_lines.len())))
+        }
         Action::Render => {
             sim.render();
             Ok(Some(sim.rendered().to_string()))
@@ -2016,6 +2032,11 @@ fn execute_attach_sim_step(
             sim.send_mouse(terminal_event);
             Ok(Some("terminal event consumed".to_string()))
         }
+        Action::SendAttach { key } => {
+            let key = runtime_vars.resolve_opt(key);
+            let emitted = sim.send_attach_chord(&key)?;
+            Ok(Some(format!("emitted {} attach actions", emitted.len())))
+        }
         Action::AssertEffect { operation } => {
             let operation = runtime_vars.resolve_opt(operation);
             ensure!(
@@ -2042,6 +2063,10 @@ fn execute_attach_sim_step(
             let actual = match path.as_str() {
                 "windows.names" => serde_json::to_string(&sim.window_names())?,
                 "windows.active_name" => serde_json::to_string(&sim.active_window_name())?,
+                "scrollback.active" => serde_json::to_string(&sim.scrollback_active())?,
+                "selection.active" => serde_json::to_string(&sim.selection_active())?,
+                "selection.text" => serde_json::to_string(&sim.selected_text())?,
+                "scrollback.cursor" => serde_json::to_string(&sim.scrollback_cursor())?,
                 other => bail!("unsupported attach-sim state path '{other}'"),
             };
             ensure!(
@@ -3882,6 +3907,7 @@ pub(super) async fn execute_step(
             bail!("render trace actions are handled by the playbook runner")
         }
         Action::SeedWindowList { .. }
+        | Action::SeedPaneText { .. }
         | Action::Render
         | Action::Locate { .. }
         | Action::TerminalEvent(_)

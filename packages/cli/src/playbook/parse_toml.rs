@@ -195,6 +195,20 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
             let key = step.key.context("send-attach requires 'key'")?;
             Ok(Action::SendAttach { key })
         }
+        "seed-pane-text" => {
+            let lines = step.lines.context("seed-pane-text requires 'lines'")?;
+            let cursor_row = step
+                .cursor_row
+                .context("seed-pane-text requires 'cursor_row'")?;
+            let cursor_col = step
+                .cursor_col
+                .context("seed-pane-text requires 'cursor_col'")?;
+            Ok(Action::SeedPaneText {
+                lines,
+                cursor_row,
+                cursor_col,
+            })
+        }
         "prefix-key" => {
             let key_str = step.key.context("prefix-key requires 'key'")?;
             let key = key_str.chars().next().context("empty key")?;
@@ -390,6 +404,9 @@ struct RawStep {
     hex: Option<String>,
     key: Option<String>,
     pane: Option<u32>,
+    lines: Option<Vec<String>>,
+    cursor_row: Option<u16>,
+    cursor_col: Option<u16>,
     // Waiting
     pattern: Option<String>,
     timeout_ms: Option<u64>,

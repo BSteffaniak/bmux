@@ -244,6 +244,12 @@ pub enum Action {
     },
     /// Seed a deterministic attach simulation window list.
     SeedWindowList { names: Vec<String>, active: String },
+    /// Seed deterministic attach simulation pane text.
+    SeedPaneText {
+        lines: Vec<String>,
+        cursor_row: u16,
+        cursor_col: u16,
+    },
     /// Render the current deterministic attach simulation state.
     Render,
     /// Locate text in the current deterministic render and store coordinates.
@@ -632,6 +638,7 @@ impl Action {
             Self::RenderMark { .. } => "render-mark",
             Self::AssertRender { .. } => "assert-render",
             Self::SeedWindowList { .. } => "seed-window-list",
+            Self::SeedPaneText { .. } => "seed-pane-text",
             Self::Render => "render",
             Self::Locate { .. } => "locate",
             Self::TerminalEvent(_) => "terminal-event",
@@ -797,6 +804,14 @@ impl Action {
                 "seed-window-list names='{}' active='{}'",
                 escape_single_quote(&names.join(",")),
                 escape_single_quote(active)
+            ),
+            Self::SeedPaneText {
+                lines,
+                cursor_row,
+                cursor_col,
+            } => format!(
+                "seed-pane-text lines='{}' cursor_row={cursor_row} cursor_col={cursor_col}",
+                escape_single_quote(&lines.join("|"))
             ),
             Self::Render => "render".to_string(),
             Self::Locate { id, text } => format!(

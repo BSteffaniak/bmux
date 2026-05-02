@@ -388,6 +388,19 @@ pub fn parse_action_line(line: &str) -> Result<Action> {
             let active = require_arg(&args, "active", "seed-window-list")?;
             Ok(Action::SeedWindowList { names, active })
         }
+        "seed-pane-text" => {
+            let lines = require_arg(&args, "lines", "seed-pane-text")?
+                .split('|')
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let cursor_row = require_arg(&args, "cursor_row", "seed-pane-text")?.parse()?;
+            let cursor_col = require_arg(&args, "cursor_col", "seed-pane-text")?.parse()?;
+            Ok(Action::SeedPaneText {
+                lines,
+                cursor_row,
+                cursor_col,
+            })
+        }
         "render" => Ok(Action::Render),
         "locate" => Ok(Action::Locate {
             id: require_arg(&args, "id", "locate")?,

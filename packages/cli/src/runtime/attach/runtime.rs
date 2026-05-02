@@ -4414,22 +4414,30 @@ fn enqueue_final_pane_action_prompt(
     );
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachViewState) {
+    handle_attach_ui_action_at(action, view_state, Instant::now());
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn handle_attach_ui_action_at(
+    action: &RuntimeAction,
+    view_state: &mut AttachViewState,
+    now: Instant,
+) {
     match action {
         RuntimeAction::EnterScrollMode => {
             if enter_attach_scrollback(view_state) {
             } else {
                 view_state.set_transient_status(
                     ATTACH_SCROLLBACK_UNAVAILABLE_STATUS,
-                    Instant::now(),
+                    now,
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
             }
         }
         RuntimeAction::ExitScrollMode => {
             if view_state.selection_active() {
-                clear_attach_selection(view_state, true);
+                clear_attach_selection_at(view_state, true, now);
             } else {
                 view_state.exit_scrollback();
             }
@@ -4475,20 +4483,20 @@ pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachVi
         RuntimeAction::BeginSelection if begin_attach_selection(view_state) => {
             view_state.set_transient_status(
                 ATTACH_SELECTION_STARTED_STATUS,
-                Instant::now(),
+                now,
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
         RuntimeAction::CopyScrollback => {
-            copy_attach_selection(view_state, false);
+            copy_attach_selection_at(view_state, false, now);
         }
         RuntimeAction::ConfirmScrollback => {
-            confirm_attach_scrollback(view_state);
+            confirm_attach_scrollback_at(view_state, now);
         }
         RuntimeAction::SwitchProfile(_) => {
             view_state.set_transient_status(
                 "switch_profile is handled by attach input loop",
-                Instant::now(),
+                now,
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
@@ -4496,7 +4504,7 @@ pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachVi
             if view_state.prompt.is_busy() {
                 view_state.set_transient_status(
                     "prompt already active",
-                    Instant::now(),
+                    now,
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
                 return;
@@ -4519,7 +4527,7 @@ pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachVi
             let Some(pane_id) = focused_attach_pane_id(view_state) else {
                 view_state.set_transient_status(
                     "no focused pane",
-                    Instant::now(),
+                    now,
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
                 return;
@@ -4527,7 +4535,7 @@ pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachVi
             if view_state.prompt.is_busy() {
                 view_state.set_transient_status(
                     "prompt already active",
-                    Instant::now(),
+                    now,
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
                 return;
@@ -4598,12 +4606,16 @@ pub fn begin_attach_selection(view_state: &mut AttachViewState) -> bool {
     view_state.selection_anchor.is_some()
 }
 
-pub fn clear_attach_selection(view_state: &mut AttachViewState, show_status: bool) {
+pub fn clear_attach_selection_at(
+    view_state: &mut AttachViewState,
+    show_status: bool,
+    now: Instant,
+) {
     view_state.selection_anchor = None;
     if show_status {
         view_state.set_transient_status(
             ATTACH_SELECTION_CLEARED_STATUS,
-            Instant::now(),
+            now,
             ATTACH_TRANSIENT_STATUS_TTL,
         );
     }
@@ -4696,13 +4708,21 @@ pub fn adjust_scrollback_cursor_component(current: usize, delta: isize, max_valu
 }
 
 pub fn copy_attach_selection(view_state: &mut AttachViewState, exit_after_copy: bool) {
+    copy_attach_selection_at(view_state, exit_after_copy, Instant::now());
+}
+
+pub fn copy_attach_selection_at(
+    view_state: &mut AttachViewState,
+    exit_after_copy: bool,
+    now: Instant,
+) {
     let Some(text) = selected_attach_text(view_state) else {
         if exit_after_copy {
             view_state.exit_scrollback();
         } else {
             view_state.set_transient_status(
                 ATTACH_SELECTION_EMPTY_STATUS,
-                Instant::now(),
+                now,
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
@@ -4713,7 +4733,7 @@ pub fn copy_attach_selection(view_state: &mut AttachViewState, exit_after_copy: 
         Ok(()) => {
             view_state.set_transient_status(
                 ATTACH_SELECTION_COPIED_STATUS,
-                Instant::now(),
+                now,
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
             if exit_after_copy {
@@ -4723,15 +4743,15 @@ pub fn copy_attach_selection(view_state: &mut AttachViewState, exit_after_copy: 
         Err(error) => {
             view_state.set_transient_status(
                 format_clipboard_service_error(&error),
-                Instant::now(),
+                now,
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
     }
 }
 
-pub fn confirm_attach_scrollback(view_state: &mut AttachViewState) {
-    copy_attach_selection(view_state, true);
+pub fn confirm_attach_scrollback_at(view_state: &mut AttachViewState, now: Instant) {
+    copy_attach_selection_at(view_state, true, now);
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -13491,7 +13511,7 @@ mod tests {
         assert!(enter_attach_scrollback(&mut view_state));
         assert!(begin_attach_selection(&mut view_state));
 
-        clear_attach_selection(&mut view_state, false);
+        clear_attach_selection_at(&mut view_state, false, Instant::now());
         assert_eq!(view_state.selection_anchor, None);
     }
 
@@ -13514,7 +13534,7 @@ mod tests {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         assert!(enter_attach_scrollback(&mut view_state));
 
-        confirm_attach_scrollback(&mut view_state);
+        confirm_attach_scrollback_at(&mut view_state, Instant::now());
         assert!(!view_state.scrollback_active);
     }
 

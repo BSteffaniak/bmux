@@ -33,6 +33,7 @@ const ATTACH_SIM_FIXTURES: &[&str] = &[
     "attach_sim_tab_click_switch.dsl",
     "attach_sim_status_top.dsl",
     "attach_sim_status_snapshot.dsl",
+    "attach_sim_scrollback_selection.dsl",
 ];
 
 struct TempDirGuard {
