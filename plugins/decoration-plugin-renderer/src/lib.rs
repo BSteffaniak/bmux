@@ -283,11 +283,17 @@ fn push_render_ops_for_command(ops: &mut Vec<RenderOp>, command: &PaintCommand) 
             if rect.w == 0 || rect.h == 0 || glyph.is_empty() {
                 return Some(());
             }
-            ops.push(RenderOp::FillRect {
-                rect: extension_rect_from_scene(rect),
-                ch: single_char(glyph)?,
-                style: render_style_from_scene(style),
-            });
+            let style = render_style_from_scene(style);
+            let rect = extension_rect_from_scene(rect);
+            if glyph == " " {
+                ops.push(RenderOp::ClearRect { rect, style });
+            } else {
+                ops.push(RenderOp::FillRect {
+                    rect,
+                    ch: single_display_cell_char(glyph)?,
+                    style,
+                });
+            }
         }
         PaintCommand::GradientRun {
             col,
@@ -413,7 +419,7 @@ fn render_cell_grid_rows(cols: u16, cells: &[SceneCell]) -> Option<Vec<Vec<Rende
                 return None;
             }
             row.push(RenderCell {
-                ch: single_char(&cell.glyph)?,
+                ch: single_display_cell_char(&cell.glyph)?,
                 style: render_style_from_scene(&cell.style),
             });
         }
@@ -425,12 +431,12 @@ fn render_cell_grid_rows(cols: u16, cells: &[SceneCell]) -> Option<Vec<Vec<Rende
 fn render_border_glyphs(glyphs: &SceneBorderGlyphs) -> Option<RenderBorderGlyphs> {
     let glyphs = border_glyphs_corners_or_custom(glyphs)?;
     Some(RenderBorderGlyphs {
-        top_left: single_char(glyphs.top_left)?,
-        top_right: single_char(glyphs.top_right)?,
-        bottom_left: single_char(glyphs.bottom_left)?,
-        bottom_right: single_char(glyphs.bottom_right)?,
-        horizontal: single_char(glyphs.horizontal)?,
-        vertical: single_char(glyphs.vertical)?,
+        top_left: single_display_cell_char(glyphs.top_left)?,
+        top_right: single_display_cell_char(glyphs.top_right)?,
+        bottom_left: single_display_cell_char(glyphs.bottom_left)?,
+        bottom_right: single_display_cell_char(glyphs.bottom_right)?,
+        horizontal: single_display_cell_char(glyphs.horizontal)?,
+        vertical: single_display_cell_char(glyphs.vertical)?,
     })
 }
 
@@ -444,8 +450,18 @@ fn single_char(value: &str) -> Option<char> {
     }
 }
 
+fn single_display_cell_char(value: &str) -> Option<char> {
+    let ch = single_char(value)?;
+    (char_display_width_u16(ch) == 1).then_some(ch)
+}
+
 fn text_width_u16(text: &str) -> u16 {
     u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+}
+
+fn char_display_width_u16(ch: char) -> u16 {
+    let mut buffer = [0; 4];
+    text_width_u16(ch.encode_utf8(&mut buffer))
 }
 
 fn paint_command_damage(command: &PaintCommand) -> impl Iterator<Item = ExtensionRect> + '_ {
@@ -720,6 +736,126 @@ mod tests {
                 .expect("cache should lock")
                 .rendered_surface(&surface_id)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn render_ops_converts_space_fill_to_clear_rect() {
+        let surface_id = Uuid::from_u128(6);
+        let rect = SceneRect {
+            x: 1,
+            y: 2,
+            w: 3,
+            h: 4,
+        };
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::FilledRect {
+                rect: rect.clone(),
+                z: 0,
+                glyph: " ".to_string(),
+                style: scene_style(),
+            }],
+        );
+
+        let ops = extension
+            .render_ops(
+                surface_id,
+                &ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                },
+                &RenderDamage::FullSurface,
+            )
+            .expect("space fills should be declarative clears");
+
+        assert_eq!(
+            ops,
+            vec![RenderOp::ClearRect {
+                rect: ExtensionRect {
+                    x: 1,
+                    y: 2,
+                    w: 3,
+                    h: 4,
+                },
+                style: RenderStyle::default(),
+            }]
+        );
+    }
+
+    #[test]
+    fn render_ops_falls_back_for_wide_cell_grid_glyphs() {
+        let surface_id = Uuid::from_u128(7);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::CellGrid {
+                origin_col: 0,
+                origin_row: 0,
+                z: 0,
+                cols: 1,
+                cells: vec![SceneCell {
+                    glyph: "界".to_string(),
+                    style: scene_style(),
+                }],
+            }],
+        );
+
+        assert!(
+            extension
+                .render_ops(
+                    surface_id,
+                    &ExtensionRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 10,
+                    },
+                    &RenderDamage::FullSurface,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn render_ops_falls_back_for_wide_border_glyphs() {
+        let surface_id = Uuid::from_u128(8);
+        let (extension, _cache) = extension_with_surface(
+            surface_id,
+            vec![PaintCommand::BoxBorder {
+                rect: SceneRect {
+                    x: 0,
+                    y: 0,
+                    w: 4,
+                    h: 3,
+                },
+                z: 0,
+                glyphs: SceneBorderGlyphs::Custom {
+                    top_left: "界".to_string(),
+                    top_right: "+".to_string(),
+                    bottom_left: "+".to_string(),
+                    bottom_right: "+".to_string(),
+                    horizontal: "-".to_string(),
+                    vertical: "|".to_string(),
+                },
+                style: scene_style(),
+            }],
+        );
+
+        assert!(
+            extension
+                .render_ops(
+                    surface_id,
+                    &ExtensionRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 10,
+                    },
+                    &RenderDamage::FullSurface,
+                )
+                .is_none()
         );
     }
 

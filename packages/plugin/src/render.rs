@@ -166,12 +166,39 @@ impl Default for BorderGlyphs {
     }
 }
 
+/// Declarative paint operation emitted by an attach render extension.
+///
+/// Coordinates are absolute terminal display-cell coordinates in the same
+/// coordinate space as the `surface_rect` passed to [`AttachRenderExtension`].
+/// The attach runtime clips every operation to that surface rectangle before
+/// lowering it to terminal output. [`RenderDamage::Regions`] also uses this
+/// absolute coordinate space.
+///
+/// Text bounds and clipping are measured in Unicode display cells, not UTF-8
+/// bytes or scalar count. Implementations should prefer `TextRun` for strings
+/// and use `CellGrid` only for already-cell-addressed one-column glyphs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderOp {
     TextRun {
         x: u16,
         y: u16,
         text: String,
+        style: RenderStyle,
+    },
+    /// Clear a rectangle by painting spaces with `style`. This is semantically
+    /// distinct from `FillRect { ch: ' ', .. }` so lower layers can eventually
+    /// choose terminal erase primitives when the style is compatible.
+    ClearRect {
+        rect: ExtensionRect,
+        style: RenderStyle,
+    },
+    /// Clear one row segment by painting `width` spaces with `style`.
+    /// Semantically equivalent to a one-row `ClearRect`, but useful for
+    /// adapters that naturally produce row-oriented erases.
+    EraseRowSegment {
+        x: u16,
+        y: u16,
+        width: u16,
         style: RenderStyle,
     },
     FillRect {

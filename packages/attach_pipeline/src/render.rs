@@ -148,6 +148,24 @@ fn queue_render_ops<W: io::Write>(
                     });
                 }
             }
+            RenderOp::ClearRect { rect, style } => {
+                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
+                wrote |= queue_render_clear_rect(stdout, surface_rect, *rect, *style)?;
+            }
+            RenderOp::EraseRowSegment { x, y, width, style } => {
+                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
+                wrote |= queue_render_clear_rect(
+                    stdout,
+                    surface_rect,
+                    ExtensionRect {
+                        x: *x,
+                        y: *y,
+                        w: *width,
+                        h: 1,
+                    },
+                    *style,
+                )?;
+            }
             RenderOp::FillRect { rect, ch, style } => {
                 wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
                 wrote |= queue_render_fill_rect(stdout, surface_rect, *rect, *ch, *style)?;
@@ -349,6 +367,15 @@ fn queue_render_text_run<W: io::Write>(
     Ok(true)
 }
 
+fn queue_render_clear_rect<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    rect: ExtensionRect,
+    style: RenderStyle,
+) -> Result<bool> {
+    queue_render_fill_rect(stdout, surface_rect, rect, ' ', style)
+}
+
 fn queue_render_fill_rect<W: io::Write>(
     stdout: &mut W,
     surface_rect: ExtensionRect,
@@ -484,7 +511,15 @@ fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
             w: text_width_u16(text),
             h: 1,
         },
-        RenderOp::FillRect { rect, .. } | RenderOp::Border { rect, .. } => *rect,
+        RenderOp::ClearRect { rect, .. }
+        | RenderOp::FillRect { rect, .. }
+        | RenderOp::Border { rect, .. } => *rect,
+        RenderOp::EraseRowSegment { x, y, width, .. } => ExtensionRect {
+            x: *x,
+            y: *y,
+            w: *width,
+            h: 1,
+        },
         RenderOp::CellGrid { x, y, rows } => ExtensionRect {
             x: *x,
             y: *y,
@@ -2655,6 +2690,48 @@ mod tests {
 
         let output = String::from_utf8(output).expect("render op bytes should be utf8");
         assert!(output.contains('界'), "{output:?}");
+    }
+
+    #[test]
+    fn queue_render_ops_clears_rect_and_row_segments() {
+        let ops = [
+            RenderOp::ClearRect {
+                rect: ExtensionRect {
+                    x: 1,
+                    y: 0,
+                    w: 3,
+                    h: 2,
+                },
+                style: RenderStyle::default(),
+            },
+            RenderOp::EraseRowSegment {
+                x: 5,
+                y: 1,
+                width: 2,
+                style: RenderStyle::default(),
+            },
+        ];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 3,
+                },
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+            .expect("clear ops should queue")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        assert!(output.contains("\u{1b}[1;2H   "), "{output:?}");
+        assert!(output.contains("\u{1b}[2;2H   "), "{output:?}");
+        assert!(output.contains("\u{1b}[2;6H  "), "{output:?}");
     }
 
     #[test]
