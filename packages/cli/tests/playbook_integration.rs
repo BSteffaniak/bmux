@@ -555,6 +555,7 @@ fn parse_and_validate_fixtures() {
         "attach_sim_tab_drag_gap.dsl",
         "attach_sim_tab_drag_mru_noop.dsl",
         "attach_sim_tab_click_switch.dsl",
+        "attach_sim_status_top.dsl",
     ];
 
     for name in &fixtures {
@@ -580,6 +581,7 @@ fn attach_sim_fixtures_run_without_sandbox() {
         "attach_sim_tab_drag_gap.dsl",
         "attach_sim_tab_drag_mru_noop.dsl",
         "attach_sim_tab_click_switch.dsl",
+        "attach_sim_status_top.dsl",
     ];
 
     for name in fixtures {

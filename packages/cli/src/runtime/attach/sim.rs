@@ -1,10 +1,12 @@
 use super::input::{TerminalGeometry, TerminalMouseEvent};
-use super::runtime::{attach_tab_drop_marker_col, reduce_attach_status_tab_mouse_event};
+use super::runtime::{
+    attach_tab_drop_marker_col, reduce_attach_status_tab_mouse_event, status_row_for_position,
+};
 use super::state::{AttachTabDropPlacement, AttachUiEffect, AttachViewState};
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use bmux_appearance::RuntimeAppearance;
 use bmux_client::AttachOpenInfo;
-use bmux_config::{StatusBarConfig, StatusTabOrder};
+use bmux_config::{StatusBarConfig, StatusPosition, StatusTabOrder};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +77,11 @@ impl AttachSimHarness {
     pub fn set_tab_order(&mut self, order: StatusTabOrder) {
         self.status_config.tab_order = order;
         self.view_state.mouse.tab_drag_enabled = !matches!(order, StatusTabOrder::Mru);
+        self.render();
+    }
+
+    pub fn set_status_position(&mut self, position: StatusPosition) {
+        self.view_state.status_position = position;
         self.render();
     }
 
@@ -174,7 +181,10 @@ impl AttachSimHarness {
                     center_col: hitbox
                         .start_col
                         .saturating_add(hitbox.end_col.saturating_sub(hitbox.start_col) / 2),
-                    row: self.geometry.rows.saturating_sub(1),
+                    row: status_row_for_position(
+                        self.view_state.status_position,
+                        self.geometry.rows,
+                    )?,
                 });
             }
         }
@@ -187,7 +197,7 @@ impl AttachSimHarness {
             start_col,
             end_col,
             center_col: start_col.saturating_add(end_col.saturating_sub(start_col) / 2),
-            row: self.geometry.rows.saturating_sub(1),
+            row: status_row_for_position(self.view_state.status_position, self.geometry.rows)?,
         })
     }
 
@@ -253,6 +263,7 @@ mod tests {
         TerminalModifiers, TerminalMouseButton, TerminalMouseEvent, TerminalMousePhase,
     };
     use crate::runtime::attach::state::{AttachTabDropPlacement, AttachUiEffect};
+    use bmux_config::StatusPosition;
     use uuid::Uuid;
 
     const fn left_mouse(phase: TerminalMousePhase, col: u16, row: u16) -> TerminalMouseEvent {
@@ -302,6 +313,18 @@ mod tests {
         );
         assert_eq!(sim.window_names(), ["two", "three", "one"]);
         assert!(sim.rendered().contains("1:two"));
+    }
+
+    #[test]
+    fn attach_sim_status_position_changes_located_mouse_row() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_window_list(&["one", "two"], "one");
+        let bottom = sim.locate_text("1:one").expect("bottom tab");
+        assert_eq!(bottom.row, 23);
+
+        sim.set_status_position(StatusPosition::Top);
+        let top = sim.locate_text("1:one").expect("top tab");
+        assert_eq!(top.row, 0);
     }
 
     #[test]

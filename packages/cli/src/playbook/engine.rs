@@ -2063,6 +2063,12 @@ fn execute_attach_sim_step(
                 ("status_bar.tab_order", "stable") => {
                     sim.set_tab_order(bmux_config::StatusTabOrder::Stable);
                 }
+                ("appearance.status_position", "top") => {
+                    sim.set_status_position(bmux_config::StatusPosition::Top);
+                }
+                ("appearance.status_position", "bottom") => {
+                    sim.set_status_position(bmux_config::StatusPosition::Bottom);
+                }
                 _ => bail!("unsupported attach-sim config {path}={value}"),
             }
             Ok(Some(format!("{path}={value}")))

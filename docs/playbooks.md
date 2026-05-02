@@ -330,21 +330,31 @@ assert-state path='windows.names' equals='["two","three","one"]'
 
 Supported attach-sim actions:
 
-| Action             | Purpose                                                                                             |
-| ------------------ | --------------------------------------------------------------------------------------------------- |
-| `seed-window-list` | Seed fake windows: `names='one,two' active='one'`                                                   |
-| `set-config`       | Set supported sim config, currently `status_bar.tab_order=mru\|stable`                              |
-| `render`           | Re-render fake attach status UI                                                                     |
-| `locate`           | Locate rendered text and define `${id.start_col}`, `${id.center_col}`, `${id.end_col}`, `${id.row}` |
-| `terminal-event`   | Send normalized terminal input; currently mouse events are supported                                |
-| `assert-rendered`  | Assert rendered output contains or matches text                                                     |
-| `assert-effect`    | Assert an effect such as `move-window` was emitted                                                  |
-| `assert-no-effect` | Assert an effect was not emitted                                                                    |
-| `assert-state`     | Assert fake state; currently supports `path='windows.names'` and `path='windows.active_name'`       |
+| Action             | Purpose                                                                                                             |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `seed-window-list` | Seed fake windows: `names='one,two' active='one'`                                                                   |
+| `set-config`       | Set supported sim config, currently `status_bar.tab_order=mru\|stable` and `appearance.status_position=top\|bottom` |
+| `render`           | Re-render fake attach status UI                                                                                     |
+| `locate`           | Locate rendered text and define `${id.start_col}`, `${id.center_col}`, `${id.end_col}`, `${id.row}`                 |
+| `terminal-event`   | Send normalized terminal input; currently mouse events are supported                                                |
+| `assert-rendered`  | Assert rendered output contains or matches text                                                                     |
+| `assert-effect`    | Assert an effect such as `move-window` was emitted                                                                  |
+| `assert-no-effect` | Assert an effect was not emitted                                                                                    |
+| `assert-state`     | Assert fake state; currently supports `path='windows.names'` and `path='windows.active_name'`                       |
 
 This driver is intentionally generic around terminal events, rendering,
 effects, and state assertions. Feature fixtures are allowed, but the input and
 assertion primitives should remain reusable for future attach UI behavior.
+
+When adding attach-sim coverage for another UI feature, prefer this pattern:
+
+1. Put production behavior behind a reducer/effect path that accepts normalized
+   terminal input and explicit geometry/config.
+2. Extend the simulation harness fake state only enough to execute those effects.
+3. Add generic actions or assertions only when the new behavior needs reusable
+   terminal/render/effect/state vocabulary.
+4. Keep feature-specific setup in narrowly named seed/config actions or fixtures,
+   not in duplicated test-only UI logic.
 
 ### Session Lifecycle
 
