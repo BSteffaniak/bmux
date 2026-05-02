@@ -3524,8 +3524,7 @@ impl SessionRuntimeManager {
             session.panes.len() <= remove_count
         };
         if remove_runtime {
-            let removed = self.remove_runtime(owner_session_id)?;
-            return Ok((pane_id, Some(removed)));
+            anyhow::bail!("cannot close the final pane without an explicit session action");
         }
         self.close_pane(owner_session_id, Some(PaneSelector::ById(pane_id)))
     }
@@ -5755,7 +5754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_final_floating_pane_removes_runtime() {
+    async fn closing_final_floating_pane_requires_explicit_session_action() {
         let session_id = SessionId(Uuid::new_v4());
         let floating_pane_id = Uuid::new_v4();
         let mut runtime = runtime_with_panes(&[floating_pane_id]);
@@ -5774,12 +5773,10 @@ mod tests {
             pane_exit_tx,
         };
 
-        let (_closed_pane_id, removed) = manager
-            .close_floating_pane(session_id, floating_pane_id)
-            .expect("final floating pane should close runtime");
+        let result = manager.close_floating_pane(session_id, floating_pane_id);
 
-        assert!(removed.is_some());
-        assert!(!manager.runtimes.contains_key(&session_id));
+        assert!(result.is_err());
+        assert!(manager.runtimes.contains_key(&session_id));
     }
 
     #[test]

@@ -30,6 +30,8 @@ owns_namespaces = [
     "lower-active-floating-pane",
     "move-floating-pane",
     "resize-floating-pane",
+    "move-active-floating-pane",
+    "resize-active-floating-pane",
     "set-floating-pane-z",
     "set-floating-pane-layer",
     "close-floating-pane",
@@ -550,6 +552,47 @@ required   = true
 value_name = "HEIGHT"
 
 [[commands]]
+accepts_repeat = true
+expose_in_cli  = true
+name           = "move-active-floating-pane"
+path           = ["move-active-floating-pane"]
+summary        = "Move the active floating pane"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "direction"
+name       = "direction"
+required   = true
+value_name = "DIRECTION"
+values     = ["left", "right", "up", "down"]
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cells"
+name       = "cells"
+value_name = "CELLS"
+
+[[commands]]
+accepts_repeat = true
+expose_in_cli  = true
+name           = "resize-active-floating-pane"
+path           = ["resize-active-floating-pane"]
+summary        = "Resize the active floating pane"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "direction"
+name       = "direction"
+value_name = "DIRECTION"
+values     = ["left", "right", "up", "down", "increase", "decrease"]
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cells"
+name       = "cells"
+value_name = "CELLS"
+
+[[commands]]
 expose_in_cli = true
 name          = "set-floating-pane-z"
 path          = ["set-floating-pane-z"]
@@ -665,3 +708,12 @@ r         = "plugin:bmux.windows:restart-pane"
 "shift+f" = "plugin:bmux.windows:focus-next-floating-pane"
 x         = "plugin:bmux.windows:close-active-pane"
 z         = "plugin:bmux.windows:zoom-pane"
+# Floating pane move/resize (repeat-safe while a floating pane is active)
+"alt+h"       = "plugin:bmux.windows:move-active-floating-pane --direction left"
+"alt+j"       = "plugin:bmux.windows:move-active-floating-pane --direction down"
+"alt+k"       = "plugin:bmux.windows:move-active-floating-pane --direction up"
+"alt+l"       = "plugin:bmux.windows:move-active-floating-pane --direction right"
+"alt+shift+h" = "plugin:bmux.windows:resize-active-floating-pane --direction left"
+"alt+shift+j" = "plugin:bmux.windows:resize-active-floating-pane --direction down"
+"alt+shift+k" = "plugin:bmux.windows:resize-active-floating-pane --direction up"
+"alt+shift+l" = "plugin:bmux.windows:resize-active-floating-pane --direction right"

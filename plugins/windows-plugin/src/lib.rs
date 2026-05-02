@@ -19,8 +19,9 @@ use bmux_plugin_sdk::{
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing},
 };
 use bmux_windows_plugin_api::windows_commands::{
-    self, CloseError, FocusError, PaneAck, PaneDirection, PaneMutationError, PaneResizeDirection,
-    PaneZoomAck, Selector, WindowAck, WindowError, WindowMovePlacement, WindowsCommandsService,
+    self, CloseError, FloatingPaneMoveDirection, FocusError, PaneAck, PaneDirection,
+    PaneMutationError, PaneResizeDirection, PaneZoomAck, Selector, WindowAck, WindowError,
+    WindowMovePlacement, WindowsCommandsService,
 };
 use bmux_windows_plugin_api::windows_state::{
     self, FloatingPaneState, PaneState, WindowEntry, WindowsStateService,
@@ -384,6 +385,7 @@ fn close_pane(
     Ok(ack)
 }
 
+#[derive(Default)]
 struct FloatingPaneCommandOptions {
     origin_x: Option<u16>,
     origin_y: Option<u16>,
@@ -394,6 +396,120 @@ struct FloatingPaneCommandOptions {
     scope: Option<String>,
     program: Option<String>,
     args: Vec<String>,
+}
+
+impl FloatingPaneCommandOptions {
+    fn overlay_cli_arguments(&mut self, arguments: &[String]) -> Result<(), String> {
+        if let Some(value) = option_value(arguments, "x") {
+            self.origin_x = Some(parse_u16_arg(&value, "x")?);
+        }
+        if let Some(value) = option_value(arguments, "y") {
+            self.origin_y = Some(parse_u16_arg(&value, "y")?);
+        }
+        if let Some(value) = option_value(arguments, "w") {
+            self.width = Some(parse_u16_arg(&value, "w")?);
+        }
+        if let Some(value) = option_value(arguments, "h") {
+            self.height = Some(parse_u16_arg(&value, "h")?);
+        }
+        if let Some(value) = option_value(arguments, "z") {
+            self.z_index = Some(parse_i32_arg(&value, "z")?);
+        }
+        if let Some(value) = option_value(arguments, "layer") {
+            self.layer = Some(value);
+        }
+        if let Some(value) = option_value(arguments, "scope") {
+            self.scope = Some(value);
+        }
+        if let Some(value) = option_value(arguments, "program") {
+            self.program = Some(value);
+        }
+        Ok(())
+    }
+}
+
+fn floating_pane_defaults(
+    settings: Option<&toml::Value>,
+) -> Result<FloatingPaneCommandOptions, String> {
+    let Some(section) = floating_pane_defaults_section(settings) else {
+        return Ok(FloatingPaneCommandOptions::default());
+    };
+    Ok(FloatingPaneCommandOptions {
+        origin_x: toml_u16_field(section, "x")?,
+        origin_y: toml_u16_field(section, "y")?,
+        width: toml_u16_field(section, "w")?,
+        height: toml_u16_field(section, "h")?,
+        z_index: toml_i32_field(section, "z")?,
+        layer: toml_string_field(section, "layer")?,
+        scope: toml_string_field(section, "scope")?,
+        program: toml_string_field(section, "program")?,
+        args: toml_string_list_field(section, "args")?.unwrap_or_default(),
+    })
+}
+
+fn floating_pane_defaults_section(settings: Option<&toml::Value>) -> Option<&toml::Value> {
+    let settings = settings?;
+    let floating = settings
+        .get("floating_pane")
+        .or_else(|| settings.get("floating-pane"))?;
+    floating.get("defaults").or(Some(floating))
+}
+
+fn toml_u16_field(section: &toml::Value, key: &str) -> Result<Option<u16>, String> {
+    let Some(value) = section.get(key) else {
+        return Ok(None);
+    };
+    match value {
+        toml::Value::Integer(raw) => u16::try_from(*raw)
+            .map(Some)
+            .map_err(|_| format!("invalid floating_pane.{key}: expected u16")),
+        toml::Value::String(raw) => parse_u16_arg(raw, key).map(Some),
+        _ => Err(format!("invalid floating_pane.{key}: expected integer")),
+    }
+}
+
+fn toml_i32_field(section: &toml::Value, key: &str) -> Result<Option<i32>, String> {
+    let Some(value) = section.get(key) else {
+        return Ok(None);
+    };
+    match value {
+        toml::Value::Integer(raw) => i32::try_from(*raw)
+            .map(Some)
+            .map_err(|_| format!("invalid floating_pane.{key}: expected i32")),
+        toml::Value::String(raw) => parse_i32_arg(raw, key).map(Some),
+        _ => Err(format!("invalid floating_pane.{key}: expected integer")),
+    }
+}
+
+fn toml_string_field(section: &toml::Value, key: &str) -> Result<Option<String>, String> {
+    let Some(value) = section.get(key) else {
+        return Ok(None);
+    };
+    match value {
+        toml::Value::String(raw) => Ok(Some(raw.clone())),
+        _ => Err(format!("invalid floating_pane.{key}: expected string")),
+    }
+}
+
+fn toml_string_list_field(section: &toml::Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = section.get(key) else {
+        return Ok(None);
+    };
+    match value {
+        toml::Value::Array(values) => values
+            .iter()
+            .map(|value| match value {
+                toml::Value::String(raw) => Ok(raw.clone()),
+                _ => Err(format!(
+                    "invalid floating_pane.{key}: expected string array"
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        _ => Err(format!(
+            "invalid floating_pane.{key}: expected string array"
+        )),
+    }
 }
 
 fn create_floating_pane(
@@ -589,10 +705,18 @@ fn resize_floating_pane_command(
     )
 }
 
-fn active_floating_pane_target(
+const fn selector_by_id(id: Uuid) -> Selector {
+    Selector {
+        id: Some(id),
+        name: None,
+        index: None,
+    }
+}
+
+fn active_floating_pane(
     caller: &(impl ServiceCaller + Sync),
     session: Option<&Selector>,
-) -> Result<(Selector, Selector), String> {
+) -> Result<(Selector, api_pane_runtime_state::FloatingPaneSummary), String> {
     let requested_session_id = session
         .map(|selector| resolve_session_id(caller, Some(selector)))
         .transpose()?;
@@ -603,18 +727,15 @@ fn active_floating_pane_target(
         .find(|(_, pane)| pane.cursor_owner)
         .or_else(|| panes.iter().find(|(_, pane)| pane.visible))
         .ok_or_else(|| "no floating panes found".to_string())?;
-    Ok((
-        Selector {
-            id: Some(*session_id),
-            name: None,
-            index: None,
-        },
-        Selector {
-            id: Some(pane.pane_id),
-            name: None,
-            index: None,
-        },
-    ))
+    Ok((selector_by_id(*session_id), pane.clone()))
+}
+
+fn active_floating_pane_target(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+) -> Result<(Selector, Selector), String> {
+    let (session_id, pane) = active_floating_pane(caller, session)?;
+    Ok((session_id, selector_by_id(pane.pane_id)))
 }
 
 fn next_floating_pane_target(
@@ -664,6 +785,78 @@ fn focus_next_floating_pane(
 ) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
     let (owner_session, target) = next_floating_pane_target(caller, session)?;
     mutate_floating_pane(caller, Some(&owner_session), &target, "focus")
+}
+
+fn move_active_floating_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    direction: FloatingPaneMoveDirection,
+    cells: u16,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let (owner_session, pane) = active_floating_pane(caller, session)?;
+    let cells = cells.max(1);
+    let (x, y) = match direction {
+        FloatingPaneMoveDirection::Left => (pane.x.saturating_sub(cells), pane.y),
+        FloatingPaneMoveDirection::Right => (pane.x.saturating_add(cells), pane.y),
+        FloatingPaneMoveDirection::Up => (pane.x, pane.y.saturating_sub(cells)),
+        FloatingPaneMoveDirection::Down => (pane.x, pane.y.saturating_add(cells)),
+    };
+    move_floating_pane(
+        caller,
+        Some(&owner_session),
+        &selector_by_id(pane.pane_id),
+        x,
+        y,
+    )
+}
+
+fn resize_active_floating_pane(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    direction: PaneResizeDirection,
+    cells: u16,
+) -> Result<api_pane_runtime_commands::FloatingPaneAck, String> {
+    let (owner_session, pane) = active_floating_pane(caller, session)?;
+    let target = selector_by_id(pane.pane_id);
+    let cells = cells.max(1);
+    let (x, y, w, h) = floating_resize_geometry(&pane, direction, cells);
+    if x != pane.x || y != pane.y {
+        move_floating_pane(caller, Some(&owner_session), &target, x, y)?;
+    }
+    resize_floating_pane(caller, Some(&owner_session), &target, w, h)
+}
+
+fn floating_resize_geometry(
+    pane: &api_pane_runtime_state::FloatingPaneSummary,
+    direction: PaneResizeDirection,
+    cells: u16,
+) -> (u16, u16, u16, u16) {
+    match direction {
+        PaneResizeDirection::Increase => (
+            pane.x,
+            pane.y,
+            pane.w.saturating_add(cells),
+            pane.h.saturating_add(cells),
+        ),
+        PaneResizeDirection::Decrease => (
+            pane.x,
+            pane.y,
+            pane.w.saturating_sub(cells).max(1),
+            pane.h.saturating_sub(cells).max(1),
+        ),
+        PaneResizeDirection::Left => {
+            let x = pane.x.saturating_sub(cells);
+            let delta = pane.x.saturating_sub(x);
+            (x, pane.y, pane.w.saturating_add(delta), pane.h)
+        }
+        PaneResizeDirection::Right => (pane.x, pane.y, pane.w.saturating_add(cells), pane.h),
+        PaneResizeDirection::Up => {
+            let y = pane.y.saturating_sub(cells);
+            let delta = pane.y.saturating_sub(y);
+            (pane.x, y, pane.w, pane.h.saturating_add(delta))
+        }
+        PaneResizeDirection::Down => (pane.x, pane.y, pane.w, pane.h.saturating_add(cells)),
+    }
 }
 
 fn set_floating_pane_z(
@@ -1649,30 +1842,9 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
             Ok(())
         }
         "create-floating-pane" => {
-            let ack = create_floating_pane_command(
-                context,
-                FloatingPaneCommandOptions {
-                    origin_x: option_value(&context.arguments, "x")
-                        .map(|v| parse_u16_arg(&v, "x"))
-                        .transpose()?,
-                    origin_y: option_value(&context.arguments, "y")
-                        .map(|v| parse_u16_arg(&v, "y"))
-                        .transpose()?,
-                    width: option_value(&context.arguments, "w")
-                        .map(|v| parse_u16_arg(&v, "w"))
-                        .transpose()?,
-                    height: option_value(&context.arguments, "h")
-                        .map(|v| parse_u16_arg(&v, "h"))
-                        .transpose()?,
-                    z_index: option_value(&context.arguments, "z")
-                        .map(|v| parse_i32_arg(&v, "z"))
-                        .transpose()?,
-                    layer: option_value(&context.arguments, "layer"),
-                    scope: option_value(&context.arguments, "scope"),
-                    program: option_value(&context.arguments, "program"),
-                    args: Vec::new(),
-                },
-            )?;
+            let mut options = floating_pane_defaults(context.settings.as_ref())?;
+            options.overlay_cli_arguments(&context.arguments)?;
+            let ack = create_floating_pane_command(context, options)?;
             if emit_to_stdout {
                 println!("created floating pane: {}", ack.pane_id);
             }
@@ -1714,6 +1886,30 @@ fn handle_command(plugin: &WindowsPlugin, context: &NativeCommandContext) -> Res
         }
         "lower-active-floating-pane" => {
             mutate_active_floating_pane(context, None, "lower")?;
+            Ok(())
+        }
+        "move-active-floating-pane" => {
+            let direction = option_value(&context.arguments, "direction")
+                .ok_or_else(|| "--direction is required".to_string())?;
+            let direction = parse_floating_move_direction_arg(&direction)?;
+            let cells = option_value(&context.arguments, "cells")
+                .map(|value| parse_u16_arg(&value, "cells"))
+                .transpose()?
+                .unwrap_or(1);
+            move_active_floating_pane(context, None, direction, cells)?;
+            Ok(())
+        }
+        "resize-active-floating-pane" => {
+            let direction = option_value(&context.arguments, "direction");
+            let direction = direction.as_deref().map_or(
+                Ok(PaneResizeDirection::Increase),
+                parse_pane_resize_direction_arg,
+            )?;
+            let cells = option_value(&context.arguments, "cells")
+                .map(|value| parse_u16_arg(&value, "cells"))
+                .transpose()?
+                .unwrap_or(1);
+            resize_active_floating_pane(context, None, direction, cells)?;
             Ok(())
         }
         "close-active-floating-pane" => {
@@ -3131,6 +3327,40 @@ impl WindowsCommandsService for WindowsCommandsHandle {
         })
     }
 
+    fn move_active_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        direction: FloatingPaneMoveDirection,
+        cells: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            move_active_floating_pane(&*caller, session.as_ref(), direction, cells)
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
+    fn resize_active_floating_pane<'a>(
+        &'a self,
+        session: Option<Selector>,
+        direction: PaneResizeDirection,
+        cells: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
+        let caller = Arc::clone(&self.shared.caller);
+        Box::pin(async move {
+            resize_active_floating_pane(&*caller, session.as_ref(), direction, cells)
+                .map(|ack| PaneAck {
+                    ok: true,
+                    pane_id: Some(ack.pane_id),
+                })
+                .map_err(map_host_error)
+        })
+    }
+
     fn focus_floating_pane<'a>(
         &'a self,
         session: Option<Selector>,
@@ -3555,6 +3785,18 @@ fn parse_pane_resize_direction_arg(value: &str) -> Result<PaneResizeDirection, S
         "down" => Ok(PaneResizeDirection::Down),
         other => Err(format!(
             "unknown resize direction '{other}' (expected increase/decrease/left/right/up/down)"
+        )),
+    }
+}
+
+fn parse_floating_move_direction_arg(value: &str) -> Result<FloatingPaneMoveDirection, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "left" => Ok(FloatingPaneMoveDirection::Left),
+        "right" => Ok(FloatingPaneMoveDirection::Right),
+        "up" => Ok(FloatingPaneMoveDirection::Up),
+        "down" => Ok(FloatingPaneMoveDirection::Down),
+        other => Err(format!(
+            "unknown floating pane move direction '{other}' (expected left/right/up/down)"
         )),
     }
 }

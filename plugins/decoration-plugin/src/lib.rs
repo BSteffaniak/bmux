@@ -49,7 +49,11 @@ struct State {
     /// Per-pane overrides. Panes without an override fall through to
     /// [`State::default_border`].
     panes: HashMap<Uuid, PaneDecoration>,
-    /// Per-pane live geometry observed from the attach runtime.
+    /// Per-surface live geometry observed from the attach runtime.
+    ///
+    /// Keys are attach surface ids, not pane ids. Tiled pane surfaces usually use
+    /// the pane id as their surface id, but floating panes have distinct surface
+    /// ids while still pointing at a pane-backed PTY.
     geometry: HashMap<Uuid, PaneGeometry>,
     /// Per-pane focus/zoom/lifecycle. Kept separate from
     /// `panes` (style) so mutators don't have to allocate a
@@ -232,7 +236,7 @@ impl DecorationStateService for DecorationServiceHandle {
     ) -> Pin<Box<dyn Future<Output = Option<PaneGeometry>> + Send + 'a>> {
         Box::pin(async move {
             let state = self.state.lock().ok()?;
-            state.geometry.get(&pane_id).cloned()
+            geometry_for_pane(&state, pane_id).cloned()
         })
     }
 
@@ -381,7 +385,7 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
         }
         PaneEvent::Closed { pane_id } => {
             state.panes.remove(pane_id);
-            state.geometry.remove(pane_id);
+            state.geometry.retain(|_, geom| geom.pane_id != *pane_id);
             state.activity.remove(pane_id);
             bump_revision(state);
         }
@@ -422,11 +426,12 @@ fn apply_pane_event(state: &mut State, event: &PaneEvent) {
 /// top at higher `z` values.
 fn build_scene(state: &mut State) -> DecorationScene {
     let mut surfaces = BTreeMap::new();
-    let pane_ids: Vec<Uuid> = state.geometry.keys().copied().collect();
-    for pane_id in pane_ids {
-        let Some(geom) = state.geometry.get(&pane_id).cloned() else {
+    let surface_ids: Vec<Uuid> = state.geometry.keys().copied().collect();
+    for surface_id in surface_ids {
+        let Some(geom) = state.geometry.get(&surface_id).cloned() else {
             continue;
         };
+        let pane_id = geom.pane_id;
         let (focused, zoomed) = state
             .activity
             .get(&pane_id)
@@ -452,9 +457,9 @@ fn build_scene(state: &mut State) -> DecorationScene {
         let interactive_regions = border_interactive_regions(&rect);
 
         surfaces.insert(
-            pane_id,
+            surface_id,
             SurfaceDecoration {
-                surface_id: pane_id,
+                surface_id,
                 rect,
                 content_rect,
                 paint_commands,
@@ -470,8 +475,15 @@ fn build_scene(state: &mut State) -> DecorationScene {
     }
 }
 
+fn geometry_for_pane(state: &State, pane_id: Uuid) -> Option<&PaneGeometry> {
+    state
+        .geometry
+        .values()
+        .find(|geometry| geometry.pane_id == pane_id)
+}
+
 fn script_pane_payload(state: &State, pane_id: Uuid) -> Option<serde_json::Value> {
-    let geom = state.geometry.get(&pane_id)?;
+    let geom = geometry_for_pane(state, pane_id)?;
     let activity = state.activity.get(&pane_id);
     let (focused, zoomed) = activity.map_or((false, false), |a| (a.focused, a.zoomed));
     let status = activity.map_or(PaneLifecycle::Running, |a| a.status);
@@ -603,7 +615,7 @@ fn record_script_perf(state: &State, duration: Duration) {
 }
 
 fn empty_surface_for(state: &State, pane_id: Uuid) -> SurfaceDecoration {
-    let (rect, content_rect) = state.geometry.get(&pane_id).map_or_else(
+    let (rect, content_rect) = geometry_for_pane(state, pane_id).map_or_else(
         || {
             (
                 Rect {
@@ -1762,7 +1774,10 @@ impl RustPlugin for DecorationPlugin {
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(scene)
             },
             "decoration-state", "pane-geometry" => |req: PaneGeometryArgs, _ctx| {
-                let geom = state.lock().ok().and_then(|s| s.geometry.get(&req.pane_id).cloned());
+                let geom = state
+                    .lock()
+                    .ok()
+                    .and_then(|s| geometry_for_pane(&s, req.pane_id).cloned());
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(geom)
             },
             "decoration-state", "pane-activity" => |req: PaneActivityArgs, _ctx| {
@@ -2221,17 +2236,17 @@ fn spawn_attach_layout_subscriber(state: Arc<Mutex<State>>) {
 }
 
 /// Reconcile `state.geometry` against an [`AttachLayoutSnapshot`].
-/// Surfaces backed by a pane (non-`None` `pane_id`) update the
-/// plugin's geometry record; panes that disappeared from the
-/// snapshot are removed. `state.activity` entries for removed panes
-/// are cleaned up too so stale focus / zoom flags don't linger.
+/// Surfaces backed by a pane (non-`None` `pane_id`) update the plugin's
+/// geometry record keyed by attach surface id; panes with no remaining visible
+/// surfaces are removed. `state.activity` entries for removed panes are cleaned
+/// up too so stale focus / zoom flags don't linger.
 fn apply_attach_layout_snapshot(
     state: &mut State,
     snapshot: &bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot,
 ) {
     use std::collections::BTreeSet;
     let mut changed = false;
-    let mut seen: BTreeSet<Uuid> = BTreeSet::new();
+    let mut seen_surfaces: BTreeSet<Uuid> = BTreeSet::new();
     for surface in &snapshot.surfaces {
         let Some(pane_id) = surface.pane_id else {
             continue;
@@ -2239,14 +2254,14 @@ fn apply_attach_layout_snapshot(
         if !surface.visible {
             continue;
         }
-        seen.insert(pane_id);
+        seen_surfaces.insert(surface.surface_id);
         let new_geometry = PaneGeometry {
             pane_id,
             rect: surface.rect.clone(),
             content_rect: surface.content_rect.clone(),
         };
-        let prev = state.geometry.insert(pane_id, new_geometry);
-        if prev.as_ref() != state.geometry.get(&pane_id) {
+        let prev = state.geometry.insert(surface.surface_id, new_geometry);
+        if prev.as_ref() != state.geometry.get(&surface.surface_id) {
             changed = true;
         }
     }
@@ -2254,13 +2269,17 @@ fn apply_attach_layout_snapshot(
     let drop_ids: Vec<Uuid> = state
         .geometry
         .keys()
-        .filter(|id| !seen.contains(id))
+        .filter(|id| !seen_surfaces.contains(id))
         .copied()
         .collect();
-    for pane_id in drop_ids {
-        state.geometry.remove(&pane_id);
-        state.activity.remove(&pane_id);
-        state.panes.remove(&pane_id);
+    for surface_id in drop_ids {
+        let Some(removed) = state.geometry.remove(&surface_id) else {
+            continue;
+        };
+        if geometry_for_pane(state, removed.pane_id).is_none() {
+            state.activity.remove(&removed.pane_id);
+            state.panes.remove(&removed.pane_id);
+        }
         changed = true;
     }
     if changed {
@@ -3302,6 +3321,45 @@ mod tests {
         assert!(block_on(handle.pane_activity(pane)).is_none());
         let deco = block_on(handle.pane_decoration(pane)).expect("default");
         assert!(!deco.focused);
+    }
+
+    #[test]
+    fn build_scene_keys_floating_decoration_by_surface_id() {
+        use bmux_attach_layout_protocol::attach_layout_protocol::{
+            AttachLayoutSnapshot, AttachSurfaceSummary,
+        };
+        let plugin = DecorationPlugin::new();
+        let pane = Uuid::from_u128(699);
+        let surface_id = Uuid::from_u128(700);
+        let snapshot = AttachLayoutSnapshot {
+            surfaces: vec![AttachSurfaceSummary {
+                surface_id,
+                pane_id: Some(pane),
+                rect: rect(2, 3, 20, 5),
+                content_rect: rect(3, 4, 18, 3),
+                visible: true,
+            }],
+            revision: 1,
+        };
+        {
+            let mut state = plugin.state.inner.lock().expect("state");
+            apply_attach_layout_snapshot(&mut state, &snapshot);
+        }
+        let scene = plugin.build_scene();
+        assert!(!scene.surfaces.contains_key(&pane));
+        let surface = scene
+            .surfaces
+            .get(&surface_id)
+            .expect("floating surface decoration is keyed by surface id");
+        assert_eq!(surface.surface_id, surface_id);
+        assert_eq!(surface.rect, rect(2, 3, 20, 5));
+        assert_eq!(surface.content_rect, rect(3, 4, 18, 3));
+        assert!(
+            surface
+                .paint_commands
+                .iter()
+                .any(|cmd| matches!(cmd, PaintCommand::BoxBorder { .. }))
+        );
     }
 
     #[test]

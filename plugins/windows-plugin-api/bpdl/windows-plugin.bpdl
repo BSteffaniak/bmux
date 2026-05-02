@@ -146,6 +146,14 @@ interface windows-commands {
         down,
     }
 
+    // Directional intent for moving a floating pane.
+    enum floating-pane-move-direction {
+        @default right,
+        left,
+        up,
+        down,
+    }
+
     // Placement for moving a window relative to another window.
     enum window-move-placement {
         @default before,
@@ -247,6 +255,18 @@ interface windows-commands {
         target: selector,
         w: u16,
         h: u16,
+    ) -> result<pane-ack, pane-mutation-error>;
+
+    command move-active-floating-pane(
+        session: selector?,
+        direction: floating-pane-move-direction,
+        cells: u16,
+    ) -> result<pane-ack, pane-mutation-error>;
+
+    command resize-active-floating-pane(
+        session: selector?,
+        direction: pane-resize-direction,
+        cells: u16,
     ) -> result<pane-ack, pane-mutation-error>;
 
     command focus-floating-pane(session: selector?, target: selector)
