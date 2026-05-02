@@ -12,6 +12,7 @@ use bmux_plugin::{
     AttachRenderExtension, ExtensionRect, RenderColor, RenderDamage, RenderOp, RenderStyle,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
+use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
 use crossterm::style::{
@@ -1229,6 +1230,26 @@ fn cell_style(cell: &vt100::Cell) -> CellStyle {
     }
 }
 
+const fn grid_cell_style(style: GridStyle) -> CellStyle {
+    CellStyle {
+        fg: grid_color_to_vt100(style.fg),
+        bg: grid_color_to_vt100(style.bg),
+        bold: style.bold,
+        dim: style.dim,
+        italic: style.italic,
+        underline: style.underline,
+        inverse: style.inverse,
+    }
+}
+
+const fn grid_color_to_vt100(color: Option<GridColor>) -> vt100::Color {
+    match color {
+        Some(GridColor::Indexed(index)) => vt100::Color::Idx(index),
+        Some(GridColor::Rgb { r, g, b }) => vt100::Color::Rgb(r, g, b),
+        None => vt100::Color::Default,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RgbColor {
     r: u8,
@@ -1361,6 +1382,75 @@ struct ContentRowRenderContext<'a> {
     runtime_appearance: &'a RuntimeAppearance,
 }
 
+#[derive(Clone, Copy)]
+struct GridRowRenderContext<'a> {
+    row: &'a PhysicalRow,
+    selection: Option<(AttachScrollbackPosition, AttachScrollbackPosition)>,
+    absolute_row: usize,
+    runtime_appearance: &'a RuntimeAppearance,
+    palette: &'a bmux_terminal_grid::StylePalette,
+}
+
+fn render_grid_row_segment(
+    context: GridRowRenderContext<'_>,
+    start_col: u16,
+    end_col: u16,
+) -> String {
+    let mut line = String::new();
+    let mut current = CellStyle::default();
+    let mut emitted_cols = 0_usize;
+    let target_cols = usize::from(end_col.saturating_sub(start_col));
+    let mut col = start_col;
+    while col < end_col {
+        let cell = context.row.cells().get(usize::from(col));
+        if let Some(cell) = cell {
+            let mut style = grid_cell_style(context.palette.get(cell.style()));
+            if cell_selected(context.selection, context.absolute_row, usize::from(col)) {
+                style = selected_style(style);
+            }
+            style = apply_content_effects(style, context.runtime_appearance);
+            if style != current {
+                line.push_str(&style_sgr(style));
+                current = style;
+            }
+            if cell.is_wide_continuation() {
+                line.push(' ');
+                emitted_cols = emitted_cols.saturating_add(1);
+                col = col.saturating_add(1);
+                continue;
+            }
+            let text = if cell.text().is_empty() {
+                " "
+            } else {
+                cell.text()
+            };
+            line.push_str(text);
+            emitted_cols = emitted_cols.saturating_add(UnicodeWidthStr::width(text).max(1));
+            col = col.saturating_add(u16::from(cell.width()).max(1));
+        } else {
+            if current != CellStyle::default() {
+                line.push_str("\x1b[0m");
+                current = CellStyle::default();
+            }
+            line.push(' ');
+            emitted_cols = emitted_cols.saturating_add(1);
+            col = col.saturating_add(1);
+        }
+    }
+
+    if emitted_cols < target_cols {
+        if current != CellStyle::default() {
+            line.push_str("\x1b[0m");
+            current = CellStyle::default();
+        }
+        line.push_str(&" ".repeat(target_cols - emitted_cols));
+    }
+    if current != CellStyle::default() {
+        line.push_str("\x1b[0m");
+    }
+    line
+}
+
 fn render_content_row_segment(
     context: ContentRowRenderContext<'_>,
     row: u16,
@@ -1427,6 +1517,43 @@ fn render_content_row_segment(
     line
 }
 
+fn damaged_grid_row_ranges(
+    row: &PhysicalRow,
+    row_index: u16,
+    width: u16,
+    rects: &[DamageRect],
+) -> Vec<(u16, u16)> {
+    let mut ranges = Vec::new();
+    for rect in rects {
+        if row_index < rect.y || row_index >= rect.bottom() {
+            continue;
+        }
+        let mut start = rect.x.min(width);
+        let mut end = rect.right().min(width);
+        if start >= end {
+            continue;
+        }
+        if start > 0
+            && row
+                .cells()
+                .get(usize::from(start))
+                .is_some_and(Cell::is_wide_continuation)
+        {
+            start = start.saturating_sub(1);
+        }
+        if end < width
+            && row
+                .cells()
+                .get(usize::from(end))
+                .is_some_and(Cell::is_wide_continuation)
+        {
+            end = end.saturating_add(1).min(width);
+        }
+        ranges.push((start, end));
+    }
+    merge_ranges(ranges)
+}
+
 fn damaged_row_ranges(
     screen: &vt100::Screen,
     row: u16,
@@ -1457,22 +1584,30 @@ fn damaged_row_ranges(
         {
             end = end.saturating_add(1).min(width);
         }
+        ranges.push((start, end));
+    }
+    merge_ranges(ranges)
+}
+
+fn merge_ranges(mut ranges: Vec<(u16, u16)>) -> Vec<(u16, u16)> {
+    let mut merged_ranges = Vec::new();
+    while let Some(range) = ranges.pop() {
         let mut index = 0;
-        let mut merged = (start, end);
-        while index < ranges.len() {
-            let existing: (u16, u16) = ranges[index];
+        let mut merged = range;
+        while index < merged_ranges.len() {
+            let existing: (u16, u16) = merged_ranges[index];
             if existing.0 <= merged.1 && merged.0 <= existing.1 {
                 merged = (existing.0.min(merged.0), existing.1.max(merged.1));
-                ranges.swap_remove(index);
+                merged_ranges.swap_remove(index);
                 index = 0;
             } else {
                 index += 1;
             }
         }
-        ranges.push(merged);
+        merged_ranges.push(merged);
     }
-    ranges.sort_unstable();
-    ranges
+    merged_ranges.sort_unstable();
+    merged_ranges
 }
 
 fn selection_bounds(
@@ -1966,14 +2101,30 @@ fn render_attach_scene_inner<W: io::Write>(
         let inner_h = usize::from(inner_height);
         if let Some(entry) = pane_buffers.get_mut(&pane_id) {
             let (old_rows, old_cols) = entry.parser.screen().size();
+            let had_structured_content = entry.terminal_grid.grid().revision() > 0;
+            let previous_grid_size = (
+                entry.terminal_grid.grid().width(),
+                entry.terminal_grid.grid().height(),
+            );
             entry
                 .parser
                 .screen_mut()
                 .set_size(inner_height.max(1), inner_width.max(1));
+            if had_structured_content {
+                let _ = entry
+                    .terminal_grid
+                    .resize_delta(inner_width.max(1), inner_height.max(1));
+            }
             // Invalidate the row cache when the pane dimensions change, since
             // the row strings are no longer comparable at a different size.
             let (new_rows, new_cols) = entry.parser.screen().size();
-            if (new_rows, new_cols) != (old_rows, old_cols) {
+            let next_grid_size = (
+                entry.terminal_grid.grid().width(),
+                entry.terminal_grid.grid().height(),
+            );
+            let parser_size_changed = (new_rows, new_cols) != (old_rows, old_cols);
+            let grid_size_changed = next_grid_size != previous_grid_size;
+            if parser_size_changed || grid_size_changed {
                 entry.prev_rows.clear();
             }
             let use_scrollback = scrollback_active && focus;
@@ -1981,6 +2132,13 @@ fn render_attach_scene_inner<W: io::Write>(
             if use_scrollback {
                 entry.parser.screen_mut().set_scrollback(scrollback_offset);
             }
+            let use_structured_grid = had_structured_content;
+            let grid_rows = use_structured_grid.then(|| {
+                entry
+                    .terminal_grid
+                    .grid()
+                    .display_rows(if use_scrollback { scrollback_offset } else { 0 }, inner_h)
+            });
             let screen = entry.parser.screen();
             let selection = if use_scrollback {
                 selection_bounds(selection_anchor, scrollback_cursor, scrollback_offset)
@@ -1995,6 +2153,14 @@ fn render_attach_scene_inner<W: io::Write>(
                         cursor.row.min(inner_h.saturating_sub(1)) as u16,
                         cursor.col.min(inner_w.saturating_sub(1)) as u16,
                     )
+                } else if use_structured_grid {
+                    let cursor = entry.terminal_grid.grid().cursor();
+                    (
+                        u16::try_from(cursor.row.min(inner_h.saturating_sub(1)))
+                            .unwrap_or(u16::MAX),
+                        u16::try_from(cursor.col.min(inner_w.saturating_sub(1)))
+                            .unwrap_or(u16::MAX),
+                    )
                 } else {
                     let (cursor_row, cursor_col) = screen.cursor_position();
                     (
@@ -2002,7 +2168,13 @@ fn render_attach_scene_inner<W: io::Write>(
                         cursor_col.min(inner_width.saturating_sub(1)),
                     )
                 };
-                let cursor_visible = use_scrollback || !screen.hide_cursor();
+                let cursor_visible = if use_scrollback {
+                    true
+                } else if use_structured_grid {
+                    entry.terminal_grid.grid().cursor().visible
+                } else {
+                    !screen.hide_cursor()
+                };
                 cursor_state = Some(AttachCursorState {
                     x: content.x.saturating_add(cursor_col),
                     y: content.y.saturating_add(cursor_row),
@@ -2041,11 +2213,40 @@ fn render_attach_scene_inner<W: io::Write>(
                     stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
                 }
                 let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
-                let damaged_ranges =
-                    damaged_row_ranges(screen, row_u16, inner_width, damaged_content_rows);
+                let damaged_ranges = grid_rows.as_ref().map_or_else(
+                    || damaged_row_ranges(screen, row_u16, inner_width, damaged_content_rows),
+                    |rows| {
+                        rows.get(row).map_or_else(Vec::new, |grid_row| {
+                            damaged_grid_row_ranges(
+                                grid_row,
+                                row_u16,
+                                inner_width,
+                                damaged_content_rows,
+                            )
+                        })
+                    },
+                );
                 let force_row_damage = !damaged_ranges.is_empty();
                 let y = content.y.saturating_add(row_u16);
-                let line = render_content_row_segment(render_context, row_u16, 0, inner_width);
+                let line = if let Some(rows) = grid_rows.as_ref().and_then(|rows| rows.get(row)) {
+                    render_grid_row_segment(
+                        GridRowRenderContext {
+                            row: rows,
+                            selection,
+                            absolute_row: if use_scrollback {
+                                scrollback_offset.saturating_add(row)
+                            } else {
+                                row
+                            },
+                            runtime_appearance,
+                            palette: entry.terminal_grid.grid().palette(),
+                        },
+                        0,
+                        inner_width,
+                    )
+                } else {
+                    render_content_row_segment(render_context, row_u16, 0, inner_width)
+                };
 
                 // Row-level diff: skip emitting if the rendered string
                 // matches the previous frame's cached version for this row.
@@ -2068,8 +2269,27 @@ fn render_attach_scene_inner<W: io::Write>(
                     }
                 } else if force_row_damage {
                     for (start_col, end_col) in damaged_ranges {
-                        let segment =
-                            render_content_row_segment(render_context, row_u16, start_col, end_col);
+                        let segment = if let Some(rows) =
+                            grid_rows.as_ref().and_then(|rows| rows.get(row))
+                        {
+                            render_grid_row_segment(
+                                GridRowRenderContext {
+                                    row: rows,
+                                    selection,
+                                    absolute_row: if use_scrollback {
+                                        scrollback_offset.saturating_add(row)
+                                    } else {
+                                        row
+                                    },
+                                    runtime_appearance,
+                                    palette: entry.terminal_grid.grid().palette(),
+                                },
+                                start_col,
+                                end_col,
+                            )
+                        } else {
+                            render_content_row_segment(render_context, row_u16, start_col, end_col)
+                        };
                         queue!(
                             stdout,
                             MoveTo(content.x.saturating_add(start_col), y),
@@ -2619,6 +2839,77 @@ mod tests {
         let toggled = append_pane_output(&mut buffer, b"\x1b[?1049hhello\x1b[?1049l");
         assert!(toggled);
         assert!(!buffer.parser.screen().alternate_screen());
+    }
+
+    #[test]
+    fn render_attach_scene_uses_structured_grid_reflow_after_resize() {
+        let pane_id = Uuid::from_u128(101);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(102),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![bmux_attach_layout_protocol::AttachSurface {
+                id: pane_id,
+                pane_id: Some(pane_id),
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 5,
+                    h: 3,
+                },
+                content_rect: AttachRect {
+                    x: 0,
+                    y: 0,
+                    w: 5,
+                    h: 3,
+                },
+                interactive_regions: Vec::new(),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+            }],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer {
+            parser: vt100::Parser::new(3, 10, 4_096),
+            terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
+                10,
+                3,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .expect("test grid dimensions are valid"),
+            ..PaneRenderBuffer::default()
+        };
+        append_pane_output(&mut buffer, b"abcdefghij");
+        pane_buffers.insert(pane_id, buffer);
+
+        let mut output = Vec::new();
+        render_attach_scene(
+            &mut output,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &FrameDamage::full_frame(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+            (5, 3),
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )
+        .expect("structured render should succeed");
+
+        let output = String::from_utf8(output).expect("output should be utf8");
+        assert!(output.contains("abcde"), "{output:?}");
+        assert!(output.contains("fghij"), "{output:?}");
     }
 
     #[test]

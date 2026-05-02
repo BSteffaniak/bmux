@@ -84,10 +84,13 @@ use super::state::{
     AttachScrollbackPosition, AttachTabDropPlacement, AttachTabDropTarget, AttachUiMode,
     AttachViewState, PaneRect, PaneRenderBuffer,
 };
-use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
+use crate::pane_runtime_client::{
+    BmuxPaneRuntimeClientExt, attach_pane_grid_snapshot_state_streaming,
+};
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
+const ATTACH_GRID_SNAPSHOT_MAX_ROWS_PER_PANE: usize = u32::MAX as usize;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 const COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY: &str = "bmux.contexts.selected_context_id";
 const ATTACH_PLUGIN_STATUS_MESSAGE_MAX_CHARS: usize = 180;
@@ -4714,6 +4717,14 @@ pub fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
     let Some(buffer) = focused_attach_pane_buffer(view_state) else {
         return 0;
     };
+    if buffer.terminal_grid.grid().revision() > 0 {
+        return buffer
+            .terminal_grid
+            .grid()
+            .all_main_rows()
+            .len()
+            .saturating_sub(buffer.terminal_grid.grid().height());
+    }
     let previous = buffer.parser.screen().scrollback();
     buffer.parser.screen_mut().set_scrollback(usize::MAX);
     let max_offset = buffer.parser.screen().scrollback();
@@ -6603,6 +6614,59 @@ enum SnapshotHydrationMode {
     FullResync,
 }
 
+async fn hydrate_attach_structured_grid_snapshots(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    pane_ids: Vec<Uuid>,
+) -> std::result::Result<(), ClientError> {
+    if pane_ids.is_empty() {
+        return Ok(());
+    }
+    let snapshots = match attach_pane_grid_snapshot_state_streaming(
+        client,
+        view_state.attached_id,
+        pane_ids,
+        ATTACH_GRID_SNAPSHOT_MAX_ROWS_PER_PANE,
+    )
+    .await
+    {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            tracing::debug!(%error, "structured pane grid snapshot unavailable; continuing with raw snapshot hydration");
+            return Ok(());
+        }
+    };
+
+    for snapshot in snapshots {
+        let decoded = match serde_json::from_slice::<bmux_terminal_grid::GridSnapshot>(
+            &snapshot.encoded,
+        ) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                tracing::warn!(pane_id = %snapshot.pane_id, %error, "failed decoding structured pane grid snapshot");
+                continue;
+            }
+        };
+        let grid = match bmux_terminal_grid::TerminalGrid::from_snapshot(
+            &decoded,
+            bmux_terminal_grid::GridLimits::default(),
+        ) {
+            Ok(grid) => grid,
+            Err(error) => {
+                tracing::warn!(pane_id = %snapshot.pane_id, %error, "failed hydrating structured pane grid snapshot");
+                continue;
+            }
+        };
+        let buffer = view_state.pane_buffers.entry(snapshot.pane_id).or_default();
+        buffer.terminal_grid = bmux_terminal_grid::TerminalGridStream::from_grid(grid);
+        buffer.expected_stream_start = Some(snapshot.stream_end);
+        buffer.prev_rows.clear();
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Snapshot hydration intentionally keeps related state transitions in one ordered flow.
 async fn hydrate_attach_state_from_snapshot_mode(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -6698,6 +6762,12 @@ async fn hydrate_attach_state_from_snapshot_mode(
             buffer.expected_stream_start = Some(chunk.stream_end);
         }
     }
+    hydrate_attach_structured_grid_snapshots(
+        client,
+        view_state,
+        active_pane_ids.iter().copied().collect(),
+    )
+    .await?;
     view_state.dirty.layout_needs_refresh = false;
     view_state
         .dirty
@@ -6770,6 +6840,8 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
                 .insert(pane_mode.pane_id, pane_mode.mode);
         }
     }
+
+    hydrate_attach_structured_grid_snapshots(client, view_state, pane_ids.to_vec()).await?;
 
     for pane_id in pane_ids {
         view_state

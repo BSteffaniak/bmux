@@ -5553,6 +5553,10 @@ mod tests {
             output_buffer: Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
                 MAX_WINDOW_OUTPUT_BUFFER_BYTES,
             ))),
+            terminal_grid: Arc::new(std::sync::Mutex::new(
+                TerminalGridStream::new(1, 1, GridLimits::default())
+                    .expect("dummy pane terminal grid dimensions are valid"),
+            )),
             exited: Arc::new(AtomicBool::new(false)),
             last_requested_size: Arc::new(std::sync::Mutex::new((1, 1))),
             output_dirty: Arc::new(AtomicBool::new(false)),

@@ -599,6 +599,19 @@ impl TerminalGrid {
     }
 
     #[must_use]
+    pub fn display_rows(&self, scrollback_offset: usize, rows: usize) -> Vec<PhysicalRow> {
+        let all_rows = match self.mode {
+            GridMode::Main => self.all_main_rows(),
+            GridMode::Alternate => self.viewport_rows(),
+        };
+        let end = all_rows
+            .len()
+            .saturating_sub(scrollback_offset.min(all_rows.len()));
+        let start = end.saturating_sub(rows.max(self.height));
+        all_rows[start..end].to_vec()
+    }
+
+    #[must_use]
     pub fn all_main_rows(&self) -> Vec<PhysicalRow> {
         self.main_rows.iter().cloned().collect()
     }
