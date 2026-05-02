@@ -394,6 +394,8 @@ impl Perform for GridPerformer<'_> {
             'X' => self.grid.erase_chars(one_based(values.first())),
             '@' => self.grid.insert_blank_chars(one_based(values.first())),
             'm' => self.grid.set_graphic_rendition(&values),
+            's' => self.grid.save_cursor(),
+            'u' => self.grid.restore_cursor(),
             'r' => {
                 if values.is_empty() {
                     self.grid.set_scroll_region(None, None);
@@ -628,6 +630,54 @@ mod tests {
         let cursor = stream.grid().cursor();
         assert_eq!((cursor.row, cursor.col), (11, 33));
         assert_eq!(stream.grid().mode(), crate::model::GridMode::Main);
+    }
+
+    #[test]
+    fn cursor_save_restore_variants_restore_saved_position() {
+        let mut stream = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+
+        stream.process(b"\x1b[3;4H\x1b7\x1b[9;10H\x1b8");
+        let cursor = stream.grid().cursor();
+        assert_eq!((cursor.row, cursor.col), (2, 3));
+
+        stream.process(b"\x1b[5;6H\x1b[s\x1b[11;12H\x1b[u");
+        let cursor = stream.grid().cursor();
+        assert_eq!((cursor.row, cursor.col), (4, 5));
+    }
+
+    #[test]
+    fn cursor_visibility_is_structured_state_and_survives_snapshot() {
+        let mut stream = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+        stream.process(b"\x1b[?25l");
+        assert!(!stream.grid().cursor().visible);
+
+        let snapshot = stream.snapshot(0, 24);
+        assert!(!snapshot.cursor.visible);
+        let hydrated = TerminalGridStream::from_snapshot(&snapshot, GridLimits::default())
+            .expect("snapshot should hydrate");
+        assert!(!hydrated.grid().cursor().visible);
+
+        stream.process(b"\x1b[?25h");
+        assert!(stream.grid().cursor().visible);
+    }
+
+    #[test]
+    fn scroll_region_reset_restores_full_viewport_scrolling() {
+        let mut grid = TerminalGrid::new(5, 4, GridLimits::default()).unwrap();
+        grid.process(b"aaaa\r\nbbbb\r\ncccc\r\ndddd");
+        grid.process(b"\x1b[2;3r\x1b[3;1H\n");
+        let region_rows = grid.viewport_rows();
+        assert_eq!(row_text(&region_rows[0]), "aaaa");
+        assert_eq!(row_text(&region_rows[1]), "cccc");
+        assert_eq!(row_text(&region_rows[2]), "");
+        assert_eq!(row_text(&region_rows[3]), "dddd");
+
+        grid.process(b"\x1b[r\x1b[4;1H\n");
+        let reset_rows = grid.viewport_rows();
+        assert_eq!(row_text(&reset_rows[0]), "cccc");
+        assert_eq!(row_text(&reset_rows[1]), "");
+        assert_eq!(row_text(&reset_rows[2]), "dddd");
+        assert_eq!(row_text(&reset_rows[3]), "");
     }
 
     #[test]

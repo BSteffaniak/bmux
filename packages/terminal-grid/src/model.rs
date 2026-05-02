@@ -1335,6 +1335,32 @@ mod tests {
         assert_eq!(row_text(&rows[1]), "efg");
     }
 
+    #[test]
+    fn large_scrollback_resize_reflows_and_remains_bounded() {
+        let mut grid = TerminalGrid::new(
+            80,
+            20,
+            GridLimits {
+                scrollback_rows: 500,
+            },
+        )
+        .unwrap();
+        for index in 0..1_500 {
+            grid.process(format!("line-{index:04} payload payload payload\r\n").as_bytes());
+        }
+
+        grid.resize(24, 20).unwrap();
+        assert!(grid.all_main_rows().len() <= 520);
+        let narrow_text = crate::visible_text(&grid, 0, 80);
+        assert!(narrow_text.contains("line-1499"));
+        assert!(narrow_text.contains("payload"));
+
+        grid.resize(100, 20).unwrap();
+        assert!(grid.all_main_rows().len() <= 520);
+        let wide_text = crate::visible_text(&grid, 0, 40);
+        assert!(wide_text.contains("line-1499 payload payload payload"));
+    }
+
     fn row_text(row: &PhysicalRow) -> String {
         row.cells()
             .iter()
