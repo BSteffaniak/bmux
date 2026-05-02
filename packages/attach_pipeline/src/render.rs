@@ -125,9 +125,18 @@ fn render_damage_trace_shape(damage: &RenderDamage) -> (u16, bool) {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TerminalCommand {
-    MoveTo { x: u16, y: u16 },
+    MoveTo {
+        x: u16,
+        y: u16,
+    },
     ApplyStyle(RenderStyle),
     Print(String),
+    EraseCells {
+        x: u16,
+        y: u16,
+        width: u16,
+        style: RenderStyle,
+    },
     ResetStyle,
 }
 
@@ -158,6 +167,17 @@ fn optimize_terminal_commands(commands: &[TerminalCommand]) -> Vec<TerminalComma
                     cursor = Some((x.saturating_add(render_text_width_u16(text)), y));
                 }
             }
+            TerminalCommand::EraseCells {
+                x,
+                y,
+                width,
+                style: erase_style,
+            } if *width > 0 => {
+                optimized.push(command.clone());
+                cursor = Some((x.saturating_add(*width), *y));
+                style = Some(*erase_style);
+            }
+            TerminalCommand::EraseCells { .. } => {}
             TerminalCommand::ResetStyle => {
                 if !matches!(optimized.last(), Some(TerminalCommand::ResetStyle)) {
                     optimized.push(TerminalCommand::ResetStyle);
@@ -184,6 +204,15 @@ fn queue_terminal_commands<W: io::Write>(
             TerminalCommand::Print(text) => {
                 queue!(stdout, Print(text)).context("failed queueing terminal print")?;
             }
+            TerminalCommand::EraseCells { x, y, width, style } => {
+                queue_render_style(stdout, *style)?;
+                queue!(
+                    stdout,
+                    MoveTo(*x, *y),
+                    Print(" ".repeat(usize::from(*width)))
+                )
+                .context("failed queueing terminal erase cells")?;
+            }
             TerminalCommand::ResetStyle => {
                 queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))
                     .context("failed resetting terminal style")?;
@@ -200,16 +229,25 @@ fn queue_render_ops<W: io::Write>(
     ops: &[RenderOp],
 ) -> Result<bool> {
     let mut wrote = false;
+    let mut commands = Vec::new();
     let mut pending_text_run = None;
     for op in ops {
         if !render_op_intersects_damage(op, damage) {
-            wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
+            wrote |= flush_pending_text_run_to_commands(
+                &mut commands,
+                surface_rect,
+                &mut pending_text_run,
+            );
             continue;
         }
         match op {
             RenderOp::TextRun { x, y, text, style } => {
                 if !merge_pending_text_run(&mut pending_text_run, *x, *y, text, *style) {
-                    wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
+                    wrote |= flush_pending_text_run_to_commands(
+                        &mut commands,
+                        surface_rect,
+                        &mut pending_text_run,
+                    );
                     pending_text_run = Some(PendingTextRun {
                         x: *x,
                         y: *y,
@@ -219,17 +257,29 @@ fn queue_render_ops<W: io::Write>(
                 }
             }
             RenderOp::StyledText { x, y, spans } => {
-                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
-                wrote |= queue_render_styled_text(stdout, surface_rect, *x, *y, spans)?;
+                wrote |= flush_pending_text_run_to_commands(
+                    &mut commands,
+                    surface_rect,
+                    &mut pending_text_run,
+                );
+                wrote |= lower_render_styled_text(&mut commands, surface_rect, *x, *y, spans);
             }
             RenderOp::ClearRect { rect, style } => {
-                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
-                wrote |= queue_render_clear_rect(stdout, surface_rect, *rect, *style)?;
+                wrote |= flush_pending_text_run_to_commands(
+                    &mut commands,
+                    surface_rect,
+                    &mut pending_text_run,
+                );
+                wrote |= lower_render_fill_rect(&mut commands, surface_rect, *rect, ' ', *style);
             }
             RenderOp::EraseRowSegment { x, y, width, style } => {
-                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
-                wrote |= queue_render_clear_rect(
-                    stdout,
+                wrote |= flush_pending_text_run_to_commands(
+                    &mut commands,
+                    surface_rect,
+                    &mut pending_text_run,
+                );
+                wrote |= lower_render_fill_rect(
+                    &mut commands,
                     surface_rect,
                     ExtensionRect {
                         x: *x,
@@ -237,30 +287,44 @@ fn queue_render_ops<W: io::Write>(
                         w: *width,
                         h: 1,
                     },
+                    ' ',
                     *style,
-                )?;
+                );
             }
             RenderOp::FillRect { rect, ch, style } => {
-                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
-                wrote |= queue_render_fill_rect(stdout, surface_rect, *rect, *ch, *style)?;
+                wrote |= flush_pending_text_run_to_commands(
+                    &mut commands,
+                    surface_rect,
+                    &mut pending_text_run,
+                );
+                wrote |= lower_render_fill_rect(&mut commands, surface_rect, *rect, *ch, *style);
             }
             RenderOp::Border {
                 rect,
                 glyphs,
                 style,
             } => {
-                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
-                wrote |= queue_render_border(stdout, surface_rect, *rect, *glyphs, *style)?;
+                wrote |= flush_pending_text_run_to_commands(
+                    &mut commands,
+                    surface_rect,
+                    &mut pending_text_run,
+                );
+                wrote |= lower_render_border(&mut commands, surface_rect, *rect, *glyphs, *style);
             }
             RenderOp::CellGrid { x, y, rows } => {
-                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
-                wrote |= queue_render_cell_grid(stdout, surface_rect, *x, *y, rows)?;
+                wrote |= flush_pending_text_run_to_commands(
+                    &mut commands,
+                    surface_rect,
+                    &mut pending_text_run,
+                );
+                wrote |= lower_render_cell_grid(&mut commands, surface_rect, *x, *y, rows);
             }
         }
     }
-    wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
+    wrote |= flush_pending_text_run_to_commands(&mut commands, surface_rect, &mut pending_text_run);
     if wrote {
-        queue_terminal_commands(stdout, &[TerminalCommand::ResetStyle])?;
+        commands.push(TerminalCommand::ResetStyle);
+        queue_terminal_commands(stdout, &commands)?;
     }
     Ok(wrote)
 }
@@ -294,16 +358,16 @@ fn merge_pending_text_run(
     true
 }
 
-fn flush_pending_text_run<W: io::Write>(
-    stdout: &mut W,
+fn flush_pending_text_run_to_commands(
+    commands: &mut Vec<TerminalCommand>,
     surface_rect: ExtensionRect,
     pending: &mut Option<PendingTextRun>,
-) -> Result<bool> {
+) -> bool {
     let Some(pending) = pending.take() else {
-        return Ok(false);
+        return false;
     };
-    queue_render_text_run(
-        stdout,
+    lower_render_text_run(
+        commands,
         surface_rect,
         pending.x,
         pending.y,
@@ -402,21 +466,6 @@ fn lower_render_text_run(
     true
 }
 
-fn queue_render_text_run<W: io::Write>(
-    stdout: &mut W,
-    surface_rect: ExtensionRect,
-    x: u16,
-    y: u16,
-    text: &str,
-    style: RenderStyle,
-) -> Result<bool> {
-    let mut commands = Vec::new();
-    if !lower_render_text_run(&mut commands, surface_rect, x, y, text, style) {
-        return Ok(false);
-    }
-    queue_terminal_commands(stdout, &commands)
-}
-
 fn lower_render_styled_text(
     commands: &mut Vec<TerminalCommand>,
     surface_rect: ExtensionRect,
@@ -436,29 +485,6 @@ fn lower_render_styled_text(
     wrote
 }
 
-fn queue_render_styled_text<W: io::Write>(
-    stdout: &mut W,
-    surface_rect: ExtensionRect,
-    x: u16,
-    y: u16,
-    spans: &[bmux_plugin::RenderTextSpan],
-) -> Result<bool> {
-    let mut commands = Vec::new();
-    if !lower_render_styled_text(&mut commands, surface_rect, x, y, spans) {
-        return Ok(false);
-    }
-    queue_terminal_commands(stdout, &commands)
-}
-
-fn queue_render_clear_rect<W: io::Write>(
-    stdout: &mut W,
-    surface_rect: ExtensionRect,
-    rect: ExtensionRect,
-    style: RenderStyle,
-) -> Result<bool> {
-    queue_render_fill_rect(stdout, surface_rect, rect, ' ', style)
-}
-
 fn lower_render_fill_rect(
     commands: &mut Vec<TerminalCommand>,
     surface_rect: ExtensionRect,
@@ -472,6 +498,17 @@ fn lower_render_fill_rect(
     if rect.is_empty() {
         return false;
     }
+    if ch == ' ' {
+        for y in rect.y..rect.bottom() {
+            commands.push(TerminalCommand::EraseCells {
+                x: rect.x,
+                y,
+                width: rect.w,
+                style,
+            });
+        }
+        return true;
+    }
     commands.push(TerminalCommand::ApplyStyle(style));
     let row = ch.to_string().repeat(usize::from(rect.w));
     for y in rect.y..rect.bottom() {
@@ -479,20 +516,6 @@ fn lower_render_fill_rect(
         commands.push(TerminalCommand::Print(row.clone()));
     }
     true
-}
-
-fn queue_render_fill_rect<W: io::Write>(
-    stdout: &mut W,
-    surface_rect: ExtensionRect,
-    rect: ExtensionRect,
-    ch: char,
-    style: RenderStyle,
-) -> Result<bool> {
-    let mut commands = Vec::new();
-    if !lower_render_fill_rect(&mut commands, surface_rect, rect, ch, style) {
-        return Ok(false);
-    }
-    queue_terminal_commands(stdout, &commands)
 }
 
 fn lower_render_border(
@@ -560,20 +583,6 @@ fn lower_render_border(
     true
 }
 
-fn queue_render_border<W: io::Write>(
-    stdout: &mut W,
-    surface_rect: ExtensionRect,
-    rect: ExtensionRect,
-    glyphs: bmux_plugin::BorderGlyphs,
-    style: RenderStyle,
-) -> Result<bool> {
-    let mut commands = Vec::new();
-    if !lower_render_border(&mut commands, surface_rect, rect, glyphs, style) {
-        return Ok(false);
-    }
-    queue_terminal_commands(stdout, &commands)
-}
-
 fn lower_render_cell_grid(
     commands: &mut Vec<TerminalCommand>,
     surface_rect: ExtensionRect,
@@ -611,20 +620,6 @@ fn lower_render_cell_grid(
         }
     }
     wrote
-}
-
-fn queue_render_cell_grid<W: io::Write>(
-    stdout: &mut W,
-    surface_rect: ExtensionRect,
-    x: u16,
-    y: u16,
-    rows: &[Vec<bmux_plugin::RenderCell>],
-) -> Result<bool> {
-    let mut commands = Vec::new();
-    if !lower_render_cell_grid(&mut commands, surface_rect, x, y, rows) {
-        return Ok(false);
-    }
-    queue_terminal_commands(stdout, &commands)
 }
 
 fn render_op_intersects_damage(op: &RenderOp, damage: &RenderDamage) -> bool {
@@ -2778,6 +2773,12 @@ mod tests {
             TerminalCommand::Print("cd".to_string()),
             TerminalCommand::ResetStyle,
             TerminalCommand::ResetStyle,
+            TerminalCommand::EraseCells {
+                x: 0,
+                y: 1,
+                width: 0,
+                style,
+            },
         ];
 
         assert_eq!(
