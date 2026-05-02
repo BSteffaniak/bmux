@@ -28,6 +28,7 @@ serde_json                = { workspace = true, features = ["std"] }
 thiserror                 = { workspace = true }
 tracing                   = { workspace = true, features = ["std"] }
 uuid                      = { workspace = true, features = ["serde", "std", "v4"] }
+vt100                     = { workspace = true }
 
 [features]
 fail-on-warnings = [

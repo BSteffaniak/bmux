@@ -871,6 +871,77 @@ fn push_cut_resize_baseline_if_missing(
     }
 }
 
+fn push_cut_full_repaint_baseline_if_needed(
+    output: &mut Vec<DisplayTrackEnvelope>,
+    all_frames: &[DisplayTrackEnvelope],
+    first_kept_ns: u64,
+) {
+    if first_kept_ns == 0 {
+        return;
+    }
+    let Some((cols, rows)) = display_bounds_at_or_before(all_frames, first_kept_ns) else {
+        return;
+    };
+    let mut parser = vt100::Parser::new(rows, cols, 20_000);
+    let mut saw_frame_bytes = false;
+    for frame in all_frames
+        .iter()
+        .filter(|frame| frame.mono_ns < first_kept_ns)
+    {
+        match &frame.event {
+            DisplayTrackEvent::Resize { cols, rows } if *cols > 0 && *rows > 0 => {
+                parser.screen_mut().set_size(*rows, *cols);
+            }
+            DisplayTrackEvent::FrameBytes { data } => {
+                parser.process(data);
+                saw_frame_bytes = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_frame_bytes {
+        return;
+    }
+    let data = parser.screen().contents_formatted();
+    if data.is_empty() {
+        return;
+    }
+    output.push(DisplayTrackEnvelope {
+        mono_ns: 0,
+        event: DisplayTrackEvent::FrameBytes { data },
+    });
+}
+
+fn display_bounds_at_or_before(
+    all_frames: &[DisplayTrackEnvelope],
+    first_kept_ns: u64,
+) -> Option<(u16, u16)> {
+    let mut bounds = None;
+    for frame in all_frames
+        .iter()
+        .filter(|frame| frame.mono_ns <= first_kept_ns)
+    {
+        match frame.event {
+            DisplayTrackEvent::Resize { cols, rows } if cols > 0 && rows > 0 => {
+                bounds = Some((cols, rows));
+            }
+            DisplayTrackEvent::StreamOpened {
+                cell_width_px: Some(cell_width),
+                cell_height_px: Some(cell_height),
+                window_width_px: Some(window_width),
+                window_height_px: Some(window_height),
+                ..
+            } if cell_width > 0 && cell_height > 0 && window_width > 0 && window_height > 0 => {
+                let cols = (window_width / cell_width).max(1);
+                let rows = (window_height / cell_height).max(1);
+                bounds.get_or_insert((cols, rows));
+            }
+            _ => {}
+        }
+    }
+    bounds
+}
+
 fn push_cut_cursor_snapshot_baseline_if_needed(
     output: &mut Vec<DisplayTrackEnvelope>,
     all_frames: &[DisplayTrackEnvelope],
@@ -938,6 +1009,7 @@ fn cut_display_track_frames(
     let mut output = Vec::new();
     push_cut_stream_opened_baseline(&mut output, all_frames, kept.first());
     push_cut_resize_baseline_if_missing(&mut output, all_frames, first_kept_ns, kept_has_resize);
+    push_cut_full_repaint_baseline_if_needed(&mut output, all_frames, first_kept_ns);
     push_cut_cursor_snapshot_baseline_if_needed(&mut output, all_frames, &kept);
 
     for frame in &mut kept {
@@ -1517,12 +1589,48 @@ mod tests {
         // Baselines are injected at mono_ns = 0.
         // Kept frames should be rebased: first_kept_ns = 30_000_000_000.
         let kept_timestamps: Vec<u64> = result.iter().map(|f| f.mono_ns).collect();
-        // StreamOpened baseline, Resize baseline, CursorSnapshot baseline, then
-        // two rebased FrameBytes at 0 and 10_000_000_000.
+        // StreamOpened baseline, Resize baseline, full repaint baseline,
+        // CursorSnapshot baseline, then two rebased FrameBytes at 0 and
+        // 10_000_000_000.
         assert_eq!(
             kept_timestamps,
-            vec![0, 0, 0, 0, 10_000_000_000],
+            vec![0, 0, 0, 0, 0, 10_000_000_000],
             "kept frames should be rebased relative to first_kept_ns"
+        );
+    }
+
+    #[test]
+    fn cut_injects_full_repaint_baseline_from_precut_frames() {
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            DisplayTrackEnvelope {
+                mono_ns: 2_000,
+                event: DisplayTrackEvent::FrameBytes {
+                    data: b"hello before cut".to_vec(),
+                },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: 30_000_000_000,
+                event: DisplayTrackEvent::FrameBytes {
+                    data: b" after".to_vec(),
+                },
+            },
+        ];
+
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let repaint = result
+            .iter()
+            .find_map(|frame| match &frame.event {
+                DisplayTrackEvent::FrameBytes { data } if frame.mono_ns == 0 => Some(data),
+                _ => None,
+            })
+            .expect("cut should inject a repaint frame at t=0");
+        let mut parser = vt100::Parser::new(24, 80, 20_000);
+        parser.process(repaint);
+        assert!(
+            parser.screen().contents().contains("hello before cut"),
+            "repaint baseline should carry visible pre-cut content"
         );
     }
 

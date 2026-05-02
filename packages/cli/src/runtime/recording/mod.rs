@@ -761,11 +761,24 @@ pub(super) async fn maybe_auto_export_recording(
     .await
     {
         Ok(_) => {
+            tracing::info!(
+                %recording_id,
+                output_path = %output_path.display(),
+                fps,
+                "recording auto-export completed"
+            );
             publish_recording_export_completed(recording_id, output);
             RecordingAutoExportOutcome::Exported { output_path }
         }
         Err(error) => {
             let error = error.to_string();
+            tracing::warn!(
+                %recording_id,
+                output_path = %output_path.display(),
+                fps,
+                error = %error,
+                "recording auto-export failed"
+            );
             publish_recording_export_failed(recording_id, output, error.clone());
             RecordingAutoExportOutcome::Failed { output_path, error }
         }
@@ -3378,7 +3391,8 @@ fn export_recording_gif(
     let mut current_rows = max_rows;
     let mut emitted_frames = 0_u32;
     let mut processed_frame_events = 0_u32;
-    let mut previous_emit_ns = None::<u64>;
+    let mut previous_emit_frame_idx = None::<u32>;
+    let mut gif_delay_clock = GifDelayClock::new(fps);
     let mut cursor_state = CursorReplayState::default();
     let mut snapshot_cursor_state = None::<RecordedCursorSnapshot>;
     let mut cursor_frames = export_metadata.map(|_| Vec::<ExportCursorFrame>::new());
@@ -3553,10 +3567,9 @@ fn export_recording_gif(
             continue;
         }
 
-        let delay_cs = previous_emit_ns.map_or(1_u16, |previous| {
-            let delta_ns = frame_time_ns.saturating_sub(previous);
-            ((delta_ns / 10_000_000).max(1).min(u64::from(u16::MAX))) as u16
-        });
+        let frame_span =
+            previous_emit_frame_idx.map_or(1, |previous| frame_idx.saturating_sub(previous).max(1));
+        let delay_cs = gif_delay_clock.delay_for_frame_span(frame_span);
         let render_started_at = profiler.stage_started();
         let mut pixels = if render_options.mode == RecordingRenderMode::Font {
             if let Some(renderer) = resvg_renderer.as_mut() {
@@ -3713,14 +3726,15 @@ fn export_recording_gif(
         }
         profiler.record_render(render_started_at);
         let encode_started_at = profiler.stage_started();
-        let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
+        let mut frame =
+            GifFrame::from_rgba_speed(width, height, &mut pixels, GIF_QUANTIZATION_SAMPLE_FACTOR);
         frame.delay = delay_cs;
         encoder
             .write_frame(&frame)
             .context("failed writing gif frame")?;
         profiler.record_encode(encode_started_at);
         previous_visual_state = Some(visual_state);
-        previous_emit_ns = Some(frame_time_ns);
+        previous_emit_frame_idx = Some(frame_idx);
         emitted_frames = emitted_frames.saturating_add(1);
         profiler.record_frame_emitted();
         progress.update(processed_frame_events, emitted_frames, false);
@@ -3817,6 +3831,35 @@ struct FrameVisualState {
     cursor_visible: bool,
     shape: CursorVisualShape,
     blink_on: bool,
+}
+
+#[derive(Debug)]
+struct GifDelayClock {
+    fps: u32,
+    remainder: u64,
+}
+
+impl GifDelayClock {
+    fn new(fps: u32) -> Self {
+        Self {
+            fps: fps.max(1),
+            remainder: 0,
+        }
+    }
+
+    fn delay_for_frame_span(&mut self, frame_span: u32) -> u16 {
+        let total = u64::from(frame_span.max(1))
+            .saturating_mul(100)
+            .saturating_add(self.remainder);
+        let fps = u64::from(self.fps.max(1));
+        let mut delay = total / fps;
+        self.remainder = total % fps;
+        if delay == 0 {
+            delay = 1;
+            self.remainder = 0;
+        }
+        u16::try_from(delay.min(u64::from(u16::MAX))).unwrap_or(u16::MAX)
+    }
 }
 
 #[derive(Debug)]
@@ -5955,6 +5998,7 @@ fn blit_rgba(
 const DISPLAY_CAPTURE_QUEUE_CAPACITY: usize = 4096;
 const DISPLAY_CAPTURE_SEGMENT_MAX_AGE: Duration = Duration::from_secs(2);
 const DISPLAY_CAPTURE_PRUNE_GRACE: Duration = Duration::from_secs(5);
+const GIF_QUANTIZATION_SAMPLE_FACTOR: i32 = 10;
 
 pub(super) struct DisplayCaptureWriter {
     sender: mpsc::SyncSender<DisplayCaptureCommand>,
@@ -5971,7 +6015,6 @@ enum DisplayCaptureCommand {
 
 struct DisplayCaptureFileWriter {
     recording_path: PathBuf,
-    recording_id: Uuid,
     client_id: Uuid,
     rolling_window: Option<Duration>,
     started_at: Instant,
@@ -5979,6 +6022,9 @@ struct DisplayCaptureFileWriter {
     segment_index: u64,
     segment_start_ns: u64,
     closed_segments: VecDeque<(PathBuf, u64)>,
+    stream_opened_baseline: DisplayTrackEvent,
+    latest_resize: Option<(u16, u16)>,
+    replay_parser: vt100::Parser,
     cursor_replay_state: CursorReplayState,
     #[cfg(any(
         feature = "image-sixel",
@@ -6134,9 +6180,12 @@ impl DisplayCaptureFileWriter {
         let display_track_path =
             display_track_output_path(recording_path, client_id, 0, rolling_window);
         let file = open_display_track_file(&display_track_path)?;
+        let stream_opened_baseline = capture_stream_opened_event(recording_id, client_id);
+        let latest_resize = current_terminal_size();
+        let (initial_cols, initial_rows) = latest_resize.unwrap_or((80, 24));
+        let replay_parser = vt100::Parser::new(initial_rows, initial_cols, 20_000);
         Ok(Self {
             recording_path: recording_path.to_path_buf(),
-            recording_id,
             client_id,
             rolling_window,
             started_at: Instant::now(),
@@ -6144,6 +6193,9 @@ impl DisplayCaptureFileWriter {
             segment_index: 0,
             segment_start_ns: 0,
             closed_segments: VecDeque::new(),
+            stream_opened_baseline,
+            latest_resize,
+            replay_parser,
             cursor_replay_state: CursorReplayState::default(),
             #[cfg(any(
                 feature = "image-sixel",
@@ -6155,26 +6207,17 @@ impl DisplayCaptureFileWriter {
     }
 
     fn record_stream_opened(&mut self) -> Result<()> {
-        let (cell_width_px, cell_height_px, window_width_px, window_height_px) =
-            capture_stream_open_metrics();
-        let terminal_profile = terminal_profile::detect_render_profile();
-        let terminal_profile_bytes = terminal_profile
-            .as_ref()
-            .and_then(|p| bmux_ipc::encode(p).ok());
-        self.record(DisplayTrackEvent::StreamOpened {
-            client_id: self.client_id,
-            recording_id: self.recording_id,
-            cell_width_px,
-            cell_height_px,
-            window_width_px,
-            window_height_px,
-            terminal_profile: terminal_profile_bytes,
-        })?;
-        if let Ok((cols, rows)) = terminal::size()
-            && cols > 0
-            && rows > 0
-        {
+        self.record_segment_baseline()
+    }
+
+    fn record_segment_baseline(&mut self) -> Result<()> {
+        self.record(self.stream_opened_baseline.clone())?;
+        if let Some((cols, rows)) = self.latest_resize {
             self.record(DisplayTrackEvent::Resize { cols, rows })?;
+        }
+        let repaint = full_screen_repaint_bytes(self.replay_parser.screen());
+        if !repaint.is_empty() {
+            self.record(DisplayTrackEvent::FrameBytes { data: repaint })?;
         }
         Ok(())
     }
@@ -6195,8 +6238,16 @@ impl DisplayCaptureFileWriter {
     }
 
     fn record(&mut self, event: DisplayTrackEvent) -> Result<()> {
+        if let DisplayTrackEvent::Resize { cols, rows } = &event
+            && *cols > 0
+            && *rows > 0
+        {
+            self.latest_resize = Some((*cols, *rows));
+            self.replay_parser.screen_mut().set_size(*rows, *cols);
+        }
         if let DisplayTrackEvent::FrameBytes { data } = &event {
             update_cursor_replay_state(&mut self.cursor_replay_state, data);
+            self.replay_parser.process(data);
         }
         #[cfg(any(
             feature = "image-sixel",
@@ -6251,6 +6302,7 @@ impl DisplayCaptureFileWriter {
         let new_path =
             display_track_segment_path(&self.recording_path, self.client_id, self.segment_index);
         self.writer = BufWriter::new(open_display_track_file(&new_path)?);
+        self.record_segment_baseline()?;
         self.prune_closed_segments(end_ns)
     }
 
@@ -6311,6 +6363,35 @@ fn display_capture_writer_loop(
             }
         }
     }
+}
+
+fn full_screen_repaint_bytes(screen: &vt100::Screen) -> Vec<u8> {
+    screen.contents_formatted()
+}
+
+fn capture_stream_opened_event(recording_id: Uuid, client_id: Uuid) -> DisplayTrackEvent {
+    let (cell_width_px, cell_height_px, window_width_px, window_height_px) =
+        capture_stream_open_metrics();
+    let terminal_profile = terminal_profile::detect_render_profile();
+    let terminal_profile_bytes = terminal_profile
+        .as_ref()
+        .and_then(|p| bmux_ipc::encode(p).ok());
+    DisplayTrackEvent::StreamOpened {
+        client_id,
+        recording_id,
+        cell_width_px,
+        cell_height_px,
+        window_width_px,
+        window_height_px,
+        terminal_profile: terminal_profile_bytes,
+    }
+}
+
+fn current_terminal_size() -> Option<(u16, u16)> {
+    let Ok((cols, rows)) = terminal::size() else {
+        return None;
+    };
+    (cols > 0 && rows > 0).then_some((cols, rows))
 }
 
 fn open_display_track_file(path: &Path) -> Result<std::fs::File> {
@@ -6422,6 +6503,83 @@ mod tests {
             }
             _ => panic!("expected stream_opened event"),
         }
+    }
+
+    #[test]
+    fn full_screen_repaint_bytes_reconstructs_visible_text() {
+        let mut parser = vt100::Parser::new(24, 80, 20_000);
+        parser.process(b"hello\r\nworld");
+
+        let repaint = full_screen_repaint_bytes(parser.screen());
+        let mut replay = vt100::Parser::new(24, 80, 20_000);
+        replay.process(&repaint);
+
+        let contents = replay.screen().contents();
+        assert!(contents.contains("hello"));
+        assert!(contents.contains("world"));
+    }
+
+    #[test]
+    fn display_capture_rotation_writes_full_repaint_baseline() {
+        let root = temp_dir();
+        let recording_id = Uuid::new_v4();
+        let client_id = Uuid::new_v4();
+        let mut writer = DisplayCaptureFileWriter::open(
+            recording_id,
+            &root,
+            client_id,
+            Some(Duration::from_secs(300)),
+        )
+        .expect("writer should open");
+
+        writer
+            .record(DisplayTrackEvent::Resize { cols: 80, rows: 24 })
+            .expect("resize should record");
+        writer
+            .record(DisplayTrackEvent::FrameBytes {
+                data: b"hello before rotation".to_vec(),
+            })
+            .expect("frame should record");
+        writer
+            .rotate(2_000_000_000)
+            .expect("rotation should write baseline");
+        writer.flush().expect("writer should flush");
+
+        let segment = display_track_segment_path(&root, client_id, 1);
+        let bytes = std::fs::read(segment).expect("second segment should read");
+        let frames = read_frames::<DisplayTrackEnvelope>(&bytes)
+            .expect("segment should decode")
+            .frames;
+        let repaint = frames
+            .iter()
+            .find_map(|frame| match &frame.event {
+                DisplayTrackEvent::FrameBytes { data } => Some(data),
+                _ => None,
+            })
+            .expect("rotated segment should contain repaint frame");
+        let mut replay = vt100::Parser::new(24, 80, 20_000);
+        replay.process(repaint);
+        assert!(
+            replay.screen().contents().contains("hello before rotation"),
+            "rotated segment baseline should carry prior visible content"
+        );
+    }
+
+    #[test]
+    fn gif_delay_clock_preserves_sixty_fps_duration() {
+        let mut clock = GifDelayClock::new(60);
+        let delays: Vec<u16> = (0..60).map(|_| clock.delay_for_frame_span(1)).collect();
+        let total: u16 = delays.iter().sum();
+        assert_eq!(total, 100);
+        assert!(delays.contains(&1));
+        assert!(delays.contains(&2));
+    }
+
+    #[test]
+    fn gif_delay_clock_preserves_skipped_frame_duration() {
+        let mut clock = GifDelayClock::new(60);
+        assert_eq!(clock.delay_for_frame_span(1), 1);
+        assert_eq!(clock.delay_for_frame_span(3), 5);
     }
 
     #[test]
