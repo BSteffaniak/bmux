@@ -1,11 +1,13 @@
 use super::input::{TerminalGeometry, TerminalMouseEvent};
+use super::prompt_ui::PromptKeyDisposition;
 use super::runtime::{
-    attach_key_event_actions, attach_tab_drop_marker_col, handle_attach_ui_action_at,
+    attach_key_event_actions, attach_tab_drop_marker_col, build_attach_help_lines,
+    handle_attach_ui_action_at, handle_help_overlay_key_event,
     reduce_attach_mouse_floating_drag_event, reduce_attach_mouse_resize_event,
     reduce_attach_status_tab_mouse_event, status_row_for_position,
 };
 use super::state::{AttachTabDropPlacement, AttachUiEffect, AttachViewState, PaneRenderBuffer};
-use crate::input::InputProcessor;
+use crate::input::{InputProcessor, RuntimeAction};
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use anyhow::{Result, bail};
 use bmux_appearance::RuntimeAppearance;
@@ -14,7 +16,7 @@ use bmux_attach_layout_protocol::{
     PaneLayoutNode, PaneState, PaneSummary,
 };
 use bmux_client::{AttachLayoutState, AttachOpenInfo};
-use bmux_config::{StatusBarConfig, StatusPosition, StatusTabOrder};
+use bmux_config::{BmuxConfig, StatusBarConfig, StatusPosition, StatusTabOrder};
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
@@ -120,6 +122,18 @@ impl AttachSimHarness {
                 context_id: Some(window.id),
             })
             .collect::<Vec<_>>();
+        let mode_label = if self.view_state.help_overlay_open {
+            "HELP"
+        } else if self.view_state.prompt.is_active() {
+            "PROMPT"
+        } else {
+            "NORMAL"
+        };
+        let hint = if self.view_state.help_overlay_open {
+            "Help overlay open | ? toggles | Esc/Enter close"
+        } else {
+            self.view_state.prompt.active_hint().unwrap_or("")
+        };
         let mut status_line = build_attach_status_line(
             self.geometry.cols,
             &self.status_config,
@@ -129,10 +143,10 @@ impl AttachSimHarness {
             "sim",
             &tabs,
             None,
-            "NORMAL",
+            mode_label,
             "write",
             None,
-            "",
+            hint,
         );
         status_line.drag_marker_col = self
             .view_state
@@ -442,45 +456,82 @@ impl AttachSimHarness {
             let CrosstermEvent::Key(key) = event else {
                 continue;
             };
+            if self.view_state.prompt.is_active() {
+                match self.view_state.prompt.handle_key_event(&key) {
+                    PromptKeyDisposition::Completed(_) => {
+                        emitted.push("prompt:completed".to_string());
+                    }
+                    PromptKeyDisposition::Consumed => emitted.push("prompt:consumed".to_string()),
+                    PromptKeyDisposition::NotActive => {}
+                }
+                continue;
+            }
+            if self.view_state.help_overlay_open {
+                let help_lines = build_attach_help_lines(&BmuxConfig::default());
+                if handle_help_overlay_key_event(&key, &help_lines, &mut self.view_state) {
+                    emitted.push("help:handled".to_string());
+                    continue;
+                }
+            }
             for action in
                 attach_key_event_actions(&key, &mut self.input_processor, self.view_state.ui_mode)?
             {
-                match action {
-                    super::state::AttachEventAction::Ui(ui_action) => {
-                        emitted.push(format!("ui:{ui_action:?}"));
-                        handle_attach_ui_action_at(&ui_action, &mut self.view_state, self.now);
-                    }
-                    super::state::AttachEventAction::Send(bytes) => {
-                        emitted.push("send".to_string());
-                        self.forwarded_bytes.push(bytes);
-                    }
-                    super::state::AttachEventAction::Ignore => {
-                        emitted.push("ignore".to_string());
-                    }
-                    super::state::AttachEventAction::Detach => {
-                        bail!("attach-sim send-attach emitted detach");
-                    }
-                    super::state::AttachEventAction::PluginCommand {
-                        plugin_id,
-                        command_name,
-                        ..
-                    } => {
-                        bail!(
-                            "attach-sim send-attach emitted unsupported plugin command {plugin_id}:{command_name}"
-                        );
-                    }
-                    super::state::AttachEventAction::Mouse(_)
-                    | super::state::AttachEventAction::Redraw => {}
-                }
+                self.apply_attach_event_action(action, &mut emitted)?;
             }
         }
         let trailing = self.input_processor.process_stream_bytes(&[]);
         for ui_action in trailing {
             emitted.push(format!("ui:{ui_action:?}"));
-            handle_attach_ui_action_at(&ui_action, &mut self.view_state, self.now);
+            self.apply_ui_action(&ui_action);
         }
         self.render();
         Ok(emitted)
+    }
+
+    fn apply_attach_event_action(
+        &mut self,
+        action: super::state::AttachEventAction,
+        emitted: &mut Vec<String>,
+    ) -> Result<()> {
+        match action {
+            super::state::AttachEventAction::Ui(ui_action) => {
+                emitted.push(format!("ui:{ui_action:?}"));
+                self.apply_ui_action(&ui_action);
+            }
+            super::state::AttachEventAction::Send(bytes) => {
+                emitted.push("send".to_string());
+                self.forwarded_bytes.push(bytes);
+            }
+            super::state::AttachEventAction::Ignore => {
+                emitted.push("ignore".to_string());
+            }
+            super::state::AttachEventAction::Detach => {
+                bail!("attach-sim send-attach emitted detach");
+            }
+            super::state::AttachEventAction::PluginCommand {
+                plugin_id,
+                command_name,
+                ..
+            } => {
+                bail!(
+                    "attach-sim send-attach emitted unsupported plugin command {plugin_id}:{command_name}"
+                );
+            }
+            super::state::AttachEventAction::Mouse(_) | super::state::AttachEventAction::Redraw => {
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_ui_action(&mut self, ui_action: &RuntimeAction) {
+        if matches!(ui_action, RuntimeAction::ShowHelp) {
+            self.view_state.help_overlay_open = !self.view_state.help_overlay_open;
+            if !self.view_state.help_overlay_open {
+                self.view_state.help_overlay_scroll = 0;
+            }
+        } else {
+            handle_attach_ui_action_at(ui_action, &mut self.view_state, self.now);
+        }
     }
 
     pub fn rendered(&self) -> &str {
@@ -514,6 +565,14 @@ impl AttachSimHarness {
 
     pub const fn selection_active(&self) -> bool {
         self.view_state.selection_active()
+    }
+
+    pub const fn help_overlay_open(&self) -> bool {
+        self.view_state.help_overlay_open
+    }
+
+    pub const fn prompt_active(&self) -> bool {
+        self.view_state.prompt.is_active()
     }
 
     pub fn selected_text(&mut self) -> Option<String> {

@@ -2073,6 +2073,8 @@ fn execute_attach_sim_step(
                 "windows.names" => serde_json::to_string(&sim.window_names())?,
                 "windows.active_name" => serde_json::to_string(&sim.active_window_name())?,
                 "scrollback.active" => serde_json::to_string(&sim.scrollback_active())?,
+                "help_overlay.open" => serde_json::to_string(&sim.help_overlay_open())?,
+                "prompt.active" => serde_json::to_string(&sim.prompt_active())?,
                 "selection.active" => serde_json::to_string(&sim.selection_active())?,
                 "selection.text" => serde_json::to_string(&sim.selected_text())?,
                 "scrollback.cursor" => serde_json::to_string(&sim.scrollback_cursor())?,
