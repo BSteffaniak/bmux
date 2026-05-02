@@ -539,6 +539,7 @@ fn parse_and_validate_fixtures() {
         "assert_matches_fail.dsl",
         "render_assert_idle.dsl",
         "render_assert_single_line_output.dsl",
+        "render_assert_exact_trace_single_line.dsl",
         "render_assert_status_only.dsl",
         "render_assert_focus_change.dsl",
         "render_assert_split_pane.dsl",
@@ -571,6 +572,11 @@ fn playbook_render_assert_idle() {
 #[test]
 fn playbook_render_assert_single_line_output() {
     assert_render_fixture_passes("render_assert_single_line_output.dsl");
+}
+
+#[test]
+fn playbook_render_assert_exact_trace_single_line() {
+    assert_render_fixture_passes("render_assert_exact_trace_single_line.dsl");
 }
 
 #[test]
