@@ -49,7 +49,7 @@ pub(super) async fn run_command(
 ) -> Result<u8> {
     match command {
         Command::External(args) => run_external_plugin_command(args).await,
-        _ => dispatch_built_in_command(command, connection_context).await,
+        _ => Box::pin(dispatch_built_in_command(command, connection_context)).await,
     }
 }
 

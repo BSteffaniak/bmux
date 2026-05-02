@@ -380,8 +380,11 @@ fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
             handle.block_on(async {
-                dispatch_built_in_command(&command, ConnectionContext::new(cli.target.as_deref()))
-                    .await
+                Box::pin(dispatch_built_in_command(
+                    &command,
+                    ConnectionContext::new(cli.target.as_deref()),
+                ))
+                .await
             })
         })
         .map(i32::from)
@@ -392,8 +395,11 @@ fn run_core_built_in_command(request: &bmux_plugin_sdk::CoreCliCommandRequest) -
             .context("failed creating runtime for core built-in command")?;
         runtime
             .block_on(async {
-                dispatch_built_in_command(&command, ConnectionContext::new(cli.target.as_deref()))
-                    .await
+                Box::pin(dispatch_built_in_command(
+                    &command,
+                    ConnectionContext::new(cli.target.as_deref()),
+                ))
+                .await
             })
             .map(i32::from)
     }

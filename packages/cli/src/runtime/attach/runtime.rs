@@ -8087,20 +8087,43 @@ async fn try_detach_or_continue(
     }
 }
 
-#[allow(clippy::too_many_lines)]
-pub fn record_attach_mouse_event(mouse_event: MouseEvent, view_state: &mut AttachViewState) {
+pub const fn record_attach_mouse_event(
+    mouse_event: MouseEvent,
+    view_state: &mut AttachViewState,
+    now: Instant,
+) {
     view_state.mouse.last_position = Some((mouse_event.column, mouse_event.row));
-    view_state.mouse.last_event_at = Some(Instant::now());
+    view_state.mouse.last_event_at = Some(now);
 }
 
-#[allow(clippy::too_many_lines)]
 pub async fn handle_attach_mouse_event(
     client: &mut StreamingBmuxClient,
     mouse_event: MouseEvent,
     view_state: &mut AttachViewState,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> std::result::Result<(), ClientError> {
-    record_attach_mouse_event(mouse_event, view_state);
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    handle_attach_mouse_event_at(
+        client,
+        mouse_event,
+        view_state,
+        kernel_client_factory,
+        Instant::now(),
+        TerminalGeometry { cols, rows },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_attach_mouse_event_at(
+    client: &mut StreamingBmuxClient,
+    mouse_event: MouseEvent,
+    view_state: &mut AttachViewState,
+    kernel_client_factory: Option<&KernelClientFactory>,
+    now: Instant,
+    geometry: TerminalGeometry,
+) -> std::result::Result<(), ClientError> {
+    record_attach_mouse_event(mouse_event, view_state, now);
 
     if !view_state.mouse.config.enabled {
         view_state.mouse.resize_drag = None;
@@ -8115,8 +8138,15 @@ pub async fn handle_attach_mouse_event(
         return Ok(());
     }
 
-    if handle_attach_status_tab_mouse_event(client, view_state, mouse_event, kernel_client_factory)
-        .await?
+    if handle_attach_status_tab_mouse_event_at(
+        client,
+        view_state,
+        mouse_event,
+        kernel_client_factory,
+        now,
+        geometry,
+    )
+    .await?
     {
         return Ok(());
     }
@@ -8128,7 +8158,7 @@ pub async fn handle_attach_mouse_event(
         return Ok(());
     }
 
-    if handle_attach_mouse_resize_drag(client, view_state, mouse_event).await? {
+    if handle_attach_mouse_resize_drag(client, view_state, mouse_event, now).await? {
         return Ok(());
     }
 
@@ -8226,7 +8256,7 @@ pub async fn handle_attach_mouse_event(
         MouseEventKind::Down(MouseButton::Left) => {
             let target = target_pane;
             view_state.mouse.hovered_pane_id = target;
-            view_state.mouse.hover_started_at = Some(Instant::now());
+            view_state.mouse.hover_started_at = Some(now);
             if !handle_attach_mouse_gesture_action(
                 client,
                 view_state,
@@ -8295,7 +8325,6 @@ pub async fn handle_attach_mouse_event(
             .await?;
 
             if view_state.mouse.config.focus_on_hover {
-                let now = Instant::now();
                 let target = target_pane;
                 if target != view_state.mouse.hovered_pane_id {
                     view_state.mouse.hovered_pane_id = target;
@@ -8418,6 +8447,7 @@ async fn handle_attach_mouse_resize_drag(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
+    now: Instant,
 ) -> std::result::Result<bool, ClientError> {
     if !view_state.mouse.config.resize_borders {
         view_state.mouse.resize_drag = None;
@@ -8426,15 +8456,16 @@ async fn handle_attach_mouse_resize_drag(
 
     match mouse_event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            let Some(mut drag) =
-                attach_scene_resize_separator_at(view_state, mouse_event.column, mouse_event.row)
-            else {
+            let Some(mut drag) = attach_scene_resize_separator_at(
+                view_state,
+                mouse_event.column,
+                mouse_event.row,
+                now,
+            ) else {
                 return Ok(false);
             };
             let throttle = Duration::from_millis(view_state.mouse.config.resize_drag_throttle_ms);
-            drag.last_applied_at = Instant::now()
-                .checked_sub(throttle)
-                .unwrap_or_else(Instant::now);
+            drag.last_applied_at = now.checked_sub(throttle).unwrap_or(now);
             view_state.mouse.resize_drag = Some(drag);
             Ok(true)
         }
@@ -8448,7 +8479,6 @@ async fn handle_attach_mouse_resize_drag(
                 view_state.mouse.resize_drag = Some(drag);
                 return Ok(true);
             }
-            let now = Instant::now();
             let throttle = Duration::from_millis(view_state.mouse.config.resize_drag_throttle_ms);
             if !throttle.is_zero() && now.duration_since(drag.last_applied_at) < throttle {
                 view_state.mouse.resize_drag = Some(drag);
@@ -8841,17 +8871,18 @@ const fn mouse_event_to_shared(mouse_event: MouseEvent) -> attach_mouse::Event {
     }
 }
 
-pub async fn handle_attach_status_tab_mouse_event(
+async fn handle_attach_status_tab_mouse_event_at(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
     kernel_client_factory: Option<&KernelClientFactory>,
+    now: Instant,
+    geometry: TerminalGeometry,
 ) -> std::result::Result<bool, ClientError> {
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
     let reduction = reduce_attach_status_tab_mouse_event(
         view_state,
         TerminalMouseEvent::from(mouse_event),
-        TerminalGeometry { cols, rows },
+        geometry,
     );
     if !reduction.consumed {
         return Ok(false);
@@ -8861,7 +8892,7 @@ pub async fn handle_attach_status_tab_mouse_event(
         view_state,
         reduction.effects,
         kernel_client_factory,
-        Instant::now(),
+        now,
     )
     .await?;
     Ok(true)
@@ -9763,6 +9794,7 @@ pub fn attach_scene_resize_separator_at(
     view_state: &AttachViewState,
     column: u16,
     row: u16,
+    last_applied_at: Instant,
 ) -> Option<AttachMouseResizeDrag> {
     let layout_state = view_state.cached_layout_state.as_ref()?;
     let pane_surfaces = layout_state
@@ -9825,7 +9857,7 @@ pub fn attach_scene_resize_separator_at(
         last_row: row,
         latest_column: column,
         latest_row: row,
-        last_applied_at: Instant::now(),
+        last_applied_at,
     })
 }
 
@@ -11574,10 +11606,11 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        record_attach_mouse_event(event, &mut view_state);
+        let now = Instant::now();
+        record_attach_mouse_event(event, &mut view_state, now);
 
         assert_eq!(view_state.mouse.last_position, Some((3, 4)));
-        assert!(view_state.mouse.last_event_at.is_some());
+        assert_eq!(view_state.mouse.last_event_at, Some(now));
     }
 
     #[test]
@@ -12783,7 +12816,8 @@ mod tests {
             zoomed: false,
         });
 
-        let drag = attach_scene_resize_separator_at(&view_state, 9, 3)
+        let now = Instant::now();
+        let drag = attach_scene_resize_separator_at(&view_state, 9, 3, now)
             .expect("separator should be detected");
         assert!(drag.vertical.is_none());
         let horizontal = drag.horizontal.expect("horizontal drag axis");
@@ -12797,7 +12831,7 @@ mod tests {
             horizontal.negative_direction,
             bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Left
         );
-        assert!(attach_scene_resize_separator_at(&view_state, 4, 3).is_none());
+        assert!(attach_scene_resize_separator_at(&view_state, 4, 3, now).is_none());
     }
 
     #[test]
@@ -12843,7 +12877,8 @@ mod tests {
             zoomed: false,
         });
 
-        let drag = attach_scene_resize_separator_at(&view_state, 12, 5)
+        let now = Instant::now();
+        let drag = attach_scene_resize_separator_at(&view_state, 12, 5, now)
             .expect("separator should be detected");
         assert!(drag.horizontal.is_none());
         let vertical = drag.vertical.expect("vertical drag axis");
@@ -12857,7 +12892,7 @@ mod tests {
             vertical.negative_direction,
             bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Up
         );
-        assert!(attach_scene_resize_separator_at(&view_state, 12, 2).is_none());
+        assert!(attach_scene_resize_separator_at(&view_state, 12, 2, now).is_none());
     }
 
     #[test]
@@ -12923,7 +12958,7 @@ mod tests {
             zoomed: false,
         });
 
-        let drag = attach_scene_resize_separator_at(&view_state, 9, 4)
+        let drag = attach_scene_resize_separator_at(&view_state, 9, 4, Instant::now())
             .expect("corner separator should be detected");
         let horizontal = drag.horizontal.expect("horizontal drag axis");
         let vertical = drag.vertical.expect("vertical drag axis");
