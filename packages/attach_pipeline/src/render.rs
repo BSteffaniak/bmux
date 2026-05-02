@@ -123,6 +123,76 @@ fn render_damage_trace_shape(damage: &RenderDamage) -> (u16, bool) {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TerminalCommand {
+    MoveTo { x: u16, y: u16 },
+    ApplyStyle(RenderStyle),
+    Print(String),
+    ResetStyle,
+}
+
+fn optimize_terminal_commands(commands: &[TerminalCommand]) -> Vec<TerminalCommand> {
+    let mut optimized = Vec::with_capacity(commands.len());
+    let mut cursor = None;
+    let mut style = None;
+    for command in commands {
+        match command {
+            TerminalCommand::ApplyStyle(next_style) if style == Some(*next_style) => {}
+            TerminalCommand::ApplyStyle(next_style) => {
+                optimized.push(command.clone());
+                style = Some(*next_style);
+            }
+            TerminalCommand::MoveTo { x, y } if cursor == Some((*x, *y)) => {}
+            TerminalCommand::MoveTo { x, y } => {
+                optimized.push(command.clone());
+                cursor = Some((*x, *y));
+            }
+            TerminalCommand::Print(text) if text.is_empty() => {}
+            TerminalCommand::Print(text) => {
+                if let Some(TerminalCommand::Print(previous)) = optimized.last_mut() {
+                    previous.push_str(text);
+                } else {
+                    optimized.push(command.clone());
+                }
+                if let Some((x, y)) = cursor {
+                    cursor = Some((x.saturating_add(render_text_width_u16(text)), y));
+                }
+            }
+            TerminalCommand::ResetStyle => {
+                if !matches!(optimized.last(), Some(TerminalCommand::ResetStyle)) {
+                    optimized.push(TerminalCommand::ResetStyle);
+                }
+                cursor = None;
+                style = None;
+            }
+        }
+    }
+    optimized
+}
+
+fn queue_terminal_commands<W: io::Write>(
+    stdout: &mut W,
+    commands: &[TerminalCommand],
+) -> Result<bool> {
+    let commands = optimize_terminal_commands(commands);
+    for command in &commands {
+        match command {
+            TerminalCommand::MoveTo { x, y } => {
+                queue!(stdout, MoveTo(*x, *y)).context("failed queueing terminal cursor move")?;
+            }
+            TerminalCommand::ApplyStyle(style) => queue_render_style(stdout, *style)?,
+            TerminalCommand::Print(text) => {
+                queue!(stdout, Print(text)).context("failed queueing terminal print")?;
+            }
+            TerminalCommand::ResetStyle => {
+                queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))
+                    .context("failed resetting terminal style")?;
+            }
+        }
+    }
+    Ok(!commands.is_empty())
+}
+
 fn queue_render_ops<W: io::Write>(
     stdout: &mut W,
     surface_rect: ExtensionRect,
@@ -190,8 +260,7 @@ fn queue_render_ops<W: io::Write>(
     }
     wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
     if wrote {
-        queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))
-            .context("failed resetting declarative render op style")?;
+        queue_terminal_commands(stdout, &[TerminalCommand::ResetStyle])?;
     }
     Ok(wrote)
 }
@@ -313,6 +382,26 @@ const fn render_named_color_to_crossterm(color: RenderNamedColor) -> Color {
     }
 }
 
+fn lower_render_text_run(
+    commands: &mut Vec<TerminalCommand>,
+    surface_rect: ExtensionRect,
+    x: u16,
+    y: u16,
+    text: &str,
+    style: RenderStyle,
+) -> bool {
+    if y < surface_rect.y || y >= surface_rect.bottom() || x >= surface_rect.right() {
+        return false;
+    }
+    let Some((clipped_x, clipped)) = clip_render_text_run_to_rect(x, text, surface_rect) else {
+        return false;
+    };
+    commands.push(TerminalCommand::ApplyStyle(style));
+    commands.push(TerminalCommand::MoveTo { x: clipped_x, y });
+    commands.push(TerminalCommand::Print(clipped));
+    true
+}
+
 fn queue_render_text_run<W: io::Write>(
     stdout: &mut W,
     surface_rect: ExtensionRect,
@@ -321,16 +410,30 @@ fn queue_render_text_run<W: io::Write>(
     text: &str,
     style: RenderStyle,
 ) -> Result<bool> {
-    if y < surface_rect.y || y >= surface_rect.bottom() || x >= surface_rect.right() {
+    let mut commands = Vec::new();
+    if !lower_render_text_run(&mut commands, surface_rect, x, y, text, style) {
         return Ok(false);
     }
-    let Some((clipped_x, clipped)) = clip_render_text_run_to_rect(x, text, surface_rect) else {
-        return Ok(false);
-    };
-    queue_render_style(stdout, style)?;
-    queue!(stdout, MoveTo(clipped_x, y), Print(clipped))
-        .context("failed queueing declarative text render op")?;
-    Ok(true)
+    queue_terminal_commands(stdout, &commands)
+}
+
+fn lower_render_styled_text(
+    commands: &mut Vec<TerminalCommand>,
+    surface_rect: ExtensionRect,
+    x: u16,
+    y: u16,
+    spans: &[bmux_plugin::RenderTextSpan],
+) -> bool {
+    let mut wrote = false;
+    let mut cursor = x;
+    for span in spans {
+        if span.text.is_empty() {
+            continue;
+        }
+        wrote |= lower_render_text_run(commands, surface_rect, cursor, y, &span.text, span.style);
+        cursor = cursor.saturating_add(render_text_width_u16(&span.text));
+    }
+    wrote
 }
 
 fn queue_render_styled_text<W: io::Write>(
@@ -340,16 +443,11 @@ fn queue_render_styled_text<W: io::Write>(
     y: u16,
     spans: &[bmux_plugin::RenderTextSpan],
 ) -> Result<bool> {
-    let mut wrote = false;
-    let mut cursor = x;
-    for span in spans {
-        if span.text.is_empty() {
-            continue;
-        }
-        wrote |= queue_render_text_run(stdout, surface_rect, cursor, y, &span.text, span.style)?;
-        cursor = cursor.saturating_add(render_text_width_u16(&span.text));
+    let mut commands = Vec::new();
+    if !lower_render_styled_text(&mut commands, surface_rect, x, y, spans) {
+        return Ok(false);
     }
-    Ok(wrote)
+    queue_terminal_commands(stdout, &commands)
 }
 
 fn queue_render_clear_rect<W: io::Write>(
@@ -361,6 +459,28 @@ fn queue_render_clear_rect<W: io::Write>(
     queue_render_fill_rect(stdout, surface_rect, rect, ' ', style)
 }
 
+fn lower_render_fill_rect(
+    commands: &mut Vec<TerminalCommand>,
+    surface_rect: ExtensionRect,
+    rect: ExtensionRect,
+    ch: char,
+    style: RenderStyle,
+) -> bool {
+    let Some(rect) = clip_extension_rect(rect, surface_rect) else {
+        return false;
+    };
+    if rect.is_empty() {
+        return false;
+    }
+    commands.push(TerminalCommand::ApplyStyle(style));
+    let row = ch.to_string().repeat(usize::from(rect.w));
+    for y in rect.y..rect.bottom() {
+        commands.push(TerminalCommand::MoveTo { x: rect.x, y });
+        commands.push(TerminalCommand::Print(row.clone()));
+    }
+    true
+}
+
 fn queue_render_fill_rect<W: io::Write>(
     stdout: &mut W,
     surface_rect: ExtensionRect,
@@ -368,47 +488,42 @@ fn queue_render_fill_rect<W: io::Write>(
     ch: char,
     style: RenderStyle,
 ) -> Result<bool> {
-    let Some(rect) = clip_extension_rect(rect, surface_rect) else {
-        return Ok(false);
-    };
-    if rect.is_empty() {
+    let mut commands = Vec::new();
+    if !lower_render_fill_rect(&mut commands, surface_rect, rect, ch, style) {
         return Ok(false);
     }
-    queue_render_style(stdout, style)?;
-    let row = ch.to_string().repeat(usize::from(rect.w));
-    for y in rect.y..rect.bottom() {
-        queue!(stdout, MoveTo(rect.x, y), Print(&row))
-            .context("failed queueing declarative fill render op")?;
-    }
-    Ok(true)
+    queue_terminal_commands(stdout, &commands)
 }
 
-fn queue_render_border<W: io::Write>(
-    stdout: &mut W,
+fn lower_render_border(
+    commands: &mut Vec<TerminalCommand>,
     surface_rect: ExtensionRect,
     rect: ExtensionRect,
     glyphs: bmux_plugin::BorderGlyphs,
     style: RenderStyle,
-) -> Result<bool> {
+) -> bool {
     let Some(rect) = clip_extension_rect(rect, surface_rect) else {
-        return Ok(false);
+        return false;
     };
     if rect.w == 0 || rect.h == 0 {
-        return Ok(false);
+        return false;
     }
-    queue_render_style(stdout, style)?;
+    commands.push(TerminalCommand::ApplyStyle(style));
     if rect.h == 1 {
         let row = glyphs.horizontal.to_string().repeat(usize::from(rect.w));
-        queue!(stdout, MoveTo(rect.x, rect.y), Print(row))
-            .context("failed queueing declarative single-row border render op")?;
-        return Ok(true);
+        commands.push(TerminalCommand::MoveTo {
+            x: rect.x,
+            y: rect.y,
+        });
+        commands.push(TerminalCommand::Print(row));
+        return true;
     }
     if rect.w == 1 {
         for y in rect.y..rect.bottom() {
-            queue!(stdout, MoveTo(rect.x, y), Print(glyphs.vertical))
-                .context("failed queueing declarative single-column border render op")?;
+            commands.push(TerminalCommand::MoveTo { x: rect.x, y });
+            commands.push(TerminalCommand::Print(glyphs.vertical.to_string()));
         }
-        return Ok(true);
+        return true;
     }
     let inner_width = usize::from(rect.w.saturating_sub(2));
     let top = format!(
@@ -423,34 +538,49 @@ fn queue_render_border<W: io::Write>(
         glyphs.horizontal.to_string().repeat(inner_width),
         glyphs.bottom_right
     );
-    queue!(stdout, MoveTo(rect.x, rect.y), Print(top))
-        .context("failed queueing declarative top border render op")?;
+    commands.push(TerminalCommand::MoveTo {
+        x: rect.x,
+        y: rect.y,
+    });
+    commands.push(TerminalCommand::Print(top));
     for y in rect.y.saturating_add(1)..rect.bottom().saturating_sub(1) {
-        queue!(stdout, MoveTo(rect.x, y), Print(glyphs.vertical))
-            .context("failed queueing declarative left border render op")?;
-        queue!(
-            stdout,
-            MoveTo(rect.right().saturating_sub(1), y),
-            Print(glyphs.vertical)
-        )
-        .context("failed queueing declarative right border render op")?;
+        commands.push(TerminalCommand::MoveTo { x: rect.x, y });
+        commands.push(TerminalCommand::Print(glyphs.vertical.to_string()));
+        commands.push(TerminalCommand::MoveTo {
+            x: rect.right().saturating_sub(1),
+            y,
+        });
+        commands.push(TerminalCommand::Print(glyphs.vertical.to_string()));
     }
-    queue!(
-        stdout,
-        MoveTo(rect.x, rect.bottom().saturating_sub(1)),
-        Print(bottom)
-    )
-    .context("failed queueing declarative bottom border render op")?;
-    Ok(true)
+    commands.push(TerminalCommand::MoveTo {
+        x: rect.x,
+        y: rect.bottom().saturating_sub(1),
+    });
+    commands.push(TerminalCommand::Print(bottom));
+    true
 }
 
-fn queue_render_cell_grid<W: io::Write>(
+fn queue_render_border<W: io::Write>(
     stdout: &mut W,
+    surface_rect: ExtensionRect,
+    rect: ExtensionRect,
+    glyphs: bmux_plugin::BorderGlyphs,
+    style: RenderStyle,
+) -> Result<bool> {
+    let mut commands = Vec::new();
+    if !lower_render_border(&mut commands, surface_rect, rect, glyphs, style) {
+        return Ok(false);
+    }
+    queue_terminal_commands(stdout, &commands)
+}
+
+fn lower_render_cell_grid(
+    commands: &mut Vec<TerminalCommand>,
     surface_rect: ExtensionRect,
     x: u16,
     y: u16,
     rows: &[Vec<bmux_plugin::RenderCell>],
-) -> Result<bool> {
+) -> bool {
     let mut wrote = false;
     for (row_offset, row) in rows.iter().enumerate() {
         let Ok(row_offset) = u16::try_from(row_offset) else {
@@ -471,13 +601,30 @@ fn queue_render_cell_grid<W: io::Write>(
             let Some(ch) = cell.ch else {
                 continue;
             };
-            queue_render_style(stdout, cell.style)?;
-            queue!(stdout, MoveTo(cell_x, cell_y), Print(ch))
-                .context("failed queueing declarative cell-grid render op")?;
+            commands.push(TerminalCommand::ApplyStyle(cell.style));
+            commands.push(TerminalCommand::MoveTo {
+                x: cell_x,
+                y: cell_y,
+            });
+            commands.push(TerminalCommand::Print(ch.to_string()));
             wrote = true;
         }
     }
-    Ok(wrote)
+    wrote
+}
+
+fn queue_render_cell_grid<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    x: u16,
+    y: u16,
+    rows: &[Vec<bmux_plugin::RenderCell>],
+) -> Result<bool> {
+    let mut commands = Vec::new();
+    if !lower_render_cell_grid(&mut commands, surface_rect, x, y, rows) {
+        return Ok(false);
+    }
+    queue_terminal_commands(stdout, &commands)
 }
 
 fn render_op_intersects_damage(op: &RenderOp, damage: &RenderDamage) -> bool {
@@ -2313,10 +2460,10 @@ fn render_attach_scene_inner<W: io::Write>(
 mod tests {
     use super::{
         AttachLayer, AttachLayerSurface, AttachRenderTrace, AttachRenderTraceOp,
-        DamageCoalescingPolicy, DamageRect, FrameDamage, append_pane_output,
-        coalesce_render_damage, opaque_row_text, queue_frame_damage_overlay,
-        queue_frame_damage_overlay_with_trace, queue_layer_fill, queue_render_ops,
-        render_attach_scene, render_attach_scene_with_stats_and_trace,
+        DamageCoalescingPolicy, DamageRect, FrameDamage, TerminalCommand, append_pane_output,
+        coalesce_render_damage, opaque_row_text, optimize_terminal_commands,
+        queue_frame_damage_overlay, queue_frame_damage_overlay_with_trace, queue_layer_fill,
+        queue_render_ops, render_attach_scene, render_attach_scene_with_stats_and_trace,
     };
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -2617,6 +2764,34 @@ mod tests {
     }
 
     #[test]
+    fn terminal_command_optimizer_merges_adjacent_same_style_text() {
+        let style = RenderStyle {
+            bold: true,
+            ..RenderStyle::default()
+        };
+        let commands = vec![
+            TerminalCommand::ApplyStyle(style),
+            TerminalCommand::MoveTo { x: 0, y: 0 },
+            TerminalCommand::Print("ab".to_string()),
+            TerminalCommand::ApplyStyle(style),
+            TerminalCommand::MoveTo { x: 2, y: 0 },
+            TerminalCommand::Print("cd".to_string()),
+            TerminalCommand::ResetStyle,
+            TerminalCommand::ResetStyle,
+        ];
+
+        assert_eq!(
+            optimize_terminal_commands(&commands),
+            vec![
+                TerminalCommand::ApplyStyle(style),
+                TerminalCommand::MoveTo { x: 0, y: 0 },
+                TerminalCommand::Print("abcd".to_string()),
+                TerminalCommand::ResetStyle,
+            ]
+        );
+    }
+
+    #[test]
     fn queue_render_ops_batches_adjacent_text_runs() {
         let ops = [
             RenderOp::TextRun {
@@ -2771,7 +2946,8 @@ mod tests {
 
         let output = String::from_utf8(output).expect("render op bytes should be utf8");
         assert!(output.contains("\u{1b}[1m\u{1b}[1;1Hhi"), "{output:?}");
-        assert!(output.contains("\u{1b}[38;5;9m\u{1b}[1;3H!"), "{output:?}");
+        assert!(output.contains("\u{1b}[38;5;9m!"), "{output:?}");
+        assert!(!output.contains("\u{1b}[1;3H!"), "{output:?}");
     }
 
     #[test]
