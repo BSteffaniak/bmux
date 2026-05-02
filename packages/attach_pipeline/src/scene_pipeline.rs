@@ -2,7 +2,7 @@ use crate::cursor::apply_attach_cursor_state;
 use crate::reconcile::{
     apply_attach_output_chunk_with, attach_layout_pane_id_set,
     attach_layout_requires_snapshot_hydration, attach_scene_revealed_pane_ids,
-    resize_attach_parsers_for_scene_with_size,
+    resize_attach_grids_for_scene_with_size,
 };
 use crate::render::{
     DamageCoalescingPolicy, FrameDamage, render_attach_scene, visible_scene_pane_ids,
@@ -76,7 +76,7 @@ impl AttachScenePipeline {
     pub fn set_viewport(&mut self, viewport: AttachViewport) {
         self.viewport = viewport;
         if let Some(layout_state) = self.layout_state.as_ref() {
-            resize_attach_parsers_for_scene_with_size(
+            resize_attach_grids_for_scene_with_size(
                 &mut self.pane_buffers,
                 &layout_state.scene,
                 viewport.cols,
@@ -114,7 +114,7 @@ impl AttachScenePipeline {
         });
 
         if let Some(layout_state) = self.layout_state.as_ref() {
-            resize_attach_parsers_for_scene_with_size(
+            resize_attach_grids_for_scene_with_size(
                 &mut self.pane_buffers,
                 &layout_state.scene,
                 self.viewport.cols,
@@ -191,7 +191,7 @@ impl AttachScenePipeline {
         }
 
         if let Some(layout_state) = self.layout_state.as_ref() {
-            resize_attach_parsers_for_scene_with_size(
+            resize_attach_grids_for_scene_with_size(
                 &mut self.pane_buffers,
                 &layout_state.scene,
                 self.viewport.cols,
@@ -253,7 +253,7 @@ impl AttachScenePipeline {
         self.layout_state = Some(next_layout);
 
         if let Some(layout_state) = self.layout_state.as_ref() {
-            resize_attach_parsers_for_scene_with_size(
+            resize_attach_grids_for_scene_with_size(
                 &mut self.pane_buffers,
                 &layout_state.scene,
                 self.viewport.cols,
@@ -519,7 +519,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hydrate_pane_grid_snapshot_preserves_pending_parser_bytes() {
+    fn hydrate_pane_grid_snapshot_preserves_pending_escape_bytes() {
         let pane_id = Uuid::new_v4();
         let mut source = TerminalGridStream::new(10, 2, GridLimits::default())
             .expect("source grid dimensions are valid");
@@ -567,6 +567,51 @@ mod tests {
         assert_eq!(
             grid.palette().get(red).fg,
             Some(bmux_terminal_grid::Color::Indexed(1))
+        );
+    }
+
+    #[test]
+    fn raw_chunk_updates_continuity_and_protocol_without_mutating_grid() {
+        let pane_id = Uuid::new_v4();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            status_top_inset: 0,
+            status_bottom_inset: 0,
+        });
+        let initial_revision = pipeline
+            .pane_buffers
+            .entry(pane_id)
+            .or_default()
+            .terminal_grid
+            .grid()
+            .revision();
+
+        let data = b"render text must not enter the grid\x1b[?1000h".to_vec();
+        let stream_end = u64::try_from(data.len()).expect("test data length fits u64");
+        let outcome = pipeline.apply_chunk(&AttachPaneChunk {
+            pane_id,
+            data,
+            stream_start: 0,
+            stream_end,
+            stream_gap: false,
+            sync_update_active: false,
+        });
+
+        assert_eq!(outcome, AttachChunkApplyOutcome::Applied { had_data: true });
+        let buffer = pipeline
+            .pane_buffers
+            .get(&pane_id)
+            .expect("pane buffer exists");
+        assert_eq!(buffer.expected_stream_start, Some(stream_end));
+        assert_eq!(buffer.terminal_grid.grid().revision(), initial_revision);
+        assert_eq!(buffer.terminal_grid.grid().viewport_rows()[0].cells(), &[]);
+        assert_eq!(
+            pipeline
+                .pane_mouse_protocol_hints()
+                .get(&pane_id)
+                .map(|hint| hint.mode),
+            Some(bmux_attach_layout_protocol::AttachMouseProtocolMode::PressRelease)
         );
     }
 }

@@ -27,9 +27,6 @@ tracing       = { workspace = true, features = ["std"] }
 unicode-width = { workspace = true }
 uuid          = { workspace = true, features = ["std"] }
 
-[dev-dependencies]
-vt100 = { workspace = true }
-
 [features]
 default = []
 

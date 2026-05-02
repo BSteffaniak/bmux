@@ -212,7 +212,7 @@ const fn rect_relative_to(rect: DamageRect, origin: DamageRect) -> DamageRect {
     )
 }
 
-pub fn resize_attach_parsers_for_scene_with_size(
+pub fn resize_attach_grids_for_scene_with_size(
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     scene: &AttachScene,
     cols: u16,
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_attach_parsers_clears_row_cache_on_dimension_change() {
+    fn resize_attach_grids_clears_row_cache_on_dimension_change() {
         let pane_id = Uuid::from_u128(1);
         let test_scene = scene(vec![pane_surface(
             Uuid::from_u128(2),
@@ -330,7 +330,7 @@ mod tests {
         let buffer = pane_buffers.entry(pane_id).or_default();
         buffer.prev_rows.push("cached".to_string());
 
-        resize_attach_parsers_for_scene_with_size(&mut pane_buffers, &test_scene, 10, 3);
+        resize_attach_grids_for_scene_with_size(&mut pane_buffers, &test_scene, 10, 3);
 
         assert!(pane_buffers[&pane_id].prev_rows.is_empty());
     }

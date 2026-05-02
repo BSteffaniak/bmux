@@ -2917,19 +2917,6 @@ mod tests {
         assert!(bytes.is_empty());
     }
 
-    fn screen_row(screen: &vt100::Screen, row: u16, width: u16) -> String {
-        let mut line = String::new();
-        for col in 0..width {
-            let cell = screen.cell(row, col).expect("screen cell should exist");
-            line.push_str(if cell.has_contents() {
-                cell.contents()
-            } else {
-                " "
-            });
-        }
-        line
-    }
-
     #[test]
     fn opaque_row_text_truncates_and_pads() {
         assert_eq!(opaque_row_text("help", 8), "help    ");
@@ -3284,9 +3271,6 @@ mod tests {
 
     #[test]
     fn queue_layer_fill_and_text_overwrite_existing_content() {
-        let mut parser = vt100::Parser::new(6, 20, 128);
-        parser.process(b"\x1b[2;1H0123456789abcdefghij");
-
         let rect = PaneRect {
             x: 0,
             y: 0,
@@ -3310,19 +3294,16 @@ mod tests {
         )
         .expect("overlay text should queue");
 
-        parser.process(&bytes);
-
-        assert_eq!(screen_row(parser.screen(), 1, 12), "0help      b");
+        let output = String::from_utf8(bytes).expect("overlay bytes should be utf8");
+        assert!(output.contains("\u{1b}[2;2H          "), "{output:?}");
+        assert!(output.contains("\u{1b}[3;2H          "), "{output:?}");
+        assert!(output.contains("\u{1b}[2;2Hhelp      "), "{output:?}");
     }
 
     #[test]
     fn queue_layer_fill_respects_content_rect_inset() {
         // Asymmetric inset — content_rect is NOT a simple 1-cell inset of rect.
         // This guards against future "fixes" that reintroduce `rect - 2` math.
-        let mut parser = vt100::Parser::new(4, 12, 128);
-        // Pre-fill rows 1..=2 with a sentinel so untouched cells stay as 'x'/'y'.
-        parser.process(b"\x1b[2;1Hxxxxxxxxxxxx\x1b[3;1Hyyyyyyyyyyyy");
-
         let rect = PaneRect {
             x: 0,
             y: 0,
@@ -3340,12 +3321,12 @@ mod tests {
 
         let mut bytes = Vec::new();
         queue_layer_fill(&mut bytes, surface).expect("overlay fill should succeed");
-        parser.process(&bytes);
 
-        // Row 1: cols 0..2 untouched ('xx'), cols 2..10 spaces, cols 10..12 untouched ('xx').
-        assert_eq!(screen_row(parser.screen(), 1, 12), "xx        xx");
-        // Row 2: same but with 'y' sentinels.
-        assert_eq!(screen_row(parser.screen(), 2, 12), "yy        yy");
+        let output = String::from_utf8(bytes).expect("overlay bytes should be utf8");
+        assert!(output.contains("\u{1b}[2;3H        "), "{output:?}");
+        assert!(output.contains("\u{1b}[3;3H        "), "{output:?}");
+        assert!(!output.contains("\u{1b}[1;"), "{output:?}");
+        assert!(!output.contains("\u{1b}[4;"), "{output:?}");
     }
 
     #[test]

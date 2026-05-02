@@ -2524,7 +2524,7 @@ pub async fn run_session_attach_with_client(
             continue;
         }
 
-        resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
+        resize_attach_grids_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
 
         // Only fetch pane output when new pane bytes are pending.
         // Pure redraw dirty flags (layout/status/overlay) must not trigger
@@ -7164,7 +7164,7 @@ async fn hydrate_attach_state_from_snapshot_mode(
     }
 
     if let Some(layout_state) = view_state.cached_layout_state.as_ref() {
-        resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
+        resize_attach_grids_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
     }
     let structured_hydrated = hydrate_attach_structured_grid_snapshots(
         client,
@@ -7237,7 +7237,7 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
             .pane_buffers
             .insert(*pane_id, PaneRenderBuffer::default());
     }
-    resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
+    resize_attach_grids_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
 
     let structured_hydrated =
         hydrate_attach_structured_grid_snapshots(client, view_state, pane_ids.to_vec()).await?;
@@ -7313,21 +7313,21 @@ pub fn attach_layout_requires_snapshot_hydration(
     bmux_attach_pipeline::reconcile::attach_layout_requires_snapshot_hydration(previous, next)
 }
 
-pub fn resize_attach_parsers_for_scene(
+pub fn resize_attach_grids_for_scene(
     pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
     scene: &AttachScene,
 ) {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    resize_attach_parsers_for_scene_with_size(pane_buffers, scene, cols, rows);
+    resize_attach_grids_for_scene_with_size(pane_buffers, scene, cols, rows);
 }
 
-pub fn resize_attach_parsers_for_scene_with_size(
+pub fn resize_attach_grids_for_scene_with_size(
     pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
     scene: &AttachScene,
     cols: u16,
     rows: u16,
 ) {
-    bmux_attach_pipeline::reconcile::resize_attach_parsers_for_scene_with_size(
+    bmux_attach_pipeline::reconcile::resize_attach_grids_for_scene_with_size(
         pane_buffers,
         scene,
         cols,
@@ -14140,7 +14140,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_attach_parsers_applies_layout_size_before_snapshot_bytes() {
+    fn resize_attach_grids_applies_layout_size_before_snapshot_bytes() {
         let pane_id = uuid::Uuid::new_v4();
         let scene = AttachScene {
             session_id: uuid::Uuid::new_v4(),
@@ -14174,7 +14174,7 @@ mod tests {
         let mut pane_buffers = BTreeMap::new();
         pane_buffers.insert(pane_id, PaneRenderBuffer::default());
 
-        resize_attach_parsers_for_scene_with_size(&mut pane_buffers, &scene, 120, 50);
+        resize_attach_grids_for_scene_with_size(&mut pane_buffers, &scene, 120, 50);
 
         let buffer = pane_buffers
             .get_mut(&pane_id)
