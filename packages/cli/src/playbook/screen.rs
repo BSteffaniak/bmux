@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result, bail};
+use bmux_attach_pipeline::PaneRenderBuffer;
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient};
 use regex::Regex;
 use serde::Serialize;
@@ -42,6 +43,7 @@ struct PaneStreamState {
     /// Expected start offset of the next incremental chunk for this pane.
     /// None means no continuity baseline has been established yet.
     expected_stream_start: Option<u64>,
+    sync_update_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +256,7 @@ impl ScreenInspector {
                     cols,
                     parser: vt100::Parser::new(rows, cols, 4_096),
                     expected_stream_start: None,
+                    sync_update_active: false,
                 });
 
             state.pane_index = pane.index;
@@ -309,6 +312,11 @@ impl ScreenInspector {
                     // Snapshot data is a recent tail, not offset-addressed stream
                     // data, so continuity baseline starts with the first batch.
                     expected_stream_start: None,
+                    sync_update_active: snapshot
+                        .chunks
+                        .iter()
+                        .find(|chunk| chunk.pane_id == pane.id)
+                        .is_some_and(|chunk| chunk.sync_update_active),
                 },
             );
         }
@@ -403,6 +411,7 @@ impl ScreenInspector {
                 result.had_activity = true;
             }
 
+            state.sync_update_active = sync_update_active;
             state.expected_stream_start = Some(stream_end);
         }
 
@@ -440,6 +449,28 @@ impl ScreenInspector {
             self.viewport_cols.saturating_sub(2).max(1),
             self.viewport_rows.saturating_sub(2).max(1),
         )
+    }
+
+    /// Copy current pane parser state into attach render buffers while preserving renderer caches.
+    pub fn sync_attach_render_buffers(
+        &self,
+        layout: &AttachLayoutState,
+        buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    ) {
+        buffers.retain(|pane_id, _| self.pane_states.contains_key(pane_id));
+        let content_dims = build_pane_content_dimensions_from_scene(&layout.scene);
+        for (pane_id, state) in &self.pane_states {
+            let (cols, rows) = content_dims
+                .get(pane_id)
+                .copied()
+                .unwrap_or((state.cols, state.rows));
+            let buffer = buffers.entry(*pane_id).or_default();
+            buffer.parser =
+                parser_from_screen_text(&screen_to_text(state.parser.screen()), rows, cols);
+            buffer.last_alternate_screen = state.parser.screen().alternate_screen();
+            buffer.sync_update_in_progress = state.sync_update_active;
+            buffer.expected_stream_start = state.expected_stream_start;
+        }
     }
 
     /// Get the full screen text of a specific pane (by index).
@@ -727,6 +758,25 @@ fn build_pane_dimensions_from_scene(
         .collect()
 }
 
+/// Extract per-pane content dimensions from scene surface content rects.
+fn build_pane_content_dimensions_from_scene(
+    scene: &bmux_attach_layout_protocol::AttachScene,
+) -> BTreeMap<Uuid, (u16, u16)> {
+    scene
+        .surfaces
+        .iter()
+        .filter_map(|surface| {
+            let pane_id = surface.pane_id?;
+            if !surface.visible {
+                return None;
+            }
+            let cols = surface.content_rect.w.max(1);
+            let rows = surface.content_rect.h.max(1);
+            Some((pane_id, (cols, rows)))
+        })
+        .collect()
+}
+
 /// Extract visible text from a vt100 screen, with trailing whitespace trimmed per line.
 fn screen_to_text(screen: &vt100::Screen) -> String {
     let mut lines = Vec::new();
@@ -742,6 +792,16 @@ fn screen_to_text(screen: &vt100::Screen) -> String {
     }
 
     lines.join("\n")
+}
+
+fn parser_from_screen_text(text: &str, rows: u16, cols: u16) -> vt100::Parser {
+    let mut parser = vt100::Parser::new(rows.max(1), cols.max(1), 4_096);
+    for (row, line) in text.lines().take(usize::from(rows)).enumerate() {
+        let cursor_row = row.saturating_add(1);
+        let sequence = format!("\x1b[{cursor_row};1H{line}");
+        parser.process(sequence.as_bytes());
+    }
+    parser
 }
 
 #[cfg(test)]

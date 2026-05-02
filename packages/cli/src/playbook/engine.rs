@@ -7,11 +7,14 @@ use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use bmux_appearance::RuntimeAppearance;
 use bmux_attach_layout_protocol::{PaneSelector, PaneSplitDirection};
+use bmux_attach_pipeline::render::render_attach_scene_with_stats_and_trace;
 use bmux_attach_pipeline::{
     AttachRenderTrace, AttachRenderTraceOp as AttachTraceOp, AttachSceneRenderStats,
+    DamageCoalescingPolicy, DamageRect, FrameDamage, PaneRenderBuffer,
 };
-use bmux_client::BmuxClient;
+use bmux_client::{AttachLayoutState, BmuxClient};
 use bmux_contexts_plugin_api::contexts_state;
 use bmux_ipc::InvokeServiceKind;
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
@@ -626,11 +629,20 @@ pub(super) struct AttachInputState {
     scrollback_offset: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PlaybookRenderTraceState {
     enabled: bool,
     marks: std::collections::BTreeMap<String, usize>,
     summaries: Vec<PlaybookRenderSummary>,
+    attach_render_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+}
+
+struct PlaybookRenderRecordContext<'a> {
+    client: &'a mut BmuxClient,
+    inspector: &'a ScreenInspector,
+    session_id: Option<Uuid>,
+    attached: bool,
+    viewport: (u16, u16),
 }
 
 impl PlaybookRenderTraceState {
@@ -639,6 +651,7 @@ impl PlaybookRenderTraceState {
             enabled,
             marks: std::collections::BTreeMap::new(),
             summaries: Vec::new(),
+            attach_render_buffers: BTreeMap::new(),
         }
     }
 
@@ -646,17 +659,101 @@ impl PlaybookRenderTraceState {
         self.marks.insert(id, self.summaries.len());
     }
 
-    fn record_delta(
+    async fn record_delta(
         &mut self,
+        context: PlaybookRenderRecordContext<'_>,
         before: Option<&[PaneCapture]>,
         after: Option<&[PaneCapture]>,
     ) -> Option<PlaybookRenderSummary> {
         if !self.enabled {
             return None;
         }
-        let summary = summarize_playbook_render_delta(before, after);
+        let delta_summary = summarize_playbook_render_delta(before, after);
+        let summary = if context.attached {
+            match self
+                .record_attach_render_trace(
+                    context.client,
+                    context.inspector,
+                    context.session_id,
+                    before,
+                    after,
+                    context.viewport,
+                )
+                .await
+            {
+                Ok(Some(summary)) => summary,
+                Ok(None) => delta_summary,
+                Err(error) => {
+                    warn!("failed to collect attach render trace for playbook step: {error:#}");
+                    delta_summary
+                }
+            }
+        } else {
+            delta_summary
+        };
         self.summaries.push(summary.clone());
         Some(summary)
+    }
+
+    async fn record_attach_render_trace(
+        &mut self,
+        client: &mut BmuxClient,
+        inspector: &ScreenInspector,
+        session_id: Option<Uuid>,
+        before: Option<&[PaneCapture]>,
+        after: Option<&[PaneCapture]>,
+        viewport: (u16, u16),
+    ) -> Result<Option<PlaybookRenderSummary>> {
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let layout = client
+            .attach_layout(session_id)
+            .await
+            .map_err(|error| anyhow::anyhow!("attach layout for render trace failed: {error}"))?;
+        inspector.sync_attach_render_buffers(&layout, &mut self.attach_render_buffers);
+        let damage = frame_damage_from_render_delta(&layout, before, after);
+        if damage.is_empty() {
+            return Ok(None);
+        }
+        let damage_stats = damage.stats();
+        let mut trace = AttachRenderTrace::new();
+        let mut bytes = Vec::new();
+        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
+            &mut bytes,
+            &layout.scene,
+            &layout.panes,
+            &mut self.attach_render_buffers,
+            &damage,
+            0,
+            0,
+            false,
+            0,
+            None,
+            None,
+            layout.zoomed,
+            viewport,
+            &RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+            Some(&mut trace),
+        )?;
+        let facts = PlaybookAttachRenderFrameFacts {
+            scene_render: stats,
+            frame_bytes: bytes.len(),
+            damage_rects: damage_stats.rect_count,
+            damage_area_cells: damage_stats.rect_area_cells,
+            full_surface_fallbacks: damage_stats.full_surface_count,
+            full_frame_fallback: damage.is_full_frame(),
+            status_rendered: damage.status_damaged() && !damage.is_full_frame(),
+            overlay_rendered: damage.overlay_damaged() && !damage.is_full_frame(),
+        };
+        let surface_panes = trace_surface_pane_indexes(&layout);
+        Ok(Some(summarize_attach_render_trace(
+            &trace,
+            facts,
+            &surface_panes,
+        )))
     }
 
     fn assert_since(
@@ -709,6 +806,86 @@ fn handle_render_trace_step(
         }
         _ => None,
     }
+}
+
+fn trace_surface_pane_indexes(layout: &AttachLayoutState) -> BTreeMap<usize, u32> {
+    layout
+        .scene
+        .surfaces
+        .iter()
+        .enumerate()
+        .filter_map(|(surface_index, surface)| {
+            let pane_id = surface.pane_id?;
+            let pane_index = layout
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .map(|pane| pane.index)?;
+            Some((surface_index, pane_index))
+        })
+        .collect()
+}
+
+fn frame_damage_from_render_delta(
+    layout: &AttachLayoutState,
+    before: Option<&[PaneCapture]>,
+    after: Option<&[PaneCapture]>,
+) -> FrameDamage {
+    let Some(after) = after else {
+        return FrameDamage::default();
+    };
+    if before.is_none_or(|panes| panes.len() != after.len()) {
+        return FrameDamage::full_frame();
+    }
+    let before_by_index = before
+        .unwrap_or_default()
+        .iter()
+        .map(|pane| (pane.index, pane))
+        .collect::<BTreeMap<_, _>>();
+    let pane_ids_by_index = layout
+        .panes
+        .iter()
+        .map(|pane| (pane.index, pane.id))
+        .collect::<BTreeMap<_, _>>();
+    let pane_sizes = content_surface_sizes_by_pane(layout);
+    let mut damage = FrameDamage::default();
+    for pane in after {
+        let Some(previous) = before_by_index.get(&pane.index) else {
+            return FrameDamage::full_frame();
+        };
+        let Some(pane_id) = pane_ids_by_index.get(&pane.index).copied() else {
+            continue;
+        };
+        let (_, _, _, segments) =
+            changed_render_rows(pane.index, &previous.screen_text, &pane.screen_text);
+        let surface_size = pane_sizes
+            .get(&pane_id)
+            .copied()
+            .unwrap_or((u16::MAX, u16::MAX));
+        for segment in segments {
+            damage.mark_content_surface_rect(
+                pane_id,
+                DamageRect::new(segment.start_col, segment.row, segment.cells, 1),
+                surface_size,
+                DamageCoalescingPolicy::default(),
+            );
+        }
+    }
+    damage
+}
+
+fn content_surface_sizes_by_pane(layout: &AttachLayoutState) -> BTreeMap<Uuid, (u16, u16)> {
+    layout
+        .scene
+        .surfaces
+        .iter()
+        .filter_map(|surface| {
+            Some((
+                surface.pane_id?,
+                (surface.content_rect.w.max(1), surface.content_rect.h.max(1)),
+            ))
+        })
+        .collect()
 }
 
 fn summarize_playbook_render_delta(
@@ -1993,7 +2170,21 @@ async fn run_playbook_inner(
                 let detail_for_visual = detail.clone();
                 let render_after = inspector.capture_all_safe();
                 let render_summary = render_trace_state
-                    .record_delta(render_before.as_deref(), render_after.as_deref());
+                    .record_delta(
+                        PlaybookRenderRecordContext {
+                            client: &mut client,
+                            inspector: &inspector,
+                            session_id,
+                            attached,
+                            viewport: (
+                                playbook.config.viewport.cols,
+                                playbook.config.viewport.rows,
+                            ),
+                        },
+                        render_before.as_deref(),
+                        render_after.as_deref(),
+                    )
+                    .await;
                 step_results.push(StepResult {
                     index: step.index,
                     action: step.action.name().to_string(),
