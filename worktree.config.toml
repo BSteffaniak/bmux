@@ -1,0 +1,27 @@
+description = "bmux development environment"
+
+# Paths to delete with `worktree-setup clean`.
+# Keep this limited to repo-local build/cache artifacts; no setup or build steps run.
+clean = [
+    "/target",
+    "/**/target",
+    "/debug",
+    "/**/debug",
+    "/dist",
+    "/**/dist",
+    "/node_modules",
+    "/**/node_modules",
+    "/.direnv",
+    "/.codeql",
+    "/.sst",
+    "/**/.sst",
+    "/.build",
+    "/**/.build",
+    "/.open-next",
+    "/**/.open-next",
+    "/infra/terraform/.terraform",
+    "/infra/wrangler/.wrangler",
+    "/sandbox-artifacts",
+    "/**/*.db",
+    "/**/*.bak",
+]
