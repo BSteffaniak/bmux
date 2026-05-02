@@ -4630,10 +4630,6 @@ pub fn adjust_scrollback_cursor_component(current: usize, delta: isize, max_valu
     }
 }
 
-pub fn copy_attach_selection(view_state: &mut AttachViewState, exit_after_copy: bool) {
-    copy_attach_selection_at(view_state, exit_after_copy, Instant::now());
-}
-
 pub fn copy_attach_selection_at(
     view_state: &mut AttachViewState,
     exit_after_copy: bool,
@@ -8365,7 +8361,7 @@ async fn handle_attach_mouse_event_at(
     if matches!(
         mouse_event.kind,
         MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
-    ) && handle_attach_mouse_selection_drag(view_state, mouse_event)
+    ) && handle_attach_mouse_selection_drag_at(view_state, mouse_event, now)
     {
         return Ok(());
     }
@@ -9622,23 +9618,30 @@ pub fn maybe_begin_attach_mouse_selection_drag(
     true
 }
 
-pub fn handle_attach_mouse_selection_drag(
+pub fn handle_attach_mouse_selection_drag_at(
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
+    now: Instant,
 ) -> bool {
     match mouse_event.kind {
-        MouseEventKind::Drag(MouseButton::Left) => {
-            update_attach_mouse_selection_drag(view_state, mouse_event.column, mouse_event.row)
+        MouseEventKind::Drag(MouseButton::Left) => update_attach_mouse_selection_drag_at(
+            view_state,
+            mouse_event.column,
+            mouse_event.row,
+            now,
+        ),
+        MouseEventKind::Up(MouseButton::Left) => {
+            finish_attach_mouse_selection_drag_at(view_state, now)
         }
-        MouseEventKind::Up(MouseButton::Left) => finish_attach_mouse_selection_drag(view_state),
         _ => false,
     }
 }
 
-fn update_attach_mouse_selection_drag(
+fn update_attach_mouse_selection_drag_at(
     view_state: &mut AttachViewState,
     column: u16,
     row: u16,
+    now: Instant,
 ) -> bool {
     let Some(drag) = view_state.mouse.selection_drag else {
         return false;
@@ -9660,7 +9663,7 @@ fn update_attach_mouse_selection_drag(
     if !drag.active {
         view_state.set_transient_status(
             ATTACH_SELECTION_STARTED_STATUS,
-            Instant::now(),
+            now,
             ATTACH_TRANSIENT_STATUS_TTL,
         );
     }
@@ -9677,7 +9680,7 @@ fn update_attach_mouse_selection_drag(
     true
 }
 
-fn finish_attach_mouse_selection_drag(view_state: &mut AttachViewState) -> bool {
+fn finish_attach_mouse_selection_drag_at(view_state: &mut AttachViewState, now: Instant) -> bool {
     let Some(drag) = view_state.mouse.selection_drag.take() else {
         return false;
     };
@@ -9685,10 +9688,10 @@ fn finish_attach_mouse_selection_drag(view_state: &mut AttachViewState) -> bool 
         match view_state.mouse.config.selection_release {
             bmux_config::MouseSelectionReleaseBehavior::Select => {}
             bmux_config::MouseSelectionReleaseBehavior::Copy => {
-                copy_attach_selection(view_state, false);
+                copy_attach_selection_at(view_state, false, now);
             }
             bmux_config::MouseSelectionReleaseBehavior::CopyAndExit => {
-                copy_attach_selection(view_state, true);
+                copy_attach_selection_at(view_state, true, now);
             }
         }
         view_state
@@ -11916,7 +11919,11 @@ mod tests {
             row: 3,
             modifiers: KeyModifiers::empty(),
         };
-        assert!(handle_attach_mouse_selection_drag(&mut view_state, drag));
+        assert!(handle_attach_mouse_selection_drag_at(
+            &mut view_state,
+            drag,
+            Instant::now()
+        ));
         assert!(view_state.scrollback_active);
         assert_eq!(
             view_state.selection_anchor,
@@ -11933,7 +11940,11 @@ mod tests {
             row: 3,
             modifiers: KeyModifiers::empty(),
         };
-        assert!(handle_attach_mouse_selection_drag(&mut view_state, up));
+        assert!(handle_attach_mouse_selection_drag_at(
+            &mut view_state,
+            up,
+            Instant::now()
+        ));
         assert!(view_state.scrollback_active);
         assert_eq!(view_state.mouse.selection_drag, None);
         assert!(view_state.selection_active());
@@ -11961,7 +11972,11 @@ mod tests {
             row: 2,
             modifiers: KeyModifiers::empty(),
         };
-        assert!(handle_attach_mouse_selection_drag(&mut view_state, up));
+        assert!(handle_attach_mouse_selection_drag_at(
+            &mut view_state,
+            up,
+            Instant::now()
+        ));
         assert!(!view_state.scrollback_active);
         assert_eq!(view_state.selection_anchor, None);
     }
@@ -11986,7 +12001,11 @@ mod tests {
             row: 3,
             modifiers: KeyModifiers::empty(),
         };
-        assert!(handle_attach_mouse_selection_drag(&mut view_state, up));
+        assert!(handle_attach_mouse_selection_drag_at(
+            &mut view_state,
+            up,
+            Instant::now()
+        ));
         assert!(view_state.selection_active());
     }
 
