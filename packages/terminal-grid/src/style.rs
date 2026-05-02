@@ -47,6 +47,16 @@ impl Default for StylePalette {
 }
 
 impl StylePalette {
+    /// Build a palette from styles already encoded in id order.
+    #[must_use]
+    pub fn from_styles(styles: Vec<Style>) -> Self {
+        if styles.is_empty() {
+            Self::default()
+        } else {
+            Self { styles }
+        }
+    }
+
     /// Return an interned id for `style`.
     #[must_use]
     pub fn intern(&mut self, style: Style) -> StyleId {

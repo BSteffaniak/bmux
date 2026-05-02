@@ -135,4 +135,29 @@ mod tests {
         assert_eq!(snapshot.rows.len(), 2);
         assert!(snapshot.rows[0].runs.len() >= 2);
     }
+
+    #[test]
+    fn snapshot_round_trips_rows_styles_and_cursor() {
+        let mut grid = TerminalGrid::new(8, 3, GridLimits::default()).unwrap();
+        grid.process("plain \x1b[31mred\r\nwide 界".as_bytes());
+        let snapshot = grid.snapshot(0, 20);
+
+        let hydrated = TerminalGrid::from_snapshot(&snapshot, GridLimits::default()).unwrap();
+
+        assert_eq!(hydrated.width(), grid.width());
+        assert_eq!(hydrated.height(), grid.height());
+        assert_eq!(hydrated.cursor(), grid.cursor());
+        assert_eq!(hydrated.palette().styles(), grid.palette().styles());
+        assert_eq!(hydrated.viewport_rows(), grid.viewport_rows());
+    }
+
+    #[test]
+    fn snapshot_rejects_unknown_mode() {
+        let mut snapshot = TerminalGrid::new(8, 2, GridLimits::default())
+            .unwrap()
+            .snapshot(0, 2);
+        snapshot.mode = "unknown".to_string();
+
+        assert!(TerminalGrid::from_snapshot(&snapshot, GridLimits::default()).is_err());
+    }
 }

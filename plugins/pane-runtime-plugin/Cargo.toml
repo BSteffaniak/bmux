@@ -35,6 +35,7 @@ bmux_session_models = { workspace = true }
 bmux_session_state = { workspace = true }
 bmux_sessions_plugin_api = { workspace = true }
 bmux_snapshot_runtime = { workspace = true }
+bmux_terminal_grid = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }

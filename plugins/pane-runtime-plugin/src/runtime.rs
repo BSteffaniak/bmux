@@ -24,6 +24,7 @@ use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::SessionManagerHandle;
 use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotDirtyFlagHandle};
+use bmux_terminal_grid::{GridLimits, TerminalGridStream};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -227,6 +228,7 @@ struct PaneRuntimeHandle {
     task: JoinHandle<()>,
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
     output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
+    terminal_grid: Arc<std::sync::Mutex<TerminalGridStream>>,
     exited: Arc<AtomicBool>,
     last_requested_size: Arc<std::sync::Mutex<(u16, u16)>>,
     /// Set to `true` by the PTY reader when new output arrives. The broadcast
@@ -1268,6 +1270,9 @@ impl PaneRuntimeHandle {
         if let Ok(mut last) = self.last_requested_size.lock() {
             *last = (rows, cols);
         }
+        if let Ok(mut grid) = self.terminal_grid.lock() {
+            let _ = grid.resize_delta(cols, rows);
+        }
         let _ = self
             .input_tx
             .send(PaneRuntimeCommand::Resize { rows, cols });
@@ -1432,6 +1437,11 @@ impl OutputFanoutBuffer {
 
     fn unregister_client(&mut self, client_id: ClientId) {
         self.cursors.remove(&client_id);
+    }
+
+    fn set_client_cursor(&mut self, client_id: ClientId, offset: u64) {
+        let clamped = offset.clamp(self.start_offset, self.end_offset());
+        self.cursors.insert(client_id, clamped);
     }
 
     fn push_chunk(&mut self, chunk: &[u8]) {
@@ -2340,6 +2350,11 @@ impl SessionRuntimeManager {
         let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
             MAX_WINDOW_OUTPUT_BUFFER_BYTES,
         )));
+        let terminal_grid = Arc::new(std::sync::Mutex::new(
+            TerminalGridStream::new(80, 24, GridLimits::default())
+                .expect("default pane terminal grid dimensions are valid"),
+        ));
+        let terminal_grid_for_reader = Arc::clone(&terminal_grid);
         let last_requested_size = Arc::new(std::sync::Mutex::new((24_u16, 80_u16)));
         let shell = pane_meta.shell.clone();
         let launch = pane_meta.launch.clone();
@@ -2711,6 +2726,12 @@ impl SessionRuntimeManager {
                                 sync_update_for_reader
                                     .store(terminal_mode_tracker.sync_update, Ordering::SeqCst);
 
+                                if let Ok(mut grid) = terminal_grid_for_reader.lock() {
+                                    grid.process(chunk);
+                                } else {
+                                    break;
+                                }
+
                                 if let Ok(mut output) = reader_output.lock() {
                                     output.push_chunk(chunk);
                                 } else {
@@ -2856,6 +2877,7 @@ impl SessionRuntimeManager {
             task,
             input_tx,
             output_buffer,
+            terminal_grid,
             exited,
             last_requested_size,
             output_dirty,
@@ -4792,6 +4814,59 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             pane_mouse_protocols: inner.pane_mouse_protocols,
             pane_input_modes: inner.pane_input_modes,
         })
+    }
+
+    fn attach_grid_snapshot_state(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_ids: &[Uuid],
+        max_rows_per_pane: usize,
+    ) -> Result<bmux_pane_runtime_state::AttachGridSnapshotState, SessionRuntimeError> {
+        self.with_lock(|m| {
+            let session = m
+                .runtimes
+                .get(&session_id)
+                .ok_or(SessionRuntimeError::NotFound)?;
+            if !session.attached_clients.contains(&client_id) {
+                return Err(SessionRuntimeError::NotAttached);
+            }
+            let mut snapshots = Vec::new();
+            let mut seen = BTreeSet::new();
+            for pane_id in pane_ids {
+                if !seen.insert(*pane_id) {
+                    continue;
+                }
+                let Some(pane) = session.panes.get(pane_id) else {
+                    continue;
+                };
+                let snapshot = {
+                    let grid = pane
+                        .terminal_grid
+                        .lock()
+                        .map_err(|_| SessionRuntimeError::Closed)?;
+                    grid.grid().snapshot(0, max_rows_per_pane)
+                };
+                let stream_end = {
+                    let mut output = pane
+                        .output_buffer
+                        .lock()
+                        .map_err(|_| SessionRuntimeError::Closed)?;
+                    let stream_end = output.end_offset();
+                    output.set_client_cursor(client_id, stream_end);
+                    stream_end
+                };
+                let encoded =
+                    serde_json::to_vec(&snapshot).map_err(|_| SessionRuntimeError::Closed)?;
+                snapshots.push(bmux_pane_runtime_state::AttachPaneGridSnapshot {
+                    pane_id: *pane_id,
+                    stream_end,
+                    encoded,
+                });
+            }
+            Ok(bmux_pane_runtime_state::AttachGridSnapshotState { snapshots })
+        })
+        .unwrap_or(Err(SessionRuntimeError::Closed))
     }
 
     fn pane_state(&self, session_id: SessionId, pane_id: Uuid) -> Option<PaneState> {

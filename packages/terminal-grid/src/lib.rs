@@ -9,12 +9,15 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod delta;
 mod model;
 mod parser;
 mod reflow;
 mod snapshot;
 mod style;
 
+pub use delta::{GridDeltaBatch, RowUpdateSnapshot};
 pub use model::{Cell, Cursor, GridLimits, GridMode, PhysicalRow, TerminalGrid, TerminalGridError};
+pub use parser::TerminalGridStream;
 pub use snapshot::{CellRunSnapshot, CursorSnapshot, GridSnapshot, RowSnapshot};
 pub use style::{Color, Style, StyleId, StylePalette};

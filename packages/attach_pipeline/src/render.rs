@@ -1138,6 +1138,7 @@ pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) -> bool {
     }
     let was_alternate = buffer.last_alternate_screen;
     buffer.parser.process(bytes);
+    buffer.terminal_grid.process(bytes);
     let is_alternate = buffer.parser.screen().alternate_screen();
     buffer.last_alternate_screen = is_alternate;
 

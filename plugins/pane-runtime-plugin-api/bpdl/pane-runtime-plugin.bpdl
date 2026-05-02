@@ -447,6 +447,16 @@ interface attach-runtime-state {
         output_still_pending: bool,
     }
 
+    record pane-grid-snapshot {
+        pane_id: uuid,
+        stream_end: u64,
+        encoded: list<u8>,
+    }
+
+    record attach-pane-grid-snapshot {
+        snapshots: list<pane-grid-snapshot>,
+    }
+
     record attach-pane-images {
         // JSON-encoded `Vec<AttachPaneImageDelta>`.
         encoded: list<u8>,
@@ -478,6 +488,12 @@ interface attach-runtime-state {
         pane_ids: list<uuid>,
         max_bytes: u32,
     ) -> result<attach-pane-output-batch, attach-state-error>;
+
+    query attach-pane-grid-snapshot-state(
+        session_id: uuid,
+        pane_ids: list<uuid>,
+        max_rows_per_pane: u32,
+    ) -> result<attach-pane-grid-snapshot, attach-state-error>;
 
     query attach-pane-images(
         session_id: uuid,

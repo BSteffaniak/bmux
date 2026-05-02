@@ -1,4 +1,4 @@
-use crate::snapshot::GridSnapshot;
+use crate::snapshot::{GridSnapshot, RowSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
 use std::collections::VecDeque;
 use thiserror::Error;
@@ -173,6 +173,8 @@ impl PhysicalRow {
 pub enum TerminalGridError {
     #[error("terminal dimensions must be non-zero")]
     ZeroDimensions,
+    #[error("invalid terminal grid snapshot: {0}")]
+    InvalidSnapshot(&'static str),
 }
 
 /// Structured terminal state with bounded main-screen scrollback and isolated
@@ -191,6 +193,12 @@ pub struct TerminalGrid {
     palette: StylePalette,
     revision: u64,
     autowrap: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CursorAnchor {
+    logical_line: usize,
+    logical_col: usize,
 }
 
 impl TerminalGrid {
@@ -229,6 +237,77 @@ impl TerminalGrid {
         })
     }
 
+    /// Hydrate a grid from a structured snapshot.
+    ///
+    /// The snapshot may contain either a full retained history or a bounded
+    /// slice. Hydration preserves every encoded row, then pads with blank rows
+    /// when the slice is shorter than the viewport height.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot has zero dimensions or an unknown
+    /// screen mode.
+    pub fn from_snapshot(
+        snapshot: &GridSnapshot,
+        limits: GridLimits,
+    ) -> Result<Self, TerminalGridError> {
+        let width = usize::from(snapshot.width);
+        let height = usize::from(snapshot.height);
+        if width == 0 || height == 0 {
+            return Err(TerminalGridError::ZeroDimensions);
+        }
+        let mode = match snapshot.mode.as_str() {
+            "main" => GridMode::Main,
+            "alternate" => GridMode::Alternate,
+            _ => return Err(TerminalGridError::InvalidSnapshot("unknown screen mode")),
+        };
+        let palette = StylePalette::from_styles(snapshot.styles.clone());
+        let rows = snapshot
+            .rows
+            .iter()
+            .map(|row| row_from_snapshot(row, width))
+            .collect::<Vec<_>>();
+        let mut main_rows = VecDeque::new();
+        let mut alt_rows = vec![PhysicalRow::new(); height];
+        match mode {
+            GridMode::Main => {
+                main_rows.extend(rows);
+                while main_rows.len() < height {
+                    main_rows.push_front(PhysicalRow::new());
+                }
+            }
+            GridMode::Alternate => {
+                for (index, row) in rows.into_iter().take(height).enumerate() {
+                    alt_rows[index] = row;
+                }
+                for _ in 0..height {
+                    main_rows.push_back(PhysicalRow::new());
+                }
+            }
+        }
+        let mut grid = Self {
+            width,
+            height,
+            limits,
+            main_rows,
+            alt_rows,
+            mode,
+            cursor: Cursor {
+                row: usize::from(snapshot.cursor.row),
+                col: usize::from(snapshot.cursor.col),
+                visible: snapshot.cursor.visible,
+            },
+            saved_cursor: Cursor::default(),
+            current_style: Style::default(),
+            palette,
+            revision: snapshot.revision,
+            autowrap: true,
+        };
+        grid.clamp_cursor();
+        grid.evict_excess_history();
+        Ok(grid)
+    }
+
     #[must_use]
     pub const fn width(&self) -> usize {
         self.width
@@ -259,6 +338,10 @@ impl TerminalGrid {
         &self.palette
     }
 
+    /// Process a self-contained byte slice with a fresh parser.
+    ///
+    /// Use [`TerminalGridStream`](crate::TerminalGridStream) for live PTY
+    /// streams where escape sequences can be split across chunks.
     pub fn process(&mut self, bytes: &[u8]) {
         crate::parser::process(self, bytes);
     }
@@ -278,6 +361,7 @@ impl TerminalGrid {
         if self.width == width && self.height == height {
             return Ok(());
         }
+        let cursor_anchor = self.main_cursor_anchor();
         crate::reflow::reflow_main_rows(&mut self.main_rows, self.width, width);
         self.width = width;
         self.height = height;
@@ -289,6 +373,9 @@ impl TerminalGrid {
         for row in &mut self.alt_rows {
             row.truncate(width);
             row.set_wrapped(false);
+        }
+        if self.mode == GridMode::Main {
+            self.restore_main_cursor_anchor(cursor_anchor);
         }
         self.cursor.row = self.cursor.row.min(height.saturating_sub(1));
         self.cursor.col = self.cursor.col.min(width.saturating_sub(1));
@@ -536,6 +623,88 @@ impl TerminalGrid {
         }
     }
 
+    fn main_cursor_anchor(&self) -> Option<CursorAnchor> {
+        if self.mode != GridMode::Main || self.main_rows.is_empty() {
+            return None;
+        }
+        let cursor_absolute_row = self.cursor_absolute_row().min(self.main_rows.len() - 1);
+        let mut logical_line = 0_usize;
+        let mut logical_start = 0_usize;
+        for (index, row) in self.main_rows.iter().enumerate() {
+            if index == cursor_absolute_row {
+                let logical_col = self.logical_col_in_run(logical_start, cursor_absolute_row);
+                return Some(CursorAnchor {
+                    logical_line,
+                    logical_col,
+                });
+            }
+            if !row.wrapped() {
+                logical_line = logical_line.saturating_add(1);
+                logical_start = index.saturating_add(1);
+            }
+        }
+        None
+    }
+
+    fn logical_col_in_run(&self, start_row: usize, cursor_row: usize) -> usize {
+        let prefix_rows = cursor_row.saturating_sub(start_row);
+        prefix_rows
+            .saturating_mul(self.width)
+            .saturating_add(self.cursor.col)
+    }
+
+    fn restore_main_cursor_anchor(&mut self, anchor: Option<CursorAnchor>) {
+        let Some(anchor) = anchor else {
+            self.clamp_cursor();
+            return;
+        };
+        if self.main_rows.is_empty() {
+            self.cursor.row = 0;
+            self.cursor.col = 0;
+            return;
+        }
+        let mut logical_line = 0_usize;
+        let mut run_start = 0_usize;
+        for (index, row) in self.main_rows.iter().enumerate() {
+            if logical_line == anchor.logical_line && !row.wrapped() {
+                self.place_cursor_in_main_run(run_start, index, anchor.logical_col);
+                return;
+            }
+            if !row.wrapped() {
+                logical_line = logical_line.saturating_add(1);
+                run_start = index.saturating_add(1);
+            }
+        }
+        let last_row = self.main_rows.len().saturating_sub(1);
+        if logical_line == anchor.logical_line {
+            self.place_cursor_in_main_run(run_start, last_row, anchor.logical_col);
+        } else {
+            self.place_cursor_absolute(last_row, self.width.saturating_sub(1));
+        }
+    }
+
+    fn place_cursor_in_main_run(&mut self, start_row: usize, end_row: usize, logical_col: usize) {
+        let row_offset = if self.width == 0 {
+            0
+        } else {
+            logical_col / self.width
+        };
+        let absolute_row = start_row.saturating_add(row_offset).min(end_row);
+        let col = if self.width == 0 {
+            0
+        } else {
+            logical_col % self.width
+        };
+        self.place_cursor_absolute(absolute_row, col);
+    }
+
+    fn place_cursor_absolute(&mut self, absolute_row: usize, col: usize) {
+        let viewport_start = self.main_rows.len().saturating_sub(self.height);
+        self.cursor.row = absolute_row.saturating_sub(viewport_start);
+        self.cursor.col = col;
+        self.clamp_cursor();
+    }
+
     fn active_row_mut(&mut self, absolute_row: usize) -> &mut PhysicalRow {
         match self.mode {
             GridMode::Main => &mut self.main_rows[absolute_row],
@@ -596,6 +765,42 @@ impl TerminalGrid {
             self.main_rows.pop_front();
         }
     }
+}
+
+fn row_from_snapshot(snapshot: &RowSnapshot, width: usize) -> PhysicalRow {
+    let mut row = PhysicalRow::new();
+    row.set_wrapped(snapshot.wrapped);
+    for run in &snapshot.runs {
+        let mut col = usize::from(run.start_col).min(width.saturating_sub(1));
+        for ch in run.text.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0).min(2);
+            if char_width == 0 {
+                if col > 0
+                    && let Some(cell) = row.cell_mut(col - 1)
+                    && !cell.is_wide_continuation()
+                {
+                    cell.append_combining(ch);
+                }
+                continue;
+            }
+            if col >= width {
+                break;
+            }
+            row.set_cell(
+                col,
+                Cell::new(
+                    ch.to_string(),
+                    run.style,
+                    u8::try_from(char_width).unwrap_or(1),
+                ),
+            );
+            if char_width == 2 && col + 1 < width {
+                row.set_cell(col + 1, Cell::spacer(run.style));
+            }
+            col = col.saturating_add(char_width);
+        }
+    }
+    row
 }
 
 fn indexed_color(index: i64) -> Option<Color> {
@@ -698,6 +903,43 @@ mod tests {
         let rows = grid.all_main_rows();
         assert_eq!(rows[0].cells()[1].text(), "界");
         assert!(rows[0].cells()[2].is_wide_continuation());
+    }
+
+    #[test]
+    fn combining_chars_attach_to_previous_cell() {
+        let mut grid = TerminalGrid::new(5, 2, GridLimits::default()).unwrap();
+        grid.process("e\u{301}".as_bytes());
+
+        assert_eq!(grid.all_main_rows()[0].cells()[0].text(), "e\u{301}");
+        assert_eq!(grid.cursor().col, 1);
+    }
+
+    #[test]
+    fn scrollback_limit_bounds_retained_main_rows() {
+        let mut grid = TerminalGrid::new(5, 2, GridLimits { scrollback_rows: 1 }).unwrap();
+        grid.process(b"1\r\n2\r\n3\r\n4");
+
+        assert_eq!(grid.all_main_rows().len(), 3);
+    }
+
+    #[test]
+    fn resize_remaps_cursor_to_same_logical_column() {
+        let mut grid = TerminalGrid::new(
+            10,
+            2,
+            GridLimits {
+                scrollback_rows: 20,
+            },
+        )
+        .unwrap();
+        grid.process(b"abcdefg");
+
+        grid.resize(4, 2).unwrap();
+
+        assert_eq!(grid.cursor().col, 3);
+        let rows = grid.all_main_rows();
+        assert_eq!(row_text(&rows[0]), "abcd");
+        assert_eq!(row_text(&rows[1]), "efg");
     }
 
     fn row_text(row: &PhysicalRow) -> String {

@@ -1,5 +1,86 @@
-use crate::model::{GridMode, TerminalGrid};
+use crate::delta::GridDeltaBatch;
+use crate::model::{GridLimits, GridMode, TerminalGrid, TerminalGridError};
 use vte::{Params, Perform};
+
+/// Streaming terminal parser plus structured grid state.
+///
+/// Unlike [`TerminalGrid::process`](crate::TerminalGrid::process), this type
+/// owns the `vte` parser state and therefore preserves incomplete escape
+/// sequences across PTY chunk boundaries.
+pub struct TerminalGridStream {
+    parser: vte::Parser,
+    grid: TerminalGrid,
+}
+
+impl TerminalGridStream {
+    /// Create a new streaming parser and grid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if width or height is zero.
+    pub fn new(width: u16, height: u16, limits: GridLimits) -> Result<Self, TerminalGridError> {
+        Ok(Self::from_grid(TerminalGrid::new(width, height, limits)?))
+    }
+
+    /// Wrap an existing grid with a fresh parser state.
+    #[must_use]
+    pub fn from_grid(grid: TerminalGrid) -> Self {
+        Self {
+            parser: vte::Parser::new(),
+            grid,
+        }
+    }
+
+    /// Borrow the structured grid.
+    #[must_use]
+    pub const fn grid(&self) -> &TerminalGrid {
+        &self.grid
+    }
+
+    /// Mutably borrow the structured grid.
+    pub fn grid_mut(&mut self) -> &mut TerminalGrid {
+        &mut self.grid
+    }
+
+    /// Consume the stream and return the grid.
+    #[must_use]
+    pub fn into_grid(self) -> TerminalGrid {
+        self.grid
+    }
+
+    /// Process one chunk of PTY output.
+    pub fn process(&mut self, bytes: &[u8]) {
+        let mut performer = GridPerformer {
+            grid: &mut self.grid,
+        };
+        self.parser.advance(&mut performer, bytes);
+    }
+
+    /// Process one chunk and return a structured row delta when state changed.
+    #[must_use]
+    pub fn process_delta(&mut self, bytes: &[u8]) -> Option<GridDeltaBatch> {
+        let before = self.grid.snapshot(0, usize::MAX);
+        self.process(bytes);
+        let after = self.grid.snapshot(0, usize::MAX);
+        GridDeltaBatch::between(&before, &after)
+    }
+
+    /// Resize the grid and return a structured row delta when state changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if width or height is zero.
+    pub fn resize_delta(
+        &mut self,
+        width: u16,
+        height: u16,
+    ) -> Result<Option<GridDeltaBatch>, TerminalGridError> {
+        let before = self.grid.snapshot(0, usize::MAX);
+        self.grid.resize(width, height)?;
+        let after = self.grid.snapshot(0, usize::MAX);
+        Ok(GridDeltaBatch::between(&before, &after))
+    }
+}
 
 pub(crate) fn process(grid: &mut TerminalGrid, bytes: &[u8]) {
     let mut parser = vte::Parser::new();
@@ -144,6 +225,7 @@ fn default_zero(value: Option<&i64>) -> usize {
 #[cfg(test)]
 mod tests {
     use crate::model::{GridLimits, TerminalGrid};
+    use crate::parser::TerminalGridStream;
 
     #[test]
     fn csi_cursor_position_moves_print_location() {
@@ -159,5 +241,20 @@ mod tests {
         grid.process(b"abcdef\r\x1b[K");
         let rows = grid.viewport_rows();
         assert!(rows[0].cells().is_empty());
+    }
+
+    #[test]
+    fn stream_preserves_split_escape_sequence() {
+        let mut stream = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        stream.process(b"\x1b[");
+        stream.process(b"31mR");
+
+        let grid = stream.grid();
+        let red = grid.viewport_rows()[0].cells()[0].style();
+        assert_ne!(red, crate::style::StyleId::DEFAULT);
+        assert_eq!(
+            grid.palette().get(red).fg,
+            Some(crate::style::Color::Indexed(1))
+        );
     }
 }

@@ -9875,11 +9875,13 @@ mod tests {
             .entry(pane_id)
             .or_insert_with(|| PaneRenderBuffer {
                 parser: vt100::Parser::new(4, 20, 4_096),
-                last_alternate_screen: false,
-                prev_rows: Vec::new(),
-                sync_update_in_progress: false,
-                expected_stream_start: None,
-                extension_render_cache: BTreeMap::new(),
+                terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
+                    20,
+                    4,
+                    bmux_terminal_grid::GridLimits::default(),
+                )
+                .expect("test grid dimensions are valid"),
+                ..PaneRenderBuffer::default()
             });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
         view_state
@@ -11043,11 +11045,13 @@ mod tests {
             .entry(pane_id)
             .or_insert_with(|| PaneRenderBuffer {
                 parser: vt100::Parser::new(40, 90, 4_096),
-                last_alternate_screen: false,
-                prev_rows: Vec::new(),
-                sync_update_in_progress: false,
-                expected_stream_start: None,
-                extension_render_cache: BTreeMap::new(),
+                terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
+                    90,
+                    40,
+                    bmux_terminal_grid::GridLimits::default(),
+                )
+                .expect("test grid dimensions are valid"),
+                ..PaneRenderBuffer::default()
             });
         // Enable SGR + press/release so the pane protocol reports clicks.
         append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
@@ -11164,11 +11168,13 @@ mod tests {
             .entry(pane_id)
             .or_insert_with(|| PaneRenderBuffer {
                 parser: vt100::Parser::new(38, 88, 4_096),
-                last_alternate_screen: false,
-                prev_rows: Vec::new(),
-                sync_update_in_progress: false,
-                expected_stream_start: None,
-                extension_render_cache: BTreeMap::new(),
+                terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
+                    88,
+                    38,
+                    bmux_terminal_grid::GridLimits::default(),
+                )
+                .expect("test grid dimensions are valid"),
+                ..PaneRenderBuffer::default()
             });
         append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
 
@@ -11329,11 +11335,13 @@ mod tests {
             .entry(pane_id)
             .or_insert_with(|| PaneRenderBuffer {
                 parser: vt100::Parser::new(6, 36, 4_096),
-                last_alternate_screen: false,
-                prev_rows: Vec::new(),
-                sync_update_in_progress: false,
-                expected_stream_start: None,
-                extension_render_cache: BTreeMap::new(),
+                terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
+                    36,
+                    6,
+                    bmux_terminal_grid::GridLimits::default(),
+                )
+                .expect("test grid dimensions are valid"),
+                ..PaneRenderBuffer::default()
             });
         append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
 

@@ -151,6 +151,9 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "attach-runtime-state", "attach-pane-output-batch" => |req: attach_state::AttachPaneOutputBatchArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_output_batch(&req, ctx))
         },
+        "attach-runtime-state", "attach-pane-grid-snapshot-state" => |req: attach_state::AttachPaneGridSnapshotArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_snapshot_state(&req, ctx))
+        },
         "attach-runtime-state", "attach-pane-images" => |req: attach_state::AttachPaneImagesArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_images(&req, ctx))
         },

@@ -20,6 +20,83 @@ use uuid::Uuid;
 
 type ClientResult<T> = bmux_client::Result<T>;
 
+#[allow(
+    dead_code,
+    reason = "structured attach hydration is wired in follow-up phases"
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneGridSnapshotResult {
+    pub pane_id: Uuid,
+    pub stream_end: u64,
+    pub encoded: Vec<u8>,
+}
+
+#[allow(
+    dead_code,
+    reason = "structured attach hydration is wired in follow-up phases"
+)]
+pub async fn attach_pane_grid_snapshot_state(
+    client: &mut bmux_client::BmuxClient,
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+    max_rows_per_pane: usize,
+) -> ClientResult<Vec<PaneGridSnapshotResult>> {
+    let max_rows_per_pane = u32::try_from(max_rows_per_pane).unwrap_or(u32::MAX);
+    match AttachState::client::attach_pane_grid_snapshot_state(
+        client,
+        session_id,
+        pane_ids,
+        max_rows_per_pane,
+    )
+    .await
+    {
+        Ok(Ok(state)) => Ok(state
+            .snapshots
+            .into_iter()
+            .map(|snapshot| PaneGridSnapshotResult {
+                pane_id: snapshot.pane_id,
+                stream_end: snapshot.stream_end,
+                encoded: snapshot.encoded,
+            })
+            .collect()),
+        Ok(Err(err)) => typed_server_error("attach-pane-grid-snapshot-state", err),
+        Err(err) => typed_dispatch_error("attach-pane-grid-snapshot-state", err),
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "structured attach hydration is wired in follow-up phases"
+)]
+pub async fn attach_pane_grid_snapshot_state_streaming(
+    client: &mut bmux_client::StreamingBmuxClient,
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+    max_rows_per_pane: usize,
+) -> ClientResult<Vec<PaneGridSnapshotResult>> {
+    let max_rows_per_pane = u32::try_from(max_rows_per_pane).unwrap_or(u32::MAX);
+    match AttachState::client::attach_pane_grid_snapshot_state(
+        client,
+        session_id,
+        pane_ids,
+        max_rows_per_pane,
+    )
+    .await
+    {
+        Ok(Ok(state)) => Ok(state
+            .snapshots
+            .into_iter()
+            .map(|snapshot| PaneGridSnapshotResult {
+                pane_id: snapshot.pane_id,
+                stream_end: snapshot.stream_end,
+                encoded: snapshot.encoded,
+            })
+            .collect()),
+        Ok(Err(err)) => typed_server_error("attach-pane-grid-snapshot-state", err),
+        Err(err) => typed_dispatch_error("attach-pane-grid-snapshot-state", err),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct LayoutPayload {
     panes: Vec<PaneSummary>,

@@ -251,8 +251,17 @@ pub fn resize_attach_parsers_for_scene_with_size(
         };
         let buffer = pane_buffers.entry(pane_id).or_default();
         let previous_size = buffer.parser.screen().size();
+        let previous_grid_size = (
+            buffer.terminal_grid.grid().width(),
+            buffer.terminal_grid.grid().height(),
+        );
         buffer.parser.screen_mut().set_size(inner_h, inner_w);
-        if buffer.parser.screen().size() != previous_size {
+        let _ = buffer.terminal_grid.resize_delta(inner_w, inner_h);
+        let next_grid_size = (
+            buffer.terminal_grid.grid().width(),
+            buffer.terminal_grid.grid().height(),
+        );
+        if buffer.parser.screen().size() != previous_size || next_grid_size != previous_grid_size {
             buffer.prev_rows.clear();
         }
     }

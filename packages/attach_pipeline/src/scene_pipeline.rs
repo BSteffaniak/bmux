@@ -20,12 +20,20 @@ use bmux_attach_pipeline_models::{
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState};
+use bmux_terminal_grid::{GridLimits, GridSnapshot, TerminalGrid, TerminalGridStream};
 use crossterm::cursor::{Hide, SavePosition};
 use crossterm::queue;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachPaneGridSnapshotState {
+    pub pane_id: Uuid,
+    pub stream_end: u64,
+    pub snapshot: GridSnapshot,
+}
 
 pub struct AttachScenePipeline {
     viewport: AttachViewport,
@@ -134,6 +142,27 @@ impl AttachScenePipeline {
             "hydrated attach scene from full snapshot",
             None,
         );
+    }
+
+    /// Hydrate local structured pane grids from server snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a snapshot cannot be converted into a valid grid.
+    pub fn hydrate_pane_grid_snapshots(
+        &mut self,
+        snapshots: Vec<AttachPaneGridSnapshotState>,
+    ) -> Result<()> {
+        for pane_snapshot in snapshots {
+            let grid = TerminalGrid::from_snapshot(&pane_snapshot.snapshot, GridLimits::default())?;
+            let buffer = self.pane_buffers.entry(pane_snapshot.pane_id).or_default();
+            buffer.terminal_grid = TerminalGridStream::from_grid(grid);
+            buffer.expected_stream_start = Some(pane_snapshot.stream_end);
+            buffer.prev_rows.clear();
+            self.dirty_pane_ids.insert(pane_snapshot.pane_id);
+        }
+        self.full_pane_redraw = true;
+        Ok(())
     }
 
     pub fn hydrate_pane_snapshot(&mut self, pane_ids: &[Uuid], snapshot: AttachPaneSnapshotState) {

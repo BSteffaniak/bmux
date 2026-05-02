@@ -11,9 +11,10 @@ use bmux_attach_layout_protocol::{
     PaneSummary,
 };
 use bmux_pane_runtime_plugin_api::attach_runtime_state::{
-    AttachLayout as AttachLayoutRecord, AttachPaneImages, AttachPaneOutputBatch,
-    AttachPaneSnapshot as AttachPaneSnapshotRecord, AttachSnapshot as AttachSnapshotRecord,
-    AttachStateError, PaneChunk, PaneInputMode, PaneMouseProtocol,
+    AttachLayout as AttachLayoutRecord, AttachPaneGridSnapshot, AttachPaneImages,
+    AttachPaneOutputBatch, AttachPaneSnapshot as AttachPaneSnapshotRecord,
+    AttachSnapshot as AttachSnapshotRecord, AttachStateError, PaneChunk, PaneGridSnapshot,
+    PaneInputMode, PaneMouseProtocol,
 };
 use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
@@ -43,6 +44,13 @@ pub struct AttachPaneOutputBatchArgs {
     pub session_id: Uuid,
     pub pane_ids: Vec<Uuid>,
     pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachPaneGridSnapshotArgs {
+    pub session_id: Uuid,
+    pub pane_ids: Vec<Uuid>,
+    pub max_rows_per_pane: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +199,34 @@ pub fn attach_pane_output_batch(
     Ok(AttachPaneOutputBatch {
         chunks: chunks.into_iter().map(chunk_to_record).collect(),
         output_still_pending,
+    })
+}
+
+pub fn attach_pane_grid_snapshot_state(
+    req: &AttachPaneGridSnapshotArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachPaneGridSnapshot, AttachStateError> {
+    let handle = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    let state = handle
+        .0
+        .attach_grid_snapshot_state(
+            SessionId(req.session_id),
+            caller_client_id(ctx),
+            &req.pane_ids,
+            req.max_rows_per_pane as usize,
+        )
+        .map_err(|_| AttachStateError::NotAttached)?;
+    Ok(AttachPaneGridSnapshot {
+        snapshots: state
+            .snapshots
+            .into_iter()
+            .map(|snapshot| PaneGridSnapshot {
+                pane_id: snapshot.pane_id,
+                stream_end: snapshot.stream_end,
+                encoded: snapshot.encoded,
+            })
+            .collect(),
     })
 }
 
