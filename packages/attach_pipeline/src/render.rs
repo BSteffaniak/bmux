@@ -148,6 +148,10 @@ fn queue_render_ops<W: io::Write>(
                     });
                 }
             }
+            RenderOp::StyledText { x, y, spans } => {
+                wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
+                wrote |= queue_render_styled_text(stdout, surface_rect, *x, *y, spans)?;
+            }
             RenderOp::ClearRect { rect, style } => {
                 wrote |= flush_pending_text_run(stdout, surface_rect, &mut pending_text_run)?;
                 wrote |= queue_render_clear_rect(stdout, surface_rect, *rect, *style)?;
@@ -329,6 +333,25 @@ fn queue_render_text_run<W: io::Write>(
     Ok(true)
 }
 
+fn queue_render_styled_text<W: io::Write>(
+    stdout: &mut W,
+    surface_rect: ExtensionRect,
+    x: u16,
+    y: u16,
+    spans: &[bmux_plugin::RenderTextSpan],
+) -> Result<bool> {
+    let mut wrote = false;
+    let mut cursor = x;
+    for span in spans {
+        if span.text.is_empty() {
+            continue;
+        }
+        wrote |= queue_render_text_run(stdout, surface_rect, cursor, y, &span.text, span.style)?;
+        cursor = cursor.saturating_add(render_text_width_u16(&span.text));
+    }
+    Ok(wrote)
+}
+
 fn queue_render_clear_rect<W: io::Write>(
     stdout: &mut W,
     surface_rect: ExtensionRect,
@@ -474,6 +497,14 @@ fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
             x: *x,
             y: *y,
             w: render_text_width_u16(text),
+            h: 1,
+        },
+        RenderOp::StyledText { x, y, spans } => ExtensionRect {
+            x: *x,
+            y: *y,
+            w: spans.iter().fold(0_u16, |width, span| {
+                width.saturating_add(render_text_width_u16(&span.text))
+            }),
             h: 1,
         },
         RenderOp::ClearRect { rect, .. }
@@ -2697,6 +2728,50 @@ mod tests {
         assert!(output.contains("\u{1b}[1;2H   "), "{output:?}");
         assert!(output.contains("\u{1b}[2;2H   "), "{output:?}");
         assert!(output.contains("\u{1b}[2;6H  "), "{output:?}");
+    }
+
+    #[test]
+    fn queue_render_ops_applies_styled_text_spans() {
+        let ops = [RenderOp::StyledText {
+            x: 0,
+            y: 0,
+            spans: vec![
+                bmux_plugin::RenderTextSpan {
+                    text: "hi".to_string(),
+                    style: RenderStyle {
+                        bold: true,
+                        ..RenderStyle::default()
+                    },
+                },
+                bmux_plugin::RenderTextSpan {
+                    text: "!".to_string(),
+                    style: RenderStyle {
+                        fg: Some(RenderColor::Named(RenderNamedColor::BrightRed)),
+                        ..RenderStyle::default()
+                    },
+                },
+            ],
+        }];
+        let mut output = Vec::new();
+
+        assert!(
+            queue_render_ops(
+                &mut output,
+                ExtensionRect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 1,
+                },
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+            .expect("styled text op should queue")
+        );
+
+        let output = String::from_utf8(output).expect("render op bytes should be utf8");
+        assert!(output.contains("\u{1b}[1m\u{1b}[1;1Hhi"), "{output:?}");
+        assert!(output.contains("\u{1b}[38;5;9m\u{1b}[1;3H!"), "{output:?}");
     }
 
     #[test]

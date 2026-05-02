@@ -212,6 +212,12 @@ pub struct RenderStyle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderTextSpan {
+    pub text: String,
+    pub style: RenderStyle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderCell {
     /// Display-cell glyph to paint. `None` represents a transparent/sparse
     /// cell: it reserves a grid position but emits no terminal bytes.
@@ -260,6 +266,11 @@ pub enum RenderOp {
         y: u16,
         text: String,
         style: RenderStyle,
+    },
+    StyledText {
+        x: u16,
+        y: u16,
+        spans: Vec<RenderTextSpan>,
     },
     /// Clear a rectangle by painting spaces with `style`. This is semantically
     /// distinct from `FillRect { ch: ' ', .. }` so lower layers can eventually
