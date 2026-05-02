@@ -265,7 +265,7 @@ pub(super) async fn dispatch_built_in_command(
             .await
         }
         (BuiltInHandlerId::Join, Command::Join { link, session }) => {
-            run_join(link.as_deref(), session.as_deref()).await
+            Box::pin(run_join(link.as_deref(), session.as_deref())).await
         }
         (BuiltInHandlerId::Hosts, Command::Hosts { verbose }) => run_hosts(*verbose),
         (

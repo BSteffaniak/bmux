@@ -334,7 +334,7 @@ Supported attach-sim actions:
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `seed-window-list` | Seed fake windows: `names='one,two' active='one'`                                                                                                                |
 | `seed-pane-text`   | Seed fake focused-pane text for scrollback/selection scenarios: `lines='one\|two' cursor_row=2 cursor_col=1`                                                     |
-| `seed-pane-layout` | Seed fake pane layout for mouse/layout scenarios, currently `split='vertical'`                                                                                   |
+| `seed-pane-layout` | Seed fake pane layout for mouse/layout scenarios, currently `split='vertical'` or `split='floating'`                                                             |
 | `set-config`       | Set supported sim config, currently `status_bar.tab_order=mru\|stable` and `appearance.status_position=top\|bottom`                                              |
 | `render`           | Re-render fake attach status UI                                                                                                                                  |
 | `snapshot`         | Capture the current attach-sim render in the playbook result snapshots                                                                                           |
@@ -342,7 +342,7 @@ Supported attach-sim actions:
 | `terminal-event`   | Send normalized terminal input; currently mouse events are supported                                                                                             |
 | `send-attach`      | Send an attach key chord through the attach keybinding processor in simulation                                                                                   |
 | `assert-rendered`  | Assert rendered output contains or matches text                                                                                                                  |
-| `assert-effect`    | Assert an effect such as `move-window` or `resize-pane` was emitted                                                                                              |
+| `assert-effect`    | Assert an effect such as `move-window`, `resize-pane`, `focus-pane`, or `move-floating-pane` was emitted                                                         |
 | `assert-no-effect` | Assert an effect was not emitted                                                                                                                                 |
 | `assert-state`     | Assert fake state; currently supports `windows.names`, `windows.active_name`, `scrollback.active`, `scrollback.cursor`, `selection.active`, and `selection.text` |
 

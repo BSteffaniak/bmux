@@ -414,6 +414,14 @@ pub enum AttachUiEffect {
         direction: PaneResizeDirection,
         cells: u16,
     },
+    FocusPane {
+        pane_id: Uuid,
+    },
+    MoveFloatingPane {
+        pane_id: Uuid,
+        x: u16,
+        y: u16,
+    },
     ShowTransientStatus {
         message: String,
     },

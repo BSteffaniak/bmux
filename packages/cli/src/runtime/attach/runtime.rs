@@ -8185,7 +8185,17 @@ async fn handle_attach_mouse_event_at(
         return Ok(());
     }
 
-    if handle_attach_mouse_floating_drag(client, view_state, mouse_event).await? {
+    let floating_reduction =
+        reduce_attach_mouse_floating_drag_event(view_state, TerminalMouseEvent::from(mouse_event));
+    if floating_reduction.consumed {
+        execute_attach_ui_effects(
+            client,
+            view_state,
+            floating_reduction.effects,
+            kernel_client_factory,
+            now,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -8403,24 +8413,20 @@ async fn handle_attach_mouse_event_at(
     Ok(())
 }
 
-async fn handle_attach_mouse_floating_drag(
-    client: &mut StreamingBmuxClient,
+pub fn reduce_attach_mouse_floating_drag_event(
     view_state: &mut AttachViewState,
-    mouse_event: MouseEvent,
-) -> std::result::Result<bool, ClientError> {
-    match mouse_event.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            let Some(surface) = attach_scene_floating_drag_surface_at(
-                view_state,
-                mouse_event.column,
-                mouse_event.row,
-            ) else {
-                return Ok(false);
+    mouse_event: TerminalMouseEvent,
+) -> AttachUiReduction {
+    match (mouse_event.phase, mouse_event.button) {
+        (TerminalMousePhase::Down, Some(TerminalMouseButton::Left)) => {
+            let Some(surface) =
+                attach_scene_floating_drag_surface_at(view_state, mouse_event.col, mouse_event.row)
+            else {
+                return AttachUiReduction::ignored();
             };
             let Some(pane_id) = surface.pane_id else {
-                return Ok(false);
+                return AttachUiReduction::ignored();
             };
-            focus_attach_pane(client, view_state, pane_id).await?;
             view_state.mouse.selection_drag = None;
             let (scene_max_x, scene_max_y) =
                 attach_scene_bounds(view_state).unwrap_or((u16::MAX, u16::MAX));
@@ -8434,36 +8440,59 @@ async fn handle_attach_mouse_floating_drag(
                 scene_max_y,
                 last_x: surface.rect.x,
                 last_y: surface.rect.y,
-                start_column: mouse_event.column,
+                start_column: mouse_event.col,
                 start_row: mouse_event.row,
             });
-            Ok(true)
+            AttachUiReduction::with_effect(AttachUiEffect::FocusPane { pane_id })
         }
-        MouseEventKind::Drag(MouseButton::Left) => {
+        (TerminalMousePhase::Drag, Some(TerminalMouseButton::Left)) => {
             let Some(mut drag) = view_state.mouse.floating_drag.take() else {
-                return Ok(false);
+                return AttachUiReduction::ignored();
             };
-            let (x, y) = floating_drag_position(drag, mouse_event.column, mouse_event.row);
-            if x != drag.last_x || y != drag.last_y {
-                move_attach_floating_pane(client, view_state, drag.pane_id, x, y).await?;
-                drag.last_x = x;
-                drag.last_y = y;
-            }
+            let effect = floating_drag_move_effect(&mut drag, mouse_event.col, mouse_event.row);
             view_state.mouse.floating_drag = Some(drag);
-            Ok(true)
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            let Some(drag) = view_state.mouse.floating_drag.take() else {
-                return Ok(false);
-            };
-            let (x, y) = floating_drag_position(drag, mouse_event.column, mouse_event.row);
-            if x != drag.last_x || y != drag.last_y {
-                move_attach_floating_pane(client, view_state, drag.pane_id, x, y).await?;
+            AttachUiReduction {
+                consumed: true,
+                effects: effect.into_iter().collect(),
             }
-            Ok(true)
         }
-        _ => Ok(view_state.mouse.floating_drag.is_some()),
+        (TerminalMousePhase::Up, Some(TerminalMouseButton::Left)) => {
+            let Some(mut drag) = view_state.mouse.floating_drag.take() else {
+                return AttachUiReduction::ignored();
+            };
+            AttachUiReduction {
+                consumed: true,
+                effects: floating_drag_move_effect(&mut drag, mouse_event.col, mouse_event.row)
+                    .into_iter()
+                    .collect(),
+            }
+        }
+        _ => {
+            if view_state.mouse.floating_drag.is_some() {
+                AttachUiReduction::consumed()
+            } else {
+                AttachUiReduction::ignored()
+            }
+        }
     }
+}
+
+fn floating_drag_move_effect(
+    drag: &mut AttachMouseFloatingDrag,
+    column: u16,
+    row: u16,
+) -> Option<AttachUiEffect> {
+    let (x, y) = floating_drag_position(*drag, column, row);
+    if x == drag.last_x && y == drag.last_y {
+        return None;
+    }
+    drag.last_x = x;
+    drag.last_y = y;
+    Some(AttachUiEffect::MoveFloatingPane {
+        pane_id: drag.pane_id,
+        x,
+        y,
+    })
 }
 
 pub fn reduce_attach_mouse_resize_event(
@@ -9041,6 +9070,12 @@ async fn execute_attach_ui_effects(
                         "attach.mouse_resize.apply_failed"
                     );
                 }
+            }
+            AttachUiEffect::FocusPane { pane_id } => {
+                focus_attach_pane(client, view_state, pane_id).await?;
+            }
+            AttachUiEffect::MoveFloatingPane { pane_id, x, y } => {
+                move_attach_floating_pane(client, view_state, pane_id, x, y).await?;
             }
             AttachUiEffect::ShowTransientStatus { message } => {
                 view_state.set_transient_status(message, now, ATTACH_TRANSIENT_STATUS_TTL);

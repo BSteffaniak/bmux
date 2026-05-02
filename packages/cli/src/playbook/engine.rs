@@ -1991,6 +1991,7 @@ fn execute_attach_sim_step(
             let split = runtime_vars.resolve_opt(split);
             match split.as_str() {
                 "vertical" => sim.seed_vertical_split_panes(),
+                "floating" => sim.seed_floating_pane_layout(),
                 other => bail!("unsupported attach-sim pane layout split '{other}'"),
             }
             Ok(Some(format!("seeded {split} pane layout")))
@@ -2182,6 +2183,10 @@ const fn attach_sim_effect_operation(
         crate::runtime::attach::state::AttachUiEffect::SwitchWindow { .. } => "switch-window",
         crate::runtime::attach::state::AttachUiEffect::MoveWindow { .. } => "move-window",
         crate::runtime::attach::state::AttachUiEffect::ResizePane { .. } => "resize-pane",
+        crate::runtime::attach::state::AttachUiEffect::FocusPane { .. } => "focus-pane",
+        crate::runtime::attach::state::AttachUiEffect::MoveFloatingPane { .. } => {
+            "move-floating-pane"
+        }
         crate::runtime::attach::state::AttachUiEffect::ShowTransientStatus { .. } => {
             "show-transient-status"
         }

@@ -1,8 +1,8 @@
 use super::input::{TerminalGeometry, TerminalMouseEvent};
 use super::runtime::{
     attach_key_event_actions, attach_tab_drop_marker_col, handle_attach_ui_action_at,
-    reduce_attach_mouse_resize_event, reduce_attach_status_tab_mouse_event,
-    status_row_for_position,
+    reduce_attach_mouse_floating_drag_event, reduce_attach_mouse_resize_event,
+    reduce_attach_status_tab_mouse_event, status_row_for_position,
 };
 use super::state::{AttachTabDropPlacement, AttachUiEffect, AttachViewState, PaneRenderBuffer};
 use crate::input::InputProcessor;
@@ -13,7 +13,6 @@ use bmux_attach_layout_protocol::{
     AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
     PaneLayoutNode, PaneState, PaneSummary,
 };
-use bmux_attach_pipeline::render::append_pane_output;
 use bmux_client::{AttachLayoutState, AttachOpenInfo};
 use bmux_config::{StatusBarConfig, StatusPosition, StatusTabOrder};
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
@@ -157,6 +156,9 @@ impl AttachSimHarness {
             reduction = reduce_attach_mouse_resize_event(&mut self.view_state, event, self.now);
         }
         if !reduction.consumed {
+            reduction = reduce_attach_mouse_floating_drag_event(&mut self.view_state, event);
+        }
+        if !reduction.consumed {
             return;
         }
         for effect in reduction.effects {
@@ -257,6 +259,95 @@ impl AttachSimHarness {
         });
     }
 
+    pub fn seed_floating_pane_layout(&mut self) {
+        let tiled_pane = Uuid::from_u128(31);
+        let floating_pane = Uuid::from_u128(32);
+        let height = self.geometry.rows.saturating_sub(1).max(8);
+        self.view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: self.view_state.attached_context_id,
+            session_id: self.view_state.attached_id,
+            focused_pane_id: tiled_pane,
+            panes: vec![
+                PaneSummary {
+                    id: tiled_pane,
+                    index: 1,
+                    name: Some("tiled".to_string()),
+                    focused: true,
+                    state: PaneState::Running,
+                    state_reason: None,
+                },
+                PaneSummary {
+                    id: floating_pane,
+                    index: 2,
+                    name: Some("float".to_string()),
+                    focused: false,
+                    state: PaneState::Running,
+                    state_reason: None,
+                },
+            ],
+            layout_root: PaneLayoutNode::Leaf {
+                pane_id: tiled_pane,
+            },
+            scene: AttachScene {
+                session_id: self.view_state.attached_id,
+                focus: AttachFocusTarget::Pane {
+                    pane_id: tiled_pane,
+                },
+                surfaces: vec![
+                    AttachSurface {
+                        id: Uuid::from_u128(33),
+                        kind: AttachSurfaceKind::Pane,
+                        layer: AttachLayer::Pane,
+                        z: 0,
+                        pane_id: Some(tiled_pane),
+                        rect: AttachRect {
+                            x: 0,
+                            y: 0,
+                            w: 40,
+                            h: height,
+                        },
+                        content_rect: AttachRect {
+                            x: 1,
+                            y: 1,
+                            w: 38,
+                            h: height.saturating_sub(2).max(1),
+                        },
+                        interactive_regions: Vec::new(),
+                        opaque: true,
+                        visible: true,
+                        accepts_input: true,
+                        cursor_owner: true,
+                    },
+                    AttachSurface {
+                        id: Uuid::from_u128(34),
+                        kind: AttachSurfaceKind::FloatingPane,
+                        layer: AttachLayer::FloatingPane,
+                        z: 10,
+                        pane_id: Some(floating_pane),
+                        rect: AttachRect {
+                            x: 2,
+                            y: 2,
+                            w: 10,
+                            h: 6,
+                        },
+                        content_rect: AttachRect {
+                            x: 3,
+                            y: 3,
+                            w: 8,
+                            h: 4,
+                        },
+                        interactive_regions: Vec::new(),
+                        opaque: true,
+                        visible: true,
+                        accepts_input: true,
+                        cursor_owner: false,
+                    },
+                ],
+            },
+            zoomed: false,
+        });
+    }
+
     pub fn seed_pane_lines(&mut self, lines: &[&str], cursor_row: u16, cursor_col: u16) {
         let pane_id = Uuid::from_u128(10);
         let content_width = lines
@@ -320,7 +411,6 @@ impl AttachSimHarness {
             .pane_buffers
             .entry(pane_id)
             .or_insert_with(|| PaneRenderBuffer {
-                parser: vt100::Parser::new(content_height, content_width, 4_096),
                 terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
                     content_width,
                     content_height,
@@ -329,7 +419,6 @@ impl AttachSimHarness {
                 .expect("attach-sim pane grid dimensions are valid"),
                 ..PaneRenderBuffer::default()
             });
-        buffer.parser = vt100::Parser::new(content_height, content_width, 4_096);
         buffer.terminal_grid = bmux_terminal_grid::TerminalGridStream::new(
             content_width,
             content_height,
@@ -338,7 +427,7 @@ impl AttachSimHarness {
         .expect("attach-sim pane grid dimensions are valid");
         let mut bytes = lines.join("\r\n").into_bytes();
         bytes.extend_from_slice(format!("\x1b[{cursor_row};{cursor_col}H").as_bytes());
-        append_pane_output(buffer, &bytes);
+        append_sim_pane_output(buffer, &bytes);
         self.view_state.exit_scrollback();
     }
 
@@ -493,8 +582,45 @@ impl AttachSimHarness {
                 );
             }
             AttachUiEffect::ResizePane { .. } | AttachUiEffect::ShowTransientStatus { .. } => {}
+            AttachUiEffect::FocusPane { pane_id } => {
+                if let Some(layout_state) = &mut self.view_state.cached_layout_state {
+                    layout_state.focused_pane_id = pane_id;
+                    layout_state.scene.focus = AttachFocusTarget::Pane { pane_id };
+                    for pane in &mut layout_state.panes {
+                        pane.focused = pane.id == pane_id;
+                    }
+                }
+                self.view_state.mouse.last_focused_pane_id = Some(pane_id);
+            }
+            AttachUiEffect::MoveFloatingPane { pane_id, x, y } => {
+                if let Some(layout_state) = &mut self.view_state.cached_layout_state {
+                    for surface in &mut layout_state.scene.surfaces {
+                        if surface.pane_id == Some(pane_id)
+                            && surface.kind == AttachSurfaceKind::FloatingPane
+                        {
+                            let inner_x_offset =
+                                surface.content_rect.x.saturating_sub(surface.rect.x);
+                            let inner_y_offset =
+                                surface.content_rect.y.saturating_sub(surface.rect.y);
+                            surface.rect.x = x;
+                            surface.rect.y = y;
+                            surface.content_rect.x = x.saturating_add(inner_x_offset);
+                            surface.content_rect.y = y.saturating_add(inner_y_offset);
+                        }
+                    }
+                }
+            }
         }
         self.effects.push(effect);
+    }
+}
+
+fn append_sim_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
+    let was_alternate = buffer.protocol_tracker.alternate_screen();
+    let _ = buffer.protocol_tracker.process(bytes);
+    buffer.terminal_grid.process(bytes);
+    if was_alternate != buffer.protocol_tracker.alternate_screen() {
+        buffer.prev_rows.clear();
     }
 }
 
@@ -704,6 +830,27 @@ mod tests {
                     cells: 3,
                     ..
                 }
+            )
+        }));
+    }
+
+    #[test]
+    fn attach_sim_mouse_floating_drag_emits_move_effect() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_floating_pane_layout();
+
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, 2, 2));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Drag, 6, 4));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, 6, 4));
+
+        assert!(sim.effects().iter().any(|effect| {
+            matches!(
+                effect,
+                AttachUiEffect::MoveFloatingPane {
+                    pane_id,
+                    x: 6,
+                    y: 4,
+                } if *pane_id == Uuid::from_u128(32)
             )
         }));
     }
