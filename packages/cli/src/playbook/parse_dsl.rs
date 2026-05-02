@@ -278,6 +278,9 @@ pub fn parse_action_line(line: &str) -> Result<Action> {
             let contains = args.get("contains").cloned();
             let not_contains = args.get("not_contains").cloned();
             let matches = args.get("matches").cloned();
+            let scrollback = args
+                .get("scrollback")
+                .is_some_and(|value| value == "true" || value == "1");
             if contains.is_none() && not_contains.is_none() && matches.is_none() {
                 bail!("assert-screen requires at least one of: contains, not_contains, matches");
             }
@@ -286,6 +289,7 @@ pub fn parse_action_line(line: &str) -> Result<Action> {
                 contains,
                 not_contains,
                 matches,
+                scrollback,
             })
         }
         "assert-layout" => {
@@ -779,11 +783,13 @@ snapshot id=final
                 contains,
                 not_contains,
                 matches,
+                scrollback,
             } => {
                 assert_eq!(*pane, Some(0));
                 assert_eq!(contains.as_deref(), Some("hello world"));
                 assert!(not_contains.is_none());
                 assert!(matches.is_none());
+                assert!(!*scrollback);
             }
             _ => panic!("expected assert-screen"),
         }

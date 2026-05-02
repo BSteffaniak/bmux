@@ -547,6 +547,7 @@ fn parse_and_validate_fixtures() {
         "render_assert_alt_screen_transition.dsl",
         "structured_reflow_basic.dsl",
         "structured_reflow_layout.dsl",
+        "structured_reflow_scrollback.dsl",
         "attach_sim_tab_drag.dsl",
         "attach_sim_tab_drag_no_motion.dsl",
         "attach_sim_tab_drag_left_half.dsl",
@@ -645,6 +646,16 @@ fn playbook_structured_reflow_layout_changes() {
     assert!(
         pass,
         "structured reflow layout playbook should pass: {json:#}"
+    );
+}
+
+#[test]
+#[serial]
+fn playbook_structured_reflow_scrollback() {
+    let (json, pass) = run_playbook_fixture("structured_reflow_scrollback.dsl");
+    assert!(
+        pass,
+        "structured reflow scrollback playbook should pass: {json:#}"
     );
 }
 

@@ -702,30 +702,6 @@ fn apply_attach_output_chunk_protocol_only(
     outcome
 }
 
-struct RawGridFallbackChunk {
-    pane_id: Uuid,
-    data: Vec<u8>,
-}
-
-fn apply_attach_raw_grid_fallback_chunks(
-    view_state: &mut AttachViewState,
-    chunks: Vec<RawGridFallbackChunk>,
-    frame_needs_render: &mut bool,
-) {
-    for chunk in chunks {
-        if chunk.data.is_empty() {
-            continue;
-        }
-        let buffer = view_state.pane_buffers.entry(chunk.pane_id).or_default();
-        buffer.terminal_grid.process(&chunk.data);
-        buffer.prev_rows.clear();
-        view_state
-            .dirty
-            .mark_pane_dirty(chunk.pane_id, AttachDirtySource::PaneOutput);
-        *frame_needs_render = true;
-    }
-}
-
 async fn recover_attach_output_desync_for_pane(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -2684,8 +2660,8 @@ pub async fn run_session_attach_with_client(
             // We keep draining while either signal is active, bounded by a
             // time budget to keep the event loop responsive.
             let mut last_round_had_data = false;
+            let mut drained_any_data = false;
             let mut recovered_output_desync = false;
-            let mut raw_grid_fallback_chunks = Vec::new();
             let drain_start = Instant::now();
             for _round in 0..ATTACH_OUTPUT_DRAIN_MAX_ROUNDS {
                 perf_window.record_drain_round();
@@ -2739,13 +2715,8 @@ pub async fn run_session_attach_with_client(
                             had_data: chunk_had_data,
                         } => {
                             had_data |= chunk_had_data;
+                            drained_any_data |= chunk_had_data;
                             any_sync_active |= sync_update_active;
-                            if chunk_had_data {
-                                raw_grid_fallback_chunks.push(RawGridFallbackChunk {
-                                    pane_id,
-                                    data: chunk.data,
-                                });
-                            }
                         }
                         AttachChunkApplyOutcome::Stale => {}
                         AttachChunkApplyOutcome::Desync => {
@@ -2756,7 +2727,6 @@ pub async fn run_session_attach_with_client(
                 }
 
                 if let Some(desynced_pane_id) = desynced_pane_id {
-                    raw_grid_fallback_chunks.clear();
                     recover_attach_output_desync_for_pane(
                         &mut client,
                         &mut view_state,
@@ -2788,17 +2758,25 @@ pub async fn run_session_attach_with_client(
                 }
             }
             if !recovered_output_desync {
-                if apply_attach_structured_grid_deltas(&mut client, &mut view_state, pane_ids)
-                    .await?
+                let structured_delta_applied = apply_attach_structured_grid_deltas(
+                    &mut client,
+                    &mut view_state,
+                    pane_ids.clone(),
+                )
+                .await?;
+                let structured_snapshot_hydrated = if structured_delta_applied || !drained_any_data
                 {
-                    frame_needs_render = true;
+                    false
                 } else {
-                    apply_attach_raw_grid_fallback_chunks(
+                    !hydrate_attach_structured_grid_snapshots(
+                        &mut client,
                         &mut view_state,
-                        raw_grid_fallback_chunks,
-                        &mut frame_needs_render,
-                    );
-                }
+                        pane_ids,
+                    )
+                    .await?
+                    .is_empty()
+                };
+                frame_needs_render |= structured_delta_applied || structured_snapshot_hydrated;
             }
 
             // Keep output pending if the last round still produced bytes OR
@@ -6854,7 +6832,7 @@ async fn apply_attach_structured_grid_deltas(
     {
         Ok(deltas) => deltas,
         Err(error) => {
-            tracing::debug!(%error, "structured pane grid delta unavailable; continuing with local raw-fed grid");
+            tracing::debug!(%error, "structured pane grid delta unavailable; structured snapshot recovery will be attempted by caller");
             return Ok(false);
         }
     };
@@ -11152,7 +11130,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_incremental_path_defers_raw_bytes_to_grid_fallback() {
+    fn structured_incremental_path_does_not_feed_raw_bytes_to_grid() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         let pane_id = view_state
             .cached_layout_state
@@ -11193,23 +11171,7 @@ mod tests {
             before_revision
         );
 
-        let mut frame_needs_render = false;
-        super::apply_attach_raw_grid_fallback_chunks(
-            &mut view_state,
-            vec![super::RawGridFallbackChunk {
-                pane_id,
-                data: b"abc".to_vec(),
-            }],
-            &mut frame_needs_render,
-        );
-
-        let fallback_buffer = view_state
-            .pane_buffers
-            .get(&pane_id)
-            .expect("pane render buffer");
-        assert!(fallback_buffer.terminal_grid.grid().revision() > before_revision);
-        assert!(frame_needs_render);
-        assert!(view_state.dirty.pane_dirty_ids.contains(&pane_id));
+        assert!(!view_state.dirty.pane_dirty_ids.contains(&pane_id));
     }
 
     #[test]

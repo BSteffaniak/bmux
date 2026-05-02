@@ -38,6 +38,7 @@ use crossterm::terminal::{
     enable_raw_mode,
 };
 use crossterm::{execute, queue};
+use regex::Regex;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -3563,6 +3564,7 @@ pub(super) async fn execute_step(
             contains,
             not_contains,
             matches,
+            scrollback,
         } => {
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
@@ -3579,13 +3581,16 @@ pub(super) async fn execute_step(
             .await?;
             let snapshot = inspector.refresh(client, sid).await?;
             let pane_idx = inspector.resolve_pane_index(*pane, &snapshot)?;
+            let text = if *scrollback {
+                inspector.pane_scrollback_text(pane_idx)
+            } else {
+                inspector.pane_text(pane_idx)
+            }
+            .unwrap_or_else(|| "<no text>".to_string());
 
             if let Some(needle) = contains {
                 let resolved = runtime_vars.resolve_opt(needle);
-                if !inspector.pane_contains(pane_idx, &resolved) {
-                    let text = inspector
-                        .pane_text(pane_idx)
-                        .unwrap_or_else(|| "<no text>".to_string());
+                if !text.contains(&resolved) {
                     return Err(StepFailure::assertion(
                         format!("assert-screen: pane {pane_idx} does not contain '{resolved}'"),
                         resolved,
@@ -3597,10 +3602,7 @@ pub(super) async fn execute_step(
 
             if let Some(needle) = not_contains {
                 let resolved = runtime_vars.resolve_opt(needle);
-                if inspector.pane_contains(pane_idx, &resolved) {
-                    let text = inspector
-                        .pane_text(pane_idx)
-                        .unwrap_or_else(|| "<no text>".to_string());
+                if text.contains(&resolved) {
                     return Err(StepFailure::assertion(
                         format!(
                             "assert-screen: pane {pane_idx} unexpectedly contains '{resolved}'"
@@ -3614,10 +3616,9 @@ pub(super) async fn execute_step(
 
             if let Some(pattern) = matches {
                 let resolved = runtime_vars.resolve_opt(pattern);
-                if !inspector.pane_matches(pane_idx, &resolved)? {
-                    let text = inspector
-                        .pane_text(pane_idx)
-                        .unwrap_or_else(|| "<no text>".to_string());
+                let re =
+                    Regex::new(&resolved).with_context(|| format!("invalid regex: {resolved}"))?;
+                if !re.is_match(&text) {
                     return Err(StepFailure::assertion(
                         format!("assert-screen: pane {pane_idx} does not match '{resolved}'"),
                         resolved,

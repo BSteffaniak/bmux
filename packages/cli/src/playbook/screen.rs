@@ -565,13 +565,25 @@ impl ScreenInspector {
         }
     }
 
-    /// Get the full screen text of a specific pane (by index).
+    /// Get the visible screen text of a specific pane (by index).
     #[must_use]
     pub fn pane_text(&self, pane_index: u32) -> Option<String> {
         self.panes
             .iter()
             .find(|p| p.pane_index == pane_index)
             .map(|p| p.screen_text.clone())
+    }
+
+    /// Get all retained main-screen text for a specific pane (by index).
+    #[must_use]
+    pub fn pane_scrollback_text(&self, pane_index: u32) -> Option<String> {
+        let pane_id = self
+            .pane_states
+            .values()
+            .find(|state| state.pane_index == pane_index)
+            .map(|state| state.pane_id)?;
+        let grid = self.pane_states.get(&pane_id)?.terminal_grid.as_ref()?;
+        Some(terminal_grid_rows_to_text(grid.grid().all_main_rows()))
     }
 
     /// Get cursor position for a pane (by index). Returns (row, col).
@@ -870,8 +882,11 @@ fn build_pane_content_dimensions_from_scene(
 }
 
 fn terminal_grid_to_text(grid: &bmux_terminal_grid::TerminalGrid, rows: usize) -> String {
-    let mut lines = grid
-        .display_rows(0, rows)
+    terminal_grid_rows_to_text(grid.display_rows(0, rows))
+}
+
+fn terminal_grid_rows_to_text(rows: Vec<bmux_terminal_grid::PhysicalRow>) -> String {
+    let mut lines = rows
         .into_iter()
         .map(|row| {
             let mut line = String::new();

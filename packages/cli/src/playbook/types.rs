@@ -202,6 +202,7 @@ pub enum Action {
         contains: Option<String>,
         not_contains: Option<String>,
         matches: Option<String>,
+        scrollback: bool,
     },
     /// Assert layout structure.
     AssertLayout { pane_count: u32 },
@@ -714,6 +715,7 @@ impl Action {
                 contains,
                 not_contains,
                 matches,
+                scrollback,
             } => {
                 let mut line = "assert-screen".to_string();
                 if let Some(p) = pane {
@@ -727,6 +729,9 @@ impl Action {
                 }
                 if let Some(m) = matches {
                     write!(line, " matches='{}'", escape_single_quote(m)).unwrap();
+                }
+                if *scrollback {
+                    line.push_str(" scrollback=true");
                 }
                 line
             }
@@ -1238,6 +1243,7 @@ mod tests {
             contains: Some("hello".to_string()),
             not_contains: Some("error".to_string()),
             matches: Some("\\d+".to_string()),
+            scrollback: true,
         };
         let (_, parsed) = round_trip(&action);
         match parsed {
@@ -1246,11 +1252,13 @@ mod tests {
                 contains,
                 not_contains,
                 matches,
+                scrollback,
             } => {
                 assert_eq!(pane, Some(1));
                 assert_eq!(contains.as_deref(), Some("hello"));
                 assert_eq!(not_contains.as_deref(), Some("error"));
                 assert_eq!(matches.as_deref(), Some("\\d+"));
+                assert!(scrollback);
             }
             other => panic!("expected AssertScreen, got {other:?}"),
         }

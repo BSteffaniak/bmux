@@ -168,6 +168,7 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
                 contains: step.contains,
                 not_contains: step.not_contains,
                 matches: step.matches,
+                scrollback: step.scrollback.unwrap_or(false),
             })
         }
         "assert-layout" => {
@@ -400,6 +401,7 @@ struct RawStep {
     contains: Option<String>,
     not_contains: Option<String>,
     matches: Option<String>,
+    scrollback: Option<bool>,
     pane_count: Option<u32>,
     row: Option<u16>,
     col: Option<u16>,
