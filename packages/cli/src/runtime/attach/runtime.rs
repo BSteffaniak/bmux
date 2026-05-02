@@ -4337,10 +4337,6 @@ fn enqueue_final_pane_action_prompt(
     );
 }
 
-pub fn handle_attach_ui_action(action: &RuntimeAction, view_state: &mut AttachViewState) {
-    handle_attach_ui_action_at(action, view_state, Instant::now());
-}
-
 #[allow(clippy::too_many_lines)]
 pub fn handle_attach_ui_action_at(
     action: &RuntimeAction,
@@ -7614,6 +7610,7 @@ pub async fn handle_attach_terminal_event(
     display_capture: &mut DisplayCaptureFanout,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
+    let now = Instant::now();
     if matches!(terminal_event, Event::Resize(_, _)) {
         update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
     }
@@ -7624,7 +7621,8 @@ pub async fn handle_attach_terminal_event(
                 match view_state.prompt.handle_key_event(key) {
                     PromptKeyDisposition::Completed(completion) => {
                         if let Some(control) =
-                            handle_attach_prompt_completion(client, view_state, completion).await?
+                            handle_attach_prompt_completion_at(client, view_state, completion, now)
+                                .await?
                         {
                             return Ok(control);
                         }
@@ -7642,9 +7640,10 @@ pub async fn handle_attach_terminal_event(
                 if let Event::Mouse(mouse) = terminal_event {
                     match view_state.prompt.handle_mouse_event(mouse) {
                         PromptKeyDisposition::Completed(completion) => {
-                            if let Some(control) =
-                                handle_attach_prompt_completion(client, view_state, completion)
-                                    .await?
+                            if let Some(control) = handle_attach_prompt_completion_at(
+                                client, view_state, completion, now,
+                            )
+                            .await?
                             {
                                 return Ok(control);
                             }
@@ -7683,7 +7682,7 @@ pub async fn handle_attach_terminal_event(
     {
         match attach_action {
             AttachEventAction::Detach => {
-                return try_detach_or_continue(client, view_state).await;
+                return try_detach_or_continue_at(client, view_state, now).await;
             }
             AttachEventAction::Send(bytes) => {
                 if view_state.help_overlay_open || view_state.prompt.is_active() {
@@ -7729,7 +7728,7 @@ pub async fn handle_attach_terminal_event(
                 {
                     view_state.set_transient_status(
                         format!("plugin action failed: {}", map_attach_client_error(error)),
-                        Instant::now(),
+                        now,
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
@@ -7746,7 +7745,7 @@ pub async fn handle_attach_terminal_event(
                 {
                     view_state.set_transient_status(
                         format!("mouse action failed: {}", map_attach_client_error(error)),
-                        Instant::now(),
+                        now,
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
@@ -7767,7 +7766,7 @@ pub async fn handle_attach_terminal_event(
                         Err(error) => {
                             view_state.set_transient_status(
                                 format!("profile switch failed: {error}"),
-                                Instant::now(),
+                                now,
                                 ATTACH_TRANSIENT_STATUS_TTL,
                             );
                         }
@@ -7804,7 +7803,7 @@ pub async fn handle_attach_terminal_event(
                 }
                 let prompt_only_action = matches!(action, RuntimeAction::Quit)
                     || is_windows_close_active_pane_action(&action);
-                handle_attach_ui_action(&action, view_state);
+                handle_attach_ui_action_at(&action, view_state, now);
                 if prompt_only_action && view_state.prompt.is_active() {
                     view_state
                         .dirty
@@ -7969,19 +7968,20 @@ async fn split_new_pane_then_close_old(
     close_pane_by_id_for_prompt(client, pane_id).await
 }
 
-fn set_close_prompt_error(view_state: &mut AttachViewState, error: ClientError) {
+fn set_close_prompt_error_at(view_state: &mut AttachViewState, error: ClientError, now: Instant) {
     view_state.set_transient_status(
         format!("close pane failed: {}", map_attach_client_error(error)),
-        Instant::now(),
+        now,
         ATTACH_TRANSIENT_STATUS_TTL,
     );
 }
 
 #[allow(clippy::too_many_lines)] // Internal prompt completions are a compact action state machine.
-pub async fn handle_attach_prompt_completion(
+pub async fn handle_attach_prompt_completion_at(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     completion: AttachPromptCompletion,
+    now: Instant,
 ) -> std::result::Result<Option<AttachLoopControl>, ClientError> {
     let mut requires_layout_refresh = false;
     match completion.origin {
@@ -8004,7 +8004,7 @@ pub async fn handle_attach_prompt_completion(
                             let status = attach_quit_failure_status(&error);
                             view_state.set_transient_status(
                                 status,
-                                Instant::now(),
+                                now,
                                 ATTACH_TRANSIENT_STATUS_TTL,
                             );
                         }
@@ -8012,7 +8012,7 @@ pub async fn handle_attach_prompt_completion(
                             let status = attach_quit_failure_status(&error);
                             view_state.set_transient_status(
                                 status,
-                                Instant::now(),
+                                now,
                                 ATTACH_TRANSIENT_STATUS_TTL,
                             );
                         }
@@ -8020,7 +8020,7 @@ pub async fn handle_attach_prompt_completion(
                 } else {
                     view_state.set_transient_status(
                         "quit canceled",
-                        Instant::now(),
+                        now,
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
@@ -8031,17 +8031,17 @@ pub async fn handle_attach_prompt_completion(
                         Ok(()) => {
                             view_state.set_transient_status(
                                 "pane closed",
-                                Instant::now(),
+                                now,
                                 ATTACH_TRANSIENT_STATUS_TTL,
                             );
                             requires_layout_refresh = true;
                         }
-                        Err(error) => set_close_prompt_error(view_state, error),
+                        Err(error) => set_close_prompt_error_at(view_state, error, now),
                     }
                 } else {
                     view_state.set_transient_status(
                         "close pane canceled",
-                        Instant::now(),
+                        now,
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
@@ -8057,17 +8057,17 @@ pub async fn handle_attach_prompt_completion(
                         Ok(()) => {
                             view_state.set_transient_status(
                                 "pane closed; switched target",
-                                Instant::now(),
+                                now,
                                 ATTACH_TRANSIENT_STATUS_TTL,
                             );
                             requires_layout_refresh = true;
                         }
-                        Err(error) => set_close_prompt_error(view_state, error),
+                        Err(error) => set_close_prompt_error_at(view_state, error, now),
                     }
                 } else {
                     view_state.set_transient_status(
                         "close pane canceled",
-                        Instant::now(),
+                        now,
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
@@ -8081,12 +8081,12 @@ pub async fn handle_attach_prompt_completion(
                         Ok(()) => {
                             view_state.set_transient_status(
                                 "new pane opened; old pane closed",
-                                Instant::now(),
+                                now,
                                 ATTACH_TRANSIENT_STATUS_TTL,
                             );
                             requires_layout_refresh = true;
                         }
-                        Err(error) => set_close_prompt_error(view_state, error),
+                        Err(error) => set_close_prompt_error_at(view_state, error, now),
                     }
                 }
                 Some(FINAL_PANE_CHOICE_NEW_SESSION) => {
@@ -8098,12 +8098,12 @@ pub async fn handle_attach_prompt_completion(
                         Ok(()) => {
                             view_state.set_transient_status(
                                 "new session opened; old pane closed",
-                                Instant::now(),
+                                now,
                                 ATTACH_TRANSIENT_STATUS_TTL,
                             );
                             requires_layout_refresh = true;
                         }
-                        Err(error) => set_close_prompt_error(view_state, error),
+                        Err(error) => set_close_prompt_error_at(view_state, error, now),
                     }
                 }
                 Some(FINAL_PANE_CHOICE_QUIT) => {
@@ -8117,20 +8117,21 @@ pub async fn handle_attach_prompt_completion(
                         Ok(Ok(_)) => {
                             return Ok(Some(AttachLoopControl::Break(AttachExitReason::Quit)));
                         }
-                        Ok(Err(err)) => set_close_prompt_error(
+                        Ok(Err(err)) => set_close_prompt_error_at(
                             view_state,
                             ClientError::ServerError {
                                 code: bmux_ipc::ErrorCode::Internal,
                                 message: format!("kill-session failed: {err:?}"),
                             },
+                            now,
                         ),
-                        Err(error) => set_close_prompt_error(view_state, error),
+                        Err(error) => set_close_prompt_error_at(view_state, error, now),
                     }
                 }
                 _ => {
                     view_state.set_transient_status(
                         "close pane canceled",
-                        Instant::now(),
+                        now,
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
@@ -8162,13 +8163,14 @@ async fn handle_attach_action_dispatch(
     view_state: &mut AttachViewState,
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
+    let now = Instant::now();
     let action_str = &dispatch_request.action;
     let action = match parse_action(action_str) {
         Ok(action) => action,
         Err(error) => {
             view_state.set_transient_status(
                 format!("invalid dispatched action: {error}"),
-                Instant::now(),
+                now,
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
             return Ok(AttachLoopControl::Continue);
@@ -8179,7 +8181,7 @@ async fn handle_attach_action_dispatch(
 
     match event_action {
         AttachEventAction::Detach => {
-            return try_detach_or_continue(client, view_state).await;
+            return try_detach_or_continue_at(client, view_state, now).await;
         }
         AttachEventAction::Send(bytes) => {
             if view_state.can_write
@@ -8210,13 +8212,13 @@ async fn handle_attach_action_dispatch(
                         "dispatched plugin action failed: {}",
                         map_attach_client_error(error)
                     ),
-                    Instant::now(),
+                    now,
                     ATTACH_TRANSIENT_STATUS_TTL,
                 );
             }
         }
         AttachEventAction::Ui(ui_action) => {
-            handle_attach_ui_action(&ui_action, view_state);
+            handle_attach_ui_action_at(&ui_action, view_state, now);
             view_state
                 .dirty
                 .mark_layout_frame_dirty(AttachDirtySource::ActionDispatch);
@@ -8235,16 +8237,17 @@ async fn handle_attach_action_dispatch(
     Ok(AttachLoopControl::Continue)
 }
 
-async fn try_detach_or_continue(
+async fn try_detach_or_continue_at(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
+    now: Instant,
 ) -> Result<AttachLoopControl> {
     match client.detach().await {
         Ok(()) => Ok(AttachLoopControl::Break(AttachExitReason::Detached)),
         Err(error) => {
             view_state.set_transient_status(
                 format!("detach blocked: {}", map_attach_client_error(error)),
-                Instant::now(),
+                now,
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
             Ok(AttachLoopControl::Continue)
@@ -8372,6 +8375,7 @@ async fn handle_attach_mouse_event_at(
             view_state,
             "scroll_up",
             kernel_client_factory,
+            now,
         )
         .await?
     {
@@ -8383,6 +8387,7 @@ async fn handle_attach_mouse_event_at(
             view_state,
             "scroll_down",
             kernel_client_factory,
+            now,
         )
         .await?
     {
@@ -8447,6 +8452,7 @@ async fn handle_attach_mouse_event_at(
                 view_state,
                 "click_left",
                 kernel_client_factory,
+                now,
             )
             .await?
             {
@@ -8539,6 +8545,7 @@ async fn handle_attach_mouse_event_at(
                         view_state,
                         "hover_focus",
                         kernel_client_factory,
+                        now,
                     )
                     .await?
                     {
@@ -9445,6 +9452,7 @@ pub async fn handle_attach_mouse_gesture_action(
     view_state: &mut AttachViewState,
     gesture: &str,
     kernel_client_factory: Option<&KernelClientFactory>,
+    now: Instant,
 ) -> std::result::Result<bool, ClientError> {
     let Some(attach_action) = resolve_mouse_gesture_action(view_state, gesture) else {
         return Ok(false);
@@ -9469,7 +9477,7 @@ pub async fn handle_attach_mouse_gesture_action(
             Ok(true)
         }
         AttachEventAction::Ui(action) => {
-            handle_attach_ui_action(&action, view_state);
+            handle_attach_ui_action_at(&action, view_state, now);
             view_state
                 .dirty
                 .mark_layout_frame_and_status_dirty(AttachDirtySource::Mouse);
