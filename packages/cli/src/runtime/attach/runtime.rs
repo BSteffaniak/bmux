@@ -5026,6 +5026,7 @@ pub fn build_attach_status_line_for_draw(
     if cols == 0 {
         return AttachStatusLine {
             rendered: String::new(),
+            spans: Vec::new(),
             tab_hitboxes: Vec::new(),
             drag_marker_col: None,
         };
@@ -5393,16 +5394,36 @@ pub fn queue_attach_status_line(
     let Some(status_row) = status_row_for_position(status_position, rows) else {
         return Ok(());
     };
-    queue!(stdout, MoveTo(0, status_row), Print(&status_line.rendered))
-        .context("failed queuing attach status line")?;
-    if let Some(marker_col) = status_line.drag_marker_col {
-        queue!(
-            stdout,
-            MoveTo(marker_col.min(cols.saturating_sub(1)), status_row),
-            Print("│")
-        )
-        .context("failed queuing attach status tab drag marker")?;
+    let mut ops = Vec::new();
+    if status_line.spans.is_empty() {
+        ops.push(RenderOp::text_run(
+            0,
+            status_row,
+            &status_line.rendered,
+            RenderStyle::new(),
+        ));
+    } else {
+        ops.push(RenderOp::styled_text(
+            0,
+            status_row,
+            status_line.spans.clone(),
+        ));
     }
+    if let Some(marker_col) = status_line.drag_marker_col {
+        ops.push(RenderOp::text_run(
+            marker_col.min(cols.saturating_sub(1)),
+            status_row,
+            "│",
+            RenderStyle::new(),
+        ));
+    }
+    queue_render_ops(
+        stdout,
+        ExtensionRect::new(0, status_row, cols, 1),
+        &RenderDamage::FullSurface,
+        &ops,
+    )
+    .context("failed queueing declarative attach status line")?;
     Ok(())
 }
 
@@ -10241,6 +10262,7 @@ mod tests {
     fn tab_status_line(hitboxes: Vec<AttachStatusTabHitbox>) -> AttachStatusLine {
         AttachStatusLine {
             rendered: String::new(),
+            spans: Vec::new(),
             tab_hitboxes: hitboxes,
             drag_marker_col: None,
         }

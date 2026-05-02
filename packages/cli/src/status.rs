@@ -3,6 +3,7 @@ use bmux_config::{
     StatusAlignActive, StatusBarConfig, StatusBarPreset, StatusDensity, StatusHintPolicy,
     StatusOverflowStyle, StatusSeparatorSet,
 };
+use bmux_plugin::{RenderColor, RenderStyle, RenderTextSpan};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
@@ -21,7 +22,10 @@ pub struct AttachStatusTabHitbox {
 
 #[derive(Clone, Debug)]
 pub struct AttachStatusLine {
+    /// ANSI-styled status line retained for text consumers and compatibility.
     pub rendered: String,
+    /// Declarative spans for render paths that want display-cell-safe styling.
+    pub spans: Vec<RenderTextSpan>,
     pub tab_hitboxes: Vec<AttachStatusTabHitbox>,
     pub drag_marker_col: Option<u16>,
 }
@@ -44,6 +48,7 @@ pub fn build_attach_status_line(
     if !config.enabled {
         return AttachStatusLine {
             rendered: String::new(),
+            spans: Vec::new(),
             tab_hitboxes: Vec::new(),
             drag_marker_col: None,
         };
@@ -117,26 +122,62 @@ pub fn build_attach_status_line(
     let composed = compose_status_line(width, &left, &right);
     clamp_hitboxes_to_width(&mut tab_hitboxes, width);
 
-    let rendered = stylize_status_line(
-        &composed.rendered,
+    attach_status_line_from_composed(
+        &composed,
         width,
         config,
         &resolved_appearance,
         tabs,
-        &tab_hitboxes,
+        tab_hitboxes,
         &overflow_ranges,
-        mode_range.map(|(start, end)| {
-            let right_start = composed.right_start_col.unwrap_or(0);
-            (
-                right_start.saturating_add(start),
-                right_start.saturating_add(end),
-            )
-        }),
+        mode_range,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_status_line_from_composed(
+    composed: &ComposedStatusLine,
+    width: u16,
+    config: &StatusBarConfig,
+    resolved_appearance: &ResolvedStatusAppearance,
+    tabs: &[AttachTab],
+    tab_hitboxes: Vec<AttachStatusTabHitbox>,
+    overflow_ranges: &[(usize, usize)],
+    mode_range: Option<(usize, usize)>,
+) -> AttachStatusLine {
+    let resolved_mode_range = mode_range.map(|(start, end)| {
+        let right_start = composed.right_start_col.unwrap_or(0);
+        (
+            right_start.saturating_add(start),
+            right_start.saturating_add(end),
+        )
+    });
+    let rendered = stylize_status_line(
+        &composed.rendered,
+        width,
+        config,
+        resolved_appearance,
+        tabs,
+        &tab_hitboxes,
+        overflow_ranges,
+        resolved_mode_range,
+        composed.right_start_col,
+    );
+    let spans = status_line_spans(
+        &composed.rendered,
+        width,
+        config,
+        resolved_appearance,
+        tabs,
+        &tab_hitboxes,
+        overflow_ranges,
+        resolved_mode_range,
         composed.right_start_col,
     );
 
     AttachStatusLine {
         rendered,
+        spans,
         tab_hitboxes,
         drag_marker_col: None,
     }
@@ -605,7 +646,111 @@ fn stylize_status_line(
     if width == 0 {
         return String::new();
     }
+    let segments = status_segments(
+        width,
+        tabs,
+        hitboxes,
+        overflow_ranges,
+        mode_range,
+        right_start_col,
+    );
 
+    let mut rendered = String::new();
+    let mut current_style = None;
+    let mut col = 0usize;
+    for ch in rendered_plain.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if char_width == 0 {
+            rendered.push(ch);
+            continue;
+        }
+        if col >= width {
+            break;
+        }
+        let style = style_for_segment(segments[col], config, appearance);
+        if current_style != Some(segments[col]) {
+            rendered.push_str(&style_sgr(style));
+            current_style = Some(segments[col]);
+        }
+        rendered.push(ch);
+        col = col.saturating_add(char_width);
+    }
+    rendered.push_str("\x1b[0m");
+    rendered
+}
+
+#[allow(clippy::too_many_arguments)]
+fn status_line_spans(
+    rendered_plain: &str,
+    width: u16,
+    config: &StatusBarConfig,
+    appearance: &ResolvedStatusAppearance,
+    tabs: &[AttachTab],
+    hitboxes: &[AttachStatusTabHitbox],
+    overflow_ranges: &[(usize, usize)],
+    mode_range: Option<(usize, usize)>,
+    right_start_col: Option<usize>,
+) -> Vec<RenderTextSpan> {
+    let width = usize::from(width);
+    if width == 0 {
+        return Vec::new();
+    }
+    let segments = status_segments(
+        width,
+        tabs,
+        hitboxes,
+        overflow_ranges,
+        mode_range,
+        right_start_col,
+    );
+    let mut spans = Vec::new();
+    let mut current_kind = None;
+    let mut current_text = String::new();
+    let mut col = 0usize;
+    for ch in rendered_plain.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if char_width == 0 {
+            current_text.push(ch);
+            continue;
+        }
+        if col >= width {
+            break;
+        }
+        let kind = segments[col];
+        if let Some(previous_kind) = current_kind
+            && previous_kind != kind
+            && !current_text.is_empty()
+        {
+            let style = style_for_segment(previous_kind, config, appearance);
+            spans.push(RenderTextSpan::new(
+                std::mem::take(&mut current_text),
+                render_style_from_status_segment(style),
+            ));
+        }
+        current_kind = Some(kind);
+        current_text.push(ch);
+        col = col.saturating_add(char_width);
+    }
+    if let Some(kind) = current_kind
+        && !current_text.is_empty()
+    {
+        let style = style_for_segment(kind, config, appearance);
+        spans.push(RenderTextSpan::new(
+            current_text,
+            render_style_from_status_segment(style),
+        ));
+    }
+    spans
+}
+
+fn status_segments(
+    width: usize,
+    tabs: &[AttachTab],
+    hitboxes: &[AttachStatusTabHitbox],
+    overflow_ranges: &[(usize, usize)],
+    mode_range: Option<(usize, usize)>,
+    right_start_col: Option<usize>,
+) -> Vec<SegmentKind> {
     let mut segments = vec![SegmentKind::Base; width];
     if let Some(start) = right_start_col {
         for segment in &mut segments[start.min(width)..width] {
@@ -647,29 +792,29 @@ fn stylize_status_line(
             *segment = kind;
         }
     }
+    segments
+}
 
-    let mut rendered = String::new();
-    let mut current_style = None;
-    let mut col = 0usize;
-    for ch in rendered_plain.chars() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if char_width == 0 {
-            rendered.push(ch);
-            continue;
-        }
-        if col >= width {
-            break;
-        }
-        let style = style_for_segment(segments[col], config, appearance);
-        if current_style != Some(segments[col]) {
-            rendered.push_str(&style_sgr(style));
-            current_style = Some(segments[col]);
-        }
-        rendered.push(ch);
-        col = col.saturating_add(char_width);
+const fn render_style_from_status_segment(style: SegmentStyle) -> RenderStyle {
+    RenderStyle {
+        fg: Some(RenderColor::Rgb {
+            r: style.fg.r,
+            g: style.fg.g,
+            b: style.fg.b,
+        }),
+        bg: Some(RenderColor::Rgb {
+            r: style.bg.r,
+            g: style.bg.g,
+            b: style.bg.b,
+        }),
+        bold: style.bold,
+        underline: style.underline,
+        italic: false,
+        reverse: false,
+        dim: style.dim,
+        blink: false,
+        strikethrough: false,
     }
-    rendered.push_str("\x1b[0m");
-    rendered
 }
 
 const fn style_for_segment(
@@ -806,5 +951,43 @@ mod tests {
                 .rendered
                 .contains("\x1b[0;1;38;2;1;2;3;48;2;17;34;51m")
         );
+        let mode_span = status
+            .spans
+            .iter()
+            .find(|span| span.text.contains("NORMAL"))
+            .expect("mode span should be declarative");
+        assert!(mode_span.style.bold);
+        assert_eq!(
+            mode_span.style.bg,
+            Some(RenderColor::Rgb {
+                r: 17,
+                g: 34,
+                b: 51,
+            })
+        );
+    }
+
+    #[test]
+    fn disabled_status_line_has_no_declarative_spans() {
+        let status = build_attach_status_line(
+            80,
+            &StatusBarConfig {
+                enabled: false,
+                ..StatusBarConfig::default()
+            },
+            &RuntimeAppearance::default(),
+            "session",
+            1,
+            "context",
+            &[],
+            None,
+            "NORMAL",
+            "write",
+            None,
+            "",
+        );
+
+        assert!(status.rendered.is_empty());
+        assert!(status.spans.is_empty());
     }
 }
