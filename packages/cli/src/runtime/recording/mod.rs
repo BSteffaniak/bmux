@@ -6258,7 +6258,7 @@ impl DisplayCaptureFileWriter {
         if let Some((cols, rows)) = self.latest_resize {
             self.record(DisplayTrackEvent::Resize { cols, rows })?;
         }
-        let repaint = full_screen_repaint_bytes(self.replay_grid.grid());
+        let repaint = bmux_terminal_grid::full_screen_repaint_bytes(self.replay_grid.grid());
         if !repaint.is_empty() {
             self.record(DisplayTrackEvent::FrameBytes { data: repaint })?;
         }
@@ -6408,85 +6408,6 @@ fn display_capture_writer_loop(
     }
 }
 
-fn full_screen_repaint_bytes(grid: &bmux_terminal_grid::TerminalGrid) -> Vec<u8> {
-    let rows = grid.viewport_rows();
-    if rows.is_empty() {
-        return Vec::new();
-    }
-    let mut bytes = b"\x1b[0m\x1b[2J".to_vec();
-    for (row_index, row) in rows.iter().enumerate() {
-        bytes.extend_from_slice(format!("\x1b[{};1H", row_index.saturating_add(1)).as_bytes());
-        let mut current_style = bmux_terminal_grid::Style::default();
-        for col in 0..grid.width() {
-            let cell = row.cells().get(col);
-            let style = cell
-                .map(|cell| grid.palette().get(cell.style()))
-                .unwrap_or_default();
-            if style != current_style {
-                bytes.extend_from_slice(grid_style_sgr(style).as_bytes());
-                current_style = style;
-            }
-            if let Some(cell) = cell
-                && !cell.is_wide_continuation()
-                && !cell.text().is_empty()
-            {
-                bytes.extend_from_slice(cell.text().as_bytes());
-            } else {
-                bytes.push(b' ');
-            }
-        }
-    }
-    bytes.extend_from_slice(b"\x1b[0m");
-    bytes
-}
-
-fn grid_style_sgr(style: bmux_terminal_grid::Style) -> String {
-    let mut parts = vec!["0".to_string()];
-    if style.bold {
-        parts.push("1".to_string());
-    }
-    if style.dim {
-        parts.push("2".to_string());
-    }
-    if style.italic {
-        parts.push("3".to_string());
-    }
-    if style.underline {
-        parts.push("4".to_string());
-    }
-    if style.inverse {
-        parts.push("7".to_string());
-    }
-    if style.strike {
-        parts.push("9".to_string());
-    }
-    push_grid_color_sgr(&mut parts, style.fg, true);
-    push_grid_color_sgr(&mut parts, style.bg, false);
-    format!("\x1b[{}m", parts.join(";"))
-}
-
-fn push_grid_color_sgr(
-    parts: &mut Vec<String>,
-    color: Option<bmux_terminal_grid::Color>,
-    foreground: bool,
-) {
-    match color {
-        None => parts.push(if foreground { "39" } else { "49" }.to_string()),
-        Some(bmux_terminal_grid::Color::Indexed(index)) => {
-            parts.push(if foreground { "38" } else { "48" }.to_string());
-            parts.push("5".to_string());
-            parts.push(index.to_string());
-        }
-        Some(bmux_terminal_grid::Color::Rgb { r, g, b }) => {
-            parts.push(if foreground { "38" } else { "48" }.to_string());
-            parts.push("2".to_string());
-            parts.push(r.to_string());
-            parts.push(g.to_string());
-            parts.push(b.to_string());
-        }
-    }
-}
-
 fn capture_stream_opened_event(recording_id: Uuid, client_id: Uuid) -> DisplayTrackEvent {
     let (cell_width_px, cell_height_px, window_width_px, window_height_px) =
         capture_stream_open_metrics();
@@ -6628,11 +6549,11 @@ mod tests {
         let mut grid = test_grid(80, 24);
         grid.process(b"hello\r\nworld");
 
-        let repaint = full_screen_repaint_bytes(grid.grid());
+        let repaint = bmux_terminal_grid::full_screen_repaint_bytes(grid.grid());
         let mut replay = test_grid(80, 24);
         replay.process(&repaint);
 
-        let contents = test_grid_contents(replay.grid());
+        let contents = bmux_terminal_grid::visible_text(replay.grid(), 0, replay.grid().height());
         assert!(contents.contains("hello"));
         assert!(contents.contains("world"));
     }
@@ -6678,7 +6599,8 @@ mod tests {
         let mut replay = test_grid(80, 24);
         replay.process(repaint);
         assert!(
-            test_grid_contents(replay.grid()).contains("hello before rotation"),
+            bmux_terminal_grid::visible_text(replay.grid(), 0, replay.grid().height())
+                .contains("hello before rotation"),
             "rotated segment baseline should carry prior visible content"
         );
     }
@@ -7197,26 +7119,6 @@ mod tests {
             bmux_terminal_grid::GridLimits::default(),
         )
         .expect("test grid dimensions are valid")
-    }
-
-    fn test_grid_contents(grid: &bmux_terminal_grid::TerminalGrid) -> String {
-        grid.display_rows(0, grid.height())
-            .into_iter()
-            .map(|row| {
-                let mut line = String::new();
-                for col in 0..grid.width() {
-                    let Some(cell) = row.cells().get(col) else {
-                        line.push(' ');
-                        continue;
-                    };
-                    if !cell.is_wide_continuation() {
-                        line.push_str(cell.text());
-                    }
-                }
-                line
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     fn temp_dir() -> std::path::PathBuf {

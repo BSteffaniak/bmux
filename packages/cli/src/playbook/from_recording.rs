@@ -336,7 +336,8 @@ fn generate_assertions_from_output(
         stream.process(&accum.bytes);
 
         // Extract visible text lines.
-        let text_lines = terminal_grid_text_lines(stream.grid(), usize::from(rows.max(1)));
+        let text_lines =
+            bmux_terminal_grid::visible_text_lines(stream.grid(), 0, usize::from(rows.max(1)));
 
         // Find the last non-empty line (often a shell prompt).
         let last_nonempty = text_lines.iter().rposition(|l| !l.trim().is_empty());
@@ -390,27 +391,6 @@ fn generate_assertions_from_output(
             }
         }
     }
-}
-
-fn terminal_grid_text_lines(grid: &bmux_terminal_grid::TerminalGrid, rows: usize) -> Vec<String> {
-    grid.display_rows(0, rows)
-        .into_iter()
-        .map(|row| terminal_grid_row_text(&row, grid.width()))
-        .collect()
-}
-
-fn terminal_grid_row_text(row: &bmux_terminal_grid::PhysicalRow, width: usize) -> String {
-    let mut text = String::new();
-    for col in 0..width {
-        let Some(cell) = row.cells().get(col) else {
-            text.push(' ');
-            continue;
-        };
-        if !cell.is_wide_continuation() {
-            text.push_str(cell.text());
-        }
-    }
-    text
 }
 
 /// Build a regex pattern from a screen line, making it robust to non-deterministic

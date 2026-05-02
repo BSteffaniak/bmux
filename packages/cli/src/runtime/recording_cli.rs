@@ -1046,33 +1046,7 @@ pub(super) fn render_output_via_terminal_grid(output: &[u8], cols: u16, rows: u1
     )
     .expect("recording verify grid dimensions are valid");
     stream.process(output);
-    terminal_grid_visible_text(stream.grid(), usize::from(rows.max(1)))
-}
-
-fn terminal_grid_visible_text(grid: &bmux_terminal_grid::TerminalGrid, rows: usize) -> String {
-    let mut lines = grid
-        .display_rows(0, rows)
-        .into_iter()
-        .map(|row| terminal_grid_row_text(&row, grid.width()))
-        .collect::<Vec<_>>();
-    while lines.last().is_some_and(|line| line.trim().is_empty()) {
-        lines.pop();
-    }
-    lines.join("\n")
-}
-
-fn terminal_grid_row_text(row: &bmux_terminal_grid::PhysicalRow, width: usize) -> String {
-    let mut text = String::new();
-    for col in 0..width {
-        let Some(cell) = row.cells().get(col) else {
-            text.push(' ');
-            continue;
-        };
-        if !cell.is_wide_continuation() {
-            text.push_str(cell.text());
-        }
-    }
-    text
+    bmux_terminal_grid::visible_text_trimmed(stream.grid(), 0, usize::from(rows.max(1)))
 }
 
 /// Normalize screen text for structural comparison: collapse digit sequences
