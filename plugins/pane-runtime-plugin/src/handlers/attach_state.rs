@@ -238,8 +238,8 @@ pub fn attach_pane_grid_snapshot_state(
     })
 }
 
-/// `attach-pane-images` delivers image-registry deltas serialized as
-/// JSON (`Vec<AttachPaneImageDelta>`).
+/// `attach-pane-grid-delta-state` delivers revisioned structured grid
+/// deltas serialized as JSON (`Vec<GridDeltaBatch>`) per pane.
 pub fn attach_pane_grid_delta_state(
     req: &AttachPaneGridDeltaArgs,
     ctx: &NativeServiceContext,

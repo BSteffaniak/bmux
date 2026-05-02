@@ -20,7 +20,7 @@ use bmux_attach_pipeline_models::{
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState};
-use bmux_terminal_grid::{GridLimits, GridSnapshot, TerminalGrid, TerminalGridStream};
+use bmux_terminal_grid::{GridLimits, GridSnapshot, TerminalGridStream};
 use crossterm::cursor::{Hide, SavePosition};
 use crossterm::queue;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
@@ -154,9 +154,10 @@ impl AttachScenePipeline {
         snapshots: Vec<AttachPaneGridSnapshotState>,
     ) -> Result<()> {
         for pane_snapshot in snapshots {
-            let grid = TerminalGrid::from_snapshot(&pane_snapshot.snapshot, GridLimits::default())?;
+            let stream =
+                TerminalGridStream::from_snapshot(&pane_snapshot.snapshot, GridLimits::default())?;
             let buffer = self.pane_buffers.entry(pane_snapshot.pane_id).or_default();
-            buffer.terminal_grid = TerminalGridStream::from_grid(grid);
+            buffer.terminal_grid = stream;
             buffer.expected_stream_start = Some(pane_snapshot.stream_end);
             buffer.prev_rows.clear();
             self.dirty_pane_ids.insert(pane_snapshot.pane_id);
@@ -461,4 +462,61 @@ fn now_epoch_ms() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hydrate_pane_grid_snapshot_preserves_pending_parser_bytes() {
+        let pane_id = Uuid::new_v4();
+        let mut source = TerminalGridStream::new(10, 2, GridLimits::default())
+            .expect("source grid dimensions are valid");
+        source.process(b"A\x1b[");
+        let snapshot = source.snapshot(0, usize::MAX);
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            status_top_inset: 0,
+            status_bottom_inset: 0,
+        });
+
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 2,
+                snapshot,
+            }])
+            .expect("snapshot should hydrate");
+        pipeline
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane buffer should exist")
+            .terminal_grid
+            .process(b"31mR");
+
+        let grid = pipeline
+            .pane_buffers
+            .get(&pane_id)
+            .expect("pane buffer should exist")
+            .terminal_grid
+            .grid();
+        let rows = grid.viewport_rows();
+        let text = rows[0]
+            .cells()
+            .iter()
+            .filter(|cell| !cell.is_wide_continuation())
+            .map(bmux_terminal_grid::Cell::text)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        let red = rows[0].cells()[1].style();
+
+        assert_eq!(text, "AR");
+        assert_eq!(
+            grid.palette().get(red).fg,
+            Some(bmux_terminal_grid::Color::Indexed(1))
+        );
+    }
 }

@@ -115,9 +115,9 @@ impl TerminalGridStream {
     /// Process one chunk and return a structured row delta when state changed.
     #[must_use]
     pub fn process_delta(&mut self, bytes: &[u8]) -> Option<GridDeltaBatch> {
-        let before = self.grid.snapshot(0, usize::MAX);
+        let before = self.snapshot(0, usize::MAX);
         self.process(bytes);
-        let after = self.grid.snapshot(0, usize::MAX);
+        let after = self.snapshot(0, usize::MAX);
         GridDeltaBatch::between(&before, &after)
     }
 
@@ -131,9 +131,9 @@ impl TerminalGridStream {
         width: u16,
         height: u16,
     ) -> Result<Option<GridDeltaBatch>, TerminalGridError> {
-        let before = self.grid.snapshot(0, usize::MAX);
+        let before = self.snapshot(0, usize::MAX);
         self.grid.resize(width, height)?;
-        let after = self.grid.snapshot(0, usize::MAX);
+        let after = self.snapshot(0, usize::MAX);
         Ok(GridDeltaBatch::between(&before, &after))
     }
 }
@@ -417,6 +417,39 @@ mod tests {
 
         let grid = hydrated.grid();
         let red = grid.viewport_rows()[0].cells()[0].style();
+        assert_eq!(
+            grid.palette().get(red).fg,
+            Some(crate::style::Color::Indexed(1))
+        );
+    }
+
+    #[test]
+    fn delta_carries_pending_escape_after_visible_output() {
+        let mut stream = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+
+        let delta = stream
+            .process_delta(b"A\x1b[")
+            .expect("visible output should produce a delta");
+
+        assert_eq!(delta.pending_bytes, b"\x1b[");
+    }
+
+    #[test]
+    fn apply_delta_preserves_pending_escape_for_future_raw_chunks() {
+        let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        let delta = producer
+            .process_delta(b"A\x1b[")
+            .expect("visible output should produce a delta");
+        let mut consumer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+
+        consumer
+            .apply_delta(&delta, GridLimits::default())
+            .expect("delta should apply");
+        consumer.process(b"31mR");
+
+        let grid = consumer.grid();
+        let red = grid.viewport_rows()[0].cells()[1].style();
+        assert_eq!(row_text(&grid.viewport_rows()[0]), "AR");
         assert_eq!(
             grid.palette().get(red).fg,
             Some(crate::style::Color::Indexed(1))

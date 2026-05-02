@@ -41,6 +41,7 @@ type RecordingPayload = ProtocolRecordingPayload<Event, ErrorCode>;
 
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
 const MAX_TERMINAL_GRID_DELTA_BATCHES: usize = 1_024;
+const MAX_TERMINAL_GRID_DELTA_BYTES: usize = 16 * 1024 * 1024;
 const RESPONSE_METADATA_HEADROOM: usize = 65_536;
 const RESPONSE_OUTPUT_BUDGET: usize =
     bmux_ipc::frame::MAX_FRAME_PAYLOAD_SIZE - RESPONSE_METADATA_HEADROOM;
@@ -230,7 +231,7 @@ struct PaneRuntimeHandle {
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
     output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
     terminal_grid: Arc<std::sync::Mutex<TerminalGridStream>>,
-    terminal_grid_deltas: Arc<std::sync::Mutex<VecDeque<GridDeltaBatch>>>,
+    terminal_grid_deltas: Arc<std::sync::Mutex<TerminalGridDeltaLog>>,
     exited: Arc<AtomicBool>,
     last_requested_size: Arc<std::sync::Mutex<(u16, u16)>>,
     /// Set to `true` by the PTY reader when new output arrives. The broadcast
@@ -1261,15 +1262,67 @@ $env.config = (
 "#
 }
 
+#[derive(Default)]
+struct TerminalGridDeltaLog {
+    batches: VecDeque<GridDeltaBatch>,
+    estimated_bytes: usize,
+}
+
+impl TerminalGridDeltaLog {
+    fn push(&mut self, delta: GridDeltaBatch) {
+        let estimated = estimate_terminal_grid_delta_bytes(&delta);
+        if estimated > MAX_TERMINAL_GRID_DELTA_BYTES {
+            self.batches.clear();
+            self.estimated_bytes = 0;
+            return;
+        }
+        self.estimated_bytes = self.estimated_bytes.saturating_add(estimated);
+        self.batches.push_back(delta);
+        while self.batches.len() > MAX_TERMINAL_GRID_DELTA_BATCHES
+            || self.estimated_bytes > MAX_TERMINAL_GRID_DELTA_BYTES
+        {
+            let Some(removed) = self.batches.pop_front() else {
+                self.estimated_bytes = 0;
+                break;
+            };
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_sub(estimate_terminal_grid_delta_bytes(&removed));
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &GridDeltaBatch> {
+        self.batches.iter()
+    }
+}
+
+fn estimate_terminal_grid_delta_bytes(delta: &GridDeltaBatch) -> usize {
+    let row_bytes = delta
+        .row_updates
+        .iter()
+        .map(|update| {
+            std::mem::size_of_val(update)
+                + update
+                    .row
+                    .runs
+                    .iter()
+                    .map(|run| std::mem::size_of_val(run) + run.text.len())
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    std::mem::size_of_val(delta)
+        + delta.mode.len()
+        + delta.pending_bytes.len()
+        + delta.styles.len() * std::mem::size_of::<bmux_terminal_grid::Style>()
+        + row_bytes
+}
+
 fn push_terminal_grid_delta(
-    deltas: &Arc<std::sync::Mutex<VecDeque<GridDeltaBatch>>>,
+    deltas: &Arc<std::sync::Mutex<TerminalGridDeltaLog>>,
     delta: GridDeltaBatch,
 ) {
     if let Ok(mut deltas) = deltas.lock() {
-        deltas.push_back(delta);
-        while deltas.len() > MAX_TERMINAL_GRID_DELTA_BATCHES {
-            deltas.pop_front();
-        }
+        deltas.push(delta);
     }
 }
 
@@ -2454,7 +2507,7 @@ impl SessionRuntimeManager {
                 .expect("default pane terminal grid dimensions are valid"),
         ));
         let terminal_grid_for_reader = Arc::clone(&terminal_grid);
-        let terminal_grid_deltas = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let terminal_grid_deltas = Arc::new(std::sync::Mutex::new(TerminalGridDeltaLog::default()));
         let terminal_grid_deltas_for_reader = Arc::clone(&terminal_grid_deltas);
         let last_requested_size = Arc::new(std::sync::Mutex::new((24_u16, 80_u16)));
         let shell = pane_meta.shell.clone();
@@ -5765,7 +5818,7 @@ mod tests {
                 TerminalGridStream::new(1, 1, GridLimits::default())
                     .expect("dummy pane terminal grid dimensions are valid"),
             )),
-            terminal_grid_deltas: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            terminal_grid_deltas: Arc::new(std::sync::Mutex::new(TerminalGridDeltaLog::default())),
             exited: Arc::new(AtomicBool::new(false)),
             last_requested_size: Arc::new(std::sync::Mutex::new((1, 1))),
             output_dirty: Arc::new(AtomicBool::new(false)),
@@ -5809,6 +5862,44 @@ mod tests {
         }
     }
 
+    fn manager_with_runtime(
+        session_id: SessionId,
+        runtime: SessionRuntimeHandle,
+    ) -> SessionRuntimeManager {
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        SessionRuntimeManager {
+            runtimes: BTreeMap::from([(session_id, runtime)]),
+            shell: "sh".to_string(),
+            pane_term: "xterm-256color".to_string(),
+            protocol_profile: ProtocolProfile::Bmux,
+            shell_integration_root: None,
+            pane_exit_tx,
+        }
+    }
+
+    fn set_pane_grid(pane: &PaneRuntimeHandle, width: u16, height: u16) {
+        *pane
+            .terminal_grid
+            .lock()
+            .expect("grid lock should be available") =
+            TerminalGridStream::new(width, height, GridLimits::default())
+                .expect("test grid dimensions are valid");
+    }
+
+    fn adapter_for_manager(manager: SessionRuntimeManager) -> ServerSessionRuntimeAdapter {
+        ServerSessionRuntimeAdapter::new(Arc::new(Mutex::new(manager)))
+    }
+
+    fn row_text(row: &bmux_terminal_grid::PhysicalRow) -> String {
+        row.cells()
+            .iter()
+            .filter(|cell| !cell.is_wide_continuation())
+            .map(bmux_terminal_grid::Cell::text)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
     fn floating_surface(pane_id: Uuid, scope: FloatingPaneScope) -> FloatingSurfaceRuntime {
         FloatingSurfaceRuntime {
             id: Uuid::new_v4(),
@@ -5830,6 +5921,201 @@ mod tests {
             accepts_input: true,
             cursor_owner: false,
         }
+    }
+
+    #[tokio::test]
+    async fn attach_grid_snapshot_state_contains_retained_scrollback() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+        set_pane_grid(pane, 5, 2);
+        pane.terminal_grid
+            .lock()
+            .expect("grid lock should be available")
+            .process(b"line1\r\nline2\r\nline3");
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+
+        let state = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[pane_id],
+            usize::MAX,
+        )
+        .expect("attached client should receive grid snapshot");
+
+        assert_eq!(state.snapshots.len(), 1);
+        let snapshot =
+            serde_json::from_slice::<bmux_terminal_grid::GridSnapshot>(&state.snapshots[0].encoded)
+                .expect("snapshot payload should decode");
+        let retained = snapshot
+            .rows
+            .iter()
+            .map(|row| {
+                row.runs
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(retained.iter().any(|row| row == "line1"));
+        assert!(retained.iter().any(|row| row == "line3"));
+        assert!(retained.len() > usize::from(snapshot.height));
+    }
+
+    #[tokio::test]
+    async fn attach_grid_delta_state_returns_updates_for_attached_client() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+        set_pane_grid(pane, 10, 2);
+        let delta = pane
+            .terminal_grid
+            .lock()
+            .expect("grid lock should be available")
+            .process_delta(b"hello")
+            .expect("output should change grid state");
+        push_terminal_grid_delta(&pane.terminal_grid_deltas, delta);
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+
+        let state = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[pane_id],
+            &[0],
+            16,
+        )
+        .expect("attached client should receive grid deltas");
+
+        assert_eq!(state.deltas.len(), 1);
+        let pane_delta = &state.deltas[0];
+        assert_eq!(pane_delta.pane_id, pane_id);
+        assert_eq!(pane_delta.base_revision, 0);
+        assert!(!pane_delta.desynced);
+        let batches = serde_json::from_slice::<Vec<GridDeltaBatch>>(&pane_delta.encoded)
+            .expect("delta payload should decode");
+        assert_eq!(batches.len(), 1);
+        let mut consumer = TerminalGridStream::new(10, 2, GridLimits::default())
+            .expect("consumer grid dimensions are valid");
+        consumer
+            .apply_delta(&batches[0], GridLimits::default())
+            .expect("delta should apply to matching revision");
+        assert_eq!(row_text(&consumer.grid().viewport_rows()[0]), "hello");
+    }
+
+    #[tokio::test]
+    async fn resize_pty_records_reflow_delta() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+        set_pane_grid(pane, 10, 2);
+        let base_revision = {
+            let mut grid = pane
+                .terminal_grid
+                .lock()
+                .expect("grid lock should be available");
+            grid.process(b"abcdefghij");
+            grid.grid().revision()
+        };
+
+        pane.resize_pty(2, 5);
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+
+        let state = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[pane_id],
+            &[base_revision],
+            16,
+        )
+        .expect("resize delta should be available");
+        let batches = serde_json::from_slice::<Vec<GridDeltaBatch>>(&state.deltas[0].encoded)
+            .expect("delta payload should decode");
+
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].reset_rows);
+        assert_eq!(batches[0].width, 5);
+        let mut consumer = TerminalGridStream::new(10, 2, GridLimits::default())
+            .expect("consumer grid dimensions are valid");
+        consumer.process(b"abcdefghij");
+        consumer
+            .apply_delta(&batches[0], GridLimits::default())
+            .expect("resize delta should apply");
+        let rows = consumer.grid().viewport_rows();
+        assert_eq!(row_text(&rows[0]), "abcde");
+        assert_eq!(row_text(&rows[1]), "fghij");
+    }
+
+    #[tokio::test]
+    async fn attach_grid_delta_state_reports_auth_and_lookup_failures() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+
+        let not_attached =
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
+                &adapter,
+                session_id,
+                client_id,
+                &[pane_id],
+                &[0],
+                16,
+            )
+            .expect_err("unattached client should be rejected");
+        assert!(matches!(not_attached, SessionRuntimeError::NotAttached));
+
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let missing_pane = Uuid::new_v4();
+        let state = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[missing_pane],
+            &[0],
+            16,
+        )
+        .expect("missing pane is omitted from delta results");
+        assert!(state.deltas.is_empty());
+
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        let empty_manager = SessionRuntimeManager {
+            runtimes: BTreeMap::new(),
+            shell: "sh".to_string(),
+            pane_term: "xterm-256color".to_string(),
+            protocol_profile: ProtocolProfile::Bmux,
+            shell_integration_root: None,
+            pane_exit_tx,
+        };
+        let adapter = adapter_for_manager(empty_manager);
+        let missing_session =
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
+                &adapter,
+                session_id,
+                client_id,
+                &[pane_id],
+                &[0],
+                16,
+            )
+            .expect_err("missing session should be reported");
+        assert!(matches!(missing_session, SessionRuntimeError::NotFound));
     }
 
     #[tokio::test]
