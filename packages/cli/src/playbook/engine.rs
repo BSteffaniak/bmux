@@ -1889,11 +1889,12 @@ fn run_attach_sim_playbook(playbook: &Playbook, started: Instant) -> PlaybookRes
     );
     let mut runtime_vars = RuntimeVars::new(playbook.config.vars.clone());
     let mut step_results = Vec::new();
+    let mut snapshots = Vec::new();
     let mut error_msg = None;
 
     for step in &playbook.steps {
         let step_started = Instant::now();
-        let result = execute_attach_sim_step(step, &mut sim, &mut runtime_vars);
+        let result = execute_attach_sim_step(step, &mut sim, &mut runtime_vars, &mut snapshots);
         #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = step_started.elapsed().as_millis() as u64;
         match result {
@@ -1938,7 +1939,7 @@ fn run_attach_sim_playbook(playbook: &Playbook, started: Instant) -> PlaybookRes
         playbook_name,
         pass: error_msg.is_none(),
         steps: step_results,
-        snapshots: Vec::new(),
+        snapshots,
         recording_id: None,
         recording_path: None,
         total_elapsed_ms,
@@ -1954,6 +1955,7 @@ fn execute_attach_sim_step(
     step: &Step,
     sim: &mut crate::runtime::attach::sim::AttachSimHarness,
     runtime_vars: &mut RuntimeVars,
+    snapshots: &mut Vec<SnapshotCapture>,
 ) -> Result<Option<String>> {
     match &step.action {
         Action::SeedWindowList { names, active } => {
@@ -1994,6 +1996,20 @@ fn execute_attach_sim_step(
                 "{id}: cols {}-{} row {}",
                 location.start_col, location.end_col, location.row
             )))
+        }
+        Action::Snapshot { id } => {
+            let id = runtime_vars.resolve_opt(id);
+            snapshots.push(SnapshotCapture {
+                id: id.clone(),
+                panes: vec![PaneCapture {
+                    index: 1,
+                    focused: true,
+                    screen_text: sim.rendered().to_string(),
+                    cursor_row: 0,
+                    cursor_col: 0,
+                }],
+            });
+            Ok(Some(format!("captured attach-sim snapshot '{id}'")))
         }
         Action::TerminalEvent(event) => {
             let terminal_event = attach_sim_terminal_event(event, runtime_vars)?;

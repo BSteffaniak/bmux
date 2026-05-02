@@ -23,6 +23,18 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/playbooks")
 }
 
+const ATTACH_SIM_FIXTURES: &[&str] = &[
+    "attach_sim_tab_drag.dsl",
+    "attach_sim_tab_drag_no_motion.dsl",
+    "attach_sim_tab_drag_left_half.dsl",
+    "attach_sim_tab_drag_right_half.dsl",
+    "attach_sim_tab_drag_gap.dsl",
+    "attach_sim_tab_drag_mru_noop.dsl",
+    "attach_sim_tab_click_switch.dsl",
+    "attach_sim_status_top.dsl",
+    "attach_sim_status_snapshot.dsl",
+];
+
 struct TempDirGuard {
     path: PathBuf,
 }
@@ -548,17 +560,9 @@ fn parse_and_validate_fixtures() {
         "structured_reflow_basic.dsl",
         "structured_reflow_layout.dsl",
         "structured_reflow_scrollback.dsl",
-        "attach_sim_tab_drag.dsl",
-        "attach_sim_tab_drag_no_motion.dsl",
-        "attach_sim_tab_drag_left_half.dsl",
-        "attach_sim_tab_drag_right_half.dsl",
-        "attach_sim_tab_drag_gap.dsl",
-        "attach_sim_tab_drag_mru_noop.dsl",
-        "attach_sim_tab_click_switch.dsl",
-        "attach_sim_status_top.dsl",
     ];
 
-    for name in &fixtures {
+    for name in fixtures.iter().chain(ATTACH_SIM_FIXTURES.iter()) {
         let path = fixtures_dir().join(name);
         let playbook = bmux_cli::playbook::parse_file(&path)
             .unwrap_or_else(|e| panic!("failed to parse {name}: {e:#}"));
@@ -573,20 +577,18 @@ fn parse_and_validate_fixtures() {
 
 #[test]
 fn attach_sim_fixtures_run_without_sandbox() {
-    let fixtures = [
-        "attach_sim_tab_drag.dsl",
-        "attach_sim_tab_drag_no_motion.dsl",
-        "attach_sim_tab_drag_left_half.dsl",
-        "attach_sim_tab_drag_right_half.dsl",
-        "attach_sim_tab_drag_gap.dsl",
-        "attach_sim_tab_drag_mru_noop.dsl",
-        "attach_sim_tab_click_switch.dsl",
-        "attach_sim_status_top.dsl",
-    ];
-
-    for name in fixtures {
-        let (_json, pass) = run_playbook_fixture(name);
+    for name in ATTACH_SIM_FIXTURES {
+        let (json, pass) = run_playbook_fixture(name);
         assert!(pass, "attach-sim fixture failed: {name}");
+        if *name == "attach_sim_status_snapshot.dsl" {
+            assert_eq!(json["snapshots"][0]["id"], "initial-status");
+            assert!(
+                json["snapshots"][0]["panes"][0]["screen_text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("1:one")
+            );
+        }
     }
 }
 

@@ -335,6 +335,7 @@ Supported attach-sim actions:
 | `seed-window-list` | Seed fake windows: `names='one,two' active='one'`                                                                   |
 | `set-config`       | Set supported sim config, currently `status_bar.tab_order=mru\|stable` and `appearance.status_position=top\|bottom` |
 | `render`           | Re-render fake attach status UI                                                                                     |
+| `snapshot`         | Capture the current attach-sim render in the playbook result snapshots                                              |
 | `locate`           | Locate rendered text and define `${id.start_col}`, `${id.center_col}`, `${id.end_col}`, `${id.row}`                 |
 | `terminal-event`   | Send normalized terminal input; currently mouse events are supported                                                |
 | `assert-rendered`  | Assert rendered output contains or matches text                                                                     |
