@@ -1987,6 +1987,14 @@ fn execute_attach_sim_step(
             sim.seed_pane_lines(&line_refs, *cursor_row, *cursor_col);
             Ok(Some(format!("seeded {} pane lines", resolved_lines.len())))
         }
+        Action::SeedPaneLayout { split } => {
+            let split = runtime_vars.resolve_opt(split);
+            match split.as_str() {
+                "vertical" => sim.seed_vertical_split_panes(),
+                other => bail!("unsupported attach-sim pane layout split '{other}'"),
+            }
+            Ok(Some(format!("seeded {split} pane layout")))
+        }
         Action::Render => {
             sim.render();
             Ok(Some(sim.rendered().to_string()))
@@ -2173,6 +2181,7 @@ const fn attach_sim_effect_operation(
     match effect {
         crate::runtime::attach::state::AttachUiEffect::SwitchWindow { .. } => "switch-window",
         crate::runtime::attach::state::AttachUiEffect::MoveWindow { .. } => "move-window",
+        crate::runtime::attach::state::AttachUiEffect::ResizePane { .. } => "resize-pane",
         crate::runtime::attach::state::AttachUiEffect::ShowTransientStatus { .. } => {
             "show-transient-status"
         }
@@ -3908,6 +3917,7 @@ pub(super) async fn execute_step(
         }
         Action::SeedWindowList { .. }
         | Action::SeedPaneText { .. }
+        | Action::SeedPaneLayout { .. }
         | Action::Render
         | Action::Locate { .. }
         | Action::TerminalEvent(_)

@@ -409,6 +409,11 @@ pub enum AttachUiEffect {
         target_context_id: Uuid,
         placement: AttachTabDropPlacement,
     },
+    ResizePane {
+        pane_id: Uuid,
+        direction: PaneResizeDirection,
+        cells: u16,
+    },
     ShowTransientStatus {
         message: String,
     },

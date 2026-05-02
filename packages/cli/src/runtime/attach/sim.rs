@@ -1,7 +1,8 @@
 use super::input::{TerminalGeometry, TerminalMouseEvent};
 use super::runtime::{
     attach_key_event_actions, attach_tab_drop_marker_col, handle_attach_ui_action_at,
-    reduce_attach_status_tab_mouse_event, status_row_for_position,
+    reduce_attach_mouse_resize_event, reduce_attach_status_tab_mouse_event,
+    status_row_for_position,
 };
 use super::state::{AttachTabDropPlacement, AttachUiEffect, AttachViewState, PaneRenderBuffer};
 use crate::input::InputProcessor;
@@ -150,8 +151,11 @@ impl AttachSimHarness {
     }
 
     pub fn send_mouse(&mut self, event: TerminalMouseEvent) {
-        let reduction =
+        let mut reduction =
             reduce_attach_status_tab_mouse_event(&mut self.view_state, event, self.geometry);
+        if !reduction.consumed {
+            reduction = reduce_attach_mouse_resize_event(&mut self.view_state, event, self.now);
+        }
         if !reduction.consumed {
             return;
         }
@@ -159,6 +163,98 @@ impl AttachSimHarness {
             self.apply_effect(effect);
         }
         self.render();
+    }
+
+    pub fn seed_vertical_split_panes(&mut self) {
+        let left_pane = Uuid::from_u128(21);
+        let right_pane = Uuid::from_u128(22);
+        let height = self.geometry.rows.saturating_sub(1).max(4);
+        self.view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: self.view_state.attached_context_id,
+            session_id: self.view_state.attached_id,
+            focused_pane_id: left_pane,
+            panes: vec![
+                PaneSummary {
+                    id: left_pane,
+                    index: 1,
+                    name: Some("left".to_string()),
+                    focused: true,
+                    state: PaneState::Running,
+                    state_reason: None,
+                },
+                PaneSummary {
+                    id: right_pane,
+                    index: 2,
+                    name: Some("right".to_string()),
+                    focused: false,
+                    state: PaneState::Running,
+                    state_reason: None,
+                },
+            ],
+            layout_root: PaneLayoutNode::Split {
+                direction: bmux_attach_layout_protocol::PaneSplitDirection::Vertical,
+                ratio_percent: 50,
+                first: Box::new(PaneLayoutNode::Leaf { pane_id: left_pane }),
+                second: Box::new(PaneLayoutNode::Leaf {
+                    pane_id: right_pane,
+                }),
+            },
+            scene: AttachScene {
+                session_id: self.view_state.attached_id,
+                focus: AttachFocusTarget::Pane { pane_id: left_pane },
+                surfaces: vec![
+                    AttachSurface {
+                        id: Uuid::from_u128(23),
+                        kind: AttachSurfaceKind::Pane,
+                        layer: AttachLayer::Pane,
+                        z: 0,
+                        pane_id: Some(left_pane),
+                        rect: AttachRect {
+                            x: 0,
+                            y: 0,
+                            w: 10,
+                            h: height,
+                        },
+                        content_rect: AttachRect {
+                            x: 1,
+                            y: 1,
+                            w: 8,
+                            h: height.saturating_sub(2).max(1),
+                        },
+                        interactive_regions: Vec::new(),
+                        opaque: true,
+                        visible: true,
+                        accepts_input: true,
+                        cursor_owner: true,
+                    },
+                    AttachSurface {
+                        id: Uuid::from_u128(24),
+                        kind: AttachSurfaceKind::Pane,
+                        layer: AttachLayer::Pane,
+                        z: 0,
+                        pane_id: Some(right_pane),
+                        rect: AttachRect {
+                            x: 10,
+                            y: 0,
+                            w: 10,
+                            h: height,
+                        },
+                        content_rect: AttachRect {
+                            x: 11,
+                            y: 1,
+                            w: 8,
+                            h: height.saturating_sub(2).max(1),
+                        },
+                        interactive_regions: Vec::new(),
+                        opaque: true,
+                        visible: true,
+                        accepts_input: true,
+                        cursor_owner: false,
+                    },
+                ],
+            },
+            zoomed: false,
+        });
     }
 
     pub fn seed_pane_lines(&mut self, lines: &[&str], cursor_row: u16, cursor_col: u16) {
@@ -396,7 +492,7 @@ impl AttachSimHarness {
                     placement,
                 );
             }
-            AttachUiEffect::ShowTransientStatus { .. } => {}
+            AttachUiEffect::ResizePane { .. } | AttachUiEffect::ShowTransientStatus { .. } => {}
         }
         self.effects.push(effect);
     }
@@ -588,5 +684,27 @@ mod tests {
         assert!(sim.selection_active());
         assert_eq!(sim.scrollback_cursor(), Some((2, 2)));
         assert_eq!(sim.selected_text(), Some("e\n  f".to_string()));
+    }
+
+    #[test]
+    fn attach_sim_mouse_resize_emits_resize_pane_effect() {
+        let mut sim = AttachSimHarness::new(100, 24);
+        sim.seed_vertical_split_panes();
+
+        sim.send_mouse(left_mouse(TerminalMousePhase::Down, 9, 3));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Drag, 12, 3));
+        sim.send_mouse(left_mouse(TerminalMousePhase::Up, 12, 3));
+
+        assert!(sim.effects().iter().any(|effect| {
+            matches!(
+                effect,
+                AttachUiEffect::ResizePane {
+                    direction:
+                        bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right,
+                    cells: 3,
+                    ..
+                }
+            )
+        }));
     }
 }

@@ -209,6 +209,10 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
                 cursor_col,
             })
         }
+        "seed-pane-layout" => {
+            let split = step.split.context("seed-pane-layout requires 'split'")?;
+            Ok(Action::SeedPaneLayout { split })
+        }
         "prefix-key" => {
             let key_str = step.key.context("prefix-key requires 'key'")?;
             let key = key_str.chars().next().context("empty key")?;
@@ -407,6 +411,7 @@ struct RawStep {
     lines: Option<Vec<String>>,
     cursor_row: Option<u16>,
     cursor_col: Option<u16>,
+    split: Option<String>,
     // Waiting
     pattern: Option<String>,
     timeout_ms: Option<u64>,

@@ -250,6 +250,8 @@ pub enum Action {
         cursor_row: u16,
         cursor_col: u16,
     },
+    /// Seed deterministic attach simulation pane layout.
+    SeedPaneLayout { split: String },
     /// Render the current deterministic attach simulation state.
     Render,
     /// Locate text in the current deterministic render and store coordinates.
@@ -639,6 +641,7 @@ impl Action {
             Self::AssertRender { .. } => "assert-render",
             Self::SeedWindowList { .. } => "seed-window-list",
             Self::SeedPaneText { .. } => "seed-pane-text",
+            Self::SeedPaneLayout { .. } => "seed-pane-layout",
             Self::Render => "render",
             Self::Locate { .. } => "locate",
             Self::TerminalEvent(_) => "terminal-event",
@@ -813,6 +816,9 @@ impl Action {
                 "seed-pane-text lines='{}' cursor_row={cursor_row} cursor_col={cursor_col}",
                 escape_single_quote(&lines.join("|"))
             ),
+            Self::SeedPaneLayout { split } => {
+                format!("seed-pane-layout split='{}'", escape_single_quote(split))
+            }
             Self::Render => "render".to_string(),
             Self::Locate { id, text } => format!(
                 "locate id='{}' text='{}'",

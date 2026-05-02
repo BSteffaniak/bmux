@@ -401,6 +401,9 @@ pub fn parse_action_line(line: &str) -> Result<Action> {
                 cursor_col,
             })
         }
+        "seed-pane-layout" => Ok(Action::SeedPaneLayout {
+            split: require_arg(&args, "split", "seed-pane-layout")?,
+        }),
         "render" => Ok(Action::Render),
         "locate" => Ok(Action::Locate {
             id: require_arg(&args, "id", "locate")?,

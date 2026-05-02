@@ -8208,7 +8208,17 @@ async fn handle_attach_mouse_event_at(
         return Ok(());
     }
 
-    if handle_attach_mouse_resize_drag(client, view_state, mouse_event, now).await? {
+    let resize_reduction =
+        reduce_attach_mouse_resize_event(view_state, TerminalMouseEvent::from(mouse_event), now);
+    if resize_reduction.consumed {
+        execute_attach_ui_effects(
+            client,
+            view_state,
+            resize_reduction.effects,
+            kernel_client_factory,
+            now,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -8493,63 +8503,71 @@ async fn handle_attach_mouse_floating_drag(
     }
 }
 
-async fn handle_attach_mouse_resize_drag(
-    client: &mut StreamingBmuxClient,
+pub fn reduce_attach_mouse_resize_event(
     view_state: &mut AttachViewState,
-    mouse_event: MouseEvent,
+    mouse_event: TerminalMouseEvent,
     now: Instant,
-) -> std::result::Result<bool, ClientError> {
+) -> AttachUiReduction {
     if !view_state.mouse.config.resize_borders {
         view_state.mouse.resize_drag = None;
-        return Ok(false);
+        return AttachUiReduction::ignored();
     }
 
-    match mouse_event.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            let Some(mut drag) = attach_scene_resize_separator_at(
-                view_state,
-                mouse_event.column,
-                mouse_event.row,
-                now,
-            ) else {
-                return Ok(false);
+    match (mouse_event.phase, mouse_event.button) {
+        (TerminalMousePhase::Down, Some(TerminalMouseButton::Left)) => {
+            let Some(mut drag) =
+                attach_scene_resize_separator_at(view_state, mouse_event.col, mouse_event.row, now)
+            else {
+                return AttachUiReduction::ignored();
             };
             let throttle = Duration::from_millis(view_state.mouse.config.resize_drag_throttle_ms);
             drag.last_applied_at = now.checked_sub(throttle).unwrap_or(now);
             view_state.mouse.resize_drag = Some(drag);
-            Ok(true)
+            AttachUiReduction::consumed()
         }
-        MouseEventKind::Drag(MouseButton::Left) => {
+        (TerminalMousePhase::Drag, Some(TerminalMouseButton::Left)) => {
             let Some(mut drag) = view_state.mouse.resize_drag else {
-                return Ok(false);
+                return AttachUiReduction::ignored();
             };
-            drag.latest_column = mouse_event.column;
+            drag.latest_column = mouse_event.col;
             drag.latest_row = mouse_event.row;
             if !attach_mouse_resize_drag_has_pending_delta(&drag) {
                 view_state.mouse.resize_drag = Some(drag);
-                return Ok(true);
+                return AttachUiReduction::consumed();
             }
             let throttle = Duration::from_millis(view_state.mouse.config.resize_drag_throttle_ms);
             if !throttle.is_zero() && now.duration_since(drag.last_applied_at) < throttle {
                 view_state.mouse.resize_drag = Some(drag);
-                return Ok(true);
+                return AttachUiReduction::consumed();
             }
-            if apply_attach_mouse_resize_delta(client, view_state, &mut drag).await {
+            let effects = resize_effects_for_drag_delta(&mut drag);
+            if !effects.is_empty() {
                 drag.last_applied_at = now;
             }
             view_state.mouse.resize_drag = Some(drag);
-            Ok(true)
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            if let Some(mut drag) = view_state.mouse.resize_drag.take() {
-                drag.latest_column = mouse_event.column;
-                drag.latest_row = mouse_event.row;
-                apply_attach_mouse_resize_delta(client, view_state, &mut drag).await;
-                return Ok(true);
+            AttachUiReduction {
+                consumed: true,
+                effects,
             }
-            Ok(false)
         }
-        _ => Ok(view_state.mouse.resize_drag.is_some()),
+        (TerminalMousePhase::Up, Some(TerminalMouseButton::Left)) => {
+            let Some(mut drag) = view_state.mouse.resize_drag.take() else {
+                return AttachUiReduction::ignored();
+            };
+            drag.latest_column = mouse_event.col;
+            drag.latest_row = mouse_event.row;
+            AttachUiReduction {
+                consumed: true,
+                effects: resize_effects_for_drag_delta(&mut drag),
+            }
+        }
+        _ => {
+            if view_state.mouse.resize_drag.is_some() {
+                AttachUiReduction::consumed()
+            } else {
+                AttachUiReduction::ignored()
+            }
+        }
     }
 }
 
@@ -8566,56 +8584,31 @@ fn attach_mouse_resize_drag_has_pending_delta(drag: &AttachMouseResizeDrag) -> b
         .is_some()
 }
 
-async fn apply_attach_mouse_resize_delta(
-    client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
-    drag: &mut AttachMouseResizeDrag,
-) -> bool {
-    let horizontal = resize_drag_axis_delta(
+fn resize_effects_for_drag_delta(drag: &mut AttachMouseResizeDrag) -> Vec<AttachUiEffect> {
+    let mut effects = Vec::new();
+    if let Some((pane_id, direction, cells)) = resize_drag_axis_delta(
         drag.horizontal,
         i32::from(drag.latest_column) - i32::from(drag.last_column),
-    );
-    let vertical = resize_drag_axis_delta(
+    ) {
+        effects.push(AttachUiEffect::ResizePane {
+            pane_id,
+            direction,
+            cells,
+        });
+        drag.last_column = drag.latest_column;
+    }
+    if let Some((pane_id, direction, cells)) = resize_drag_axis_delta(
         drag.vertical,
         i32::from(drag.latest_row) - i32::from(drag.last_row),
-    );
-    let horizontal_applied = if let Some((target, direction, cells)) = horizontal
-        && apply_attach_pane_resize_or_log(client, view_state, target, direction, cells).await
-    {
-        drag.last_column = drag.latest_column;
-        true
-    } else {
-        false
-    };
-    let vertical_applied = if let Some((target, direction, cells)) = vertical
-        && apply_attach_pane_resize_or_log(client, view_state, target, direction, cells).await
-    {
-        drag.last_row = drag.latest_row;
-        true
-    } else {
-        false
-    };
-    horizontal_applied || vertical_applied
-}
-
-async fn apply_attach_pane_resize_or_log(
-    client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
-    pane_id: Uuid,
-    direction: bmux_windows_plugin_api::windows_commands::PaneResizeDirection,
-    cells: u16,
-) -> bool {
-    if let Err(error) = resize_attach_pane(client, view_state, pane_id, direction, cells).await {
-        tracing::warn!(
-            %error,
-            %pane_id,
-            ?direction,
+    ) {
+        effects.push(AttachUiEffect::ResizePane {
+            pane_id,
+            direction,
             cells,
-            "attach.mouse_resize.apply_failed"
-        );
-        return false;
+        });
+        drag.last_row = drag.latest_row;
     }
-    true
+    effects
 }
 
 fn resize_drag_axis_delta(
@@ -9088,6 +9081,23 @@ async fn execute_attach_ui_effects(
                     target_context_id,
                     placement,
                 );
+            }
+            AttachUiEffect::ResizePane {
+                pane_id,
+                direction,
+                cells,
+            } => {
+                if let Err(error) =
+                    resize_attach_pane(client, view_state, pane_id, direction, cells).await
+                {
+                    tracing::warn!(
+                        %error,
+                        %pane_id,
+                        ?direction,
+                        cells,
+                        "attach.mouse_resize.apply_failed"
+                    );
+                }
             }
             AttachUiEffect::ShowTransientStatus { message } => {
                 view_state.set_transient_status(message, now, ATTACH_TRANSIENT_STATUS_TTL);
