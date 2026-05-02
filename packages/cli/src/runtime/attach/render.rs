@@ -1,17 +1,5 @@
 #[cfg(test)]
-pub fn append_pane_output(
-    buffer: &mut bmux_attach_pipeline::PaneRenderBuffer,
-    bytes: &[u8],
-) -> bool {
-    let was_alternate = buffer.protocol_tracker.alternate_screen();
-    let _ = buffer.protocol_tracker.process(bytes);
-    buffer.terminal_grid.process(bytes);
-    let toggled = was_alternate != buffer.protocol_tracker.alternate_screen();
-    if toggled {
-        buffer.prev_rows.clear();
-    }
-    toggled
-}
+pub use bmux_attach_pipeline::render::append_pane_output;
 
 pub use bmux_attach_pipeline::render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, opaque_row_text,

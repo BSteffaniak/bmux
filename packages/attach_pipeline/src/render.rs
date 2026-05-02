@@ -1411,7 +1411,6 @@ impl AttachLayerSurface {
     }
 }
 
-#[cfg(test)]
 pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
